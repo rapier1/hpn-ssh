@@ -28,7 +28,7 @@
 # endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 
-#define SSHBUF_SIZE_MAX		0x8000000	/* Hard maximum size */
+#define SSHBUF_SIZE_MAX		0xF000000	/* Hard maximum size 256MB */
 #define SSHBUF_REFS_MAX		0x100000	/* Max child buffers */
 #define SSHBUF_MAX_BIGNUM	(16384 / 8)	/* Max bignum *bytes* */
 #define SSHBUF_MAX_ECPOINT	((528 * 2 / 8) + 1) /* Max EC point *bytes* */
@@ -43,6 +43,7 @@ struct sshbuf {
 	size_t off;		/* First available byte is buf->d + buf->off */
 	size_t size;		/* Last byte is buf->d + buf->size - 1 */
 	size_t max_size;	/* Maximum size of buffer */
+	size_t window_max;      /* channel window max */
 	size_t alloc;		/* Total bytes allocated to buf->d */
 	int readonly;		/* Refers to external, const data */
 	int dont_free;		/* Kludge to support sshbuf_init */

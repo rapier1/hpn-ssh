@@ -10,31 +10,33 @@
 .\"
 .\" $OpenBSD: scp.1,v 1.107 2022/02/10 04:12:38 djm Exp $
 .\"
-.Dd $Mdocdate: February 10 2022 $
-.Dt SCP 1
+.Dd $Mdocdate: March 24 2022 $
+.Dt HPNSCP 1
 .Os
 .Sh NAME
-.Nm scp
-.Nd OpenSSH secure file copy
+.Nm hpnscp
+.Nd HPN/OpenSSH secure file copy
 .Sh SYNOPSIS
-.Nm scp
-.Op Fl 346ABCOpqRrsTv
+.Nm hpnscp
+.Op Fl 346ABCOpqRrsTvZ
 .Op Fl c Ar cipher
 .Op Fl D Ar sftp_server_path
-.Op Fl F Ar ssh_config
+.Op Fl F Ar hpnssh_config
 .Op Fl i Ar identity_file
 .Op Fl J Ar destination
 .Op Fl l Ar limit
-.Op Fl o Ar ssh_option
+.Op Fl o Ar hpnssh_option
 .Op Fl P Ar port
 .Op Fl S Ar program
+.Op Fl z Ar file path of remote scp
 .Ar source ... target
 .Sh DESCRIPTION
 .Nm
-copies files between hosts on a network.
+copies files between hosts on a network. It is binary compatible with OpenSSH's scp including
+the use of the same directives and configuration options except where noted. 
 .Pp
 It uses
-.Xr ssh 1
+.Xr hpnssh 1
 for data transfer, and uses the same authentication and provides the
 same security as a login session.
 .Pp
@@ -91,7 +93,7 @@ Forces
 to use IPv6 addresses only.
 .It Fl A
 Allows forwarding of
-.Xr ssh-agent 1
+.Xr hpnssh-agent 1
 to the remote system.
 The default is not to forward an authentication agent.
 .It Fl B
@@ -101,30 +103,30 @@ Compression enable.
 Passes the
 .Fl C
 flag to
-.Xr ssh 1
+.Xr hpnssh 1
 to enable compression.
 .It Fl c Ar cipher
 Selects the cipher to use for encrypting the data transfer.
 This option is directly passed to
-.Xr ssh 1 .
+.Xr hpnssh 1 .
 .It Fl D Ar sftp_server_path
 When using the SFTP protocol support via
 .Fl s ,
 connect directly to a local SFTP server program rather than a
 remote one via
-.Xr ssh 1 .
+.Xr hpnssh 1 .
 This option may be useful in debugging the client and server.
-.It Fl F Ar ssh_config
+.It Fl F Ar hpnssh_config
 Specifies an alternative
 per-user configuration file for
-.Nm ssh .
+.Nm hpnssh .
 This option is directly passed to
-.Xr ssh 1 .
+.Xr hpnssh 1 .
 .It Fl i Ar identity_file
 Selects the file from which the identity (private key) for public key
 authentication is read.
 This option is directly passed to
-.Xr ssh 1 .
+.Xr hpnssh 1 .
 .It Fl J Ar destination
 Connect to the target host by first making an
 .Nm
@@ -137,7 +139,7 @@ This is a shortcut to specify a
 .Cm ProxyJump
 configuration directive.
 This option is directly passed to
-.Xr ssh 1 .
+.Xr hpnssh 1 .
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
 .It Fl O
@@ -148,17 +150,17 @@ wildcard patterns and for expanding paths with a
 .Sq ~
 prefix for older SFTP servers.
 This mode is the default.
-.It Fl o Ar ssh_option
+.It Fl o Ar hpnssh_option
 Can be used to pass options to
 .Nm ssh
 in the format used in
-.Xr ssh_config 5 .
+.Xr hpnssh_config 5 .
 This is useful for specifying options
 for which there is no separate
 .Nm scp
 command-line flag.
 For full details of the options listed below, and their possible values, see
-.Xr ssh_config 5 .
+.Xr hpnssh_config 5 .
 .Pp
 .Bl -tag -width Ds -offset indent -compact
 .It AddressFamily
@@ -235,7 +237,7 @@ source file.
 .It Fl q
 Quiet mode: disables the progress meter as well as warning and diagnostic
 messages from
-.Xr ssh 1 .
+.Xr hpnssh 1 .
 .It Fl R
 Copies between two remote hosts are performed by connecting to the origin
 host and executing
@@ -255,7 +257,7 @@ Name of
 .Ar program
 to use for the encrypted connection.
 The program must understand
-.Xr ssh 1
+.Xr hpnssh 1
 options.
 .It Fl s
 Use the SFTP protocol for transfers rather than the original scp protocol.
@@ -274,7 +276,7 @@ Verbose mode.
 Causes
 .Nm
 and
-.Xr ssh 1
+.Xr hpnssh 1
 to print debugging messages about their progress.
 This is helpful in
 debugging connection, authentication, and configuration problems.
@@ -282,14 +284,14 @@ debugging connection, authentication, and configuration problems.
 .Sh EXIT STATUS
 .Ex -std scp
 .Sh SEE ALSO
-.Xr sftp 1 ,
-.Xr ssh 1 ,
-.Xr ssh-add 1 ,
-.Xr ssh-agent 1 ,
-.Xr ssh-keygen 1 ,
-.Xr ssh_config 5 ,
-.Xr sftp-server 8 ,
-.Xr sshd 8
+.Xr hpnsftp 1 ,
+.Xr hpnssh 1 ,
+.Xr hpnssh-add 1 ,
+.Xr hpnssh-agent 1 ,
+.Xr hpnssh-keygen 1 ,
+.Xr hpnssh_config 5 ,
+.Xr hpnsftp-server 8 ,
+.Xr hpnsshd 8
 .Sh HISTORY
 .Nm
 is based on the rcp program in
@@ -298,6 +300,7 @@ source code from the Regents of the University of California.
 .Sh AUTHORS
 .An Timo Rinne Aq Mt tri@iki.fi
 .An Tatu Ylonen Aq Mt ylo@cs.hut.fi
+.An Chris Rapier Aq Mt rapier@psc.edu
 .Sh CAVEATS
 The original SCP protocol (used by default) requires execution of the
 remote user's shell to perform

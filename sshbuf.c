@@ -27,6 +27,9 @@
 #include "ssherr.h"
 #include "sshbuf.h"
 #include "misc.h"
+/* #include "log.h" */
+
+#define BUF_WATERSHED 256*1024
 
 static inline int
 sshbuf_check_sanity(const struct sshbuf *buf)
@@ -324,9 +327,40 @@ sshbuf_allocate(struct sshbuf *buf, size_t len)
 	 */
 	need = len + buf->size - buf->alloc;
 	rlen = ROUNDUP(buf->alloc + need, SSHBUF_SIZE_INC);
+	/* With the changes in 8.9 the output buffer end up growing pretty
+	 * slowly. It's knows that it needs to grow but it only does so 32K
+	 * at a time. This means a lot of calls to realloc and memcpy which
+	 * kills performance until the buffer reaches some maximum size.
+	 * so we explicitly test for a buffer that's trying to grow and
+	 * if it is then we push the growth to whatever the adjusted value of
+	 * local_window_max happens to be. This significantly reduces overhead
+	 * and improves performance. In this case we look for a buffer that is trying
+	 * to grow larger than BUF_WATERSHED (256*1024 taken from PACKET_MAX_SIZE)
+	 * and where the local_window_max isn't zero (which is usally in the Channels
+	 * struct but we copied it into the shhbuf as window_max). If it is zero or
+	 * the buffer is smaller than BUF_WATERSHED we just use the
+	 * normal value for need. We also don't want to grow the buffer past
+	 * what we need (the size of window_max) so if the current allocation (in
+	 * buf->alloc) is greater than window_max we skip it.
+	 */
+	if (rlen > BUF_WATERSHED && buf->window_max !=0 && buf->alloc < buf->window_max) {
+		// debug("*********** prior rlen %zu and need %zu buf_alloc is %zu", rlen, need, buf->alloc);
+		/* set need to the the max window size less the current allocation */
+		need = buf->window_max;
+		rlen = ROUNDUP(buf->alloc + need, SSHBUF_SIZE_INC);
+		/* in some cases, like a very high rtt with a large receive buffer
+		 * rlen can exceed buf->max size. So clamp it if necessary */
+		if (rlen > buf->max_size)
+			rlen = buf->max_size;
+		//debug ("***********************************  rlen is %zu need is %zu window max is %zu max_size is %zu", rlen, need, buf->window_max, buf->max_size);
+	}
 	SSHBUF_DBG(("need %zu initial rlen %zu", need, rlen));
 	if (rlen > buf->max_size)
 		rlen = buf->alloc + need;
+	/* be sure to include log.h if you uncomment the debug
+	 * this debug helped identify the buffer growth issue in v8.9
+	 * see the git log about it. search for sshbuf_read -cjr */
+	/* debug("adjusted rlen: %zu, len: %lu for %p", rlen, len, buf); */
 	SSHBUF_DBG(("adjusted rlen %zu", rlen));
 	if ((dp = recallocarray(buf->d, buf->alloc, rlen, 1)) == NULL) {
 		SSHBUF_DBG(("realloc fail"));
@@ -398,4 +432,3 @@ sshbuf_consume_end(struct sshbuf *buf, size_t len)
 	SSHBUF_TELL("done");
 	return 0;
 }
-

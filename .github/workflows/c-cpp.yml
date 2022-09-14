@@ -18,27 +18,27 @@ jobs:
         # Then we include any extra configs we want to test for specific VMs.
         # Valgrind slows things down quite a bit, so start them first.
         include:
-          - { os: ubuntu-20.04, configs: valgrind-1 }
-          - { os: ubuntu-20.04, configs: valgrind-2 }
-          - { os: ubuntu-20.04, configs: valgrind-3 }
-          - { os: ubuntu-20.04, configs: valgrind-4 }
-          - { os: ubuntu-20.04, configs: valgrind-unit }
+#          - { os: ubuntu-20.04, configs: valgrind-1 }
+#          - { os: ubuntu-20.04, configs: valgrind-2 }
+#          - { os: ubuntu-20.04, configs: valgrind-3 }
+#          - { os: ubuntu-20.04, configs: valgrind-4 }
+#          - { os: ubuntu-20.04, configs: valgrind-unit }
           - { os: ubuntu-20.04, configs: c89 }
           - { os: ubuntu-20.04, configs: clang-6.0 }
           - { os: ubuntu-20.04, configs: clang-8 }
           - { os: ubuntu-20.04, configs: clang-9 }
           - { os: ubuntu-20.04, configs: clang-10 }
           - { os: ubuntu-20.04, configs: clang-11 }
-          - { os: ubuntu-20.04, configs: clang-12-Werror }
+#          - { os: ubuntu-20.04, configs: clang-12-Werror }
           - { os: ubuntu-20.04, configs: gcc-7 }
           - { os: ubuntu-20.04, configs: gcc-8 }
           - { os: ubuntu-20.04, configs: gcc-10 }
-          - { os: ubuntu-20.04, configs: gcc-11-Werror }
+#          - { os: ubuntu-20.04, configs: gcc-11-Werror }
           - { os: ubuntu-20.04, configs: pam }
           - { os: ubuntu-20.04, configs: kitchensink }
           - { os: ubuntu-20.04, configs: hardenedmalloc }
           - { os: ubuntu-20.04, configs: tcmalloc }
-          - { os: ubuntu-20.04, configs: musl }
+#          - { os: ubuntu-20.04, configs: musl }
           - { os: ubuntu-latest, configs: libressl-master }
           - { os: ubuntu-latest, configs: libressl-2.2.9 }
           - { os: ubuntu-latest, configs: libressl-2.8.3 }
