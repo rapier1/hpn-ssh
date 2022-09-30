@@ -26,6 +26,7 @@ SFTP_SERVER=$(libexecdir)/hpnsftp-server
 SSH_KEYSIGN=$(libexecdir)/hpnssh-keysign
 SSH_PKCS11_HELPER=$(libexecdir)/hpnssh-pkcs11-helper
 SSH_SK_HELPER=$(libexecdir)/hpnssh-sk-helper
+SSH_CIPHER_BENCH=$(libexecdir)/hpnssh-cipher-bench
 PRIVSEP_PATH=@PRIVSEP_PATH@
 SSH_PRIVSEP_USER=@SSH_PRIVSEP_USER@
 STRIP_OPT=@STRIP_OPT@
@@ -68,7 +69,7 @@ MKDIR_P=@MKDIR_P@
 
 .SUFFIXES: .lo
 
-TARGETS=hpnssh$(EXEEXT) hpnsshd$(EXEEXT) hpnssh-add$(EXEEXT) hpnssh-keygen$(EXEEXT) hpnssh-keyscan${EXEEXT} hpnssh-keysign${EXEEXT} hpnssh-pkcs11-helper$(EXEEXT) hpnssh-agent$(EXEEXT) hpnscp$(EXEEXT) hpnsftp-server$(EXEEXT) hpnsftp$(EXEEXT) hpnssh-sk-helper$(EXEEXT)
+TARGETS=hpnssh$(EXEEXT) hpnsshd$(EXEEXT) hpnssh-add$(EXEEXT) hpnssh-keygen$(EXEEXT) hpnssh-keyscan${EXEEXT} hpnssh-keysign${EXEEXT} hpnssh-pkcs11-helper$(EXEEXT) hpnssh-agent$(EXEEXT) hpnscp$(EXEEXT) hpnsftp-server$(EXEEXT) hpnsftp$(EXEEXT) hpnssh-sk-helper$(EXEEXT) hpnssh-cipher-bench$(EXEEXT)
 
 XMSS_OBJS=\
 	ssh-xmss.o \
@@ -154,6 +155,8 @@ SSHKEYSCAN_OBJS=ssh-keyscan.o $(SKOBJS)
 SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-server-main.o
 
 SFTP_OBJS=	sftp.o progressmeter.o $(SFTP_CLIENT_OBJS)
+
+CIPHER_BENCH_OBJS=	ssh-cipher-bench.o
 
 MANPAGES	= hpnmoduli.5.out hpnscp.1.out hpnssh-add.1.out hpnssh-agent.1.out hpnssh-keygen.1.out hpnssh-keyscan.1.out hpnssh.1.out hpnsshd.8.out hpnsftp-server.8.out hpnsftp.1.out hpnssh-keysign.8.out hpnssh-pkcs11-helper.8.out hpnssh-sk-helper.8.out hpnsshd_config.5.out hpnssh_config.5.out
 MANPAGES_IN	= hpnmoduli.5 hpnscp.1 hpnssh-add.1 hpnssh-agent.1 hpnssh-keygen.1 hpnssh-keyscan.1 hpnssh.1 hpnsshd.8 hpnsftp-server.8 hpnsftp.1 hpnssh-keysign.8 hpnssh-pkcs11-helper.8 hpnssh-sk-helper.8 hpnsshd_config.5 hpnssh_config.5
@@ -243,6 +246,9 @@ hpnsftp-server$(EXEEXT): $(LIBCOMPAT) libssh.a $(SFTPSERVER_OBJS)
 
 hpnsftp$(EXEEXT): $(LIBCOMPAT) libssh.a $(SFTP_OBJS)
 	$(LD) -o $@ $(SFTP_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(LIBEDIT)
+
+hpnssh-cipher-bench$(EXEEXT): $(LIBCOMPAT) libssh.a $(CIPHER_BENCH_OBJS)
+	$(LD) -o $@ $(CIPHER_BENCH_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS)
 
 # test driver for the loginrec code - not built by default
 logintest: logintest.o $(LIBCOMPAT) libssh.a loginrec.o
@@ -409,6 +415,7 @@ install-files:
 	$(INSTALL) -m 0755 $(STRIP_OPT) hpnssh-sk-helper$(EXEEXT) $(DESTDIR)$(SSH_SK_HELPER)$(EXEEXT)
 	$(INSTALL) -m 0755 $(STRIP_OPT) hpnsftp$(EXEEXT) $(DESTDIR)$(bindir)/hpnsftp$(EXEEXT)
 	$(INSTALL) -m 0755 $(STRIP_OPT) hpnsftp-server$(EXEEXT) $(DESTDIR)$(SFTP_SERVER)$(EXEEXT)
+	$(INSTALL) -m 0755 $(STRIP_OPT) hpnssh-cipher-bench$(EXEEXT) $(DESTDIR)$(SSH_CIPHER_BENCH)$(EXEEXT)
 	$(INSTALL) -m 644 hpnssh.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh.1
 	$(INSTALL) -m 644 hpnscp.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/hpnscp.1
 	$(INSTALL) -m 644 hpnssh-add.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh-add.1
@@ -485,6 +492,7 @@ uninstall:
 	-rm -f $(DESTDIR)$(SSH_KEYSIGN)$(EXEEXT)
 	-rm -f $(DESTDIR)$(SSH_PKCS11_HELPER)$(EXEEXT)
 	-rm -f $(DESTDIR)$(SSH_SK_HELPER)$(EXEEXT)
+	-rm -f $(DESTDIR)$(SSH_CIPHER_BENCH)$(EXEEXT)
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh.1
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/hpnscp.1
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh-add.1

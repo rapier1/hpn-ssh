@@ -45,4 +45,5 @@ hpnssh-keyscan
 hpnssh-keysign
 hpnssh-pkcs11-helper
 hpnssh-sk-helper
+hpnssh-cipher-bench
 hpnsshd
