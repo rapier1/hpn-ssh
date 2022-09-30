@@ -21,6 +21,8 @@ static char doc[] = "A benchmarking tool for SSH ciphers.";
 static struct argp_option options[] = {
 	{"ciphers", 'c', "cipher_list", 0,
 	    "comma-separated list of ciphers to benchmark"},
+	{"3des", 'd', 0, 0,
+	    "enable the \"3des-cbc\" cipher, which is normally skipped"},
 	{"num",     'n', "N", 0, "benchmark each cipher with N packets"},
 	{"quiet",   'q', 0, 0, "don't print the table header"},
 	{ 0 }
@@ -28,6 +30,7 @@ static struct argp_option options[] = {
 
 struct arguments {
 	int quiet;
+	int des;
 	uint32_t n;
 	char * cipherList;
 };
@@ -38,6 +41,9 @@ static error_t parse_opt(int key, char * arg, struct argp_state * state) {
 	switch(key) {
 		case 'c':
 			arguments->cipherList = arg;
+			break;
+		case 'd':
+			arguments->des = 1;
 			break;
 		case 'n':
 			arguments->n = atoi(arg);
@@ -507,13 +513,15 @@ int testList(char * cipherlist, uint32_t n, int quiet) {
 	for (int i = 0; cipherlist[i] != '\0'; i++) {
 		if (cipherlist[i] == ',') {
 			cipherlist[i] = '\0';
-			if (test(maxstrlen, cursor, n) != 0)
-				return 1;
+			if (strlen(cursor) != 0)
+				if (test(maxstrlen, cursor, n) != 0)
+					return 1;
 			cursor = &(cipherlist[i+1]);
 		}
 	}
-	if (test(maxstrlen, cursor, n) != 0)
-		return 1;
+	if(strlen(cursor) != 0)
+		if (test(maxstrlen, cursor, n) != 0)
+			return 1;
 
 	return 0;
 }
@@ -537,6 +545,10 @@ int main(int argc, char ** argv) {
 			    "Could not get list of valid ciphers.\n");
 			exit(1);
 		}
+		if (arguments.des != 1)
+			for (char * c = strstr(cipherList,"3des-cbc");
+			    *c != ','; c++)
+				*c = ',';
 	} else {
 		cipherList = strdup(arguments.cipherList);
 		if (cipherList == NULL) {
