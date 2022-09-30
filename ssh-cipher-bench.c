@@ -23,7 +23,11 @@ static struct argp_option options[] = {
 	    "comma-separated list of ciphers to benchmark"},
 	{"3des", 'd', 0, 0,
 	    "enable the \"3des-cbc\" cipher, which is normally skipped"},
-	{"num",     'n', "N", 0, "benchmark each cipher with N packets"},
+	{"num",     'n', "N", 0, "benchmark each cipher with N packets; "
+	    "N defaults to 1024"},
+	{"packetsize", 'p', "L", 0,
+	    "use packets of length L bytes, not exceeding L=SSH_IOBUFSZ, "
+	    "where SSH_IOBUFSZ is usually 32768; L defaults to SSH_IOBUFSZ"},
 	{"quiet",   'q', 0, 0, "don't print the table header"},
 	{ 0 }
 };
@@ -32,11 +36,13 @@ struct arguments {
 	int quiet;
 	int des;
 	uint32_t n;
+	uint32_t ps;
 	char * cipherList;
 };
 
 static error_t parse_opt(int key, char * arg, struct argp_state * state) {
 	struct arguments * arguments = state->input;
+	int i = 0;
 
 	switch(key) {
 		case 'c':
@@ -46,7 +52,26 @@ static error_t parse_opt(int key, char * arg, struct argp_state * state) {
 			arguments->des = 1;
 			break;
 		case 'n':
-			arguments->n = atoi(arg);
+			i = atoi(arg);
+			if (i <= 0)
+				argp_error(state, "N must be a positive integer.");
+			arguments->n = i;
+			break;
+		case 'p':
+			i = atoi(arg);
+			if (i < 0)
+				argp_error(state, "L must be a non-negative integer.");
+			if (i > SSH_IOBUFSZ) {
+				fprintf(stderr,
+				    "NOTE: The packet size cannot exceed "
+				    "SSH_IOBUFSZ, which is %u.\n"
+				    "      Benchmarks will be run with the "
+				    "maximum packet size of %u bytes.\n",
+				    SSH_IOBUFSZ, SSH_IOBUFSZ);
+				i = SSH_IOBUFSZ;
+			}
+
+			arguments->ps = i;
 			break;
 		case 'q':
 			arguments->quiet = 1;
@@ -250,7 +275,7 @@ struct timespec bigroot(struct bignum a) {
 	return l;
 }
 
-int test(unsigned int maxstrlen, char * arg, uint32_t n) {
+int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps) {
 	struct sshcipher * c;
 	struct sshcipher_ctx * ctx;
 	unsigned int keylen, ivlen;
@@ -295,7 +320,7 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n) {
 	len += 1;                   /* uint8_t  : packet type          */
 	len += 4;                   /* uint32_t : remote_id            */
 	len += 4;                   /* uint32_t : packet payload size  */
-	len += SSH_IOBUFSZ;         /* <varies> : packet payload (max) */
+	len += ps;         /* <varies> : packet payload (max) */
 	len += pad(len, blocksize); /* <varies> : padding              */
 	authlen = cipher_authlen(c);
 
@@ -441,9 +466,8 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n) {
 	speed = avg.tv_nsec;
 	speed /= NANO;
 	speed += avg.tv_sec;
-	speed /= 32768; /* packet size */
 	speed *= 1073741824; /* 1 GiB */
-	speed = 1/speed;
+	speed = ps/speed;
 	printf("%12.6lf ", speed);
 	speed *= 8;
 	printf("%12.6lf ", speed);
@@ -471,7 +495,7 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n) {
 	return 1;
 }
 
-int testList(char * cipherlist, uint32_t n, int quiet) {
+int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet) {
 	char * cursor, * header;
 	unsigned int maxstrlen, curstrlen;
 	
@@ -514,13 +538,13 @@ int testList(char * cipherlist, uint32_t n, int quiet) {
 		if (cipherlist[i] == ',') {
 			cipherlist[i] = '\0';
 			if (strlen(cursor) != 0)
-				if (test(maxstrlen, cursor, n) != 0)
+				if (test(maxstrlen, cursor, n, ps) != 0)
 					return 1;
 			cursor = &(cipherlist[i+1]);
 		}
 	}
 	if(strlen(cursor) != 0)
-		if (test(maxstrlen, cursor, n) != 0)
+		if (test(maxstrlen, cursor, n, ps) != 0)
 			return 1;
 
 	return 0;
@@ -533,6 +557,8 @@ int main(int argc, char ** argv) {
 
 	arguments.quiet = 0;
 	arguments.n = 1024;
+	arguments.des = 0;
+	arguments.ps = SSH_IOBUFSZ;
 	arguments.cipherList = NULL;
 	cipherList = NULL;
 
@@ -557,7 +583,8 @@ int main(int argc, char ** argv) {
 			exit(1);
 		}
 	}
-	retval = testList(cipherList, arguments.n, arguments.quiet);
+	retval = testList(cipherList, arguments.n, arguments.ps,
+	    arguments.quiet);
 	free(cipherList);
 	exit(retval);
 }
