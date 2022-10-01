@@ -493,7 +493,7 @@ int testList(char * cipherlist, uint32_t n, int quiet) {
 		header = malloc((maxstrlen + 55) * sizeof(*header));
 		sprintf(header,"%*s|%11s|%11s|%12s|%12s|%3s",maxstrlen, "", "",
 		    "", "", "", "");
-		for (int i = 0; i < maxstrlen + 55; i++) {
+		for (unsigned int i = 0; i < maxstrlen + 55; i++) {
 			if (header[i] == ' ')
 				header[i] = '-';
 			else if (header[i] == '|')
