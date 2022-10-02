@@ -60,13 +60,15 @@ static error_t parse_opt(int key, char * arg, struct argp_state * state) {
 		case 'n':
 			i = atoi(arg);
 			if (i <= 0)
-				argp_error(state, "N must be a positive integer.");
+				argp_error(state,
+				    "N must be a positive integer.");
 			arguments->n = i;
 			break;
 		case 'p':
 			i = atoi(arg);
 			if (i < 0)
-				argp_error(state, "L must be a non-negative integer.");
+				argp_error(state,
+				    "L must be a non-negative integer.");
 			if (i > SSH_IOBUFSZ) {
 				fprintf(stderr,
 				    "NOTE: The packet size cannot exceed "
