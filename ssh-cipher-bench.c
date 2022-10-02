@@ -10,6 +10,7 @@
 #include "includes.h"
 
 #include "cipher.h"
+#include "ssh-cipher-bench-stats.h"
 
 #define NANO 1000000000
 
@@ -23,6 +24,7 @@ static struct argp_option options[] = {
 	    "comma-separated list of ciphers to benchmark"},
 	{"3des", 'd', 0, 0,
 	    "enable the \"3des-cbc\" cipher, which is normally skipped"},
+	{"graph", 'g', 0, 0, "enable graphs in output"},
 	{"num",     'n', "N", 0, "benchmark each cipher with N packets; "
 	    "N defaults to 1024"},
 	{"packetsize", 'p', "L", 0,
@@ -35,6 +37,7 @@ static struct argp_option options[] = {
 struct arguments {
 	int quiet;
 	int des;
+	uint32_t graph;
 	uint32_t n;
 	uint32_t ps;
 	char * cipherList;
@@ -50,6 +53,9 @@ static error_t parse_opt(int key, char * arg, struct argp_state * state) {
 			break;
 		case 'd':
 			arguments->des = 1;
+			break;
+		case 'g':
+			arguments->graph = 1;
 			break;
 		case 'n':
 			i = atoi(arg);
@@ -112,170 +118,8 @@ unsigned int pad(unsigned int len, unsigned int blocksize) {
 	return padding;
 }
 
-void normalize(struct timespec * t) {
-	while (t->tv_nsec > NANO) {
-		t->tv_sec += 1;
-		t->tv_nsec -= NANO;
-	}
-	while (t->tv_nsec < 0) {
-		if (t->tv_sec == 0)
-			fprintf(stderr, "Warning! Negative time detected!\n");
-		t->tv_sec -= 1;
-		t->tv_nsec += NANO;
-	}
-}
-
-struct timespec plus(struct timespec a, struct timespec b) {
-	struct timespec c;
-	c.tv_sec = a.tv_sec + b.tv_sec;
-	c.tv_nsec = a.tv_nsec + b.tv_nsec;
-	normalize(&c);
-	return c;
-}
-
-struct timespec minus(struct timespec a, struct timespec b) {
-	struct timespec c;
-	c.tv_sec = a.tv_sec - b.tv_sec;
-	c.tv_nsec = a.tv_nsec - b.tv_nsec;
-	normalize(&c);
-	return c;
-}
-
-struct timespec time_div(struct timespec a, uint32_t b) {
-	struct timespec c;
-	unsigned long long d;
-
-	c.tv_sec = a.tv_sec / b;
-	d = 0;
-	d = d + (a.tv_sec % b);
-	d = d * NANO;
-	d = d + a.tv_nsec;
-	d = d / b;
-	if (d > NANO)
-		fprintf(stderr, "Overflow!\n");
-	c.tv_nsec = d % NANO;
-
-	return c;
-}
-
-struct bignum {
-	unsigned long long s;
-	unsigned long long ns;
-	unsigned long long nns;
-};
-
-void bignormalize(struct bignum * b) {
-	if (b->ns > NANO) {
-		b->s += (b->ns / NANO);
-		b->ns %= NANO;
-	}
-	if (b->nns > NANO) {
-		b->ns += (b->nns / NANO);
-		b->nns %= NANO;
-	}
-	if (b->ns > NANO) {
-		b->s += (b->ns / NANO);
-		b->ns %= NANO;
-	}
-}
-
-struct bignum bigdiv(struct bignum a, uint32_t b) {
-	struct bignum c;
-
-	c.s = a.s / b;
-	c.ns = a.s % b;
-	c.ns *= NANO;
-	c.ns += a.ns;
-	c.nns = c.ns % b;
-	c.ns /= b;
-	c.nns *= NANO;
-	c.nns += a.nns;
-	c.nns /= b;
-	bignormalize(&c);
-	return c;
-}
-
-int bigLessThanOrEqual(struct bignum a, struct bignum b) {
-	if (a.s != b.s)
-		return (a.s < b.s);
-	if (a.ns != b.ns)
-		return (a.ns < b.ns);
-	return (a.nns <= b.nns);
-}
-
-struct bignum mult(struct timespec a, struct timespec b) {
-	struct bignum c;
-	unsigned long long as, ans, bs, bns;
-
-	as = a.tv_sec;
-	bs = b.tv_sec;
-	ans = a.tv_nsec;
-	bns = b.tv_nsec;
-
-	c.s = as * bs;
-	c.ns = (as * bns) + (bs * ans);
-	c.nns = ans * bns;
-
-	bignormalize(&c);
-	return c;
-}
-
-struct timespec halve(struct timespec a) {
-	struct timespec b;
-
-	b.tv_sec = a.tv_sec / 2;
-	b.tv_nsec = a.tv_nsec / 2;
-	if (a.tv_sec % 2 != 0)
-		b.tv_nsec += (NANO/2);
-	normalize(&b);
-	return b;
-}
-
-struct timespec next(struct timespec a) {
-	a.tv_nsec += 1;
-	normalize(&a);
-	return a;
-}
-
-int time_equal(struct timespec a, struct timespec b) {
-	if (a.tv_sec == b.tv_sec)
-		return (a.tv_nsec == b.tv_nsec);
-	return 0;
-}
-
-struct timespec bigroot(struct bignum a) {
-	struct timespec l, m, r, oldr;
-	l.tv_sec = 0;
-	r.tv_sec = oldr.tv_sec = 1;
-	l.tv_nsec = r.tv_nsec = oldr.tv_nsec = 0;
-
-	while (bigLessThanOrEqual(mult(r, r), a)) {
-		oldr.tv_sec = r.tv_sec;
-		r.tv_sec *= 2;
-		if (r.tv_sec < oldr.tv_sec) {
-			fprintf(stderr, "Overflow during root-finding.\n");
-			exit(1);
-		}
-	}
-
-	while (! time_equal(next(l), r)) {
-		m = plus(l, r);
-		m = halve(m);
-		if (m.tv_sec < l.tv_sec || m.tv_sec > r.tv_sec) {
-			fprintf(stderr, "Overflow during root-finding.\n");
-			exit(1);
-		}
-
-		if (bigLessThanOrEqual(mult(m, m), a))
-			l = m;
-		else
-			r = m;
-	}
-
-	return l;
-}
-
-int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps) {
+int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
+    uint32_t graph, char * header) {
 	struct sshcipher * c;
 	struct sshcipher_ctx * ctx;
 	unsigned int keylen, ivlen;
@@ -286,10 +130,9 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps) {
 	unsigned char no_opt;
 	struct timespec * starts, * stops;
 	struct timespec * start, * stop;
-	struct timespec avg, stddev, delta;
-	struct bignum vari, dvari;
-	unsigned long long ts, tns;
 	double speed;
+	struct cbrecords * recs;
+	struct cbstats stats;
 	
 	c = NULL;
 	ctx = NULL;
@@ -301,11 +144,6 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps) {
 	no_opt = 4; /* doesn't matter */
 	starts = stops = NULL;
 	start = stop = NULL;
-	avg.tv_sec = stddev.tv_sec = delta.tv_sec = 0;
-	avg.tv_nsec = stddev.tv_nsec = delta.tv_nsec = 0;
-	vari.s = vari.ns = vari.nns = 0;
-	dvari.s = dvari.ns = dvari.nns = 0;
-	ts = tns = 0;
 
 	c = cipher_by_name(arg);
 	if (c == NULL) {
@@ -379,6 +217,8 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps) {
 		goto fail;
 	}
 
+	recs = initRecs(n);
+
 	for (counter = 0; counter < n; counter++) {
 		start = &(starts[counter]);
 		stop = &(stops[counter]);
@@ -398,80 +238,82 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps) {
 	for (counter = 0; counter < n; counter++) {
 		start = &(starts[counter]);
 		stop = &(stops[counter]);
-		normalize(stop);
-		normalize(start);
-
-		delta = minus(*stop, *start);
-		avg = plus(avg, delta);
-		
-		ts = delta.tv_sec;
-		tns = delta.tv_nsec;
-		vari.s += ts * ts;
-		vari.ns += 2 * ts * tns;
-		vari.nns += tns * tns;
-		bignormalize(&vari);
+		start->tv_sec += start->tv_nsec / 1000000000ull;
+		start->tv_nsec %= 1000000000ull;
+		stop->tv_sec += stop->tv_nsec / 1000000000ull;
+		stop->tv_nsec %= 1000000000ull;
+		record(recs, counter, start->tv_sec, start->tv_nsec,
+		    stop->tv_sec, stop->tv_nsec);
 	}
-	vari.nns *= n;
-	vari.ns *= n;
-	vari.s *= n;
-	bignormalize(&vari);
-	ts = avg.tv_sec;
-	tns = avg.tv_nsec;
+	stats = getStats(recs);
 
-	dvari.s = ts * ts;
-	dvari.ns = 2 * ts * tns;
-	dvari.nns = tns * tns;
-	bignormalize(&dvari);
-
-	if (vari.s < dvari.s) {
-		fprintf(stderr, "avg(x^2) < (avg(x))^2\n");
-	}
-	vari.s -= dvari.s;
-	while (vari.ns < dvari.ns) {
-		if (vari.s == 0)
-			fprintf(stderr, "avg(x^2) < (avg(x))^2\n");
-		vari.s -= 1;
-		vari.ns += NANO;
-	}
-	vari.ns -= dvari.ns;
-	while (vari.nns < dvari.nns) {
-		if (vari.ns == 0) {
-			if (vari.s == 0)
-				fprintf(stderr, "avg(x^2) < (avg(x))^2\n");
-			vari.s -= 1;
-			vari.ns += NANO;
-		}
-		vari.ns -= 1;
-		vari.nns += NANO;
-	}
-	vari.nns -= dvari.nns;
-	bignormalize(&vari);
-
-	avg = time_div(avg, n);
-	vari = bigdiv(vari, n);
-	vari = bigdiv(vari, n);
-
-	stddev = bigroot(vari);
-
-	printf("%-*s ", maxstrlen, arg);
-	if (avg.tv_sec > 0)
-		printf("%2ld%9lu ", avg.tv_sec, avg.tv_nsec);
-	else
-		printf("  %9lu ", avg.tv_nsec);
-	if (stddev.tv_sec > 0)
-		printf("%2ld%9lu ", stddev.tv_sec, stddev.tv_nsec);
-	else
-		printf("  %9lu ", stddev.tv_nsec);
-
-	speed = avg.tv_nsec;
-	speed /= NANO;
-	speed += avg.tv_sec;
+	speed = stats.avg;
+	speed /= 1000000000;
 	speed *= 1073741824; /* 1 GiB */
 	speed = ps/speed;
-	printf("%12.6lf ", speed);
-	speed *= 8;
-	printf("%12.6lf ", speed);
-	printf("%3hhu\n", no_opt);
+	if (header != NULL && graph)
+		printf("%s\n", header);
+	if (header != NULL || !graph)
+		printf(
+		    "%-*s %11llu %11llu %11llu %11llu %12.6lf %12.6lf %3hhu\n",
+		    maxstrlen, arg, stats.min, stats.max, stats.avg, stats.std,
+		    speed, speed * 8, no_opt);
+	else
+		printf("%s (%hhu)\n", arg, no_opt);
+
+	if (graph) {
+		unsigned long binmax = 0;
+		for (int i = 0; i < NBINS; i++)
+			if (stats.bins[i] > binmax)
+				binmax = stats.bins[i];
+
+		#define HEIGHT 5
+
+		double density = binmax / HEIGHT;
+
+		char bingrid[NBINS][HEIGHT];
+		for (int i = 0; i < HEIGHT; i++)
+			for (int j = 0; j < NBINS; j++)
+				bingrid[j][i] = ' ';
+		for (int i = 0; i < NBINS; i++) {
+			double barheight = stats.bins[i] / density;
+			for (long unsigned int j = 0;
+			    (j < barheight) && (j < HEIGHT); j++) {
+				double blockheight = barheight - j;
+				if (blockheight >= 15.0/16.0)
+					bingrid[i][j] = '8';
+				else if (blockheight >= 13.0/16.0)
+					bingrid[i][j] = '7';
+				else if (blockheight >= 11.0/16.0)
+					bingrid[i][j] = '6';
+				else if (blockheight >=  9.0/16.0)
+					bingrid[i][j] = '5';
+				else if (blockheight >=  7.0/16.0)
+					bingrid[i][j] = '4';
+				else if (blockheight >=  5.0/16.0)
+					bingrid[i][j] = '3';
+				else if (blockheight >=  3.0/16.0)
+					bingrid[i][j] = '2';
+				else if (blockheight >=  1.0/16.0)
+					bingrid[i][j] = '1';
+			}
+		}
+		for (int i = HEIGHT - 1; i >= 0; i--) {
+			for (int j = 0; j < NBINS; j++) {
+				if ((bingrid[j][i] >= '1') &&
+				    (bingrid[j][i] <= '8'))
+					printf("\xe2\x96%c",
+					    bingrid[j][i] - 0x30 + 0x80);
+				else
+					printf("%c", bingrid[j][i]);
+			}
+			printf("|\n");
+		}
+		printf("%-11llu%*s%11llu\n\n", stats.firstbin, NBINS - 22, "",
+		    stats.lastbin);
+	}
+
+	freeRecs(recs);
 	free(starts);
 	starts = NULL;
 	free(stops);
@@ -495,10 +337,12 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps) {
 	return 1;
 }
 
-int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet) {
+int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet,
+    uint32_t graph) {
 	char * cursor, * header;
 	unsigned int maxstrlen, curstrlen;
 	
+	header = NULL;
 	maxstrlen = 0;
 	curstrlen = 0;
 	for (int i=0; cipherlist[i] != '\0'; i++) {
@@ -517,20 +361,21 @@ int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet) {
 		maxstrlen = 6;
 
 	if (!quiet) {
-		printf("%-*s %11s %11s %12s %12s %3s\n",maxstrlen, "cipher",
-		    "avg. (ns)", "stdev. (ns)", "rate (GiB/s)", "rate (Gib/s)",
-		    "!op");
-		header = malloc((maxstrlen + 55) * sizeof(*header));
-		sprintf(header,"%*s|%11s|%11s|%12s|%12s|%3s",maxstrlen, "", "",
-		    "", "", "", "");
-		for (unsigned int i = 0; i < maxstrlen + 55; i++) {
+		header = malloc(2 * (maxstrlen + 79) * sizeof(*header));
+		sprintf(header,"%-*s %11s %11s %11s %11s %12s %12s %3s\n"
+		    "%*s|%11s|%11s|%11s|%11s|%12s|%12s|%3s", maxstrlen,
+		    "cipher", "min. (ns)", "max. (ns)", "avg. (ns)",
+		    "std. (ns)", "rate (GiB/s)", "rate (Gib/s)", "!op",
+		    maxstrlen, "", "", "", "", "", "", "", "");
+		for (unsigned int i = maxstrlen + 79; i < 2*(maxstrlen + 79);
+		    i++) {
 			if (header[i] == ' ')
 				header[i] = '-';
 			else if (header[i] == '|')
 				header[i] = ' ';
 		}
-		printf("%s\n",header);
-		free(header);
+		if (!graph)
+			printf("%s\n",header);
 	}
 
 	cursor = cipherlist;
@@ -538,14 +383,17 @@ int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet) {
 		if (cipherlist[i] == ',') {
 			cipherlist[i] = '\0';
 			if (strlen(cursor) != 0)
-				if (test(maxstrlen, cursor, n, ps) != 0)
+				if (test(maxstrlen, cursor, n, ps, graph,
+				    header) != 0)
 					return 1;
 			cursor = &(cipherlist[i+1]);
 		}
 	}
-	if(strlen(cursor) != 0)
-		if (test(maxstrlen, cursor, n, ps) != 0)
+	if (strlen(cursor) != 0)
+		if (test(maxstrlen, cursor, n, ps, graph, header) != 0)
 			return 1;
+	if (header != NULL)
+		free(header);
 
 	return 0;
 }
@@ -558,6 +406,7 @@ int main(int argc, char ** argv) {
 	arguments.quiet = 0;
 	arguments.n = 1024;
 	arguments.des = 0;
+	arguments.graph = 0;
 	arguments.ps = SSH_IOBUFSZ;
 	arguments.cipherList = NULL;
 	cipherList = NULL;
@@ -584,7 +433,7 @@ int main(int argc, char ** argv) {
 		}
 	}
 	retval = testList(cipherList, arguments.n, arguments.ps,
-	    arguments.quiet);
+	    arguments.quiet, arguments.graph);
 	free(cipherList);
 	exit(retval);
 }
