@@ -540,7 +540,7 @@ checkError(unsigned char err)
 }
 
 struct cbstats
-getStats(struct cbrecords * recs) {
+getStats(struct cbrecords * recs, unsigned int nbins) {
 	struct cbstats stats;
 	struct fp2 avg, sum, sumsq;
 	struct fp min, max, std;
@@ -594,23 +594,28 @@ getStats(struct cbrecords * recs) {
 	if (stats.lastbin > stats.max)
 		stats.lastbin = stats.max;
 
-	binwidth = ((double) (stats.lastbin - stats.firstbin)) /
-	    ((double) NBINS);
-	for (int i = 0; i < NBINS; i++)
-		stats.bins[i] = 0;
-	for (unsigned long i = 0; i < recs->n; i++) {
-		if ((recs->data[i].x > stats.firstbin) &&
-		    (recs->data[i].x < stats.lastbin)) {
-			bin = (unsigned int) (((double) (recs->data[i].x -
-			    stats.firstbin)) / binwidth);
-			if (bin >= NBINS)
-				bin = bin - 1;
-			if (bin < 0)
-				bin = bin + 1;
-			if ((bin >= NBINS) || (bin < 0)) {
-				fprintf(stderr, "Bad bin calculated!\n");
-			} else {
-				stats.bins[bin]++;
+	if (nbins > 0) {
+		stats.bins = calloc(nbins, sizeof(*(stats.bins)));
+	
+		binwidth = ((double) (stats.lastbin - stats.firstbin)) /
+		    ((double) nbins);
+		for (unsigned int i = 0; i < nbins; i++)
+			stats.bins[i] = 0;
+		for (unsigned long i = 0; i < recs->n; i++) {
+			if ((recs->data[i].x > stats.firstbin) &&
+			    (recs->data[i].x < stats.lastbin)) {
+				bin = (unsigned int) (((double) (recs->data[i].x
+				- stats.firstbin)) / binwidth);
+				if (bin >= nbins)
+					bin = bin - 1;
+				if (bin < 0)
+					bin = bin + 1;
+				if ((bin >= nbins) || (bin < 0)) {
+					fprintf(stderr,
+					    "Bad bin calculated!\n");
+				} else {
+					stats.bins[bin]++;
+				}
 			}
 		}
 	}

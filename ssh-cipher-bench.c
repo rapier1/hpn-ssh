@@ -24,7 +24,9 @@ static struct argp_option options[] = {
 	    "comma-separated list of ciphers to benchmark"},
 	{"3des", 'd', 0, 0,
 	    "enable the \"3des-cbc\" cipher, which is normally skipped"},
-	{"graph", 'g', 0, 0, "enable graphs in output"},
+	{"graph", 'g', "WIDTH", OPTION_ARG_OPTIONAL, "enable graphs in output, "
+	    "with a display width of WIDTH characters, where WIDTH is at least "
+	    "3; WIDTH defaults to 80"},
 	{"num",     'n', "N", 0, "benchmark each cipher with N packets; "
 	    "N defaults to 1024"},
 	{"packetsize", 'p', "L", 0,
@@ -37,7 +39,7 @@ static struct argp_option options[] = {
 struct arguments {
 	int quiet;
 	int des;
-	uint32_t graph;
+	unsigned int nbins;
 	uint32_t n;
 	uint32_t ps;
 	char * cipherList;
@@ -55,7 +57,15 @@ static error_t parse_opt(int key, char * arg, struct argp_state * state) {
 			arguments->des = 1;
 			break;
 		case 'g':
-			arguments->graph = 1;
+			if (arg != NULL) {
+				i = atoi(arg);
+				if (i < 3)
+					argp_error(state,
+					    "WIDTH must be at lest 3.");
+				arguments->nbins = i - 2;
+			} else {
+				arguments->nbins = 80 - 2;
+			}
 			break;
 		case 'n':
 			i = atoi(arg);
@@ -121,7 +131,7 @@ unsigned int pad(unsigned int len, unsigned int blocksize) {
 }
 
 int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
-    uint32_t graph, char * header) {
+    unsigned int nbins, char * header) {
 	struct sshcipher * c;
 	struct sshcipher_ctx * ctx;
 	unsigned int keylen, ivlen;
@@ -247,15 +257,15 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
 		record(recs, counter, start->tv_sec, start->tv_nsec,
 		    stop->tv_sec, stop->tv_nsec);
 	}
-	stats = getStats(recs);
+	stats = getStats(recs, nbins);
 
 	speed = stats.avg;
 	speed /= 1000000000;
 	speed *= 1073741824; /* 1 GiB */
 	speed = ps/speed;
-	if (header != NULL && graph)
+	if ((header != NULL) && (nbins > 0))
 		printf("%s\n", header);
-	if (header != NULL || !graph)
+	if ((header != NULL) || (nbins == 0))
 		printf(
 		    "%-*s %11llu %11llu %11llu %11llu %12.6lf %12.6lf %3hhu\n",
 		    maxstrlen, arg, stats.min, stats.max, stats.avg, stats.std,
@@ -263,9 +273,9 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
 	else
 		printf("%s (%hhu)\n", arg, no_opt);
 
-	if (graph) {
+	if (nbins > 0) {
 		unsigned long binmax = 0;
-		for (int i = 0; i < NBINS; i++)
+		for (unsigned int i = 0; i < nbins; i++)
 			if (stats.bins[i] > binmax)
 				binmax = stats.bins[i];
 
@@ -273,11 +283,11 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
 
 		double density = binmax / HEIGHT;
 
-		char bingrid[NBINS][HEIGHT];
+		char bingrid[nbins][HEIGHT];
 		for (int i = 0; i < HEIGHT; i++)
-			for (int j = 0; j < NBINS; j++)
+			for (unsigned int j = 0; j < nbins; j++)
 				bingrid[j][i] = ' ';
-		for (int i = 0; i < NBINS; i++) {
+		for (unsigned int i = 0; i < nbins; i++) {
 			double barheight = stats.bins[i] / density;
 			for (long unsigned int j = 0;
 			    (j < barheight) && (j < HEIGHT); j++) {
@@ -300,8 +310,15 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
 					bingrid[i][j] = '1';
 			}
 		}
+
+		printf(" ");
+		for (unsigned int i = 0; i < nbins; i++)
+			printf("_");
+		printf("\n");
+
 		for (int i = HEIGHT - 1; i >= 0; i--) {
-			for (int j = 0; j < NBINS; j++) {
+			printf("|");
+			for (unsigned int j = 0; j < nbins; j++) {
 				if ((bingrid[j][i] >= '1') &&
 				    (bingrid[j][i] <= '8'))
 					printf("\xe2\x96%c",
@@ -311,8 +328,18 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
 			}
 			printf("|\n");
 		}
-		printf("%-11llu%*s%11llu\n\n", stats.firstbin, NBINS - 22, "",
-		    stats.lastbin);
+
+		char fbinstr[12];
+		char lbinstr[12];
+		sprintf(fbinstr, "%llu", stats.firstbin);
+		sprintf(lbinstr, "%llu", stats.lastbin);
+		if (nbins > (strlen(fbinstr) + strlen(lbinstr)))
+			printf(" %s%*s%s\n\n", fbinstr,
+			    nbins - (int) (strlen(fbinstr) + strlen(lbinstr)),
+			    "", lbinstr);
+		else
+			printf("%s - %s\n\n", fbinstr, lbinstr);
+		free(stats.bins);
 	}
 
 	freeRecs(recs);
@@ -340,7 +367,7 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
 }
 
 int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet,
-    uint32_t graph) {
+    unsigned int nbins) {
 	char * cursor, * header;
 	unsigned int maxstrlen, curstrlen;
 	
@@ -376,7 +403,7 @@ int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet,
 			else if (header[i] == '|')
 				header[i] = ' ';
 		}
-		if (!graph)
+		if (nbins == 0)
 			printf("%s\n",header);
 	}
 
@@ -385,14 +412,14 @@ int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet,
 		if (cipherlist[i] == ',') {
 			cipherlist[i] = '\0';
 			if (strlen(cursor) != 0)
-				if (test(maxstrlen, cursor, n, ps, graph,
+				if (test(maxstrlen, cursor, n, ps, nbins,
 				    header) != 0)
 					return 1;
 			cursor = &(cipherlist[i+1]);
 		}
 	}
 	if (strlen(cursor) != 0)
-		if (test(maxstrlen, cursor, n, ps, graph, header) != 0)
+		if (test(maxstrlen, cursor, n, ps, nbins, header) != 0)
 			return 1;
 	if (header != NULL)
 		free(header);
@@ -408,7 +435,7 @@ int main(int argc, char ** argv) {
 	arguments.quiet = 0;
 	arguments.n = 1024;
 	arguments.des = 0;
-	arguments.graph = 0;
+	arguments.nbins = 0;
 	arguments.ps = SSH_IOBUFSZ;
 	arguments.cipherList = NULL;
 	cipherList = NULL;
@@ -435,7 +462,7 @@ int main(int argc, char ** argv) {
 		}
 	}
 	retval = testList(cipherList, arguments.n, arguments.ps,
-	    arguments.quiet, arguments.graph);
+	    arguments.quiet, arguments.nbins);
 	free(cipherList);
 	exit(retval);
 }
