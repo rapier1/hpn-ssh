@@ -20,19 +20,21 @@ const char * argp_program_bug_address = "<mwd@psc.edu>";
 static char doc[] = "A benchmarking tool for SSH ciphers.";
 
 static struct argp_option options[] = {
-	{"ciphers", 'c', "cipher_list", 0,
-	    "comma-separated list of ciphers to benchmark"},
-	{"3des", 'd', 0, 0,
-	    "enable the \"3des-cbc\" cipher, which is normally skipped"},
+	{"ciphers", 'c', "cipher_list", 0, "comma-separated list of ciphers to "
+	    "benchmark"},
+	{"3des", 'd', 0, 0, "enable the \"3des-cbc\" cipher, which is normally "
+	    "skipped"},
 	{"graph", 'g', "WIDTH", OPTION_ARG_OPTIONAL, "enable graphs in output, "
 	    "with a display width of WIDTH characters, where WIDTH is at least "
 	    "3; WIDTH defaults to 80"},
-	{"num",     'n', "N", 0, "benchmark each cipher with N packets; "
-	    "N defaults to 1024"},
-	{"packetsize", 'p', "L", 0,
-	    "use packets of length L bytes, not exceeding L=SSH_IOBUFSZ, "
-	    "where SSH_IOBUFSZ is usually 32768; L defaults to SSH_IOBUFSZ"},
-	{"quiet",   'q', 0, 0, "don't print the table header"},
+	{"num", 'n', "N", 0, "benchmark each cipher with N packets; N defaults "
+	    "to 1024"},
+	{"output", 'o', "FILE", 0, "write encryption timings to FILE for "
+	    "external analysis"},
+	{"packetsize", 'p', "L", 0, "use packets of length L bytes, not "
+	    "exceeding L=SSH_IOBUFSZ, where SSH_IOBUFSZ is usually 32768; L "
+	    "defaults to SSH_IOBUFSZ"},
+	{"quiet", 'q', 0, 0, "don't print the table header"},
 	{ 0 }
 };
 
@@ -43,6 +45,7 @@ struct arguments {
 	uint32_t n;
 	uint32_t ps;
 	char * cipherList;
+	char * outpath;
 };
 
 static error_t parse_opt(int key, char * arg, struct argp_state * state) {
@@ -73,6 +76,9 @@ static error_t parse_opt(int key, char * arg, struct argp_state * state) {
 				argp_error(state,
 				    "N must be a positive integer.");
 			arguments->n = i;
+			break;
+		case 'o':
+			arguments->outpath = arg;
 			break;
 		case 'p':
 			i = atoi(arg);
@@ -131,7 +137,7 @@ unsigned int pad(unsigned int len, unsigned int blocksize) {
 }
 
 int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
-    unsigned int nbins, char * header) {
+    unsigned int nbins, char * header, FILE * outfile) {
 	struct sshcipher * c;
 	struct sshcipher_ctx * ctx;
 	unsigned int keylen, ivlen;
@@ -247,6 +253,13 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
 	free(dest);
 	dest = NULL;
 
+	if (outfile != NULL) {
+		if (fprintf(outfile, "# %s\n", arg) < 0) {
+			fprintf(stderr, "Error writing to output file.\n");
+			goto fail;
+		}
+	}
+
 	for (counter = 0; counter < n; counter++) {
 		start = &(starts[counter]);
 		stop = &(stops[counter]);
@@ -256,6 +269,18 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
 		stop->tv_nsec %= 1000000000ull;
 		record(recs, counter, start->tv_sec, start->tv_nsec,
 		    stop->tv_sec, stop->tv_nsec);
+		if (outfile != NULL) {
+			if (fprintf(outfile, "%llu\n",
+			    (stop->tv_sec * 1000000000ull) +
+			    (unsigned long long) stop->tv_nsec -
+			    (start->tv_sec * 1000000000ull) -
+			    (unsigned long long) start->tv_nsec
+			    ) < 0) {
+				fprintf(stderr,
+				    "Error writing to output file.\n");
+				goto fail;
+			}
+		}
 	}
 	stats = getStats(recs, nbins);
 
@@ -367,11 +392,14 @@ int test(unsigned int maxstrlen, char * arg, uint32_t n, uint32_t ps,
 }
 
 int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet,
-    unsigned int nbins) {
+    unsigned int nbins, char * outpath) {
 	char * cursor, * header;
 	unsigned int maxstrlen, curstrlen;
+	FILE * outfile;
 	
 	header = NULL;
+	outfile = NULL;
+
 	maxstrlen = 0;
 	curstrlen = 0;
 	for (int i=0; cipherlist[i] != '\0'; i++) {
@@ -407,24 +435,43 @@ int testList(char * cipherlist, uint32_t n, uint32_t ps, int quiet,
 			printf("%s\n",header);
 	}
 
+	if ((outpath != NULL) && (strlen(outpath) > 0)) {
+		outfile = fopen(outpath, "w");
+		if (outfile == NULL) {
+			fprintf(stderr, "Failed to open \"%s\" for writing.\n",
+			    outpath);
+			goto fail;
+		}
+	}
+
 	cursor = cipherlist;
 	for (int i = 0; cipherlist[i] != '\0'; i++) {
 		if (cipherlist[i] == ',') {
 			cipherlist[i] = '\0';
 			if (strlen(cursor) != 0)
 				if (test(maxstrlen, cursor, n, ps, nbins,
-				    header) != 0)
-					return 1;
+				    header, outfile) != 0)
+					goto fail;
 			cursor = &(cipherlist[i+1]);
 		}
 	}
 	if (strlen(cursor) != 0)
-		if (test(maxstrlen, cursor, n, ps, nbins, header) != 0)
-			return 1;
+		if (test(maxstrlen, cursor, n, ps, nbins, header, outfile) != 0)
+			goto fail;
+	
 	if (header != NULL)
 		free(header);
+	if (outfile != NULL)
+		fclose(outfile);
 
 	return 0;
+
+ fail:
+	if (header != NULL)
+		free(header);
+	if (outfile != NULL)
+		fclose(outfile);
+	return 1;
 }
 
 int main(int argc, char ** argv) {
@@ -438,6 +485,7 @@ int main(int argc, char ** argv) {
 	arguments.nbins = 0;
 	arguments.ps = SSH_IOBUFSZ;
 	arguments.cipherList = NULL;
+	arguments.outpath = NULL;
 	cipherList = NULL;
 
 	argp_parse(&argp, argc, argv, 0, 0, &arguments);
@@ -462,7 +510,7 @@ int main(int argc, char ** argv) {
 		}
 	}
 	retval = testList(cipherList, arguments.n, arguments.ps,
-	    arguments.quiet, arguments.nbins);
+	    arguments.quiet, arguments.nbins, arguments.outpath);
 	free(cipherList);
 	exit(retval);
 }
