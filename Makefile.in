@@ -26,6 +26,7 @@ SFTP_SERVER=$(libexecdir)/sftp-server
 SSH_KEYSIGN=$(libexecdir)/ssh-keysign
 SSH_PKCS11_HELPER=$(libexecdir)/ssh-pkcs11-helper
 SSH_SK_HELPER=$(libexecdir)/ssh-sk-helper
+SSH_CIPHER_BENCH=$(libexecdir)/ssh-cipher-bench
 PRIVSEP_PATH=@PRIVSEP_PATH@
 SSH_PRIVSEP_USER=@SSH_PRIVSEP_USER@
 STRIP_OPT=@STRIP_OPT@
@@ -68,7 +69,7 @@ MKDIR_P=@MKDIR_P@
 
 .SUFFIXES: .lo
 
-TARGETS=ssh$(EXEEXT) sshd$(EXEEXT) ssh-add$(EXEEXT) ssh-keygen$(EXEEXT) ssh-keyscan${EXEEXT} ssh-keysign${EXEEXT} ssh-pkcs11-helper$(EXEEXT) ssh-agent$(EXEEXT) scp$(EXEEXT) sftp-server$(EXEEXT) sftp$(EXEEXT) ssh-sk-helper$(EXEEXT)
+TARGETS=ssh$(EXEEXT) sshd$(EXEEXT) ssh-add$(EXEEXT) ssh-keygen$(EXEEXT) ssh-keyscan${EXEEXT} ssh-keysign${EXEEXT} ssh-pkcs11-helper$(EXEEXT) ssh-agent$(EXEEXT) scp$(EXEEXT) sftp-server$(EXEEXT) sftp$(EXEEXT) ssh-sk-helper$(EXEEXT) ssh-cipher-bench$(EXEEXT)
 
 XMSS_OBJS=\
 	ssh-xmss.o \
@@ -153,6 +154,8 @@ SSHKEYSCAN_OBJS=ssh-keyscan.o $(SKOBJS)
 SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-server-main.o
 
 SFTP_OBJS=	sftp.o progressmeter.o $(SFTP_CLIENT_OBJS)
+
+CIPHER_BENCH_OBJS=     ssh-cipher-bench.o ssh-cipher-bench-stats.o
 
 MANPAGES	= moduli.5.out scp.1.out ssh-add.1.out ssh-agent.1.out ssh-keygen.1.out ssh-keyscan.1.out ssh.1.out sshd.8.out sftp-server.8.out sftp.1.out ssh-keysign.8.out ssh-pkcs11-helper.8.out ssh-sk-helper.8.out sshd_config.5.out ssh_config.5.out
 MANPAGES_IN	= moduli.5 scp.1 ssh-add.1 ssh-agent.1 ssh-keygen.1 ssh-keyscan.1 ssh.1 sshd.8 sftp-server.8 sftp.1 ssh-keysign.8 ssh-pkcs11-helper.8 ssh-sk-helper.8 sshd_config.5 ssh_config.5
@@ -242,6 +245,9 @@ sftp-server$(EXEEXT): $(LIBCOMPAT) libssh.a $(SFTPSERVER_OBJS)
 
 sftp$(EXEEXT): $(LIBCOMPAT) libssh.a $(SFTP_OBJS)
 	$(LD) -o $@ $(SFTP_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(LIBEDIT)
+
+ssh-cipher-bench$(EXEEXT): $(LIBCOMPAT) libssh.a $(CIPHER_BENCH_OBJS)
+	$(LD) -o $@ $(CIPHER_BENCH_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS)
 
 # test driver for the loginrec code - not built by default
 logintest: logintest.o $(LIBCOMPAT) libssh.a loginrec.o
@@ -408,6 +414,7 @@ install-files:
 	$(INSTALL) -m 0755 $(STRIP_OPT) ssh-sk-helper$(EXEEXT) $(DESTDIR)$(SSH_SK_HELPER)$(EXEEXT)
 	$(INSTALL) -m 0755 $(STRIP_OPT) sftp$(EXEEXT) $(DESTDIR)$(bindir)/sftp$(EXEEXT)
 	$(INSTALL) -m 0755 $(STRIP_OPT) sftp-server$(EXEEXT) $(DESTDIR)$(SFTP_SERVER)$(EXEEXT)
+	$(INSTALL) -m 0755 $(STRIP_OPT) ssh-cipher-bench$(EXEEXT) $(DESTDIR)$(SSH_CIPHER_BENCH)$(EXEEXT)
 	$(INSTALL) -m 644 ssh.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/ssh.1
 	$(INSTALL) -m 644 scp.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/scp.1
 	$(INSTALL) -m 644 ssh-add.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/ssh-add.1
@@ -484,6 +491,7 @@ uninstall:
 	-rm -f $(DESTDIR)$(SSH_KEYSIGN)$(EXEEXT)
 	-rm -f $(DESTDIR)$(SSH_PKCS11_HELPER)$(EXEEXT)
 	-rm -f $(DESTDIR)$(SSH_SK_HELPER)$(EXEEXT)
+	-rm -f $(DESTDIR)$(SSH_CIPHER_BENCH)$(EXEEXT)
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/ssh.1
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/scp.1
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/ssh-add.1
