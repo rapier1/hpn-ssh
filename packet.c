@@ -245,7 +245,7 @@ ssh_alloc_session_state(void)
 	TAILQ_INIT(&ssh->public_keys);
 	state->connection_in = -1;
 	state->connection_out = -1;
-	state->max_packet_size = 32768;
+	state->max_packet_size = CHAN_SES_PACKET_DEFAULT;
 	state->packet_timeout_ms = -1;
 	state->p_send.packets = state->p_read.packets = 0;
 	state->initialized = 1;
@@ -1326,7 +1326,7 @@ ssh_packet_read_seqnr(struct ssh *ssh, u_char *typep, u_int32_t *seqnr_p)
 	struct session_state *state = ssh->state;
 	int len, r, ms_remain;
 	struct pollfd pfd;
-	char buf[8192];
+	char buf[SSH_IOBUFSZ];
 	struct timeval start;
 	struct timespec timespec, *timespecp = NULL;
 

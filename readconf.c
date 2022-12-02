@@ -67,6 +67,7 @@
 #include "uidswap.h"
 #include "myproposal.h"
 #include "digest.h"
+#include "sshbuf.h"
 
 /* Format of the configuration file:
 
@@ -166,6 +167,7 @@ typedef enum {
 	oHashKnownHosts,
 	oTunnel, oTunnelDevice,
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
+	oTcpRcvBufPoll, oTcpRcvBuf, oHPNDisabled, oHPNBufferSize,
 	oVisualHostKey,
 	oKexAlgorithms, oIPQoS, oRequestTTY, oSessionType, oStdinNull,
 	oForkAfterAuthentication, oIgnoreUnknown, oProxyUseFdpass,
@@ -320,6 +322,11 @@ static struct {
 	{ "proxyjump", oProxyJump },
 	{ "securitykeyprovider", oSecurityKeyProvider },
 	{ "knownhostscommand", oKnownHostsCommand },
+
+	{ "tcprcvbufpoll", oTcpRcvBufPoll },
+	{ "tcprcvbuf", oTcpRcvBuf },
+	{ "hpndisabled", oHPNDisabled },
+	{ "hpnbuffersize", oHPNBufferSize },
 
 	{ NULL, oBadOption }
 };
@@ -1135,6 +1142,18 @@ parse_time:
 		intptr = &options->check_host_ip;
 		goto parse_flag;
 
+	case oHPNDisabled:
+		intptr = &options->hpn_disabled;
+		goto parse_flag;
+
+	case oHPNBufferSize:
+		intptr = &options->hpn_buffer_size;
+		goto parse_int;
+
+	case oTcpRcvBufPoll:
+		intptr = &options->tcp_rcv_buf_poll;
+		goto parse_flag;
+
 	case oVerifyHostKeyDNS:
 		intptr = &options->verify_host_key_dns;
 		multistate_ptr = multistate_yesnoask;
@@ -1388,6 +1407,10 @@ parse_int:
 		if (*activep && *intptr == -1)
 			*intptr = value;
 		break;
+
+	case oTcpRcvBuf:
+		intptr = &options->tcp_rcv_buf;
+		goto parse_int;
 
 	case oCiphers:
 		arg = argv_next(&ac, &av);
@@ -2422,6 +2445,10 @@ initialize_options(Options * options)
 	options->ip_qos_interactive = -1;
 	options->ip_qos_bulk = -1;
 	options->request_tty = -1;
+	options->hpn_disabled = -1;
+	options->hpn_buffer_size = -1;
+	options->tcp_rcv_buf_poll = -1;
+	options->tcp_rcv_buf = -1;
 	options->session_type = -1;
 	options->stdin_null = -1;
 	options->fork_after_authentication = -1;
@@ -2587,6 +2614,26 @@ fill_default_options(Options * options)
 		options->server_alive_interval = 0;
 	if (options->server_alive_count_max == -1)
 		options->server_alive_count_max = 3;
+	if (options->hpn_disabled == -1)
+		options->hpn_disabled = 0;
+	if (options->hpn_buffer_size > -1) {
+		/* if a user tries to set the size to 0 set it to 1KB */
+		if (options->hpn_buffer_size == 0)
+			options->hpn_buffer_size = 1;
+		/* limit the buffer to SSHBUF_SIZE_MAX (currently 256MB) */
+		if (options->hpn_buffer_size > (SSHBUF_SIZE_MAX / 1024)) {
+			options->hpn_buffer_size = SSHBUF_SIZE_MAX;
+			debug("User requested buffer larger than 256MB. Request reverted to 256MB");
+		} else
+			options->hpn_buffer_size *= 1024;
+		debug("hpn_buffer_size set to %d", options->hpn_buffer_size);
+	}
+	if (options->tcp_rcv_buf == 0)
+		options->tcp_rcv_buf = 1;
+	if (options->tcp_rcv_buf > -1)
+		options->tcp_rcv_buf *=1024;
+	if (options->tcp_rcv_buf_poll == -1)
+		options->tcp_rcv_buf_poll = 1;
 	if (options->control_master == -1)
 		options->control_master = 0;
 	if (options->control_persist == -1) {
