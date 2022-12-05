@@ -367,13 +367,13 @@ sshbuf_allocate(struct sshbuf *buf, size_t len)
 	 * what we need (the size of window_max) so if the current allocation (in
 	 * buf->alloc) is greater than window_max we skip it.
 	 */
-	if (rlen > BUF_WATERSHED && buf->window_max !=0 && buf->alloc < buf->window_max) {
-		/*debug_f ("prior rlen %zu and need %zu buf_alloc is %zu", rlen, need, buf->alloc); */
+	if (rlen > BUF_WATERSHED && buf->window_max !=0  && buf->alloc < buf->window_max) {
+		/* debug_f ("%p, prior rlen %zu and need %zu buf_alloc is %zu", buf, rlen, need, buf->alloc); */
 		/* set need to the the max window size less the current allocation */
-		need = len + buf->window_max - buf->alloc;
+		need = buf->max_alloc;
 		rlen = ROUNDUP(buf->alloc + need, SSHBUF_SIZE_INC);
-		/* debug_f ("rlen is %zu need is %zu window max is %zu max_size is %zu", */
-		/* 	 rlen, need, buf->window_max, buf->max_alloc); */
+		/* debug_f ("%p, rlen is %zu need is %zu window max is %zu max_size is %zu",
+		 *	 buf, rlen, need, buf->window_max, buf->max_alloc); */
 	}
 	SSHBUF_DBG(("need %zu initial rlen %zu", need, rlen));
 
@@ -385,10 +385,9 @@ sshbuf_allocate(struct sshbuf *buf, size_t len)
 	 * TODO: Come up with a better solution -cjr 12/1/2022 */
 	if (rlen > BUF_WATERSHED && buf->window_max == 0) 
 		rlen = buf->max_alloc;
-	/* with the above this line might not be necessary but maintain it
-	 * until we have a better handle on things -cjr 12/1/2022*/
+	/* rlen might be above the max allocation */
 	if (rlen > buf->max_alloc)
-		rlen = buf->alloc + need;
+		rlen = buf->max_alloc;
 	SSHBUF_DBG(("adjusted rlen %zu", rlen));
 	if ((dp = recallocarray(buf->d, buf->alloc, rlen, 1)) == NULL) {
 		SSHBUF_DBG(("realloc fail"));
