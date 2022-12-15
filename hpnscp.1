@@ -8,9 +8,9 @@
 .\"
 .\" Created: Sun May  7 00:14:37 1995 ylo
 .\"
-.\" $OpenBSD: scp.1,v 1.108 2022/02/23 21:21:16 djm Exp $
+.\" $OpenBSD: scp.1,v 1.110 2022/09/19 21:39:16 djm Exp $
 .\"
-.Dd $Mdocdate: March 24 2022 $
+.Dd $Mdocdate: September 19 2022 $
 .Dt HPNSCP 1
 .Os
 .Sh NAME
@@ -28,7 +28,7 @@
 .Op Fl o Ar ssh_option
 .Op Fl P Ar port
 .Op Fl S Ar program
-.Op Fl z Ar file path of remote scp
+.Op Fl X Ar sftp_option
 .Ar source ... target
 .Sh DESCRIPTION
 .Nm
@@ -214,6 +214,7 @@ For full details of the options listed below, and their possible values, see
 .It PubkeyAcceptedAlgorithms
 .It PubkeyAuthentication
 .It RekeyLimit
+.It RequiredRSASize
 .It SendEnv
 .It ServerAliveInterval
 .It ServerAliveCountMax
@@ -291,6 +292,21 @@ and
 to print debugging messages about their progress.
 This is helpful in
 debugging connection, authentication, and configuration problems.
+.It Fl X Ar sftp_option
+Specify an option that controls aspects of SFTP protocol behaviour.
+The valid options are:
+.Bl -tag -width Ds
+.It Cm nrequests Ns = Ns Ar value
+Controls how many concurrent SFTP read or write requests may be in progress
+at any point in time during a download or upload.
+This value must be between 1 and 8192.
+By default 1024 requests may be active concurrently.
+.It Cm buffer Ns = Ns Ar value
+Controls the maximum buffer size for a single SFTP read/write operation used
+during download or upload. This value must be between 1B and 255KB. You may use
+the K unit for the size. E.g. 32768 or 32K.
+By default a 32KB buffer is used.
+.El
 .El
 .Sh EXIT STATUS
 .Ex -std scp
@@ -309,9 +325,9 @@ is based on the rcp program in
 .Bx
 source code from the Regents of the University of California.
 .Pp
-Since OpenSSH 8.8,
+Since OpenSSH 9.0,
 .Nm
-has use the SFTP protocol for transfers by default.
+has used the SFTP protocol for transfers by default.
 .Sh AUTHORS
 .An Timo Rinne Aq Mt tri@iki.fi
 .An Tatu Ylonen Aq Mt ylo@cs.hut.fi

@@ -3,8 +3,10 @@ name: C/C++ CI
 on:
   push:
     branches: [ master, pre-stage ]
+    paths: [ '**.c', '**.h', '**.m4', '**.sh', '.github/**', '**/Makefile.in', 'configure.ac' ]
   pull_request:
     branches: [ master ]
+    paths: [ '**.c', '**.h', '**.m4', '**.sh', '.github/**', '**/Makefile.in', 'configure.ac' ]
 
 jobs:
   ci:
@@ -13,42 +15,33 @@ jobs:
       fail-fast: false
       matrix:
         # First we test all OSes in the default configuration.
-        os: [ubuntu-20.04, ubuntu-18.04, macos-10.15, macos-11.0]
+        os: [ubuntu-22.04, ubuntu-20.04, ubuntu-18.04, macos-11, macos-12]
         configs: [default]
         # Then we include any extra configs we want to test for specific VMs.
-        # Valgrind slows things down quite a bit, so start them first.
         include:
-#          - { os: ubuntu-20.04, configs: valgrind-1 }
-#          - { os: ubuntu-20.04, configs: valgrind-2 }
-#          - { os: ubuntu-20.04, configs: valgrind-3 }
-#          - { os: ubuntu-20.04, configs: valgrind-4 }
-#          - { os: ubuntu-20.04, configs: valgrind-unit }
-          - { os: ubuntu-20.04, configs: c89 }
           - { os: ubuntu-20.04, configs: clang-6.0 }
           - { os: ubuntu-20.04, configs: clang-8 }
           - { os: ubuntu-20.04, configs: clang-9 }
           - { os: ubuntu-20.04, configs: clang-10 }
           - { os: ubuntu-20.04, configs: clang-11 }
-#          - { os: ubuntu-20.04, configs: clang-12-Werror }
           - { os: ubuntu-20.04, configs: gcc-7 }
           - { os: ubuntu-20.04, configs: gcc-8 }
           - { os: ubuntu-20.04, configs: gcc-10 }
-#          - { os: ubuntu-20.04, configs: gcc-11-Werror }
           - { os: ubuntu-20.04, configs: pam }
           - { os: ubuntu-20.04, configs: kitchensink }
           - { os: ubuntu-20.04, configs: hardenedmalloc }
           - { os: ubuntu-20.04, configs: tcmalloc }
-#          - { os: ubuntu-20.04, configs: musl }
+          - { os: ubuntu-20.04, configs: without-openssl }
+          - { os: ubuntu-22.04, configs: libressl-2.2.9 }
+          - { os: ubuntu-22.04, configs: libressl-2.8.3 }
+          - { os: ubuntu-22.04, configs: libressl-3.0.2 }
+          - { os: ubuntu-22.04, configs: libressl-3.2.6 }
+          - { os: ubuntu-22.04, configs: libressl-3.3.4 }
+          - { os: ubuntu-22.04, configs: libressl-3.4.3 }
+          - { os: ubuntu-22.04, configs: without-openssl }
+          - { os: ubuntu-latest, configs: libressl-3.5.3 }
           - { os: ubuntu-latest, configs: libressl-master }
-          - { os: ubuntu-latest, configs: libressl-2.2.9 }
-          - { os: ubuntu-latest, configs: libressl-2.8.3 }
-          - { os: ubuntu-latest, configs: libressl-3.0.2 }
-          - { os: ubuntu-latest, configs: libressl-3.2.6 }
-          - { os: ubuntu-latest, configs: libressl-3.3.4 }
-          - { os: ubuntu-latest, configs: libressl-3.4.1 }
-#          - { os: ubuntu-latest, configs: libressl-3.5.0 }
           - { os: ubuntu-latest, configs: openssl-master }
-          - { os: ubuntu-latest, configs: openssl-noec }
           - { os: ubuntu-latest, configs: openssl-1.0.1 }
           - { os: ubuntu-latest, configs: openssl-1.0.1u }
           - { os: ubuntu-latest, configs: openssl-1.0.2u }
@@ -56,10 +49,15 @@ jobs:
           - { os: ubuntu-latest, configs: openssl-1.1.1 }
           - { os: ubuntu-latest, configs: openssl-1.1.1k }
           - { os: ubuntu-latest, configs: openssl-1.1.1m }
-          - { os: ubuntu-latest, configs: openssl-3.0.0 }
-          - { os: ubuntu-latest, configs: openssl-3.0.1 }
-          - { os: ubuntu-latest, configs: openssl-1.1.1_stable } # stable branch
-          - { os: ubuntu-latest, configs: openssl-3.0 }          # stable branch
+          - { os: ubuntu-22.04, configs: openssl-3.0.0 }
+          - { os: ubuntu-22.04, configs: openssl-3.0.1 }
+          - { os: ubuntu-22.04, configs: openssl-3.0.2 }
+          - { os: ubuntu-22.04, configs: openssl-3.0.3 }
+          - { os: ubuntu-22.04, configs: openssl-3.0.5 }
+          - { os: ubuntu-22.04, configs: openssl-3.0.6 }
+          - { os: ubuntu-22.04, configs: openssl-3.0.7 }
+          - { os: ubuntu-22.04, configs: openssl-1.1.1_stable } # stable branch
+          - { os: ubuntu-22.04, configs: openssl-3.0 }          # stable branch
           - { os: ubuntu-18.04, configs: pam }
           - { os: ubuntu-18.04, configs: krb5 }
           - { os: ubuntu-18.04, configs: heimdal }
@@ -68,19 +66,19 @@ jobs:
           - { os: ubuntu-18.04, configs: selinux }
           - { os: ubuntu-18.04, configs: kitchensink }
           - { os: ubuntu-18.04, configs: without-openssl }
-          - { os: macos-10.15,  configs: pam }
-          - { os: macos-11.0,   configs: pam }
+          - { os: macos-11,   configs: pam }
+          - { os: macos-12,   configs: pam }
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: setup CI system
-      run: ./.github/setup_ci.sh ${{ matrix.configs }}
+      run: sh ./.github/setup_ci.sh ${{ matrix.configs }}
     - name: autoreconf
-      run: autoreconf
+      run: sh -c autoreconf
     - name: configure
-      run: ./.github/configure.sh ${{ matrix.configs }}
+      run: sh ./.github/configure.sh ${{ matrix.configs }}
     - name: save config
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       with:
         name: ${{ matrix.os }}-${{ matrix.configs }}-config
         path: config.h
@@ -89,12 +87,13 @@ jobs:
     - name: make
       run: make -j2
     - name: make tests
-      run: ./.github/run_test.sh ${{ matrix.configs }}
+      run: sh ./.github/run_test.sh ${{ matrix.configs }}
       env:
         TEST_SSH_UNSAFE_PERMISSIONS: 1
+        TEST_SSH_HOSTBASED_AUTH: yes
     - name: save logs
       if: failure()
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       with:
         name: ${{ matrix.os }}-${{ matrix.configs }}-logs
         path: |
@@ -102,3 +101,5 @@ jobs:
           config.log
           regress/*.log
           regress/valgrind-out/
+          regress/asan.log.*
+          regress/msan.log.*

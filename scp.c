@@ -1,4 +1,4 @@
-/* $OpenBSD: scp.c,v 1.247 2022/03/20 08:52:17 djm Exp $ */
+/* $OpenBSD: scp.c,v 1.248 2022/05/13 06:31:50 djm Exp $ */
 /*
  * scp - secure remote copy.  This is basically patched BSD rcp which
  * uses ssh to do the data transfer (instead of using rcmd).
@@ -183,6 +183,10 @@ char *remote_path;
 /* This is used to store the pid of ssh_program */
 pid_t do_cmd_pid = -1;
 pid_t do_cmd_pid2 = -1;
+
+/* SFTP copy parameters */
+size_t sftp_copy_buflen;
+size_t sftp_nrequests;
 
 /* Needed for sftp */
 volatile sig_atomic_t interrupted = 0;
@@ -468,13 +472,14 @@ void throughlocal_sftp(struct sftp_conn *, struct sftp_conn *,
 int
 main(int argc, char **argv)
 {
-	int ch, fflag, tflag, status, n;
+	int ch, fflag, tflag, status, r, n;
 	char **newargv, *argv0;
 	const char *errstr;
 	extern char *optarg;
 	extern int optind;
 	enum scp_mode_e mode = MODE_SFTP;
 	char *sftp_direct = NULL;
+	long long llv;
 
 	/* we use this to prepend the debugging statements
 	 * so we know which side is saying what */
@@ -482,8 +487,6 @@ main(int argc, char **argv)
 
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
-
-	seed_rng();
 
 	msetlocale();
 
@@ -513,7 +516,7 @@ main(int argc, char **argv)
 
 	fflag = Tflag = tflag = 0;
 	while ((ch = getopt(argc, argv,
-	    "12346ABCTdfOpqRrstvZz:D:F:J:M:P:S:c:i:l:o:")) != -1) {
+	    "12346ABCTdfOpqRrstvZ:D:F:J:M:P:S:c:i:l:o:X:")) != -1) {
 		switch (ch) {
 		/* User-visible flags. */
 		case '1':
@@ -580,9 +583,6 @@ main(int argc, char **argv)
 		case 'S':
 			ssh_program = xstrdup(optarg);
 			break;
-		case 'z':
-			remote_path = xstrdup(optarg);
-			break;
 		case 'v':
 			addargs(&args, "-v");
 			addargs(&remote_remote_args, "-v");
@@ -599,9 +599,41 @@ main(int argc, char **argv)
 			break;
 #ifdef WITH_OPENSSL			
 		case 'Z':
+			/* currently resume only works in SCP mode */
 			resume_flag = 1;
+			mode = MODE_SCP;
 			break;
 #endif
+		case 'X':
+			/* Please keep in sync with sftp.c -X */
+			if (strncmp(optarg, "buffer=", 7) == 0) {
+				r = scan_scaled(optarg + 7, &llv);
+				/* don't ask for a buffer larger than the maximum
+				 * size that SFTP can handle */
+				if (r == 0 && (llv <= 0 || llv > (SFTP_MAX_MSG_LENGTH - 1024))) {
+					r = -1;
+					errno = EINVAL;
+				}
+				if (r == -1) {
+					fatal("Invalid buffer size. Must be between 1B and 255KB."
+					      "\"%s\": %s", optarg + 7, strerror(errno));
+				}
+				sftp_copy_buflen = (size_t)llv;
+			} else if (strncmp(optarg, "nrequests=", 10) == 0) {
+				/* more than 10k to 15k requests starts stalling the connection
+				 * 8192 * default buffer size is 256MB of outstanding data.
+				 * if users need more then they need to up the buffer size */
+				llv = strtonum(optarg + 10, 1, 8 * 1024,
+					       &errstr);
+				if (errstr != NULL) {
+					fatal("Invalid number of requests. Must be between 1 and 8192. "
+					      "\"%s\": %s", optarg + 10, errstr);
+				}
+				sftp_nrequests = (size_t)llv;
+			} else {
+				fatal("Invalid -X option");
+			}
+			break;
 		/* Server options. */
 		case 'd':
 			targetshouldbedirectory = 1;
@@ -673,12 +705,9 @@ main(int argc, char **argv)
 	remin = remout = -1;
 	do_cmd_pid = -1;
 	/* Command to be executed on remote system using "ssh". */
-	/* the command uses the first scp in the users
-	 * path. This isn't necessarily going to be the 'right' scp to use.
-	 * So the current solution is to give the user the option of
-	 * entering the path to correct scp. If they don't then it defaults
-	 * to whatever scp is first in their path -cjr */
-	/* TODO: Rethink this in light renaming the binaries */
+	/* In the event of an hpn to hpn connection the scp
+	 * command is rewritten to hpnscp. This happens in 
+	 * clientloop.c -cjr 12/12/2022 */
 	
 	(void) snprintf(cmd, sizeof cmd, "%s%s%s%s%s%s",
 			remote_path ? remote_path : "scp",
@@ -1025,7 +1054,8 @@ do_sftp_connect(char *host, char *user, int port, char *sftp_direct,
 		    reminp, remoutp, pidp) < 0)
 			return NULL;
 	}
-	return do_init(*reminp, *remoutp, 32768, 64, limit_kbps);
+	return do_init(*reminp, *remoutp,
+	    sftp_copy_buflen, sftp_nrequests, limit_kbps);
 }
 
 void
@@ -1430,11 +1460,11 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 
 	if (src_is_dir && iamrecursive) {
 		if (upload_dir(conn, src, abs_dst, pflag,
-		    SFTP_PROGRESS_ONLY, 0, 0, 1) != 0) {
+		    SFTP_PROGRESS_ONLY, 0, 0, 1, 1) != 0) {
 			error("failed to upload directory %s to %s", src, targ);
 			errs = 1;
 		}
-	} else if (do_upload(conn, src, abs_dst, pflag, 0, 0) != 0) {
+	} else if (do_upload(conn, src, abs_dst, pflag, 0, 0, 1) != 0) {
 		error("failed to upload file %s to %s", src, targ);
 		errs = 1;
 	}
@@ -1811,11 +1841,11 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 		debug("Fetching %s to %s\n", g.gl_pathv[i], abs_dst);
 		if (globpath_is_dir(g.gl_pathv[i]) && iamrecursive) {
 			if (download_dir(conn, g.gl_pathv[i], abs_dst, NULL,
-			    pflag, SFTP_PROGRESS_ONLY, 0, 0, 1) == -1)
+			    pflag, SFTP_PROGRESS_ONLY, 0, 0, 1, 1) == -1)
 				err = -1;
 		} else {
 			if (do_download(conn, g.gl_pathv[i], abs_dst, NULL,
-			    pflag, 0, 0) == -1)
+			    pflag, 0, 0, 1) == -1)
 				err = -1;
 		}
 		free(abs_dst);
