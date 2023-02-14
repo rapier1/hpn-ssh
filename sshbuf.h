@@ -1,4 +1,4 @@
-/*	$OpenBSD: sshbuf.h,v 1.27 2022/05/25 06:03:44 djm Exp $	*/
+/*	$OpenBSD: sshbuf.h,v 1.28 2022/12/02 04:40:27 djm Exp $	*/
 /*
  * Copyright (c) 2011 Damien Miller
  *
@@ -34,22 +34,7 @@
 #define SSHBUF_MAX_BIGNUM	(16384 / 8)	/* Max bignum *bytes* */
 #define SSHBUF_MAX_ECPOINT	((528 * 2 / 8) + 1) /* Max EC point *bytes* */
 
-/*
-* NB. do not depend on the internals of this. It will be made opaque
-* one day.
-*/
-struct sshbuf {
-	u_char *d;		/* Data */
-	const u_char *cd;	/* Const data */
-	size_t off;		/* First available byte is buf->d + buf->off */
-	size_t size;		/* Last byte is buf->d + buf->size - 1 */
-	size_t max_alloc;	/* Maximum allocatable size of buffer */
-	size_t window_max;      /* channel window max */
-	size_t alloc;		/* Total bytes allocated to buf->d */
-	int readonly;		/* Refers to external, const data */
-	u_int refcount;		/* Tracks self and number of child buffers */
-	struct sshbuf *parent;	/* If child, pointer to parent */
-};
+struct sshbuf;
 
 /*
  * Create a new sshbuf buffer.
@@ -360,6 +345,8 @@ int sshbuf_read(int, struct sshbuf *, size_t, size_t *)
 		((u_char *)(p))[0] = (__v >> 8) & 0xff; \
 		((u_char *)(p))[1] = __v & 0xff; \
 	} while (0)
+
+void sshbuf_set_window_max(struct sshbuf *buf , size_t len);
 
 /* Internal definitions follow. Exposed for regress tests */
 #ifdef SSHBUF_INTERNAL
