@@ -353,6 +353,7 @@ sshbuf_check_reserve(const struct sshbuf *buf, size_t len)
 	return 0;
 }
 
+void
 sshbuf_set_window_max(struct sshbuf *buf, size_t len)
 {
         buf->window_max = len; 
