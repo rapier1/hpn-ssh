@@ -516,7 +516,7 @@ main(int argc, char **argv)
 
 	fflag = Tflag = tflag = 0;
 	while ((ch = getopt(argc, argv,
-	    "12346ABCTdfOpqRrstvZ:D:F:J:M:P:S:c:i:l:o:X:")) != -1) {
+	    "12346ABCTdfOpqRrstvZD:F:J:M:P:S:c:i:l:o:X:")) != -1) {
 		switch (ch) {
 		/* User-visible flags. */
 		case '1':
