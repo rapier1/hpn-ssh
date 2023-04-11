@@ -28,11 +28,12 @@
 # endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 
-#define SSHBUF_SIZE_MAX		0xF000000	/* Hard maximum size 256MB */
-#define SSHBUF_ALLOC_MAX        (SSHBUF_SIZE_MAX*2)     /* Max alloc size */
+#define SSHBUF_SIZE_MAX		0xFFFFFFF	/* Hard maximum size 256MB */
 #define SSHBUF_REFS_MAX		0x100000	/* Max child buffers */
 #define SSHBUF_MAX_BIGNUM	(16384 / 8)	/* Max bignum *bytes* */
 #define SSHBUF_MAX_ECPOINT	((528 * 2 / 8) + 1) /* Max EC point *bytes* */
+#define MAX_LABEL_LEN           64 /*maximum size of sshbuf label */
+#define sshbuf_new() sshbuf_new_label(__func__)
 
 /*
 * NB. do not depend on the internals of this. It will be made opaque
@@ -43,19 +44,32 @@ struct sshbuf {
 	const u_char *cd;	/* Const data */
 	size_t off;		/* First available byte is buf->d + buf->off */
 	size_t size;		/* Last byte is buf->d + buf->size - 1 */
-	size_t max_alloc;	/* Maximum allocatable size of buffer */
+	size_t max_size;	/* Maximum size of buffer */
 	size_t window_max;      /* channel window max */
 	size_t alloc;		/* Total bytes allocated to buf->d */
 	int readonly;		/* Refers to external, const data */
 	u_int refcount;		/* Tracks self and number of child buffers */
 	struct sshbuf *parent;	/* If child, pointer to parent */
+	char label[MAX_LABEL_LEN];   /* String for buffer label - debugging use */
+	struct timeval buf_ts; /* creation time of buffer */
 };
 
 /*
  * Create a new sshbuf buffer.
  * Returns pointer to buffer on success, or NULL on allocation failure.
  */
-struct sshbuf *sshbuf_new(void);
+/* struct sshbuf *sshbuf_new(void); */
+
+/*
+ * Create a new labeled sshbuf buffer.
+ * Returns pointer to buffer on success, or NULL on allocation failure.
+ */
+struct sshbuf *sshbuf_new_label(const char *);
+
+/*
+ * relabel the sshbuf struct
+ */
+void sshbuf_relabel(struct sshbuf *, const char *);
 
 /*
  * Create a new, read-only sshbuf buffer from existing data.
