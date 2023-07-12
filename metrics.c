@@ -2,7 +2,10 @@
 #include "metrics.h"
 #include "ssherr.h"
 #include <stdlib.h>
-#ifdef __linux__
+#ifdef __alpine__
+#include <stdio.h>
+#endif
+#if defined __linux__ && !defined(__alpine__)
 #include <linux/version.h>
 #endif
 
@@ -28,7 +31,7 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
  * on non linux systems we set the kernel version to 0
  * which will get us the base set of metrics from netinet/tcp.h
  */
-#ifdef __linux__
+#if defined __linux__ && !defined(__alpine__)
 	binn_object_set_uint32(binnobj, "kernel_version", LINUX_VERSION_CODE);
 #else
 	binn_object_set_uint32(binnobj, "kernel_version", 0);
@@ -63,7 +66,7 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
 			       data->tcpi_rcv_space);
 
 /* the following exist under both but with different names */
-#ifdef __linux__
+#if defined __linux__ && !defined(__alpine__)
 	binn_object_set_uint8(binnobj, "tcpi_ca_state",
 			      data->tcpi_ca_state);
 	binn_object_set_uint8(binnobj, "tcpi_probes",
@@ -140,7 +143,7 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
 #endif
 
 /* Under BSD snd_rexmitpack is the same as linux total_retrans*/
-#ifdef __linux__
+#if defined __linux__ && !defined(__alpine__)
 	binn_object_set_uint32(binnobj, "tcpi_total_retrans",
 			       data->tcpi_total_retrans);
 #else
@@ -149,7 +152,7 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
 #endif
 
 /* The last section are for kernel specific metrics in linux */
-#ifdef __linux__
+#if defined __linux__ && !defined(__alpine__)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,15,0)
 	binn_object_set_uint64(binnobj, "tcpi_max_pacing_rate",
 			       data->tcpi_max_pacing_rate);
@@ -285,7 +288,7 @@ metrics_read_binn_object (void *binnobj, char **output) {
 	 * any given metric. This means that a remote host that has a different
 	 * kernel that the local host will be able to process the data in terms of
 	 * the remote kernel version. Only necessary under linux*/
-#ifdef __linux__
+#if defined __linux__ && !defined(__alpine__)
 	if (kernel_version >= KERNEL_VERSION(3,15,0)) {
 		len += snprintf(*output+len, (buflen-len), ", %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_max_pacing_rate"),
@@ -381,7 +384,7 @@ metrics_print_header(FILE *fptr, char *extra_text, int kernel_version) {
 	/* compare the received kernel version to the version that supports
 	 * any given metric. This way we can print consistent headers.
 	 * Only necessary under linux*/
-#ifdef __linux__
+#if defined __linux__ && !defined(__alpine__)
 	if (kernel_version >= KERNEL_VERSION(3,15,0)) {
 		fprintf(fptr, ", max_pacing_rate, pacing_rate");
 	}
