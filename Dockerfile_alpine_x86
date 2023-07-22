@@ -1,0 +1,43 @@
+FROM alpine:3.12
+USER root
+
+# -- build & hpn-ssh
+WORKDIR /hpnssh
+COPY hpnssh /hpnssh
+
+RUN apk add \
+  bash \
+  openrc \
+  build-base \
+  musl-dev \
+  linux-headers \
+  curl \
+  gcc \
+  g++ \
+  autoconf \
+  automake \
+  zlib-dev \
+  openssl-dev \
+  libc-dev \
+  coreutils \
+  dumb-init \
+  gettext \
+  sudo
+
+# hpn-ssh build
+RUN autoreconf -f -i
+RUN CFLAGS="-D__alpine__" ./configure 
+RUN make && make install
+# RUN useradd --system --shell /usr/sbin/nologin --comment="Privilege separated HPNSSH User" --home=/run/hpnsshd hpnsshd
+RUN adduser -D -H -u 1001 -s /usr/sbin/nologin -h /run/hpnsshd -g "Privilege separated HPNSSH User" hpnsshd
+EXPOSE 2222
+
+CMD ["openresty", "-g", "daemon off;"]
+
+# RUN adduser -D -H -s /sbin/nologin -h /run/hpnsshd -g "Privilege separated HPNSSH User" hpnsshd
+
+RUN chmod +x /entrypoint.sh /refresh-certificate.sh /refresh-configuration.sh /ssh-proxy.sh /ip-whitelist.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+CMD ["/usr/local/sbin/hpnsshd"]

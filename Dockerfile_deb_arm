@@ -1,0 +1,46 @@
+FROM debian:bullseye
+
+# -- install dependencies to build hpn-ssh lib
+RUN apt-get update && \
+    apt-get install -y  build-essential \ 
+                        zlib1g-dev \
+                        libssl-dev \ 
+                        libreadline-dev \ 
+                        autoconf \
+                        automake \
+                        # -- optional
+                        sudo \
+                        less \
+                        htop
+
+# -- copy source code from git
+COPY openssh-portable /app
+WORKDIR /app
+
+# -- configure build
+RUN autoreconf -f -i
+RUN ./configure  
+      # --prefix=/usr \
+      # --exec_prefix=/usr \
+      # --sbindir=/usr/bin \
+      # --libexecdir=/usr/lib/hpnssh \ 
+      # --with-privsep-path=/var/empty/sshd \
+      # --sysconfdir=/etc
+
+# -- setup hpnsshd user
+# https://www.psc.edu/hpn-ssh-home/hpn-ssh-installation/#step-8-set-up-the-hpnsshd-user
+RUN useradd --system --shell /usr/sbin/nologin --comment="Privilege separated HPNSSH User" --home=/run/hpnsshd hpnsshd
+
+# -- make & install
+RUN make && make install
+
+# -- add testing user
+RUN useradd -rm -d /home/test -s /bin/bash -g root -G sudo -u 1000 test
+RUN echo 'test:test' | chpasswd
+
+# -- hpnssh default port is 2222
+EXPOSE 2222
+
+# -- start hpn-ssh daemon
+CMD ["/usr/local/sbin/hpnsshd", "-D"]
+
