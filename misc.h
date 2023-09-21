@@ -241,6 +241,18 @@ void	notify_complete(struct notifier_ctx *, const char *, ...)
 typedef void (*sshsig_t)(int);
 sshsig_t ssh_signal(int, sshsig_t);
 
+typedef struct statm_t {
+  unsigned long size;
+  unsigned long resident;
+  unsigned long share;
+  unsigned long text;
+  unsigned long lib;
+  unsigned long data;
+  unsigned long dt;
+} statm_t;
+
+void read_mem_stats(struct statm_t *, int);
+
 /* On OpenBSD time_t is int64_t which is long long. */
 /* #define SSH_TIME_T_MAX LLONG_MAX */
 
