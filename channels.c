@@ -1,4 +1,4 @@
-/* $OpenBSD: channels.c,v 1.432 2023/07/04 03:59:21 dlg Exp $ */
+/* $OpenBSD: channels.c,v 1.433 2023/09/04 00:01:46 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -231,7 +231,6 @@ static void channel_handler_init(struct ssh_channels *sc);
 
 
 static int hpn_disabled = 0;
-static int hpn_buffer_size = 2 * 1024 * 1024;
 
 /* -- channel core */
 
@@ -2933,8 +2932,9 @@ channel_after_poll(struct ssh *ssh, struct pollfd *pfd, u_int npfd)
 
 /*
  * Enqueue data for channels with open or draining c->input.
+ * Returns non-zero if a packet was enqueued.
  */
-static void
+static int
 channel_output_poll_input_open(struct ssh *ssh, Channel *c)
 {
 	size_t len, plen;
@@ -2957,7 +2957,7 @@ channel_output_poll_input_open(struct ssh *ssh, Channel *c)
 			else
 				chan_ibuf_empty(ssh, c);
 		}
-		return;
+		return 0;
 	}
 
 	if (!c->have_remote_id)
@@ -2974,7 +2974,7 @@ channel_output_poll_input_open(struct ssh *ssh, Channel *c)
 		 */
 		if (plen > c->remote_window || plen > c->remote_maxpacket) {
 			debug("channel %d: datagram too big", c->self);
-			return;
+			return 0;
 		}
 		/* Enqueue it */
 		if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_DATA)) != 0 ||
@@ -2983,7 +2983,7 @@ channel_output_poll_input_open(struct ssh *ssh, Channel *c)
 		    (r = sshpkt_send(ssh)) != 0)
 			fatal_fr(r, "channel %i: send datagram", c->self);
 		c->remote_window -= plen;
-		return;
+		return 1;
 	}
 
 	/* Enqueue packet for buffered data. */
@@ -2992,7 +2992,7 @@ channel_output_poll_input_open(struct ssh *ssh, Channel *c)
 	if (len > c->remote_maxpacket)
 		len = c->remote_maxpacket;
 	if (len == 0)
-		return;
+		return 0;
 	if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_DATA)) != 0 ||
 	    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
 	    (r = sshpkt_put_string(ssh, sshbuf_ptr(c->input), len)) != 0 ||
@@ -3001,19 +3001,21 @@ channel_output_poll_input_open(struct ssh *ssh, Channel *c)
 	if ((r = sshbuf_consume(c->input, len)) != 0)
 		fatal_fr(r, "channel %i: consume", c->self);
 	c->remote_window -= len;
+	return 1;
 }
 
 /*
  * Enqueue data for channels with open c->extended in read mode.
+ * Returns non-zero if a packet was enqueued.
  */
-static void
+static int
 channel_output_poll_extended_read(struct ssh *ssh, Channel *c)
 {
 	size_t len;
 	int r;
 
 	if ((len = sshbuf_len(c->extended)) == 0)
-		return;
+		return 0;
 
 	debug2("channel %d: rwin %u elen %zu euse %d", c->self,
 	    c->remote_window, sshbuf_len(c->extended), c->extended_usage);
@@ -3022,7 +3024,7 @@ channel_output_poll_extended_read(struct ssh *ssh, Channel *c)
 	if (len > c->remote_maxpacket)
 		len = c->remote_maxpacket;
 	if (len == 0)
-		return;
+		return 0;
 	if (!c->have_remote_id)
 		fatal_f("channel %d: no remote id", c->self);
 	if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_EXTENDED_DATA)) != 0 ||
@@ -3035,15 +3037,20 @@ channel_output_poll_extended_read(struct ssh *ssh, Channel *c)
 		fatal_fr(r, "channel %i: consume", c->self);
 	c->remote_window -= len;
 	debug2("channel %d: sent ext data %zu", c->self, len);
+	return 1;
 }
 
-/* If there is data to send to the connection, enqueue some of it now. */
-void
+/*
+ * If there is data to send to the connection, enqueue some of it now.
+ * Returns non-zero if data was enqueued.
+ */
+int
 channel_output_poll(struct ssh *ssh)
 {
 	struct ssh_channels *sc = ssh->chanctxt;
 	Channel *c;
 	u_int i;
+	int ret = 0;
 
 	for (i = 0; i < sc->channels_alloc; i++) {
 		c = sc->channels[i];
@@ -3066,12 +3073,13 @@ channel_output_poll(struct ssh *ssh)
 		/* Get the amount of buffered data for this channel. */
 		if (c->istate == CHAN_INPUT_OPEN ||
 		    c->istate == CHAN_INPUT_WAIT_DRAIN)
-			channel_output_poll_input_open(ssh, c);
+			ret |= channel_output_poll_input_open(ssh, c);
 		/* Send extended data, i.e. stderr */
 		if (!(c->flags & CHAN_EOF_SENT) &&
 		    c->extended_usage == CHAN_EXTENDED_READ)
-			channel_output_poll_extended_read(ssh, c);
+			ret |= channel_output_poll_extended_read(ssh, c);
 	}
+	return ret;
 }
 
 /* -- mux proxy support  */
@@ -3763,11 +3771,10 @@ channel_fwd_bind_addr(struct ssh *ssh, const char *listen_addr, int *wildcardp,
 
 
 void
-channel_set_hpn(int external_hpn_disabled, int external_hpn_buffer_size)
+channel_set_hpn_disabled(int external_hpn_disabled)
 {
 	hpn_disabled = external_hpn_disabled;
-	hpn_buffer_size = external_hpn_buffer_size;
-	debug("HPN Disabled: %d, HPN Buffer Size: %d", hpn_disabled, hpn_buffer_size);
+	debug("HPN Disabled: %d, HPN Buffer Size: %d", hpn_disabled);
 }
 
 static int
@@ -3909,10 +3916,9 @@ channel_setup_fwd_listener_tcpip(struct ssh *ssh, int type,
 		}
 
 		/* Allocate a channel number for the socket. */
-		/* explicitly test for hpn disabled option. if true use smaller window size */
 		c = channel_new(ssh, "port-listener", type, sock, sock, -1,
-		    hpn_disabled ? CHAN_TCP_WINDOW_DEFAULT : hpn_buffer_size,
-		    CHAN_TCP_PACKET_DEFAULT, 0, "port listener", 1);
+		    CHAN_TCP_WINDOW_DEFAULT, CHAN_TCP_PACKET_DEFAULT, 0,
+		    "port listener", 1);
 		c->path = xstrdup(host);
 		c->host_port = fwd->connect_port;
 		c->listening_addr = addr == NULL ? NULL : xstrdup(addr);
@@ -5080,9 +5086,8 @@ x11_create_display_inet(struct ssh *ssh, int x11_display_offset,
 		sock = socks[n];
 		nc = channel_new(ssh, "x11-listener",
 		    SSH_CHANNEL_X11_LISTENER, sock, sock, -1,
-				 hpn_disabled ? CHAN_X11_WINDOW_DEFAULT : hpn_buffer_size,
-				 CHAN_X11_PACKET_DEFAULT,
-				 0, "X11 inet listener", 1);
+		    CHAN_X11_WINDOW_DEFAULT, CHAN_X11_PACKET_DEFAULT,
+		    0, "X11 inet listener", 1);
 		nc->single_connection = single_connection;
 		(*chanids)[n] = nc->self;
 	}

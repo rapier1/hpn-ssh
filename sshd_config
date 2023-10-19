@@ -115,9 +115,6 @@ Subsystem	sftp	/usr/libexec/sftp-server
 # disable hpn performance boosts
 #HPNDisabled no
 
-# buffer size for hpn to non-hpn connections
-#HPNBufferSize 2048
-
 # Example of overriding settings on a per-user basis
 #Match User anoncvs
 #	X11Forwarding no
