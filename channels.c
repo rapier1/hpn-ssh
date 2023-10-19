@@ -3774,7 +3774,7 @@ void
 channel_set_hpn_disabled(int external_hpn_disabled)
 {
 	hpn_disabled = external_hpn_disabled;
-	debug("HPN Disabled: %d, HPN Buffer Size: %d", hpn_disabled);
+	debug_f("HPN Disabled: %d", hpn_disabled);
 }
 
 static int
