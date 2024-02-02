@@ -133,11 +133,10 @@ compat_banner(struct ssh *ssh, const char *version)
 			ssh->compat = check[i].bugs;
 			/* Check to see if the remote side is OpenSSH and not HPN */
 			/* TODO: update to new matching process */
-			if (strstr(version, "OpenSSH") != NULL) {
-				if (strstr(version, "hpn") == NULL) {
-					ssh->compat |= SSH_BUG_LARGEWINDOW;
-					debug("Remote is NON-HPN aware");
-				}
+			if ((strstr(version, "OpenSSH_8.9") != NULL) ||
+			    (strstr(version, "OpenSSH_9") != NULL)) {
+				ssh->compat |= SSH_RESTRICT_WINDOW;
+				debug("Restricting advertised window size.");
 			}
 			return;
 		}

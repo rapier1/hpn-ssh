@@ -104,6 +104,11 @@
 /* Maximum number of fake X11 displays to try. */
 #define MAX_DISPLAYS  1000
 
+/* in version of OpenSSH later than 8.8 if we advertise a window
+ * 16MB or larger is causes a pathological behaviour that reduces
+ * throughput. This is not a great solution. */
+#define NON_HPN_WINDOW_MAX (15 * 1024 * 1024)
+
 /* Per-channel callback for pre/post IO actions */
 typedef void chan_fn(struct ssh *, Channel *c);
 
@@ -1240,13 +1245,20 @@ channel_tcpwinsz(struct ssh *ssh)
 
 	ret = getsockopt(ssh_packet_get_connection_in(ssh),
 			 SOL_SOCKET, SO_RCVBUF, &tcpwinsz, &optsz);
+
 	/* return no more than SSHBUF_SIZE_MAX (currently 256MB) */
 	if ((ret == 0) && tcpwinsz > SSHBUF_SIZE_MAX)
 		tcpwinsz = SSHBUF_SIZE_MAX;
 
-	debug3_f("tcp connection %d, Receive window: %d",
-	       ssh_packet_get_connection_in(ssh), tcpwinsz);
-	return tcpwinsz;
+	/* if the remote side is OpenSSH after version 8.8 we need to restrict
+	 * the size of the advertised window. Now this means that any HPN to non-HPN
+	 * connection will be window limited to 15MB of receive space. This is a
+	 * non-optimal solution.
+	 */
+
+	if ((ssh->compat & SSH_RESTRICT_WINDOW) && (tcpwinsz > NON_HPN_WINDOW_MAX))
+		tcpwinsz = NON_HPN_WINDOW_MAX;
+	return (tcpwinsz);
 }
 
 static void
@@ -5060,7 +5072,7 @@ x11_create_display_inet(struct ssh *ssh, int x11_display_offset,
 				if ((errno != EINVAL) && (errno != EAFNOSUPPORT)
 #ifdef EPFNOSUPPORT
 				    && (errno != EPFNOSUPPORT)
-#endif 
+#endif
 				    ) {
 					error("socket: %.100s", strerror(errno));
 					freeaddrinfo(aitop);
