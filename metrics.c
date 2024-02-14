@@ -253,7 +253,7 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
  * the object will not necessarily have all of the elements. If it's empty it
  * current just spits out 0. This isn't optimal as 0 can also be a valid value */
 void
-metrics_read_binn_object (void *binnobj, char **output) {
+metrics_read_binn_object (void *binnobj, char **output, char * extra_columns) {
 	int len = 0;
 	int buflen = 1023;
 	int kernel_version = 0;
@@ -378,6 +378,10 @@ metrics_read_binn_object (void *binnobj, char **output) {
 			);
 	}
 #endif /* ifdef __linux__ */
+	if (extra_columns != NULL) {
+		len += snprintf(*output+len, (buflen-len), ", %s",
+		                extra_columns);
+	}
 }
 
 /* Print out the header to the file so that the column header matches the
@@ -386,7 +390,7 @@ metrics_read_binn_object (void *binnobj, char **output) {
  * NOTE: This doesn't put the values/headers in the most useful order but the
  * resulting file is probably going to get processed by something */
 void
-metrics_print_header(FILE *fptr, char *extra_text, int kernel_version) {
+metrics_print_header(FILE *fptr, char *extra_text, char * extra_columns, int kernel_version) {
 	if (extra_text != NULL) {
 		fprintf(fptr, "%s\n", extra_text);
 	}
@@ -440,5 +444,8 @@ metrics_print_header(FILE *fptr, char *extra_text, int kernel_version) {
 		fprintf(fptr, ", fastopen_client_fail");
 	}
 #endif /* ifdef __linux__ */
+	if (extra_columns != NULL) {
+		fprintf(fptr, ", %s", extra_columns);
+	}
 	fprintf(fptr, "\n\n");
 }

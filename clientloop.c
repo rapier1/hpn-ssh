@@ -115,6 +115,7 @@
 #include "ssherr.h"
 #include "hostfile.h"
 #include "metrics.h"
+#include "qfactor.h"
 
 /* Permitted RSA signature algorithms for UpdateHostkeys proofs */
 #define HOSTKEY_PROOF_RSA_ALGS	"rsa-sha2-512,rsa-sha2-256"
@@ -201,7 +202,7 @@ static struct global_confirms global_confirms =
 
 void ssh_process_session2_setup(int, int, int, struct sshbuf *);
 
-void client_request_metrics(struct ssh *);
+void client_request_metrics(struct ssh *, struct qfactor_ctx *);
 
 static void quit_message(const char *fmt, ...)
     __attribute__((__format__ (printf, 1, 2)));
@@ -1457,6 +1458,7 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	u_int64_t ibytes, obytes;
 	time_t previous_time;
 	int conn_in_ready, conn_out_ready;
+	struct qfactor_ctx * qctx = NULL;
 
 	debug_f("Entering interactive session.");
 	session_ident = ssh2_chan_id;
@@ -1542,14 +1544,16 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	}
 
 	schedule_server_alive_check();
-	if (options.metrics)
-		client_request_metrics(ssh); /* initial metrics polling */
+	if (options.metrics) {
+		qctx = qfactor_open();
+		client_request_metrics(ssh, qctx); /* initial metrics polling */
+	}
 
 	/* Main loop of the client for the interactive session mode. */
 	while (!quit_pending) {
 		if (options.metrics) {
 			if ((time(NULL) - previous_time) >= options.metrics_interval) {
-				client_request_metrics(ssh);
+				client_request_metrics(ssh, qctx);
 				previous_time = time(NULL);
 			}
 		}
@@ -1635,8 +1639,12 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 		}
 	}
 
-	if (options.metrics)
-		client_request_metrics(ssh); /* final metrics polling */
+	if (options.metrics) {
+		qfactor_set_autoclose(qctx);
+		client_request_metrics(ssh, qctx); /* final metrics polling */
+		/* qfactor_close(qctx); */
+		qctx = NULL;
+	}
 
 	free(pfd);
 
@@ -2703,6 +2711,11 @@ client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *
 	size_t tcpi_len, len = 0;
 	binn *metricsobj = NULL;
 	int r, kernel_version = 0;
+	struct qfactor_ctx * qctx = (struct qfactor_ctx *) _ctx;
+	size_t qmsg_len = 1024;
+	char qmsg[qmsg_len];
+	size_t qmsg_hdr_len = 1024;
+	char qmsg_hdr[qmsg_hdr_len];
 
 	time(&now);
 	info = localtime(&now);
@@ -2746,6 +2759,7 @@ client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *
 	 * blob has to be a const uchar as that's what string_direct expects
 	 * we cast it as a void for the binn functions */
 	sshpkt_get_string_direct(ssh, &blob, &len);
+
 	if (len == 0) {
 		/* received no data. which is weird */
 		error("Received no remote metrics data. Continuing.");
@@ -2755,11 +2769,11 @@ client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *
 	kernel_version = binn_object_int32((void *)blob, "kernel_version");
 
 	/* create a string of the data from the binn object blob */
-	metrics_read_binn_object((void *)blob, &metricsstring);
+	metrics_read_binn_object((void *)blob, &metricsstring, NULL);
 
 	/* have we printed the header? */
 	if (metrics_hdr_remote_flag == 0) {
-		metrics_print_header(remfptr, "REMOTE CONNECTION", kernel_version);
+		metrics_print_header(remfptr, "REMOTE CONNECTION", NULL, kernel_version);
 		metrics_hdr_remote_flag = 1;
 	}
 	fprintf(remfptr, "%s, ", timestamp);
@@ -2799,14 +2813,18 @@ localonly:
 	 * format the data consistently */
 	metrics_write_binn_object(&local_tcp_info, metricsobj);
 
+	qfactor_read(qctx, qmsg, qmsg_len);
+
 	/* create a string of the data from the binn object metricsobj */
-	metrics_read_binn_object((void *)metricsobj, &metricsstring);
+	metrics_read_binn_object((void *)metricsobj, &metricsstring, qmsg);
 
 	/* get the kernel version printing the header */
 	kernel_version = binn_object_int32(metricsobj, "kernel_version");
 
+
 	if (metrics_hdr_local_flag == 0) {
-		metrics_print_header(localfptr, "LOCAL CONNECTION", kernel_version);
+		qfactor_write_header(qmsg_hdr, qmsg_hdr_len);
+		metrics_print_header(localfptr, "LOCAL CONNECTION", qmsg_hdr, kernel_version);
 		metrics_hdr_local_flag = 1;
 	}
 
@@ -2826,7 +2844,7 @@ out:
  * I can probably do this by using clint_input_global_request but
  * I need to understand that better.
  */
-void client_request_metrics(struct ssh *ssh) {
+void client_request_metrics(struct ssh *ssh, struct qfactor_ctx * qctx) {
 	int r;
 
 	debug_f("Asking server for TCP stack metrics");
@@ -2842,7 +2860,7 @@ void client_request_metrics(struct ssh *ssh) {
 	if ((r = sshpkt_send(ssh)) != 0)
 		fatal_fr(r, "send stack request");
 	/* i believe this indicates what we are to use for a callback */
-	client_register_global_confirm(client_process_request_metrics, NULL);
+	client_register_global_confirm(client_process_request_metrics, (void *) qctx);
 }
 
 static int
