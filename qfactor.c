@@ -3,7 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-
+#include <errno.h>
 #include <arpa/inet.h>
 
 #include "qfactor.h"
@@ -26,26 +26,53 @@ struct qfactor_server_msg {
 	u_char timestamp[QFACTOR_MS_CTIME_BUF_LEN];
 };
 
+struct qfactor_ctx {
+	int sockfd;
+	int autoclose;
+};
+
 int sendToSocket(int sockfd, struct qfactor_client_msg * msg)
 {
-	/* TODO: error handling for binn_object() */
+	u_char * end = NULL;
+	u_char *ptr = NULL;
+	int ret = 0;
+
 	binn * o = binn_object();
-	/* TODO: error handling for binn_object_set_uint32() */
-	binn_object_set_uint32(o, "msg_type", msg->msg_type);
-	/* TODO: error handling for binn_object_set_uint32() */
-	binn_object_set_uint32(o, "op", msg->op);
+	if (o == NULL)
+		goto fail;
 
-	/* TODO: error handling for binn_ptr() */
-	u_char * ptr = (u_char *) binn_ptr(o);
-	/* TODO: error handling for binn_size() */
-	u_char * end = ptr + binn_size(o);
-	/* TODO: error handling for write() */
-	while (ptr < end)
-		ptr += write(sockfd, ptr, end - ptr);
+	if (binn_object_set_uint32(o, "msg_type", msg->msg_type) == FALSE)
+		goto fail;
 
-	/* TODO: error handling for binn_free() */
+	if (binn_object_set_uint32(o, "op", msg->op) == FALSE)
+		goto fail;
+
+	ptr = (u_char *) binn_ptr(o);
+	if (ptr == NULL)
+		goto fail;
+
+	ret = binn_size(o);
+	/* o should not have a size of 0 at this point */
+	if (ret != 0)
+		end = ptr + ret;
+	else
+		goto fail;
+
+	while (ptr < end) {
+		ret = write(sockfd, ptr, end - ptr);
+		if (ret == -1) {
+			error("Write failed with %s", strerror(errno));
+			debug_f("Write failed with %s", strerror(errno));
+			goto fail;
+		}
+		ptr += ret;
+	}
+
 	binn_free(o);
 	return 0;
+fail:
+	binn_free(o);
+	return -1;
 }
 
 int readFromSocket(int sockfd, char * msg, size_t len)
@@ -53,6 +80,8 @@ int readFromSocket(int sockfd, char * msg, size_t len)
 	char buf[QFACTOR_BUFSIZE_FROM_SERVER];
 	size_t nread = 0;
 	ssize_t newread = 0;
+	struct qfactor_server_msg * rcvd = NULL;
+
 	while(nread < sizeof(buf)) {
 		newread = read(sockfd, buf + nread, sizeof(buf) - nread);
 		if (newread < 0) { /* signal or error */
@@ -68,8 +97,10 @@ int readFromSocket(int sockfd, char * msg, size_t len)
 	}
 	binn * o = (binn *) buf;
 	int value = 0;
-	/* TODO: handle binn_object_blob() error conditions */
-	struct qfactor_server_msg * rcvd = binn_object_blob(o, "Msg", &value);
+	/* handle binn_object_blob() error conditions, any error return FALSE aka 0*/
+	rcvd = binn_object_blob(o, "Msg", &value);
+	if (value == 0)
+		return -1;
 	/* TODO: handle this better */
 	if (rcvd->msg_type != QFACTOR_HPNSSH_MSG) {
 		return -1;
@@ -77,11 +108,6 @@ int readFromSocket(int sockfd, char * msg, size_t len)
 	snprintf(msg, len, "%s, %d, %d, %d, %d", rcvd->timestamp, rcvd->op, rcvd->hop_latency, rcvd->queue_occupancy, rcvd->switch_id);
 	return 0;
 }
-
-struct qfactor_ctx {
-	int sockfd;
-	int autoclose;
-};
 
 void qfactor_set_autoclose(struct qfactor_ctx * qctx) {
 	if (qctx)
@@ -115,8 +141,8 @@ int qfactor_read(struct qfactor_ctx * qctx, char * smsg, size_t len)
 	if (smsg == NULL || qctx == NULL)
 		return -1;
 	struct qfactor_client_msg cmsg = { QFACTOR_HPNSSH_MSG, QFACTOR_READ };
-	/* TODO: add error checking for sendToSocket() */
-	sendToSocket(qctx->sockfd, &cmsg);
+	if (sendToSocket(qctx->sockfd, &cmsg) == -1)
+		return -1;
 	int ret = readFromSocket(qctx->sockfd, smsg, len);
 	if (qctx->autoclose)
 		qfactor_close(qctx);

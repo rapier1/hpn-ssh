@@ -174,6 +174,7 @@ int     metrics_hdr_remote_flag = 0;
 int     metrics_hdr_local_flag = 0;
 int     remote_no_poll_flag = 0;
 int     local_no_poll_flag = 0;
+int     supress_qf_warning = 0;
 
 /* Track escape per proto2 channel */
 struct escape_filter_ctx {
@@ -1546,6 +1547,8 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	schedule_server_alive_check();
 	if (options.metrics) {
 		qctx = qfactor_open();
+		if (qctx == NULL)
+			error ("Cannot connect to q-factor server. Continuing.");
 		client_request_metrics(ssh, qctx); /* initial metrics polling */
 	}
 
@@ -2813,7 +2816,16 @@ localonly:
 	 * format the data consistently */
 	metrics_write_binn_object(&local_tcp_info, metricsobj);
 
-	qfactor_read(qctx, qmsg, qmsg_len);
+	if ((qctx == NULL) || (qfactor_read(qctx, qmsg, qmsg_len) != 0)) {
+		if (supress_qf_warning == 0) {
+			debug_f("Error reading from Q-Factor server. Continuing. Future warnings supressed");
+			error("Error reading from Q-Factor server. Continuing.");
+			supress_qf_warning = 1;
+		}
+
+	} else {
+		debug_f("Read message from Q-Factor server: %s", qmsg);
+	}
 
 	/* create a string of the data from the binn object metricsobj */
 	metrics_read_binn_object((void *)metricsobj, &metricsstring, qmsg);
