@@ -61,7 +61,8 @@ struct sshbuf {
 void
 sshbuf_relabel(struct sshbuf *buf, const char *label)
 {
-	strncpy(buf->label, label, MAX_LABEL_LEN-1);
+	if (label != NULL)
+		strncpy(buf->label, label, MAX_LABEL_LEN-1);
 }
 
 /* set the type (from enum sshbuf_type) of the given sshbuf.
@@ -243,7 +244,7 @@ sshbuf_reset(struct sshbuf *buf)
 size_t
 sshbuf_max_size(const struct sshbuf *buf)
 {
-	return buf->max_size / 2;
+	return buf->max_size;
 }
 
 size_t
@@ -280,8 +281,8 @@ sshbuf_set_max_size(struct sshbuf *buf, size_t max_size)
 		return SSH_ERR_BUFFER_READ_ONLY;
 	if (max_size > SSHBUF_SIZE_MAX)
 		return SSH_ERR_NO_BUFFER_SPACE;
+	/* pack and realloc if necessary */
 	sshbuf_maybe_pack(buf, max_size < buf->size);
-	/* Shrink alloc if the existing allocation is larger than requested */
 	if (max_size < buf->alloc && max_size > buf->size) {
 		if (buf->size < SSHBUF_SIZE_INIT)
 			rlen = SSHBUF_SIZE_INIT;
@@ -355,7 +356,7 @@ sshbuf_check_reserve(const struct sshbuf *buf, size_t len)
 	if (buf->readonly || buf->refcount > 1)
 		return SSH_ERR_BUFFER_READ_ONLY;
 	SSHBUF_TELL("check");
-	/* Check that len is reasonable and that max size + available < len */
+	/* Check that len is reasonable and that max_size + available < len */
 	if (len > buf->max_size || buf->max_size - len < buf->size - buf->off)
 		return SSH_ERR_NO_BUFFER_SPACE;
 	return 0;
