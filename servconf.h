@@ -198,11 +198,14 @@ typedef struct {
 	char   *adm_forced_command;
 
 	int	use_pam;		/* Enable auth via PAM */
-        int     tcp_rcv_buf_poll;       /* poll tcp rcv window in autotuning kernels*/
+
+	/* hpnssh options */
+	int     tcp_rcv_buf_poll;       /* poll tcp rcv window in autotuning kernels*/
 	int	hpn_disabled;		/* disable hpn functionality. false by default */
 	int	none_enabled;		/* Enable NONE cipher switch */
 	int     nonemac_enabled;        /* Enable NONE MAC switch */
-  
+	int     use_mptcp;              /* Use MPTCP */
+
 	int	permit_tun;
 
 	char   **permitted_opens;	/* May also be one of PERMITOPEN_* */

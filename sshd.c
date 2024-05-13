@@ -1035,8 +1035,13 @@ listen_on_addrs(struct listenaddr *la)
 			continue;
 		}
 		/* Create socket for listening. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0) /*MPTCP is only in very 5.6+ */
+		listen_sock = socket(ai->ai_family, ai->ai_socktype,
+		    options.use_mptcp ? IPPROTO_MPTCP : ai->ai_protocol);
+#else
 		listen_sock = socket(ai->ai_family, ai->ai_socktype,
 		    ai->ai_protocol);
+#endif
 		if (listen_sock == -1) {
 			/* kernel may not support ipv6 */
 			verbose("socket: %.100s", strerror(errno));

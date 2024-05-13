@@ -192,6 +192,7 @@ initialize_server_options(ServerOptions *options)
 	options->hpn_disabled = -1;
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
+	options->use_mptcp = -1;
 	options->ip_qos_interactive = -1;
 	options->ip_qos_bulk = -1;
 	options->version_addendum = NULL;
@@ -438,8 +439,12 @@ fill_default_server_options(ServerOptions *options)
 		debug ("Attempted to enabled None MAC without setting None Enabled to true. None MAC disabled.");
 		options->nonemac_enabled = 0;
 	}
+	if (options->tcp_rcv_buf_poll == -1)
+		options->tcp_rcv_buf_poll = 1;
 	if (options->hpn_disabled == -1)
 		options->hpn_disabled = 0;
+	if (options->use_mptcp == -1)
+		options->use_mptcp = 0;
 	if (options->ip_qos_interactive == -1)
 		options->ip_qos_interactive = IPTOS_DSCP_AF21;
 	if (options->ip_qos_bulk == -1)
@@ -521,7 +526,7 @@ typedef enum {
 	sKerberosGetAFSToken, sPasswordAuthentication,
 	sKbdInteractiveAuthentication, sListenAddress, sAddressFamily,
 	sPrintMotd, sPrintLastLog, sIgnoreRhosts,
-	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sHPNDisabled,
+	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sHPNDisabled, sUseMPTCP,
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
 	sPermitUserEnvironment, sAllowTcpForwarding, sCompression,
@@ -692,6 +697,7 @@ static struct {
 	{ "tcprcvbufpoll", sTcpRcvBufPoll, SSHCFG_ALL },
 	{ "noneenabled", sNoneEnabled, SSHCFG_ALL },
 	{ "nonemacenabled", sNoneMacEnabled, SSHCFG_ALL },
+	{ "usemptcp", sUseMPTCP, SSHCFG_GLOBAL },
 	{ "kexalgorithms", sKexAlgorithms, SSHCFG_GLOBAL },
 	{ "include", sInclude, SSHCFG_ALL },
 	{ "ipqos", sIPQoS, SSHCFG_ALL },
@@ -1557,20 +1563,24 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		intptr = &options->hpn_disabled;
 		goto parse_flag;
 
+	case sNoneEnabled:
+		intptr = &options->none_enabled;
+		goto parse_flag;
+
+	case sNoneMacEnabled:
+		intptr = &options->nonemac_enabled;
+		goto parse_flag;
+
+	case sUseMPTCP:
+		intptr = &options->use_mptcp;
+		goto parse_flag;
+
 	case sIgnoreUserKnownHosts:
 		intptr = &options->ignore_user_known_hosts;
  parse_flag:
 		multistate_ptr = multistate_flag;
 		goto parse_multistate;
 
-	case sNoneEnabled:
-		intptr = &options->none_enabled;
-		goto parse_flag;
-		
-	case sNoneMacEnabled:
-		intptr = &options->nonemac_enabled;
-		goto parse_flag;
-		
 	case sHostbasedAuthentication:
 		intptr = &options->hostbased_authentication;
 		goto parse_flag;
@@ -3175,6 +3185,11 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sStreamLocalBindUnlink, o->fwd_opts.streamlocal_bind_unlink);
 	dump_cfg_fmtint(sFingerprintHash, o->fingerprint_hash);
 	dump_cfg_fmtint(sExposeAuthInfo, o->expose_userauth_info);
+	dump_cfg_fmtint(sHPNDisabled, o->hpn_disabled);
+	dump_cfg_fmtint(sTcpRcvBufPoll, o->tcp_rcv_buf_poll);
+	dump_cfg_fmtint(sNoneEnabled, o->none_enabled);
+	dump_cfg_fmtint(sNoneMacEnabled, o->nonemac_enabled);
+	dump_cfg_fmtint(sUseMPTCP, o->use_mptcp);
 
 	/* string arguments */
 	dump_cfg_string(sPidFile, o->pid_file);

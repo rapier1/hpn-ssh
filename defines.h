@@ -892,6 +892,10 @@ struct winsize {
 # define SSH_IOBUFSZ (32*1024)
 #endif
 
+#ifndef IPPROTO_MPTCP
+#define IPPROTO_MPTCP 262
+#endif
+
 /*
  * We want functions in openbsd-compat, if enabled, to override system ones.
  * We no-op out the weak symbol definition rather than remove it to reduce
@@ -943,3 +947,12 @@ struct winsize {
 # define USE_SNTRUP761X25519 1
 #endif
 #endif /* _DEFINES_H */
+
+/* used to enable checking linux kernel versions */
+#if defined(__linux__) && !defined(__alpine__)
+#include <linux/version.h>
+#endif
+
+#ifndef KERNEL_VERSION /* shouldn't be necessary to define this */
+#define KERNEL_VERSION(a,b,c) (((a) <<16) + ((b) << 8) +(c))
+#endif

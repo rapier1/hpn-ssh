@@ -20,13 +20,8 @@
 #include "ssherr.h"
 #include <stdlib.h>
 #include <stdio.h>
-#if defined(__linux__) && !defined(__alpine__)
-#include <linux/version.h>
-#endif
 
-#ifndef KERNEL_VERSION /* shouldn't be necessary to define this */
-#define KERNEL_VERSION(a,b,c) (((a) <<16) + ((b) << 8) +(c))
-#endif
+/* kernel version macro moved to defines.h */
 
 /* add the information from the tcp_info struct to the
  * serialized binary object

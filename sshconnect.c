@@ -358,7 +358,12 @@ ssh_create_socket(struct addrinfo *ai)
 #endif
 	char ntop[NI_MAXHOST];
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0) /* MPTCP only in 5.6+ */
+	sock = socket(ai->ai_family, ai->ai_socktype,
+	    options.use_mptcp ? IPPROTO_MPTCP : ai->ai_protocol);
+#else
 	sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+#endif
 	if (sock == -1) {
 		error("socket: %s", strerror(errno));
 		return -1;

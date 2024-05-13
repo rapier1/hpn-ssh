@@ -171,7 +171,7 @@ typedef enum {
 	oTunnel, oTunnelDevice,
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
 	oTcpRcvBufPoll, oHPNDisabled,
-	oNoneEnabled, oNoneMacEnabled, oNoneSwitch,
+	oNoneEnabled, oNoneMacEnabled, oNoneSwitch, oUseMPTCP,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oVisualHostKey,
 	oKexAlgorithms, oIPQoS, oRequestTTY, oSessionType, oStdinNull,
@@ -310,6 +310,7 @@ static struct {
 	{ "noneenabled", oNoneEnabled },
 	{ "nonemacenabled", oNoneMacEnabled },
 	{ "noneswitch", oNoneSwitch },
+	{ "usemptcp", oUseMPTCP},
 	{ "metrics", oMetrics },
 	{ "metricspath", oMetricsPath },
 	{ "metricsinterval", oMetricsInterval },
@@ -1267,6 +1268,10 @@ parse_time:
 
 	case oNoneMacEnabled:
 		intptr = &options->nonemac_enabled;
+		goto parse_flag;
+
+	case oUseMPTCP:
+		intptr = &options->use_mptcp;
 		goto parse_flag;
 
 	case oMetrics:
@@ -2692,6 +2697,7 @@ initialize_options(Options * options)
 	options->none_switch = -1;
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
+	options->use_mptcp = -1;
 	options->metrics = -1;
 	options->metrics_path = NULL;
 	options->metrics_interval = -1;
@@ -2891,6 +2897,8 @@ fill_default_options(Options * options)
 		fprintf(stderr, "None MAC can only be used with the None cipher. None MAC disabled.\n");
 		options->nonemac_enabled = 0;
 	}
+	if (options->use_mptcp == -1)
+		options->use_mptcp = 0;
 	if (options->metrics == -1)
 		options->metrics = 0;
 	if (options->metrics_interval == -1)
@@ -3660,6 +3668,14 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oVisualHostKey, o->visual_host_key);
 	dump_cfg_fmtint(oUpdateHostkeys, o->update_hostkeys);
 	dump_cfg_fmtint(oEnableEscapeCommandline, o->enable_escape_commandline);
+	dump_cfg_fmtint(oTcpRcvBufPoll, o->tcp_rcv_buf_poll);
+	dump_cfg_fmtint(oHPNDisabled, o->hpn_disabled);
+	dump_cfg_fmtint(oNoneSwitch, o->none_switch);
+	dump_cfg_fmtint(oNoneEnabled, o->none_enabled);
+	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
+	dump_cfg_fmtint(oFallback, o->fallback);
+	dump_cfg_fmtint(oMetrics, o->metrics);
+
 
 	/* Integer options */
 	dump_cfg_int(oCanonicalizeMaxDots, o->canonicalize_max_dots);
@@ -3671,6 +3687,8 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_int(oRequiredRSASize, o->required_rsa_size);
 	dump_cfg_int(oObscureKeystrokeTiming,
 	    o->obscure_keystroke_timing_interval);
+	dump_cfg_int(oMetricsInterval, o->metrics_interval);
+	dump_cfg_int(oFallbackPort, o->fallback_port);
 
 	/* String options */
 	dump_cfg_string(oBindAddress, o->bind_address);
@@ -3699,6 +3717,7 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_string(oXAuthLocation, o->xauth_location);
 	dump_cfg_string(oKnownHostsCommand, o->known_hosts_command);
 	dump_cfg_string(oTag, o->tag);
+	dump_cfg_string(oMetricsPath, o->metrics_path);
 
 	/* Forwards */
 	dump_cfg_forwards(oDynamicForward, o->num_local_forwards, o->local_forwards);

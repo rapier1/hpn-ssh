@@ -17,6 +17,8 @@ grep "HostKey " $OBJ/sshd_config > $OBJ/sshd_config_minimal
 SSHD_KEYS="`cat $OBJ/sshd_config_minimal`"
 
 verbose "reparse minimal config"
+echo "$SUDO ${SSHD} -T -f $OBJ/sshd_config_minimal >$OBJ/sshd_config.1"
+
 ($SUDO ${SSHD} -T -f $OBJ/sshd_config_minimal >$OBJ/sshd_config.1 &&
  $SUDO ${SSHD} -T -f $OBJ/sshd_config.1 >$OBJ/sshd_config.2 &&
  diff $OBJ/sshd_config.1 $OBJ/sshd_config.2) || fail "reparse minimal config"
