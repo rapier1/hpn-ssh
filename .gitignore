@@ -48,3 +48,4 @@ hpnssh-keysign
 hpnssh-pkcs11-helper
 hpnssh-sk-helper
 hpnsshd
+hpnsshd-session
