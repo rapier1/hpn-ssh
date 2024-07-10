@@ -154,7 +154,7 @@ u_int32_t umac_get_u32_le(const void *vp)
         return (v);
 }
 
-#if (! __LITTLE_ENDIAN__) /* compile time warning thrown otherwise */
+#if 0 /* compile time warning thrown otherwise */
 static __attribute__((__bounded__(__minbytes__, 1, 4)));
 void umac_put_u32_le(void *vp, u_int32_t v)
 {
