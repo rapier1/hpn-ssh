@@ -2,6 +2,6 @@
 
 #define SSH_VERSION	"OpenSSH_9.8"
 
-#define SSH_PORTABLE	"p3"
-#define SSH_HPN         "-DynWin"
+#define SSH_PORTABLE	"p1"
+#define SSH_HPN         "_DynWin"
 #define SSH_RELEASE	SSH_VERSION SSH_PORTABLE SSH_HPN
