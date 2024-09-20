@@ -116,6 +116,15 @@
 #define REEXEC_CONFIG_PASS_FD		(STDERR_FILENO + 3)
 #define REEXEC_MIN_FREE_FD		(STDERR_FILENO + 4)
 
+#ifdef NERSC_MOD
+#include "nersc.h"
+extern char n_ntop[NI_MAXHOST];
+extern char n_port[NI_MAXHOST];
+extern int client_session_id;
+extern char interface_list[256];
+extern int audit_disabled = 0;
+#endif
+
 extern char *__progname;
 
 /* Server configuration options. */
@@ -1265,9 +1274,45 @@ main(int ac, char **av)
 	 */
 	remote_ip = ssh_remote_ipaddr(ssh);
 
+#ifdef NERSC_MOD
+
+	/* here we were setting client_session_id to the current pid
+	 *  but will now use a positive random number
+	 *  to use as a tracking id for the remainder of the
+	 *  session.  c_s_i is defined in nersc.c
+	 */
+	client_session_id = abs(arc4random() );
+
+	char* t1buf = encode_string(interface_list, strlen(interface_list));
+
+	s_audit("sshd_connection_start_3", "count=%i uristring=%s addr=%s port=%i/tcp addr=%s port=%s/tcp count=%ld",
+		client_session_id, interface_list, remote_ip, remote_port, n_ntop, n_port);
+
+	free(t1buf);
+#endif
+
 #ifdef SSH_AUDIT_EVENTS
 	audit_connection_from(remote_ip, remote_port);
 #endif
+
+#ifdef LIBWRAP
+	allow_severity = options.log_facility|LOG_INFO;
+	deny_severity = options.log_facility|LOG_WARNING;
+	/* Check whether logins are denied from this host. */
+	if (packet_connection_is_on_socket()) {
+		struct request_info req;
+
+		request_init(&req, RQ_DAEMON, __progname, RQ_FILE, sock_in, 0);
+		fromhost(&req);
+
+		if (!hosts_access(&req)) {
+			debug("Connection refused by tcp wrapper");
+			refuse(&req);
+			/* NOTREACHED */
+			fatal("libwrap refuse returns");
+		}
+	}
+#endif /* LIBWRAP */
 
 	rdomain = ssh_packet_rdomain_in(ssh);
 
@@ -1384,6 +1429,11 @@ main(int ac, char **av)
 	/* Start session. */
 	do_authenticated(ssh, authctxt);
 
+#ifdef NERSC_MOD
+	s_audit("sshd_connection_end_3", "count=%i addr=%s port=%i/tcp addr=%s port=%s/tcp",
+		client_session_id, remote_ip, remote_port, n_ntop, n_port);
+#endif
+	
 	/* The connection has been terminated. */
 	ssh_packet_get_bytes(ssh, &ibytes, &obytes);
 	verbose("Transferred: sent %llu, received %llu bytes",

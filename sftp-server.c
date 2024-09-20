@@ -57,6 +57,11 @@
 #include "sftp.h"
 #include "sftp-common.h"
 
+#ifdef NERSC_MOD
+#include "nersc.h"
+extern int client_session_id;
+#endif
+
 char *sftp_realpath(const char *, char *); /* sftp-realpath.c */
 
 /* Maximum data read that we are willing to accept */
@@ -680,6 +685,12 @@ send_statvfs(u_int32_t id, struct statvfs *st)
 		fatal_fr(r, "compose");
 	send_msg(msg);
 	sshbuf_free(msg);
+
+#ifdef NERSC_MOD
+	s_audit("sftp_process_init_3", "count=%i int=%d int=%d",
+		get_client_session_id(), (int)getppid(), version);
+#endif
+
 }
 
 /*
@@ -777,6 +788,14 @@ process_open(u_int32_t id)
 	}
 	if (status != SSH2_FX_OK)
 		send_status(id, status);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string( name, strlen(name));
+	s_audit("sftp_process_open_3", "count=%i int=%d uristring=%s",
+		get_client_session_id(), (int)getppid(), t1buf);
+	free(t1buf);
+#endif
+
 	free(name);
 }
 
@@ -793,6 +812,11 @@ process_close(u_int32_t id)
 	ret = handle_close(handle);
 	status = (ret == -1) ? errno_to_portable(errno) : SSH2_FX_OK;
 	send_status(id, status);
+
+#ifdef NERSC_MOD
+	s_audit("sftp_process_close_3", "count=%i int=%d int=%d  int=%d", 
+		get_client_session_id(), (int)getppid(), id, handle);
+#endif
 }
 
 static void
@@ -918,6 +942,14 @@ process_do_stat(u_int32_t id, int do_lstat)
 	}
 	if (status != SSH2_FX_OK)
 		send_status(id, status);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(name, strlen(name));
+	s_audit("sftp_process_do_stat_3", "count=%i int=%d uristring=%s",
+		get_client_session_id(), (int)getppid(), t1buf);
+	free(t1buf);
+#endif
+
 	free(name);
 }
 
@@ -957,6 +989,11 @@ process_fstat(u_int32_t id)
 	}
 	if (status != SSH2_FX_OK)
 		send_status(id, status);
+
+#ifdef NERSC_MOD
+	s_audit("sftp_process_fstat_3", "count=%i int=%d int=%d", 
+		get_client_session_id(), (int)getppid(), handle);
+#endif
 }
 
 static struct timeval *
@@ -1093,6 +1130,13 @@ process_fsetstat(u_int32_t id)
 		}
 	}
 	send_status(id, status);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string( handle_to_name(handle), strlen(handle_to_name(handle)) );
+	s_audit("sftp_process_fsetstat_3", "count=%i int=%d int=%d uristring=%s", 
+		get_client_session_id(), (int)getppid(), id, t1buf);
+	free(t1buf);
+#endif
 }
 
 static void
@@ -1122,6 +1166,13 @@ process_opendir(u_int32_t id)
 	}
 	if (status != SSH2_FX_OK)
 		send_status(id, status);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(path, strlen(path));
+	s_audit("sftp_process_opendir_3", "count=%i int=%d uristring=%s",
+		get_client_session_id(), (int)getpid(), t1buf);
+	free(t1buf);
+#endif
 	free(path);
 }
 
@@ -1178,6 +1229,12 @@ process_readdir(u_int32_t id)
 		} else {
 			send_status(id, SSH2_FX_EOF);
 		}
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(path, strlen(path));
+	s_audit("sftp_process_readdir_3", "count=%i int=%d uristring=%s",
+		get_client_session_id(), (int)getppid(), t1buf);
+#endif
 		free(stats);
 	}
 }
@@ -1196,6 +1253,12 @@ process_remove(u_int32_t id)
 	r = unlink(name);
 	status = (r == -1) ? errno_to_portable(errno) : SSH2_FX_OK;
 	send_status(id, status);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(name, strlen(name));
+	s_audit("sftp_process_remove_3", "count=%i int=%d uristring=%s",
+		get_client_session_id(), (int)getppid(), t1buf);
+#endif
 	free(name);
 }
 
@@ -1217,6 +1280,13 @@ process_mkdir(u_int32_t id)
 	r = mkdir(name, mode);
 	status = (r == -1) ? errno_to_portable(errno) : SSH2_FX_OK;
 	send_status(id, status);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(name, strlen(name));
+	s_audit("sftp_process_mkdir_3", "count=%i int=%d uristring=%s",
+		get_client_session_id(), (int)getpid(), t1buf);
+	free(t1buf);
+#endif
 	free(name);
 }
 
@@ -1234,6 +1304,13 @@ process_rmdir(u_int32_t id)
 	r = rmdir(name);
 	status = (r == -1) ? errno_to_portable(errno) : SSH2_FX_OK;
 	send_status(id, status);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(name, strlen(name));
+	s_audit("sftp_process_rmdir_3", "count=%i int=%d uristring=%s",
+		get_client_session_id(), (int)getppid(), t1buf);
+	free(t1buf);
+#endif
 	free(name);
 }
 
@@ -1261,6 +1338,13 @@ process_realpath(u_int32_t id)
 		s.name = s.long_name = resolvedname;
 		send_names(id, 1, &s);
 	}
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(path, strlen(path));
+	s_audit("sftp_process_realpath_3", "count=%i int=%d uristring=%s",
+		get_client_session_id(), (int)getppid(), t1buf);
+	free(t1buf);
+#endif
 	free(path);
 }
 
@@ -1320,6 +1404,17 @@ process_rename(u_int32_t id)
 			status = SSH2_FX_OK;
 	}
 	send_status(id, status);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string( oldpath, strlen(oldpath));
+	char* t2buf = encode_string( newpath, strlen(newpath));
+
+	s_audit("sftp_process_rename_3", "count=%i int=%d uristring=%s uristring=%s",
+		get_client_session_id(), (int)getppid(), t1buf, t2buf);
+
+	free(t1buf);
+	free(t2buf);
+#endif
 	free(oldpath);
 	free(newpath);
 }
@@ -1346,6 +1441,13 @@ process_readlink(u_int32_t id)
 		s.name = s.long_name = buf;
 		send_names(id, 1, &s);
 	}
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string( path, strlen(path));
+	s_audit("sftp_process_readlink_3", "count=%i int=%d uristring=%s",
+		get_client_session_id(), (int)getppid(), t1buf);
+	free(t1buf);
+#endif
 	free(path);
 }
 
@@ -1365,6 +1467,17 @@ process_symlink(u_int32_t id)
 	r = symlink(oldpath, newpath);
 	status = (r == -1) ? errno_to_portable(errno) : SSH2_FX_OK;
 	send_status(id, status);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string( oldpath, strlen(oldpath));
+	char* t2buf = encode_string( newpath, strlen(newpath));
+
+	s_audit("sftp_process_symlink_3", "count=%i int=%d uristring=%s uristring=%s",
+		get_client_session_id(), (int)getppid(), t1buf, t2buf);
+
+	free(t1buf);
+	free(t2buf);
+#endif
 	free(oldpath);
 	free(newpath);
 }
@@ -1857,7 +1970,15 @@ process(void)
 			}
 		}
 		if (handlers[i].handler == NULL)
+#ifdef NERSC_MOD
+		{
+			s_audit("sftp_process_unknown_3", "count=%i int=%d uristring=%d",
+				get_client_session_id(), (int)getppid(), type);
 			error("Unknown message %u", type);
+		}
+#else
+			error("Unknown message %u", type);
+#endif
 	}
 	/* discard the remaining bytes from the current packet */
 	if (buf_len < sshbuf_len(iqueue)) {
@@ -2032,6 +2153,13 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 			    strerror(errno));
 		}
 	}
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(pw->pw_name, strlen(pw->pw_name));
+	s_audit("sftp_process_init_3", "count=%i int=%d uristring=%s addr=%s", 
+		get_client_session_id(), (int)getppid(), t1buf, client_addr);
+	free(t1buf);
+#endif
 
 	for (;;) {
 		struct pollfd pfd[2];

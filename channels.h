@@ -205,7 +205,27 @@ struct Channel {
 	mux_callback_fn		*mux_rcb;
 	void			*mux_ctx;
 	int			mux_pause;
-	int			mux_downstream_id;
+	int     		mux_downstream_id;
+
+#ifdef NERSC_MOD
+	struct sshbuf *rx_line_buf;
+	struct sshbuf *tx_line_buf;
+	int     audit_enable;
+
+	int     max_tx_lines;
+	int     max_rx_lines;
+	int     max_tx_char;
+	int     max_rx_char;
+
+	int     tx_lines_sent;
+	int     rx_lines_sent;
+	int     tx_bytes_sent;
+	int     rx_bytes_sent;
+	int     tx_bytes_skipped;
+	int     rx_bytes_skipped;
+	int     rx_passwd_flag;
+	int	tx_aux_size;
+#endif
 
 	/* Inactivity timeouts */
 

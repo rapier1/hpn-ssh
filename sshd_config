@@ -118,6 +118,8 @@ Subsystem	sftp	/usr/libexec/hpnsftp-server
 # allow the use of the none cipher
 #NoneEnabled no
 
+# Disable sshd auditing
+#AuditDisabled no
 # allow the use of the none MAC
 #NoneMacEnabled no
 

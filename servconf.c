@@ -214,6 +214,7 @@ initialize_server_options(ServerOptions *options)
 	options->fingerprint_hash = -1;
 	options->disable_forwarding = -1;
 	options->expose_userauth_info = -1;
+	options->audit_disabled = -1;
 	options->required_rsa_size = -1;
 	options->channel_timeouts = NULL;
 	options->num_channel_timeouts = 0;
@@ -483,6 +484,8 @@ fill_default_server_options(ServerOptions *options)
 		options->disable_multithreaded = 0;
 	if (options->hpn_disabled == -1)
 		options->hpn_disabled = 0;
+	if (options->audit_disabled == -1)
+		options->audit_disabled = 0;
 	if (options->ip_qos_interactive == -1)
 		options->ip_qos_interactive = IPTOS_DSCP_AF21;
 	if (options->ip_qos_bulk == -1)
@@ -565,6 +568,7 @@ typedef enum {
 	sPrintMotd, sPrintLastLog, sIgnoreRhosts,
 	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sHPNDisabled,
 	sDisableMTAES,
+	sAuditDisabled,
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
 	sPermitUserEnvironment, sAllowTcpForwarding, sCompression,
@@ -738,6 +742,7 @@ static struct {
 	{ "trustedusercakeys", sTrustedUserCAKeys, SSHCFG_ALL },
 	{ "authorizedprincipalsfile", sAuthorizedPrincipalsFile, SSHCFG_ALL },
 	{ "hpndisabled", sHPNDisabled, SSHCFG_ALL },
+	{ "auditdisabled", sAuditDisabled, SSHCFG_ALL },
 	{ "tcprcvbufpoll", sTcpRcvBufPoll, SSHCFG_ALL },
 	{ "noneenabled", sNoneEnabled, SSHCFG_ALL },
 	{ "nonemacenabled", sNoneMacEnabled, SSHCFG_ALL },
@@ -1529,6 +1534,10 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		intptr = &options->hpn_disabled;
 		goto parse_flag;
 
+	case sAuditDisabled:
+		intptr = &options->audit_disabled;
+		goto parse_flag;
+		
 	case sIgnoreUserKnownHosts:
 		intptr = &options->ignore_user_known_hosts;
  parse_flag:

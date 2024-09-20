@@ -215,6 +215,9 @@ typedef struct {
         int     tcp_rcv_buf_poll;       /* poll tcp rcv window in autotuning kernels*/
 	int	hpn_disabled;		/* disable hpn functionality. false by default */
 	int	none_enabled;		/* Enable NONE cipher switch */
+
+	int	audit_disabled;		/* disable SSHD instrumentation */
+	
 	int     nonemac_enabled;        /* Enable NONE MAC switch */
 	int disable_multithreaded; /* Disable multithreaded aes-ctr cipher */
   

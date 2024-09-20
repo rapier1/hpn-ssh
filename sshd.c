@@ -92,11 +92,31 @@
 #include "addr.h"
 #include "srclimit.h"
 
+#ifdef LIBWRAP
+#include <tcpd.h>
+#include <syslog.h>
+int allow_severity;
+int deny_severity;
+#endif /* LIBWRAP */
+
+#ifndef O_NOCTTY
+#define O_NOCTTY	0
+#endif
+
 /* Re-exec fds */
 #define REEXEC_DEVCRYPTO_RESERVED_FD	(STDERR_FILENO + 1)
 #define REEXEC_STARTUP_PIPE_FD		(STDERR_FILENO + 2)
 #define REEXEC_CONFIG_PASS_FD		(STDERR_FILENO + 3)
 #define REEXEC_MIN_FREE_FD		(STDERR_FILENO + 4)
+
+#ifdef NERSC_MOD
+#include "nersc.h"
+extern char n_ntop[NI_MAXHOST];
+extern char n_port[NI_MAXHOST];
+extern int client_session_id;
+extern char interface_list[256];
+extern int audit_disabled = 0;
+#endif
 
 extern char *__progname;
 
@@ -483,6 +503,24 @@ sighup_handler(int sig)
 static void
 sighup_restart(void)
 {
+
+#ifdef NERSC_MOD
+
+	struct listenaddr *li;
+	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
+	u_int i;
+
+	for (i = 0; i < options.num_listen_addrs; i++) {
+
+		li = &options.listen_addrs[i];
+
+		if ( getnameinfo(li->addrs->ai_addr, li->addrs->ai_addrlen,ntop, sizeof(ntop), strport, 
+				sizeof(strport),NI_NUMERICHOST|NI_NUMERICSERV) == 0) {
+			s_audit("sshd_restart_3", "addr=%s  port=%s/tcp", ntop, strport);
+		}
+	}
+#endif
+
 	logit("Received SIGHUP; restarting.");
 	if (options.pid_file != NULL)
 		unlink(options.pid_file);
@@ -807,10 +845,16 @@ listen_on_addrs(struct listenaddr *la)
 		if (listen(listen_sock, SSH_LISTEN_BACKLOG) == -1)
 			fatal("listen on [%s]:%s: %.100s",
 			    ntop, strport, strerror(errno));
-		logit("Server listening on %s port %s%s%s.",
-		    ntop, strport,
-		    la->rdomain == NULL ? "" : " rdomain ",
-		    la->rdomain == NULL ? "" : la->rdomain);
+		logit("Server listening on %s port %s.", ntop, strport);
+
+#ifdef NERSC_MOD
+		/* set using (pid,address,port) */
+		set_server_id(getpid(),ntop,(int)options.ports[0]);
+
+		s_audit("sshd_start_3", "addr=%s port=%s/tcp", ntop, strport);
+		client_session_id=0;
+		set_interface_list();
+#endif
 	}
 }
 
@@ -850,6 +894,15 @@ static void
 server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s,
     int log_stderr)
 {
+
+#ifdef NERSC_MOD
+	struct addrinfo *ai;
+	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
+
+	ai = options.listen_addrs->addrs;
+	struct timespec l_tv;
+#endif 
+
 	struct pollfd *pfd = NULL;
 	int i, ret, npfd;
 	int oactive = -1, listening = 0, lameduck = 0;
@@ -896,6 +949,17 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s,
 			close_listen_socks();
 			if (options.pid_file != NULL)
 				unlink(options.pid_file);
+
+/*
+ * taking this out for the time being as it is causing issues with NERSC
+ *
+#ifdef NERSC_MOD
+			if (  getnameinfo(ai->ai_addr, ai->ai_addrlen,ntop, sizeof(ntop), strport,
+					sizeof(strport),NI_NUMERICHOST|NI_NUMERICSERV) == 0) {
+				s_audit("sshd_exit_3", "addr=%s  port=%s/tcp", ntop, strport);
+			}
+#endif
+ */
 			exit(received_sigterm == SIGTERM ? 0 : 255);
 		}
 		if (received_sigchld) {
@@ -939,7 +1003,26 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s,
 		}
 
 		/* Wait until a connection arrives or a child exits. */
+#ifndef NERSC_MOD
 		ret = ppoll(pfd, npfd, NULL, &osigset);
+#endif
+
+#ifdef NERSC_MOD
+
+		/*  If a connection happens, we break from the loop with some ammount of
+		 *  data flagged in the return bits of select.  On error we see ret < 0.
+		 *
+		 *  This needs to be tested wqith great enthusiasm since there might be corner
+		 *  cases of ret == 0 that I am not aware of
+		 */
+		l_tv.tv_sec = 60;
+		l_tv.tv_nsec = 0;
+
+		ret = ppoll(pfd, npfd, &l_tv, &osigset);
+
+		s_audit("sshd_server_heartbeat_3", "count=%i", ret);
+#endif
+
 		if (ret == -1 && errno != EINTR) {
 			error("ppoll: %.100s", strerror(errno));
 			if (errno == EINVAL)
@@ -1462,6 +1545,20 @@ main(int ac, char **av)
 		fprintf(stderr, "Extra argument %s.\n", av[optind]);
 		exit(1);
 	}
+
+#ifdef NERSC_MOD
+	/* here we are setting the values for the server id which lives in nersc.c */
+	getnameinfo(options.listen_addrs->addrs->ai_addr, options.listen_addrs->addrs->ai_addrlen,
+		n_ntop, sizeof(n_ntop), n_port,sizeof(n_port),
+		NI_NUMERICHOST|NI_NUMERICSERV); 
+
+	/* To avoid linking issues, we just set a variable here based on the running configuration
+	 *   not my favorite
+	 */
+	if ( options.audit_disabled )
+		audit_disabled = 1;
+
+#endif
 
 	debug("sshd version %s, %s", SSH_VERSION, SSH_OPENSSL_VERSION);
 

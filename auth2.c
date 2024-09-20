@@ -61,6 +61,11 @@
 #include "digest.h"
 #include "kex.h"
 
+#ifdef NERSC_MOD
+#include "nersc.h"
+extern int client_session_id;
+#endif
+
 /* import */
 extern ServerOptions options;
 extern struct sshbuf *loginmsg;

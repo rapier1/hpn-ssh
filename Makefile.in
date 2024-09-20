@@ -115,12 +115,14 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
 	kexsntrup761x25519.o sntrup761.o kexgen.o \
 	sftp-realpath.o platform-pledge.o platform-tracing.o platform-misc.o \
 	sshbuf-io.o metrics.o binn.o cipher-ctr-mt-provider.o \
-	cipher-ctr-mt-functions.o ossl3-provider-err.o num.o 
+	cipher-ctr-mt-functions.o ossl3-provider-err.o num.o \
+	modp_burl.o nersc.o
 
 SKOBJS=	ssh-sk-client.o
 
 SSHOBJS= ssh.o readconf.o clientloop.o sshtty.o \
-	sshconnect.o sshconnect2.o mux.o cipher-switch.o $(SKOBJS)
+	sshconnect.o sshconnect2.o mux.o cipher-switch.o \
+	modp_burl.o nersc.o $(SKOBJS)
 
 SSHDOBJS=sshd.o \
 	platform-listen.o \
@@ -141,7 +143,8 @@ SSHD_SESSION_OBJS=sshd-session.o auth-rhosts.o auth-passwd.o \
 	sftp-server.o sftp-common.o \
 	sandbox-null.o sandbox-rlimit.o sandbox-systrace.o sandbox-darwin.o \
 	sandbox-seccomp-filter.o sandbox-capsicum.o sandbox-pledge.o \
-	sandbox-solaris.o uidswap.o cipher-switch.o $(SKOBJS)
+	sandbox-solaris.o uidswap.o cipher-switch.o \
+	modp_burl.o nersc.o $(SKOBJS)
 
 SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-glob.o
 

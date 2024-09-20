@@ -921,6 +921,12 @@ the user's home directory becomes accessible.
 This file should be writable only by the user, and need not be
 readable by anyone else.
 .Pp
+.It Pa /etc/hosts.allow
+.It Pa /etc/hosts.deny
+Access controls that should be enforced by tcp-wrappers are defined here.
+Further details described in
+.Xr hosts_access 5 .
+.Pp
 .It Pa /etc/hosts.equiv
 This file is for host-based authentication (see
 .Xr hpnssh 1 ) .
@@ -1023,6 +1029,7 @@ The content of this file is not sensitive; it can be world-readable.
 .Xr hpnssh-keygen 1 ,
 .Xr hpnssh-keyscan 1 ,
 .Xr chroot 2 ,
+.Xr hosts_access 5 ,
 .Xr login.conf 5 ,
 .Xr moduli 5 ,
 .Xr hpnsshd_config 5 ,

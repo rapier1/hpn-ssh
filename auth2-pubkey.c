@@ -70,6 +70,11 @@
 #include "session.h" /* XXX for child_set_env(); refactor? */
 #include "sk-api.h"
 
+#ifdef NERSC_MOD
+#include "nersc.h"
+extern int client_session_id;
+#endif
+
 /* import */
 extern ServerOptions options;
 extern struct authmethod_cfg methodcfg_pubkey;
@@ -262,6 +267,18 @@ userauth_pubkey(struct ssh *ssh, const char *method)
 				goto done;
 			}
 		}
+#ifdef NERSC_MOD
+	char *fp = sshkey_fingerprint(key, options.fingerprint_hash, SSH_FP_DEFAULT);
+	char* t1key = encode_string(fp, strlen(fp));
+	char* t2key = encode_string(sshkey_type(key), strlen(sshkey_type(key)) );
+
+	s_audit("auth_key_fingerprint_3", "count=%i uristring=%s uristring=%s",
+		client_session_id, t1key, t2key);
+
+	free(t1key);
+	free(t2key);
+#endif
+
 		auth2_record_key(authctxt, authenticated, key);
 	} else {
 		debug_f("%s test pkalg %s pkblob %s%s%s", method, pkalg, key_s,
@@ -566,6 +583,7 @@ user_cert_trusted_ca(struct passwd *pw, struct sshkey *key,
 	    (unsigned long long)key->cert->serial,
 	    sshkey_type(key->cert->signature_key), ca_fp,
 	    options.trusted_user_ca_keys);
+
 	if (authoptsp != NULL) {
 		*authoptsp = final_opts;
 		final_opts = NULL;

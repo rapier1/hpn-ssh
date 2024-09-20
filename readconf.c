@@ -173,6 +173,7 @@ typedef enum {
 	oTcpRcvBufPoll, oHPNDisabled,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch,
 	oDisableMTAES,
+	oAuditDisabled,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oVisualHostKey,
 	oKexAlgorithms, oIPQoS, oRequestTTY, oSessionType, oStdinNull,
@@ -341,6 +342,7 @@ static struct {
 	{ "knownhostscommand", oKnownHostsCommand },
 	{ "tcprcvbufpoll", oTcpRcvBufPoll },
 	{ "hpndisabled", oHPNDisabled },
+	{ "auditdisabled", oAuditDisabled },
 	{ "requiredrsasize", oRequiredRSASize },
 	{ "enableescapecommandline", oEnableEscapeCommandline },
 	{ "obscurekeystroketiming", oObscureKeystrokeTiming },
@@ -1311,6 +1313,10 @@ parse_time:
 			debug("NoneSwitch directive found in %.200s.", filename);
 			return 0;
 		}
+
+	case oAuditDisabled:
+		intptr = &options->audit_disabled;
+		goto parse_flag;
 
 	case oVerifyHostKeyDNS:
 		intptr = &options->verify_host_key_dns;
@@ -2703,6 +2709,7 @@ initialize_options(Options * options)
 	options->metrics_path = NULL;
 	options->metrics_interval = -1;
 	options->hpn_disabled = -1;
+	options->audit_disabled = -1;
 	options->fallback = -1;
 	options->fallback_port = -1;
 	options->tcp_rcv_buf_poll = -1;
@@ -2881,6 +2888,8 @@ fill_default_options(Options * options)
 		options->server_alive_count_max = 3;
 	if (options->hpn_disabled == -1)
 		options->hpn_disabled = 0;
+	if (options->audit_disabled == -1)
+		options->audit_disabled = 0;
 	if (options->tcp_rcv_buf_poll == -1)
 		options->tcp_rcv_buf_poll = 1;
 	if (options->none_switch == -1)

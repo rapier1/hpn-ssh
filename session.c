@@ -96,6 +96,12 @@
 #include "atomicio.h"
 #include "cipher-switch.h"
 
+#ifdef NERSC_MOD
+#include "nersc.h"
+#include <ctype.h>
+extern int client_session_id;
+#endif
+
 #if defined(KRB5) && defined(USE_AFS)
 #include <kafs.h>
 #endif
@@ -445,6 +451,16 @@ do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 	}
 #endif
 
+#ifdef NERSC_MOD
+	if ( command != NULL ) 	{
+
+		char* t1buf = encode_string(command, strlen(command));
+		s_audit("session_remote_exec_no_pty_3", "count=%i count=%i count=%ld uristring=%s", 
+			client_session_id, s->chanid, (long)getppid(), t1buf);
+		free(t1buf);
+	}
+#endif
+
 	session_proctitle(s);
 
 	/* Fork the child. */
@@ -580,6 +596,15 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 	ptyfd = s->ptyfd;
 	ttyfd = s->ttyfd;
 
+#ifdef NERSC_MOD
+	if ( command != NULL ) 	{
+
+		char* t1buf = encode_string(command, strlen(command));
+		s_audit("session_remote_exec_pty_3", "count=%i count=%i count=%ld uristring=%s", 
+			client_session_id, s->chanid, (long)getppid(), t1buf);
+		free(t1buf);
+	}
+#endif
 	/*
 	 * Create another descriptor of the pty master side for use as the
 	 * standard input.  We could use the original descriptor, but this
@@ -678,6 +703,19 @@ do_exec(struct ssh *ssh, Session *s, const char *command)
 	int ret;
 	const char *forced = NULL, *tty = NULL;
 	char session_type[1024];
+
+#ifdef NERSC_MOD
+	/* since the channel client/server code now takes the raw string
+	 *  data, we remove the 'clean_command' functionality 
+	 */
+	if ( command != NULL ) 	{
+
+		char* t1buf = encode_string(command, strlen(command));
+		s_audit("session_remote_do_exec_3", "count=%i count=%i count=%ld uristring=%s", 
+			client_session_id, s->chanid, (long)getppid(), t1buf);
+		free(t1buf);
+	}
+#endif
 
 	if (options.adm_forced_command) {
 		original_command = command;
@@ -2229,6 +2267,17 @@ session_input_channel_req(struct ssh *ssh, Channel *c, const char *rtype)
 			success = session_env_req(ssh, s);
 		}
 	}
+
+#ifdef NERSC_MOD
+	if ((strcmp(rtype,"window-change") != 0) && (strcmp(rtype,"env") != 0)) {
+
+		char* t1buf = encode_string(rtype, strlen(rtype));
+		s_audit("session_channel_request_3", "count=%i int=%d count=%d uristring=%s", 
+			client_session_id, getpid(), c->self, t1buf);
+		free(t1buf);
+	}
+#endif
+
 	if (strcmp(rtype, "window-change") == 0) {
 		success = session_window_change_req(ssh, s);
 	} else if (strcmp(rtype, "break") == 0) {
@@ -2409,6 +2458,10 @@ session_exit_message(struct ssh *ssh, Session *s, int status)
 
 	/* disconnect channel */
 	debug_f("release channel %d", s->chanid);
+
+#ifdef NERSC_MOD
+	s_audit("session_exit_3", "count=%i count=%d count=%ld count=%d", client_session_id, s->chanid, (long)getppid(), status);
+#endif
 
 	/*
 	 * Adjust cleanup callback attachment to send close messages when
@@ -2618,6 +2671,14 @@ session_setup_x11fwd(struct ssh *ssh, Session *s)
 		    s->display_number, s->screen);
 		s->display = xstrdup(display);
 		s->auth_display = xstrdup(auth_display);
+
+#ifdef NERSC_MOD
+		char* t1buf = encode_string(display, strlen(display));
+		s_audit("session_x11fwd_3", "count=%i count=%i uristring=%s", 
+			client_session_id, s->chanid, t1buf);
+		free(t1buf);
+#endif
+
 	} else {
 #ifdef IPADDR_IN_DISPLAY
 		struct hostent *he;

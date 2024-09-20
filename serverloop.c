@@ -83,6 +83,11 @@
 #include "metrics.h"
 #include "cipher-switch.h"
 
+#ifdef NERSC_MOD
+#include "nersc.h"
+extern int client_session_id;
+#endif
+
 extern ServerOptions options;
 
 /* XXX */
@@ -338,6 +343,10 @@ server_loop2(struct ssh *ssh, Authctxt *authctxt)
 
 	server_init_dispatch(ssh);
 
+#ifdef NERSC_MOD
+	s_audit("session_new_3", "count=%i int=%d uristring=SSH2", client_session_id, (int)getpid());
+#endif
+
 	for (;;) {
 		process_buffered_input_packets(ssh);
 
@@ -432,6 +441,18 @@ server_request_direct_tcpip(struct ssh *ssh, int *reason, const char **errmsg)
 	    !options.disable_forwarding) {
 		c = channel_connect_to_port(ssh, target, target_port,
 		    "direct-tcpip", "direct-tcpip", reason, errmsg);
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(originator, strlen(originator));
+	char* t2buf = encode_string(target, strlen(target));
+	
+	s_audit("session_request_direct_tcpip_3", "count=%i count=%i uristring=%s port=%d/tcp string=%s port=%d/tcp count=%i",
+		client_session_id, c->self, t1buf, originator_port, t2buf, target_port);
+		
+	free(t1buf);
+	free(t2buf);
+#endif
+
 	} else {
 		logit("refused local port forward: "
 		    "originator %s port %d, target %s port %d",
@@ -528,6 +549,12 @@ server_request_tun(struct ssh *ssh)
 	sock = tun_open(tun, mode, &ifname);
 	if (sock < 0)
 		goto done;
+
+#ifdef NERSC_MOD
+	s_audit("session_tun_init_3", "count=%i count=%i count=%i",
+		client_session_id, c->self, mode);
+#endif
+
 	debug("Tunnel forwarding using interface %s", ifname);
 
 	c = channel_new(ssh, "tun", SSH_CHANNEL_OPEN, sock, sock, -1,
@@ -627,6 +654,7 @@ server_input_channel_open(int type, u_int32_t seq, struct ssh *ssh)
 		c->remote_window = rwindow;
 		c->remote_maxpacket = rmaxpack;
 		if (c->type != SSH_CHANNEL_CONNECTING) {
+
 			if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_OPEN_CONFIRMATION)) != 0 ||
 			    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
 			    (r = sshpkt_put_u32(ssh, c->self)) != 0 ||
@@ -636,6 +664,14 @@ server_input_channel_open(int type, u_int32_t seq, struct ssh *ssh)
 				sshpkt_fatal(ssh, r,
 				    "%s: send open confirm", __func__);
 			}
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(ctype, strlen(ctype));
+	
+	s_audit("session_input_channel_open_3", "count=%i count=%i uristring=%s int=%d int=%i int=%d",
+		client_session_id, type, t1buf, rchan, rwindow, rmaxpack);
+		
+	free(t1buf);
+#endif
 		}
 	} else {
 		debug_f("failure %s", ctype);

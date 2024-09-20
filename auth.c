@@ -83,6 +83,14 @@ extern struct sshbuf *loginmsg;
 extern struct passwd *privsep_pw;
 extern struct sshauthopt *auth_opts;
 
+#ifdef NERSC_MOD
+#include "nersc.h"
+#include <unistd.h>
+extern int client_session_id;
+extern char n_ntop[NI_MAXHOST];
+extern char n_port[NI_MAXHOST];
+#endif
+
 /* Debugging messages */
 static struct sshbuf *auth_debug;
 
@@ -306,6 +314,19 @@ auth_log(struct ssh *ssh, int authenticated, int partial,
 
 	free(extra);
 
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(authctxt->user, strlen(authctxt->user) );
+	char* t2buf = encode_string(method, strlen(method) );
+	char* t3buf = encode_string(authmsg, strlen(authmsg) );
+
+	s_audit("auth_info_3", "count=%i uristring=%s uristring=%s uristring=%s addr=%.200s  port=%d/tcp addr=%s port=%s/tcp",
+		client_session_id, t3buf, t1buf, t2buf, ssh_remote_ipaddr(ssh), ssh_remote_port(ssh), n_ntop, 
+		n_port);
+	free(t1buf);
+	free(t2buf);
+	free(t3buf);
+#endif
+
 #if defined(CUSTOM_FAILED_LOGIN) || defined(SSH_AUDIT_EVENTS)
 	if (authenticated == 0 && !(authctxt->postponed || partial)) {
 		/* Log failed login attempt */
@@ -322,6 +343,7 @@ auth_log(struct ssh *ssh, int authenticated, int partial,
 	}
 #endif
 #if defined(CUSTOM_FAILED_LOGIN) && defined(WITH_AIXAUTHENTICATE)
+
 	if (authenticated)
 		sys_auth_record_login(authctxt->user,
 		    auth_get_canonical_hostname(ssh, options.use_dns), "ssh",
@@ -496,6 +518,13 @@ getpwnamallow(struct ssh *ssh, const char *user)
 		record_failed_login(ssh, user,
 		    auth_get_canonical_hostname(ssh, options.use_dns), "ssh");
 #endif
+
+#ifdef NERSC_MOD
+	char* t1buf = encode_string(user, strlen(user));
+	s_audit("auth_invalid_user_3", "count=%i uristring=%s", client_session_id, t1buf);
+	free(t1buf);
+#endif
+
 #ifdef SSH_AUDIT_EVENTS
 		audit_event(ssh, SSH_INVALID_USER);
 #endif /* SSH_AUDIT_EVENTS */
