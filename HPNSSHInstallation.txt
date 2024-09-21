@@ -136,7 +136,7 @@ Enter any runtime options you want on the SSHD_OPTS line. If you can’t think o
 leave it blank. A sample /etc/defauls/hpnssh file may be found in defaults.hpnsshd.
 
 You must then reload the systemd service to make it aware of this new service with
-sudo systemctl daemon-reload
+“sudo systemctl daemon-reload”
 
 If you are using an init.d (you start a service with ‘system’) then you need to install an
 init.d. Create the file /etc/init.d/hpnssh and copy the following into it. NB: The following is
