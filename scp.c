@@ -1371,6 +1371,17 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
  * fragments match. There may be a more efficient process for the hashing
  * Note: LibreSSL doesn't support blake2b512 so we can't offer them
  * the resume feature cjr 7/18/2023 */
+
+/* 10/16/2024 Looking to move from blake512 to xxhash. xxHash is
+ * significantly faster but isn't a cryptographic hash. That shouldn't
+ * be a problem in this application though. We don't need it to act as
+ * a signature but, instead, to ensure that the file sections are
+ * equivilant. It also has the advantage of *not* relying on a crypto
+ * library so we can make it available more widely.
+ * xxHash is available from https://github.com/Cyan4973/xxHash
+ * The question we need to answer is do we make it a dependency or do we
+ * build it locally and install the library ourselves? -CJR */
+
 #if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 void calculate_hash(char *filename, char *output, off_t length)
 {
