@@ -140,6 +140,13 @@
 #if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 #include <openssl/evp.h>
 #endif
+/* trying to incorporate xxhash it's self contained 
+ * so it will work with libressl and it's faster than 
+ * blake512. However, we have other versions of hpn-ssh
+ * that use the blake512 hash so we need to have both for now
+ * CJR 11/5/2024
+ */
+#include "xxhash.h"
 #include "sftp.h"
 
 #include "sftp-common.h"
@@ -148,6 +155,7 @@
 extern char *__progname;
 
 #define COPY_BUFLEN	16384
+#define DEBUG
 
 int do_cmd(char *, char *, char *, int, int, char *, int *, int *, pid_t *);
 int do_cmd2(char *, char *, int, char *, int, int);
@@ -1382,7 +1390,7 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
  * The question we need to answer is do we make it a dependency or do we
  * build it locally and install the library ourselves? -CJR */
 
-#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
+#if !(defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 void calculate_hash(char *filename, char *output, off_t length)
 {
 	int n, md_len;
@@ -1410,7 +1418,6 @@ void calculate_hash(char *filename, char *output, off_t length)
 	md = EVP_get_digestbyname("blake2b512");
 	c = EVP_MD_CTX_new();
 	EVP_DigestInit_ex(c, md, NULL);
-
 	while (length > 0) {
 		if (length > HASH_BUFLEN)
 			/* fread returns the number of elements read.
@@ -1434,9 +1441,85 @@ void calculate_hash(char *filename, char *output, off_t length)
 	fclose(file_ptr);
 }
 #else
+#include <assert.h>
 void calculate_hash(char *filename, char *output, off_t length)
 {
   /* empty function for builds without openssl or are using libressl */
+  /* this was an empty function but for now we are going to use it to 
+   * test xxhash. Once we have it working we can figure out the compatibility 
+   * tests and fallback methods. cjr 11/5/2024
+   */
+ 	size_t n, xxhash_len;
+	/* XXH3_state_t* state; /\* hash context *\/ */
+	/* XXH128_hash_t hash; /\* hash results *\/ */
+	XXH64_canonical_t canonical;
+	char buf[HASH_BUFLEN];
+	ssize_t bytes;
+	char tmp[3];
+	FILE *file_ptr;
+	*output = '\0';
+
+	/* open file for calculating hash */
+	file_ptr = fopen(filename, "r");
+	if (file_ptr==NULL)
+	{
+		if (verbose_mode) {
+			fprintf(stderr, "%s: error opening file %s\n", hostname, filename);
+			/* file the expected output with spaces */
+			snprintf(output, HASH_LEN, "%s",  " ");
+		}
+		return;
+	}
+	
+	/* state = XXH3_createState(); */
+
+	/* while (length > 0) { */
+	/* 	if (length > HASH_BUFLEN) */
+	/* 		bytes=fread(buf, 1,  HASH_BUFLEN, file_ptr); */
+	/* 	else */
+	/* 		bytes=fread(buf, 1, length, file_ptr); */
+	/* 	fprintf(stderr, "%s: length is '%ld' of HASH_BUFLEN  %d for bytes %d\n", hostname, length, HASH_BUFLEN, bytes); */
+	/* 	XXH3_128bits_update(state, buf, bytes); */
+	/* 	length -= HASH_BUFLEN; */
+	/* } */
+	/* hash = XXH3_128bits_digest(state); */
+	/* XXH3_freeState(state); */
+
+	/* /\* this uses the canonical version of the hash to improve */
+	/*  * portability by standarizing an endianess. */
+	/*  * See the xxhash.h documentation */
+	/*  *\/ */
+
+	    // Allocate a state struct. Do not just use malloc() or new.
+	XXH3_state_t* state = XXH3_createState();
+	assert(state != NULL && "Out of memory!");
+	// Reset the state to start a new hashing session.
+	XXH3_64bits_reset(state);
+	char buffer[4096];
+	size_t count;
+	// Read the file in chunks
+	while ((count = fread(buffer, 1, sizeof(buffer), file_ptr)) != 0) {
+		// Run update() as many times as necessary to process the data
+		XXH3_64bits_update(state, buffer, count);
+	}
+	// Retrieve the finalized hash. This will not change the state.
+	XXH64_hash_t result = XXH3_64bits_digest(state);
+	// Free the state. Do not use free().
+	XXH3_freeState(state);
+        XXH64_canonicalFromHash(&canonical, result);
+	xxhash_len = sizeof(canonical.digest);
+	fprintf (stderr, "hash length is %d\n", xxhash_len);
+	/* convert the hash into a string */
+	for(n=0; n < xxhash_len; n++) {
+		snprintf(tmp, 3, "%02x", canonical.digest[n]);
+		strncat(output, tmp, 3);
+	}
+	strncat(output, " ", 1);
+	
+#ifdef DEBUG
+	fprintf(stderr, "%s: HASH IS '%s' of length %ld\n", hostname, output, strlen(output));
+#endif
+	fclose(file_ptr); 
 }
 #endif /* WITH_OPENSSL */
 
@@ -2148,8 +2231,8 @@ sink(int argc, char **argv, const char *src)
 #ifdef DEBUG
 			fprintf (stderr, "%s: '%s'\n", hostname, remote_hashsum);
 #endif
-			if (!cp || *cp++ != ' ')
-				SCREWUP("hash not delimited");
+//			if (!cp || *cp++ != ' ')
+//				SCREWUP("hash not delimited");
 		}
 #ifdef DEBUG
 		fprintf(stderr, "%s: cp is %s\n", hostname, cp);
