@@ -1527,7 +1527,7 @@ Optional Packages:
   --with-superuser-path=  Specify different path for super-user
   --with-4in6             Check for and convert IPv4 in IPv6 mapped addresses
   --with-bsd-auth         Enable BSD auth support
-  --with-pid-dir=PATH     Specify location of sshd.pid file
+  --with-pid-dir=PATH     Specify location of hpnsshd.pid file
   --with-lastlog=FILE|DIR specify lastlog location common locations
 
 Some influential environment variables:
@@ -18783,8 +18783,8 @@ then :
 			200*)   # LibreSSL
 				lver=`echo "$sslver" | sed 's/.*libressl-//'`
 				case "$lver" in
-				2*|300*) # 2.x, 3.0.0
-					as_fn_error $? "LibreSSL >= 3.1.0 required (have \"$ssl_showver\")" "$LINENO" 5
+				2*|300*|301*|302*|303*|304*|306*) # 2.x, 3.0.0
+					as_fn_error $? "LibreSSL >= 3.7.0 required (have \"$ssl_showver\")" "$LINENO" 5
 					;;
 				*) ;;	# Assume all other versions are good.
 				esac
@@ -18793,6 +18793,9 @@ then :
 				# OpenSSL 3; we use the 1.1x API
 				# https://openssl.org/policies/general/versioning-policy.html
 				CPPFLAGS="$CPPFLAGS -DOPENSSL_API_COMPAT=0x10100000L"
+
+printf "%s\n" "#define WITH_OPENSSL3 1" >>confdefs.h
+
 				;;
 		        *)
 				as_fn_error $? "Unknown/unsupported OpenSSL version (\"$ssl_showver\")" "$LINENO" 5
@@ -19076,6 +19079,58 @@ then :
 fi
 
 
+	# OpenSSL 3.0 API
+	# Does OpenSSL support the EVP_MAC functions for Poly1305?
+	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether OpenSSL supports Poly1305 MAC EVP" >&5
+printf %s "checking whether OpenSSL supports Poly1305 MAC EVP... " >&6; }
+	if test "$cross_compiling" = yes
+then :
+  { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in \`$ac_pwd':" >&5
+printf "%s\n" "$as_me: error: in \`$ac_pwd':" >&2;}
+as_fn_error $? "cannot run test program while cross compiling
+See \`config.log' for more details" "$LINENO" 5; }
+else $as_nop
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+	#include <stdlib.h>
+	#include <stdio.h>
+	#include <openssl/evp.h>
+
+int
+main (void)
+{
+
+		EVP_MAC *mac = EVP_MAC_fetch(NULL, "poly1305", NULL);
+		if (mac == NULL)
+		   exit(1);
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_run "$LINENO"
+then :
+
+			{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+printf "%s\n" "#define OPENSSL_HAVE_POLY_EVP 1" >>confdefs.h
+
+
+else $as_nop
+
+			{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+
+
+fi
+rm -f core *.core core.conftest.* gmon.out bb.out conftest$ac_exeext \
+  conftest.$ac_objext conftest.beam conftest.$ac_ext
+fi
+
+
+
 	if test "x$openssl_engine" = "xyes" ; then
 		{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for OpenSSL ENGINE support" >&5
 printf %s "checking for OpenSSL ENGINE support... " >&6; }
@@ -19109,6 +19164,8 @@ else $as_nop
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
 	fi
+
+
 
 	# Check for OpenSSL without EVP_aes_{192,256}_cbc
 	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether OpenSSL lacks support for AES 192/256" >&5
@@ -20228,7 +20285,7 @@ case "$host" in
 	SSH_PRIVSEP_USER=CYGWIN_SSH_PRIVSEP_USER
 	;;
 *)
-	SSH_PRIVSEP_USER=sshd
+	SSH_PRIVSEP_USER=hpnsshd
 	;;
 esac
 
@@ -25159,11 +25216,11 @@ then :
 fi
 
 if test -z "$MANTYPE"; then
-	if ${MANDOC} ${srcdir}/ssh.1 >/dev/null 2>&1; then
+	if ${MANDOC} ${srcdir}/hpnssh.1 >/dev/null 2>&1; then
 		MANTYPE=doc
-	elif ${NROFF} -mdoc ${srcdir}/ssh.1 >/dev/null 2>&1; then
+	elif ${NROFF} -mdoc ${srcdir}/hpnssh.1 >/dev/null 2>&1; then
 		MANTYPE=doc
-	elif ${NROFF} -man ${srcdir}/ssh.1 >/dev/null 2>&1; then
+	elif ${NROFF} -man ${srcdir}/hpnssh.1 >/dev/null 2>&1; then
 		MANTYPE=man
 	else
 		MANTYPE=cat
@@ -25514,7 +25571,7 @@ printf "%s\n" "#define BSD_AUTH 1" >>confdefs.h
 fi
 
 
-# Where to place sshd.pid
+# Where to place hpnsshd.pid
 piddir=/var/run
 # make sure the directory exists
 if test ! -d $piddir ; then
@@ -27716,3 +27773,4 @@ if test "$AUDIT_MODULE" = "bsm" ; then
 	echo "WARNING: BSM audit support is currently considered EXPERIMENTAL."
 	echo "See the Solaris section in README.platform for details."
 fi
+
