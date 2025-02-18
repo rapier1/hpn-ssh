@@ -1405,9 +1405,6 @@
 /* define if you have struct timeval */
 #undef HAVE_STRUCT_TIMEVAL
 
-/* Define to 1 if you have the `swap32' function. */
-#undef HAVE_SWAP32
-
 /* Define to 1 if you have the `sysconf' function. */
 #undef HAVE_SYSCONF
 
@@ -1775,6 +1772,9 @@
 /* libcrypto has NID_secp521r1 */
 #undef OPENSSL_HAS_NISTP521
 
+/* Libcrypto supports Poly1305 MAC EVP */
+#undef OPENSSL_HAVE_POLY_EVP
+
 /* libcrypto is missing AES 192 and 256 bit functions */
 #undef OPENSSL_LOBOTOMISED_AES
 
@@ -2004,6 +2004,9 @@
 
 /* use libcrypto for cryptography */
 #undef WITH_OPENSSL
+
+/* With OpenSSL3 */
+#undef WITH_OPENSSL3
 
 /* Define if you want SELinux support. */
 #undef WITH_SELINUX
