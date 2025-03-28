@@ -1592,6 +1592,10 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		intptr = &options->nonemac_enabled;
 		goto parse_flag;
 
+	case sDisableMTAES:
+		intptr = &options->disable_multithreaded;
+		goto parse_flag;
+
 	case sUseMPTCP:
 		intptr = &options->use_mptcp;
 		goto parse_flag;
@@ -1601,18 +1605,6 @@ process_server_config_line_depth(ServerOptions *options, char *line,
  parse_flag:
 		multistate_ptr = multistate_flag;
 		goto parse_multistate;
-
-	case sNoneEnabled:
-		intptr = &options->none_enabled;
-		goto parse_flag;
-
-	case sNoneMacEnabled:
-		intptr = &options->nonemac_enabled;
-		goto parse_flag;
-
-	case sDisableMTAES:
-		intptr = &options->disable_multithreaded;
-		goto parse_flag;
 
 	case sHostbasedAuthentication:
 		intptr = &options->hostbased_authentication;
