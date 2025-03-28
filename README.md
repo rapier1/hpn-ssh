@@ -1,5 +1,7 @@
 # HPNSSH: Based on Portable OpenSSH
 
+HPN-SSH is a high performance soft fork of OpenSSH that can provide significnatly faster throughput for bulk data transfers over a wide range of network paths. In some situations we've seen throughput rates more than 100 times faster than OpenSSH. HPN-SSH is able to do this by optimizing the application layer receive buffer to match the TCP receive buffer. Notably, to see performance improvements HPN-SSH only needs to be the data receiver so users can see notable improvements with many other SSH implementations. HPN-SSH also incorporate two parallelized ciphers, AES-CTR and Chacha20 (the default). When using these ciphers a throughput performance increase of 30% is typical. More information on how we do this work and other features of HPN-SSH is available from [https://hpnssh.org](https://hpnssh.org). 
+
 Starting with version HPN17v0 there will be significant changes to the naming convention used for executables and installation locations. The last version that does not include these changes is HPN16v1 corresponding to the HPN-8_8_P1 tag on the master branch.
 
 HPNSSH is a variant of OpenSSH. It a complete implementation of the SSH protocol (version 2) for secure remote login, command execution and file transfer. It includes a client ``hpnssh`` and server ``hpnsshd``, file transfer utilities ``hpnscp`` and ``hpnsftp`` as well as tools for key generation (``hpnssh-keygen``), run-time key storage (``hpnssh-agent``) and a number of supporting programs. It includes numerous performance and functionality enhancements focused on high performance networks and computing envrironments. Complete information can be found in the HPN-README file.
@@ -49,7 +51,8 @@ Releases include a pre-built copy of the ``configure`` script and may be built u
 
 ```
 tar zxvf hpnssh-X.YpZ.tar.gz
-cd hpnssh
+cd hpn-ssh
+autoreconf -f -i
 ./configure # [options]
 make && make tests
 ```
@@ -62,8 +65,8 @@ If building from git, you'll need [autoconf](https://www.gnu.org/software/autoco
 
 ```
 git clone https://github.com/rapier1/hpn-ssh
-cd openssh-portable
-autoreconf
+cd hpn-ssh
+autoreconf -f -i
 ./configure
 make && make tests
 ```

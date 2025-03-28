@@ -127,7 +127,7 @@ Alternatively, the ./configure command will generate a hpnsshd.service file from
 hpnsshd.service.in. You can use this file by copying it to
 /libsystemd/system/hpnsshd.service instead of copying the above text.
 
-Then create the defaults file at /etc/defaults/hpnsshd with the following content:
+Then create the defaults file at /etc/default/hpnsshd with the following content:
 # Default settings for openssh-server.
 # Options to pass to sshd
 SSHD_OPTS=
