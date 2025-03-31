@@ -359,14 +359,21 @@ ssh_create_socket(struct addrinfo *ai)
 #endif
 	char ntop[NI_MAXHOST];
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0) /* MPTCP only in 5.6+ */
+#if HAVE_MPTCP /* supported in Linux and OSX */
 	sock = socket(ai->ai_family, ai->ai_socktype,
 	    options.use_mptcp ? IPPROTO_MPTCP : ai->ai_protocol);
 #else
+	/* they asked to use mptcp but the OS doesn't support it
+	 * I don't want them to think they are using MPTCP
+	 * when they aren't - CJR 3/31/2025*/
+	if (options.use_mptcp)
+		fatal("MPTCP not supported by the operating system.");
 	sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 #endif
 	if (sock == -1) {
 		error("socket: %s", strerror(errno));
+		if (options.use_mptcp)
+			error ("You asked to use MPTCP. Please ensure it is enabled.");
 		return -1;
 	}
 	(void)fcntl(sock, F_SETFD, FD_CLOEXEC);

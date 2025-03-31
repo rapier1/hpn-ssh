@@ -2476,6 +2476,37 @@ if test ! -z "$check_for_openpty_ctty_bug"; then
 	)
 fi
 
+
+# Testing MPTCP Support
+# Does the OS support MPTCP?
+	AC_MSG_CHECKING([whether the OS supports MPTCP])
+	AC_RUN_IFELSE(
+		[AC_LANG_PROGRAM([[
+		#include <stdio.h>
+		#include <stdlib.h>
+		#include <unistd.h>
+		#include <sys/types.h>
+		#include <sys/socket.h>
+		#include <stdbool.h>
+		#include <netinet/in.h>
+
+		]], [[
+		int sock = -1;
+		sock = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+		if (sock < 0) {
+		   exit(1);
+		   }
+		]])],
+		[
+			AC_MSG_RESULT([yes])
+			AC_DEFINE([HAVE_MPTCP], [1],
+			    [OS Supports MPTCP])
+		],
+		[
+			AC_MSG_RESULT([no])
+		]
+	)
+
 if test "x$ac_cv_func_getaddrinfo" = "xyes" && \
     test "x$check_for_hpux_broken_getaddrinfo" = "x1"; then
 	AC_MSG_CHECKING([if getaddrinfo seems to work])
@@ -3035,7 +3066,6 @@ if test "x$openssl" = "xyes" ; then
 			AC_MSG_RESULT([no])
 		]
 	)
-
 
 	if test "x$openssl_engine" = "xyes" ; then
 		AC_MSG_CHECKING([for OpenSSL ENGINE support])

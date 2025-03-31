@@ -971,6 +971,9 @@
 /* define if you have mode_t data type */
 #undef HAVE_MODE_T
 
+/* OS Supports MPTCP */
+#undef HAVE_MPTCP
+
 /* Some systems put nanosleep outside of libc */
 #undef HAVE_NANOSLEEP
 
