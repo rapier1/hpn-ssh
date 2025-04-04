@@ -573,6 +573,13 @@ verbose ()
 	fi
 }
 
+warn ()
+{
+	save_debug_log "WARN: $@"
+	RESULT=2
+	echo "$@"
+}
+
 fail ()
 {
 	save_debug_log "FAIL: $@"
@@ -1056,11 +1063,19 @@ if [ "x$USE_VALGRIND" != "x" ]; then
 fi
 
 if [ $RESULT -eq 0 ]; then
-	verbose ok $tid
+    verbose ok $tid
 	if [ "x$CACHE" != "x" ]; then
 		touch "$CACHE"
 	fi
 else
+    if [ $RESULT -eq 2 ]; then
+	verbose warning $tid
+	if [ "x$CACHE" != "x" ]; then
+		touch "$CACHE"
+	fi  
+	exit 0
+    else
 	echo failed $tid
+    fi
 fi
 exit $RESULT

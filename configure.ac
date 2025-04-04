@@ -2564,6 +2564,8 @@ fi
 
 # Testing MPTCP Support
 # Does the OS support MPTCP?
+# We don't use this at the moment
+# but I am holding it in resrve -cjr 04/04/2025
 	AC_MSG_CHECKING([whether the OS supports MPTCP])
 	AC_RUN_IFELSE(
 		[AC_LANG_PROGRAM([[
