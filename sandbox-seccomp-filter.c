@@ -436,7 +436,7 @@ static const struct sock_fprog preauth_program = {
 };
 
 struct ssh_sandbox {
-	pid_t child_pid;
+	int junk;
 };
 
 struct ssh_sandbox *
@@ -450,8 +450,6 @@ ssh_sandbox_init(struct monitor *monitor)
 	 */
 	debug3("%s: preparing seccomp filter sandbox", __func__);
 	box = xcalloc(1, sizeof(*box));
-	box->child_pid = 0;
-
 	return box;
 }
 
@@ -531,19 +529,6 @@ ssh_sandbox_child(struct ssh_sandbox *box)
 	else if (nnp_failed)
 		fatal("%s: SECCOMP_MODE_FILTER activated but "
 		    "PR_SET_NO_NEW_PRIVS failed", __func__);
-}
-
-void
-ssh_sandbox_parent_finish(struct ssh_sandbox *box)
-{
-	free(box);
-	debug3("%s: finished", __func__);
-}
-
-void
-ssh_sandbox_parent_preauth(struct ssh_sandbox *box, pid_t child_pid)
-{
-	box->child_pid = child_pid;
 }
 
 #endif /* SANDBOX_SECCOMP_FILTER */
