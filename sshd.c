@@ -827,21 +827,18 @@ listen_on_addrs(struct listenaddr *la)
 			continue;
 		}
 		/* Create socket for listening. */
-#if HAVE_MPTCP /*MPTCP is available in Linux and OS X */
-		listen_sock = socket(ai->ai_family, ai->ai_socktype,
-		    options.use_mptcp ? IPPROTO_MPTCP : ai->ai_protocol);
-#else
-		/* they asked to use mptcp but the OS doesn't support it
-		 * I don't want them to think they are using MPTCP
-		 * when they aren't - CJR 3/31/2025*/
 		if (options.use_mptcp)
-			fatal("MPTCP not supported by the operating system.");
-		listen_sock = socket(ai->ai_family, ai->ai_socktype,
-		    ai->ai_protocol);
-#endif
+			listen_sock = socket(ai->ai_family, ai->ai_socktype,
+			    IPPROTO_MPTCP);
+		else
+			listen_sock = socket(ai->ai_family, ai->ai_socktype,
+			    ai->ai_protocol);
+
 		if (listen_sock == -1) {
 			/* kernel may not support ipv6 */
 			verbose("socket: %.100s", strerror(errno));
+			if (options.use_mptcp)
+				verbose("MPTCP requested but may not be available.");
 			continue;
 		}
 		if (set_nonblock(listen_sock) == -1) {

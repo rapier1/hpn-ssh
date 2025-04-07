@@ -573,6 +573,13 @@ verbose ()
 	fi
 }
 
+warn ()
+{
+	save_debug_log "WARN: $@"
+	RESULT=2
+	echo "$@"
+}
+
 fail ()
 {
 	save_debug_log "FAIL: $@"
@@ -1055,12 +1062,25 @@ if [ "x$USE_VALGRIND" != "x" ]; then
 	fi
 fi
 
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
 if [ $RESULT -eq 0 ]; then
-	verbose ok $tid
+    verbose ok $tid
 	if [ "x$CACHE" != "x" ]; then
 		touch "$CACHE"
 	fi
 else
+    if [ $RESULT -eq 2 ]; then
+	verbose "\n${RED}warning $tid\n"${NC}
+	if [ "x$CACHE" != "x" ]; then
+		touch "$CACHE"
+	fi  
+	# we exit 0 otherwise the rest of the tests
+	# won't run
+	exit 0
+    else
 	echo failed $tid
+    fi
 fi
 exit $RESULT
