@@ -64,8 +64,6 @@ jobs:
           - { target: ubuntu-latest, config: gcc-14 }
           - { target: ubuntu-latest, config: clang-15 }
           - { target: ubuntu-latest, config: clang-19 }
-          - { target: ubuntu-latest, config: boringssl }
-          - { target: ubuntu-latest, config: aws-lc }
           - { target: ubuntu-latest, config: libressl-master }
           - { target: ubuntu-latest, config: libressl-3.7.2 }
           - { target: ubuntu-latest, config: libressl-3.8.4 }
