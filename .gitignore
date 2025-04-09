@@ -34,6 +34,8 @@ ssh-keysign
 ssh-pkcs11-helper
 ssh-sk-helper
 sshd
+sshd-session
+sshd-auth
 hpnscp
 hpnsftp
 hpnsftp-server
@@ -48,6 +50,6 @@ hpnssh-sk-helper
 hpnsshd
 hpnsshd-session
 hpnsshd-auth
-!regress/misc/fuzz-harness/Makefile
-!regress/unittests/sshsig/Makefile
+!regress/misc/**/Makefile
+!regress/unittests/**/Makefile
 tags
