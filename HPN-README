@@ -1,5 +1,15 @@
 Notes:
 
+MPTCP Support in 18.7.0:
+Multipath TCP is now available as a runtime option for HPN-SSH. MPTCP
+is available only on Linux and Mac OSX operating systems. Using MPTCP on a system that
+doesn't support it will result in a notice and failure. The use cases for MPTCP include
+seamless handovers when changing networks and aggregating multiple interfaces to improve
+available bandwidth. As of 18.7.0 this options should be considered somewhat experimental.
+
+Usage:
+-oUseMPTCP=[Yes|No] will enable MPTCP. The default is no.
+
 LibreSSL Support:
 Changes in LibreSSL version 3.5 and 3.6 prevent the use of the threaded AES CTR cipher.
 In those cases HPNSSH will fallback to the serial version of the AES CTR cipher. A warning
