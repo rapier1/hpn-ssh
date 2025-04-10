@@ -1549,19 +1549,6 @@ main(int ac, char **av)
 	/* Fill in default values for those options not explicitly set. */
 	fill_default_server_options(&options);
 
-	if (options.none_enabled == 1) {
-		char *old_ciphers = options.ciphers;
-		xasprintf(&options.ciphers, "%s,none", old_ciphers);
-		free(old_ciphers);
-
-		/* only enable the none MAC in context of the none cipher -cjr */
-		if (options.nonemac_enabled == 1) {
-			char *old_macs = options.macs;
-			xasprintf(&options.macs, "%s,none", old_macs);
-			free(old_macs);
-		}
-	}
-
 	/* Check that options are sensible */
 	if (options.authorized_keys_command_user == NULL &&
 	    (options.authorized_keys_command != NULL &&

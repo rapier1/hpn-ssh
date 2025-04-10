@@ -827,10 +827,24 @@ do_ssh2_kex(struct ssh *ssh)
 	struct kex *kex;
 	int r;
 
-	if (options.none_enabled == 1)
+	/* this used to be in sshd.c when we read the configuration file
+	 * but needed to be moved here as do_ssh2_kex in sshd-auth wasn't
+	 * picking up the none options. CJR 4/10/2025
+	 */
+	if (options.none_enabled == 1) {
 		debug("WARNING: None cipher enabled");
-	if (options.nonemac_enabled == 1)
-		debug("WARNING: None MAC enabled");
+		char *old_ciphers = options.ciphers;
+		xasprintf(&options.ciphers, "%s,none", old_ciphers);
+		free(old_ciphers);
+
+		/* only enable the none MAC in context of the none cipher -cjr */
+		if (options.nonemac_enabled == 1) {
+			debug("WARNING: None MAC enabled");
+			char *old_macs = options.macs;
+			xasprintf(&options.macs, "%s,none", old_macs);
+			free(old_macs);
+		}
+	}
 
 	if (options.rekey_limit || options.rekey_interval)
 		ssh_packet_set_rekey_limits(ssh, options.rekey_limit,
