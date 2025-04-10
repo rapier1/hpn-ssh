@@ -12,6 +12,8 @@ survey.sh
 **/*.o
 **/*.lo
 **/*.so
+**/*.dylib
+**/*.dll
 **/*.out
 **/*.a
 **/*.un~
@@ -32,6 +34,8 @@ ssh-keysign
 ssh-pkcs11-helper
 ssh-sk-helper
 sshd
+sshd-session
+sshd-auth
 hpnscp
 hpnsftp
 hpnsftp-server
@@ -44,7 +48,8 @@ hpnssh-keysign
 hpnssh-pkcs11-helper
 hpnssh-sk-helper
 hpnsshd
-!regress/misc/fuzz-harness/Makefile
-!regress/unittests/sshsig/Makefile
+hpnsshd-session
+hpnsshd-auth
+!regress/misc/**/Makefile
+!regress/unittests/**/Makefile
 tags
-

@@ -1,4 +1,4 @@
-/* $OpenBSD: sshconnect.c,v 1.368 2024/04/30 02:10:49 djm Exp $ */
+/* $OpenBSD: sshconnect.c,v 1.369 2024/12/06 16:21:48 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -359,11 +359,18 @@ ssh_create_socket(struct addrinfo *ai)
 #endif
 	char ntop[NI_MAXHOST];
 
-	sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+	if (options.use_mptcp)
+		sock = socket(ai->ai_family, ai->ai_socktype, IPPROTO_MPTCP);
+	else
+		sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+
 	if (sock == -1) {
 		error("socket: %s", strerror(errno));
+		if (options.use_mptcp)
+			error ("You asked to use MPTCP. Please ensure it is enabled.");
 		return -1;
 	}
+
 	(void)fcntl(sock, F_SETFD, FD_CLOEXEC);
 
 	/* Use interactive QOS (if specified) until authentication completed */
@@ -1604,7 +1611,8 @@ ssh_login(struct ssh *ssh, Sensitive *sensitive, const char *orighost,
 	lowercase(host);
 
 	/* Exchange protocol version identification strings with the server. */
-	if ((r = kex_exchange_identification(ssh, timeout_ms, NULL)) != 0)
+	if ((r = kex_exchange_identification(ssh, timeout_ms,
+	    options.version_addendum)) != 0)
 		sshpkt_fatal(ssh, r, "banner exchange");
 
 	/* Put the connection into non-blocking mode. */

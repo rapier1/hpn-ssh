@@ -1,4 +1,4 @@
-/* $OpenBSD: readconf.h,v 1.156 2024/03/04 02:16:11 djm Exp $ */
+/* $OpenBSD: readconf.h,v 1.159 2025/02/15 01:48:30 djm Exp $ */
 
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
@@ -19,7 +19,6 @@
 /* Data structure for representing option data. */
 
 #define SSH_MAX_HOSTS_FILES	32
-#define MAX_CANON_DOMAINS	32
 #define PATH_MAX_SUN		(sizeof((struct sockaddr_un *)0)->sun_path)
 
 struct allowed_cname {
@@ -50,8 +49,6 @@ typedef struct {
 	int     strict_host_key_checking;	/* Strict host key checking. */
 	int     compression;	/* Compress packets in both directions. */
 	int     tcp_keep_alive;	/* Set SO_KEEPALIVE. */
-	int     tcp_rcv_buf_poll; /* Option to poll recv buf every window transfer */
-	int     hpn_disabled;     /* Switch to disable HPN buffer management */
 	int	ip_qos_interactive;	/* IP ToS/DSCP/class for interactive */
 	int	ip_qos_bulk;		/* IP ToS/DSCP/class for bulk traffic */
 	SyslogFacility log_facility;	/* Facility for system logging. */
@@ -122,6 +119,11 @@ typedef struct {
 
 	int	enable_ssh_keysign;
 	int64_t rekey_limit;
+	int	rekey_interval;
+
+	/* hpnssh options */
+	int     tcp_rcv_buf_poll; /* Option to poll recv buf every window transfer */
+	int     hpn_disabled;     /* Switch to disable HPN buffer management */
 	int     none_switch;    /* Use none cipher */
 	int     none_enabled;   /* Allow none to be used */
 	int     nonemac_enabled;   /* Allow none to be used */
@@ -131,7 +133,7 @@ typedef struct {
         char   *metrics_path; /* path for the metrics files */
 	int     fallback; /* en|disable fallback port (def: true) */
 	int     fallback_port; /* port to fallback to (def: 22) */
-	int	rekey_interval;
+	int     use_mptcp;
 
 	int	no_host_authentication_for_localhost;
 	int	identities_only;
@@ -197,6 +199,8 @@ typedef struct {
 	char	**channel_timeouts;	/* inactivity timeout by channel type */
 	u_int	num_channel_timeouts;
 
+	char	*version_addendum;
+
 	char	*ignored_unknown; /* Pattern list of unknown tokens to ignore */
 }       Options;
 
@@ -251,9 +255,9 @@ int      fill_default_options(Options *);
 void	 fill_default_options_for_canonicalization(Options *);
 void	 free_options(Options *o);
 int	 process_config_line(Options *, struct passwd *, const char *,
-    const char *, char *, const char *, int, int *, int);
+    const char *, const char *, char *, const char *, int, int *, int);
 int	 read_config_file(const char *, struct passwd *, const char *,
-    const char *, Options *, int, int *);
+    const char *, const char *, Options *, int, int *);
 int	 parse_forward(struct Forward *, const char *, int, int);
 int	 parse_jump(const char *, Options *, int);
 int	 parse_ssh_uri(const char *, char **, char **, int *);

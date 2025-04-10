@@ -213,12 +213,14 @@ typedef struct {
 	int	use_pam;		/* Enable auth via PAM */
 	char   *pam_service_name;
 
+	/* hpnssh options */
         int     tcp_rcv_buf_poll;       /* poll tcp rcv window in autotuning kernels*/
 	int	hpn_disabled;		/* disable hpn functionality. false by default */
 	int	none_enabled;		/* Enable NONE cipher switch */
 	int     nonemac_enabled;        /* Enable NONE MAC switch */
-	int disable_multithreaded; /* Disable multithreaded aes-ctr cipher */
-  
+	int     use_mptcp;              /* Use MPTCP - Linux only */
+	int     disable_multithreaded;  /* Disable multithreaded aes-ctr cipher */
+
 	int	permit_tun;
 
 	char   **permitted_opens;	/* May also be one of PERMITOPEN_* */
@@ -255,6 +257,7 @@ typedef struct {
 	int	unused_connection_timeout;
 
 	char   *sshd_session_path;
+	char   *sshd_auth_path;
 
 	int	refuse_connection;
 }       ServerOptions;

@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.135 2024/06/14 04:43:11 djm Exp $
+#	$OpenBSD: Makefile,v 1.136 2025/03/11 07:50:20 dtucker Exp $
 
 tests:		prep file-tests t-exec unit
 
@@ -23,6 +23,7 @@ clean:
 distclean:	clean
 
 LTESTS= 	connect \
+		connect-mptcp \
 		proxy-connect \
 		sshfp-connect \
 		connect-privsep \
@@ -65,6 +66,7 @@ LTESTS= 	connect \
 		sftp-batch \
 		sftp-glob \
 		sftp-perm \
+		sftp-resume \
 		sftp-uri \
 		reconfigure \
 		dynamic-forward \

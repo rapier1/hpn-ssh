@@ -216,7 +216,9 @@ including rpc/rpc.h breaks Solaris 6
 /* (or die trying) */
 
 #ifndef HAVE_U_INT
+typedef unsigned short u_short;
 typedef unsigned int u_int;
+typedef unsigned long u_long;
 #endif
 
 #ifndef HAVE_INTXX_T
@@ -646,7 +648,9 @@ struct winsize {
 # endif /* WORDS_BIGENDIAN */
 #endif /* BYTE_ORDER */
 
-#ifndef HAVE_ENDIAN_H
+#if (defined(HAVE_DECL_LE32TOH) && HAVE_DECL_LE32TOH == 0) || \
+    (defined(HAVE_DECL_LE64TOH) && HAVE_DECL_LE64TOH == 0) || \
+    (defined(HAVE_DECL_HTOLE64) && HAVE_DECL_HTOLE64 == 0)
 # define openssh_swap32(v)					\
 	(uint32_t)(((uint32_t)(v) & 0xff) << 24 |		\
 	((uint32_t)(v) & 0xff00) << 8 |				\
@@ -662,13 +666,25 @@ struct winsize {
 	((uint64_t)(v) & 0xff000000000000ULL) >> 40 |		\
 	((uint64_t)(v) & 0xff00000000000000ULL) >> 56)
 # ifdef WORDS_BIGENDIAN
-#  define le32toh(v) (openssh_swap32(v))
-#  define le64toh(v) (openssh_swap64(v))
-#  define htole64(v) (openssh_swap64(v))
+#  if defined(HAVE_DECL_LE32TOH) && HAVE_DECL_LE32TOH == 0
+#   define le32toh(v) (openssh_swap32(v))
+#  endif
+#  if defined(HAVE_DECL_LE64TOH) && HAVE_DECL_LE64TOH == 0
+#   define le64toh(v) (openssh_swap64(v))
+#  endif
+#  if defined(HAVE_DECL_HTOLE64) && HAVE_DECL_HTOLE64 == 0
+#   define htole64(v) (openssh_swap64(v))
+# endif
 # else
-#  define le32toh(v) ((uint32_t)v)
-#  define le64toh(v) ((uint64_t)v)
-#  define htole64(v) ((uint64_t)v)
+#  if defined(HAVE_DECL_LE32TOH) && HAVE_DECL_LE32TOH == 0
+#   define le32toh(v) ((uint32_t)v)
+#  endif
+#  if defined(HAVE_DECL_LE64TOH) && HAVE_DECL_LE64TOH == 0
+#    define le64toh(v) ((uint64_t)v)
+#  endif
+#  if defined(HAVE_DECL_HTOLE64) && HAVE_DECL_HTOLE64 == 0
+#   define htole64(v) ((uint64_t)v)
+#  endif
 # endif
 #endif
 
@@ -918,6 +934,10 @@ struct winsize {
 # define SSH_IOBUFSZ (32*1024)
 #endif
 
+#ifndef IPPROTO_MPTCP
+#define IPPROTO_MPTCP 262
+#endif
+
 /*
  * We want functions in openbsd-compat, if enabled, to override system ones.
  * We no-op out the weak symbol definition rather than remove it to reduce
@@ -971,3 +991,12 @@ struct winsize {
 # define USE_MLKEM768X25519	1
 #endif
 #endif /* _DEFINES_H */
+
+/* used to enable checking linux kernel versions */
+#if defined(__linux__) && !defined(__alpine__)
+#include <linux/version.h>
+#endif
+
+#ifndef KERNEL_VERSION /* shouldn't be necessary to define this */
+#define KERNEL_VERSION(a,b,c) (((a) <<16) + ((b) << 8) +(c))
+#endif
