@@ -70,6 +70,15 @@
 #include "authfd.h"
 #include "kex.h"
 
+/*
+ * RFC 8305 Happy Eyeballs Version 2: Better Connectivity Using Concurrency
+ *
+ * implementation can have a fixed delay for how long to wait before
+ * starting the next connection attempt [...] recommended value for a
+ * default delay is 250 milliseconds.
+ */
+#define CONNECTION_ATTEMPT_DELAY 250
+
 struct sshkey *previous_host_key = NULL;
 
 static int matching_host_key_dns = 0;
@@ -83,6 +92,9 @@ extern char *__progname;
 
 static int show_other_keys(struct hostkeys *, struct sshkey *);
 static void warn_changed_key(struct sshkey *);
+static int
+ssh_connect_happy_eyeballs(const char * host, struct addrinfo *ai, struct sockaddr_storage *hostaddr, int *timeout_ms);
+
 
 /* Expand a proxy command */
 static char *
@@ -471,60 +483,71 @@ ssh_connect_direct(struct ssh *ssh, const char *host, struct addrinfo *aitop,
 			sleep(1);
 			debug("Trying again...");
 		}
-		/*
-		 * Loop through addresses for this host, and try each one in
-		 * sequence until the connection succeeds.
-		 */
-		for (ai = aitop; ai; ai = ai->ai_next) {
-			if (ai->ai_family != AF_INET &&
-			    ai->ai_family != AF_INET6) {
-				errno = EAFNOSUPPORT;
-				continue;
-			}
-			if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
-			    ntop, sizeof(ntop), strport, sizeof(strport),
-			    NI_NUMERICHOST|NI_NUMERICSERV) != 0) {
-				oerrno = errno;
-				error_f("getnameinfo failed");
-				errno = oerrno;
-				continue;
-			}
-			if (options.address_family != AF_UNSPEC &&
-			    ai->ai_family != options.address_family) {
-				debug2_f("skipping address [%s]:%s: "
-				    "wrong address family", ntop, strport);
-				errno = EAFNOSUPPORT;
-				continue;
-			}
+		if (options.use_happyeyes == 1) {
+			sock = ssh_connect_happy_eyeballs(host, aitop,
+			    hostaddr, timeout_ms);
+			if (sock != -1)
+				break;	/* Successful connection. */
+		} else {
+			/*
+			 * Loop through addresses for this host, and try each one in
+			 * sequence until the connection succeeds.
+			 */
+			for (ai = aitop; ai; ai = ai->ai_next) {
+				if (ai->ai_family != AF_INET &&
+				    ai->ai_family != AF_INET6) {
+					errno = EAFNOSUPPORT;
+					continue;
+				}
+				if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
+				    ntop, sizeof(ntop), strport,
+				    sizeof(strport),
+				    NI_NUMERICHOST|NI_NUMERICSERV) != 0) {
+					oerrno = errno;
+					error_f("getnameinfo failed");
+					errno = oerrno;
+					continue;
+				}
+				if (options.address_family != AF_UNSPEC &&
+				    ai->ai_family != options.address_family) {
+					debug2_f("skipping address [%s]:%s: "
+						 "wrong address family",
+						 ntop, strport);
+					errno = EAFNOSUPPORT;
+					continue;
+				}
 
-			debug("Connecting to %.200s [%.100s] port %s.",
-				host, ntop, strport);
+				debug("Connecting to %.200s [%.100s] port %s.",
+				    host, ntop, strport);
 
-			/* Create a socket for connecting. */
-			sock = ssh_create_socket(ai);
-			if (sock < 0) {
-				/* Any error is already output */
-				errno = 0;
-				continue;
-			}
+				/* Create a socket for connecting. */
+				sock = ssh_create_socket(ai);
+				if (sock < 0) {
+					/* Any error is already output */
+					errno = 0;
+					continue;
+				}
 
-			*timeout_ms = saved_timeout_ms;
-			if (timeout_connect(sock, ai->ai_addr, ai->ai_addrlen,
-			    timeout_ms) >= 0) {
-				/* Successful connection. */
-				memcpy(hostaddr, ai->ai_addr, ai->ai_addrlen);
-				break;
-			} else {
-				oerrno = errno;
-				debug("connect to address %s port %s: %s",
-				    ntop, strport, strerror(errno));
-				close(sock);
-				sock = -1;
-				errno = oerrno;
+				*timeout_ms = saved_timeout_ms;
+				if (timeout_connect(sock, ai->ai_addr,
+				    ai->ai_addrlen,
+				    timeout_ms) >= 0) {
+					/* Successful connection. */
+					memcpy(hostaddr, ai->ai_addr,
+					       ai->ai_addrlen);
+					break;
+				} else {
+					oerrno = errno;
+					debug("connect to address %s port %s: %s",
+					    ntop, strport, strerror(errno));
+					close(sock);
+					sock = -1;
+					errno = oerrno;
+				}
 			}
+			if (sock != -1)
+				break;	/* Successful connection. */
 		}
-		if (sock != -1)
-			break;	/* Successful connection. */
 	}
 
 	/* Return failure if we didn't get a successful connection. */
@@ -1766,4 +1789,189 @@ maybe_add_key_to_agent(const char *authfile, struct sshkey *private,
 	else
 		debug("could not add identity to agent: %s (%d)", authfile, r);
 	close(auth_sock);
+}
+
+static int
+ssh_connect_timeout(struct timeval *tv, int timeout_ms)
+ {
+	if (timeout_ms <= 0)
+		return 0;
+	ms_subtract_diff(tv, &timeout_ms);
+	return timeout_ms <= 0;
+}
+
+/*
+ * Return 0 if the addrinfo was not tried. Return -1 if using it
+ * failed. Return 1 if it was used.
+ */
+static int
+ssh_connect_happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
+				    int *timeout_ms,
+				    struct timeval *initiate,
+				    int *nfds, fd_set *fds,
+				    struct addrinfo *fd_ai[])
+{
+	int oerrno, sock;
+	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
+
+	memset(ntop, 0, sizeof(ntop));
+	memset(strport, 0, sizeof(strport));
+	/* If *nfds != 0 then *initiate is initialised. */
+	if (*nfds &&
+	    (ai == NULL ||
+	      !ssh_connect_timeout(initiate, CONNECTION_ATTEMPT_DELAY)))
+		/* Do not initiate new connections yet */
+		return 0;
+	if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6) {
+		errno = EAFNOSUPPORT;
+		return -1;
+	}
+	if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
+			ntop, sizeof(ntop),
+			strport, sizeof(strport),
+			NI_NUMERICHOST|NI_NUMERICSERV) != 0) {
+		oerrno = errno;
+		error("%s: getnameinfo failed", __func__);
+		errno = oerrno;
+		return -1;
+	}
+	debug("HAPPY EYEBALLS Connecting to %.200s [%.100s] port %s.",
+	      host, ntop, strport);
+	/* Create a socket for connecting */
+	sock = ssh_create_socket(ai);
+	if (sock < 0) {
+		/* Any error is already output */
+		errno = 0;
+		return -1;
+	}
+	if (sock >= FD_SETSIZE) {
+		error("socket number to big for select: %d", sock);
+		close(sock);
+		return -1;
+	}
+	fd_ai[sock] = ai;
+	set_nonblock(sock);
+	if (connect(sock, ai->ai_addr, ai->ai_addrlen) < 0 &&
+	    errno != EINPROGRESS) {
+		error("connect to address %s port %s: %s",
+		      ntop, strport, strerror(errno));
+		errno = 0;
+		close(sock);
+		return -1;
+	}
+	monotime_tv(initiate);
+	FD_SET(sock, fds);
+	*nfds = MAXIMUM(*nfds, sock + 1);
+	return 1;
+}
+
+static int
+ssh_connect_happy_eyeballs_process(int *nfds, fd_set *fds,
+				   struct addrinfo *fd_ai[],
+				   int ready, fd_set *wfds)
+{
+	socklen_t optlen;
+	int sock, optval = 0;
+	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
+	for (sock = *nfds - 1; ready > 0 && sock >= 0; sock--) {
+		if (FD_ISSET(sock, wfds)) {
+			ready--;
+			optlen = sizeof(optval);
+			if (getsockopt(sock, SOL_SOCKET, SO_ERROR,
+				       &optval, &optlen) < 0) {
+				optval = errno;
+				error("getsockopt failed: %s",
+				      strerror(errno));
+			} else if (optval != 0) {
+				memset(ntop, 0, sizeof(ntop));
+				memset(strport, 0, sizeof(strport));
+				if (getnameinfo(fd_ai[sock]->ai_addr,
+						fd_ai[sock]->ai_addrlen,
+						ntop, sizeof(ntop),
+						strport, sizeof(strport),
+						NI_NUMERICHOST|NI_NUMERICSERV) != 0)
+					error("connect finally failed: %s",
+					      strerror(optval));
+				else
+					error("connect to address %s port %s finally: %s",
+					      ntop, strport, strerror(optval));
+			}
+			FD_CLR(sock, fds);
+			while (*nfds > 0 && ! FD_ISSET(*nfds - 1, fds))
+				--*nfds;
+			if (optval == 0) {
+				unset_nonblock(sock);
+				return sock;
+			}
+			close(sock);
+			errno = optval;
+		}
+	}
+	return -1;
+}
+
+static int
+ssh_connect_happy_eyeballs(const char * host, struct addrinfo *ai,
+			   struct sockaddr_storage *hostaddr, int *timeout_ms)
+{
+	struct addrinfo *fd_ai[FD_SETSIZE];
+	struct timeval initiate_tv, start_tv, select_tv, *tv;
+	fd_set fds, wfds;
+	int res, oerrno, diff, diff0, nfds = 0, sock = -1;
+	FD_ZERO(&fds);
+	if (*timeout_ms > 0)
+		monotime_tv(&start_tv);
+	while ((ai != NULL || nfds > 0) &&
+	       ! ssh_connect_timeout(&start_tv, *timeout_ms)) {
+		res = ssh_connect_happy_eyeballs_initiate(host, ai,
+							  timeout_ms,
+							  &initiate_tv,
+							  &nfds, &fds, fd_ai);
+		if (res != 0)
+			ai = ai->ai_next;
+		if (res == -1)
+			continue;
+		tv = NULL;
+		if (ai != NULL || *timeout_ms > 0) {
+			tv = &select_tv;
+			if (ai != NULL) {
+				diff = CONNECTION_ATTEMPT_DELAY;
+				ms_subtract_diff(&initiate_tv, &diff);
+				if (*timeout_ms > 0) {
+					diff0 = *timeout_ms;
+					ms_subtract_diff(&start_tv, &diff0);
+					diff = MINIMUM(diff, diff0);
+				}
+			} else {
+				diff = *timeout_ms;
+				ms_subtract_diff(&start_tv, &diff);
+			}
+			tv->tv_sec = diff / 1000;
+			tv->tv_usec = (diff % 1000) * 1000;
+		}
+		wfds = fds;
+		res = select(nfds, NULL, &wfds, NULL, tv);
+		oerrno = errno;
+		if (res < 0) {
+			error("select failed: %s", strerror(errno));
+			errno = oerrno;
+			continue;
+		}
+		sock = ssh_connect_happy_eyeballs_process(&nfds, &fds, fd_ai,
+							  res, &wfds);
+		if (sock >= 0) {
+			memcpy(hostaddr, fd_ai[sock]->ai_addr,
+			       fd_ai[sock]->ai_addrlen);
+			break;
+		}
+	}
+	oerrno = errno;
+	while (nfds-- > 0)
+		if (FD_ISSET(nfds, &fds))
+			close(nfds);
+	if (ssh_connect_timeout(&start_tv, *timeout_ms))
+		errno = ETIMEDOUT;
+	else
+		errno = oerrno;
+	return sock;
 }

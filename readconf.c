@@ -173,7 +173,7 @@ typedef enum {
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
 	oTcpRcvBufPoll, oHPNDisabled,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch,
-	oDisableMTAES, oUseMPTCP,
+	oDisableMTAES, oUseMPTCP, oHappyEyes,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oVisualHostKey,
 	oKexAlgorithms, oIPQoS, oRequestTTY, oSessionType, oStdinNull,
@@ -314,6 +314,7 @@ static struct {
 	{ "nonemacenabled", oNoneMacEnabled },
 	{ "noneswitch", oNoneSwitch },
 	{ "usemptcp", oUseMPTCP},
+	{ "happyeyes", oHappyEyes },
 	{ "disablemtaes", oDisableMTAES },
 	{ "metrics", oMetrics },
 	{ "metricspath", oMetricsPath },
@@ -1367,6 +1368,10 @@ parse_time:
 
 	case oUseMPTCP:
 		intptr = &options->use_mptcp;
+		goto parse_flag;
+
+	case oHappyEyes:
+		intptr = &options->use_happyeyes;
 		goto parse_flag;
 
 	case oDisableMTAES:
@@ -2824,6 +2829,7 @@ initialize_options(Options * options)
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
 	options->use_mptcp = -1;
+	options->use_happyeyes = -1;
 	options->disable_multithreaded = -1;
 	options->metrics = -1;
 	options->metrics_path = NULL;
@@ -3027,6 +3033,8 @@ fill_default_options(Options * options)
 	}
 	if (options->use_mptcp == -1)
 		options->use_mptcp = 0;
+	if (options->use_happyeyes == -1)
+		options->use_happyeyes = 0;
 	if (options->disable_multithreaded == -1)
 		options->disable_multithreaded = 0;
 	if (options->metrics == -1)
