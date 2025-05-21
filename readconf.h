@@ -133,7 +133,8 @@ typedef struct {
         char   *metrics_path; /* path for the metrics files */
 	int     fallback; /* en|disable fallback port (def: true) */
 	int     fallback_port; /* port to fallback to (def: 22) */
-	int     use_mptcp;
+        int     use_mptcp; /* use MultiPath TCP */
+        int     use_happyeyes; /* use RFC 8305 - Happy Eyeballs */
 
 	int	no_host_authentication_for_localhost;
 	int	identities_only;

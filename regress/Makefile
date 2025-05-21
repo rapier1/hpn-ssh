@@ -24,6 +24,7 @@ distclean:	clean
 
 LTESTS= 	connect \
 		connect-mptcp \
+		connect-happy-eyeballs \
 		proxy-connect \
 		sshfp-connect \
 		connect-privsep \
