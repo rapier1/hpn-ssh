@@ -1,11 +1,21 @@
 Notes:
 
+Happy Eyeballs Support in 18.X.X (update before release)
+Happy Eyeballs (RFC 8305) is for use on dual stack systems meaning that they have both 
+IPv4 and IPv6 TCP stacks. When enabled this option will try to connect to the
+taget over both IPv4 and IPv6 with preference given to IPv6. The first connection 
+that completes successfully will be used. Any outstanding connection attempts will
+be closed. As of version 18.X.X this option shoudl be considered somewhat experimental. 
+
+usage:
+-oHappyEyes=[Yes|No] will enabled Happy Eyeballs. The default is no. 
+
 MPTCP Support in 18.7.0:
 Multipath TCP is now available as a runtime option for HPN-SSH. MPTCP
 is available only on Linux and Mac OSX operating systems. Using MPTCP on a system that
 doesn't support it will result in a notice and failure. The use cases for MPTCP include
 seamless handovers when changing networks and aggregating multiple interfaces to improve
-available bandwidth. As of 18.7.0 this options should be considered somewhat experimental.
+available bandwidth. As of 18.7.0 this option should be considered somewhat experimental.
 
 Usage:
 -oUseMPTCP=[Yes|No] will enable MPTCP. The default is no.
