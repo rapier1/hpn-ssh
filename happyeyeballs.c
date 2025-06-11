@@ -116,6 +116,11 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 		return -1;
 	}
 	fd_ai[sock] = ai;
+	/* using nonblocking sockets with select allows
+	 * use to fire off new sockets without waiting for a
+	 * connection to be established. This lets us avoid
+	 * the use of threads. set_nonblock is in misc.c
+	 * and uses fnctl */
 	set_nonblock(sock);
 	if (connect(sock, ai->ai_addr, ai->ai_addrlen) < 0 &&
 	    errno != EINPROGRESS) {
@@ -187,12 +192,12 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 	FD_ZERO(&fds);
 	if (*timeout_ms > 0)
 		monotime_tv(&start_tv);
+	/* run through potentials unless we have timed out */
 	while ((ai != NULL || nfds > 0) &&
 	       ! timeout(&start_tv, *timeout_ms)) {
+		/* set up the sockets */
 		res = happy_eyeballs_initiate(host, ai,
-							  timeout_ms,
-							  &initiate_tv,
-							  &nfds, &fds, fd_ai);
+		     timeout_ms, &initiate_tv,&nfds, &fds, fd_ai);
 		if (res != 0)
 			ai = ai->ai_next;
 		if (res == -1)
@@ -223,18 +228,22 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 			errno = oerrno;
 			continue;
 		}
+		/* start processing the sockets */
 		sock = happy_eyeballs_process(&nfds, &fds, fd_ai,
 							  res, &wfds);
 		if (sock >= 0) {
+			/* we have a connection */
 			memcpy(hostaddr, fd_ai[sock]->ai_addr,
 			       fd_ai[sock]->ai_addrlen);
 			break;
 		}
 	}
 	oerrno = errno;
+	/* close other connection attempts/sockets */
 	while (nfds-- > 0)
 		if (FD_ISSET(nfds, &fds))
 			close(nfds);
+	/* we timed out with no valid connections */
 	if (timeout(&start_tv, *timeout_ms))
 		errno = ETIMEDOUT;
 	else
