@@ -41,7 +41,6 @@
 #include <arpa/inet.h>
 #include <string.h>
 
-//#include "dns.h"
 #include "happyeyeballs.h"
 #include "sshconnect.h"
 #include "ssh.h"
@@ -54,7 +53,7 @@ extern int ssh_create_socket(struct addrinfo *ai);
 /* delay 250ms between IPv6 and IPv4 connection
  * this lets us preference IPv6 connections.
  */
-#define CONNECTION_ATTEMPT_DELAY 250
+#define CONNECTION_ATTEMPT_DELAY 2500
 
 /* have we timed out? */
 static int
@@ -80,18 +79,25 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 	int oerrno, sock;
 	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
 
+	debug_f ("Happy eyeballs initiating");
 	memset(ntop, 0, sizeof(ntop));
 	memset(strport, 0, sizeof(strport));
 	/* If *nfds != 0 then *initiate is initialised. */
 	if (*nfds &&
 	    (ai == NULL ||
-	      !timeout(initiate, CONNECTION_ATTEMPT_DELAY)))
+	      !timeout(initiate, CONNECTION_ATTEMPT_DELAY))) { 
 		/* Do not initiate new connections yet */
+		debug_f ("Waiting to initiate new connection");
 		return 0;
+	}
+	/* trying to use a family we don't support */
 	if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6) {
+		debug_f ("Address family not supported");
 		errno = EAFNOSUPPORT;
 		return -1;
 	}
+
+	debug_f ("Running getnameinfo for %s", host);
 	if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
 			ntop, sizeof(ntop),
 			strport, sizeof(strport),
@@ -144,6 +150,8 @@ happy_eyeballs_process(int *nfds, fd_set *fds,
 	socklen_t optlen;
 	int sock, optval = 0;
 	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
+
+	debug_f("in happy_eyeballs_process");
 	for (sock = *nfds - 1; ready > 0 && sock >= 0; sock--) {
 		if (FD_ISSET(sock, wfds)) {
 			ready--;
@@ -185,25 +193,32 @@ int
 happy_eyeballs(const char * host, struct addrinfo *ai,
 			   struct sockaddr_storage *hostaddr, int *timeout_ms)
 {
-	struct addrinfo *fd_ai[FD_SETSIZE];
+	struct addrinfo *fd_ai[FD_SETSIZE]; /* 1024 */
 	struct timeval initiate_tv, start_tv, select_tv, *tv;
 	fd_set fds, wfds;
 	int res, oerrno, diff, diff0, nfds = 0, sock = -1;
+
+	debug_f("Starting Happy Eyeballs connection");
+
 	FD_ZERO(&fds);
-	if (*timeout_ms > 0)
-		monotime_tv(&start_tv);
+	if (*timeout_ms > 0) /* default value of no timeout - use TCP default instead */
+		monotime_tv(&start_tv); /* monotime_tv is in misc.c */
+
 	/* run through potentials unless we have timed out */
 	while ((ai != NULL || nfds > 0) &&
 	       ! timeout(&start_tv, *timeout_ms)) {
 		/* set up the sockets */
 		res = happy_eyeballs_initiate(host, ai,
-		     timeout_ms, &initiate_tv,&nfds, &fds, fd_ai);
+		     timeout_ms, &initiate_tv, &nfds, &fds, fd_ai);
 		if (res != 0)
 			ai = ai->ai_next;
 		if (res == -1)
 			continue;
 		tv = NULL;
-		if (ai != NULL || *timeout_ms > 0) {
+
+		/* this is just to pause between connection attempts */
+		debug_f ("Start pause");
+  		if (ai != NULL || *timeout_ms > 0) {
 			tv = &select_tv;
 			if (ai != NULL) {
 				diff = CONNECTION_ATTEMPT_DELAY;
@@ -220,6 +235,9 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 			tv->tv_sec = diff / 1000;
 			tv->tv_usec = (diff % 1000) * 1000;
 		}
+		debug_f("End pause");
+		
+		/* create a writeable set of file descriptors */
 		wfds = fds;
 		res = select(nfds, NULL, &wfds, NULL, tv);
 		oerrno = errno;
@@ -229,9 +247,11 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 			continue;
 		}
 		/* start processing the sockets */
+		debug_f ("Processing HE FDS");
 		sock = happy_eyeballs_process(&nfds, &fds, fd_ai,
 							  res, &wfds);
 		if (sock >= 0) {
+			debug_f ("Happy eyeballs connected");
 			/* we have a connection */
 			memcpy(hostaddr, fd_ai[sock]->ai_addr,
 			       fd_ai[sock]->ai_addrlen);

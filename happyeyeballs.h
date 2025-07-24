@@ -24,6 +24,3 @@
 
 int happy_eyeballs(const char *, struct addrinfo *,
 		   struct sockaddr_storage *, int *);
-
-
-
