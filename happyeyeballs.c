@@ -25,6 +25,7 @@
  * Section 4 requires sorting of DNS results as per
  * RFC 6724. This is provided by the getaddrinfo call
  * from gcc. This may not be available via musl.
+ * Interleaving of addresses is not currently supported.
  * Section 5 is implemented.
  * Section 6 is not implemented outside of getaddrinfo
  * Section 7 in under consideration
@@ -46,6 +47,7 @@
 #include "ssh.h"
 #include "misc.h"
 #include "log.h"
+#include <unistd.h>
 
 /* this is from sshconnect.c */
 extern int ssh_create_socket(struct addrinfo *ai);
@@ -53,7 +55,7 @@ extern int ssh_create_socket(struct addrinfo *ai);
 /* delay 250ms between IPv6 and IPv4 connection
  * this lets us preference IPv6 connections.
  */
-#define CONNECTION_ATTEMPT_DELAY 2500
+#define CONNECTION_ATTEMPT_DELAY 250
 
 /* have we timed out? */
 static int
@@ -205,6 +207,8 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 		monotime_tv(&start_tv); /* monotime_tv is in misc.c */
 
 	/* run through potentials unless we have timed out */
+	/* timeout_ms being the user defined connection timeout if
+	 * they aren't using the tcp timeout */
 	while ((ai != NULL || nfds > 0) &&
 	       ! timeout(&start_tv, *timeout_ms)) {
 		/* set up the sockets */
@@ -216,9 +220,10 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 			continue;
 		tv = NULL;
 
-		/* this is just to pause between connection attempts */
-		debug_f ("Start pause");
+		/* this is just to determine the pause between 
+		 * calls to select. */
   		if (ai != NULL || *timeout_ms > 0) {
+			debug_f ("In pause...");
 			tv = &select_tv;
 			if (ai != NULL) {
 				diff = CONNECTION_ATTEMPT_DELAY;
@@ -235,11 +240,16 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 			tv->tv_sec = diff / 1000;
 			tv->tv_usec = (diff % 1000) * 1000;
 		}
-		debug_f("End pause");
 		
 		/* create a writeable set of file descriptors */
 		wfds = fds;
+		/* select will pause for time tv determined by the above
+		 * timing caculations */
+		debug_f("Starting select");
 		res = select(nfds, NULL, &wfds, NULL, tv);
+		debug_f("Leaving select");
+
+		/* preserve any errors */
 		oerrno = errno;
 		if (res < 0) {
 			error("select failed: %s", strerror(errno));
@@ -257,6 +267,7 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 			       fd_ai[sock]->ai_addrlen);
 			break;
 		}
+		debug_f("restarting while loop");
 	}
 	oerrno = errno;
 	/* close other connection attempts/sockets */
