@@ -67,6 +67,8 @@ timeout(struct timeval *tv, int timeout_ms)
 	return timeout_ms <= 0;
 }
 
+char global_ntop[NI_MAXHOST];
+
 /*
  * Return 0 if the addrinfo was not tried. Return -1 if using it
  * failed. Return 1 if it was used.
@@ -109,8 +111,10 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 		errno = oerrno;
 		return -1;
 	}
+	memcpy(global_ntop,ntop,sizeof(ntop)); 
 	debug("HAPPY EYEBALLS Connecting to %.200s [%.100s] port %s.",
 	      host, ntop, strport);
+	debug("HAPPY %.200s", global_ntop);
 	/* Create a socket for connecting */
 	sock = ssh_create_socket(ai);
 	if (sock < 0) {
@@ -271,7 +275,9 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 	}
 	oerrno = errno;
 	/* close other connection attempts/sockets */
+	debug_f("NFDS is %d", nfds);
 	while (nfds-- > 0)
+		debug_f("Running FD_ISSET on %d", nfds);
 		if (FD_ISSET(nfds, &fds))
 			close(nfds);
 	/* we timed out with no valid connections */

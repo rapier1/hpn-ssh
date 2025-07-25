@@ -81,6 +81,7 @@ static pid_t proxy_command_pid = 0;
 extern int debug_flag;
 extern Options options;
 extern char *__progname;
+extern char global_ntop[NI_MAXHOST];
 
 static int show_other_keys(struct hostkeys *, struct sshkey *);
 static void warn_changed_key(struct sshkey *);
@@ -482,6 +483,7 @@ ssh_connect_direct(struct ssh *ssh, const char *host, struct addrinfo *aitop,
 				debug_f ("******* Happy eyeballs successful");
 			}
 		} else {
+			debug_f("******************************* NOT HERE**********");
 			/*
 			 * Loop through addresses for this host, and try each one in
 			 * sequence until the connection succeeds.
@@ -1637,6 +1639,7 @@ ssh_login(struct ssh *ssh, Sensitive *sensitive, const char *orighost,
 	/* key exchange */
 	/* authenticate user */
 	debug("Authenticating to %s:%d as '%s'", host, port, server_user);
+	debug("HAPPY Auth to %.200s", global_ntop);
 	ssh_kex2(ssh, host, hostaddr, port, cinfo);
 	ssh_userauth2(ssh, local_user, server_user, host, sensitive);
 	free(local_user);
