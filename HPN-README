@@ -5,10 +5,12 @@ Happy Eyeballs (RFC 8305) is for use on dual stack systems meaning that they hav
 IPv4 and IPv6 TCP stacks. When enabled this option will try to connect to the
 taget over both IPv4 and IPv6 with preference given to IPv6. The first connection 
 that completes successfully will be used. Any outstanding connection attempts will
-be closed. As of version 18.X.X this option shoudl be considered somewhat experimental. 
+be closed. As of version 18.X.X this option should be considered somewhat experimental.
 
 usage:
 -oHappyEyes=[Yes|No] will enabled Happy Eyeballs. The default is no. 
+-oHappyDelay=[N] where N is a positive integer express in milliseconds.
+                 The default value of 250ms is suggested by RFC 8305.
 
 MPTCP Support in 18.7.0:
 Multipath TCP is now available as a runtime option for HPN-SSH. MPTCP

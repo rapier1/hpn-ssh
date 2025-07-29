@@ -41,21 +41,28 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "happyeyeballs.h"
 #include "sshconnect.h"
 #include "ssh.h"
 #include "misc.h"
 #include "log.h"
-#include <unistd.h>
+#include "readconf.h"
 
 /* this is from sshconnect.c */
 extern int ssh_create_socket(struct addrinfo *ai);
 
-/* delay 250ms between IPv6 and IPv4 connection
+/* get the options struct if for the delay time */
+extern Options options;
+
+/* delay between IPv6 and IPv4 connection
  * this lets us preference IPv6 connections.
+ * default of 250ms as per RFC 8305 Section 5.
+ * Yes, we could just use the option value in the code
+ * but I think using descriptive var is clearer here
  */
-#define CONNECTION_ATTEMPT_DELAY 250
+//const int connection_attempt_delay = options.happy_delay;
 
 /* have we timed out? */
 static int
@@ -69,13 +76,13 @@ timeout(struct timeval *tv, int timeout_ms)
 
 char global_ntop[NI_MAXHOST];
 
+
 char *return_fam(int fam) {
 	if (fam == 10)
 		return "IPv6";
 	else
 		return "IPv4";
 }
-
 
 /*
  * Return 0 if the addrinfo was not tried. Return -1 if using it
@@ -97,7 +104,7 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 	/* If *nfds != 0 then *initiate is initialised. */
 	if (*nfds &&
 	    (ai == NULL ||
-	      !timeout(initiate, CONNECTION_ATTEMPT_DELAY))) { 
+	     !timeout(initiate, options.happy_delay))) {
 		/* Do not initiate new connections yet */
 		debug_f ("Waiting to initiate new connection");
 		return 0;
@@ -119,7 +126,7 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 		errno = oerrno;
 		return -1;
 	}
-	memcpy(global_ntop,ntop,sizeof(ntop)); 
+	memcpy(global_ntop,ntop,sizeof(ntop));
 	debug("HAPPY EYEBALLS Connecting to %.200s [%.100s] port %s.",
 	      host, ntop, strport);
 	debug("HAPPY %.200s", global_ntop);
@@ -240,13 +247,13 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 			continue;
 		tv = NULL;
 
-		/* this is just to determine the pause between 
+		/* this is just to determine the pause between
 		 * calls to select. */
   		if (ai != NULL || *timeout_ms > 0) {
 			debug_f ("In pause...");
 			tv = &select_tv;
 			if (ai != NULL) {
-				diff = CONNECTION_ATTEMPT_DELAY;
+				diff = options.happy_delay;
 				ms_subtract_diff(&initiate_tv, &diff);
 				if (*timeout_ms > 0) {
 					diff0 = *timeout_ms;
@@ -260,7 +267,7 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 			tv->tv_sec = diff / 1000;
 			tv->tv_usec = (diff % 1000) * 1000;
 		}
-		
+
 		/* create a writeable set of file descriptors */
 		wfds = fds;
 		/* select will pause for time tv determined by the above
@@ -292,13 +299,11 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 	oerrno = errno;
 	/* close other connection attempts/sockets */
 	debug_f("NFDS is %d", nfds);
-	//while (nfds-- > 0)
-	for (int foo = 0; foo < nfds; foo++)
-		if (FD_ISSET(foo, &fds)) {
-			debug_f ("closing nfds %d", foo);
-			close(foo);}
-		else
-			debug_f("FSDSET true for %d", foo);
+	while (nfds-- > 0) {
+		debug_f("Running FD_ISSET on %d", nfds);
+		if (FD_ISSET(nfds, &fds))
+			close(nfds);
+	}
 	/* we timed out with no valid connections */
 	if (timeout(&start_tv, *timeout_ms))
 		errno = ETIMEDOUT;

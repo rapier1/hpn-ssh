@@ -135,6 +135,7 @@ typedef struct {
 	int     fallback_port; /* port to fallback to (def: 22) */
         int     use_mptcp; /* use MultiPath TCP */
         int     use_happyeyes; /* use RFC 8305 - Happy Eyeballs */
+	int     happy_delay; /* user defined dleay for RFC 8305 */
 
 	int	no_host_authentication_for_localhost;
 	int	identities_only;
