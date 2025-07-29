@@ -67,6 +67,16 @@ timeout(struct timeval *tv, int timeout_ms)
 	return timeout_ms <= 0;
 }
 
+char global_ntop[NI_MAXHOST];
+
+char *return_fam(int fam) {
+	if (fam == 10)
+		return "IPv6";
+	else
+		return "IPv4";
+}
+
+
 /*
  * Return 0 if the addrinfo was not tried. Return -1 if using it
  * failed. Return 1 if it was used.
@@ -99,7 +109,7 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 		return -1;
 	}
 
-	debug_f ("Running getnameinfo for %s", host);
+	debug_f ("Running getnameinfo for %s and %d", host, ai->ai_family);
 	if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
 			ntop, sizeof(ntop),
 			strport, sizeof(strport),
@@ -109,8 +119,10 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 		errno = oerrno;
 		return -1;
 	}
+	memcpy(global_ntop,ntop,sizeof(ntop)); 
 	debug("HAPPY EYEBALLS Connecting to %.200s [%.100s] port %s.",
 	      host, ntop, strport);
+	debug("HAPPY %.200s", global_ntop);
 	/* Create a socket for connecting */
 	sock = ssh_create_socket(ai);
 	if (sock < 0) {
@@ -125,11 +137,12 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 	}
 	fd_ai[sock] = ai;
 	/* using nonblocking sockets with select allows
-	 * use to fire off new sockets without waiting for a
+	 * us to fire off new sockets without waiting for a
 	 * connection to be established. This lets us avoid
 	 * the use of threads. set_nonblock is in misc.c
 	 * and uses fnctl */
 	set_nonblock(sock);
+	debug_f("PRE CONNECT for %s", return_fam(ai->ai_family));
 	if (connect(sock, ai->ai_addr, ai->ai_addrlen) < 0 &&
 	    errno != EINPROGRESS) {
 		error("connect to address %s port %s: %s",
@@ -138,6 +151,7 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 		close(sock);
 		return -1;
 	}
+	debug_f("POST CONNECT for %s", return_fam(ai->ai_family));
 	monotime_tv(initiate);
 	FD_SET(sock, fds);
 	*nfds = MAXIMUM(*nfds, sock + 1);
@@ -155,15 +169,20 @@ happy_eyeballs_process(int *nfds, fd_set *fds,
 
 	debug_f("in happy_eyeballs_process");
 	for (sock = *nfds - 1; ready > 0 && sock >= 0; sock--) {
+		debug_f("Processing for %s: %d", return_fam(fd_ai[sock]->ai_family), sock);
 		if (FD_ISSET(sock, wfds)) {
+			debug_f("FD_ISSET true for %d", sock);
 			ready--;
 			optlen = sizeof(optval);
+			debug_f("OPTVAL is %d for %d", optval, sock);
 			if (getsockopt(sock, SOL_SOCKET, SO_ERROR,
 				       &optval, &optlen) < 0) {
 				optval = errno;
+				debug_f("WHAT?!");
 				error("getsockopt failed: %s",
 				      strerror(errno));
 			} else if (optval != 0) {
+				debug_f("Copying data for %d on%s", optval, return_fam(fd_ai[sock]->ai_family));
 				memset(ntop, 0, sizeof(ntop));
 				memset(strport, 0, sizeof(strport));
 				if (getnameinfo(fd_ai[sock]->ai_addr,
@@ -181,6 +200,7 @@ happy_eyeballs_process(int *nfds, fd_set *fds,
 			while (*nfds > 0 && ! FD_ISSET(*nfds - 1, fds))
 				--*nfds;
 			if (optval == 0) {
+				debug_f("unsetting nonblock for %s on %d", return_fam(fd_ai[sock]->ai_family), sock);
 				unset_nonblock(sock);
 				return sock;
 			}
@@ -271,9 +291,14 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 	}
 	oerrno = errno;
 	/* close other connection attempts/sockets */
-	while (nfds-- > 0)
-		if (FD_ISSET(nfds, &fds))
-			close(nfds);
+	debug_f("NFDS is %d", nfds);
+	//while (nfds-- > 0)
+	for (int foo = 0; foo < nfds; foo++)
+		if (FD_ISSET(foo, &fds)) {
+			debug_f ("closing nfds %d", foo);
+			close(foo);}
+		else
+			debug_f("FSDSET true for %d", foo);
 	/* we timed out with no valid connections */
 	if (timeout(&start_tv, *timeout_ms))
 		errno = ETIMEDOUT;
