@@ -474,16 +474,15 @@ ssh_connect_direct(struct ssh *ssh, const char *host, struct addrinfo *aitop,
 			debug("Trying again...");
 		}
 		if (options.use_happyeyes == 1) {
-			debug_f ("********** Trying happy eyeballs");
+			debug_f ("Trying happy eyeballs.");
 			sock = happy_eyeballs(host, aitop,
 			    hostaddr, timeout_ms);
 			//sock = happy_eyeballs_connect(host, aitop, hostaddr);
 			if (sock != -1) {
+				debug_f ("Happy eyeballs successful.");
 				break;	/* Successful connection. */
-				debug_f ("******* Happy eyeballs successful");
 			}
 		} else {
-			debug_f("******************************* NOT HERE**********");
 			/*
 			 * Loop through addresses for this host, and try each one in
 			 * sequence until the connection succeeds.
