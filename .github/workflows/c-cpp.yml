@@ -114,8 +114,8 @@ jobs:
           - { target: ubuntu-latest, config: putty-snapshot }
           - { target: ubuntu-latest, config: zlib-develop }
           - { target: ubuntu-latest, config: tcmalloc }
-#	  musl doesn't work because it doesn't know about linux/tcp.h
-#	  - { target: ubuntu-latest, config: musl }
+#         musl doesn't work because it doesn't know about linux/tcp.h
+#         - { target: ubuntu-latest, config: musl }
           - { target: ubuntu-22.04-arm, config: kitchensink }
           - { target: ubuntu-24.04-arm, config: kitchensink }
 # we know pam doesn't work because we can't install a new pam file
