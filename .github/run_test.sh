@@ -12,6 +12,7 @@ if [ ! -z "$SUDO" ] && [ ! -z "$TEST_SSH_HOSTBASED_AUTH" ]; then
     $SUDO mkdir -p "${sshconf}"
     hostname | $SUDO tee $sshconf/shosts.equiv >/dev/null
     echo "EnableSSHKeysign yes" | $SUDO tee $sshconf/ssh_config >/dev/null
+    $SUDO mkdir -p $sshconf
     $SUDO cp -p /etc/ssh/ssh_host*key* $sshconf
     $SUDO make install
     for key in $sshconf/ssh_host*key*.pub; do
@@ -19,18 +20,6 @@ if [ ! -z "$SUDO" ] && [ ! -z "$TEST_SSH_HOSTBASED_AUTH" ]; then
             $SUDO tee -a $sshconf/ssh_known_hosts >/dev/null
     done
 fi
-
-output_failed_logs() {
-    for i in regress/failed*.log; do
-        if [ -f "$i" ]; then
-            echo -------------------------------------------------------------------------
-            echo LOGFILE $i
-            cat $i
-            echo -------------------------------------------------------------------------
-        fi
-    done
-}
-trap output_failed_logs 0
 
 env=""
 if [ ! -z "${SUDO}" ]; then
