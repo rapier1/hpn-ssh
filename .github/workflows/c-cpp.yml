@@ -36,8 +36,8 @@ jobs:
           - macos-14
           - macos-15
           - windows-2022
-	  - windows-2025
-	config: [default]
+          - windows-2025
+        config: [default]
         # Then we include any extra configs we want to test for specific VMs.
         include:
           - { target: windows-2022, config: cygwin-release }
@@ -173,4 +173,4 @@ jobs:
         path: |
           config.h
           config.log
-	  regress/
+          regress/
