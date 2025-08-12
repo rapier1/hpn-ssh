@@ -12,10 +12,8 @@ name: C/C++ CI
 
 on:
   push:
-    branches: [ master, pre-stage, release_candidates, dev_major, dev_minor ]
     paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/c-cpp.yml' ]
   pull_request:
-    branches: [ master, release_candidates ]
     paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/c-cpp.yml' ]
 
 jobs:
@@ -28,7 +26,6 @@ jobs:
         # First we test all OSes in the default configuration.
         target:
           - ubuntu-22.04
-          - ubuntu-24.04
           - ubuntu-latest
           - ubuntu-22.04-arm
           - ubuntu-24.04-arm
@@ -39,11 +36,11 @@ jobs:
           - windows-2025
         config: [default]
         # Then we include any extra configs we want to test for specific VMs.
+        # Valgrind slows things down quite a bit, so start them first.
         include:
           - { target: windows-2022, config: cygwin-release }
           - { target: windows-2025, config: cygwin-release }
-# binn.c no longer works with c89 so remove this test.
-#          - { target: ubuntu-22.04, config: c89 }
+          - { target: ubuntu-22.04, config: c89 }
           - { target: ubuntu-22.04, config: clang-11 }
           - { target: ubuntu-22.04, config: clang-12-Werror }
           - { target: ubuntu-22.04, config: clang-14 }
@@ -66,9 +63,6 @@ jobs:
           - { target: ubuntu-22.04, config: valgrind-2 }
           - { target: ubuntu-22.04, config: valgrind-3 }
           - { target: ubuntu-22.04, config: valgrind-4 }
-#          - { target: ubuntu-22.04, config: valgrind-5 }
-          - { target: ubuntu-22.04, config: valgrind-6 }
-          - { target: ubuntu-22.04, config: valgrind-7 }
           - { target: ubuntu-22.04, config: valgrind-unit }
           - { target: ubuntu-22.04, config: without-openssl }
           - { target: ubuntu-latest, config: gcc-14 }
@@ -77,6 +71,11 @@ jobs:
           - { target: ubuntu-latest, config: boringssl }
           - { target: ubuntu-latest, config: aws-lc }
           - { target: ubuntu-latest, config: libressl-master }
+          - { target: ubuntu-latest, config: libressl-3.2.6 }
+          - { target: ubuntu-latest, config: libressl-3.3.6 }
+          - { target: ubuntu-latest, config: libressl-3.4.3 }
+          - { target: ubuntu-latest, config: libressl-3.5.3 }
+          - { target: ubuntu-latest, config: libressl-3.6.1 }
           - { target: ubuntu-latest, config: libressl-3.7.2 }
           - { target: ubuntu-latest, config: libressl-3.8.4 }
           - { target: ubuntu-latest, config: libressl-3.9.2 }
@@ -114,16 +113,15 @@ jobs:
           - { target: ubuntu-latest, config: putty-snapshot }
           - { target: ubuntu-latest, config: zlib-develop }
           - { target: ubuntu-latest, config: tcmalloc }
-#         musl doesn't work because it doesn't know about linux/tcp.h
-#         - { target: ubuntu-latest, config: musl }
+          - { target: ubuntu-latest, config: musl }
           - { target: ubuntu-22.04-arm, config: kitchensink }
           - { target: ubuntu-24.04-arm, config: kitchensink }
-# we know pam doesn't work because we can't install a new pam file
-# for hpnssh via the CI test methods
-#         - { target: macos-13, config: pam }
-#         - { target: macos-14, config: pam }
-#         - { target: macos-15, config: pam }
+          - { target: macos-13, config: pam }
+          - { target: macos-14, config: pam }
+          - { target: macos-15, config: pam }
     runs-on: ${{ matrix.target }}
+    env:
+      EPHEMERAL_VM: yes
     steps:
     - name: check RUN_ONLY_TARGET_CONFIG
       if: vars.RUN_ONLY_TARGET_CONFIG != ''
@@ -135,6 +133,8 @@ jobs:
       id: cygwin_install
       if: ${{ startsWith(matrix.target, 'windows') }}
       uses: cygwin/cygwin-install-action@master
+      env:
+        CYGWIN: "winsymlinks:native"
     - uses: actions/checkout@main
     - name: setup CI system
       run: sh ./.github/setup_ci.sh ${{ matrix.config }} ${{ matrix.target }}

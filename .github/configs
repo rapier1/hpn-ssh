@@ -14,7 +14,7 @@ if [ "$config" = "" ]; then
 fi
 
 if [ ! -z "${LTESTS}" ]; then
-       OVERRIDE_LTESTS="${LTESTS}"
+	OVERRIDE_LTESTS="${LTESTS}"
 fi
 
 unset CC CFLAGS CPPFLAGS LDFLAGS LTESTS SUDO
@@ -172,12 +172,12 @@ case "$config" in
 	SSHD_CONFOPTS="UsePam yes"
 	;;
     boringssl)
-       CONFIGFLAGS="--disable-pkcs11"
-       LIBCRYPTOFLAGS="--with-ssl-dir=/opt/boringssl --with-rpath=-Wl,-rpath,"
-       ;;
-    aws-lc)
-       LIBCRYPTOFLAGS="--with-ssl-dir=/opt/aws-lc --with-rpath=-Wl,-rpath,"
-       ;;
+	CONFIGFLAGS="--disable-pkcs11"
+	LIBCRYPTOFLAGS="--with-ssl-dir=/opt/boringssl --with-rpath=-Wl,-rpath,"
+	;;
+	aws-lc)
+	LIBCRYPTOFLAGS="--with-ssl-dir=/opt/aws-lc --with-rpath=-Wl,-rpath,"
+	;;
     libressl-*)
 	LIBCRYPTOFLAGS="--with-ssl-dir=/opt/libressl --with-rpath=-Wl,-rpath,"
 	;;
@@ -204,7 +204,7 @@ case "$config" in
 	LIBCRYPTOFLAGS="--without-openssl"
 	TEST_TARGET=t-exec
 	;;
-    valgrind-[1-7]|valgrind-unit)
+    valgrind-[1-4]|valgrind-unit)
 	# rlimit sandbox and FORTIFY_SOURCE confuse Valgrind.
 	CONFIGFLAGS="--without-sandbox --without-hardening"
 	CONFIGFLAGS="$CONFIGFLAGS --with-cppflags=-D_FORTIFY_SOURCE=0"
@@ -214,12 +214,9 @@ case "$config" in
 	# Valgrind slows things down enough that the agent timeout test
 	# won't reliably pass, and the unit tests run longer than allowed
 	# by github so split into separate tests.
-	tests2="integrity try-ciphers"
-	tests3="krl forward-control sshsig"
-	tests4="cert-userkey cert-hostkey"
-	tests5="rekey"
-	tests6="agent-restrict kextype sftp"
-	tests7="kextype sftp-perm keygen-comment percent"
+	tests2="integrity try-ciphers rekey"
+	tests3="krl forward-control sshsig agent-restrict kextype sftp"
+	tests4="cert-userkey cert-hostkey kextype sftp-perm keygen-comment percent"
 	case "$config" in
 	    valgrind-1)
 		# All tests except agent-timeout (which is flaky under valgrind),
@@ -228,7 +225,7 @@ case "$config" in
 		# Slow ones are run separately to increase parallelism.
 		SKIP_LTESTS="agent-timeout connection-timeout hostbased"
 		SKIP_LTESTS="$SKIP_LTESTS penalty-expire"
-		SKIP_LTESTS="$SKIP_LTESTS ${tests2} ${tests3} ${tests4} ${tests5} ${tests6} ${tests7}"
+		SKIP_LTESTS="$SKIP_LTESTS ${tests2} ${tests3} ${tests4} ${tests5}"
 		;;
 	    valgrind-2)
 		LTESTS="${tests2}"
@@ -238,15 +235,6 @@ case "$config" in
 		;;
 	    valgrind-4)
 		LTESTS="${tests4}"
-		;;
-	    valgrind-5)
-		LTESTS="${tests5}"
-		;;
-	    valgrind-6)
-		LTESTS="${tests6}"
-		;;
-	    valgrind-7)
-		LTESTS="${tests7}"
 		;;
 	    valgrind-unit)
 		TEST_TARGET="unit USE_VALGRIND=1"
@@ -355,10 +343,6 @@ case "${TARGET_HOST}" in
 	# No sudo on Windows.
 	SUDO=""
 	;;
-    windows*)
-	#No sudo on Windows. 
-	SUDO=""
-	;;
 esac
 
 host=`./config.guess`
@@ -415,8 +399,8 @@ if [ -x "$(which plink 2>/dev/null)" ]; then
 fi
 
 if [ ! -z "${OVERRIDE_LTESTS}" ]; then
-       echo >&2 "Overriding LTESTS, was '${LTESTS}', now '${OVERRIDE_LTESTS}'"
-       LTESTS="${OVERRIDE_LTESTS}"
+	echo >&2 "Overriding LTESTS, was '${LTESTS}', now '${OVERRIDE_LTESTS}'"
+	LTESTS="${OVERRIDE_LTESTS}"
 fi
 
 export CC CFLAGS CPPFLAGS LDFLAGS LTESTS SUDO
