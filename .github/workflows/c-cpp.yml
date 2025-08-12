@@ -165,7 +165,7 @@ jobs:
     - name: chown logs
       if: failure()
       run: test -x "$(which sudo 2>&1)" && sudo chown -R "${LOGNAME}" regress
-   - name: save logs
+    - name: save logs
       if: failure()
       uses: actions/upload-artifact@main
       with:
