@@ -12,9 +12,11 @@ name: C/C++ CI
 
 on:
   push:
+    branches: [ master, dev_major, dev_minor ]
     paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/c-cpp.yml' ]
   pull_request:
-    paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/c-cpp.yml' ]
+    branches: [ master, dev_major, dev_minor ]
+  paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/c-cpp.yml' ]
 
 jobs:
   ci:
@@ -26,6 +28,7 @@ jobs:
         # First we test all OSes in the default configuration.
         target:
           - ubuntu-22.04
+          - ubunut-24.04
           - ubuntu-latest
           - ubuntu-22.04-arm
           - ubuntu-24.04-arm
@@ -40,7 +43,8 @@ jobs:
         include:
           - { target: windows-2022, config: cygwin-release }
           - { target: windows-2025, config: cygwin-release }
-          - { target: ubuntu-22.04, config: c89 }
+# binn no longer supports c89 so skip.
+#          - { target: ubuntu-22.04, config: c89 }
           - { target: ubuntu-22.04, config: clang-11 }
           - { target: ubuntu-22.04, config: clang-12-Werror }
           - { target: ubuntu-22.04, config: clang-14 }
@@ -63,6 +67,9 @@ jobs:
           - { target: ubuntu-22.04, config: valgrind-2 }
           - { target: ubuntu-22.04, config: valgrind-3 }
           - { target: ubuntu-22.04, config: valgrind-4 }
+          - { target: ubuntu-22.04, config: valgrind-5 }
+          - { target: ubuntu-22.04, config: valgrind-6 }
+          - { target: ubuntu-22.04, config: valgrind-7 }
           - { target: ubuntu-22.04, config: valgrind-unit }
           - { target: ubuntu-22.04, config: without-openssl }
           - { target: ubuntu-latest, config: gcc-14 }
@@ -71,11 +78,14 @@ jobs:
           - { target: ubuntu-latest, config: boringssl }
           - { target: ubuntu-latest, config: aws-lc }
           - { target: ubuntu-latest, config: libressl-master }
-          - { target: ubuntu-latest, config: libressl-3.2.6 }
-          - { target: ubuntu-latest, config: libressl-3.3.6 }
-          - { target: ubuntu-latest, config: libressl-3.4.3 }
-          - { target: ubuntu-latest, config: libressl-3.5.3 }
-          - { target: ubuntu-latest, config: libressl-3.6.1 }
+# We don't support libreSSL earlier than 3.7 due to problems with
+# the structures used by the aes-ctr mt cipher that wasn't address
+# before 3.7
+#          - { target: ubuntu-latest, config: libressl-3.2.6 }
+#          - { target: ubuntu-latest, config: libressl-3.3.6 }
+#          - { target: ubuntu-latest, config: libressl-3.4.3 }
+#          - { target: ubuntu-latest, config: libressl-3.5.3 }
+#          - { target: ubuntu-latest, config: libressl-3.6.1 }
           - { target: ubuntu-latest, config: libressl-3.7.2 }
           - { target: ubuntu-latest, config: libressl-3.8.4 }
           - { target: ubuntu-latest, config: libressl-3.9.2 }
@@ -113,12 +123,15 @@ jobs:
           - { target: ubuntu-latest, config: putty-snapshot }
           - { target: ubuntu-latest, config: zlib-develop }
           - { target: ubuntu-latest, config: tcmalloc }
+#musl doens't know about linux/tcp.h so skip
           - { target: ubuntu-latest, config: musl }
           - { target: ubuntu-22.04-arm, config: kitchensink }
           - { target: ubuntu-24.04-arm, config: kitchensink }
-          - { target: macos-13, config: pam }
-          - { target: macos-14, config: pam }
-          - { target: macos-15, config: pam }
+# Can't copy the necessary pam file in darwin without
+# user interaction so skip these
+#          - { target: macos-13, config: pam }
+#          - { target: macos-14, config: pam }
+#          - { target: macos-15, config: pam }
     runs-on: ${{ matrix.target }}
     env:
       EPHEMERAL_VM: yes
