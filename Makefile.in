@@ -74,7 +74,7 @@ MKDIR_P=@MKDIR_P@
 
 .SUFFIXES: .lo
 
-TARGETS=hpnssh$(EXEEXT) hpnsshd$(EXEEXT) hpnsshd-session$(EXEEXT) hpnsshd-auth$(EXEXT) hpnssh-add$(EXEEXT) hpnssh-keygen$(EXEEXT) hpnssh-keyscan${EXEEXT} hpnssh-keysign${EXEEXT} hpnssh-pkcs11-helper$(EXEEXT) hpnssh-agent$(EXEEXT) hpnscp$(EXEEXT) hpnsftp-server$(EXEEXT) hpnsftp$(EXEEXT) hpnssh-sk-helper$(EXEEXT)
+TARGETS=hpnssh$(EXEEXT) hpnsshd$(EXEEXT) hpnsshd-session$(EXEEXT) hpnsshd-auth$(EXEEXT) hpnssh-add$(EXEEXT) hpnssh-keygen$(EXEEXT) hpnssh-keyscan${EXEEXT} hpnssh-keysign${EXEEXT} hpnssh-pkcs11-helper$(EXEEXT) hpnssh-agent$(EXEEXT) hpnscp$(EXEEXT) hpnsftp-server$(EXEEXT) hpnsftp$(EXEEXT) hpnssh-sk-helper$(EXEEXT)
 
 XMSS_OBJS=\
 	ssh-xmss.o \
