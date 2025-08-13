@@ -359,6 +359,7 @@ ssh_create_socket(struct addrinfo *ai)
 #endif
 	char ntop[NI_MAXHOST];
 
+	/* user request for Multipath TCP */
 	if (options.use_mptcp)
 		sock = socket(ai->ai_family, ai->ai_socktype, IPPROTO_MPTCP);
 	else
