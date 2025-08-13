@@ -75,8 +75,9 @@ jobs:
           - { target: ubuntu-latest, config: gcc-14 }
           - { target: ubuntu-latest, config: clang-15 }
           - { target: ubuntu-latest, config: clang-19 }
-          - { target: ubuntu-latest, config: boringssl }
-          - { target: ubuntu-latest, config: aws-lc }
+# these don't support our crypto methods
+#          - { target: ubuntu-latest, config: boringssl }
+#          - { target: ubuntu-latest, config: aws-lc }
           - { target: ubuntu-latest, config: libressl-master }
 # We don't support libreSSL earlier than 3.7 due to problems with
 # the structures used by the aes-ctr mt cipher that wasn't address
@@ -124,7 +125,7 @@ jobs:
           - { target: ubuntu-latest, config: zlib-develop }
           - { target: ubuntu-latest, config: tcmalloc }
 #musl doens't know about linux/tcp.h so skip
-          - { target: ubuntu-latest, config: musl }
+#          - { target: ubuntu-latest, config: musl }
           - { target: ubuntu-22.04-arm, config: kitchensink }
           - { target: ubuntu-24.04-arm, config: kitchensink }
 # Can't copy the necessary pam file in darwin without
