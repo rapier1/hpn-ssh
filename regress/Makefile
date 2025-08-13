@@ -59,6 +59,7 @@ LTESTS= 	connect \
 		scp \
 		scp3 \
 		scp-uri \
+		scp-resume \
 		sftp \
 		sftp-chroot \
 		sftp-cmds \

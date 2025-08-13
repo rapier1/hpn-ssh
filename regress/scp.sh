@@ -146,23 +146,6 @@ for mode in scp sftp ; do
 	    done
 	fi
 
-	if $SCP -Z 2>&1 | grep "vZ" > /dev/null 2>&1
-	then
-	    verbose "$tag: resume local dir to remote dir"
-	    scpclean
-	    rm -rf ${DIR2}
-	    cp ${DATA} ${DIR}/copy1
-	    cp ${DATA} ${DIR}/copy2
-	    cp ${DATA} ${DIR}/copy3
-	    $SCP -r $scpopts ${DIR} somehost:${DIR2} || fail "copy failed"
-	    truncate --size=-512 ${DIR2}/copy1
-	    truncate --size=+512 ${DIR2}/copy2
-	    $SCP -Z $scpopts ${DIR}/* somehost:${DIR2} || fail "resume failed"
-	    for i in $(cd ${DIR} && echo *); do
-		cmp ${DIR}/$i ${DIR2}/$i || fail "corrupted resume copy"
-	    done
-	fi
-
 	verbose "$tag: unmatched glob file local->remote"
 	scpclean
 	$SCP $scpopts ${DATA} somehost:${COPY3} || fail "copy failed"

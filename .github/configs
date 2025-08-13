@@ -354,6 +354,11 @@ case "${TARGET_HOST}" in
     win10)
 	# No sudo on Windows.
 	SUDO=""
+	SKIP_LTESTS="scp-resume"
+	;;
+    windows*)
+	#skip the scp-resume test
+	SKIP_LTESTS="scp-resume"
 	;;
 esac
 
@@ -363,6 +368,7 @@ case "$host" in
 	SUDO=""
 	# Don't run compat tests on cygwin as they don't currently compile.
 	TEST_TARGET="tests"
+	SKIP_LTESTS="scp-resume"
 	;;
 *-darwin*)
 	# Unless specified otherwise, build without OpenSSL on Mac OS since
