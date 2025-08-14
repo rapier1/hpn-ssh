@@ -69,6 +69,7 @@
 #include "ssherr.h"
 #include "authfd.h"
 #include "kex.h"
+#include "happyeyeballs.h"
 
 struct sshkey *previous_host_key = NULL;
 
@@ -347,7 +348,7 @@ check_ifaddrs(const char *ifname, int af, const struct ifaddrs *ifaddrs,
 /*
  * Creates a socket for use as the ssh connection.
  */
-static int
+int
 ssh_create_socket(struct addrinfo *ai)
 {
 	int sock, r;
@@ -472,60 +473,75 @@ ssh_connect_direct(struct ssh *ssh, const char *host, struct addrinfo *aitop,
 			sleep(1);
 			debug("Trying again...");
 		}
-		/*
-		 * Loop through addresses for this host, and try each one in
-		 * sequence until the connection succeeds.
-		 */
-		for (ai = aitop; ai; ai = ai->ai_next) {
-			if (ai->ai_family != AF_INET &&
-			    ai->ai_family != AF_INET6) {
-				errno = EAFNOSUPPORT;
-				continue;
+		if (options.use_happyeyes == 1) {
+			debug_f ("********** Trying happy eyeballs");
+			sock = happy_eyeballs(host, aitop,
+			    hostaddr, timeout_ms);
+			//sock = happy_eyeballs_connect(host, aitop, hostaddr);
+			if (sock != -1) {
+				break;	/* Successful connection. */
+				debug_f ("******* Happy eyeballs successful");
 			}
-			if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
-			    ntop, sizeof(ntop), strport, sizeof(strport),
-			    NI_NUMERICHOST|NI_NUMERICSERV) != 0) {
-				oerrno = errno;
-				error_f("getnameinfo failed");
-				errno = oerrno;
-				continue;
-			}
-			if (options.address_family != AF_UNSPEC &&
-			    ai->ai_family != options.address_family) {
-				debug2_f("skipping address [%s]:%s: "
-				    "wrong address family", ntop, strport);
-				errno = EAFNOSUPPORT;
-				continue;
-			}
+		} else {
+			/*
+			 * Loop through addresses for this host, and try each one in
+			 * sequence until the connection succeeds.
+			 */
+			for (ai = aitop; ai; ai = ai->ai_next) {
+				if (ai->ai_family != AF_INET &&
+				    ai->ai_family != AF_INET6) {
+					errno = EAFNOSUPPORT;
+					continue;
+				}
+				if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
+				    ntop, sizeof(ntop), strport,
+				    sizeof(strport),
+				    NI_NUMERICHOST|NI_NUMERICSERV) != 0) {
+					oerrno = errno;
+					error_f("getnameinfo failed");
+					errno = oerrno;
+					continue;
+				}
+				if (options.address_family != AF_UNSPEC &&
+				    ai->ai_family != options.address_family) {
+					debug2_f("skipping address [%s]:%s: "
+						 "wrong address family",
+						 ntop, strport);
+					errno = EAFNOSUPPORT;
+					continue;
+				}
 
-			debug("Connecting to %.200s [%.100s] port %s.",
-				host, ntop, strport);
+				debug("Connecting to %.200s [%.100s] port %s.",
+				    host, ntop, strport);
 
-			/* Create a socket for connecting. */
-			sock = ssh_create_socket(ai);
-			if (sock < 0) {
-				/* Any error is already output */
-				errno = 0;
-				continue;
-			}
+				/* Create a socket for connecting. */
+				sock = ssh_create_socket(ai);
+				if (sock < 0) {
+					/* Any error is already output */
+					errno = 0;
+					continue;
+				}
 
-			*timeout_ms = saved_timeout_ms;
-			if (timeout_connect(sock, ai->ai_addr, ai->ai_addrlen,
-			    timeout_ms) >= 0) {
-				/* Successful connection. */
-				memcpy(hostaddr, ai->ai_addr, ai->ai_addrlen);
-				break;
-			} else {
-				oerrno = errno;
-				debug("connect to address %s port %s: %s",
-				    ntop, strport, strerror(errno));
-				close(sock);
-				sock = -1;
-				errno = oerrno;
+				*timeout_ms = saved_timeout_ms;
+				if (timeout_connect(sock, ai->ai_addr,
+				    ai->ai_addrlen,
+				    timeout_ms) >= 0) {
+					/* Successful connection. */
+					memcpy(hostaddr, ai->ai_addr,
+					       ai->ai_addrlen);
+					break;
+				} else {
+					oerrno = errno;
+					debug("connect to address %s port %s: %s",
+					    ntop, strport, strerror(errno));
+					close(sock);
+					sock = -1;
+					errno = oerrno;
+				}
 			}
+			if (sock != -1)
+				break;	/* Successful connection. */
 		}
-		if (sock != -1)
-			break;	/* Successful connection. */
 	}
 
 	/* Return failure if we didn't get a successful connection. */
