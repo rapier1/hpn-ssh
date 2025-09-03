@@ -77,6 +77,41 @@
 #include "ssherr.h"
 #include "platform.h"
 
+
+/* Function to determine if FIPS is enabled for not.
+ * We assume that fips is not enabled and then test from there.
+ * The idea is that if there is an error or we can't read the value
+ * then either the OS doesn't support FIPS or that FIPS will
+ * catch anything we try to do that's not FIPS compliant.
+ * That would be limited to trying to use one of the parallel ciphers.
+ */
+int
+fips_enabled()
+{
+	int value = 0;
+	const char* fips_path = "/proc/sys/crypto/fips_enabled";
+
+	FILE *f = fopen(fips_path, "f");
+	/* if we can't open the path to fips_enabled it
+	 * either doesn't exist or there is an error. In either
+	 * case we treat it as if fips is *not* enabled
+	*/
+	if (!f) {
+		return 0;
+	}
+
+	/* fips_enabled does exist so read the value.
+	 * It should be either 0 (disabled) or 1 (enabled)
+	 */
+	if ( 1 != fscanf(f,"%d", value) )
+		/* if we get some error here then we
+		 * again fail to retuning fips being disabled
+		 */
+		return 0;
+
+	return value;
+}
+
 void
 read_mem_stats(statm_t *result, int post_auth)
 {

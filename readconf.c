@@ -2830,7 +2830,10 @@ initialize_options(Options * options)
 	options->nonemac_enabled = -1;
 	options->use_mptcp = -1;
 	options->use_happyeyes = -1;
-	options->disable_multithreaded = -1;
+	if (fips_enabled != 0) 
+		options->disable_multithreaded = 1;
+	else
+		options->disable_multithreaded = -1;
 	options->metrics = -1;
 	options->metrics_path = NULL;
 	options->metrics_interval = -1;
