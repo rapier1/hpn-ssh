@@ -2830,10 +2830,6 @@ initialize_options(Options * options)
 	options->nonemac_enabled = -1;
 	options->use_mptcp = -1;
 	options->use_happyeyes = -1;
-	if (fips_enabled != 0) 
-		options->disable_multithreaded = 1;
-	else
-		options->disable_multithreaded = -1;
 	options->metrics = -1;
 	options->metrics_path = NULL;
 	options->metrics_interval = -1;
@@ -3038,6 +3034,13 @@ fill_default_options(Options * options)
 		options->use_mptcp = 0;
 	if (options->use_happyeyes == -1)
 		options->use_happyeyes = 0;
+	if (fips_enabled() != 0) {
+		options->disable_multithreaded = 1;
+		debug_f("FIPS mode is enabled. Parallel ciphers disabled.");
+	}
+	else {
+		debug_f("FIPS mode disabled or not found.");
+	}
 	if (options->disable_multithreaded == -1)
 		options->disable_multithreaded = 0;
 	if (options->metrics == -1)
