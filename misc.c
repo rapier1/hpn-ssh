@@ -92,7 +92,7 @@ fips_enabled()
 	int value = 0;
 	const char* fips_path = "/proc/sys/crypto/fips_enabled";
 
-	FILE *f = fopen(fips_path, "f");
+	FILE *f = fopen(fips_path, "r");
 	/* if we can't open the path to fips_enabled it
 	 * either doesn't exist or there is an error. In either
 	 * case we treat it as if fips is *not* enabled
@@ -105,13 +105,14 @@ fips_enabled()
 	/* fips_enabled does exist so read the value.
 	 * It should be either 0 (disabled) or 1 (enabled)
 	 */
-	if ( 1 != fscanf(f,"%d", value) ) {
+	if ( 1 != fscanf(f,"%d", &value) ) {
 		/* if we get some error here then we
 		 * again fail to retuning fips being disabled
 		 */
 		debug3_f("Error processing fips_enabled.");
 		return 0;
 	}
+	debug3_f("FIPS mode is %d", value);
 
 	return value;
 }
