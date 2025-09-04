@@ -98,7 +98,7 @@ fips_enabled()
 	 * case we treat it as if fips is *not* enabled
 	*/
 	if (!f) {
-		debug3_f("Cannot open path to fips_enabled.");
+		debug3_f("Cannot open path to fips_enabled. Enabling parallel ciphers.");
 		return 0;
 	}
 
@@ -109,10 +109,15 @@ fips_enabled()
 		/* if we get some error here then we
 		 * again fail to retuning fips being disabled
 		 */
-		debug3_f("Error processing fips_enabled.");
+		debug3_f("Error processing fips_enabled. Enabling parallel ciphers.");
 		return 0;
 	}
-	debug3_f("FIPS mode is %d", value);
+
+	/* let the user know the status */
+	if (value == 0)
+		debug3_f("FIPS mode is disabled. Enabling parallel ciphers.");
+	else
+		debug3_f("FIPS mode is enabled. Disabling parallel ciphers.");
 
 	return value;
 }

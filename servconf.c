@@ -210,10 +210,7 @@ initialize_server_options(ServerOptions *options)
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
 	options->use_mptcp = -1;
-	if (fips_enabled() != 0)
-		options->disable_multithreaded = 1;
-	else
-		options->disable_multithreaded = -1;
+	options->disable_multithreaded = -1;
 	options->ip_qos_interactive = -1;
 	options->ip_qos_bulk = -1;
 	options->version_addendum = NULL;
@@ -491,13 +488,6 @@ fill_default_server_options(ServerOptions *options)
 	}
 	if (options->tcp_rcv_buf_poll == -1)
 		options->tcp_rcv_buf_poll = 1;
-	if (fips_enabled() != 0) {
-		options->disable_multithreaded = 1;
-		debug_f("FIPS mode is enabled. Parallel ciphers disabled.");
-	}
-	else {
-		debug_f("FIPS mode disabled or not found.");
-	}
 	if (options->disable_multithreaded == -1)
 		options->disable_multithreaded = 0;
 	if (options->hpn_disabled == -1)
