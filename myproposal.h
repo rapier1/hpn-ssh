@@ -58,11 +58,20 @@
 	"rsa-sha2-512," \
 	"rsa-sha2-256"
 
-#define	KEX_SERVER_ENCRYPT \
-	"chacha20-poly1305-mt@hpnssh.org,"  \
-	"chacha20-poly1305@openssh.com,"    \
-	"aes128-gcm@openssh.com,aes256-gcm@openssh.com," \
-	"aes128-ctr,aes192-ctr,aes256-ctr"
+/* if we aren't using openssl we need to remove the
+ * parallel CC20 cipher from the list */
+#ifdef WITH_OPENSSL
+#define KEX_SERVER_ENCRYPT \
+        "chacha20-poly1305-mt@hpnssh.org,"  \
+        "chacha20-poly1305@openssh.com,"    \
+        "aes128-gcm@openssh.com,aes256-gcm@openssh.com," \
+        "aes128-ctr,aes192-ctr,aes256-ctr"
+#else
+#define KEX_SERVER_ENCRYPT \
+        "chacha20-poly1305@openssh.com,"    \
+        "aes128-gcm@openssh.com,aes256-gcm@openssh.com," \
+        "aes128-ctr,aes192-ctr,aes256-ctr"
+#endif
 
 #define KEX_CLIENT_ENCRYPT KEX_SERVER_ENCRYPT
 
