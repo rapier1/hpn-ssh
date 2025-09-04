@@ -667,7 +667,7 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 	/* switch to the parallel cipher if appropriate
 	 * If FIPS mode exists and is enabled then no parallel ciphers.
 	 */
-	if (options.disable_multithreaded == 0) && (fips_enabled() == 0))
+	if ((options.disable_multithreaded == 0) && (fips_enabled() == 0))
 		cipher_switch(ssh);
 	return 0;
 }
