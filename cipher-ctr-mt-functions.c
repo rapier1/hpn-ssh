@@ -557,7 +557,6 @@ int aes_mt_start_threads(void *vevp_ctx, const u_char *key,
  *                     unsigned char *out, size_t *outl, size_t outsize,
  *                     const unsigned char *in, size_t inl))
  */
-
 int aes_mt_do_cipher(void *vevp_ctx,
 			    u_char *dest, size_t *destlen, size_t destsize,
 			    const u_char *src, size_t len)
@@ -619,11 +618,15 @@ int aes_mt_do_cipher(void *vevp_ctx,
 		/* } else */
 #endif
 		/* 64 bits */
-		if ((align & 0x7) == 0) {
-			destp.u64[0] = srcp.u64[0] ^ bufp.u64[0];
-			destp.u64[1] = srcp.u64[1] ^ bufp.u64[1];
-		/* 32 bits */
-		} else if ((align & 0x3) == 0) {
+		/* this is causing undefined behaviour in sanitizers
+		 * this is annoying because it's more efficient
+		 * but UB is not something I want to retain */
+		/* if ((align & 0x7) == 0) { */
+		/* 	destp.u64[0] = srcp.u64[0] ^ bufp.u64[0]; */
+		/* 	destp.u64[1] = srcp.u64[1] ^ bufp.u64[1]; */
+		/* /\* 32 bits *\/ */
+		/* } else */
+		if ((align & 0x3) == 0) {
 			destp.u32[0] = srcp.u32[0] ^ bufp.u32[0];
 			destp.u32[1] = srcp.u32[1] ^ bufp.u32[1];
 			destp.u32[2] = srcp.u32[2] ^ bufp.u32[2];
