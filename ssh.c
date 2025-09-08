@@ -1948,8 +1948,8 @@ fork_postauth(struct ssh *ssh)
 	 * is forking or has a delayed fork.
 	 * Note: if FIPS mode is enabled then this overrides user preferences.
 	 */
-	if ((options.disable_multithreaded == 0) && (fips_enabled() == 0))
-		cipher_switch(ssh);
+	//	if ((options.disable_multithreaded == 0) && (fips_enabled() == 0))
+	//	cipher_switch(ssh);
 }
 
 static void
