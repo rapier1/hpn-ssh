@@ -41,6 +41,18 @@ jobs:
         # Then we include any extra configs we want to test for specific VMs.
         # Valgrind slows things down quite a bit, so start them first.
         include:
+          - { target: ubuntu-22.04, config: valgrind-1 }
+          - { target: ubuntu-22.04, config: valgrind-2 }
+          - { target: ubuntu-22.04, config: valgrind-3 }
+          - { target: ubuntu-22.04, config: valgrind-4 }
+# There seems to be an issue with running these tests in valgrind.
+# this is an area of future work.
+# It might work better now. Re-enable -5 and move to
+# top of stack.
+          - { target: ubuntu-22.04, config: valgrind-5 }
+          - { target: ubuntu-22.04, config: valgrind-6 }
+          - { target: ubuntu-22.04, config: valgrind-7 }
+          - { target: ubuntu-22.04, config: valgrind-unit }
           - { target: windows-2022, config: cygwin-release }
           - { target: windows-2025, config: cygwin-release }
 # binn no longer supports c89 so skip.
@@ -63,16 +75,6 @@ jobs:
           - { target: ubuntu-22.04, config: pam }
           - { target: ubuntu-22.04, config: selinux }
           - { target: ubuntu-22.04, config: sk }
-          - { target: ubuntu-22.04, config: valgrind-1 }
-          - { target: ubuntu-22.04, config: valgrind-2 }
-          - { target: ubuntu-22.04, config: valgrind-3 }
-          - { target: ubuntu-22.04, config: valgrind-4 }
-# There seems to be an issue with running these tests in valgrind. 
-# this is an area of future work
-#          - { target: ubuntu-22.04, config: valgrind-5 }
-          - { target: ubuntu-22.04, config: valgrind-6 }
-          - { target: ubuntu-22.04, config: valgrind-7 }
-          - { target: ubuntu-22.04, config: valgrind-unit }
           - { target: ubuntu-22.04, config: without-openssl }
           - { target: ubuntu-latest, config: gcc-14 }
           - { target: ubuntu-latest, config: clang-15 }
@@ -82,7 +84,7 @@ jobs:
 #          - { target: ubuntu-latest, config: aws-lc }
           - { target: ubuntu-latest, config: libressl-master }
 # We don't support libreSSL earlier than 3.7 due to problems with
-# the structures used by the aes-ctr mt cipher that wasn't address
+# the structures used by the aes-ctr mt cipher that wasn't addressed
 # before 3.7
 #          - { target: ubuntu-latest, config: libressl-3.2.6 }
 #          - { target: ubuntu-latest, config: libressl-3.3.6 }
