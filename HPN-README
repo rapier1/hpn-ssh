@@ -1,14 +1,28 @@
 Notes:
 
+FIPS Mode and Parallel Ciphers in 18.7.1
+Operating HPN-SSH in operating systems working in FIPS mode (e.g. RHEL with
+FIPS enabled) precludes the use of parallel ciphers. This is because
+the parallel AES-CTR implementation is not FIPS certified and will cause FIPS
+to exit with an error when loaded. In the case of the parallel ChaCha20 cipher
+the algorithm itself has not been FIPS certified and no implementation of
+ChaCha20 should be allowed in FIPS mode.
+
+When operating under OSes that write the FIPS state to
+/proc/sys/crypto/fips_enabled (Fedora variants) HPN-SSH will read this state
+and automatically disable the parallel AES-CTR cipher. This cannot
+be overridden by the user. For optimal performance in these circumstances
+we suggest the use of the AES-GCM cipher.
+
 Happy Eyeballs Support in 18.7.1
-Happy Eyeballs (RFC 8305) is for use on dual stack systems meaning that they have both 
+Happy Eyeballs (RFC 8305) is for use on dual stack systems meaning that they have both
 IPv4 and IPv6 TCP stacks. When enabled this option will try to connect to the
-taget over both IPv4 and IPv6 with preference given to IPv6. The first connection 
+taget over both IPv4 and IPv6 with preference given to IPv6. The first connection
 that completes successfully will be used. Any outstanding connection attempts will
-be closed. As of version 18.7.1 this option should be considered somewhat experimental. 
+be closed. As of version 18.7.1 this option should be considered somewhat experimental.
 
 usage:
--oHappyEyes=[Yes|No] will enabled Happy Eyeballs. The default is no. 
+-oHappyEyes=[Yes|No] will enabled Happy Eyeballs. The default is no.
 
 MPTCP Support in 18.7.0:
 Multipath TCP is now available as a runtime option for HPN-SSH. MPTCP
@@ -31,6 +45,7 @@ default hpnsshd port. However, we understand that many users will be end up conn
 standard SSH servers on port 22. To make the easier for users the client will fall back to
 port 22 in the event that there is no hpnssh server running on port 2222. The behaviour can
 be modifed as follows:
+
 -oFallback=[yes|no] will enable or disable port fallback. Default is yes.
 -oFallbackPort=[N] where N is the port number that should be used for fall back.
     Default is 22.
@@ -88,6 +103,8 @@ the source only send the necessary bytes to complete the transfer. If the hashes
 the entire file is resent. If the target file is larger then the source file then the entire
 source file is sent and any existing target file is overwritten.
 
+Note: The mode required the use of the legacy SCP mode instead of the default SFTP
+protocol. As such, legacy SCP mode is enabled by default (equivilant to '-O').
 
 MULTI-THREADED AES CIPHER:
 The AES cipher in CTR mode has been multithreaded (MTR-AES-CTR). This will allow ssh installations
