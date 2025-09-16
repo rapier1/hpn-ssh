@@ -3076,9 +3076,9 @@ fill_default_options(Options * options)
 	if (options->visual_host_key == -1)
 		options->visual_host_key = 0;
 	if (options->ip_qos_interactive == -1)
-		options->ip_qos_interactive = IPTOS_LOWDELAY;
+		options->ip_qos_interactive = IPTOS_DSCP_AF21;
 	if (options->ip_qos_bulk == -1)
-		options->ip_qos_bulk = IPTOS_THROUGHPUT;
+		options->ip_qos_bulk = IPTOS_DSCP_CS1;
 	if (options->request_tty == -1)
 		options->request_tty = REQUEST_TTY_AUTO;
 	if (options->session_type == -1)
@@ -3112,6 +3112,17 @@ fill_default_options(Options * options)
 		options->obscure_keystroke_timing_interval =
 		    SSH_KEYSTROKE_DEFAULT_INTERVAL_MS;
 	}
+
+	/* the default IP QoS values don't work effectively with
+	   RFC 8305  due to implementation issues on some OSes.
+	   So if HappyEyes is true we set the IP QoS to
+	   less precise values
+	*/
+	if (options->ip_qos_interactive == -1)
+		options->ip_qos_interactive = IPTOS_LOW_DELAY;
+	if (options->ip_qos_bulk == -1)
+		options->ip_qos_bulk = IPTOS_THROUGHPUT;
+	if (options->request_tty == -1)
 
 	/* Expand KEX name lists */
 	all_cipher = cipher_alg_list(',', 0);

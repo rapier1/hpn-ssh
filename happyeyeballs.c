@@ -56,14 +56,6 @@ extern int ssh_create_socket(struct addrinfo *ai);
 /* get the options struct if for the delay time */
 extern Options options;
 
-/* delay between IPv6 and IPv4 connection
- * this lets us preference IPv6 connections.
- * default of 250ms as per RFC 8305 Section 5.
- * Yes, we could just use the option value in the code
- * but I think using descriptive var is clearer here
- */
-//const int connection_attempt_delay = options.happy_delay;
-
 /* have we timed out? */
 static int
 timeout(struct timeval *tv, int timeout_ms)
@@ -72,16 +64,6 @@ timeout(struct timeval *tv, int timeout_ms)
 		return 0;
 	ms_subtract_diff(tv, &timeout_ms);
 	return timeout_ms <= 0;
-}
-
-char global_ntop[NI_MAXHOST];
-
-
-char *return_fam(int fam) {
-	if (fam == 10)
-		return "IPv6";
-	else
-		return "IPv4";
 }
 
 /*
@@ -116,7 +98,6 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 		return -1;
 	}
 
-	debug_f ("Running getnameinfo for %s and %d", host, ai->ai_family);
 	if (getnameinfo(ai->ai_addr, ai->ai_addrlen,
 			ntop, sizeof(ntop),
 			strport, sizeof(strport),
@@ -126,10 +107,6 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 		errno = oerrno;
 		return -1;
 	}
-	memcpy(global_ntop,ntop,sizeof(ntop));
-	debug("HAPPY EYEBALLS Connecting to %.200s [%.100s] port %s.",
-	      host, ntop, strport);
-	debug("HAPPY %.200s", global_ntop);
 	/* Create a socket for connecting */
 	sock = ssh_create_socket(ai);
 	if (sock < 0) {
@@ -149,7 +126,6 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 	 * the use of threads. set_nonblock is in misc.c
 	 * and uses fnctl */
 	set_nonblock(sock);
-	debug_f("PRE CONNECT for %s", return_fam(ai->ai_family));
 	if (connect(sock, ai->ai_addr, ai->ai_addrlen) < 0 &&
 	    errno != EINPROGRESS) {
 		error("connect to address %s port %s: %s",
@@ -158,7 +134,6 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 		close(sock);
 		return -1;
 	}
-	debug_f("POST CONNECT for %s", return_fam(ai->ai_family));
 	monotime_tv(initiate);
 	FD_SET(sock, fds);
 	*nfds = MAXIMUM(*nfds, sock + 1);
@@ -174,22 +149,16 @@ happy_eyeballs_process(int *nfds, fd_set *fds,
 	int sock, optval = 0;
 	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
 
-	debug_f("in happy_eyeballs_process");
 	for (sock = *nfds - 1; ready > 0 && sock >= 0; sock--) {
-		debug_f("Processing for %s: %d", return_fam(fd_ai[sock]->ai_family), sock);
 		if (FD_ISSET(sock, wfds)) {
-			debug_f("FD_ISSET true for %d", sock);
 			ready--;
 			optlen = sizeof(optval);
-			debug_f("OPTVAL is %d for %d", optval, sock);
 			if (getsockopt(sock, SOL_SOCKET, SO_ERROR,
 				       &optval, &optlen) < 0) {
 				optval = errno;
-				debug_f("WHAT?!");
 				error("getsockopt failed: %s",
 				      strerror(errno));
 			} else if (optval != 0) {
-				debug_f("Copying data for %d on%s", optval, return_fam(fd_ai[sock]->ai_family));
 				memset(ntop, 0, sizeof(ntop));
 				memset(strport, 0, sizeof(strport));
 				if (getnameinfo(fd_ai[sock]->ai_addr,
@@ -197,17 +166,14 @@ happy_eyeballs_process(int *nfds, fd_set *fds,
 						ntop, sizeof(ntop),
 						strport, sizeof(strport),
 						NI_NUMERICHOST|NI_NUMERICSERV) != 0)
-					error("connect finally failed: %s",
 					      strerror(optval));
 				else
-					error("connect to address %s port %s finally: %s",
 					      ntop, strport, strerror(optval));
 			}
 			FD_CLR(sock, fds);
 			while (*nfds > 0 && ! FD_ISSET(*nfds - 1, fds))
 				--*nfds;
 			if (optval == 0) {
-				debug_f("unsetting nonblock for %s on %d", return_fam(fd_ai[sock]->ai_family), sock);
 				unset_nonblock(sock);
 				return sock;
 			}
@@ -250,7 +216,6 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 		/* this is just to determine the pause between
 		 * calls to select. */
   		if (ai != NULL || *timeout_ms > 0) {
-			debug_f ("In pause...");
 			tv = &select_tv;
 			if (ai != NULL) {
 				diff = options.happy_delay;
@@ -272,9 +237,7 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 		wfds = fds;
 		/* select will pause for time tv determined by the above
 		 * timing caculations */
-		debug_f("Starting select");
 		res = select(nfds, NULL, &wfds, NULL, tv);
-		debug_f("Leaving select");
 
 		/* preserve any errors */
 		oerrno = errno;
@@ -294,13 +257,10 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 			       fd_ai[sock]->ai_addrlen);
 			break;
 		}
-		debug_f("restarting while loop");
 	}
 	oerrno = errno;
 	/* close other connection attempts/sockets */
-	debug_f("NFDS is %d", nfds);
 	while (nfds-- > 0) {
-		debug_f("Running FD_ISSET on %d", nfds);
 		if (FD_ISSET(nfds, &fds))
 			close(nfds);
 	}
