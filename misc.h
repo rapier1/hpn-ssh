@@ -263,5 +263,6 @@ typedef struct statm_t {
 } statm_t;
 
 void read_mem_stats(struct statm_t *, int);
+int fips_enabled();
 
 #endif /* _MISC_H */

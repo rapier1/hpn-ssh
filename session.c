@@ -557,8 +557,10 @@ do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 	session_set_fds(ssh, s, inout[1], inout[1], err[1],
 	    s->is_subsystem, 0);
 #endif
-	/* switch to the parallel ciphers if necessary */
-	if (options.disable_multithreaded == 0)
+	/* switch to the parallel ciphers if necessary
+	 * If FIPS mode exists and is enabled then don't use a parallel cipher
+	 */
+	if ((options.disable_multithreaded == 0) && (fips_enabled() == 0))
 		cipher_switch(ssh);
 	return 0;
 }
@@ -662,8 +664,10 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 	ssh_packet_set_interactive(ssh, 1,
 	    options.ip_qos_interactive, options.ip_qos_bulk);
 	session_set_fds(ssh, s, ptyfd, fdout, -1, 1, 1);
-	/* switch to the parallel cipher if appropriate */
-	if (options.disable_multithreaded == 0)
+	/* switch to the parallel cipher if appropriate
+	 * If FIPS mode exists and is enabled then no parallel ciphers.
+	 */
+	if ((options.disable_multithreaded == 0) && (fips_enabled() == 0))
 		cipher_switch(ssh);
 	return 0;
 }

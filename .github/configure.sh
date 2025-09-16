@@ -18,4 +18,4 @@ if [ "x$LDFLAGS" != "x" ]; then
 fi
 
 echo ./configure ${CONFIGFLAGS} --with-privsep-user=sshd
-./configure ${CONFIGFLAGS} --with-privsep-user=sshd
+./configure ${CONFIGFLAGS} --with-privsep-user=sshd 2>&1

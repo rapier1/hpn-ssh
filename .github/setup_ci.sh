@@ -1,8 +1,17 @@
 #!/bin/sh
 
+config="$1"
+target="$2"
+
 PACKAGES=""
 
- . .github/configs $@
+echo Running as:
+id
+
+echo Environment:
+set
+
+ . .github/configs ${config}
 
 host=`./config.guess`
 echo "config.guess: $host"
@@ -10,9 +19,17 @@ case "$host" in
 *cygwin)
 	PACKAGER=setup
 	echo Setting CYGWIN system environment variable.
-	setx CYGWIN "binmode"
+	setx CYGWIN "winsymlinks:native"
 	echo Removing extended ACLs so umask works as expected.
+	set -x
 	setfacl -b . regress
+	icacls regress /c /t /q /Inheritance:d
+	icacls regress /c /t /q /Grant ${USERNAME}:F
+	icacls regress /c /t /q /Remove:g "Authenticated Users" \
+	     BUILTIN\\Administrators BUILTIN Everyone System Users
+	takeown /F regress
+	icacls regress
+	set +x
 	PACKAGES="$PACKAGES,autoconf,automake,cygwin-devel,gcc-core"
 	PACKAGES="$PACKAGES,make,openssl,libssl-devel,zlib-devel"
 	;;
@@ -24,10 +41,9 @@ case "$host" in
 	PACKAGER=apt
 esac
 
-TARGETS=$@
+TARGETS=${config}
 
 INSTALL_FIDO_PPA="no"
-#COPY_PAM_MODULE="no"
 export DEBIAN_FRONTEND=noninteractive
 
 set -e
@@ -139,6 +155,14 @@ for TARGET in $TARGETS; do
         esac
         PACKAGES="${PACKAGES} putty-tools dropbear-bin"
        ;;
+    boringssl)
+        INSTALL_BORINGSSL=1
+        PACKAGES="${PACKAGES} cmake ninja-build"
+       ;;
+    aws-lc)
+        INSTALL_AWSLC=1
+        PACKAGES="${PACKAGES} cmake ninja-build"
+        ;;
     putty-*)
 	INSTALL_PUTTY=$(echo "${TARGET}" | cut -f2 -d-)
 	PACKAGES="${PACKAGES} cmake"
@@ -160,14 +184,6 @@ if [ "yes" = "$INSTALL_FIDO_PPA" ]; then
     sudo apt-add-repository -y ppa:yubico/stable
 fi
 
-#need to copy the pam modules for sshd to hpnsshd on
-#macos with pam.
-#if [ "yes" = "$COPY_PAM_MODULE" ]; then
-#    if [ `uname` = "Darwin" }; then
-#	sudo cp /etc/pam.d/sshd /etc/pam.d/hpnsshd
-#    fi
-#fi
-
 tries=3
 while [ ! -z "$PACKAGES" ] && [ "$tries" -gt "0" ]; do
     case "$PACKAGER" in
@@ -185,7 +201,8 @@ while [ ! -z "$PACKAGES" ] && [ "$tries" -gt "0" ]; do
 	fi
 	;;
     setup)
-	if /cygdrive/c/setup.exe -q -P `echo "$PACKAGES" | tr ' ' ,`; then
+	setup="/cygdrive/$(echo "${CYGWIN_SETUP}" | tr -d : | tr '\' '/')"
+	if "${setup}" -q -P `echo "$PACKAGES" | tr ' ' ,`; then
 		PACKAGES=""
 	fi
 	;;
@@ -236,6 +253,24 @@ if [ ! -z "${INSTALL_LIBRESSL}" ]; then
     fi
 fi
 
+if [ ! -z "${INSTALL_BORINGSSL}" ]; then
+    (cd ${HOME} && git clone https://boringssl.googlesource.com/boringssl &&
+     cd ${HOME}/boringssl && mkdir build && cd build &&
+     cmake -GNinja  -DCMAKE_POSITION_INDEPENDENT_CODE=ON .. && ninja &&
+     mkdir -p /opt/boringssl/lib &&
+     cp ${HOME}/boringssl/build/libcrypto.a /opt/boringssl/lib &&
+     cp -r ${HOME}/boringssl/include /opt/boringssl)
+fi
+
+if [ ! -z "${INSTALL_AWSLC}" ]; then
+    (cd ${HOME} && git clone --depth 1 --branch v1.46.1 https://github.com/aws/aws-lc.git &&
+     cd ${HOME}/aws-lc && mkdir build && cd build &&
+     cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF .. && ninja &&
+     mkdir -p /opt/aws-lc/lib &&
+     cp ${HOME}/aws-lc/build/crypto/libcrypto.a /opt/aws-lc/lib &&
+     cp -r ${HOME}/aws-lc/include /opt/aws-lc)
+fi
+
 if [ ! -z "${INSTALL_ZLIB}" ]; then
     (cd ${HOME} && git clone https://github.com/madler/zlib.git &&
      cd ${HOME}/zlib && ./configure && make &&
@@ -262,4 +297,22 @@ if [ ! -z "${INSTALL_PUTTY}" ]; then
      fi
     )
     /usr/local/bin/plink -V
+fi
+
+# If we're running on an ephemeral VM, set a random password and set
+# up to run the password auth test.
+if [ ! -z "${EPHEMERAL_VM}" ]; then
+
+    # This is the github "target" as specified in the yml file.
+    # In particular, ubuntu-latest sets the password field to the locked
+    # value, so unless we reset it here most of the tests will fail.
+    case "${target}" in
+    ubuntu-*)
+	echo ${target} target: setting random password.
+	openssl rand -base64 9 >regress/password
+	pw=$(tr -d '\n' <regress/password | openssl passwd -6 -stdin)
+	sudo usermod --password "${pw}" runner
+	sudo usermod --unlock runner
+	;;
+    esac
 fi

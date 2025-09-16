@@ -232,6 +232,10 @@ if [ "x$USE_VALGRIND" != "x" ]; then
 		VG_IGNORE="/bin/*,/sbin/*,/usr/*,/var/*"
 		VG_LOG="$OBJ/valgrind-out/${VG_TEST}."
 		VG_OPTS="--track-origins=yes $VG_LEAK"
+		# we have threaded components so use --fair-sched to
+		# try to get around hangs. This is most obvious in the
+		# on the 2 core VMs used for CI testing..
+		VG_OPTS="$VG_OPTS --trace-children=yes --fair-sched=try"
 		VG_OPTS="$VG_OPTS --trace-children=yes"
 		VG_OPTS="$VG_OPTS --trace-children-skip=${VG_IGNORE}"
 		VG_OPTS="$VG_OPTS --vgdb-prefix=$OBJ/valgrind-vgdb/"

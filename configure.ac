@@ -3014,6 +3014,12 @@ if test "x$openssl" = "xyes" ; then
 				CPPFLAGS="$CPPFLAGS -DOPENSSL_API_COMPAT=0x10100000L"
 				AC_DEFINE([WITH_OPENSSL3], [1], [With OpenSSL3])
 				;;
+			40*)
+				#OpenSSL 4-dev
+				CPPFLAGS="$CPPFLAGS -DOPENSSL_API_COMPAT=0x10100000L"
+				#Note - we may need to rename this flag.
+				AC_DEFINE([WITH_OPENSSL3], [1], [With OpenSSL3])
+				;;
 		        *)
 				AC_MSG_ERROR([Unknown/unsupported OpenSSL version ("$ssl_showver")])
 		                ;;
