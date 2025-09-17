@@ -77,6 +77,53 @@
 #include "ssherr.h"
 #include "platform.h"
 
+/* Function to determine if FIPS is enabled for not.
+ * We assume that fips is not enabled and then test from there.
+ * The idea is that if there is an error or we can't read the value
+ * then either the OS doesn't support FIPS or that FIPS will
+ * catch anything we try to do that's not FIPS compliant.
+ * That would be limited to trying to use one of the parallel ciphers.
+ */
+int
+fips_enabled()
+{
+	debug3_f("Checking for FIPS");
+	int value = 0;
+	const char* fips_path = "/proc/sys/crypto/fips_enabled";
+
+	FILE *f = fopen(fips_path, "r");
+	/* if we can't open the path to fips_enabled it
+	 * either doesn't exist or there is an error. In either
+	 * case we treat it as if fips is *not* enabled
+	 */
+	if (!f) {
+		debug3_f("Cannot open path to fips_enabled. Enabling parallel ciphers.");
+		return 0;
+	}
+
+	/* fips_enabled does exist so read the value.
+	 * It should be either 0 (disabled) or 1 (enabled)
+	 */
+	if ( 1 != fscanf(f,"%d", &value) ) {
+		/* if we get some error here then we
+		 * again fail to retuning fips being disabled
+		 */
+		debug3_f("Error processing fips_enabled. Enabling parallel ciphers.");
+		return 0;
+	}
+
+	/* let the user know the status */
+	if (value == 0)
+		debug3_f("FIPS mode is disabled. Enabling parallel ciphers.");
+	else
+		debug3_f("FIPS mode is enabled. Disabling parallel ciphers.");
+
+	return value;
+}
+
+/* helper function used to determine memory usage during
+ * development process. Not to be used in production.
+ */
 void
 read_mem_stats(statm_t *result, int post_auth)
 {

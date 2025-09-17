@@ -1945,8 +1945,10 @@ fork_postauth(struct ssh *ssh)
 	if (stdfd_devnull(1, 1, !(log_is_on_stderr() && debug_flag)) == -1)
 		error_f("stdfd_devnull failed");
 	/* we do the cipher switch here in the event that the client
-	   is forking or has a delayed fork */
-	if (options.disable_multithreaded == 0)
+	 * is forking or has a delayed fork.
+	 * If FIPS mode exists and is enabled then no parallel ciphers.
+	 */
+	if ((options.disable_multithreaded == 0) && (fips_enabled() == 0))
 		cipher_switch(ssh);
 }
 
@@ -2424,8 +2426,10 @@ ssh_session2(struct ssh *ssh, const struct ssh_conn_info *cinfo)
 		/* check to see if we are switching ciphers to
 		 * one of our parallel versions. If the client is
 		 * forking then we handle it in fork_postauth()
+		 * If FIPS mode exists and is enabled then no parallel ciphers.
 		 */
-		if (options.disable_multithreaded == 0)
+		if ((options.disable_multithreaded == 0)
+		    && (fips_enabled() == 0))
 			cipher_switch(ssh);
 	}
 	return client_loop(ssh, tty_flag, tty_flag ?
