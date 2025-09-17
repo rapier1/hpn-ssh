@@ -232,7 +232,7 @@ if [ "x$USE_VALGRIND" != "x" ]; then
 		VG_IGNORE="/bin/*,/sbin/*,/usr/*,/var/*"
 		VG_LOG="$OBJ/valgrind-out/${VG_TEST}."
 		VG_OPTS="--track-origins=yes $VG_LEAK"
-		VG_OPTS="$VG_OPTS --trace-children=yes"
+		VG_OPTS="$VG_OPTS --trace-children=yes --fair-sched=try"
 		VG_OPTS="$VG_OPTS --trace-children-skip=${VG_IGNORE}"
 		VG_OPTS="$VG_OPTS --vgdb-prefix=$OBJ/valgrind-vgdb/"
 		VG_PATH="valgrind"
