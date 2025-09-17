@@ -1,11 +1,11 @@
 Notes:
 
-Happy Eyeballs Support in 18.X.X (update before release)
+Happy Eyeballs Support in 18.7.1 
 Happy Eyeballs (RFC 8305) is for use on dual stack systems meaning that they have both 
 IPv4 and IPv6 TCP stacks. When enabled this option will try to connect to the
 taget over both IPv4 and IPv6 with preference given to IPv6. The first connection 
 that completes successfully will be used. Any outstanding connection attempts will
-be closed. As of version 18.X.X this option should be considered somewhat experimental.
+be closed. As of version 18.7.1 this option should be considered somewhat experimental.
 
 usage:
 -oHappyEyes=[Yes|No] will enabled Happy Eyeballs. The default is no. 
