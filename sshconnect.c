@@ -474,16 +474,14 @@ ssh_connect_direct(struct ssh *ssh, const char *host, struct addrinfo *aitop,
 			debug("Trying again...");
 		}
 		if (options.use_happyeyes == 1) {
-			debug_f ("********** Trying happy eyeballs");
+			debug_f ("Attempting RFC 8305 / Happy Eyeballs connection.");
 			sock = happy_eyeballs(host, aitop,
 			    hostaddr, timeout_ms);
-			//sock = happy_eyeballs_connect(host, aitop, hostaddr);
 			if (sock != -1) {
+				debug_f ("RFC 8305 / Happy Eyeballs connection successful.");
 				break;	/* Successful connection. */
-				debug_f ("******* Happy eyeballs successful");
 			}
 		} else {
-			debug_f("******************************* NOT HERE**********");
 			/*
 			 * Loop through addresses for this host, and try each one in
 			 * sequence until the connection succeeds.
@@ -1639,7 +1637,9 @@ ssh_login(struct ssh *ssh, Sensitive *sensitive, const char *orighost,
 	/* key exchange */
 	/* authenticate user */
 	debug("Authenticating to %s:%d as '%s'", host, port, server_user);
-	debug("HAPPY Auth to %.200s", global_ntop);
+	/* if using RFC 8305 clearly state which address we are connected to */
+	if (options.use_happyeyes == 1)
+		debug("RFC 8305 authenticating to %.200s", global_ntop);
 	ssh_kex2(ssh, host, hostaddr, port, cinfo);
 	ssh_userauth2(ssh, local_user, server_user, host, sensitive);
 	free(local_user);

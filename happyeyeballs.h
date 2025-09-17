@@ -17,9 +17,6 @@
 /*
  * RFC 8305 Happy Eyeballs Version 2: Better Connectivity Using Concurrency
  *
- * implementation can have a fixed delay for how long to wait before
- * starting the next connection attempt [...] recommended value for a
- * default delay is 250 milliseconds.
  */
 
 int happy_eyeballs(const char *, struct addrinfo *,
