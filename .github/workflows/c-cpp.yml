@@ -49,7 +49,7 @@ jobs:
           - { target: ubuntu-22.04, config: valgrind-6 }
           - { target: ubuntu-22.04, config: valgrind-7 }
           - { target: ubuntu-22.04, config: valgrind-unit }
-	  - { target: windows-2022, config: cygwin-release }
+          - { target: windows-2022, config: cygwin-release }
           - { target: windows-2025, config: cygwin-release }
 # binn no longer supports c89 so skip.
 #          - { target: ubuntu-22.04, config: c89 }
