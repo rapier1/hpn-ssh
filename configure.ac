@@ -3008,16 +3008,10 @@ if test "x$openssl" = "xyes" ; then
 				*) ;;	# Assume all other versions are good.
 				esac
 				;;
-			30*)
+			30*|40*)
 				# OpenSSL 3; we use the 1.1x API
 				# https://openssl.org/policies/general/versioning-policy.html
 				CPPFLAGS="$CPPFLAGS -DOPENSSL_API_COMPAT=0x10100000L"
-				AC_DEFINE([WITH_OPENSSL3], [1], [With OpenSSL3])
-				;;
-			40*)
-				#OpenSSL 4-dev
-				CPPFLAGS="$CPPFLAGS -DOPENSSL_API_COMPAT=0x10100000L"
-				#Note - we may need to rename this flag.
 				AC_DEFINE([WITH_OPENSSL3], [1], [With OpenSSL3])
 				;;
 		        *)
