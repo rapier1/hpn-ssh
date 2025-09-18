@@ -2,7 +2,7 @@ Notes:
 
 FIPS Mode and Parallel Ciphers in 18.7.1
 Operating HPN-SSH in operating systems working in FIPS mode (e.g. RHEL with
-FIPS enabled) precludes the use of parallel ciphers. This is because
+FIPS enabled) preclude the use of parallel ciphers. This is because
 the parallel AES-CTR implementation is not FIPS certified and will cause FIPS
 to exit with an error when loaded. In the case of the parallel ChaCha20 cipher
 the algorithm itself has not been FIPS certified and no implementation of

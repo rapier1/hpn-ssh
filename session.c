@@ -401,6 +401,7 @@ int
 do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 {
 	pid_t pid;
+	int fips = 0;
 #ifdef USE_PIPES
 	int pin[2], pout[2], perr[2];
 
@@ -560,7 +561,13 @@ do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 	/* switch to the parallel ciphers if necessary
 	 * If FIPS mode exists and is enabled then no parallel ciphers.
 	 */
-	if ((options.disable_multithreaded == 0) && (fips_enabled() == 0))
+	fips = fips_enabled();
+	if (fips)
+		debug2_f("FIPS mode is enabled. Parallel ciphers are disabled");
+	else
+		debug2_f("FIPS mode not found or disabled. Parallel ciphers are enabled");
+
+	if ((options.disable_multithreaded == 0) && (fips == 0))
 		cipher_switch(ssh);
 	return 0;
 }
@@ -576,6 +583,7 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 {
 	int fdout, ptyfd, ttyfd, ptymaster;
 	pid_t pid;
+	int fips = 0;
 
 	if (s == NULL)
 		fatal("do_exec_pty: no session");
@@ -667,7 +675,13 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 	/* switch to the parallel cipher if appropriate
 	 * If FIPS mode exists and is enabled then no parallel ciphers.
 	 */
-	if ((options.disable_multithreaded == 0) && (fips_enabled() == 0))
+	fips = fips_enabled();
+	if (fips)
+		debug2_f("FIPS mode is enabled. Parallel ciphers are disabled");
+	else
+		debug2_f("FIPS mode not found or disabled. Parallel ciphers are enabled");
+
+	if ((options.disable_multithreaded == 0) && (fips == 0))
 		cipher_switch(ssh);
 	return 0;
 }

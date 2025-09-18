@@ -87,38 +87,44 @@
 int
 fips_enabled()
 {
-	debug3_f("Checking for FIPS");
-	int value = 0;
+	int mode = 0;
 	const char* fips_path = "/proc/sys/crypto/fips_enabled";
+	FILE *fips_enabled = NULL;
 
-	FILE *f = fopen(fips_path, "r");
+	debug2_f("Checking for FIPS");
+
 	/* if we can't open the path to fips_enabled it
 	 * either doesn't exist or there is an error. In either
-	 * case we treat it as if fips is *not* enabled
+	 * case we treat it as if fips is *not* enabled.
+	 * This is because I want to fail towards the most
+	 * common scenario which is that fips_enabled either
+	 * doesn't exist (non-fedora variants) or isn't
+	 * enabled.
 	 */
-	if (!f) {
-		debug3_f("Cannot open path to fips_enabled. Enabling parallel ciphers.");
+	fips_enabled = fopen(fips_path, "r");
+	if (!fips_enabled) {
+		debug3_f("Cannot open path to fips_enabled.");
 		return 0;
 	}
 
 	/* fips_enabled does exist so read the value.
 	 * It should be either 0 (disabled) or 1 (enabled)
 	 */
-	if ( 1 != fscanf(f,"%d", &value) ) {
+	if ( 1 != fscanf(fips_enabled,"%d", &mode) ) {
 		/* if we get some error here then we
 		 * again fail to retuning fips being disabled
 		 */
-		debug3_f("Error processing fips_enabled. Enabling parallel ciphers.");
+		debug3_f("Error processing fips_enabled.");
 		return 0;
 	}
 
 	/* let the user know the status */
-	if (value == 0)
-		debug3_f("FIPS mode is disabled. Enabling parallel ciphers.");
+	if (mode == 0)
+		debug3_f("FIPS mode is disabled.");
 	else
-		debug3_f("FIPS mode is enabled. Disabling parallel ciphers.");
+		debug3_f("FIPS mode is enabled.");
 
-	return value;
+	return mode;
 }
 
 /* helper function used to determine memory usage during
