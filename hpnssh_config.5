@@ -1315,10 +1315,18 @@ If one argument is specified, it is used as the packet class unconditionally.
 If two values are specified, the first is automatically selected for
 interactive sessions and the second for non-interactive sessions.
 The default is
-.Cm lowdelay
+.Cm af21
+(Low-Latency Data)
 for interactive sessions and
-.Cm throughput
-for non-interactive sessions.
+.Cm cs1
+(Lower Effort)
+for non-interactive sessions. If using the
+.Cm HappyEyes
+option these revert to
+.Cm lowdelay
+and
+.Cm throughput ,
+respectively.
 .It Cm KbdInteractiveAuthentication
 Specifies whether to use keyboard-interactive authentication.
 The argument to this keyword must be
