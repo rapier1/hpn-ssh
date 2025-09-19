@@ -1,15 +1,24 @@
 Notes:
 
+FIPS Mode and Parallel Ciphers in 18.7.1
+Using HPN-SSH in operating systems working in FIPS mode (e.g. RHEL with
+FIPS enabled) preclude the use of parallel ciphers. This is because
+the parallel AES-CTR implementation is not FIPS certified and will cause FIPS
+to exit with an error when loaded. In the case of the parallel ChaCha20 cipher
+the algorithm itself has not been FIPS certified and no implementation of
+ChaCha20 should be allowed in FIPS mode. We suggest the use of the AES-GCM
+cipher when operating under FIPS mode for optimal performance. 
+
 Happy Eyeballs Support in 18.7.1 
 Happy Eyeballs (RFC 8305) is for use on dual stack systems meaning that they have both 
 IPv4 and IPv6 TCP stacks. When enabled this option will try to connect to the
-taget over both IPv4 and IPv6 with preference given to IPv6. The first connection 
+target over both IPv4 and IPv6 with preference given to IPv6. The first connection 
 that completes successfully will be used. Any outstanding connection attempts will
 be closed. As of version 18.7.1 this option should be considered somewhat experimental.
 
 usage:
--oHappyEyes=[Yes|No] will enabled Happy Eyeballs. The default is no. 
--oHappyDelay=[N] where N is a positive integer express in milliseconds.
+-oHappyEyes=[Yes|No] will enable Happy Eyeballs. The default is no. 
+-oHappyDelay=[N] where N is a positive integer expressed in milliseconds.
                  The default value of 250ms is suggested by RFC 8305.
 
 MPTCP Support in 18.7.0:
@@ -89,7 +98,6 @@ computes the hash of the file *up to* the size of the target file. If those hash
 the source only send the necessary bytes to complete the transfer. If the hashes do not match then
 the entire file is resent. If the target file is larger then the source file then the entire
 source file is sent and any existing target file is overwritten.
-
 
 MULTI-THREADED AES CIPHER:
 The AES cipher in CTR mode has been multithreaded (MTR-AES-CTR). This will allow ssh installations
@@ -189,4 +197,4 @@ Sponsors: Thanks to Niklas Hambuchen for being the first sponsor of HPN-SSH
 	  via github's sponsor program!
 
 
-Edited: October 11, 2023
+Edited: September 19, 2025

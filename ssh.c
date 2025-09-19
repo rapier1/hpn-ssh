@@ -1936,6 +1936,8 @@ control_persist_detach(void)
 static void
 fork_postauth(struct ssh *ssh)
 {
+	int fips = 0;
+
 	if (need_controlpersist_detach)
 		control_persist_detach();
 	debug("forking to background");
@@ -1945,8 +1947,16 @@ fork_postauth(struct ssh *ssh)
 	if (stdfd_devnull(1, 1, !(log_is_on_stderr() && debug_flag)) == -1)
 		error_f("stdfd_devnull failed");
 	/* we do the cipher switch here in the event that the client
-	   is forking or has a delayed fork */
-	if (options.disable_multithreaded == 0)
+	 * is forking or has a delayed fork.
+	 * If FIPS mode exists and is enabled then no parallel ciphers.
+	 */
+	fips = fips_enabled();
+	if (fips)
+		debug2_f("FIPS mode is enabled. Parallel ciphers are disabled");
+	else
+		debug2_f("FIPS mode not found or disabled. Parallel ciphers are enabled");
+
+	if ((options.disable_multithreaded == 0) && (fips == 0))
 		cipher_switch(ssh);
 }
 
@@ -2313,6 +2323,7 @@ ssh_session2(struct ssh *ssh, const struct ssh_conn_info *cinfo)
 {
 	int r, interactive, id = -1;
 	char *cp, *tun_fwd_ifname = NULL;
+	int fips = 0;
 
 	/*
 	 * We need to initialize this early because the forwarding logic below
@@ -2424,8 +2435,15 @@ ssh_session2(struct ssh *ssh, const struct ssh_conn_info *cinfo)
 		/* check to see if we are switching ciphers to
 		 * one of our parallel versions. If the client is
 		 * forking then we handle it in fork_postauth()
+		 * If FIPS mode exists and is enabled then no parallel ciphers.
 		 */
-		if (options.disable_multithreaded == 0)
+		fips = fips_enabled();
+		if (fips)
+			debug2_f("FIPS mode is enabled. Parallel ciphers are disabled");
+		else
+			debug2_f("FIPS mode not found or disabled. Parallel ciphers are enabled");
+		if ((options.disable_multithreaded == 0)
+		    && (fips == 0))
 			cipher_switch(ssh);
 	}
 	return client_loop(ssh, tty_flag, tty_flag ?
