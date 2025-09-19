@@ -77,7 +77,7 @@
 #include "ssherr.h"
 #include "platform.h"
 
-/* Function to determine if FIPS is enabled for not.
+/* Function to determine if FIPS is enabled or not.
  * We assume that fips is not enabled and then test from there.
  * The idea is that if there is an error or we can't read the value
  * then either the OS doesn't support FIPS or that FIPS will
@@ -112,7 +112,7 @@ fips_enabled()
 	 */
 	if ( 1 != fscanf(fips_enabled,"%d", &mode) ) {
 		/* if we get some error here then we
-		 * again fail to retuning fips being disabled
+		 * again fail to returning fips being disabled
 		 */
 		debug3_f("Error processing fips_enabled.");
 		return 0;
