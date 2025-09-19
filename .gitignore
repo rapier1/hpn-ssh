@@ -2,6 +2,8 @@ Makefile
 buildpkg.sh
 config.h
 config.h.in~
+config.h.in
+aclocal.m4
 config.log
 config.status
 openbsd-compat/Makefile
