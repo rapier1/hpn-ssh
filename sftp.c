@@ -1,4 +1,4 @@
-/* $OpenBSD: sftp.c,v 1.240 2025/03/28 06:04:07 dtucker Exp $ */
+/* $OpenBSD: sftp.c,v 1.244 2025/09/30 00:06:06 djm Exp $ */
 /*
  * Copyright (c) 2001-2004 Damien Miller <djm@openbsd.org>
  *
@@ -19,9 +19,7 @@
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
-#ifdef HAVE_SYS_STAT_H
-# include <sys/stat.h>
-#endif
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #ifdef HAVE_SYS_STATVFS_H
@@ -31,12 +29,8 @@
 #include <ctype.h>
 #include <errno.h>
 
-#ifdef HAVE_PATHS_H
-# include <paths.h>
-#endif
-#ifdef HAVE_LIBGEN_H
+#include <paths.h>
 #include <libgen.h>
-#endif
 #ifdef HAVE_LOCALE_H
 # include <locale.h>
 #endif
@@ -53,9 +47,7 @@ typedef void EditLine;
 #include <string.h>
 #include <unistd.h>
 
-#ifdef HAVE_UTIL_H
-# include <util.h>
-#endif
+#include <util.h>
 
 #include "xmalloc.h"
 #include "log.h"
@@ -1865,7 +1857,7 @@ complete_display(char **list, u_int len)
 
 /*
  * Given a "list" of words that begin with a common prefix of "word",
- * attempt to find an autocompletion to extends "word" by the next
+ * attempt to find an autocompletion that extends "word" by the next
  * characters common to all entries in "list".
  */
 static char *
@@ -1876,6 +1868,7 @@ complete_ambiguous(const char *word, char **list, size_t count)
 
 	if (count > 0) {
 		u_int y, matchlen = strlen(list[0]);
+		u_int itemlen = matchlen, wordlen = strlen(word);
 
 		/* Find length of common stem */
 		for (y = 1; list[y]; y++) {
@@ -1887,6 +1880,10 @@ complete_ambiguous(const char *word, char **list, size_t count)
 
 			matchlen = x;
 		}
+
+		for (; matchlen > wordlen; matchlen--)
+			if (mblen(list[0] + matchlen, itemlen - matchlen) >= 0)
+				break;
 
 		if (matchlen > strlen(word)) {
 			char *tmp = xstrdup(list[0]);
@@ -2351,6 +2348,8 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	free(conn);
 
 #ifdef USE_LIBEDIT
+	if (hl != NULL)
+		history_end(hl);
 	if (el != NULL)
 		el_end(el);
 #endif /* USE_LIBEDIT */
@@ -2662,7 +2661,7 @@ main(int argc, char **argv)
 	} else {
 		if ((r = argv_split(sftp_direct, &tmp, &cpp, 1)) != 0)
 			fatal_r(r, "Parse -D arguments");
-		if (cpp[0] == 0)
+		if (cpp[0] == NULL)
 			fatal("No sftp server specified via -D");
 		connect_to_server(cpp[0], cpp, &in, &out);
 		argv_free(cpp, tmp);
