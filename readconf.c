@@ -3875,8 +3875,8 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
 	dump_cfg_fmtint(oFallback, o->fallback);
 	dump_cfg_fmtint(oMetrics, o->metrics);
-	dump_cfg_fmtint(oUseMPTCP, o->usemptcp);
-	dump_cfg_fmtint(oHappyEyes, o->happyeyes);
+	dump_cfg_fmtint(oUseMPTCP, o->use_mptcp);
+	dump_cfg_fmtint(oHappyEyes, o->use_happyeyes);
 	dump_cfg_fmtint(oWarnWeakCrypto, o->warn_weak_crypto);
 	
 	/* Integer options */
@@ -3891,7 +3891,7 @@ dump_client_config(Options *o, const char *host)
 	    o->obscure_keystroke_timing_interval);
 	dump_cfg_int(oMetricsInterval, o->metrics_interval);
 	dump_cfg_int(oFallbackPort, o->fallback_port);
-	dump_cfp_int(oHappyDelay, o->happydelay);
+	dump_cfg_int(oHappyDelay, o->happy_delay);
 	
 	/* String options */
 	dump_cfg_string(oBindAddress, o->bind_address);
