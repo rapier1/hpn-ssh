@@ -1,4 +1,14 @@
-name: C/C++ CI
+name: CI
+
+# For testing, you can set variables in your repo (Repo -> Settings ->
+# Security -> Actions -> Variables) to restrict the tests that are run.
+# The supported variables are:
+#
+# RUN_ONLY_TARGET_CONFIG: Run only the single matching target and config,
+#   separated by spaces, eg "ubuntu-latest default".  All other tests will
+#   fail immediately.
+#
+# LTESTS: Override the set of tests run.
 
 # For testing, you can set variables in your repo (Repo -> Settings ->
 # Security -> Actions -> Variables) to restrict the tests that are run.
@@ -13,10 +23,10 @@ name: C/C++ CI
 on:
   push:
     branches: [ master, dev_major, dev_minor ]
-    paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/c-cpp.yml' ]
+    paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/*.sh', '.github/workflows/c-cpp.yml' ]
   pull_request:
     branches: [ master, dev_major, dev_minor ]
-    paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/c-cpp.yml' ]
+    paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/*.sh', '.github/workflows/c-cpp.yml' ]
 
 jobs:
   ci:
@@ -103,25 +113,18 @@ jobs:
           - { target: ubuntu-latest, config: openssl-3.2.3 }
           - { target: ubuntu-latest, config: openssl-3.3.2 }
           - { target: ubuntu-latest, config: openssl-3.4.0 }
+          - { target: ubuntu-latest, config: openssl-3.4.2 }
+          - { target: ubuntu-latest, config: openssl-3.5.0 }
+          - { target: ubuntu-latest, config: openssl-3.5.3 }
           - { target: ubuntu-latest, config: openssl-1.1.1_stable }
           - { target: ubuntu-latest, config: openssl-3.0 }  # stable branch
           - { target: ubuntu-latest, config: openssl-3.1 }  # stable branch
           - { target: ubuntu-latest, config: openssl-3.2 }  # stable branch
           - { target: ubuntu-latest, config: openssl-3.3 }  # stable branch
-          - { target: ubuntu-latest, config: putty-0.71 }
-          - { target: ubuntu-latest, config: putty-0.72 }
-          - { target: ubuntu-latest, config: putty-0.73 }
-          - { target: ubuntu-latest, config: putty-0.74 }
-          - { target: ubuntu-latest, config: putty-0.75 }
-          - { target: ubuntu-latest, config: putty-0.76 }
-          - { target: ubuntu-latest, config: putty-0.77 }
-          - { target: ubuntu-latest, config: putty-0.78 }
-          - { target: ubuntu-latest, config: putty-0.79 }
-          - { target: ubuntu-latest, config: putty-0.80 }
-          - { target: ubuntu-latest, config: putty-0.81 }
-          - { target: ubuntu-latest, config: putty-0.82 }
-          - { target: ubuntu-latest, config: putty-0.83 }
-          - { target: ubuntu-latest, config: putty-snapshot }
+          - { target: ubuntu-latest, config: openssl-3.4 }  # stable branch
+          - { target: ubuntu-latest, config: openssl-3.5 }  # stable branch
+          - { target: ubuntu-latest, config: openssl-3.6 }  # stable branch
+          - { target: ubuntu-latest, config: putty-versions }
           - { target: ubuntu-latest, config: zlib-develop }
           - { target: ubuntu-latest, config: tcmalloc }
 #musl doens't know about linux/tcp.h so skip
@@ -173,6 +176,11 @@ jobs:
         TEST_SSH_UNSAFE_PERMISSIONS: 1
         TEST_SSH_HOSTBASED_AUTH: yes
         LTESTS: ${{ vars.LTESTS }}
+    - name: test OpenSSL3 ABI compatibility
+      if: ${{ startsWith(matrix.config, 'openssl-3') }}
+      run: |
+       sh .github/install_libcrypto.sh -a ${{ matrix.config }} /opt/openssl
+       sh .github/run_test.sh ${{ matrix.config }}
     - name: show logs
       if: failure()
       run: for i in regress/failed*.log; do echo ====; echo logfile $i; echo =====; cat $i; done
