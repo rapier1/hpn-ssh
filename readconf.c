@@ -173,7 +173,7 @@ typedef enum {
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
 	oTcpRcvBufPoll, oHPNDisabled,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch,
-	oDisableMTAES, oUseMPTCP,
+	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oVisualHostKey,
 	oKexAlgorithms, oIPQoS, oRequestTTY, oSessionType, oStdinNull,
@@ -314,6 +314,8 @@ static struct {
 	{ "nonemacenabled", oNoneMacEnabled },
 	{ "noneswitch", oNoneSwitch },
 	{ "usemptcp", oUseMPTCP},
+	{ "happyeyes", oHappyEyes },
+	{ "happydelay", oHappyDelay },
 	{ "disablemtaes", oDisableMTAES },
 	{ "metrics", oMetrics },
 	{ "metricspath", oMetricsPath },
@@ -1368,6 +1370,14 @@ parse_time:
 	case oUseMPTCP:
 		intptr = &options->use_mptcp;
 		goto parse_flag;
+
+	case oHappyEyes:
+		intptr = &options->use_happyeyes;
+		goto parse_flag;
+
+	case oHappyDelay:
+		intptr = &options->happy_delay;
+		goto parse_int;
 
 	case oDisableMTAES:
 		intptr = &options->disable_multithreaded;
@@ -2824,6 +2834,8 @@ initialize_options(Options * options)
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
 	options->use_mptcp = -1;
+	options->use_happyeyes = -1;
+	options->happy_delay = -1;
 	options->disable_multithreaded = -1;
 	options->metrics = -1;
 	options->metrics_path = NULL;
@@ -3027,6 +3039,14 @@ fill_default_options(Options * options)
 	}
 	if (options->use_mptcp == -1)
 		options->use_mptcp = 0;
+	if (options->use_happyeyes == -1)
+		options->use_happyeyes = 0;
+	/* if the user tries to set the delay to 0 then in just loops forever
+	 * so instead of using the standard -1 test we use < 1 to make sure the
+	 * user isn't being too clever for their own good
+	 */
+	if (options->happy_delay < 1)
+		options->happy_delay = 250; /* default 250ms as per RFC 8305 Section 5 */
 	if (options->disable_multithreaded == -1)
 		options->disable_multithreaded = 0;
 	if (options->metrics == -1)
@@ -3055,10 +3075,22 @@ fill_default_options(Options * options)
 		options->permit_local_command = 0;
 	if (options->visual_host_key == -1)
 		options->visual_host_key = 0;
-	if (options->ip_qos_interactive == -1)
+	/* in the event we are using RFC 8305 then we
+	 * need to override the default QOS as these
+	 * interfere with the connection process in our
+	 * test environment. I don't know if it has a real world
+	 * impact but TODO try to find a real world way to test this.
+	 */
+	if (options->ip_qos_interactive == -1) {
 		options->ip_qos_interactive = IPTOS_DSCP_AF21;
-	if (options->ip_qos_bulk == -1)
+		if (options->use_happyeyes == 1)
+			options->ip_qos_interactive = IPTOS_LOWDELAY;
+	}
+	if (options->ip_qos_bulk == -1) {
 		options->ip_qos_bulk = IPTOS_DSCP_CS1;
+		if (options->use_happyeyes == 1)
+			options->ip_qos_bulk = IPTOS_THROUGHPUT;
+	}
 	if (options->request_tty == -1)
 		options->request_tty = REQUEST_TTY_AUTO;
 	if (options->session_type == -1)
