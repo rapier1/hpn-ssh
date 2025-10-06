@@ -56,3 +56,4 @@ hpnsshd-auth
 !regress/misc/**/Makefile
 !regress/unittests/**/Makefile
 tags
+
