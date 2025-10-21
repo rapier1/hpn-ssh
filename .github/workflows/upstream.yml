@@ -2,9 +2,8 @@ name: OpenBSD
 
 on:
   push:
-#don't run anything
-#    branches: [ master ]
-#    paths: [ '**.c', '**.h', '**.sh', '.github/configs', '.github/workflows/upstream.yml' ]
+    branches: [ master ]
+    paths: [ '**.c', '**.h', '**.sh', '.github/configs', '.github/workflows/upstream.yml' ]
 
 jobs:
   selfhosted:
