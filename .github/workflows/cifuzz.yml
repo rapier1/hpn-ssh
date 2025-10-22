@@ -1,7 +1,7 @@
 name: CIFuzz
 on:
   push:
-    branches: [master, dev_minor, dev_major, release_candidates]
+    branches: [master, dev_minor, dev_major, release_candidates, test]
     paths: [ '**.c', '**.h', '**.m4', '**.sh', '.github/**', '**/Makefile.in', 'configure.ac' ]
   pull_request:
     paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/cifuzz.yml' ]
