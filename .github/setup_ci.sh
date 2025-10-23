@@ -164,7 +164,7 @@ for TARGET in $TARGETS; do
         PACKAGES="${PACKAGES} cmake ninja-build"
         ;;
     putty-*)
-	INSTALL_PUTTY=$(echo "${TARGET}" | cut -f2 -d-)
+	INSTALL_PUTTY=0.83
 	PACKAGES="${PACKAGES} cmake"
 	;;
     valgrind*)
@@ -225,13 +225,8 @@ if [ "${INSTALL_HARDENED_MALLOC}" = "yes" ]; then
 fi
 
 if [ ! -z "${INSTALL_OPENSSL}" ]; then
-    (cd ${HOME} &&
-     git clone https://github.com/openssl/openssl.git &&
-     cd ${HOME}/openssl &&
-     git checkout ${INSTALL_OPENSSL} &&
-     ./config no-threads shared ${SSLCONFOPTS} \
-         --prefix=/opt/openssl &&
-     make && sudo make install_sw)
+	.github/install_libcrypto.sh \
+	    "${INSTALL_OPENSSL}" /opt/openssl "${SSLCONFOPTS}"
 fi
 
 if [ ! -z "${INSTALL_LIBRESSL}" ]; then
@@ -278,25 +273,25 @@ if [ ! -z "${INSTALL_ZLIB}" ]; then
 fi
 
 if [ ! -z "${INSTALL_PUTTY}" ]; then
-    ver="${INSTALL_PUTTY}"
-    case "${INSTALL_PUTTY}" in
-    snapshot)
-	tarball=putty.tar.gz
-	(cd /tmp && wget https://tartarus.org/~simon/putty-snapshots/${tarball})
-	;;
-    *)
-	tarball=putty-${ver}.tar.gz
-	(cd /tmp && wget https://the.earth.li/~sgtatham/putty/${ver}/${tarball})
+	.github/install_putty.sh "${INSTALL_PUTTY}"
+fi
+
+# If we're running on an ephemeral VM, set a random password and set
+# up to run the password auth test.
+if [ ! -z "${EPHEMERAL_VM}" ]; then
+
+    # This is the github "target" as specified in the yml file.
+    # In particular, ubuntu-latest sets the password field to the locked
+    # value, so unless we reset it here most of the tests will fail.
+    case "${target}" in
+    ubuntu-*)
+	echo ${target} target: setting random password.
+	openssl rand -base64 9 >regress/password
+	pw=$(tr -d '\n' <regress/password | openssl passwd -6 -stdin)
+	sudo usermod --password "${pw}" runner
+	sudo usermod --unlock runner
 	;;
     esac
-    (cd ${HOME} && tar xfz /tmp/${tarball} && cd putty-*
-     if [ -f CMakeLists.txt ]; then
-	cmake . && cmake --build . && sudo cmake --build . --target install
-     else
-	./configure && make && sudo make install
-     fi
-    )
-    /usr/local/bin/plink -V
 fi
 
 # If we're running on an ephemeral VM, set a random password and set

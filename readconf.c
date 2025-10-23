@@ -1,4 +1,4 @@
-/* $OpenBSD: readconf.c,v 1.398 2025/03/18 04:53:14 djm Exp $ */
+/* $OpenBSD: readconf.c,v 1.406 2025/08/29 03:50:38 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -29,14 +29,10 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#ifdef HAVE_IFADDRS_H
-# include <ifaddrs.h>
-#endif
+#include <ifaddrs.h>
 #include <limits.h>
 #include <netdb.h>
-#ifdef HAVE_PATHS_H
-# include <paths.h>
-#endif
+#include <paths.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
@@ -48,9 +44,7 @@
 #else
 # include "openbsd-compat/glob.h"
 #endif
-#ifdef HAVE_UTIL_H
 #include <util.h>
-#endif
 #if defined(HAVE_STRNVIS) && defined(HAVE_VIS_H) && !defined(BROKEN_STRNVIS)
 # include <vis.h>
 #endif
@@ -185,7 +179,7 @@ typedef enum {
 	oPubkeyAcceptedAlgorithms, oCASignatureAlgorithms, oProxyJump,
 	oSecurityKeyProvider, oKnownHostsCommand, oRequiredRSASize,
 	oEnableEscapeCommandline, oObscureKeystrokeTiming, oChannelTimeout,
-	oVersionAddendum,
+	oVersionAddendum, oRefuseConnection, oWarnWeakCrypto,
 	oIgnore, oIgnoredUnknownOption, oDeprecated, oUnsupported
 } OpCodes;
 
@@ -351,6 +345,8 @@ static struct {
 	{ "obscurekeystroketiming", oObscureKeystrokeTiming },
 	{ "channeltimeout", oChannelTimeout },
 	{ "versionaddendum", oVersionAddendum },
+	{ "refuseconnection", oRefuseConnection },
+	{ "warnweakcrypto", oWarnWeakCrypto },
 
 	{ NULL, oBadOption }
 };
@@ -787,12 +783,13 @@ match_cfg_line(Options *options, const char *full_line, int *acp, char ***avp,
 		if (strcasecmp(attrib, "canonical") == 0 ||
 		    strcasecmp(attrib, "final") == 0) {
 			/*
-			 * If the config requests "Match final" then remember
-			 * this so we can perform a second pass later.
+			 * If the config requests "Match final" without
+			 * negation then remember this so we can perform a
+			 * second pass later.
 			 */
 			if (strcasecmp(attrib, "final") == 0 &&
 			    want_final_pass != NULL)
-				*want_final_pass = 1;
+				*want_final_pass |= !negate;
 			r = !!final_pass;  /* force bitmask member to boolean */
 			if (r == (negate ? 1 : 0))
 				this_result = result = 0;
@@ -1116,6 +1113,15 @@ static const struct multistate multistate_compression[] = {
 	{ "yes",			COMP_DELAYED },
 #endif
 	{ "no",				COMP_NONE },
+	{ NULL, -1 }
+};
+/* XXX this will need to be replaced with a bitmask if we add more flags */
+static const struct multistate multistate_warnweakcrypto[] = {
+	{ "true",			1 },
+	{ "false",			0 },
+	{ "yes",			1 },
+	{ "no",				0 },
+	{ "no-pq-kex",			0 },
 	{ NULL, -1 }
 };
 
@@ -2246,6 +2252,12 @@ parse_pubkey_algos:
 			    filename, linenum, arg);
 			goto out;
 		}
+		if (value == INT_MIN) {
+			debug("%s line %d: Deprecated IPQoS value \"%s\" "
+			    "ignored - using system default instead. Consider"
+			    " using DSCP values.", filename, linenum, arg);
+			value = INT_MAX;
+		}
 		arg = argv_next(&ac, &av);
 		if (arg == NULL)
 			value2 = value;
@@ -2253,6 +2265,12 @@ parse_pubkey_algos:
 			error("%s line %d: Bad IPQoS value: %s",
 			    filename, linenum, arg);
 			goto out;
+		}
+		if (value2 == INT_MIN) {
+			debug("%s line %d: Deprecated IPQoS value \"%s\" "
+			    "ignored - using system default instead. Consider"
+			    " using DSCP values.", filename, linenum, arg);
+			value2 = INT_MAX;
 		}
 		if (*activep && options->ip_qos_interactive == -1) {
 			options->ip_qos_interactive = value;
@@ -2501,6 +2519,11 @@ parse_pubkey_algos:
 		intptr = &options->required_rsa_size;
 		goto parse_int;
 
+	case oWarnWeakCrypto:
+		intptr = &options->warn_weak_crypto;
+		multistate_ptr = multistate_warnweakcrypto;
+		goto parse_multistate;
+
 	case oObscureKeystrokeTiming:
 		value = -1;
 		while ((arg = argv_next(&ac, &av)) != NULL) {
@@ -2594,6 +2617,19 @@ parse_pubkey_algos:
 				options->version_addendum = xstrdup(str + len);
 		}
 		argv_consume(&ac);
+		break;
+
+	case oRefuseConnection:
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0') {
+			error("%.200s line %d: Missing argument.",
+			    filename, linenum);
+			goto out;
+		}
+		if (*activep) {
+			fatal("%.200s line %d: RefuseConnection: %s",
+			    filename, linenum, arg);
+		}
 		break;
 
 	case oDeprecated:
@@ -2861,6 +2897,7 @@ initialize_options(Options * options)
 	options->pubkey_accepted_algos = NULL;
 	options->known_hosts_command = NULL;
 	options->required_rsa_size = -1;
+	options->warn_weak_crypto = -1;
 	options->enable_escape_commandline = -1;
 	options->obscure_keystroke_timing_interval = -1;
 	options->tag = NULL;
@@ -2970,10 +3007,6 @@ fill_default_options(Options * options)
 		    _PATH_SSH_CLIENT_ID_ED25519, 0);
 		add_identity_file(options, "~/",
 		    _PATH_SSH_CLIENT_ID_ED25519_SK, 0);
-		add_identity_file(options, "~/", _PATH_SSH_CLIENT_ID_XMSS, 0);
-#ifdef WITH_DSA
-		add_identity_file(options, "~/", _PATH_SSH_CLIENT_ID_DSA, 0);
-#endif
 	}
 	if (options->escape_char == -1)
 		options->escape_char = '~';
@@ -3082,12 +3115,12 @@ fill_default_options(Options * options)
 	 * impact but TODO try to find a real world way to test this.
 	 */
 	if (options->ip_qos_interactive == -1) {
-		options->ip_qos_interactive = IPTOS_DSCP_AF21;
+		options->ip_qos_interactive = IPTOS_DSCP_EF;
 		if (options->use_happyeyes == 1)
 			options->ip_qos_interactive = IPTOS_LOWDELAY;
 	}
 	if (options->ip_qos_bulk == -1) {
-		options->ip_qos_bulk = IPTOS_DSCP_CS1;
+		options->ip_qos_bulk = IPTOS_DSCP_CS0;
 		if (options->use_happyeyes == 1)
 			options->ip_qos_bulk = IPTOS_THROUGHPUT;
 	}
@@ -3118,6 +3151,8 @@ fill_default_options(Options * options)
 #endif
 	if (options->required_rsa_size == -1)
 		options->required_rsa_size = SSH_RSA_MINIMUM_MODULUS_SIZE;
+	if (options->warn_weak_crypto == -1)
+		options->warn_weak_crypto = 1;
 	if (options->enable_escape_commandline == -1)
 		options->enable_escape_commandline = 0;
 	if (options->obscure_keystroke_timing_interval == -1) {
@@ -3145,6 +3180,7 @@ fill_default_options(Options * options)
 			goto fail; \
 		} \
 	} while (0)
+	options->kex_algorithms_set = options->kex_algorithms != NULL;
 	ASSEMBLE(ciphers, def_cipher, all_cipher);
 	ASSEMBLE(macs, def_mac, all_mac);
 	ASSEMBLE(kex_algorithms, def_kex, all_kex);
@@ -3839,8 +3875,10 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
 	dump_cfg_fmtint(oFallback, o->fallback);
 	dump_cfg_fmtint(oMetrics, o->metrics);
-
-
+	dump_cfg_fmtint(oUseMPTCP, o->use_mptcp);
+	dump_cfg_fmtint(oHappyEyes, o->use_happyeyes);
+	dump_cfg_fmtint(oWarnWeakCrypto, o->warn_weak_crypto);
+	
 	/* Integer options */
 	dump_cfg_int(oCanonicalizeMaxDots, o->canonicalize_max_dots);
 	dump_cfg_int(oConnectionAttempts, o->connection_attempts);
@@ -3853,7 +3891,8 @@ dump_client_config(Options *o, const char *host)
 	    o->obscure_keystroke_timing_interval);
 	dump_cfg_int(oMetricsInterval, o->metrics_interval);
 	dump_cfg_int(oFallbackPort, o->fallback_port);
-
+	dump_cfg_int(oHappyDelay, o->happy_delay);
+	
 	/* String options */
 	dump_cfg_string(oBindAddress, o->bind_address);
 	dump_cfg_string(oBindInterface, o->bind_interface);
