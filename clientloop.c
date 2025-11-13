@@ -1,4 +1,4 @@
-/* $OpenBSD: clientloop.c,v 1.415 2025/09/25 06:23:19 jsg Exp $ */
+/* $OpenBSD: clientloop.c,v 1.417 2025/10/16 00:00:36 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -949,7 +949,7 @@ client_repledge(void)
 	/* Might be able to tighten pledge now that session is established */
 	if (options.control_master || options.control_path != NULL ||
 	    options.forward_x11 || options.fork_after_authentication ||
-	    can_update_hostkeys() ||
+	    options.pkcs11_provider != NULL || can_update_hostkeys() ||
 	    (session_ident != -1 && !session_setup_complete)) {
 		/* Can't tighten */
 		return;
@@ -1465,7 +1465,9 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	debug_f("Entering interactive session.");
 	session_ident = ssh2_chan_id;
 
-	if (options.control_master &&
+	if (options.pkcs11_provider != NULL)
+		debug("pledge: disabled (PKCS11Provider active)");
+	else if (options.control_master &&
 	    !option_clear_or_none(options.control_path)) {
 		debug_f("pledge: id");
 		if (pledge("stdio rpath wpath cpath unix inet dns recvfd sendfd proc exec id tty",

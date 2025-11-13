@@ -1,4 +1,4 @@
-#	$OpenBSD: test-exec.sh,v 1.131 2025/07/26 01:53:31 djm Exp $
+#	$OpenBSD: test-exec.sh,v 1.133 2025/10/21 07:18:27 dtucker Exp $
 #	Placed in the Public Domain.
 
 #SUDO=sudo
@@ -167,6 +167,9 @@ if [ "x$TEST_SSH_DROPBEARKEY" != "x" ]; then
 fi
 if [ "x$TEST_SSH_DROPBEARCONVERT" != "x" ]; then
 	DROPBEARCONVERT="${TEST_SSH_DROPBEARCONVERT}"
+fi
+if [ "x$TEST_SSH_TMUX" != "x" ]; then
+	TMUX="${TEST_SSH_TMUX}"
 fi
 if [ "x$TEST_SSH_PKCS11_HELPER" != "x" ]; then
 	SSH_PKCS11_HELPER="${TEST_SSH_PKCS11_HELPER}"
@@ -531,11 +534,12 @@ save_debug_log ()
 
 	for logfile in $TEST_SSH_LOGDIR $TEST_REGRESS_LOGFILE \
 	    $TEST_SSH_LOGFILE $TEST_SSHD_LOGFILE; do
-		if [ ! -z "$SUDO" ] && [ -e "$logfile" ]; then
+		if [ ! -z "$SUDO" ]; then
+			touch $logfile
 			$SUDO chown -R $USER $logfile
+			$SUDO chmod ug+rw $logfile
 		fi
 	done
-	test -z "$SUDO" || $SUDO chmod ug+rw $TEST_SSHD_LOGFILE
 	echo $@ >>$TEST_REGRESS_LOGFILE
 	echo $@ >>$TEST_SSH_LOGFILE
 	echo $@ >>$TEST_SSHD_LOGFILE
@@ -929,6 +933,9 @@ p11_find_lib() {
 PKCS11_OK=
 export PKCS11_OK
 p11_setup() {
+	# XXX we could potentially test ed25519 only in the absence of
+	# RSA and ECDSA support.
+	$SSH -Q key | grep ssh-rsa >/dev/null || return 1
 	p11_find_lib \
 		/usr/local/lib/softhsm/libsofthsm2.so \
 		/usr/lib64/pkcs11/libsofthsm2.so \
@@ -998,13 +1005,19 @@ EOF
 		fatal "softhsm import ed25519 fail"
 	chmod 600 $ED25519
 	${SSHKEYGEN} -y -f $ED25519 > ${ED25519}.pub
-	# Prepare askpass script to load PIN.
+	# Prepare some askpass scripts to load PINs.
 	PIN_SH=$SSH_SOFTHSM_DIR/pin.sh
 	cat > $PIN_SH << EOF
 #!/bin/sh
 echo "${TEST_SSH_PIN}"
 EOF
 	chmod 0700 "$PIN_SH"
+	WRONGPIN_SH=$SSH_SOFTHSM_DIR/wrongpin.sh
+	cat > $WRONGPIN_SH << EOF
+#!/bin/sh
+echo "0000"
+EOF
+	chmod 0700 "$WRONGPIN_SH"
 	PKCS11_OK=yes
 	if env SSH_ASKPASS="$PIN_SH" SSH_ASKPASS_REQUIRE=force \
 	    ${SSHKEYGEN} -D ${TEST_SSH_PKCS11} >/dev/null 2>&1 ; then

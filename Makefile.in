@@ -103,7 +103,7 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
 	poly1305.o chacha.o cipher-chachapoly.o cipher-chachapoly-libcrypto.o \
 	cipher-chachapoly-libcrypto-mt.o \
 	ssh-ed25519.o digest-openssl.o digest-libc.o \
-	hmac.o ed25519.o hash.o \
+	hmac.o ed25519.o ed25519-openssl.o \
 	kex.o kex-names.o kexdh.o kexgex.o kexecdh.o kexc25519.o \
 	kexgexc.o kexgexs.o \
 	kexsntrup761x25519.o kexmlkem768x25519.o sntrup761.o kexgen.o \
@@ -117,7 +117,7 @@ P11OBJS= ssh-pkcs11-client.o
 SKOBJS=	ssh-sk-client.o
 
 SSHOBJS= ssh.o readconf.o clientloop.o sshtty.o \
-	sshconnect.o sshconnect2.o mux.o cipher-switch.o $(P11OBJS) $(SKOBJS)
+	sshconnect.o sshconnect2.o mux.o cipher-switch.o ssh-pkcs11.o $(SKOBJS)
 
 SSHDOBJS=sshd.o \
 	platform-listen.o \
@@ -765,7 +765,7 @@ regress/unittests/utf8/test_utf8$(EXEEXT): \
 SK_DUMMY_OBJS=\
 	regress/misc/sk-dummy/sk-dummy.lo \
 	regress/misc/sk-dummy/fatal.lo \
-	ed25519.lo hash.lo
+	ed25519.lo ed25519-openssl.lo
 
 SK_DUMMY_LIBRARY=@SK_DUMMY_LIBRARY@
 
@@ -862,6 +862,7 @@ interop-tests t-exec file-tests extra-tests: regress-prep regress-binaries $(TAR
 		TEST_SSH_DROPBEARKEY="@DROPBEARKEY@" \
 		TEST_SSH_DROPBEARCONVERT="@DROPBEARCONVERT@" \
 		TEST_SSH_DBCLIENT="@DBCLIENT@" \
+		TEST_SSH_TMUX="@TMUX@" \
 		TEST_SSH_IPV6="@TEST_SSH_IPV6@" \
 		TEST_SSH_UTF8="@TEST_SSH_UTF8@" \
 		TEST_SHELL="$(TEST_SHELL)" \

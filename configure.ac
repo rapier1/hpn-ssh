@@ -3194,15 +3194,6 @@ if test "x$openssl" = "xyes" ; then
 		RSA_get_default_method \
 	])
 
-	# OpenSSL_add_all_algorithms may be a macro.
-	AC_CHECK_FUNC(OpenSSL_add_all_algorithms,
-	    AC_DEFINE(HAVE_OPENSSL_ADD_ALL_ALGORITHMS, 1, [as a function]),
-	    AC_CHECK_DECL(OpenSSL_add_all_algorithms,
-		AC_DEFINE(HAVE_OPENSSL_ADD_ALL_ALGORITHMS, 1, [as a macro]), ,
-		[[#include <openssl/evp.h>]]
-	    )
-	)
-
 	# LibreSSL/OpenSSL API differences
 	AC_CHECK_FUNCS([ \
 		EC_POINT_get_affine_coordinates \
@@ -3416,6 +3407,10 @@ if test "x$openssl" = "xyes" ; then
 		[AC_LANG_PROGRAM([[
 	#include <string.h>
 	#include <openssl/evp.h>
+	#include <openssl/opensslconf.h>
+	#ifdef OPENSSL_NO_EC
+	# error "OpenSSL has no EC support."
+	#endif
 		]], [[
 		unsigned char buf[64];
 		memset(buf, 0, sizeof(buf));
@@ -3831,6 +3826,24 @@ AC_CHECK_TYPES([nfds_t], , , [
 #include <sys/poll.h>
 #endif
 ])
+
+if test "x$ac_cv_type_nfds_t" != "xyes"; then
+	AC_MSG_CHECKING([if poll nfds_t is unsigned long])
+	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <sys/types.h>
+#ifdef HAVE_POLL_H
+#include <poll.h>
+#endif
+#ifdef HAVE_SYS_POLL_H
+#include <sys/poll.h>
+#endif
+	    int poll(struct pollfd *, unsigned long, int timeout);
+	    ]], [[return poll(0, 0, 0);]])],
+	    [AC_MSG_RESULT([yes])
+	     AC_DEFINE(POLL_NFDS_T_ULONG, 1, [Define if poll 2nd arg is ulong])],
+	    [AC_MSG_RESULT([no])]
+	)
+fi
 
 # Decide which sandbox style to use
 sandbox_arg=""
@@ -5866,6 +5879,7 @@ AC_PATH_PROG([DROPBEAR], [dropbear])
 AC_PATH_PROG([DBCLIENT], [dbclient])
 AC_PATH_PROG([DROPBEARKEY], [dropbearkey])
 AC_PATH_PROG([DROPBEARCONVERT], [dropbearconvert])
+AC_PATH_PROG([TMUX], [tmux])
 
 CFLAGS="${CFLAGS} ${CFLAGS_AFTER}"
 LDFLAGS="${LDFLAGS} ${LDFLAGS_AFTER}"
