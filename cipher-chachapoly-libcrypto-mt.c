@@ -42,6 +42,7 @@
 #include "xmalloc.h"
 #include "cipher-chachapoly.h"
 #include "cipher-chachapoly-libcrypto-mt.h"
+#include "fasterxor.h"
 
 #ifndef likely
 # define likely(x)   __builtin_expect(!!(x), 1)
@@ -589,7 +590,15 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 				for (u_int i=0; i<aadlen; i++)
 					dest[i] = ks->headerStream[i] ^ src[i];
 			/* Crypt payload */
+#ifdef USEFASTERXOR			
+			/* faster-xor2 is significantly faster (100MB/s+) but it bombs when
+			 * we hit a rekey. Need to figure that out.
+			 * Okay, so it looks like it only crashes out when the remote
+			 * is not using the same xor method. */
+			faster_xor2(dest+aadlen,src+aadlen,ks->mainStream,len,KEYSTREAMLEN);
+#else
 			fastXOR(dest+aadlen,src+aadlen,ks->mainStream,len);
+#endif
 			/* calculate and append tag */
 #if !defined(WITH_OPENSSL3) && defined(EVP_PKEY_POLY1305)
 			if (do_encrypt) {
