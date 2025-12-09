@@ -103,7 +103,7 @@ AuthorizedKeysFile	.ssh/authorized_keys
 #PermitTunnel no
 #ChrootDirectory none
 #VersionAddendum none
-#UseMPTCP no
+#UseMPTCP yes
 
 # no default banner path
 #Banner none
