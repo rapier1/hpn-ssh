@@ -828,8 +828,12 @@ listen_on_addrs(struct listenaddr *la)
 		}
 		/* Create socket for listening. */
 		if (options.use_mptcp)
+#ifdef IPPROTO_MPTCP
 			listen_sock = socket(ai->ai_family, ai->ai_socktype,
 			    IPPROTO_MPTCP);
+#else
+			listen_sock = -1;
+#endif
 		else
 			listen_sock = socket(ai->ai_family, ai->ai_socktype,
 			    ai->ai_protocol);
