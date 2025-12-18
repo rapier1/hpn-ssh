@@ -1,4 +1,4 @@
-/* $OpenBSD: servconf.h,v 1.168 2024/09/15 01:18:26 djm Exp $ */
+/* $OpenBSD: servconf.h,v 1.172 2025/12/16 08:32:50 dtucker Exp $ */
 
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
@@ -73,13 +73,14 @@ struct per_source_penalty {
 	int	max_sources6;
 	int	overflow_mode;
 	int	overflow_mode6;
-	int	penalty_crash;
-	int	penalty_grace;
-	int	penalty_authfail;
-	int	penalty_noauth;
-	int	penalty_refuseconnection;
-	int	penalty_max;
-	int	penalty_min;
+	double	penalty_crash;
+	double	penalty_grace;
+	double	penalty_authfail;
+	double	penalty_invaliduser;
+	double	penalty_noauth;
+	double	penalty_refuseconnection;
+	double	penalty_max;
+	double	penalty_min;
 };
 
 typedef struct {
@@ -151,6 +152,7 @@ typedef struct {
 						 * authenticated with Kerberos. */
 	int     gss_authentication;	/* If true, permit GSSAPI authentication */
 	int     gss_cleanup_creds;	/* If true, destroy cred cache on logout */
+	int     gss_deleg_creds;	/* If true, accept delegated GSS credentials */
 	int     gss_strict_acceptor;	/* If true, restrict the GSSAPI acceptor name */
 	int     password_authentication;	/* If true, permit password
 						 * authentication. */

@@ -1,4 +1,4 @@
-/* $OpenBSD: packet.c,v 1.323 2025/09/25 06:33:19 djm Exp $ */
+/* $OpenBSD: packet.c,v 1.327 2025/12/05 06:16:27 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -59,9 +59,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <time.h>
-#ifdef HAVE_UTIL_H
-# include <util.h>
-#endif
+#include <util.h>
 
 /*
  * Explicitly include OpenSSL before zlib as some versions of OpenSSL have
@@ -3023,4 +3021,165 @@ void *
 ssh_packet_get_receive_context(struct ssh *ssh)
 {
         return ssh->state->receive_context;
+}
+
+static char *
+format_traffic_stats(struct packet_state *ps)
+{
+	char *stats = NULL, bytes[FMT_SCALED_STRSIZE];
+
+	if (ps->bytes > LLONG_MAX || fmt_scaled(ps->bytes, bytes) != 0)
+		strlcpy(bytes, "OVERFLOW", sizeof(bytes));
+
+	xasprintf(&stats, "%lu pkts %llu blks %sB",
+	    (unsigned long)ps->packets, (unsigned long long)ps->blocks, bytes);
+	return stats;
+}
+
+static char *
+dedupe_alg_names(const char *in, const char *out)
+{
+	char *names = NULL;
+
+	if (in == NULL)
+		in = "<implicit>";
+	if (out == NULL)
+		out = "<implicit>";
+
+	if (strcmp(in, out) == 0) {
+		names = xstrdup(in);
+	} else {
+		xasprintf(&names, "%s in, %s out", in, out);
+	}
+	return names;
+}
+
+static char *
+comp_status_message(struct ssh *ssh)
+{
+#ifdef WITH_ZLIB
+	char *ret = NULL;
+	struct session_state *state = ssh->state;
+	unsigned long long iraw = 0, icmp = 0, oraw = 0, ocmp = 0;
+	char iraw_f[FMT_SCALED_STRSIZE] = "", oraw_f[FMT_SCALED_STRSIZE] = "";
+	char icmp_f[FMT_SCALED_STRSIZE] = "", ocmp_f[FMT_SCALED_STRSIZE] = "";
+
+	if (state->compression_buffer) {
+		if (state->compression_in_started) {
+			iraw = state->compression_in_stream.total_out;
+			icmp = state->compression_in_stream.total_in;
+			if (fmt_scaled(iraw, iraw_f) != 0)
+				strlcpy(iraw_f, "OVERFLOW", sizeof(iraw_f));
+			if (fmt_scaled(icmp, icmp_f) != 0)
+				strlcpy(icmp_f, "OVERFLOW", sizeof(icmp_f));
+		}
+		if (state->compression_out_started) {
+			oraw = state->compression_out_stream.total_in;
+			ocmp = state->compression_out_stream.total_out;
+			if (fmt_scaled(oraw, oraw_f) != 0)
+				strlcpy(oraw_f, "OVERFLOW", sizeof(oraw_f));
+			if (fmt_scaled(ocmp, ocmp_f) != 0)
+				strlcpy(ocmp_f, "OVERFLOW", sizeof(ocmp_f));
+		}
+		xasprintf(&ret,
+		    "    compressed %s/%s (*%.3f) in,"
+		    " %s/%s (*%.3f) out\r\n",
+		    icmp_f, iraw_f, iraw == 0 ? 0.0 : (double)icmp / iraw,
+		    ocmp_f, oraw_f, oraw == 0 ? 0.0 : (double)ocmp / oraw);
+		return ret;
+	}
+#endif	/* WITH_ZLIB */
+	return xstrdup("");
+}
+
+char *
+connection_info_message(struct ssh *ssh)
+{
+	char *ret = NULL, *cipher = NULL, *mac = NULL, *comp = NULL;
+	char *rekey_volume = NULL, *rekey_time = NULL, *comp_info = NULL;
+	char thishost[NI_MAXHOST] = "unknown", *tcp_info = NULL;
+	struct kex *kex;
+	struct session_state *state;
+	struct newkeys *nk_in, *nk_out;
+	char *stats_in = NULL, *stats_out = NULL;
+	u_int64_t epoch = (u_int64_t)time(NULL) - monotime();
+
+	if (ssh == NULL)
+		return NULL;
+	state = ssh->state;
+	kex = ssh->kex;
+
+	(void)gethostname(thishost, sizeof(thishost));
+
+	if (ssh_local_port(ssh) != 65535 ||
+	     strcmp(ssh_local_ipaddr(ssh), "UNKNOWN") != 0) {
+		xasprintf(&tcp_info, "  tcp %s:%d -> %s:%d\r\n",
+		    ssh_local_ipaddr(ssh), ssh_local_port(ssh),
+		    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh));
+	} else {
+		tcp_info = xstrdup("");
+	}
+
+	nk_in = ssh->state->newkeys[MODE_IN];
+	nk_out = ssh->state->newkeys[MODE_OUT];
+	stats_in = format_traffic_stats(&ssh->state->p_read);
+	stats_out = format_traffic_stats(&ssh->state->p_send);
+
+	cipher = dedupe_alg_names(nk_in->enc.name, nk_out->enc.name);
+	mac = dedupe_alg_names(nk_in->mac.name, nk_out->mac.name);
+	comp = dedupe_alg_names(nk_in->comp.name, nk_out->comp.name);
+
+	/* Volume based rekeying. */
+	if (state->rekey_limit == 0) {
+		xasprintf(&rekey_volume, "limit none");
+	} else {
+		char *volumes = NULL, in[32], out[32];
+
+		snprintf(in, sizeof(in), "%llu",
+		   (unsigned long long)state->max_blocks_in);
+		snprintf(out, sizeof(out), "%llu",
+		   (unsigned long long)state->max_blocks_out);
+		volumes = dedupe_alg_names(in, out);
+		xasprintf(&rekey_volume, "limit blocks %s", volumes);
+		free(volumes);
+	}
+
+	/* Time based rekeying. */
+	if (state->rekey_interval == 0) {
+		rekey_time = xstrdup("interval none");
+	} else {
+		char rekey_next[64];
+
+		format_absolute_time(epoch + state->rekey_time +
+		    state->rekey_interval, rekey_next, sizeof(rekey_next));
+		xasprintf(&rekey_time, "interval %s, next %s",
+		    fmt_timeframe(state->rekey_interval), rekey_next);
+	}
+	comp_info = comp_status_message(ssh);
+
+	xasprintf(&ret, "Connection information for %s pid %lld\r\n"
+	    "%s"
+	    "  kexalgorithm %s\r\n  hostkeyalgorithm %s\r\n"
+	    "  cipher %s\r\n  mac %s\r\n  compression %s\r\n"
+	    "  rekey %s %s\r\n"
+	    "  traffic %s in, %s out\r\n"
+	    "%s",
+	    thishost, (long long)getpid(),
+	    tcp_info,
+	    kex->name, kex->hostkey_alg,
+	    cipher, mac, comp,
+	    rekey_volume, rekey_time,
+	    stats_in, stats_out,
+	    comp_info
+	);
+	free(tcp_info);
+	free(cipher);
+	free(mac);
+	free(comp);
+	free(stats_in);
+	free(stats_out);
+	free(rekey_volume);
+	free(rekey_time);
+	free(comp_info);
+	return ret;
 }
