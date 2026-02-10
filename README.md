@@ -95,4 +95,4 @@ HPN-SSH development is discussed on the [hpnssh-community mailing list](https://
 
 ## Reporting bugs
 
-_Non-security_ bugs may be reported to the developers via [GitHub Issues]](https://github.com/rapier1/hpn-ssh/issues) or via the mailing list above. Security bugs should be reported to [hpnssh@psc.edu](mailto:hpnssh@psc.edu).
+_Non-security_ bugs may be reported to the developers via [GitHub Issues](https://github.com/rapier1/hpn-ssh/issues) or via the mailing list above. Security bugs should be reported to [hpnssh@psc.edu](mailto:hpnssh@psc.edu).
