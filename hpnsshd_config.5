@@ -2067,9 +2067,10 @@ directives.
 .It Cm UseMPTCP
 If set to
 .Cm yes ,
-this will enable Multipath TCP (MPTCP) instead of TCP (this only works on Linux).
+this will enable Multipath TCP (MPTCP) support. This only works on Linux. MPTCP
+will be used if requested by clients. If not, TCP will be used as before.
 The default is
-.Cm no .
+.Cm yes .
 .It Cm UsePAM
 Enables the Pluggable Authentication Module interface.
 If set to

@@ -941,10 +941,6 @@ struct winsize {
 # define SSH_IOBUFSZ (32*1024)
 #endif
 
-#ifndef IPPROTO_MPTCP
-#define IPPROTO_MPTCP 262
-#endif
-
 /*
  * We want functions in openbsd-compat, if enabled, to override system ones.
  * We no-op out the weak symbol definition rather than remove it to reduce

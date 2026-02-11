@@ -827,10 +827,15 @@ listen_on_addrs(struct listenaddr *la)
 			continue;
 		}
 		/* Create socket for listening. */
+		listen_sock = -1;
+#ifdef IPPROTO_MPTCP
 		if (options.use_mptcp)
 			listen_sock = socket(ai->ai_family, ai->ai_socktype,
 			    IPPROTO_MPTCP);
-		else
+#endif
+
+		/* Fallback to "plain" TCP if MPTCP is not available */
+		if (listen_sock == -1)
 			listen_sock = socket(ai->ai_family, ai->ai_socktype,
 			    ai->ai_protocol);
 

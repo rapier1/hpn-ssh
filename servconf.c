@@ -487,7 +487,7 @@ fill_default_server_options(ServerOptions *options)
 	if (options->hpn_disabled == -1)
 		options->hpn_disabled = 0;
 	if (options->use_mptcp == -1)
-		options->use_mptcp = 0;
+		options->use_mptcp = 1;
 	if (options->ip_qos_interactive == -1)
 		options->ip_qos_interactive = IPTOS_DSCP_EF;
 	if (options->ip_qos_bulk == -1)

@@ -355,7 +355,11 @@ ssh_create_socket(struct addrinfo *ai)
 
 	/* user request for Multipath TCP */
 	if (options.use_mptcp)
+#ifdef IPPROTO_MPTCP
 		sock = socket(ai->ai_family, ai->ai_socktype, IPPROTO_MPTCP);
+#else
+		sock = -1;
+#endif
 	else
 		sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 
