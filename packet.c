@@ -1100,7 +1100,7 @@ ssh_set_newkeys(struct ssh *ssh, int mode)
 	/* get the maximum number of blocks the cipher can
 	 * handle safely */
 	*hard_max_blocks = cipher_rekey_blocks(enc->cipher);
-	*max_blocks = *hard_max_blocks. 
+	*max_blocks = *hard_max_blocks;
 
 	/* if we have a custom oRekeyLimit use that. */
 	if (state->rekey_limit) {
@@ -1117,7 +1117,7 @@ ssh_set_newkeys(struct ssh *ssh, int mode)
 	}
 	debug("rekey %s after %s blocks / %sB data", dir, blocks_s, bytes_s);
 
-}	return 0;
+	return 0;
 }
 
 /* this supports the forced rekeying required for the NONE cipher */
