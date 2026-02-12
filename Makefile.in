@@ -110,7 +110,8 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
 	sftp-realpath.o platform-pledge.o platform-tracing.o platform-misc.o \
 	sshbuf-io.o metrics.o binn.o cipher-ctr-mt-provider.o \
 	cipher-ctr-mt-functions.o ossl3-provider-err.o num.o \
-	happyeyeballs.o misc-agent.o
+	happyeyeballs.o misc-agent.o ssherr-libcrypto.o
+	sshbuf-io.o misc-agent.o ssherr-libcrypto.o
 
 P11OBJS= ssh-pkcs11-client.o
 
@@ -153,7 +154,7 @@ SSHD_AUTH_OBJS=sshd-auth.o \
 	sftp-server.o sftp-common.o \
 	uidswap.o cipher-switch.o $(P11OBJS) $(SKOBJS)
 
-SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-glob.o
+SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-glob.o ssherr-nolibcrypto.o
 
 SCP_OBJS=	scp.o progressmeter.o $(SFTP_CLIENT_OBJS)
 
@@ -167,11 +168,11 @@ SSHKEYSIGN_OBJS=ssh-keysign.o readconf.o uidswap.o $(P11OBJS) $(SKOBJS)
 
 P11HELPER_OBJS=	ssh-pkcs11-helper.o ssh-pkcs11.o $(SKOBJS)
 
-SKHELPER_OBJS=	ssh-sk-helper.o ssh-sk.o sk-usbhid.o
+SKHELPER_OBJS=	ssh-sk-helper.o ssh-sk.o sk-usbhid.o ssherr-nolibcrypto.o
 
 SSHKEYSCAN_OBJS=ssh-keyscan.o $(P11OBJS) $(SKOBJS)
 
-SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-server-main.o
+SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-server-main.o ssherr-nolibcrypto.o
 
 SFTP_OBJS=	sftp.o sftp-usergroup.o progressmeter.o $(SFTP_CLIENT_OBJS)
 

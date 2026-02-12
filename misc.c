@@ -43,7 +43,6 @@
 #include <unistd.h>
 
 #include <netinet/in.h>
-#include <netinet/in_systm.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -1882,7 +1881,7 @@ monotime(void)
 	struct timespec ts;
 
 	monotime_ts(&ts);
-	return ts.tv_sec;
+	return (ts.tv_sec);
 }
 
 double
@@ -1891,7 +1890,7 @@ monotime_double(void)
 	struct timespec ts;
 
 	monotime_ts(&ts);
-	return ts.tv_sec + ((double)ts.tv_nsec / 1000000000);
+	return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
 void

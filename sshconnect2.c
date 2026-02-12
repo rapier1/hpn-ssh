@@ -1,4 +1,4 @@
-/* $OpenBSD: sshconnect2.c,v 1.378 2025/09/15 04:51:35 djm Exp $ */
+/* $OpenBSD: sshconnect2.c,v 1.380 2026/02/05 22:05:49 djm Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  * Copyright (c) 2008 Damien Miller.  All rights reserved.
@@ -29,6 +29,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/queue.h>
 #include <sys/stat.h>
 
 #include <errno.h>
@@ -44,8 +45,6 @@
 #if defined(HAVE_STRNVIS) && defined(HAVE_VIS_H) && !defined(BROKEN_STRNVIS)
 #include <vis.h>
 #endif
-
-#include "openbsd-compat/sys-queue.h"
 
 #include "xmalloc.h"
 #include "ssh.h"
@@ -1317,7 +1316,8 @@ identity_sign(struct identity *id, u_char **sigp, size_t *lenp,
 	 * PKCS#11 tokens may not support all signature algorithms,
 	 * so check what we get back.
 	 */
-	if ((r = sshkey_check_sigtype(*sigp, *lenp, alg)) != 0) {
+	if ((id->key->flags & SSHKEY_FLAG_EXT) != 0 &&
+	    (r = sshkey_check_sigtype(*sigp, *lenp, alg)) != 0) {
 		debug_fr(r, "sshkey_check_sigtype");
 		goto out;
 	}
@@ -1385,7 +1385,7 @@ sign_and_send_pubkey(struct ssh *ssh, Identity *id)
 	 * This will try to set sign_id to the private key that will perform
 	 * the signature.
 	 */
-	if (sshkey_is_cert(id->key)) {
+	if (id->agent_fd == -1 && sshkey_is_cert(id->key)) {
 		TAILQ_FOREACH(private_id, &authctxt->keys, next) {
 			if (sshkey_equal_public(id->key, private_id->key) &&
 			    id->key->type != private_id->key->type) {

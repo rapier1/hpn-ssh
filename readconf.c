@@ -1,4 +1,4 @@
-/* $OpenBSD: readconf.c,v 1.407 2025/11/20 05:10:11 dtucker Exp $ */
+/* $OpenBSD: readconf.c,v 1.408 2026/02/08 19:54:31 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -22,13 +22,13 @@
 
 #include <net/if.h>
 #include <netinet/in.h>
-#include <netinet/in_systm.h>
 #include <netinet/ip.h>
 #include <arpa/inet.h>
 
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <ifaddrs.h>
 #include <limits.h>
 #include <netdb.h>
@@ -39,11 +39,6 @@
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
-#ifdef USE_SYSTEM_GLOB
-# include <glob.h>
-#else
-# include "openbsd-compat/glob.h"
-#endif
 #include <util.h>
 #if defined(HAVE_STRNVIS) && defined(HAVE_VIS_H) && !defined(BROKEN_STRNVIS)
 # include <vis.h>

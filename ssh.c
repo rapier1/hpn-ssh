@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh.c,v 1.621 2025/12/05 06:16:27 dtucker Exp $ */
+/* $OpenBSD: ssh.c,v 1.622 2025/12/22 01:17:31 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -43,10 +43,12 @@
 #include "includes.h"
 
 #include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/resource.h>
 #include <sys/ioctl.h>
+#include <sys/queue.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
 
@@ -75,7 +77,6 @@
 #include <openssl/err.h>
 #endif
 #include "openbsd-compat/openssl-compat.h"
-#include "openbsd-compat/sys-queue.h"
 
 #include "xmalloc.h"
 #include "ssh.h"
@@ -820,6 +821,8 @@ main(int ac, char **av)
 				muxclient_command = SSHMUX_COMMAND_ALIVE_CHECK;
 			else if (strcmp(optarg, "conninfo") == 0)
 				muxclient_command = SSHMUX_COMMAND_CONNINFO;
+			else if (strcmp(optarg, "channels") == 0)
+				muxclient_command = SSHMUX_COMMAND_CHANINFO;
 			else if (strcmp(optarg, "forward") == 0)
 				muxclient_command = SSHMUX_COMMAND_FORWARD;
 			else if (strcmp(optarg, "exit") == 0)

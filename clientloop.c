@@ -1,4 +1,4 @@
-/* $OpenBSD: clientloop.c,v 1.418 2025/11/27 02:18:48 dtucker Exp $ */
+/* $OpenBSD: clientloop.c,v 1.419 2026/02/07 17:10:34 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -66,6 +66,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/queue.h>
 
 #include <ctype.h>
 #include <errno.h>
@@ -81,7 +82,6 @@
 #include <unistd.h>
 #include <limits.h>
 
-#include "openbsd-compat/sys-queue.h"
 #include "xmalloc.h"
 #include "ssh.h"
 #include "ssh2.h"

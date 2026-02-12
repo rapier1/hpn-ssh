@@ -1,4 +1,4 @@
-/* $OpenBSD: sshd-session.c,v 1.18 2025/12/16 08:32:50 dtucker Exp $ */
+/* $OpenBSD: sshd-session.c,v 1.19 2025/12/30 00:35:37 djm Exp $ */
 /*
  * SSH2 implementation:
  * Privilege Separation:
@@ -31,12 +31,12 @@
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include "openbsd-compat/sys-tree.h"
-#include "openbsd-compat/sys-queue.h"
 #include <sys/wait.h>
+#include <sys/tree.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/queue.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -405,7 +405,7 @@ privsep_postauth(struct ssh *ssh, Authctxt *authctxt)
 	 * Hack for systems that don't support FD passing: retain privileges
 	 * in the post-auth privsep process so it can allocate PTYs directly.
 	 * This is basically equivalent to what we did <= 9.7, which was to
-	 * disable post-auth privsep entriely.
+	 * disable post-auth privsep entirely.
 	 * Cygwin doesn't need to drop privs here although it doesn't support
 	 * fd passing, as AFAIK PTY allocation on this platform doesn't require
 	 * special privileges to begin with.
@@ -1267,6 +1267,9 @@ main(int ac, char **av)
 	if ((r = kex_exchange_identification(ssh, -1,
 	    options.version_addendum)) != 0)
 		sshpkt_fatal(ssh, r, "banner exchange");
+
+	if ((ssh->compat & SSH_BUG_NOREKEY))
+		debug("client does not support rekeying");
 
 	ssh_packet_set_nonblocking(ssh);
 

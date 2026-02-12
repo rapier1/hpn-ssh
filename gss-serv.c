@@ -1,4 +1,4 @@
-/* $OpenBSD: gss-serv.c,v 1.34 2025/12/08 03:55:22 djm Exp $ */
+/* $OpenBSD: gss-serv.c,v 1.36 2026/02/08 15:28:01 dtucker Exp $ */
 
 /*
  * Copyright (c) 2001-2003 Simon Wilkinson. All rights reserved.
@@ -30,12 +30,13 @@
 
 #include <sys/types.h>
 #include <sys/param.h>
+#include <sys/queue.h>
 
+#include <netdb.h>
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
 
-#include "openbsd-compat/sys-queue.h"
 #include "xmalloc.h"
 #include "sshkey.h"
 #include "hostfile.h"
@@ -334,7 +335,7 @@ ssh_gssapi_storecreds(void)
 {
 	if (options.gss_deleg_creds == 0) {
 		debug_f("delegate credential is disabled, doing nothing");
-		return 0;
+		return;
 	}
 
 	if (gssapi_client.mech && gssapi_client.mech->storecreds) {
