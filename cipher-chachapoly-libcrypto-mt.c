@@ -589,7 +589,8 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 				for (u_int i=0; i<aadlen; i++)
 					dest[i] = ks->headerStream[i] ^ src[i];
 			/* Crypt payload */
-			fastXOR(dest+aadlen,src+aadlen,ks->mainStream,len);
+			//fastXOR(dest+aadlen,src+aadlen,ks->mainStream,len);
+			hpn_xor_buffers(src+aadlen, ks->mainStream, dest+aadlen, len);
 			/* calculate and append tag */
 #if !defined(WITH_OPENSSL3) && defined(EVP_PKEY_POLY1305)
 			if (do_encrypt) {
