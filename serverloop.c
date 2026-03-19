@@ -1,4 +1,4 @@
-/* $OpenBSD: serverloop.c,v 1.245 2025/10/30 03:19:54 djm Exp $ */
+/* $OpenBSD: serverloop.c,v 1.246 2026/03/03 09:57:25 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -411,7 +411,7 @@ server_loop2(struct ssh *ssh, Authctxt *authctxt)
 }
 
 static int
-server_input_keep_alive(int type, u_int32_t seq, struct ssh *ssh)
+server_input_keep_alive(int type, uint32_t seq, struct ssh *ssh)
 {
 	debug("Got %d/%u for keepalive", type, seq);
 	/*
@@ -620,7 +620,7 @@ server_request_session(struct ssh *ssh)
 }
 
 static int
-server_input_channel_open(int type, u_int32_t seq, struct ssh *ssh)
+server_input_channel_open(int type, uint32_t seq, struct ssh *ssh)
 {
 	Channel *c = NULL;
 	char *ctype = NULL;
@@ -825,7 +825,7 @@ server_input_hostkeys_prove(struct ssh *ssh, struct sshbuf **respp)
 }
 
 static int
-server_input_global_request(int type, u_int32_t seq, struct ssh *ssh)
+server_input_global_request(int type, uint32_t seq, struct ssh *ssh)
 {
 	char *rtype = NULL;
 	u_char want_reply = 0;
@@ -934,7 +934,7 @@ server_input_global_request(int type, u_int32_t seq, struct ssh *ssh)
 }
 
 static int
-server_input_channel_req(int type, u_int32_t seq, struct ssh *ssh)
+server_input_channel_req(int type, uint32_t seq, struct ssh *ssh)
 {
 	Channel *c;
 	int r, success = 0;

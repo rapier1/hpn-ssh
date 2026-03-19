@@ -537,13 +537,16 @@ AC_CHECK_HEADERS([ \
     poll.h \
     stdint.h \
     sys/mman.h \
-    sys/mount.h \
     sys/stat.h \
     sys/statvfs.h \
     sys/time.h \
     sys/un.h \
     time.h \
-    util.h], [], [
+    util.h \
+    ], [
+	# Remove any old shims.
+	rm -f "$COMPATINCLUDESDIR/$ac_header"
+    ], [
 	COMPATINCLUDES="$COMPATINCLUDESDIR"
 	header="$COMPATINCLUDES/$ac_header"
 	dir=`dirname "$header"`
@@ -571,17 +574,6 @@ for include in sys/queue.h sys/tree.h; do
 		;;
 	esac >"$header"
 done
-
-# DragonFly uses STAILQ_* in its sys/mount.h, so we explicitly
-# need to include the system one first, not our shim.
-case "$host" in
-*-*-dragonfly*)
-	COMPATINCLUDES="$COMPATINCLUDESDIR"
-	mkdir -p "$COMPATINCLUDES/sys"
-	echo '#include "/usr/include/sys/queue.h"'
-	echo '#include "/usr/include/sys/mount.h"'
-	;;
-esac > "$COMPATINCLUDES/sys/mount.h"
 
 AC_CHECK_DECLS([le32toh, le64toh, htole64], [], [], [
 #ifdef HAVE_SYS_TYPES_H
@@ -774,8 +766,6 @@ case "$host" in
 	AC_DEFINE([SPT_TYPE], [SPT_REUSEARGV],
 		[Define to a Set Process Title type if your system is
 		supported by bsd-setproctitle.c])
-	AC_DEFINE([SSHPAM_CHAUTHTOK_NEEDS_RUID], [1],
-	    [AIX 5.2 and 5.3 (and presumably newer) require this])
 	AC_DEFINE([PTY_ZEROREAD], [1], [read(1) can return 0 for a non-closed fd])
 	AC_DEFINE([PLATFORM_SYS_DIR_UID], 2, [System dirs owned by bin (uid 2)])
 	AC_DEFINE([BROKEN_STRNDUP], 1, [strndup broken, see APAR IY61211])
@@ -1215,9 +1205,6 @@ if (setsockopt(s, IPPROTO_IP, IP_TOS, &one, sizeof(one)) == -1)
 	AC_DEFINE([PAM_SUN_CODEBASE])
 	AC_DEFINE([LOGIN_NEEDS_UTMPX])
 	AC_DEFINE([PAM_TTY_KLUDGE])
-	AC_DEFINE([SSHPAM_CHAUTHTOK_NEEDS_RUID], [1],
-		[Define if pam_chauthtok wants real uid set
-		to the unpriv'ed user])
 	AC_DEFINE([LOCKED_PASSWD_STRING], ["*LK*"])
 	# Pushing STREAMS modules will cause sshd to acquire a controlling tty.
 	AC_DEFINE([SSHD_ACQUIRES_CTTY], [1],
@@ -1783,11 +1770,13 @@ dnl create a glob.h shim so we don't have to sprinkle ifdefs everywhere.
 AC_MSG_CHECKING([if we can use the system glob])
 if test "x$use_system_glob" = "xyes" ; then
 	AC_MSG_RESULT([yes])
+	# Remove any old shims.
+	rm -f "$COMPATINCLUDESDIR/glob.h"
 else
 	AC_MSG_RESULT([no])
-	COMPATINCLUDES="openbsd-compat/include"
+	COMPATINCLUDES="$COMPATINCLUDESDIR"
 	mkdir -p "$COMPATINCLUDES"
-	echo '# include "openbsd-compat/glob.h"' >$COMPATINCLUDES/glob.h
+	echo '#include "openbsd-compat/glob.h"' >$COMPATINCLUDES/glob.h
 fi
 
 AC_CHECK_DECL([VIS_ALL], ,
@@ -2225,6 +2214,7 @@ AC_CHECK_FUNCS([ \
 	truncate \
 	unlinkat \
 	unsetenv \
+	unveil \
 	updwtmpx \
 	utimensat \
 	user_from_uid \
@@ -3047,8 +3037,15 @@ nocrypto_saved_LIBS="$LIBS"
 if test "x$openssl" = "xyes" ; then
 	LIBS="-lcrypto $LIBS"
 	CHANNELLIBS="-lcrypto $CHANNELLIBS"
-	AC_TRY_LINK_FUNC([RAND_add], ,
-	    [AC_MSG_ERROR([*** working libcrypto not found, check config.log])])
+	AC_TRY_LINK_FUNC([RAND_add], , [
+	    # As of early 2026, BoringSSL libcrypto needs -lstdc++ for
+	    # destructors so try that before giving up.
+	    LIBS="$LIBS -lstdc++"
+	    CHANNELLIBS="$CHANNELLIBS -lstdc++"
+	    AC_TRY_LINK_FUNC([RAND_add], , [
+		AC_MSG_ERROR([*** working libcrypto not found, check config.log])
+	    ])
+	])
 	AC_CHECK_HEADER([openssl/opensslv.h], ,
 	    [AC_MSG_ERROR([*** OpenSSL headers missing - please install first or check config.log ***])])
 

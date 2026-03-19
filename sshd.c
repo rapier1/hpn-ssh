@@ -1,4 +1,4 @@
-/* $OpenBSD: sshd.c,v 1.625 2026/02/08 15:28:01 dtucker Exp $ */
+/* $OpenBSD: sshd.c,v 1.626 2026/02/09 21:21:39 dtucker Exp $ */
 /*
  * Copyright (c) 2000, 2001, 2002 Markus Friedl.  All rights reserved.
  * Copyright (c) 2002 Niels Provos.  All rights reserved.
@@ -50,12 +50,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
-
-#ifdef WITH_OPENSSL
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-#include "openbsd-compat/openssl-compat.h"
-#endif
 
 #ifdef HAVE_SECUREWARE
 #include <sys/security.h>
@@ -941,7 +935,6 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s,
 	struct early_child *child;
 	struct sshbuf *buf;
 	socklen_t fromlen;
-	u_char rnd[256];
 	sigset_t nsigset, osigset;
 
 	/* pipes connected to unauthenticated child sshd processes */
@@ -1238,14 +1231,7 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s,
 			 * Ensure that our random state differs
 			 * from that of the child
 			 */
-			arc4random_stir();
-			arc4random_buf(rnd, sizeof(rnd));
-#ifdef WITH_OPENSSL
-			RAND_seed(rnd, sizeof(rnd));
-			if ((RAND_bytes((u_char *)rnd, 1)) != 1)
-				fatal_f("RAND_bytes failed");
-#endif
-			explicit_bzero(rnd, sizeof(rnd));
+			reseed_prngs();
 		}
 	}
 }
