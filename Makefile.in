@@ -371,6 +371,11 @@ clean:	regressclean
 	rm -f regress/ecdsa-sha2-*
 	rm -f regress/host.sk-ecdsa-sha2-nistp256@openssh.com
 	rm -f regress/misc/ssh-verify-attestation/ssh-verify-attestation$(EXEEXT)
+	rm -f regress/dbclient.log
+	rm -f regress/finished.?
+	rm -f regress/ssh-proxy.sh
+	rm -rf regress/.ssh
+	rm -f regress/ssh_proxy.sh
 	rm -f regress/misc/ssh-verify-attestation/*.o
 	(cd openbsd-compat && $(MAKE) clean)
 
