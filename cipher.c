@@ -582,10 +582,12 @@ cipher_free(struct sshcipher_ctx *cc)
 	 * the ctx it is a part of it doesn't get freed. So...
 	 * cjr 2/7/2023
 	 */
+#if !defined(WITH_OPENSSL3)
 	if (cc->meth_ptr != NULL) {
 		EVP_CIPHER_meth_free((void *)(EVP_CIPHER *)cc->meth_ptr);
 		cc->meth_ptr = NULL;
 	}
+#endif
 #endif
 	freezero(cc, sizeof(*cc));
 }
