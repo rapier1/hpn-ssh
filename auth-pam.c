@@ -1015,6 +1015,14 @@ sshpam_free_ctx(void *ctxtp)
 	 */
 }
 
+int
+sshpam_priv_kbdint_authdone(void *ctxtp)
+{
+	struct pam_ctxt *ctxt = ctxtp;
+
+	return ctxt->pam_done == SshPamAuthenticated;
+}
+
 KbdintDevice sshpam_device = {
 	"pam",
 	sshpam_init_ctx,

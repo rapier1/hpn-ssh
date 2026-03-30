@@ -1,4 +1,4 @@
-/* $OpenBSD: monitor.c,v 1.254 2026/03/11 09:10:59 dtucker Exp $ */
+/* $OpenBSD: monitor.c,v 1.255 2026/03/28 05:06:16 djm Exp $ */
 /*
  * Copyright 2002 Niels Provos <provos@citi.umich.edu>
  * Copyright 2002 Markus Friedl <markus@openbsd.org>
@@ -689,7 +689,6 @@ mm_answer_moduli(struct ssh *ssh, int sock, struct sshbuf *m)
 	if (dh == NULL) {
 		if ((r = sshbuf_put_u8(m, 0)) != 0)
 			fatal_fr(r, "assemble empty");
-		return (0);
 	} else {
 		/* Send first bignum */
 		DH_get0_pqg(dh, &dh_p, NULL, &dh_g);
@@ -1205,7 +1204,7 @@ mm_answer_pam_query(struct ssh *ssh, int sock, struct sshbuf *m)
 		fatal_f("no context");
 	ret = (sshpam_device.query)(sshpam_ctxt, &name, &info,
 	    &num, &prompts, &echo_on);
-	if (ret == 0 && num == 0)
+	if (ret == 0 && num == 0 && sshpam_priv_kbdint_authdone(sshpam_ctxt))
 		sshpam_authok = sshpam_ctxt;
 	if (num > 1 || name == NULL || info == NULL)
 		fatal("sshpam_device.query failed");

@@ -604,6 +604,10 @@ struct winsize {
 # define __nonnull__(x)
 #endif
 
+#if !defined(HAVE_ATTRIBUTE__NONSTRING__) && !defined(__nonstring__)
+# define __nonstring__
+#endif
+
 #ifndef OSSH_ALIGNBYTES
 #define OSSH_ALIGNBYTES	(sizeof(int) - 1)
 #endif

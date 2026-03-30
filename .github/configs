@@ -208,10 +208,14 @@ case "$config" in
 	LIBCRYPTOFLAGS="--without-openssl"
 	TEST_TARGET=t-exec
 	;;
-    valgrind-[1-7]|valgrind-unit)
+    valgrind-[1-7]|valgrind-unit|valgrind-pam-1)
 	# rlimit sandbox and FORTIFY_SOURCE confuse Valgrind.
 	CONFIGFLAGS="--without-sandbox --without-hardening"
 	CONFIGFLAGS="$CONFIGFLAGS --with-cppflags=-D_FORTIFY_SOURCE=0"
+	if [ "${config}" = "valgrind-pam-1" ]; then
+		CONFIGFLAGS="$CONFIGFLAGS --with-pam"
+		SSHD_CONFOPTS="UsePam yes"
+	fi
 	TEST_TARGET="t-exec USE_VALGRIND=1"
 	TEST_SSH_ELAPSED_TIMES=1
 	export TEST_SSH_ELAPSED_TIMES
@@ -225,7 +229,7 @@ case "$config" in
 	tests6="agent-restrict kextype sftp"
 	tests7="kextype sftp-perm keygen-comment percent"
 	case "$config" in
-	    valgrind-1)
+	    valgrind-1|valgrind-pam)
 		# All tests except agent-timeout (which is flaky under valgrind),
 		# connection-timeout (which doesn't work since it's so slow)
 		# and hostbased (since valgrind won't let ssh exec keysign).

@@ -358,6 +358,19 @@ AC_COMPILE_IFELSE(
     [ AC_MSG_RESULT([no]) ]
 )
 
+saved_CFLAGS="$CFLAGS"
+CFLAGS="$CFLAGS -Werror"
+AC_MSG_CHECKING([if compiler supports __nonstring__ attribute on char arrays])
+AC_COMPILE_IFELSE(
+    [AC_LANG_PROGRAM([[#include <stdlib.h>]],
+    [[ char __attribute__ ((__nonstring__)) h[5] = "hello"; return h[0]!='h'; ]])],
+    [ AC_MSG_RESULT([yes])
+      AC_DEFINE(HAVE_ATTRIBUTE__NONSTRING__, [1],
+	 [compiler supports nonstring attribute]) ],
+    [ AC_MSG_RESULT([no]) ]
+)
+CFLAGS="$saved_CFLAGS"
+
 if test "x$no_attrib_nonnull" != "x1" ; then
 	AC_DEFINE([HAVE_ATTRIBUTE__NONNULL__], [1], [Have attribute nonnull])
 fi
