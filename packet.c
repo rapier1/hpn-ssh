@@ -85,6 +85,7 @@
 #include "mac.h"
 #include "log.h"
 #include "canohost.h"
+#include "channels.h"
 #include "misc.h"
 #include "packet.h"
 #include "ssherr.h"
