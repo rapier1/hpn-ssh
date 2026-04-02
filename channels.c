@@ -2233,8 +2233,6 @@ channel_post_connecting(struct ssh *ssh, Channel *c)
 static int
 channel_handle_rfd(struct ssh *ssh, Channel *c)
 {
-	char buf[CHAN_RBUF];
-	ssize_t len;
 	int r, force;
 	size_t nr = 0, have, avail, maxlen = CHANNEL_MAX_READ;
 	int pty_zeroread = 0;
@@ -2278,6 +2276,30 @@ channel_handle_rfd(struct ssh *ssh, Channel *c)
 		return 1;
 	}
 
+	/*
+	 * Datagram or filtered channel path: needs a temporary stack buffer
+	 * because the data must pass through input_filter() or be framed as
+	 * a datagram before entering c->input.
+	 *
+	 * buf[] (CHAN_RBUF = 32KB) is declared in this inner scope rather
+	 * than at function level to avoid a performance penalty from
+	 * -ftrivial-auto-var-init=zero, which causes the compiler to emit
+	 * a memset() for every local variable on function entry.  With buf
+	 * at function scope the 32KB zeroing happens on every call, even
+	 * though the simple-channel fast path above (the common case for
+	 * bulk data) never touches buf.  CPU profiling showed this dead
+	 * zeroing consuming ~10% of client CPU during high-throughput
+	 * transfers.  Moving buf into this scope limits the zeroing to
+	 * calls that actually take the datagram/filter path.
+	 *
+	 * Security note: buf is still zeroed by the compiler before use in
+	 * this path.  The simple-channel path never allocates buf at all,
+	 * so there is no uninitialized memory exposure.
+	 */
+	{
+	char buf[CHAN_RBUF];
+	ssize_t len;
+
 	errno = 0;
 	len = read(c->rfd, buf, sizeof(buf));
 	/* fixup AIX zero-length read with errno set to look more like errors */
@@ -2290,15 +2312,7 @@ channel_handle_rfd(struct ssh *ssh, Channel *c)
 		debug2("channel %d: read<=0 rfd %d len %zd: %s",
 		    c->self, c->rfd, len,
 		    len == 0 ? "closed" : strerror(errno));
- rfail:
-		if (c->type != SSH_CHANNEL_OPEN) {
-			debug2("channel %d: not open", c->self);
-			chan_mark_dead(ssh, c);
-			return -1;
-		} else {
-			chan_read_failed(ssh, c);
-		}
-		return -1;
+		goto rfail;
 	}
 	channel_set_used_time(ssh, c);
 	if (c->input_filter != NULL) {
@@ -2313,6 +2327,17 @@ channel_handle_rfd(struct ssh *ssh, Channel *c)
 		fatal_fr(r, "channel %i: put data", c->self);
 
 	return 1;
+	} /* end datagram/filter buf[] scope */
+
+ rfail:
+	if (c->type != SSH_CHANNEL_OPEN) {
+		debug2("channel %d: not open", c->self);
+		chan_mark_dead(ssh, c);
+		return -1;
+	} else {
+		chan_read_failed(ssh, c);
+	}
+	return -1;
 }
 
 static int
