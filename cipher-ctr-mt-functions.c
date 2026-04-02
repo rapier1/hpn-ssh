@@ -579,7 +579,8 @@ int aes_mt_do_cipher(void *vevp_ctx,
 	int ridx;
 	u_char *buf;
 	EVP_CIPHER_CTX *evp_ctx = vevp_ctx;
-
+	uint64_t src_a, key_a;
+	
 	if (len == 0)
 		return 1;
 
@@ -622,11 +623,20 @@ int aes_mt_do_cipher(void *vevp_ctx,
 		/* this is causing undefined behaviour in sanitizers
 		 * this is annoying because it's more efficient
 		 * but UB is not something I want to retain */
-		/* if ((align & 0x7) == 0) { */
-		/* 	destp.u64[0] = srcp.u64[0] ^ bufp.u64[0]; */
-		/* 	destp.u64[1] = srcp.u64[1] ^ bufp.u64[1]; */
-		/* /\* 32 bits *\/ */
-		/* } else */
+		if ((align & 0x7) == 0) {
+			/* this should resolve the strict aliasing UB
+			 * and the performance doesn't seem to change much
+			 * but the memcpys are killing me 3-5-26 cjr*/
+			memcpy(&src_a, &srcp.u64[0], sizeof(uint64_t));
+			memcpy(&key_a, &bufp.u64[0], sizeof(uint64_t));
+			destp.u64[0] = src_a ^ key_a;
+			memcpy(&src_a, &srcp.u64[1], sizeof(uint64_t));
+			memcpy(&key_a, &bufp.u64[1], sizeof(uint64_t));
+			destp.u64[1] = src_a ^ key_a;
+			/* destp.u64[0] = srcp.u64[0] ^ bufp.u64[0]; */
+			/* destp.u64[1] = srcp.u64[1] ^ bufp.u64[1]; */
+                /* 32 bits */
+		} else
 		if ((align & 0x3) == 0) {
 			destp.u32[0] = srcp.u32[0] ^ bufp.u32[0];
 			destp.u32[1] = srcp.u32[1] ^ bufp.u32[1];
