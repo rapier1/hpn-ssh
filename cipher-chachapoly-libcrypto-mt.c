@@ -420,21 +420,6 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 	return NULL;
 }
 
-static inline void
-fastXOR(u_char *dest, const u_char *src, const u_char *keystream, u_int len)
-{
-
-	/* XXX: this was __uint128_t but that was causing unaligned load errors.
-	 * this works but we need to explore it more. */
-	typedef uint32_t chunk;
-	size_t i;
-
-	for (i=0; i < (len / sizeof(chunk)); i++)
-		((chunk *)dest)[i]=((chunk *)src)[i]^((chunk *)keystream)[i];
-	for (i=i*(sizeof(chunk) / sizeof(char)); i < len; i++)
-		dest[i]=src[i]^keystream[i];
-}
-
 /* Portable FastXOR using memcpy to avoid strict-aliasing and alignment UB.
  * Uses 128-bit chunks on compilers that support __uint128_t (GCC/Clang on
  * 64-bit platforms), falls back to uint64_t elsewhere. */

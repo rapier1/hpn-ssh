@@ -136,26 +136,33 @@ compat_banner(struct ssh *ssh, const char *version)
 			if (strstr(version, "OpenSSH") != NULL) {
 				/* check if the remote is hpn and if the version
 				 * uses hpn prefixed binaries */
-				const char *op;
+				const char *op, *np;
 				if ((op = strstr(version, "hpn")) != NULL) {
-					int hpnver = 0;
+					long hpnver;
+					char *ep;
 					ssh->compat |= SSH_HPNSSH;
 					debug("Remote is HPN enabled");
-					if (sscanf(op, "hpn%d", &hpnver) == 1 &&
-					    hpnver >= 16) {
+					np = op + strlen("hpn");
+					hpnver = strtol(np, &ep, 10);
+					if (ep != np && hpnver >= 16) {
 						ssh->compat |= SSH_HPNSSH_PREFIX;
 						debug("Remote uses HPNSSH prefixes.");
 					}
 				}
 				/* Restrict advertised window for non-HPN OpenSSH >= 8.9. */
 				if (!(ssh->compat & SSH_HPNSSH)) {
-					const char *op;
-					int omaj = 0, omin = 0;
-					if ((op = strstr(version, "OpenSSH_")) != NULL &&
-					    sscanf(op, "OpenSSH_%d.%d", &omaj, &omin) == 2 &&
-					    (omaj >= 9 || (omaj == 8 && omin >= 9))) {
-						ssh->compat |= SSH_RESTRICT_WINDOW;
-						debug("Restricting advertised window size.");
+					if ((op = strstr(version, "OpenSSH_")) != NULL) {
+						long omaj, omin;
+						char *ep;
+						np = op + strlen("OpenSSH_");
+						omaj = strtol(np, &ep, 10);
+						if (ep != np && *ep == '.') {
+							omin = strtol(ep + 1, &ep, 10);
+							if (omaj >= 9 || (omaj == 8 && omin >= 9)) {
+								ssh->compat |= SSH_RESTRICT_WINDOW;
+								debug("Restricting advertised window size.");
+							}
+						}
 					}
 				}
 			}
