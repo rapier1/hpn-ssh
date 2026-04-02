@@ -135,16 +135,19 @@ compat_banner(struct ssh *ssh, const char *version)
 			/* TODO: See if we can work this into the new method for bug checks */
 			if (strstr(version, "OpenSSH") != NULL) {
 				/* check if the remote is hpn and if the version
-				 * uses hpn prefixed binaries */
-				const char *op, *np;
+				 * uses hpn prefixed binaries.
+				 * Parse version numbers by hand to avoid
+				 * sscanf/strtol whose ASAN interceptors
+				 * can over-read short heap buffers. */
+				const char *op, *p;
+				int val;
 				if ((op = strstr(version, "hpn")) != NULL) {
-					long hpnver;
-					char *ep;
 					ssh->compat |= SSH_HPNSSH;
 					debug("Remote is HPN enabled");
-					np = op + strlen("hpn");
-					hpnver = strtol(np, &ep, 10);
-					if (ep != np && hpnver >= 16) {
+					p = op + 3; /* skip "hpn" */
+					for (val = 0; *p >= '0' && *p <= '9'; p++)
+						val = val * 10 + (*p - '0');
+					if (p != op + 3 && val >= 16) {
 						ssh->compat |= SSH_HPNSSH_PREFIX;
 						debug("Remote uses HPNSSH prefixes.");
 					}
@@ -152,12 +155,14 @@ compat_banner(struct ssh *ssh, const char *version)
 				/* Restrict advertised window for non-HPN OpenSSH >= 8.9. */
 				if (!(ssh->compat & SSH_HPNSSH)) {
 					if ((op = strstr(version, "OpenSSH_")) != NULL) {
-						long omaj, omin;
-						char *ep;
-						np = op + strlen("OpenSSH_");
-						omaj = strtol(np, &ep, 10);
-						if (ep != np && *ep == '.') {
-							omin = strtol(ep + 1, &ep, 10);
+						int omaj = 0, omin = 0;
+						p = op + 8; /* skip "OpenSSH_" */
+						for (; *p >= '0' && *p <= '9'; p++)
+							omaj = omaj * 10 + (*p - '0');
+						if (p != op + 8 && *p == '.') {
+							p++;
+							for (; *p >= '0' && *p <= '9'; p++)
+								omin = omin * 10 + (*p - '0');
 							if (omaj >= 9 || (omaj == 8 && omin >= 9)) {
 								ssh->compat |= SSH_RESTRICT_WINDOW;
 								debug("Restricting advertised window size.");
