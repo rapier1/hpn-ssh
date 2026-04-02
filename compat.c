@@ -29,6 +29,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdarg.h>
 
 #include "xmalloc.h"
@@ -131,54 +132,33 @@ compat_banner(struct ssh *ssh, const char *version)
 			debug_f("match: %s pat %s compat 0x%08x",
 			    version, check[i].pat, check[i].bugs);
 			ssh->compat = check[i].bugs;
-			/* Check to see if the remote side is OpenSSH and not HPN.
-		 * Copy version to a stack buffer so all string
-		 * operations work on well-padded memory and avoid
-		 * ASAN interceptor over-reads on small heap buffers. */
-			{
-				char vbuf[256];
-				const char *op, *p;
-				size_t vlen;
-
-				for (vlen = 0; vlen < sizeof(vbuf) - 1 &&
-				    version[vlen] != '\0'; vlen++)
-					vbuf[vlen] = version[vlen];
-				vbuf[vlen] = '\0';
-
-			if (strstr(vbuf, "OpenSSH") != NULL) {
+			/* Check to see if the remote side is OpenSSH and not HPN */
+			/* TODO: See if we can work this into the new method for bug checks */
+			if (strstr(version, "OpenSSH") != NULL) {
 				/* check if the remote is hpn and if the version
 				 * uses hpn prefixed binaries */
-				if ((op = strstr(vbuf, "hpn")) != NULL) {
-					int val;
+				const char *op;
+				if ((op = strstr(version, "hpn")) != NULL) {
+					int hpnver = 0;
 					ssh->compat |= SSH_HPNSSH;
 					debug("Remote is HPN enabled");
-					p = op + 3; /* skip "hpn" */
-					for (val = 0; *p >= '0' && *p <= '9'; p++)
-						val = val * 10 + (*p - '0');
-					if (p != op + 3 && val >= 16) {
+					if (sscanf(op, "hpn%d", &hpnver) == 1 &&
+					    hpnver >= 16) {
 						ssh->compat |= SSH_HPNSSH_PREFIX;
 						debug("Remote uses HPNSSH prefixes.");
 					}
 				}
 				/* Restrict advertised window for non-HPN OpenSSH >= 8.9. */
 				if (!(ssh->compat & SSH_HPNSSH)) {
-					if ((op = strstr(vbuf, "OpenSSH_")) != NULL) {
-						int omaj = 0, omin = 0;
-						p = op + 8; /* skip "OpenSSH_" */
-						for (; *p >= '0' && *p <= '9'; p++)
-							omaj = omaj * 10 + (*p - '0');
-						if (p != op + 8 && *p == '.') {
-							p++;
-							for (; *p >= '0' && *p <= '9'; p++)
-								omin = omin * 10 + (*p - '0');
-							if (omaj >= 9 || (omaj == 8 && omin >= 9)) {
-								ssh->compat |= SSH_RESTRICT_WINDOW;
-								debug("Restricting advertised window size.");
-							}
-						}
+					const char *op;
+					int omaj = 0, omin = 0;
+					if ((op = strstr(version, "OpenSSH_")) != NULL &&
+					    sscanf(op, "OpenSSH_%d.%d", &omaj, &omin) == 2 &&
+					    (omaj >= 9 || (omaj == 8 && omin >= 9))) {
+						ssh->compat |= SSH_RESTRICT_WINDOW;
+						debug("Restricting advertised window size.");
 					}
 				}
-			}
 			}
 			debug("ssh->compat is %u", ssh->compat);
 			return;
