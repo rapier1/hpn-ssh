@@ -1348,22 +1348,31 @@ channel_tcpwinsz(struct ssh *ssh)
 	u_int32_t tcpwinsz = 0;
 	socklen_t optsz = sizeof(tcpwinsz);
 	int ret = -1;
-
+	
 	/* if we aren't on a socket return 128KB */
 	if (!ssh_packet_connection_is_on_socket(ssh))
 		return 128 * 1024;
 
+	/* get the current size of the receive buffer */
 	ret = getsockopt(ssh_packet_get_connection_in(ssh),
 			 SOL_SOCKET, SO_RCVBUF, &tcpwinsz, &optsz);
-	/* return no more than SSHBUF_SIZE_MAX (currently 256MB) */
-	if ((ret == 0) && tcpwinsz > SSHBUF_SIZE_MAX)
+
+	/* error on the socket - this should never happen */
+	/* return OpenSSH's max window size */
+	if (ret != 0) {
+		debug_f("getsockopt SO_RCVBUF failed: %s", strerror(errno));
+		return (2 * 1024 * 1024);
+	}
+	
+	/* return no more than SSHBUF_SIZE_MAX (currently 128MB) */
+	if (tcpwinsz > SSHBUF_SIZE_MAX)
 		tcpwinsz = SSHBUF_SIZE_MAX;
+
 	/* if the remote side is OpenSSH after version 8.8 we need to restrict
 	 * the size of the advertised window. Now this means that any HPN to non-HPN
 	 * connection will be window limited to 15MB of receive space. This is a
 	 * non-optimal solution.
 	 */
-
 	if ((ssh->compat & SSH_RESTRICT_WINDOW) && (tcpwinsz > NON_HPN_WINDOW_MAX))
 		tcpwinsz = NON_HPN_WINDOW_MAX;
 	return (tcpwinsz);
