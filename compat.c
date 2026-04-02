@@ -131,17 +131,25 @@ compat_banner(struct ssh *ssh, const char *version)
 			debug_f("match: %s pat %s compat 0x%08x",
 			    version, check[i].pat, check[i].bugs);
 			ssh->compat = check[i].bugs;
-			/* Check to see if the remote side is OpenSSH and not HPN */
-			/* TODO: See if we can work this into the new method for bug checks */
-			if (strstr(version, "OpenSSH") != NULL) {
-				/* check if the remote is hpn and if the version
-				 * uses hpn prefixed binaries.
-				 * Parse version numbers by hand to avoid
-				 * sscanf/strtol whose ASAN interceptors
-				 * can over-read short heap buffers. */
+			/* Check to see if the remote side is OpenSSH and not HPN.
+		 * Copy version to a stack buffer so all string
+		 * operations work on well-padded memory and avoid
+		 * ASAN interceptor over-reads on small heap buffers. */
+			{
+				char vbuf[256];
 				const char *op, *p;
-				int val;
-				if ((op = strstr(version, "hpn")) != NULL) {
+				size_t vlen;
+
+				for (vlen = 0; vlen < sizeof(vbuf) - 1 &&
+				    version[vlen] != '\0'; vlen++)
+					vbuf[vlen] = version[vlen];
+				vbuf[vlen] = '\0';
+
+			if (strstr(vbuf, "OpenSSH") != NULL) {
+				/* check if the remote is hpn and if the version
+				 * uses hpn prefixed binaries */
+				if ((op = strstr(vbuf, "hpn")) != NULL) {
+					int val;
 					ssh->compat |= SSH_HPNSSH;
 					debug("Remote is HPN enabled");
 					p = op + 3; /* skip "hpn" */
@@ -154,7 +162,7 @@ compat_banner(struct ssh *ssh, const char *version)
 				}
 				/* Restrict advertised window for non-HPN OpenSSH >= 8.9. */
 				if (!(ssh->compat & SSH_HPNSSH)) {
-					if ((op = strstr(version, "OpenSSH_")) != NULL) {
+					if ((op = strstr(vbuf, "OpenSSH_")) != NULL) {
 						int omaj = 0, omin = 0;
 						p = op + 8; /* skip "OpenSSH_" */
 						for (; *p >= '0' && *p <= '9'; p++)
@@ -170,6 +178,7 @@ compat_banner(struct ssh *ssh, const char *version)
 						}
 					}
 				}
+			}
 			}
 			debug("ssh->compat is %u", ssh->compat);
 			return;
