@@ -2281,7 +2281,6 @@ ssh_session2_open(struct ssh *ssh)
 	    window, packetmax, CHAN_EXTENDED_WRITE,
 	    "client-session", CHANNEL_NONBLOCK_STDIO);
 
-	/* TODO: Is this the right place for these options? */
 	if (options.tcp_rcv_buf_poll > 0 && !options.hpn_disabled) {
 		c->dynamic_window = 1;
 		debug("Enabled Dynamic Window Scaling");
