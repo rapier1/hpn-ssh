@@ -594,10 +594,18 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 		if (r != SSH_ERR_MAC_INVALID) {
 			/* Crypt additional data (i.e., packet length) */
 			/* TODO: is aadlen always four bytes? */
+			/* For chachapoly yes. It is always 4 bytes -cjr */
 			/* TODO: do we always have an aadlen? */
-			if (aadlen)
+			/* chachapoly will always have aadlen but cipher_crypt()
+			 * does not *require* that aadlen be set. However
+			 * chachapoly won't function without it -cjr */
+			/*if (aadlen)
 				for (u_int i=0; i<aadlen; i++)
-					dest[i] = ks->headerStream[i] ^ src[i];
+				dest[i] = ks->headerStream[i] ^ src[i]; */
+			/* the first 4 bytes are the aadlen */
+			*(uint32_t *)dest =
+				*(const uint32_t *)ks->headerStream ^
+				*(const uint32_t *)src;
 			/* Crypt payload */
 			fastXOR2(dest+aadlen,src+aadlen,ks->mainStream,len);
 			/* calculate and append tag */
