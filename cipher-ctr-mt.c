@@ -456,30 +456,30 @@ ssh_aes_ctr(EVP_CIPHER_CTX *ctx, u_char *dest, const u_char *src,
 		align = destp.u | srcp.u | bufp.u;
 #endif
 
-		/* xor the src against the key (buf)
-		 * different systems can do all 16 bytes at once or
-		 * may need to do it in 8 or 4 bytes chunks
-		 * worst case is doing it as a loop */
+		/* XOR src against keystream (buf). Use memcpy to
+		 * avoid strict aliasing UB when type-punning through
+		 * wider integer types. The compiler optimizes these
+		 * fixed-size memcpys into register loads. */
 #ifdef CIPHER_INT128_OK
-		/* with GCC 13 we have having consistent seg faults
-		 * in this section of code. Since this is a critical
-		 * code path we are removing this until we have a solution
-		 * in place -cjr 02/22/24
-		 * TODO: FIX THIS
-		 */
-		/* if ((align & 0xf) == 0) { */
-		/* 	destp.u128[0] = srcp.u128[0] ^ bufp.u128[0]; */
-		/* } else */
+		if ((align & 0xf) == 0) {
+			__uint128_t s128, k128, d128;
+			memcpy(&s128, srcp.u8, sizeof(s128));
+			memcpy(&k128, bufp.u8, sizeof(k128));
+			d128 = s128 ^ k128;
+			memcpy(destp.u8, &d128, sizeof(d128));
+		} else
 #endif
-		/* this is causing undefined behaviour in sanitizers
-		 * this is annoying because it's more efficient
-		 * but UB is not something I want to retain */
-		/* 64 bits */
-		/* if ((align & 0x7) == 0) { */
-		/* 	destp.u64[0] = srcp.u64[0] ^ bufp.u64[0]; */
-		/* 	destp.u64[1] = srcp.u64[1] ^ bufp.u64[1]; */
-		/* /\* 32 bits *\/ */
-		/* } else */
+		if ((align & 0x7) == 0) {
+			uint64_t src_a, key_a, dst_a;
+			memcpy(&src_a, srcp.u8, sizeof(uint64_t));
+			memcpy(&key_a, bufp.u8, sizeof(uint64_t));
+			dst_a = src_a ^ key_a;
+			memcpy(destp.u8, &dst_a, sizeof(uint64_t));
+			memcpy(&src_a, srcp.u8 + 8, sizeof(uint64_t));
+			memcpy(&key_a, bufp.u8 + 8, sizeof(uint64_t));
+			dst_a = src_a ^ key_a;
+			memcpy(destp.u8 + 8, &dst_a, sizeof(uint64_t));
+		} else
 		if ((align & 0x3) == 0) {
 			destp.u32[0] = srcp.u32[0] ^ bufp.u32[0];
 			destp.u32[1] = srcp.u32[1] ^ bufp.u32[1];
