@@ -665,6 +665,8 @@ const EVP_CIPHER *
 evp_aes_ctr_mt(void)
 {
 	static EVP_CIPHER *aes_ctr;
+	if (aes_ctr != NULL)
+		return aes_ctr;
 	aes_ctr = EVP_CIPHER_meth_new(NID_undef, 16/*block*/, 16/*key*/);
 	EVP_CIPHER_meth_set_iv_length(aes_ctr, AES_BLOCK_SIZE);
 	EVP_CIPHER_meth_set_init(aes_ctr, ssh_aes_ctr_init);

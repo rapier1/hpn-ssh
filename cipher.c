@@ -71,7 +71,6 @@ struct sshcipher_ctx {
 	int	plaintext;
 	int	encrypt;
 	EVP_CIPHER_CTX *evp;
-	const EVP_CIPHER *meth_ptr; /*used to free memory in aes_ctr_mt */
 	struct chachapoly_ctx *cp_ctx;
 #ifdef WITH_OPENSSL
 	struct chachapoly_ctx_mt *cp_ctx_mt;
@@ -324,7 +323,6 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 
 	cc->plaintext = (cipher->flags & CFLAG_NONE) != 0;
 	cc->encrypt = do_encrypt;
-	cc->meth_ptr = NULL;
 
 	if (keylen < cipher->key_len ||
 	    (iv != NULL && ivlen < cipher_ivlen(cipher))) {
@@ -407,12 +405,6 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 		}
 #else
 		type = (*evp_aes_ctr_mt)(); /* see cipher-ctr-mt.c */
-		/* we need to free this later if using aes_ctr_mt
-		 * under OSSL 1.1. Honestly, we could avoid this by making
-		 * it a global in cipher-ctr_mt.c and exporting it here
-		 * then we'd only have to call EVP_CIPHER_meth once but this
-		 * works for now. TODO: This. cjr 02.22.2023 */
-		cc->meth_ptr = type;
 #endif /* WITH_OPENSSL3 */
 	} /* if (strstr()) */
 	if (EVP_CipherInit(cc->evp, type, NULL, (u_char *)iv,
@@ -576,18 +568,8 @@ cipher_free(struct sshcipher_ctx *cc)
 #ifdef WITH_OPENSSL
 	EVP_CIPHER_CTX_free(cc->evp);
 	cc->evp = NULL;
-	/* if meth_ptr isn't null then we are using the aes_ctr_mt
-	 * evp_cipher_meth_new() in cipher-ctr-mt.c under OSSL 1.1
-	 * if we don't explicitly free it then, even though we free
-	 * the ctx it is a part of it doesn't get freed. So...
-	 * cjr 2/7/2023
-	 */
-#if !defined(WITH_OPENSSL3)
-	if (cc->meth_ptr != NULL) {
-		EVP_CIPHER_meth_free((void *)(EVP_CIPHER *)cc->meth_ptr);
-		cc->meth_ptr = NULL;
-	}
-#endif
+	/* aes_ctr_mt EVP_CIPHER is a singleton in cipher-ctr-mt.c,
+	 * no per-connection free needed. */
 #endif
 	freezero(cc, sizeof(*cc));
 }
