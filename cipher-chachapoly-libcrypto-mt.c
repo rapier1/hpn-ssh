@@ -17,6 +17,7 @@
  */
 
 /* TODO: audit includes */
+/* audited removed stdarg.h and stdio.h */
 
 #include "includes.h"
 #ifdef WITH_OPENSSL
@@ -27,9 +28,7 @@
 
 #include <sys/types.h>
 #include <unistd.h> /* needed for getpid under C99 */
-#include <stdarg.h> /* needed for log.h */
 #include <string.h>
-#include <stdio.h>  /* needed for misc.h */
 #include <pthread.h>
 
 #include <openssl/evp.h>
