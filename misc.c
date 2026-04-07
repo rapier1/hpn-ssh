@@ -93,6 +93,7 @@ fips_enabled()
 	fips_enabled = fopen(fips_path, "r");
 	if (!fips_enabled) {
 		debug3_f("Cannot open path to fips_enabled.");
+		fclose(fips_enabled);
 		return 0;
 	}
 
@@ -104,6 +105,7 @@ fips_enabled()
 		 * again fail to returning fips being disabled
 		 */
 		debug3_f("Error processing fips_enabled.");
+		fclose(fips_enabled);
 		return 0;
 	}
 
@@ -113,6 +115,7 @@ fips_enabled()
 	else
 		debug3_f("FIPS mode is enabled.");
 
+	fclose(fips_enabled);
 	return mode;
 }
 
