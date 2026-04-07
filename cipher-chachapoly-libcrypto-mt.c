@@ -60,7 +60,7 @@
 /* Number of worker threads to spawn. */
 /* the goal is to ensure that main is never
  * waiting on the worker threads for keystream data */
-#define NUMTHREADS 4
+#define NUMTHREADS 1
 
 /* 64 seems to be a pretty good balance between memory and performance
  * 128 is another option with somewhat higher memory consumption */
