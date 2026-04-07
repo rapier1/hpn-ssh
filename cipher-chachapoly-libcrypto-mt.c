@@ -587,9 +587,11 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 		  for (u_int i=0; i<aadlen; i++)
 		  dest[i] = ks->headerStream[i] ^ src[i]; */
 		/* the first 4 bytes are the aadlen */
-		*(uint32_t *)dest =
-			*(const uint32_t *)ks->headerStream ^
-			*(const uint32_t *)src;
+		uint32_t aad_src, aad_key, aad_dst;
+		memcpy(&aad_src, src, sizeof(uint32_t));
+		memcpy(&aad_key, ks->headerStream, sizeof(uint32_t));
+		aad_dst = aad_src ^ aad_key;
+		memcpy(dest, &aad_dst, sizeof(uint32_t));
 		/* Crypt payload */
 		fastXOR2(dest+aadlen,src+aadlen,ks->mainStream,len);
 		/* calculate and append tag */
