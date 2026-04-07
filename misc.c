@@ -93,7 +93,6 @@ fips_enabled()
 	fips_enabled = fopen(fips_path, "r");
 	if (!fips_enabled) {
 		debug3_f("Cannot open path to fips_enabled.");
-		fclose(fips_enabled);
 		return 0;
 	}
 
