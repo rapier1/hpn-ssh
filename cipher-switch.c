@@ -46,8 +46,11 @@ cipher_switch(struct ssh *ssh) {
 	const char *send = cipher_ctx_name(send_cc);
 	const char *recv = cipher_ctx_name(recv_cc);
 
+	if (send == NULL || recv == NULL)
+		fatal_f("Could not get cipher context name!");
+
 	debug_f("Send: %s Recv: %s", send, recv);
-	
+
 	/* if the name of the cipher matches then we set the context
 	 * to authenticated (it likely already is though) and then
 	 * force the rekey. Either side can do this. One downside of

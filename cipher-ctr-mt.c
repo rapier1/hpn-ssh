@@ -252,9 +252,9 @@ stop_and_join_pregen_threads(struct ssh_aes_ctr_ctx_mt *c)
 			    c->tid[i]);
 		else {
 			debug_f ("Joining %lu (%lu, %d)", c->tid[i], c->struct_id, c->id[i]);
+			pthread_join(c->tid[i], NULL);
 			pthread_mutex_destroy(&c->q[i].lock);
 			pthread_cond_destroy(&c->q[i].cond);
-			pthread_join(c->tid[i], NULL);
 			/* this finds the entry in the hash that corresponding to the
 			 * thread id. That's used to find the pointer to the cipher struct
 			 * created in thread_loop. */
