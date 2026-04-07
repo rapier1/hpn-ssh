@@ -60,7 +60,7 @@
 /* Number of worker threads to spawn. */
 /* the goal is to ensure that main is never
  * waiting on the worker threads for keystream data */
-#define NUMTHREADS 1
+#define NUMTHREADS 4
 
 /* 64 seems to be a pretty good balance between memory and performance
  * 128 is another option with somewhat higher memory consumption */
@@ -354,7 +354,7 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 		for (tDataI--; tDataI >= 0; tDataI--)
 			free_threadData(&(ctx_mt->batches[1].tds[tDataI]));
 		/* Free the batches[0] tds too */
-		for (tDataI = NUMTHREADS; tDataI >= 0; tDataI--)
+		for (tDataI = NUMTHREADS - 1; tDataI >= 0; tDataI--)
 			free_threadData(&(ctx_mt->batches[0].tds[tDataI]));
 		goto fail;
 	}
