@@ -62,7 +62,7 @@
  * waiting on the worker threads for keystream data */
 #define NUMTHREADS 1
 
-/* 64 seems to be a pretty blance between memory and performance
+/* 64 seems to be a pretty good balance between memory and performance
  * 128 is another option with somewhat higher memory consumption */
 #define NUMSTREAMS 64
 
@@ -562,7 +562,7 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 		ctx_mt->ptaglen = POLY1305_TAGLEN;
 		if (EVP_DigestSignFinal(ctx_mt->md_ctx, expected_tag,
 		    &ctx_mt->ptaglen) == 0) {
-			debug_f("SSL error while finalizing decyrpted poly1305");
+			debug_f("SSL error while finalizing decrypted poly1305");
 			return SSH_ERR_INTERNAL_ERROR;
 		}
 #else
@@ -603,7 +603,7 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 			ctx_mt->ptaglen = POLY1305_TAGLEN;
 			if (EVP_DigestSignFinal(ctx_mt->md_ctx, dest+aadlen+len,
 			    &ctx_mt->ptaglen) == 0) {
-				debug_f("SSL error while finalizing decyrpted poly1305");
+				debug_f("SSL error while finalizing decrypted poly1305");
 				return SSH_ERR_INTERNAL_ERROR;
 			}
 		}

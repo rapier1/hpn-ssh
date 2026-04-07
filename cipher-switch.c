@@ -16,7 +16,7 @@
  */
 
 /* This provides the function to switch from a serial to parallel
- * cipher. This has been moved into it's own file in order to make it
+ * cipher. This has been moved into its own file in order to make it
  * available to both the client and server without having to clutter
  * up other files.
  */
