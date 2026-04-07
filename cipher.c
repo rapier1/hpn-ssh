@@ -373,35 +373,43 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 	 * _meth_new process found in cipher-ctr-mt.c */
 	if (strstr(cc->cipher->name, "ctr") && enable_threads) {
 #ifdef WITH_OPENSSL3
-		/* this version of openssl uses providers */
-		OSSL_LIB_CTX *aes_lib = NULL; /* probably not needed */
-		OSSL_PROVIDER *aes_mt_provider = NULL;
+		/* this version of openssl uses providers.
+		 * Cache the provider and cipher objects as singletons
+		 * so we don't leak on rekey. */
+		static OSSL_LIB_CTX *aes_lib = NULL;
+		static OSSL_PROVIDER *aes_mt_provider = NULL;
+		static EVP_CIPHER *aes_ctr_mt_128 = NULL;
+		static EVP_CIPHER *aes_ctr_mt_192 = NULL;
+		static EVP_CIPHER *aes_ctr_mt_256 = NULL;
 		type = NULL;
 
-		if (OSSL_PROVIDER_add_builtin(aes_lib, "hpnssh",
-					      OSSL_provider_init) != 1) {
-			fatal("Failed to add HPNSSH provider for AES-CTR");
-		}
-		aes_mt_provider = OSSL_PROVIDER_load(aes_lib, "hpnssh");
-
-		if (aes_mt_provider != NULL) {
-			/* use the previous key length to determine which cipher to load */
-			if (cipher->key_len == 32)
-				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_256", NULL);
-			if (cipher->key_len == 24)
-				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_192", NULL);
-			if (cipher->key_len == 16)
-				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_128", NULL);
-			if (type == NULL) {
-				ERR_print_errors_fp(stderr);
-				fatal("FAILED TO LOAD aes_ctr_mt");
-			} else {
-				debug("LOADED aes_ctr_mt");
+		if (aes_mt_provider == NULL) {
+			if (OSSL_PROVIDER_add_builtin(aes_lib, "hpnssh",
+						      OSSL_provider_init) != 1) {
+				fatal("Failed to add HPNSSH provider for AES-CTR");
 			}
+			aes_mt_provider = OSSL_PROVIDER_load(aes_lib, "hpnssh");
+			if (aes_mt_provider == NULL) {
+				ERR_print_errors_fp(stderr);
+				fatal("Failed to load HPN-SSH AES-CTR-MT provider.");
+			}
+			aes_ctr_mt_128 = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_128", NULL);
+			aes_ctr_mt_192 = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_192", NULL);
+			aes_ctr_mt_256 = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_256", NULL);
 		}
-		else {
+
+		if (cipher->key_len == 32)
+			type = aes_ctr_mt_256;
+		else if (cipher->key_len == 24)
+			type = aes_ctr_mt_192;
+		else if (cipher->key_len == 16)
+			type = aes_ctr_mt_128;
+
+		if (type == NULL) {
 			ERR_print_errors_fp(stderr);
-			fatal("Failed to load HPN-SSH AES-CTR-MT provider.");
+			fatal("FAILED TO LOAD aes_ctr_mt");
+		} else {
+			debug("LOADED aes_ctr_mt");
 		}
 #else
 		type = (*evp_aes_ctr_mt)(); /* see cipher-ctr-mt.c */
