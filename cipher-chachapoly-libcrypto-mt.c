@@ -313,6 +313,7 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 		goto fail;
 	if ((ctx_mt->poly_ctx = EVP_MAC_CTX_new(mac)) == NULL)
 		goto fail;
+	EVP_MAC_free(mac); /* no longer needed */
 #elif !defined(WITH_OPENSSL3) && defined(EVP_PKEY_POLY1305)
 	if ((ctx_mt->md_ctx = EVP_MD_CTX_new()) == NULL)
 		goto fail;
@@ -400,6 +401,7 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 
  fail:
 #ifdef OPENSSL_HAVE_POLY_EVP
+	EVP_MAC_free(mac);
 	if (ctx_mt->poly_ctx != NULL) {
 		EVP_MAC_CTX_free(ctx_mt->poly_ctx);
 		ctx_mt->poly_ctx = NULL;
