@@ -471,7 +471,7 @@ manager_thread(struct manager_thread_args * margs) {
 	u_int batchID = oldBatchID + 2;
 
 	pthread_t tid[NUMTHREADS];
-	struct worker_thread_args * wargs = malloc(NUMTHREADS * sizeof(*wargs));
+	struct worker_thread_args * wargs = xmalloc(NUMTHREADS * sizeof(*wargs));
 	int ti;
 
 	for (ti = 0; ti < NUMTHREADS; ti++) {
@@ -621,7 +621,7 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 
 	if (unlikely(ctx_mt->seqnr / NUMSTREAMS > ctx_mt->batchID)) {
 		struct manager_thread_args * args =
-			malloc(sizeof(*args));
+			xmalloc(sizeof(*args));
 		if (args == NULL) {
 			return SSH_ERR_INTERNAL_ERROR;
 		}

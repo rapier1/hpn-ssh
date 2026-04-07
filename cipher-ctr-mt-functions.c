@@ -233,7 +233,7 @@ thread_loop(void *job)
 	 * thread id, which is available to us in the free function.
 	 * Note, the thread id isn't necessary unique across rekeys but
 	 * that's okay as they are unique during a key. */
-	ptr = malloc(sizeof *ptr); /*freed in stop & prejoin */
+	ptr = xmalloc(sizeof *ptr); /*freed in stop & prejoin */
 	ptr->tid = pthread_self(); /* index for hash */
 	ptr->pointer = evp_ctx;
 	HASH_ADD_INT(evp_ptrs, tid, ptr);
@@ -360,7 +360,7 @@ thread_loop(void *job)
  * -cjr 09/08/2022 */
 void *aes_mt_newctx_256(void *provctx)
 {
-	struct aes_mt_ctx_st *aes_mt_ctx = malloc(sizeof(*aes_mt_ctx));
+	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
 	EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
@@ -388,7 +388,7 @@ void *aes_mt_newctx_256(void *provctx)
 
 void *aes_mt_newctx_192(void *provctx)
 {
-	struct aes_mt_ctx_st *aes_mt_ctx = malloc(sizeof(*aes_mt_ctx));
+	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
 	EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
@@ -416,7 +416,7 @@ void *aes_mt_newctx_192(void *provctx)
 
 void *aes_mt_newctx_128(void *provctx)
 {
-	struct aes_mt_ctx_st *aes_mt_ctx = malloc(sizeof(*aes_mt_ctx));
+	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
 	EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
