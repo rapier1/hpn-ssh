@@ -535,7 +535,7 @@ host-key: hpnssh-keygen$(EXEEXT)
 		./hpnssh-keygen -A; \
 	fi
 
-host-key-force: hpnssh-keygen$(EXEEXT) ssh$(EXEEXT)
+host-key-force: hpnssh-keygen$(EXEEXT) hpnssh$(EXEEXT)
 	./hpnssh-keygen -t rsa -f $(DESTDIR)$(sysconfdir)/ssh_host_rsa_key -N ""
 	./hpnssh-keygen -t ed25519 -f $(DESTDIR)$(sysconfdir)/ssh_host_ed25519_key -N ""
 	if ./hpnssh -Q key | grep ecdsa >/dev/null ; then \
