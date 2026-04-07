@@ -2196,17 +2196,21 @@ void
 sshpkt_final_log_entry (struct ssh *ssh) {
 	double total_time;
 
-	if (ssh->start_time < 1)
-		/* this will produce a NaN in the output. -cjr */
+	if (ssh->start_time < 1) {
+		/* this will produce a NaN in the output so don't do that - cjr */
 		total_time = 0;
-	else
+		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %lu;OUT: %lu;Duration: %.1f;tPut_in: N/A;tPut_out: N/A",
+		    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
+		    ssh->stdin_bytes, ssh->fdout_bytes, total_time);
+	}
+	else {
 		total_time = monotime_double() - ssh->start_time;
-
-	logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %lu;OUT: %lu;Duration: %.1f;tPut_in: %.1f;tPut_out: %.1f",
-	      ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
-	      ssh->stdin_bytes, ssh->fdout_bytes, total_time,
-	      ssh->stdin_bytes / total_time,
-	      ssh->fdout_bytes / total_time);
+		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %lu;OUT: %lu;Duration: %.1f;tPut_in: %.1f;tPut_out: %.1f",
+		    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
+		    ssh->stdin_bytes, ssh->fdout_bytes, total_time,
+		    ssh->stdin_bytes / total_time,
+		    ssh->fdout_bytes / total_time);
+	}
 }
 
 /*
