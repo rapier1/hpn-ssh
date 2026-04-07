@@ -60,7 +60,7 @@
  * loop and multiple calls to EVP_EncryptUpdate. Doing so
  * dramatically reduced CPU load in the threads and indicated
  * that we could also eliminate most of the threads and queues
- * as it would take far less time for a queue to ebter KQ_FULL
+ * as it would take far less time for a queue to enter KQ_FULL
  * state. As such, we've reduced the default number of threads
  * and queues from 2 and 8 (respectively) to 1 and 2. We've also
  * elimnated the need to determine the physical number of cores on
@@ -338,7 +338,7 @@ thread_loop(void *x)
 			/* set the initial counter */
 			EVP_EncryptInit_ex(aesni_ctx, NULL, NULL, NULL, q->ctr);
 
-			/* encypher a block sized null string (mynull) with the key. This
+			/* encipher a block sized null string (mynull) with the key. This
 			 * returns the keystream because xoring the keystream
 			 * against null returns the keystream. Store that in the appropriate queue */
 			EVP_EncryptUpdate(aesni_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
@@ -395,7 +395,7 @@ thread_loop(void *x)
 		/* set the initial counter */
 		EVP_EncryptInit_ex(aesni_ctx, NULL, NULL, NULL, q->ctr);
 
-		/* see coresponding block above for useful comments */
+		/* see corresponding block above for useful comments */
 		EVP_EncryptUpdate(aesni_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
 
 		/* Re-lock, mark full and signal consumer */
