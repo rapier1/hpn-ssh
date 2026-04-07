@@ -321,8 +321,7 @@ thread_loop(void *x)
 	else if (c->keylen == 192)
 		EVP_EncryptInit_ex(aesni_ctx, EVP_aes_192_ctr(), NULL, c->orig_key, NULL);
 	else {
-		logit("Invalid key length of %d in AES CTR MT. Exiting", c->keylen);
-		exit(1);
+		fatal_f("Invalid key length of %d in AES CTR MT. Exiting", c->keylen);
 	}
 
 	/*
@@ -626,7 +625,7 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 		for (i = 0; i < cipher_threads; i++) {
 			pthread_rwlock_wrlock(&c->tid_lock);
 			if (pthread_create(&c->tid[i], &attr, thread_loop, c) != 0)
-				fatal_f ("AES-CTR MT Could not create thread in %s");
+				fatal_f ("AES-CTR MT Could not create thread");
                                 /*should die here */
 			else {
 				c->id[i] = i;
@@ -636,7 +635,7 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 			pthread_rwlock_unlock(&c->tid_lock);
 		}
 		pthread_mutex_lock(&c->q[0].lock);
-		// wait for all of the threads to be initialized
+		/* wait for all of the threads to be initialized */
 		while (c->q[0].qstate == KQINIT)
 			pthread_cond_wait(&c->q[0].cond, &c->q[0].lock);
 		pthread_mutex_unlock(&c->q[0].lock);

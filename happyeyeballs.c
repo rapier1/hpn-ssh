@@ -78,7 +78,7 @@ char global_ntop[NI_MAXHOST];
 
 /* used to provide information for debug statements */
 char *return_fam(int fam) {
-	if (fam == 10)
+	if (fam == AF_INET6)
 		return "IPv6";
 	else
 		return "IPv4";

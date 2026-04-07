@@ -353,7 +353,7 @@ thread_loop(void *job)
 /* honestly the way this works makes me think that there has to be
  * a better way of doing this however, I've yet to find one that doesn't
  * involve more madness. I think that's mostly becase I don't understand
- * how params work properly. I feel like I shoudl be able to use them
+ * how params work properly. I feel like I should be able to use them
  * to specify the key length but... also, I'd think I'd be able to
  * set aes_mt_ctx_st->keylen to the keylength but that doesn't seem to
  * work either. That said, this does work even if it's a bit clunky.
@@ -543,7 +543,7 @@ int aes_mt_start_threads(void *vevp_ctx, const u_char *key,
 			pthread_rwlock_unlock(&aes_mt_ctx->tid_lock);
 		}
 		pthread_mutex_lock(&aes_mt_ctx->q[0].lock);
-		// wait for all of the threads to be initialized
+		/* wait for all of the threads to be initialized */
 		while (aes_mt_ctx->q[0].qstate == KQINIT)
 			pthread_cond_wait(&aes_mt_ctx->q[0].cond, &aes_mt_ctx->q[0].lock);
 		pthread_mutex_unlock(&aes_mt_ctx->q[0].lock);

@@ -58,7 +58,6 @@ cipher_switch(struct ssh *ssh) {
 	 * if statement */
 	if (strstr(send, "ctr") || strstr(recv, "ctr")) {
 		debug("Serial to parallel AES-CTR cipher swap");
-		/* cipher_reset_multithreaded(); */
 		ssh_packet_set_authenticated(ssh);
 		packet_request_rekeying();
 	}
