@@ -260,7 +260,10 @@ stop_and_join_pregen_threads(struct ssh_aes_ctr_ctx_mt *c)
 			 * created in thread_loop. */
 			struct aes_mt_ctx_ptrs *ptr;
 			HASH_FIND_INT(evp_ptrs, &c->tid[i], ptr);
-			EVP_CIPHER_CTX_free(ptr->pointer);
+			if (ptr != NULL)
+				EVP_CIPHER_CTX_free(ptr->pointer);
+			else
+				fatal_f ("Cannot find entry in hash table for thread id");
 			HASH_DEL(evp_ptrs, ptr);
 			free(ptr);              }
         }
