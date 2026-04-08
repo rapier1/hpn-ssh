@@ -193,8 +193,8 @@ static struct provider_ctx_st *provider_ctx_new(const OSSL_CORE_HANDLE *core,
 {
     struct provider_ctx_st *ctx;
 
-    if ((ctx = xmalloc(sizeof(*ctx))) != NULL
-        && (ctx->proverr_handle = proverr_new_handle(core, in)) != NULL) {
+    if ((ctx = xmalloc(sizeof(*ctx))) &&
+        (ctx->proverr_handle = proverr_new_handle(core, in)) != NULL) {
         ctx->core_handle = core;
     } else {
         provider_ctx_free(ctx);
