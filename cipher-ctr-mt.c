@@ -637,6 +637,7 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 			}
 			pthread_rwlock_unlock(&c->tid_lock);
 		}
+		pthread_attr_destroy(&attr);
 		pthread_mutex_lock(&c->q[0].lock);
 		/* wait for all of the threads to be initialized */
 		while (c->q[0].qstate == KQINIT)

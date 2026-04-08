@@ -545,6 +545,7 @@ int aes_mt_start_threads(void *vevp_ctx, const u_char *key,
 			}
 			pthread_rwlock_unlock(&aes_mt_ctx->tid_lock);
 		}
+		pthread_attr_destroy(&attr);
 		pthread_mutex_lock(&aes_mt_ctx->q[0].lock);
 		/* wait for all of the threads to be initialized */
 		while (aes_mt_ctx->q[0].qstate == KQINIT)
