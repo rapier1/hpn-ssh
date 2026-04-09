@@ -233,6 +233,9 @@ struct session_state {
 	 */
 	int disconnecting;
 
+	/* HPN: use SO_SNDBUF as bulk write threshold */
+	int hpn_dynamic_bulk;
+
 	/* Nagle disabled on socket */
 	int nodelay_set;
 
@@ -2348,10 +2351,45 @@ ssh_packet_have_data_to_write(struct ssh *ssh)
 int
 ssh_packet_not_very_much_data_to_write(struct ssh *ssh)
 {
-	if (ssh->state->interactive_mode)
-		return sshbuf_len(ssh->state->output) < 16384;
-	else
-		return sshbuf_len(ssh->state->output) < 128 * 1024;
+	struct session_state *state = ssh->state;
+	size_t limit = 128 * 1024;
+
+	if (state->interactive_mode)
+		return sshbuf_len(state->output) < 16384;
+
+	if (state->hpn_dynamic_bulk) {
+		u_int32_t sndbuf = 0;
+		socklen_t optlen = sizeof(sndbuf);
+
+		if (getsockopt(state->connection_out, SOL_SOCKET,
+		    SO_SNDBUF, &sndbuf, &optlen) == 0 && sndbuf > limit)
+			limit = sndbuf;
+	}
+
+	return sshbuf_len(state->output) < limit;
+}
+
+size_t
+ssh_packet_bulk_write_limit(struct ssh *ssh)
+{
+	struct session_state *state = ssh->state;
+	size_t limit = 128 * 1024;
+
+	if (state->hpn_dynamic_bulk) {
+		u_int32_t sndbuf = 0;
+		socklen_t optlen = sizeof(sndbuf);
+
+		if (getsockopt(state->connection_out, SOL_SOCKET,
+		    SO_SNDBUF, &sndbuf, &optlen) == 0 && sndbuf > limit)
+			limit = sndbuf;
+	}
+	return limit;
+}
+
+void
+ssh_packet_enable_hpn_bulk(struct ssh *ssh)
+{
+	ssh->state->hpn_dynamic_bulk = 1;
 }
 
 /*
