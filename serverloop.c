@@ -611,6 +611,7 @@ server_request_session(struct ssh *ssh)
 	if ((options.tcp_rcv_buf_poll) && (!options.hpn_disabled)) {
 		c->dynamic_window = 1;
 		ssh_packet_enable_hpn_bulk(ssh);
+		channel_set_hpn_memlimit(options.hpn_memory_limit);
 	}
 	if (session_open(the_authctxt, c->self) != 1) {
 		debug("session open failed, free channel %d", c->self);

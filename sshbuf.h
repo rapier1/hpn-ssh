@@ -30,7 +30,7 @@
 # endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 
-#define SSHBUF_SIZE_MAX		0x8000000	/* Hard maximum size 128MB */
+#define SSHBUF_SIZE_MAX		0x20000000	/* Hard maximum size 512MB */
 #define SSHBUF_REFS_MAX		0x100000	/* Max child buffers */
 #define SSHBUF_MAX_BIGNUM	(16384 / 8)	/* Max bignum *bytes* */
 #define SSHBUF_MAX_ECPOINT	((528 * 2 / 8) + 1) /* Max EC point *bytes* */

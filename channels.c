@@ -230,6 +230,21 @@ static void channel_handler_init(struct ssh_channels *sc);
 /* default values to enable hpn and the initial buffer size */
 static int hpn_disabled = 0;
 
+/* HPN memory limit level and corresponding caps.
+ * this allows the user to have hpn-ssh use higher receive
+ * buffer limits at run time. We do it this way because at higher
+ * buffer sizes there can be a ballooning of memory in some
+ * situations such as when there is local I/O contention. */
+static int hpn_memlimit = HPN_MEMLIMIT_DEFAULT;
+
+/* We give them a choice of 3 limits. This corresponds to
+ * default, high, and max, respectively */
+static const u_int32_t hpn_memlimit_caps[] = {
+	0x08000000,	/* HPN_MEMLIMIT_DEFAULT: 128 MB */
+	0x10000000,	/* HPN_MEMLIMIT_HIGH:    256 MB */
+	0x20000000,	/* HPN_MEMLIMIT_MAX:     512 MB */
+};
+
 /* -- channel core */
 
 void
@@ -1346,6 +1361,7 @@ static int
 channel_tcpwinsz(struct ssh *ssh)
 {
 	u_int32_t tcpwinsz = 0;
+	u_int32_t memlimit_cap = hpn_memlimit_caps[hpn_memlimit];
 	socklen_t optsz = sizeof(tcpwinsz);
 	int ret = -1;
 	
@@ -1363,10 +1379,10 @@ channel_tcpwinsz(struct ssh *ssh)
 		debug_f("getsockopt SO_RCVBUF failed: %s", strerror(errno));
 		return (2 * 1024 * 1024);
 	}
-	
-	/* return no more than SSHBUF_SIZE_MAX (currently 128MB) */
-	if (tcpwinsz > SSHBUF_SIZE_MAX)
-		tcpwinsz = SSHBUF_SIZE_MAX;
+
+	/* cap the channel window at the configured HPN memory limit */
+	if (tcpwinsz > memlimit_cap)
+		tcpwinsz = memlimit_cap;
 
 	/* if the remote side is OpenSSH after version 8.8 we need to restrict
 	 * the size of the advertised window. Now this means that any HPN to non-HPN
@@ -1375,6 +1391,7 @@ channel_tcpwinsz(struct ssh *ssh)
 	 */
 	if ((ssh->compat & SSH_RESTRICT_WINDOW) && (tcpwinsz > NON_HPN_WINDOW_MAX))
 		tcpwinsz = NON_HPN_WINDOW_MAX;
+
 	return (tcpwinsz);
 }
 
@@ -2518,6 +2535,17 @@ channel_check_window(struct ssh *ssh, Channel *c)
 	    c->local_consumed > 0) {
 		int addition = 0;
 		u_int32_t tcpwinsz = channel_tcpwinsz(ssh);
+
+		/* /\* DEBUG: log window state for BDP analysis *\/ */
+		/* debug_f("Channel %d: tcpwinsz=%u (%.1fMB) " */
+		/*     "local_window=%u (%.1fMB) local_window_max=%u (%.1fMB) " */
+		/*     "local_consumed=%u dynamic=%d", */
+		/*     c->self, */
+		/*     tcpwinsz, tcpwinsz / (1024.0 * 1024.0), */
+		/*     c->local_window, c->local_window / (1024.0 * 1024.0), */
+		/*     c->local_window_max, c->local_window_max / (1024.0 * 1024.0), */
+		/*     c->local_consumed, c->dynamic_window); */
+
 		/* adjust max window size if we are in a dynamic environment
 		 * and the tcp receive buffer is larger than the ssh window */
 		if (c->dynamic_window && (tcpwinsz > c->local_window_max)) {
@@ -3970,11 +3998,24 @@ channel_fwd_bind_addr(struct ssh *ssh, const char *listen_addr, int *wildcardp,
 	return addr;
 }
 
+/* allow the client to diable hpn. No access to the
+ * options struct here */
 void
 channel_set_hpn_disabled(int external_hpn_disabled)
 {
 	hpn_disabled = external_hpn_disabled;
 	debug("HPN Disabled: %d", hpn_disabled);
+}
+
+/* allow server or client to set the memory limit.
+ * we need a setter because channels doesn't have
+ * access to the options struct */
+void
+channel_set_hpn_memlimit(int level)
+{	
+	hpn_memlimit = level;
+	debug("HPN Memory Limit: %d (cap %.0f MB)", level,
+	    hpn_memlimit_caps[level] / (1024.0 * 1024.0));
 }
 
 static int

@@ -203,6 +203,7 @@ initialize_server_options(ServerOptions *options)
 	options->authorized_principals_command_user = NULL;
 	options->tcp_rcv_buf_poll = -1;
 	options->hpn_disabled = -1;
+	options->hpn_memory_limit = -1;
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
 	options->use_mptcp = -1;
@@ -488,6 +489,8 @@ fill_default_server_options(ServerOptions *options)
 		options->disable_multithreaded = 0;
 	if (options->hpn_disabled == -1)
 		options->hpn_disabled = 0;
+	if (options->hpn_memory_limit == -1)
+		options->hpn_memory_limit = 0;
 	if (options->use_mptcp == -1)
 		options->use_mptcp = 0;
 	if (options->ip_qos_interactive == -1)
@@ -575,7 +578,7 @@ typedef enum {
 	sKerberosGetAFSToken, sPasswordAuthentication,
 	sKbdInteractiveAuthentication, sListenAddress, sAddressFamily,
 	sPrintMotd, sPrintLastLog, sIgnoreRhosts,
-	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sHPNDisabled,
+	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sHPNDisabled, sHPNMemoryLimit,
 	sDisableMTAES, sUseMPTCP,
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
@@ -752,6 +755,7 @@ static struct {
 	{ "trustedusercakeys", sTrustedUserCAKeys, SSHCFG_ALL },
 	{ "authorizedprincipalsfile", sAuthorizedPrincipalsFile, SSHCFG_ALL },
 	{ "hpndisabled", sHPNDisabled, SSHCFG_ALL },
+	{ "hpnmemorylimit", sHPNMemoryLimit, SSHCFG_ALL },
 	{ "tcprcvbufpoll", sTcpRcvBufPoll, SSHCFG_ALL },
 	{ "noneenabled", sNoneEnabled, SSHCFG_ALL },
 	{ "nonemacenabled", sNoneMacEnabled, SSHCFG_ALL },
@@ -1343,6 +1347,12 @@ static const struct multistate multistate_tcpfwd[] = {
 	{ "local",			FORWARD_LOCAL },
 	{ NULL, -1 }
 };
+static const struct multistate multistate_hpnmemorylimit[] = {
+	{ "default",			0 },	/* 128 MB */
+	{ "high",			1 },	/* 256 MB */
+	{ "max",			2 },	/* 512 MB */
+	{ NULL, -1 }
+};
 
 static int
 process_server_config_line_depth(ServerOptions *options, char *line,
@@ -1599,6 +1609,11 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 	case sHPNDisabled:
 		intptr = &options->hpn_disabled;
 		goto parse_flag;
+
+	case sHPNMemoryLimit:
+		multistate_ptr = multistate_hpnmemorylimit;
+		intptr = &options->hpn_memory_limit;
+		goto parse_multistate;
 
 	case sNoneEnabled:
 		intptr = &options->none_enabled;
@@ -3375,6 +3390,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sFingerprintHash, o->fingerprint_hash);
 	dump_cfg_fmtint(sExposeAuthInfo, o->expose_userauth_info);
 	dump_cfg_fmtint(sHPNDisabled, o->hpn_disabled);
+	dump_cfg_fmtint(sHPNMemoryLimit, o->hpn_memory_limit);
 	dump_cfg_fmtint(sTcpRcvBufPoll, o->tcp_rcv_buf_poll);
 	dump_cfg_fmtint(sNoneEnabled, o->none_enabled);
 	dump_cfg_fmtint(sNoneMacEnabled, o->nonemac_enabled);
