@@ -909,7 +909,7 @@ The list of available signature algorithms may also be obtained using
 In some situations, such as transfers on a local area network, the impact
 of the HPN code produces a net decrease in performance. In these cases it is
 helpful to disable the HPN functionality. By default HPNDisabled is set to 
-.CM no.
+.Cm no.
 .It Cm IgnoreRhosts
 Specifies whether to ignore per-user
 .Pa .rhosts
@@ -2027,7 +2027,7 @@ This avoids infinitely hanging sessions.
 .Pp
 To disable TCP keepalive messages, the value should be set to
 .Cm no .
-.IT Cm TcpRcvBufPoll
+.It Cm TcpRcvBufPoll
 Enable of disable the polling of the tcp receive buffer throughout the life
 of the connection. Make sure that this option is enabled for systems making 
 use of autotuning kernels (linux 2.4.24+, 2.6, MS Vista) in order to
