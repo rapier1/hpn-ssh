@@ -226,6 +226,14 @@ send_string_request(struct sftp_conn *conn, u_int id, u_int code, const char *s,
 	struct sshbuf *msg = conn->msg;
 	int r;
 
+	/*
+	 * Reset before building: response-reading helpers (e.g. get_status)
+	 * do not consume the full STATUS packet — error-message and
+	 * language-tag strings are left unread.  Without this reset, those
+	 * leftover bytes would be prepended to the outgoing request by
+	 * send_msg(), corrupting the message stream.
+	 */
+	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, code)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_string(msg, s, len)) != 0)
@@ -241,6 +249,8 @@ send_string_attrs_request(struct sftp_conn *conn, u_int id, u_int code,
 	struct sshbuf *msg = conn->msg;
 	int r;
 
+	/* Reset for the same reason as send_string_request above. */
+	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, code)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_string(msg, s, len)) != 0 ||
@@ -594,6 +604,8 @@ sftp_get_limits(struct sftp_conn *conn, struct sftp_limits *limits)
 		return -1;
 	}
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
@@ -636,6 +648,8 @@ sftp_close(struct sftp_conn *conn, const u_char *handle, u_int handle_len)
 	struct sshbuf *msg = conn->msg;
 	int r;
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_CLOSE)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
@@ -666,6 +680,8 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 	if (dir)
 		*dir = NULL;
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	id = conn->msg_id++;
 
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_OPENDIR)) != 0 ||
@@ -964,6 +980,8 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 
 	expected_id = id = conn->msg_id++;
 	if (expand) {
+		/* Reset for the same reason as send_string_request. */
+		sshbuf_reset(msg);
 		debug2("Sending SSH2_FXP_EXTENDED(expand-path@openssh.com) "
 		    "\"%s\"", path);
 		if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
@@ -1082,6 +1100,8 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	attrib_clear(&junk); /* Send empty attributes */
 
 	/* Open the old file for reading */
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_OPEN)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
@@ -1098,6 +1118,8 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 		return -1;
 
 	/* Open the new file for writing */
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_OPEN)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
@@ -1117,6 +1139,8 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	}
 
 	/* Copy the file data */
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
@@ -1153,6 +1177,8 @@ sftp_rename(struct sftp_conn *conn, const char *oldpath, const char *newpath,
 	u_int status, id;
 	int r, use_ext = (conn->exts & SFTP_EXT_POSIX_RENAME) && !force_legacy;
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	/* Send rename request */
 	id = conn->msg_id++;
 	if (use_ext) {
@@ -1200,6 +1226,8 @@ sftp_hardlink(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	debug2("Sending SSH2_FXP_EXTENDED(hardlink@openssh.com) "
 	    "\"%s\" to \"%s\"", oldpath, newpath);
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	/* Send link request */
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
@@ -1233,6 +1261,8 @@ sftp_symlink(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	}
 	debug2("Sending SSH2_FXP_SYMLINK \"%s\" to \"%s\"", oldpath, newpath);
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	/* Send symlink request */
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_SYMLINK)) != 0 ||
@@ -1264,6 +1294,8 @@ sftp_fsync(struct sftp_conn *conn, u_char *handle, u_int handle_len)
 		return -1;
 	debug2("Sending SSH2_FXP_EXTENDED(fsync@openssh.com)");
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	/* Send fsync request */
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
@@ -1349,6 +1381,8 @@ sftp_statvfs(struct sftp_conn *conn, const char *path, struct sftp_statvfs *st,
 
 	debug2("Sending SSH2_FXP_EXTENDED(statvfs@openssh.com) \"%s\"", path);
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	id = conn->msg_id++;
 
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
@@ -1376,6 +1410,8 @@ sftp_fstatvfs(struct sftp_conn *conn, const u_char *handle, u_int handle_len,
 
 	debug2("Sending SSH2_FXP_EXTENDED(fstatvfs@openssh.com)");
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	id = conn->msg_id++;
 
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
@@ -1403,6 +1439,8 @@ sftp_lsetstat(struct sftp_conn *conn, const char *path, Attrib *a)
 
 	debug2("Sending SSH2_FXP_EXTENDED(lsetstat@openssh.com) \"%s\"", path);
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
@@ -1426,6 +1464,8 @@ send_read_request(struct sftp_conn *conn, u_int id, uint64_t offset,
 	struct sshbuf *msg = conn->msg;
 	int r;
 
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_READ)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_string(msg, handle, handle_len)) != 0 ||
@@ -1455,6 +1495,8 @@ send_open(struct sftp_conn *conn, const char *path, const char *tag,
 		attrib_clear(&junk); /* Send empty attributes */
 		a = &junk;
 	}
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	/* Send open request */
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_OPEN)) != 0 ||
@@ -2752,6 +2794,8 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 	if ((uidbuf = sshbuf_new()) == NULL ||
 	    (gidbuf = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
+	/* Reset for the same reason as send_string_request. */
+	sshbuf_reset(msg);
 	expected_id = id = conn->msg_id++;
 	debug2("Sending SSH2_FXP_EXTENDED(users-groups-by-id@openssh.com)");
 	for (i = 0; i < nuids; i++) {
