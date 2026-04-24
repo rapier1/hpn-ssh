@@ -1597,8 +1597,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	    &handle, &handle_len) != 0)
 		return -1;
 
-	local_fd = open(local_path, O_WRONLY | O_CREAT |
-	((resume_flag || inplace_flag) ? 0 : O_TRUNC), mode | S_IWUSR);
+	local_fd = open(local_path,
+	    ((resume_flag && verify) ? O_RDWR : O_WRONLY) | O_CREAT |
+	    ((resume_flag || inplace_flag) ? 0 : O_TRUNC), mode | S_IWUSR);
 	if (local_fd == -1) {
 		error("open local \"%s\": %s", local_path, strerror(errno));
 		sftp_close(conn, handle, handle_len);
@@ -1623,6 +1624,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			 * useful to resume or verify).
 			 */
 			if ((uint64_t)st.st_size == size) {
+				/*
+				 * We could hash-verify here but that
+				 * imposes ~33s/TB plus I/O on each side.
+				 */
 				skip_ret = 1; /* identical */
 				goto resume_fail;
 			}
@@ -1996,10 +2001,11 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 				    new_src, new_dst);
 				ret = -1;
 			} else if (dr == 1) {
-				mprintf("File skipped: Identical.\n");
+				mprintf("File skipped: %s: Identical.\n",
+				    new_src);
 			} else if (dr == 2) {
-				mprintf("File skipped: Target is larger"
-				    " than source.\n");
+				mprintf("File skipped: %s: Target is larger"
+				    " than source.\n", new_src);
 			}
 		} else
 			logit("download \"%s\": not a regular file", new_src);
@@ -2254,6 +2260,10 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			    (unsigned long long)c.size,
 			    (unsigned long long)sb.st_size);
 			if ((off_t)c.size == sb.st_size) {
+				/*
+				 * We could hash-verify here but that
+				 * imposes ~33s/TB plus I/O on each side.
+				 */
 				close(local_fd);
 				return 1; /* identical */
 			}
@@ -2600,10 +2610,11 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 				    new_src, new_dst);
 				ret = -1;
 			} else if (ur == 1) {
-				mprintf("File skipped: Identical.\n");
+				mprintf("File skipped: %s: Identical.\n",
+				    new_src);
 			} else if (ur == 2) {
-				mprintf("File skipped: Target is larger"
-				    " than source.\n");
+				mprintf("File skipped: %s: Target is larger"
+				    " than source.\n", new_src);
 			}
 		} else
 			logit("%s: not a regular file", filename);

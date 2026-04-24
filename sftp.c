@@ -417,6 +417,7 @@ parse_getput_flags(const char *cmd, char **argv, int argc,
 			break;
 		case 'v':
 			*vflag = 1;
+			*aflag = 1;
 			break;
 		default:
 			error("%s: Invalid flag -%c", cmd, optopt);
@@ -726,10 +727,11 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			if (dr == -1)
 				err = -1;
 			else if (dr == 1)
-				mprintf("File skipped: Identical.\n");
+				mprintf("File skipped: %s: Identical.\n",
+				    g.gl_pathv[i]);
 			else if (dr == 2)
-				mprintf("File skipped: Target is larger"
-				    " than source.\n");
+				mprintf("File skipped: %s: Target is larger"
+				    " than source.\n", g.gl_pathv[i]);
 		}
 		free(abs_dst);
 		abs_dst = NULL;
@@ -835,10 +837,11 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			if (ur == -1)
 				err = -1;
 			else if (ur == 1)
-				mprintf("File skipped: Identical.\n");
+				mprintf("File skipped: %s: Identical.\n",
+				    g.gl_pathv[i]);
 			else if (ur == 2)
-				mprintf("File skipped: Target is larger"
-				    " than source.\n");
+				mprintf("File skipped: %s: Target is larger"
+				    " than source.\n", g.gl_pathv[i]);
 		}
 	}
 
