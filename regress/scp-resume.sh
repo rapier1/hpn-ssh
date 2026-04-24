@@ -80,10 +80,19 @@ for mode in legacy sftp; do
 			if test $direction = put; then
 				if test $mode = sftp; then
 					case "${size}" in
-					same|larger)
-						# SFTP put refuses when dest >= source size.
+					same)
+						# SFTP put skips identical files (exit 0).
 						$SCP -Z $scpopts ${COPY}.1 somehost:${COPY}.2 \
-						    && fail "$tag put -Z should have refused size=${size}"
+						    || fail "$tag put -Z failed size=${size}"
+						cmp ${COPY}.1 ${COPY}.2 \
+						    || fail "$tag corrupted after put -Z size=${size}"
+						continue
+						;;
+					larger)
+						# SFTP put skips when dest is larger (exit 0);
+						# dest is intentionally left untouched.
+						$SCP -Z $scpopts ${COPY}.1 somehost:${COPY}.2 \
+						    || fail "$tag put -Z failed size=${size}"
 						continue
 						;;
 					esac
