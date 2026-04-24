@@ -137,7 +137,7 @@ int sftp_fsync(struct sftp_conn *conn, u_char *, u_int);
  * if 'pflag' is set
  */
 int sftp_download(struct sftp_conn *, const char *, const char *, Attrib *,
-    int, int, int, int);
+    int, int, int, int, int);
 
 /*
  * Recursively download 'remote_directory' to 'local_directory'. Preserve

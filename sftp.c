@@ -143,6 +143,7 @@ enum sftp_command {
 	I_PWD,
 	I_QUIT,
 	I_REGET,
+	I_VREGET,
 	I_RENAME,
 	I_REPUT,
 	I_VREPUT,
@@ -196,6 +197,7 @@ static const struct CMD cmds[] = {
 	{ "pwd",	I_PWD,		REMOTE,		NOARGS	},
 	{ "quit",	I_QUIT,		NOARGS,		NOARGS	},
 	{ "reget",	I_REGET,	REMOTE,		LOCAL	},
+	{ "regetv",	I_VREGET,	REMOTE,		LOCAL	},
 	{ "rename",	I_RENAME,	REMOTE,		REMOTE	},
 	{ "reput",	I_REPUT,	LOCAL,		REMOTE	},
 	{ "reputv",	I_VREPUT,	LOCAL,		REMOTE	},
@@ -300,6 +302,7 @@ help(void)
 	    "pwd                                Display remote working directory\n"
 	    "quit                               Quit sftp\n"
 	    "reget [-fpR] remote [local]        Resume download file\n"
+	    "regetv [-fpR] remote [local]       Resume download with hash verification\n"
 	    "rename oldpath newpath             Rename remote file\n"
 	    "reput [-fpR] local [remote]        Resume upload file\n"
 	    "reputv [-fpR] local [remote]       Resume upload with hash verification\n"
@@ -639,7 +642,7 @@ local_is_dir(const char *path)
 
 static int
 process_get(struct sftp_conn *conn, const char *src, const char *dst,
-    const char *pwd, int pflag, int rflag, int resume, int fflag)
+    const char *pwd, int pflag, int rflag, int resume, int fflag, int verify)
 {
 	char *filename, *abs_src = NULL, *abs_dst = NULL, *tmp = NULL;
 	glob_t g;
@@ -697,7 +700,10 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		free(tmp);
 
 		resume |= global_aflag;
-		if (!quiet && resume)
+		if (!quiet && verify)
+			mprintf("Downloading %s to %s (verified resume)\n",
+			    g.gl_pathv[i], abs_dst);
+		else if (!quiet && resume)
 			mprintf("Resuming %s to %s\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && !resume)
@@ -713,7 +719,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		} else {
 			if (sftp_download(conn, g.gl_pathv[i], abs_dst, NULL,
 			    pflag || global_pflag, resume,
-			    fflag || global_fflag, 0) == -1)
+			    fflag || global_fflag, 0, verify) == -1)
 				err = -1;
 		}
 		free(abs_dst);
@@ -1406,6 +1412,7 @@ parse_args(const char **cpp, int *ignore_errors, int *disable_echo, int *aflag,
 	switch (cmdnum) {
 	case I_GET:
 	case I_REGET:
+	case I_VREGET:
 	case I_REPUT:
 	case I_VREPUT:
 	case I_PUT:
@@ -1587,12 +1594,17 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		/* Unrecognized command */
 		err = -1;
 		break;
+	case I_VREGET:
+		aflag = 1;
+		err = process_get(conn, path1, path2, *pwd, pflag,
+		    rflag, aflag, fflag, 1 /* verify */);
+		break;
 	case I_REGET:
 		aflag = 1;
 		/* FALLTHROUGH */
 	case I_GET:
 		err = process_get(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag);
+		    rflag, aflag, fflag, 0 /* verify */);
 		break;
 	case I_VREPUT:
 		aflag = 1;

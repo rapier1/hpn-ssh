@@ -1788,6 +1788,7 @@ process_extended_hpn_check_file(uint32_t id)
 	uint64_t remaining;
 	ssize_t nread;
 	struct sshbuf *msg;
+	struct stat st;
 
 	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0 ||
 	    (r = sshbuf_get_u64(iqueue, &length)) != 0)
@@ -1798,10 +1799,19 @@ process_extended_hpn_check_file(uint32_t id)
 	logit("hpn-check-file \"%s\" length %llu", path,
 	    (unsigned long long)length);
 
-	if ((fd = open(path, O_RDONLY)) == -1) {
+	if ((fd = open(path, O_RDONLY|O_NOFOLLOW)) == -1) {
 		send_status(id, errno_to_portable(errno));
 		goto out;
 	}
+
+	if (fstat(fd, &st) == -1) {
+		send_status(id, errno_to_portable(errno));
+		goto out;
+	}
+	/* Clamp to actual file size to prevent a malicious client from
+	 * requesting a hash of UINT64_MAX bytes and causing unbounded I/O. */
+	if (length > (uint64_t)st.st_size)
+		length = (uint64_t)st.st_size;
 
 	if ((state = XXH3_createState()) == NULL) {
 		send_status(id, SSH2_FX_FAILURE);

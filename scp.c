@@ -184,7 +184,7 @@ char hostname[HOST_NAME_MAX + 1];
 
 /* defines for the resume function. Need them even if not supported */
 #define HASH_LEN 16                /* XXH3_64bits: 8 bytes → 16 hex chars */
-#define BUF_AND_HASH HASH_LEN + 64 /* length of the hash and other data to get size of buffer */
+#define BUF_AND_HASH (HASH_LEN + 64) /* length of the hash and other data to get size of buffer */
 #define HASH_BUFLEN 8192	   /* 8192 seems to be a good balance between freads
 				    * and the digest func*/
 static void
@@ -1376,8 +1376,12 @@ void calculate_hash(char *filename, char *output, off_t length)
 		    HASH_BUFLEN : (size_t)length;
 
 		bytes = fread(buf, 1, toread, file_ptr);
-		if (bytes == 0)
-			break; /* EOF */
+		if (bytes == 0) {
+			if (ferror(file_ptr))
+				error("calculate_hash: read error on %s: %s",
+				    filename, strerror(errno));
+			break;
+		}
 		XXH3_64bits_update(state, buf, bytes);
 		length -= (off_t)bytes;
 	}
@@ -1874,7 +1878,7 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 				err = -1;
 		} else {
 			if (sftp_download(conn, g.gl_pathv[i], abs_dst, NULL,
-			    pflag, 0, 0, 1) == -1)
+			    pflag, 0, 0, 1, 0) == -1)
 				err = -1;
 		}
 		free(abs_dst);
@@ -1921,7 +1925,6 @@ sink(int argc, char **argv, const char *src)
 	char tmpbuf[BUF_AND_HASH];
 	char outbuf[BUF_AND_HASH];
 	char match;
-	int bad_match_flag = 0;
 	np = NULL; /* this was originally '/0' but that's wrong */
 
 
@@ -1969,7 +1972,6 @@ sink(int argc, char **argv, const char *src)
 	}
 
 	for (first = 1;; first = 0) {
-		bad_match_flag = 0; /* used in resume mode. */
 #ifdef DEBUG
 		fprintf(stderr, "%s: At start of loop buf is %s\n", hostname, buf);
 #endif
@@ -2260,7 +2262,7 @@ sink(int argc, char **argv, const char *src)
 						 (long long)npstat.st_size, local_hashsum);
 					snprintf(outbuf, BUF_AND_HASH, "%-*s", BUF_AND_HASH-1, tmpbuf);
 					(void) atomicio(vwrite, remout, outbuf, strlen(outbuf));
-					bad_match_flag = 1;
+
 				}
 			}
 			/* if npstat.st_size is 0 then the local file doesn't exist and
@@ -2304,7 +2306,6 @@ sink(int argc, char **argv, const char *src)
 					 (long long)npstat.st_size);
 				snprintf(outbuf, BUF_AND_HASH, "%-*s", BUF_AND_HASH-1, tmpbuf);
 				(void) atomicio(vwrite, remout, outbuf, strlen(outbuf));
-				bad_match_flag = 1;
 			}
 
 #ifdef DEBUG
@@ -2331,13 +2332,12 @@ sink(int argc, char **argv, const char *src)
 #endif
 				xfer_size = size;
 				resume_offset = 0;
-				bad_match_flag = 1;
 			} else {
 #ifdef DEBUG
 				fprintf(stderr, "%s: match status is M, resuming at offset %lld\n",
 					hostname, (long long)resume_offset);
 #endif
-				bad_match_flag = 0;
+	
 			}
 		}
 
@@ -2346,7 +2346,7 @@ sink(int argc, char **argv, const char *src)
 			hostname, mode, np, (long long)resume_offset);
 #endif
 		ofd = (resume_offset > 0)
-		    ? open(np, O_WRONLY, mode)
+		    ? open(np, O_WRONLY|O_NOFOLLOW, mode)
 		    : open(np, O_WRONLY|O_CREAT, mode);
 		if (ofd == -1) {
 bad:			run_err("%s: %s", np, strerror(errno));
@@ -2429,7 +2429,7 @@ bad:			run_err("%s: %s", np, strerror(errno));
 			wrerr = 1;
 		}
 		if (!wrerr && (!exists || S_ISREG(stb.st_mode)) &&
-		    ftruncate(ofd, resume_offset + xfer_size) != 0)
+		    ftruncate(ofd, size) != 0)
 			note_err("%s: truncate: %s", np, strerror(errno));
 
 		if (pflag) {
