@@ -287,7 +287,7 @@ help(void)
 	    "df [-hi] [path]                    Display statistics for current directory or\n"
 	    "                                   filesystem containing 'path'\n"
 	    "exit                               Quit sftp\n"
-	    "get [-afpR] remote [local]         Download file\n"
+	    "get [-afpRv] remote [local]        Download file (-v: verified resume)\n"
 	    "help                               Display this help text\n"
 	    "lcd path                           Change local directory to 'path'\n"
 	    "lls [ls-options [path]]            Display local directory listing\n"
@@ -298,7 +298,7 @@ help(void)
 	    "lumask umask                       Set local umask to 'umask'\n"
 	    "mkdir path                         Create remote directory\n"
 	    "progress                           Toggle display of progress meter\n"
-	    "put [-afpR] local [remote]         Upload file\n"
+	    "put [-afpRv] local [remote]        Upload file (-v: verified resume)\n"
 	    "pwd                                Display remote working directory\n"
 	    "quit                               Quit sftp\n"
 	    "reget [-fpR] remote [local]        Resume download file\n"
@@ -390,7 +390,7 @@ path_strip(const char *path, const char *strip)
 
 static int
 parse_getput_flags(const char *cmd, char **argv, int argc,
-    int *aflag, int *fflag, int *pflag, int *rflag)
+    int *aflag, int *fflag, int *pflag, int *rflag, int *vflag)
 {
 	extern int opterr, optind, optopt, optreset;
 	int ch;
@@ -398,8 +398,8 @@ parse_getput_flags(const char *cmd, char **argv, int argc,
 	optind = optreset = 1;
 	opterr = 0;
 
-	*aflag = *fflag = *rflag = *pflag = 0;
-	while ((ch = getopt(argc, argv, "afPpRr")) != -1) {
+	*aflag = *fflag = *rflag = *pflag = *vflag = 0;
+	while ((ch = getopt(argc, argv, "afPpRrv")) != -1) {
 		switch (ch) {
 		case 'a':
 			*aflag = 1;
@@ -414,6 +414,9 @@ parse_getput_flags(const char *cmd, char **argv, int argc,
 		case 'r':
 		case 'R':
 			*rflag = 1;
+			break;
+		case 'v':
+			*vflag = 1;
 			break;
 		default:
 			error("%s: Invalid flag -%c", cmd, optopt);
@@ -1362,7 +1365,7 @@ makeargv(const char *arg, int *argcp, int sloppy, char *lastquote,
 static int
 parse_args(const char **cpp, int *ignore_errors, int *disable_echo, int *aflag,
 	  int *fflag, int *hflag, int *iflag, int *lflag, int *pflag,
-	  int *rflag, int *sflag,
+	  int *rflag, int *sflag, int *vflag,
     unsigned long *n_arg, char **path1, char **path2)
 {
 	const char *cmd, *cp = *cpp;
@@ -1429,7 +1432,7 @@ parse_args(const char **cpp, int *ignore_errors, int *disable_echo, int *aflag,
 	case I_VREPUT:
 	case I_PUT:
 		if ((optidx = parse_getput_flags(cmd, argv, argc,
-		    aflag, fflag, pflag, rflag)) == -1)
+		    aflag, fflag, pflag, rflag, vflag)) == -1)
 			return -1;
 		/* Get first pathname (mandatory) */
 		if (argc - optidx < 1) {
@@ -1577,7 +1580,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 	char *path1, *path2, *tmp;
 	int ignore_errors = 0, disable_echo = 1;
 	int aflag = 0, fflag = 0, hflag = 0, iflag = 0;
-	int lflag = 0, pflag = 0, rflag = 0, sflag = 0;
+	int lflag = 0, pflag = 0, rflag = 0, sflag = 0, vflag = 0;
 	int cmdnum, i;
 	unsigned long n_arg = 0;
 	Attrib a, aa;
@@ -1587,7 +1590,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 
 	path1 = path2 = NULL;
 	cmdnum = parse_args(&cmd, &ignore_errors, &disable_echo, &aflag, &fflag,
-	    &hflag, &iflag, &lflag, &pflag, &rflag, &sflag, &n_arg,
+	    &hflag, &iflag, &lflag, &pflag, &rflag, &sflag, &vflag, &n_arg,
 	    &path1, &path2);
 	if (ignore_errors != 0)
 		err_abort = 0;
@@ -1616,7 +1619,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		/* FALLTHROUGH */
 	case I_GET:
 		err = process_get(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag, 0 /* verify */);
+		    rflag, aflag, fflag, vflag /* verify */);
 		break;
 	case I_VREPUT:
 		aflag = 1;
@@ -1628,7 +1631,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		/* FALLTHROUGH */
 	case I_PUT:
 		err = process_put(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag, 0 /* verify */);
+		    rflag, aflag, fflag, vflag /* verify */);
 		break;
 	case I_COPY:
 		path1 = sftp_make_absolute(path1, *pwd);

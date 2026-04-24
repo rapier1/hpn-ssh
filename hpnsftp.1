@@ -497,7 +497,7 @@ extension.
 Quit
 .Nm hpnsftp .
 .It Xo Ic get
-.Op Fl afpR
+.Op Fl afpRv
 .Ar remote-path
 .Op Ar local-path
 .Xc
@@ -524,6 +524,25 @@ Note that resumption assumes that any partial copy of the local file matches
 the remote copy.
 If the remote file contents differ from the partial local copy then the
 resultant file is likely to be corrupt.
+.Pp
+If the
+.Fl v
+flag is specified, then attempt to resume partial transfers of existing files
+using hash verification.
+Before resuming, the hash of the local partial file is compared against
+the hash of the corresponding prefix of the remote file using the
+.Cm hpn-check-file@hpnssh.org
+extension.
+If the hashes match the transfer is resumed from the end of the local file;
+if they differ the local file is truncated and the transfer restarts from
+the beginning.
+If the local file is already the same size or larger than the remote file
+the transfer is skipped.
+This flag implies
+.Fl a
+and requires that the remote server support the
+.Cm hpn-check-file@hpnssh.org
+extension.
 .Pp
 If the
 .Fl f
@@ -642,7 +661,7 @@ Create remote directory specified by
 .It Ic progress
 Toggle display of progress meter.
 .It Xo Ic put
-.Op Fl afpR
+.Op Fl afpRv
 .Ar local-path
 .Op Ar remote-path
 .Xc
@@ -669,6 +688,25 @@ Note that resumption assumes that any partial copy of the remote file
 matches the local copy.
 If the local file contents differ from the remote local copy then
 the resultant file is likely to be corrupt.
+.Pp
+If the
+.Fl v
+flag is specified, then attempt to resume partial transfers of existing files
+using hash verification.
+Before resuming, the hash of the remote partial file is compared against
+the hash of the corresponding prefix of the local file using the
+.Cm hpn-check-file@hpnssh.org
+extension.
+If the hashes match the transfer is resumed from the end of the remote file;
+if they differ the remote file is truncated and the transfer restarts from
+the beginning.
+If the remote file is already the same size or larger than the local file
+the transfer is skipped.
+This flag implies
+.Fl a
+and requires that the remote server support the
+.Cm hpn-check-file@hpnssh.org
+extension.
 .Pp
 If the
 .Fl f
@@ -712,6 +750,24 @@ Equivalent to
 with the
 .Fl a
 flag set.
+.It Xo Ic regetv
+.Op Fl fpR
+.Ar remote-path
+.Op Ar local-path
+.Xc
+Resume download of
+.Ar remote-path
+with hash verification.
+Equivalent to
+.Ic get
+with the
+.Fl v
+flag set.
+See the description of
+.Fl v
+under
+.Ic get
+for details.
 .It Xo Ic reput
 .Op Fl fpR
 .Ar local-path
@@ -724,6 +780,24 @@ Equivalent to
 with the
 .Fl a
 flag set.
+.It Xo Ic reputv
+.Op Fl fpR
+.Ar local-path
+.Op Ar remote-path
+.Xc
+Resume upload of
+.Ar local-path
+with hash verification.
+Equivalent to
+.Ic put
+with the
+.Fl v
+flag set.
+See the description of
+.Fl v
+under
+.Ic put
+for details.
 .It Ic rename Ar oldpath newpath
 Rename remote file from
 .Ar oldpath
