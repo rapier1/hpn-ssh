@@ -30,8 +30,6 @@ for cmd in put get; do
 
 	# Perform copy and check.
 
-	echo "CMD = ${cmd}"
-
 	echo "${cmd} -a ${COPY}.1 ${COPY}.2" | \
 	    ${SFTP} -D ${SFTPSERVER} -vvv >${CLIENT_LOG} 2>&1 \
 	    || fail "${cmd} failed"
