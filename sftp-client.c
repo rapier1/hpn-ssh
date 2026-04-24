@@ -117,6 +117,11 @@ static u_char *
 get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
     const char *errfmt, ...) __attribute__((format(printf, 4, 5)));
 
+/* Forward declarations for hash helpers used by sftp_download (verified resume) */
+static int sftp_xxhash_local_fd(int, uint64_t, uint64_t *);
+static int sftp_hash_remote_file(struct sftp_conn *, const char *,
+    uint64_t, uint64_t *);
+
 static struct request *
 request_enqueue(struct requests *requests, u_int id, size_t len,
     uint64_t offset)
@@ -1541,7 +1546,7 @@ progress_meter_path(const char *path)
 int
 sftp_download(struct sftp_conn *conn, const char *remote_path,
     const char *local_path, Attrib *a, int preserve_flag, int resume_flag,
-    int fsync_flag, int inplace_flag)
+    int fsync_flag, int inplace_flag, int verify)
 {
 	struct sshbuf *msg = conn->msg;
 	u_char *handle;
@@ -1596,29 +1601,98 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	((resume_flag || inplace_flag) ? 0 : O_TRUNC), mode | S_IWUSR);
 	if (local_fd == -1) {
 		error("open local \"%s\": %s", local_path, strerror(errno));
-		goto fail;
+		sftp_close(conn, handle, handle_len);
+		free(handle);
+		return -1;
 	}
 	if (resume_flag) {
 		if (fstat(local_fd, &st) == -1) {
 			error("stat local \"%s\": %s",
 			    local_path, strerror(errno));
-			goto fail;
+			goto resume_fail;
 		}
 		if (st.st_size < 0) {
 			error("\"%s\" has negative size", local_path);
-			goto fail;
+			goto resume_fail;
 		}
-		if ((uint64_t)st.st_size > size) {
-			error("Unable to resume download of \"%s\": "
-			    "local file is larger than remote", local_path);
- fail:
-			sftp_close(conn, handle, handle_len);
-			free(handle);
-			if (local_fd != -1)
-				close(local_fd);
-			return -1;
+		if (verify) {
+			/*
+			 * Verified resume: refuse if local >= remote (nothing
+			 * useful to resume or verify).
+			 */
+			if ((uint64_t)st.st_size >= size) {
+				error("verified resume \"%s\": "
+				    "local file same size or larger",
+				    local_path);
+				goto resume_fail;
+			}
+			if (st.st_size > 0) {
+				if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0) {
+					error("verified resume of \"%s\": remote "
+					    "server does not support "
+					    "hpn-check-file@hpnssh.org; "
+					    "downloading from scratch",
+					    remote_path);
+					if (ftruncate(local_fd, 0) == -1) {
+						error("truncate \"%s\": %s",
+						    local_path, strerror(errno));
+						goto resume_fail;
+					}
+					/* offset stays 0; plain fresh download */
+				} else {
+					uint64_t local_hash, remote_hash;
+					int lret, rret;
+
+					lret = sftp_xxhash_local_fd(local_fd,
+					    (uint64_t)st.st_size, &local_hash);
+					rret = sftp_hash_remote_file(conn,
+					    remote_path, (uint64_t)st.st_size,
+					    &remote_hash);
+					if (lret == 0 && rret == 0 &&
+					    local_hash == remote_hash) {
+						debug("verified resume: hash "
+						    "match, resuming at "
+						    "offset %llu",
+						    (unsigned long long)
+						    st.st_size);
+						offset = highwater = maxack =
+						    st.st_size;
+					} else {
+						debug("verified resume: hash "
+						    "mismatch or error; "
+						    "restarting download");
+						if (ftruncate(local_fd, 0)
+						    == -1) {
+							error("truncate "
+							    "\"%s\": %s",
+							    local_path,
+							    strerror(errno));
+							goto resume_fail;
+						}
+						/* offset stays 0 */
+					}
+				}
+			}
+			/* st.st_size == 0: fresh download, offset stays 0 */
+		} else {
+			/* Plain size-only resume */
+			if ((uint64_t)st.st_size > size) {
+				error("Unable to resume download of \"%s\": "
+				    "local file is larger than remote",
+				    local_path);
+				goto resume_fail;
+			}
+			offset = highwater = maxack = st.st_size;
 		}
-		offset = highwater = maxack = st.st_size;
+		goto resume_done;
+ resume_fail:
+		sftp_close(conn, handle, handle_len);
+		free(handle);
+		if (local_fd != -1)
+			close(local_fd);
+		return -1;
+ resume_done:
+		;
 	}
 
 	/* Read from remote and write to local */
@@ -1914,7 +1988,7 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 		} else if (S_ISREG(a->perm)) {
 			if (sftp_download(conn, new_src, new_dst, a,
 			    preserve_flag, resume_flag, fsync_flag,
-			    inplace_flag) == -1) {
+			    inplace_flag, 0) == -1) {
 				error("Download of file %s to %s failed",
 				    new_src, new_dst);
 				ret = -1;
@@ -2012,11 +2086,13 @@ sftp_xxhash_local_fd(int fd, uint64_t length, uint64_t *hash_out)
 		if (nread < 0) {
 			error_f("read failed: %s", strerror(errno));
 			XXH3_freeState(state);
+			(void)lseek(fd, pos_before, SEEK_SET);
 			return -1;
 		}
 		if (XXH3_64bits_update(state, buf, (size_t)nread) == XXH_ERROR) {
 			error_f("XXH3_64bits_update failed");
 			XXH3_freeState(state);
+			(void)lseek(fd, pos_before, SEEK_SET);
 			return -1;
 		}
 		remaining -= (uint64_t)nread;
@@ -2026,6 +2102,8 @@ sftp_xxhash_local_fd(int fd, uint64_t length, uint64_t *hash_out)
 	*hash_out = (uint64_t)hash;
 	debug3_f("local hash of first %llu bytes: %016llx",
 	    (unsigned long long)length, (unsigned long long)*hash_out);
+	if (lseek(fd, pos_before, SEEK_SET) == -1)
+		error_f("lseek restore failed: %s", strerror(errno));
 	return 0;
 }
 
