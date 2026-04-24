@@ -1576,6 +1576,10 @@ syserr:			run_err("%s: %s", name, strerror(errno));
 				fprintf(stderr, "%s: we got '%s' in inbuf length %ld buf was %ld\n",
 					hostname, inbuf, strlen(inbuf), strlen(buf));
 #endif
+			/* Check if remote sent an SCP error instead of a valid resume response */
+			if (inbuf[0] == '\x01')
+				fatal_f("Remote hpnscp is not compatible with the resume "
+				    "function. Please upgrade remote to latest version.");
 		}
 		if (response() < 0) {
 #ifdef DEBUG
@@ -1905,9 +1909,10 @@ sink(int argc, char **argv, const char *src)
 	int amt, exists, first, ofd;
 	mode_t mode, omode, mask;
 	off_t size, statbytes, xfer_size;
+	off_t resume_offset = 0; /* byte offset to seek to for direct resume; 0 = fresh write */
 	unsigned long long ull;
 	int setimes, targisdir, wrerr;
-	char ch, *cp, *np, *np_tmp, *targ, *why, *vect[1], buf[16384], visbuf[16384];
+	char ch, *cp, *np, *targ, *why, *vect[1], buf[16384], visbuf[16384];
 	char **patterns = NULL;
 	size_t n, npatterns = 0;
 	struct timeval tv[2];
@@ -1918,7 +1923,6 @@ sink(int argc, char **argv, const char *src)
 	char match;
 	int bad_match_flag = 0;
 	np = NULL; /* this was originally '/0' but that's wrong */
-	np_tmp = NULL;
 
 
 #define	atime	tv[0]
@@ -2111,8 +2115,10 @@ sink(int argc, char **argv, const char *src)
 #ifdef DEBUG
 			fprintf (stderr, "%s: '%s'\n", hostname, remote_hashsum);
 #endif
-			if (!cp || *cp++ != ' ')
-				SCREWUP("hash not delimited");
+			if (!cp || *cp != ' ')
+				fatal_f("Remote hpnscp is not compatible with the resume "
+				    "function. Please upgrade remote to latest version.");
+			cp++;
 		}
 #ifdef DEBUG
 		fprintf(stderr, "%s: cp is %s\n", hostname, cp);
@@ -2260,7 +2266,6 @@ sink(int argc, char **argv, const char *src)
 			/* if npstat.st_size is 0 then the local file doesn't exist and
 			 * we have to move it. Since we are in resume mode treat it as a resume */
 			if (npstat.st_size < xfer_size || (npstat.st_size == 0)) {
-				char rand_string[9];
 #ifdef DEBUG
 				fprintf (stderr, "%s: %s is smaller than %s\n", hostname, np, cp);
 #endif
@@ -2276,9 +2281,9 @@ sink(int argc, char **argv, const char *src)
 				fprintf(stderr, "%s: Sending new file (%s) modes: %s\n",
 					hostname, np, outbuf);
 #endif
-				/*now we have to send np's length and hash to the other end
-				 * if the computed hashes match then we seek to np's length in
-				 * file and append to np starting from there */
+				/* Send our partial size and hash to the source.  If the source
+				 * confirms a match we will seek directly to npstat.st_size in
+				 * the existing file and write the remainder there. */
 				(void) atomicio(vwrite, remout, outbuf, strlen(outbuf));
 #ifdef DEBUG
 				fprintf(stderr, "%s: New size: %ld, size: %ld, st_size: %ld\n",
@@ -2286,22 +2291,7 @@ sink(int argc, char **argv, const char *src)
 #endif
 				xfer_size = size - npstat.st_size;
 				resume_flag = 1;
-				np_tmp = xstrdup(np);
-				/* We should have a random component to avoid clobbering a
-				 * local file. Make sure it doesn't already exist and, if it does,
-				 * try again. Very unlikely for it to already exist though. */
-				rand_str(rand_string, 8);
-				strcat(np, rand_string);
-				while (stat(np, &stb) == 0) {
-					/* file exists, try a new suffix */
-					np[strlen(np) - 8] = '\0';  /* strip old suffix */
-					rand_str(rand_string, 8);
-					strcat(np, rand_string);
-				}
-#ifdef DEBUG
-				fprintf(stderr, "%s: Will concat %s to %s after xfer\n",
-					hostname, np, np_tmp);
-#endif
+				resume_offset = npstat.st_size;
 			} else if (npstat.st_size > size) {
 			/* the target file is larger than the source.
 			 * so we need to overwrite it. We don't need to send the hash though. */
@@ -2333,45 +2323,39 @@ sink(int argc, char **argv, const char *src)
 			/* the remote is always going to send a match status
 			 * so we need to read it so we don't get out of sync */
 			(void) atomicio(read, remin, &match, 1);
-			if (match != 'M') {/*fragments do not match*/
-				/* expected response of F, M and NULL *but*
-				 * anything other than M is a failure
-				 * if it's a NULL then we reset xfer_size but
-				 * we retain the file pointers */
+			if (match != 'M') {
+				/* Hash mismatch or unexpected response — transfer full file. */
+#ifdef DEBUG
+				fprintf(stderr, "%s: match status is '%c', restarting full transfer\n",
+					hostname, match);
+#endif
 				xfer_size = size;
+				resume_offset = 0;
 				bad_match_flag = 1;
-				if (match == 'F') {
-					/* got an F for failure and not NULL
-					 * so we want to swap over the filename from
-					 * the temp back to the original */
-#ifdef DEBUG
-					fprintf(stderr, "%s: match status is F\n", hostname);
-#endif
-					if (np_tmp != NULL)
-						np = np_tmp;
-					else {
-						continue;
-					}
-				} else {
-#ifdef DEBUG
-					fprintf(stderr, "%s: match received is NULL\n", hostname);
-#endif
-				}
 			} else {
 #ifdef DEBUG
-				fprintf(stderr, "%s match status is M\n", hostname);
+				fprintf(stderr, "%s: match status is M, resuming at offset %lld\n",
+					hostname, (long long)resume_offset);
 #endif
-				bad_match_flag = 0; /* while this is set at the beginning of the
-                                                     * loop I'm setting it here explicitly as well */
+				bad_match_flag = 0;
 			}
 		}
 
 #ifdef DEBUG
-		fprintf(stderr, "%s: Creating file. mode is %d for %s\n",
-			hostname, mode, np);
+		fprintf(stderr, "%s: Creating file. mode is %d for %s resume_offset=%lld\n",
+			hostname, mode, np, (long long)resume_offset);
 #endif
-		if ((ofd = open(np, O_WRONLY|O_CREAT, mode)) == -1) {
+		ofd = (resume_offset > 0)
+		    ? open(np, O_WRONLY, mode)
+		    : open(np, O_WRONLY|O_CREAT, mode);
+		if (ofd == -1) {
 bad:			run_err("%s: %s", np, strerror(errno));
+			continue;
+		}
+		if (resume_offset > 0 &&
+		    lseek(ofd, resume_offset, SEEK_SET) == -1) {
+			run_err("%s: lseek: %s", np, strerror(errno));
+			close(ofd);
 			continue;
 		}
 
@@ -2445,78 +2429,9 @@ bad:			run_err("%s: %s", np, strerror(errno));
 			wrerr = 1;
 		}
 		if (!wrerr && (!exists || S_ISREG(stb.st_mode)) &&
-		    ftruncate(ofd, xfer_size) != 0)
+		    ftruncate(ofd, resume_offset + xfer_size) != 0)
 			note_err("%s: truncate: %s", np, strerror(errno));
 
-                /* if np_tmp isn't set then we don't have a resume file to cat */
-		/* likewise, bad match flag means no resume flag */
-#ifdef DEBUG
-		fprintf (stderr, "%s: resume_flag: %d, np_tmp: %s, bad_match_flag: %d\n",
-			 hostname, resume_flag, np_tmp, bad_match_flag);
-#endif
-		if (resume_flag && np_tmp && !bad_match_flag) {
-			FILE *orig, *resume;
-			char res_buf[512]; /* set at 512 just because, might want to increase*/
-			ssize_t res_bytes = 0;
-			off_t sum = 0;
-			struct stat res_stat;
-			*res_buf = '\0';
-			orig = NULL; /*supress warnings*/
-			resume = NULL; /*supress warnings*/
-#ifdef DEBUG
-			fprintf(stderr, "%s: Resume flag is set. Going to concat %s to %s  now\n",
-				hostname, np, np_tmp);
-#endif
-			/* np/ofd is the resume file so open np_tmp for appending
-			 * close ofd because we are going to be shifting it
-			 * and I don't wnat the same file open in multiple descriptors */
-			if (close(ofd) == -1)
-				note_err("%s: close: %s", np, strerror(errno));
-			/* orig is the target file, resume is the temp file */
-			orig = fopen(np_tmp, "a"); /*open for appending*/
-			if (orig == NULL) {
-				fprintf(stderr, "%s: Could not open %s for appending.", hostname, np_tmp);
-				goto stopcat;
-			}
-			resume = fopen(np, "r"); /*open for reading only*/
-			if (resume == NULL) {
-				fprintf(stderr, "%s: Could not open %s for reading.", hostname, np);
-				goto stopcat;
-			}
-			/* get the number of bytes in the temp file*/
-			if (fstat(fileno(resume), &res_stat) == -1) {
-				fprintf(stderr, "%s: Could not stat %s", hostname, np);
-				goto stopcat;
-			}
-			/* while the number of bytes read from the temp file
-			 * is less than the size of the file read in a chunk and
-			 * write it to the target file */
-			do {
-				res_bytes = fread(res_buf, 1, 512, resume);
-				fwrite(res_buf, 1, res_bytes, orig);
-				sum += res_bytes;
-			} while (sum < res_stat.st_size);
-
-stopcat:		if (orig)
-				fclose(orig);
-			if (resume)
-				fclose(resume);
-			/* delete the resume file */
-			remove(np);
-#ifdef DEBUG
-			fprintf (stderr, "%s: np(%s) and np_tmp(%s)\n", hostname, np, np_tmp);
-#endif
-			np = np_tmp;
-#ifdef DEBUG
-			fprintf (stderr, "%s np(%s) and np_tmp(%s)\n", hostname, np, np_tmp);
-#endif
-			/* reset ofd to the original np */
-			if ((ofd = open(np_tmp, O_WRONLY)) == -1) {
-				fprintf(stderr, "%s: couldn't open %s in append function\n", hostname, np_tmp);
-				atomicio(vwrite, remout, "", 1);
-				goto bad;
-			}
-		}
 		if (pflag) {
 			if (exists || omode != mode)
 #ifdef HAVE_FCHMOD
@@ -2556,11 +2471,7 @@ stopcat:		if (orig)
 			fprintf (stderr, "%s: Sending null to remout.\n", hostname);
 #endif
 			(void) atomicio(vwrite, remout, "", 1); }
-		/* we are in resume mode and we have allocated memory for np_tmp */
-		if (resume_flag && np_tmp != NULL) {
-			free(np_tmp);
-			np_tmp = NULL;
-		}
+		resume_offset = 0; /* reset for next file */
         }
 done:
 	for (n = 0; n < npatterns; n++)
