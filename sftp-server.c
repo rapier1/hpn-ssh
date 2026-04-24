@@ -49,6 +49,9 @@
 #include "sftp.h"
 #include "sftp-common.h"
 
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
 char *sftp_realpath(const char *, char *); /* sftp-realpath.c */
 
 /* Maximum data read that we are willing to accept */
@@ -116,6 +119,7 @@ static void process_extended_expand(uint32_t id);
 static void process_extended_copy_data(uint32_t id);
 static void process_extended_home_directory(uint32_t id);
 static void process_extended_get_users_groups_by_id(uint32_t id);
+static void process_extended_hpn_check_file(uint32_t id);
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -166,6 +170,8 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_home_directory, 0 },
 	{ "users-groups-by-id", "users-groups-by-id@openssh.com", 0,
 	    process_extended_get_users_groups_by_id, 0 },
+	{ "hpn-check-file", "hpn-check-file@hpnssh.org", 0,
+	    process_extended_hpn_check_file, 0 },
 	{ NULL, NULL, 0, NULL, 0 }
 };
 
@@ -725,6 +731,7 @@ process_init(void)
 	compose_extension(msg, "copy-data", "1");
 	compose_extension(msg, "home-directory", "1");
 	compose_extension(msg, "users-groups-by-id@openssh.com", "1");
+	compose_extension(msg, "hpn-check-file@hpnssh.org", "1");
 
 	send_msg(msg);
 	sshbuf_free(msg);
@@ -1766,6 +1773,85 @@ process_extended_get_users_groups_by_id(uint32_t id)
 	sshbuf_free(usernames);
 	sshbuf_free(groupnames);
 	sshbuf_free(msg);
+}
+
+static void
+process_extended_hpn_check_file(uint32_t id)
+{
+	char *path = NULL;
+	uint64_t length;
+	int r;
+	int fd = -1;
+	XXH3_state_t *state = NULL;
+	XXH64_hash_t hash;
+	u_char buf[65536];
+	uint64_t remaining;
+	ssize_t nread;
+	struct sshbuf *msg;
+
+	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0 ||
+	    (r = sshbuf_get_u64(iqueue, &length)) != 0)
+		fatal_fr(r, "parse");
+
+	debug3("request %u: hpn-check-file \"%s\" length %llu",
+	    id, path, (unsigned long long)length);
+	logit("hpn-check-file \"%s\" length %llu", path,
+	    (unsigned long long)length);
+
+	if ((fd = open(path, O_RDONLY)) == -1) {
+		send_status(id, errno_to_portable(errno));
+		goto out;
+	}
+
+	if ((state = XXH3_createState()) == NULL) {
+		send_status(id, SSH2_FX_FAILURE);
+		goto out;
+	}
+	if (XXH3_64bits_reset(state) == XXH_ERROR) {
+		error_f("XXH3_64bits_reset failed");
+		send_status(id, SSH2_FX_FAILURE);
+		goto out;
+	}
+
+	remaining = length;
+	while (remaining > 0) {
+		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
+
+		nread = read(fd, buf, toread);
+		if (nread == 0)
+			break; /* EOF before length bytes — hash what we have */
+		if (nread < 0) {
+			send_status(id, errno_to_portable(errno));
+			goto out;
+		}
+		if (XXH3_64bits_update(state, buf, (size_t)nread) == XXH_ERROR) {
+			error_f("XXH3_64bits_update failed");
+			send_status(id, SSH2_FX_FAILURE);
+			goto out;
+		}
+		remaining -= (uint64_t)nread;
+	}
+	hash = XXH3_64bits_digest(state);
+	debug3("hpn-check-file: computed hash %016llx for \"%s\" "
+	    "length %llu", (unsigned long long)hash, path,
+	    (unsigned long long)length);
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u64(msg, (uint64_t)hash)) != 0)
+		fatal_fr(r, "compose");
+	debug3("hpn-check-file: sending EXTENDED_REPLY id=%u hash=%016llx",
+	    id, (unsigned long long)hash);
+	send_msg(msg);
+	sshbuf_free(msg);
+out:
+	if (state != NULL)
+		XXH3_freeState(state);
+	if (fd != -1)
+		close(fd);
+	free(path);
 }
 
 static void

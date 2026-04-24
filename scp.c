@@ -114,12 +114,8 @@
 #include "misc.h"
 #include "progressmeter.h"
 #include "utf8.h"
-/* libressl doesn't support the blake2b512 digest so
- * we need to prevent libressl from using the resume feature
- * cjr 7/18/2023 */
-#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
-#include <openssl/evp.h>
-#endif
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 #include "sftp.h"
 
 #include "sftp-common.h"
@@ -187,7 +183,7 @@ int resume_flag = 0; /* 0 is off, 1 is on */
 char hostname[HOST_NAME_MAX + 1];
 
 /* defines for the resume function. Need them even if not supported */
-#define HASH_LEN 128               /*40 sha1, 64 blake2s256 128 blake2b512*/
+#define HASH_LEN 16                /* XXH3_64bits: 8 bytes → 16 hex chars */
 #define BUF_AND_HASH HASH_LEN + 64 /* length of the hash and other data to get size of buffer */
 #define HASH_BUFLEN 8192	   /* 8192 seems to be a good balance between freads
 				    * and the digest func*/
@@ -466,7 +462,7 @@ void source(int, char *[]);
 void tolocal(int, char *[], enum scp_mode_e, char *sftp_direct);
 void toremote(int, char *[], enum scp_mode_e, char *sftp_direct);
 void usage(void);
-void calculate_hash(char *, char *, off_t); /*get the hash of file to length*/
+void calculate_hash(char *, char *, off_t); /* get the XXH3_64bits hash of file to length */
 void rand_str(char *, size_t); /*gen randome char string */
 
 void source_sftp(int, char *, char *, struct sftp_conn *);
@@ -600,13 +596,9 @@ main(int argc, char **argv)
 			addargs(&remote_remote_args, "-q");
 			showprogress = 0;
 			break;
-#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 		case 'Z':
-			/* currently resume only works in SCP mode */
 			resume_flag = 1;
-			mode = MODE_SCP;
 			break;
-#endif
 		case 'X':
 			/* Please keep in sync with sftp.c -X */
 			if (strncmp(optarg, "buffer=", 7) == 0) {
@@ -1352,65 +1344,53 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 /* calculate the hash of a file up to length bytes
  * this is used to determine if remote and local file
  * fragments match. There may be a more efficient process for the hashing
- * Note: LibreSSL doesn't support blake2b512 so we can't offer them
- * the resume feature cjr 7/18/2023 */
-#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
+ * Uses XXH3_64bits (streaming) and writes the result as a 16-char hex string
+ * into output (caller must provide at least HASH_LEN+1 bytes). */
 void calculate_hash(char *filename, char *output, off_t length)
 {
-	int n, md_len;
-	EVP_MD_CTX *c;
-	const EVP_MD *md;
+	XXH3_state_t *state;
+	XXH64_hash_t hash;
 	char buf[HASH_BUFLEN];
-	ssize_t bytes;
-	unsigned char out[EVP_MAX_MD_SIZE];
-	char tmp[3];
+	size_t bytes;
 	FILE *file_ptr;
+
 	*output = '\0';
 
-	/* open file for calculating hash */
 	file_ptr = fopen(filename, "r");
-	if (file_ptr==NULL)
-	{
-		if (verbose_mode) {
-			fprintf(stderr, "%s: error opening file %s\n", hostname, filename);
-			/* file the expected output with spaces */
-			snprintf(output, HASH_LEN, "%s",  " ");
-		}
+	if (file_ptr == NULL) {
+		if (verbose_mode)
+			fprintf(stderr, "%s: error opening file %s\n",
+			    hostname, filename);
 		return;
 	}
 
-	md = EVP_get_digestbyname("blake2b512");
-	c = EVP_MD_CTX_new();
-	EVP_DigestInit_ex(c, md, NULL);
+	state = XXH3_createState();
+	if (state == NULL) {
+		fclose(file_ptr);
+		return;
+	}
+	XXH3_64bits_reset(state);
 
 	while (length > 0) {
-		if (length > HASH_BUFLEN)
-			/* fread returns the number of elements read.
-			 * in this case 1. Multiply by the length to get the bytes */
-			bytes=fread(buf, HASH_BUFLEN, 1, file_ptr) * HASH_BUFLEN;
-		else
-			bytes=fread(buf, length, 1, file_ptr) * length;
-		EVP_DigestUpdate(c, buf, bytes);
-		length -= HASH_BUFLEN;
+		size_t toread = (length > HASH_BUFLEN) ?
+		    HASH_BUFLEN : (size_t)length;
+
+		bytes = fread(buf, 1, toread, file_ptr);
+		if (bytes == 0)
+			break; /* EOF */
+		XXH3_64bits_update(state, buf, bytes);
+		length -= (off_t)bytes;
 	}
-	EVP_DigestFinal(c, out, &md_len);
-	EVP_MD_CTX_free(c);
-	/* convert the hash into a string */
-	for(n=0; n < md_len; n++) {
-		snprintf(tmp, 3, "%02x", out[n]);
-		strncat(output, tmp, 3);
-	}
-#ifdef DEBUG
-	fprintf(stderr, "%s: HASH IS '%s' of length %ld\n", hostname, output, strlen(output));
-#endif
+	hash = XXH3_64bits_digest(state);
+	XXH3_freeState(state);
 	fclose(file_ptr);
+
+	/* Write hash as a fixed-width 16-char hex string (HASH_LEN). */
+	snprintf(output, HASH_LEN + 1, "%016llx", (unsigned long long)hash);
+#ifdef DEBUG
+	fprintf(stderr, "%s: HASH IS '%s'\n", hostname, output);
+#endif
 }
-#else
-void calculate_hash(char *filename, char *output, off_t length)
-{
-  /* empty function for builds without openssl or are using libressl */
-}
-#endif /* WITH_OPENSSL */
 
 #define TYPE_OVERFLOW(type, val) \
 	((sizeof(type) == 4 && (val) > INT32_MAX) || \
@@ -1485,11 +1465,12 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 
 	if (src_is_dir && iamrecursive) {
 		if (sftp_upload_dir(conn, src, abs_dst, pflag,
-		    SFTP_PROGRESS_ONLY, 0, 0, 1, 1) != 0) {
+		    SFTP_PROGRESS_ONLY, 0, resume_flag, 0, 1, 1) != 0) {
 			error("failed to upload directory %s to %s", src, targ);
 			errs = 1;
 		}
-	} else if (sftp_upload(conn, src, abs_dst, pflag, 0, 0, 1) != 0) {
+	} else if (sftp_upload(conn, src, abs_dst, pflag, 0,
+	    resume_flag, 0, 1) != 0) {
 		error("failed to upload file %s to %s", src, targ);
 		errs = 1;
 	}
@@ -2724,20 +2705,11 @@ response(void)
 void
 usage(void)
 {
-#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 	(void) fprintf(stderr,
 	    "usage: hpnscp [-346ABCOpqRrsTvZ] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n"
 	    "              [-i identity_file] [-J destination] [-l limit] [-o ssh_option]\n"
 	    "              [-P port] [-S program] [-X sftp_option] source ... target\n");
 	exit(1);
-#else
-	(void) fprintf(stderr,
-	    "usage: hpnscp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n"
-	    "              [-i identity_file] [-J destination] [-l limit]\n"
-	    "              [-o ssh_option] [-P port]"
-	    "              [-S program] source ... target\n");
-	exit(1);
-#endif
 
 }
 
