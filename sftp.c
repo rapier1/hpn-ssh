@@ -717,10 +717,16 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else {
-			if (sftp_download(conn, g.gl_pathv[i], abs_dst, NULL,
-			    pflag || global_pflag, resume,
-			    fflag || global_fflag, 0, verify) == -1)
+			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
+			    NULL, pflag || global_pflag, resume,
+			    fflag || global_fflag, 0, verify);
+			if (dr == -1)
 				err = -1;
+			else if (dr == 1)
+				mprintf("File skipped: Identical.\n");
+			else if (dr == 2)
+				mprintf("File skipped: Target is larger"
+				    " than source.\n");
 		}
 		free(abs_dst);
 		abs_dst = NULL;
@@ -820,10 +826,16 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else {
-			if (sftp_upload(conn, g.gl_pathv[i], abs_dst,
+			int ur = sftp_upload(conn, g.gl_pathv[i], abs_dst,
 			    pflag || global_pflag, resume, verify,
-			    fflag || global_fflag, 0) == -1)
+			    fflag || global_fflag, 0);
+			if (ur == -1)
 				err = -1;
+			else if (ur == 1)
+				mprintf("File skipped: Identical.\n");
+			else if (ur == 2)
+				mprintf("File skipped: Target is larger"
+				    " than source.\n");
 		}
 	}
 

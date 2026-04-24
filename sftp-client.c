@@ -1655,6 +1655,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		return -1;
 	}
 	if (resume_flag) {
+		/* -1=error, 1=identical, 2=target larger than source */
+		int skip_ret = -1;
 		if (fstat(local_fd, &st) == -1) {
 			error("stat local \"%s\": %s",
 			    local_path, strerror(errno));
@@ -1669,10 +1671,12 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			 * Verified resume: refuse if local >= remote (nothing
 			 * useful to resume or verify).
 			 */
-			if ((uint64_t)st.st_size >= size) {
-				error("verified resume \"%s\": "
-				    "local file same size or larger",
-				    local_path);
+			if ((uint64_t)st.st_size == size) {
+				skip_ret = 1; /* identical */
+				goto resume_fail;
+			}
+			if ((uint64_t)st.st_size > size) {
+				skip_ret = 2; /* target larger than source */
 				goto resume_fail;
 			}
 			if (st.st_size > 0) {
@@ -1726,9 +1730,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		} else {
 			/* Plain size-only resume */
 			if ((uint64_t)st.st_size > size) {
-				error("Unable to resume download of \"%s\": "
-				    "local file is larger than remote",
-				    local_path);
+				skip_ret = 2; /* target larger than source */
 				goto resume_fail;
 			}
 			offset = highwater = maxack = st.st_size;
@@ -1739,7 +1741,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		free(handle);
 		if (local_fd != -1)
 			close(local_fd);
-		return -1;
+		return skip_ret;
  resume_done:
 		;
 	}
@@ -2039,12 +2041,18 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			    fsync_flag, follow_link_flag, inplace_flag) == -1)
 				ret = -1;
 		} else if (S_ISREG(a->perm)) {
-			if (sftp_download(conn, new_src, new_dst, a,
+			int dr = sftp_download(conn, new_src, new_dst, a,
 			    preserve_flag, resume_flag, fsync_flag,
-			    inplace_flag, 0) == -1) {
+			    inplace_flag, 0);
+			if (dr == -1) {
 				error("Download of file %s to %s failed",
 				    new_src, new_dst);
 				ret = -1;
+			} else if (dr == 1) {
+				mprintf("File skipped: Identical.\n");
+			} else if (dr == 2) {
+				mprintf("File skipped: Target is larger"
+				    " than source.\n");
 			}
 		} else
 			logit("download \"%s\": not a regular file", new_src);
@@ -2298,11 +2306,13 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			debug3_f("remote file exists, size=%llu local_size=%llu",
 			    (unsigned long long)c.size,
 			    (unsigned long long)sb.st_size);
-			if ((off_t)c.size >= sb.st_size) {
-				error("resume \"%s\": destination file "
-				    "same size or larger", local_path);
+			if ((off_t)c.size == sb.st_size) {
 				close(local_fd);
-				return -1;
+				return 1; /* identical */
+			}
+			if ((off_t)c.size > sb.st_size) {
+				close(local_fd);
+				return 2; /* target larger than source */
 			}
 			{
 				uint64_t local_hash, remote_hash;
@@ -2353,11 +2363,13 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				close(local_fd);
 				return -1;
 			}
-			if ((off_t)c.size >= sb.st_size) {
-				error("resume \"%s\": destination file "
-				    "same size or larger", local_path);
+			if ((off_t)c.size == sb.st_size) {
 				close(local_fd);
-				return -1;
+				return 1; /* identical */
+			}
+			if ((off_t)c.size > sb.st_size) {
+				close(local_fd);
+				return 2; /* target larger than source */
 			}
 		}
 		if (lseek(local_fd, (off_t)c.size, SEEK_SET) == -1) {
@@ -2636,12 +2648,18 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			    inplace_flag) == -1)
 				ret = -1;
 		} else if (S_ISREG(sb.st_mode)) {
-			if (sftp_upload(conn, new_src, new_dst,
+			int ur = sftp_upload(conn, new_src, new_dst,
 			    preserve_flag, resume, verify, fsync_flag,
-			    inplace_flag) == -1) {
+			    inplace_flag);
+			if (ur == -1) {
 				error("upload \"%s\" to \"%s\" failed",
 				    new_src, new_dst);
 				ret = -1;
+			} else if (ur == 1) {
+				mprintf("File skipped: Identical.\n");
+			} else if (ur == 2) {
+				mprintf("File skipped: Target is larger"
+				    " than source.\n");
 			}
 		} else
 			logit("%s: not a regular file", filename);
