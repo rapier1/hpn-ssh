@@ -148,17 +148,20 @@ int sftp_download_dir(struct sftp_conn *, const char *, const char *, Attrib *,
 
 /*
  * Upload 'local_path' to 'remote_path'. Preserve permissions and times
- * if 'pflag' is set
+ * if 'pflag' is set. If 'verify' is set and the server supports the
+ * hpn-check-file@hpnssh.org extension, hash-compare the overlapping prefix
+ * before deciding whether to resume or restart. Falls back to size-only
+ * resume if the extension is unavailable.
  */
 int sftp_upload(struct sftp_conn *, const char *, const char *,
-    int, int, int, int);
+    int, int, int, int, int);
 
 /*
  * Recursively upload 'local_directory' to 'remote_directory'. Preserve
- * times if 'pflag' is set
+ * times if 'pflag' is set. 'verify' is propagated to each file upload.
  */
 int sftp_upload_dir(struct sftp_conn *, const char *, const char *,
-    int, int, int, int, int, int);
+    int, int, int, int, int, int, int);
 
 /*
  * Download a 'from_path' from the 'from' connection and upload it to

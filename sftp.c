@@ -145,6 +145,7 @@ enum sftp_command {
 	I_REGET,
 	I_RENAME,
 	I_REPUT,
+	I_VREPUT,
 	I_RM,
 	I_RMDIR,
 	I_SHELL,
@@ -197,6 +198,7 @@ static const struct CMD cmds[] = {
 	{ "reget",	I_REGET,	REMOTE,		LOCAL	},
 	{ "rename",	I_RENAME,	REMOTE,		REMOTE	},
 	{ "reput",	I_REPUT,	LOCAL,		REMOTE	},
+	{ "reputv",	I_VREPUT,	LOCAL,		REMOTE	},
 	{ "rm",		I_RM,		REMOTE,		NOARGS	},
 	{ "rmdir",	I_RMDIR,	REMOTE,		NOARGS	},
 	{ "symlink",	I_SYMLINK,	REMOTE,		REMOTE	},
@@ -300,6 +302,7 @@ help(void)
 	    "reget [-fpR] remote [local]        Resume download file\n"
 	    "rename oldpath newpath             Rename remote file\n"
 	    "reput [-fpR] local [remote]        Resume upload file\n"
+	    "reputv [-fpR] local [remote]       Resume upload with hash verification\n"
 	    "rm path                            Delete remote file\n"
 	    "rmdir path                         Remove remote directory\n"
 	    "symlink oldpath newpath            Symlink remote file\n"
@@ -725,7 +728,7 @@ out:
 
 static int
 process_put(struct sftp_conn *conn, const char *src, const char *dst,
-    const char *pwd, int pflag, int rflag, int resume, int fflag)
+    const char *pwd, int pflag, int rflag, int resume, int fflag, int verify)
 {
 	char *tmp_dst = NULL;
 	char *abs_dst = NULL;
@@ -794,7 +797,10 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		free(tmp);
 
 		resume |= global_aflag;
-		if (!quiet && resume)
+		if (!quiet && verify)
+			mprintf("Uploading %s to %s (verified resume)\n",
+			    g.gl_pathv[i], abs_dst);
+		else if (!quiet && resume)
 			mprintf("Resuming upload of %s to %s\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && !resume)
@@ -804,12 +810,12 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
 		    (rflag || global_rflag)) {
 			if (sftp_upload_dir(conn, g.gl_pathv[i], abs_dst,
-			    pflag || global_pflag, 1, resume,
+			    pflag || global_pflag, 1, resume, verify,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else {
 			if (sftp_upload(conn, g.gl_pathv[i], abs_dst,
-			    pflag || global_pflag, resume,
+			    pflag || global_pflag, resume, verify,
 			    fflag || global_fflag, 0) == -1)
 				err = -1;
 		}
@@ -1401,6 +1407,7 @@ parse_args(const char **cpp, int *ignore_errors, int *disable_echo, int *aflag,
 	case I_GET:
 	case I_REGET:
 	case I_REPUT:
+	case I_VREPUT:
 	case I_PUT:
 		if ((optidx = parse_getput_flags(cmd, argv, argc,
 		    aflag, fflag, pflag, rflag)) == -1)
@@ -1587,12 +1594,17 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		err = process_get(conn, path1, path2, *pwd, pflag,
 		    rflag, aflag, fflag);
 		break;
+	case I_VREPUT:
+		aflag = 1;
+		err = process_put(conn, path1, path2, *pwd, pflag,
+		    rflag, aflag, fflag, 1 /* verify */);
+		break;
 	case I_REPUT:
 		aflag = 1;
 		/* FALLTHROUGH */
 	case I_PUT:
 		err = process_put(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag);
+		    rflag, aflag, fflag, 0 /* verify */);
 		break;
 	case I_COPY:
 		path1 = sftp_make_absolute(path1, *pwd);
