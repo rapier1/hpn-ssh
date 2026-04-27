@@ -285,7 +285,7 @@ stop_and_join_pregen_threads(struct ssh_aes_ctr_ctx_mt *c)
 static void *
 thread_loop(void *x)
 {
-	EVP_CIPHER_CTX *aesni_ctx;
+	EVP_CIPHER_CTX * volatile aesni_ctx;
 	struct ssh_aes_ctr_ctx_mt *c = x;
 	struct kq *q;
 	struct aes_mt_ctx_ptrs *ptr;

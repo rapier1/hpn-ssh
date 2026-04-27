@@ -211,7 +211,7 @@ static int get_thread_count() {
 static void *
 thread_loop(void *job)
 {
-	EVP_CIPHER_CTX *evp_ctx;
+	EVP_CIPHER_CTX * volatile evp_ctx;
 	struct aes_mt_ctx_st *aes_mt_ctx = job;
 	struct kq *q;
 	struct aes_mt_ctx_ptrs *ptr;
