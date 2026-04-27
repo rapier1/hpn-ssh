@@ -3195,6 +3195,8 @@ fmt_intarg(ServerOpCodes code, int val)
 		return fmt_multistate_int(val, multistate_tcpfwd);
 	case sIgnoreRhosts:
 		return fmt_multistate_int(val, multistate_ignore_rhosts);
+	case sHPNMemoryLimit:
+		return fmt_multistate_int(val, multistate_hpnmemorylimit);
 	case sFingerprintHash:
 		return ssh_digest_alg_name(val);
 	default:

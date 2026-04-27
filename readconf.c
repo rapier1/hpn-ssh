@@ -3778,6 +3778,8 @@ fmt_intarg(OpCodes code, int val)
 		return fmt_multistate_int(val, multistate_yesnoaskconfirm);
 	case oPubkeyAuthentication:
 		return fmt_multistate_int(val, multistate_pubkey_auth);
+	case oHPNMemoryLimit:
+		return fmt_multistate_int(val, multistate_hpnmemorylimit);
 	case oFingerprintHash:
 		return ssh_digest_alg_name(val);
 	default:
@@ -3960,7 +3962,7 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oTcpRcvBufPoll, o->tcp_rcv_buf_poll);
 	dump_cfg_fmtint(oHPNDisabled, o->hpn_disabled);
 	dump_cfg_fmtint(oHPNMemoryLimit, o->hpn_memory_limit);
-	dump_cfg_fmtint(oNoneSwitch, o->none_switch);
+	/* NoneSwitch is command-line only; omit from -G dump to allow reparse */
 	dump_cfg_fmtint(oNoneEnabled, o->none_enabled);
 	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
 	dump_cfg_fmtint(oFallback, o->fallback);
