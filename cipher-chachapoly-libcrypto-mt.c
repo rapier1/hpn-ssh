@@ -17,6 +17,7 @@
  */
 
 /* TODO: audit includes */
+/* audited removed stdarg.h and stdio.h */
 
 #include "includes.h"
 #ifdef WITH_OPENSSL
@@ -27,9 +28,7 @@
 
 #include <sys/types.h>
 #include <unistd.h> /* needed for getpid under C99 */
-#include <stdarg.h> /* needed for log.h */
 #include <string.h>
-#include <stdio.h>  /* needed for misc.h */
 #include <pthread.h>
 
 #include <openssl/evp.h>
@@ -63,7 +62,7 @@
  * waiting on the worker threads for keystream data */
 #define NUMTHREADS 1
 
-/* 64 seems to be a pretty blance between memory and performance
+/* 64 seems to be a pretty good balance between memory and performance
  * 128 is another option with somewhat higher memory consumption */
 #define NUMSTREAMS 64
 
@@ -314,6 +313,7 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 		goto fail;
 	if ((ctx_mt->poly_ctx = EVP_MAC_CTX_new(mac)) == NULL)
 		goto fail;
+	EVP_MAC_free(mac); /* no longer needed */
 #elif !defined(WITH_OPENSSL3) && defined(EVP_PKEY_POLY1305)
 	if ((ctx_mt->md_ctx = EVP_MD_CTX_new()) == NULL)
 		goto fail;
@@ -354,7 +354,7 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 		for (tDataI--; tDataI >= 0; tDataI--)
 			free_threadData(&(ctx_mt->batches[1].tds[tDataI]));
 		/* Free the batches[0] tds too */
-		for (tDataI = NUMTHREADS; tDataI >= 0; tDataI--)
+		for (tDataI = NUMTHREADS - 1; tDataI >= 0; tDataI--)
 			free_threadData(&(ctx_mt->batches[0].tds[tDataI]));
 		goto fail;
 	}
@@ -401,6 +401,7 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 
  fail:
 #ifdef OPENSSL_HAVE_POLY_EVP
+	EVP_MAC_free(mac);
 	if (ctx_mt->poly_ctx != NULL) {
 		EVP_MAC_CTX_free(ctx_mt->poly_ctx);
 		ctx_mt->poly_ctx = NULL;
@@ -472,7 +473,7 @@ manager_thread(struct manager_thread_args * margs) {
 	u_int batchID = oldBatchID + 2;
 
 	pthread_t tid[NUMTHREADS];
-	struct worker_thread_args * wargs = malloc(NUMTHREADS * sizeof(*wargs));
+	struct worker_thread_args * wargs = xmalloc(NUMTHREADS * sizeof(*wargs));
 	int ti;
 
 	for (ti = 0; ti < NUMTHREADS; ti++) {
@@ -533,19 +534,6 @@ int
 chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
     const u_char *src, u_int len, u_int aadlen, u_int authlen, int do_encrypt)
 {
-#ifdef SAFETY
-	if (ctx_mt->mainpid != getpid()) { /* we're a fork */
-		/*
-		 * TODO: this is EXTREMELY RARE, may never happen at all (only
-		 * if the fork calls crypt), so we should tell the compiler.
-		 */
-		/* The worker threads don't exist, we could spawn them? */
-		debug_f("Fork called crypt without workers!");
-		chachapoly_free_mt(ctx_mt);
-		return SSH_ERR_INTERNAL_ERROR;
-	}
-#endif
-
 	pthread_t * manager_tid = &(ctx_mt->manager_tid[ctx_mt->batchID % 2]);
 	if (unlikely(*manager_tid != ctx_mt->self_tid)) {
 		int ret = join_manager_thread(*manager_tid);
@@ -561,100 +549,102 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 
 	int r = SSH_ERR_INTERNAL_ERROR;
 
-#ifdef SAFETY
-	if (batch->batchID == ctx_mt->batchID) { /* Safety check */
-#endif
-		/* check tag before anything else */
-		if (!do_encrypt) {
-			const u_char *tag = src + aadlen + len;
-			u_char expected_tag[POLY1305_TAGLEN];
+	/* check tag before anything else */
+	if (!do_encrypt) {
+		const u_char *tag = src + aadlen + len;
+		u_char expected_tag[POLY1305_TAGLEN];
 #if !defined(WITH_OPENSSL3) && defined(EVP_PKEY_POLY1305)
+		if ((EVP_PKEY_CTX_ctrl(ctx_mt->poly_ctx, -1,
+		    EVP_PKEY_OP_SIGNCTX, EVP_PKEY_CTRL_SET_MAC_KEY,
+		    POLY1305_KEYLEN, ks->poly_key) <= 0) ||
+		    (EVP_DigestSignUpdate(ctx_mt->md_ctx, src, aadlen + len) == 0)) {
+			debug_f("SSL error while decrypting poly1305 tag");
+			return SSH_ERR_INTERNAL_ERROR;
+		}
+		ctx_mt->ptaglen = POLY1305_TAGLEN;
+		if (EVP_DigestSignFinal(ctx_mt->md_ctx, expected_tag,
+		    &ctx_mt->ptaglen) == 0) {
+			debug_f("SSL error while finalizing decrypted poly1305");
+			return SSH_ERR_INTERNAL_ERROR;
+		}
+#else
+		poly1305_auth(ctx_mt->poly_ctx, expected_tag, src,
+	            aadlen + len, ks->poly_key);
+#endif
+		if (timingsafe_bcmp(expected_tag, tag, POLY1305_TAGLEN) != 0)
+			r = SSH_ERR_MAC_INVALID;
+		explicit_bzero(expected_tag, sizeof(expected_tag));
+	}
+	if (r != SSH_ERR_MAC_INVALID) {
+		/* Crypt additional data (i.e., packet length) */
+		/* TODO: is aadlen always four bytes? */
+		/* For chachapoly yes. It is always 4 bytes -cjr */
+		/* TODO: do we always have an aadlen? */
+		/* chachapoly will always have aadlen but cipher_crypt()
+		 * does not *require* that aadlen be set. However
+		 * chachapoly won't function without it -cjr */
+		/*if (aadlen)
+		  for (u_int i=0; i<aadlen; i++)
+		  dest[i] = ks->headerStream[i] ^ src[i]; */
+		/* the first 4 bytes are the aadlen */
+		uint32_t aad_src, aad_key, aad_dst;
+		memcpy(&aad_src, src, sizeof(uint32_t));
+		memcpy(&aad_key, ks->headerStream, sizeof(uint32_t));
+		aad_dst = aad_src ^ aad_key;
+		memcpy(dest, &aad_dst, sizeof(uint32_t));
+		/* Crypt payload */
+		fastXOR2(dest+aadlen,src+aadlen,ks->mainStream,len);
+		/* calculate and append tag */
+#if !defined(WITH_OPENSSL3) && defined(EVP_PKEY_POLY1305)
+		if (do_encrypt) {
 			if ((EVP_PKEY_CTX_ctrl(ctx_mt->poly_ctx, -1,
 			    EVP_PKEY_OP_SIGNCTX, EVP_PKEY_CTRL_SET_MAC_KEY,
-			    POLY1305_KEYLEN, ks->poly_key) <= 0) ||
-			    (EVP_DigestSignUpdate(ctx_mt->md_ctx, src, aadlen + len) == 0)) {
-				debug_f("SSL error while decrypting poly1305 tag");
+			    POLY1305_KEYLEN, ks->poly_key) <=0) ||
+			    (EVP_DigestSignUpdate(ctx_mt->md_ctx, dest, aadlen + len) == 0)) {
+				debug_f ("SSL error while encrypting poly1305 tag");
 				return SSH_ERR_INTERNAL_ERROR;
 			}
 			ctx_mt->ptaglen = POLY1305_TAGLEN;
-			if (EVP_DigestSignFinal(ctx_mt->md_ctx, expected_tag,
+			if (EVP_DigestSignFinal(ctx_mt->md_ctx, dest+aadlen+len,
 			    &ctx_mt->ptaglen) == 0) {
-				debug_f("SSL error while finalizing decyrpted poly1305");
+				debug_f("SSL error while finalizing decrypted poly1305");
 				return SSH_ERR_INTERNAL_ERROR;
 			}
+		}
 #else
-			poly1305_auth(ctx_mt->poly_ctx, expected_tag, src,
-			    aadlen + len, ks->poly_key);
+		if (do_encrypt)
+			poly1305_auth(ctx_mt->poly_ctx, dest+aadlen+len,
+			    dest, aadlen+len, ks->poly_key);
 #endif
-			if (timingsafe_bcmp(expected_tag, tag, POLY1305_TAGLEN)
-			    != 0)
-				r = SSH_ERR_MAC_INVALID;
-			explicit_bzero(expected_tag, sizeof(expected_tag));
-		}
-		if (r != SSH_ERR_MAC_INVALID) {
-			/* Crypt additional data (i.e., packet length) */
-			/* TODO: is aadlen always four bytes? */
-			/* TODO: do we always have an aadlen? */
-			if (aadlen)
-				for (u_int i=0; i<aadlen; i++)
-					dest[i] = ks->headerStream[i] ^ src[i];
-			/* Crypt payload */
-			fastXOR2(dest+aadlen,src+aadlen,ks->mainStream,len);
-			/* calculate and append tag */
-#if !defined(WITH_OPENSSL3) && defined(EVP_PKEY_POLY1305)
-			if (do_encrypt) {
-				if ((EVP_PKEY_CTX_ctrl(ctx_mt->poly_ctx, -1,
-				    EVP_PKEY_OP_SIGNCTX, EVP_PKEY_CTRL_SET_MAC_KEY,
-				    POLY1305_KEYLEN, ks->poly_key) <=0) ||
-				    (EVP_DigestSignUpdate(ctx_mt->md_ctx, dest, aadlen + len) == 0)) {
-					debug_f ("SSL error while encrypting poly1305 tag");
-					return SSH_ERR_INTERNAL_ERROR;
-				}
-				ctx_mt->ptaglen = POLY1305_TAGLEN;
-				if (EVP_DigestSignFinal(ctx_mt->md_ctx, dest+aadlen+len,
-				    &ctx_mt->ptaglen) == 0) {
-					debug_f("SSL error while finalizing decyrpted poly1305");
-					return SSH_ERR_INTERNAL_ERROR;
-				}
-			}
-#else
-			if (do_encrypt)
-				poly1305_auth(ctx_mt->poly_ctx, dest+aadlen+len,
-				    dest, aadlen+len, ks->poly_key);
-#endif
-			r=0; /* Success! */
-		}
-		if (r) /* Anything nonzero is an error. */
-			return r;
-
-		ctx_mt->seqnr = seqnr + 1;
-
-		if (unlikely(ctx_mt->seqnr / NUMSTREAMS > ctx_mt->batchID)) {
-			struct manager_thread_args * args =
-			    malloc(sizeof(*args));
-			if (args == NULL) {
-				return SSH_ERR_INTERNAL_ERROR;
-			}
-			args->ctx_mt = ctx_mt;
-			args->oldBatchID = ctx_mt->batchID;
-			if (pthread_create(&(ctx_mt->manager_tid[ctx_mt->batchID
-			    % 2]), NULL, (void *) manager_thread, args) != 0) {
-				free(args);
-				return SSH_ERR_INTERNAL_ERROR;
-			}
-			ctx_mt->batchID = ctx_mt->seqnr / NUMSTREAMS;
-		}
-
-		/* TODO: Nothing we need to sanitize here? */
-
-		return 0;
-#ifdef SAFETY
-	} else { /* Bad, it's the wrong batch. */
-		debug_f( "Pre-crypt batch miss! Seeking %u, found %u. Failing.",
-		    ctx_mt->batchID, batch->batchID);
-		return SSH_ERR_INTERNAL_ERROR;
+		r=0; /* Success! */
 	}
-#endif
+	if (r) /* Anything nonzero is an error. */
+		return r;
+
+	ctx_mt->seqnr = seqnr + 1;
+
+	if (unlikely(ctx_mt->seqnr / NUMSTREAMS > ctx_mt->batchID)) {
+		struct manager_thread_args * args =
+			xmalloc(sizeof(*args));
+		if (args == NULL) {
+			return SSH_ERR_INTERNAL_ERROR;
+		}
+		args->ctx_mt = ctx_mt;
+		args->oldBatchID = ctx_mt->batchID;
+		if (pthread_create(&(ctx_mt->manager_tid[ctx_mt->batchID
+		     % 2]), NULL, (void *) manager_thread, args) != 0) {
+			free(args);
+			return SSH_ERR_INTERNAL_ERROR;
+		}
+		ctx_mt->batchID = ctx_mt->seqnr / NUMSTREAMS;
+	}
+
+	/* TODO: Nothing we need to sanitize here? */
+	/* no need to zero anything out. poly_key, headerStream,
+	 * and mainStream persist in the batch struct but are
+	 * overwritten by generate_keystream() on reuse. - cjr */
+
+	return 0;
 }
 
 int
@@ -662,12 +652,7 @@ chachapoly_get_length_mt(struct chachapoly_ctx_mt *ctx_mt, u_int *plenp,
     u_int seqnr, const u_char *cp, u_int len)
 {
 	/* TODO: add compiler hints */
-#ifdef SAFETY
-	if (ctx_mt->mainpid != getpid()) { /* Use serial mode if we're a fork */
-		debug_f("We're a fork. Failing.");
-		return SSH_ERR_INTERNAL_ERROR;
-	}
-#endif
+	/* I don't think hints are necessary -cjr */
 
 	if (len < 4)
 		return SSH_ERR_MESSAGE_INCOMPLETE;
@@ -681,25 +666,12 @@ chachapoly_get_length_mt(struct chachapoly_ctx_mt *ctx_mt, u_int *plenp,
 	}
 
 	u_char buf[4];
-#ifdef SAFETY
-	u_int sought_batchID = seqnr / NUMSTREAMS;
-#endif
 	struct mt_keystream_batch * batch =
 	    &(ctx_mt->batches[ctx_mt->batchID % 2]);
 	struct mt_keystream * ks = &(batch->streams[seqnr % NUMSTREAMS]);
-#ifdef SAFETY
-	if (batch->batchID == sought_batchID) {
-#endif
-		for (u_int i=0; i < sizeof(buf); i++)
-			buf[i]=ks->headerStream[i] ^ cp[i];
-		*plenp = PEEK_U32(buf);
-		return 0;
-#ifdef SAFETY
-	} else {
-		debug_f("Batch miss! Seeking %u, found %u. Failing.",
-		    sought_batchID, batch->batchID);
-		return SSH_ERR_INTERNAL_ERROR;
-	}
-#endif
+	for (u_int i=0; i < sizeof(buf); i++)
+		buf[i]=ks->headerStream[i] ^ cp[i];
+	*plenp = PEEK_U32(buf);
+	return 0;
 }
 #endif /* defined(HAVE_EVP_CHACHA20) && !defined(HAVE_BROKEN_CHACHA20) */

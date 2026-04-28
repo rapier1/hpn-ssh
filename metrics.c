@@ -37,7 +37,7 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
  * these measurements existed in previous kernels but the oldest this
  * is going to support is 3.7.0. We do need to store the kernel version as well */
 
-/* obvioulsy the version code macro only exists under linux so
+/* obviously the version code macro only exists under linux so
  * on non linux systems we set the kernel version to 0
  * which will get us the base set of metrics from netinet/tcp.h
  */

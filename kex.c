@@ -807,12 +807,6 @@ kex_ready(struct ssh *ssh, char *proposal[PROPOSAL_MAX])
 	    patch_list(proposal[PROPOSAL_ENC_ALGS_CTOS]);
 	proposal[PROPOSAL_ENC_ALGS_STOC] =
 	    patch_list(proposal[PROPOSAL_ENC_ALGS_STOC]);
-
-	/*
-	 * TODO: Likely memory leak here. The original contents of
-	 * proposal[PROPOSAL_ENC_ALGS_CTOS] are no longer accessible or
-	 * freeable.
-	 */
 #endif
 
 	if ((r = kex_prop2buf(ssh->kex->my, proposal)) != 0)

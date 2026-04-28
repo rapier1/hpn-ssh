@@ -507,6 +507,7 @@ ssh_userauth2(struct ssh *ssh, const char *local_user,
 			/* NONEMAC can only be used in context of the NONE CIPHER */
 			if (options.nonemac_enabled == 1) {
 				const char *none_mac = "none";
+				kex_proposal_free_entries(myproposal);  /* free first call's allocations */
 				kex_proposal_populate_entries(ssh, myproposal, s, none_cipher,
 							      none_mac,
 							      compression_alg_list(options.compression),

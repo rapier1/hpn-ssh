@@ -48,7 +48,7 @@
  * loop and multiple calls to EVP_EncryptUpdate. Doing so
  * dramatically reduced CPU load in the threads and indicated
  * that we could also eliminate most of the threads and queues
- * as it would take far less time for a queue to ebter KQ_FULL
+ * as it would take far less time for a queue to enter KQ_FULL
  * state. As such, we've reduced the default number of threads
  * and queues from 2 and 8 (respectively) to 1 and 2. We've also
  * elimnated the need to determine the physical number of cores on
@@ -163,7 +163,10 @@ stop_and_join_pregen_threads(struct aes_mt_ctx_st *aes_mt_ctx)
 			 * created in thread_loop. */
 			struct aes_mt_ctx_ptrs *ptr;
 			HASH_FIND_INT(evp_ptrs, &aes_mt_ctx->tid[i], ptr);
-			EVP_CIPHER_CTX_free(ptr->pointer);
+			if (ptr != NULL)
+				EVP_CIPHER_CTX_free(ptr->pointer);
+			else
+				fatal_f ("Cannot find entry in hash table for thread id");
 			HASH_DEL(evp_ptrs, ptr);
 			free(ptr);
                 }
@@ -233,13 +236,13 @@ thread_loop(void *job)
 	 * thread id, which is available to us in the free function.
 	 * Note, the thread id isn't necessary unique across rekeys but
 	 * that's okay as they are unique during a key. */
-	ptr = malloc(sizeof *ptr); /*freed in stop & prejoin */
+	ptr = xmalloc(sizeof *ptr); /*freed in stop & prejoin */
 	ptr->tid = pthread_self(); /* index for hash */
 	ptr->pointer = evp_ctx;
 	HASH_ADD_INT(evp_ptrs, tid, ptr);
 
 	/* initialize the cipher ctx with the key provided
-	 * determinbe which cipher to use based on the key size */
+	 * determine which cipher to use based on the key size */
 	if (aes_mt_ctx->keylen == 256)
 		EVP_EncryptInit_ex(evp_ctx, EVP_aes_256_ctr(), NULL, aes_mt_ctx->orig_key, NULL);
 	else if (aes_mt_ctx->keylen == 128)
@@ -261,7 +264,7 @@ thread_loop(void *job)
 		if (q->qstate == KQINIT) {
 			/* set the initial counter */
 			EVP_EncryptInit_ex(evp_ctx, NULL, NULL, NULL, q->ctr);
-			/* encypher a block sized null string (mynull) with the key. This
+			/* encipher a block sized null string (mynull) with the key. This
 			 * returns the keystream because xoring the keystream
 			 * against null returns the keystream. Store that in the appropriate queue */
 			EVP_EncryptUpdate(evp_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
@@ -324,7 +327,7 @@ thread_loop(void *job)
 		/* set the initial counter */
 		EVP_EncryptInit_ex(evp_ctx, NULL, NULL, NULL, q->ctr);
 
-		/* see coresponding block above for useful comments */
+		/* see corresponding block above for useful comments */
 		EVP_EncryptUpdate(evp_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
 
 		/* Re-lock, mark full and signal consumer */
@@ -353,14 +356,14 @@ thread_loop(void *job)
 /* honestly the way this works makes me think that there has to be
  * a better way of doing this however, I've yet to find one that doesn't
  * involve more madness. I think that's mostly becase I don't understand
- * how params work properly. I feel like I shoudl be able to use them
+ * how params work properly. I feel like I should be able to use them
  * to specify the key length but... also, I'd think I'd be able to
  * set aes_mt_ctx_st->keylen to the keylength but that doesn't seem to
  * work either. That said, this does work even if it's a bit clunky.
  * -cjr 09/08/2022 */
 void *aes_mt_newctx_256(void *provctx)
 {
-	struct aes_mt_ctx_st *aes_mt_ctx = malloc(sizeof(*aes_mt_ctx));
+	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
 	EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
@@ -388,7 +391,7 @@ void *aes_mt_newctx_256(void *provctx)
 
 void *aes_mt_newctx_192(void *provctx)
 {
-	struct aes_mt_ctx_st *aes_mt_ctx = malloc(sizeof(*aes_mt_ctx));
+	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
 	EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
@@ -416,7 +419,7 @@ void *aes_mt_newctx_192(void *provctx)
 
 void *aes_mt_newctx_128(void *provctx)
 {
-	struct aes_mt_ctx_st *aes_mt_ctx = malloc(sizeof(*aes_mt_ctx));
+	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
 	EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
@@ -542,8 +545,9 @@ int aes_mt_start_threads(void *vevp_ctx, const u_char *key,
 			}
 			pthread_rwlock_unlock(&aes_mt_ctx->tid_lock);
 		}
+		pthread_attr_destroy(&attr);
 		pthread_mutex_lock(&aes_mt_ctx->q[0].lock);
-		// wait for all of the threads to be initialized
+		/* wait for all of the threads to be initialized */
 		while (aes_mt_ctx->q[0].qstate == KQINIT)
 			pthread_cond_wait(&aes_mt_ctx->q[0].cond, &aes_mt_ctx->q[0].lock);
 		pthread_mutex_unlock(&aes_mt_ctx->q[0].lock);
@@ -604,38 +608,29 @@ int aes_mt_do_cipher(void *vevp_ctx,
 		align = destp.u | srcp.u | bufp.u;
 #endif
 
-		/* xor the src against the key (buf)
-		 * different systems can do all 16 bytes at once or
-		 * may need to do it in 8 or 4 bytes chunks
-		 * worst case is doing it as a loop */
+		/* XOR src against keystream (buf). Use memcpy to
+		 * avoid strict aliasing UB when type-punning through
+		 * wider integer types. The compiler optimizes these
+		 * fixed-size memcpys into register loads. */
 #ifdef CIPHER_INT128_OK
-		/* with GCC 13 we have having consistent seg faults
-		 * in this section of code. Since this is a critical
-		 * code path we are removing this until we have a solution
-		 * in place -cjr 02/22/24
-		 * TODO: FIX THIS
-		 */
-		/* if ((align & 0xf) == 0) { */
-		/* 	destp.u128[0] = srcp.u128[0] ^ bufp.u128[0]; */
-		/* } else */
+		if ((align & 0xf) == 0) {
+			__uint128_t s128, k128, d128;
+			memcpy(&s128, srcp.u8, sizeof(s128));
+			memcpy(&k128, bufp.u8, sizeof(k128));
+			d128 = s128 ^ k128;
+			memcpy(destp.u8, &d128, sizeof(d128));
+		} else
 #endif
-		/* 64 bits */
-		/* this is causing undefined behaviour in sanitizers
-		 * this is annoying because it's more efficient
-		 * but UB is not something I want to retain */
 		if ((align & 0x7) == 0) {
-			/* this should resolve the strict aliasing UB
-			 * and the performance doesn't seem to change much
-			 * but the memcpys are killing me 3-5-26 cjr*/
-			memcpy(&src_a, &srcp.u64[0], sizeof(uint64_t));
-			memcpy(&key_a, &bufp.u64[0], sizeof(uint64_t));
-			destp.u64[0] = src_a ^ key_a;
-			memcpy(&src_a, &srcp.u64[1], sizeof(uint64_t));
-			memcpy(&key_a, &bufp.u64[1], sizeof(uint64_t));
-			destp.u64[1] = src_a ^ key_a;
-			/* destp.u64[0] = srcp.u64[0] ^ bufp.u64[0]; */
-			/* destp.u64[1] = srcp.u64[1] ^ bufp.u64[1]; */
-                /* 32 bits */
+			uint64_t dst_a;
+			memcpy(&src_a, srcp.u8, sizeof(uint64_t));
+			memcpy(&key_a, bufp.u8, sizeof(uint64_t));
+			dst_a = src_a ^ key_a;
+			memcpy(destp.u8, &dst_a, sizeof(uint64_t));
+			memcpy(&src_a, srcp.u8 + 8, sizeof(uint64_t));
+			memcpy(&key_a, bufp.u8 + 8, sizeof(uint64_t));
+			dst_a = src_a ^ key_a;
+			memcpy(destp.u8 + 8, &dst_a, sizeof(uint64_t));
 		} else
 		if ((align & 0x3) == 0) {
 			destp.u32[0] = srcp.u32[0] ^ bufp.u32[0];

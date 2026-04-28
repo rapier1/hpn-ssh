@@ -78,7 +78,7 @@ char global_ntop[NI_MAXHOST];
 
 /* used to provide information for debug statements */
 char *return_fam(int fam) {
-	if (fam == 10)
+	if (fam == AF_INET6)
 		return "IPv6";
 	else
 		return "IPv4";
@@ -173,10 +173,9 @@ happy_eyeballs_process(int *nfds, fd_set *fds,
 	socklen_t optlen;
 	int sock, optval = 0;
 	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
-
 	debug2_f("Processing RFC 8305 connections");
 	for (sock = *nfds - 1; ready > 0 && sock >= 0; sock--) {
-		debug2_f("RFC 8305: Processing for %s: %d", return_fam(fd_ai[sock]->ai_family), sock);
+		debug2_f("RFC 8305: Processing for %d", sock);
 		if (FD_ISSET(sock, wfds)) {
 			debug2_f("RFC 8305: FD_ISSET true for %d", sock);
 			ready--;
