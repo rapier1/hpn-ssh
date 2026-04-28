@@ -417,4 +417,11 @@ void	 chan_obuf_empty(struct ssh *, Channel *);
 
 /* hpn handler */
 void     channel_set_hpn_disabled(int);
+
+/* HPN memory limit: controls maximum SSH channel window size. */
+#define HPN_MEMLIMIT_DEFAULT	0	/* 128 MB */
+#define HPN_MEMLIMIT_HIGH	1	/* 256 MB */
+#define HPN_MEMLIMIT_MAX	2	/* 512 MB */
+
+void     channel_set_hpn_memlimit(int);
 #endif

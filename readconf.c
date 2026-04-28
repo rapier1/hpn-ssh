@@ -157,7 +157,7 @@ typedef enum {
 	oHashKnownHosts,
 	oTunnel, oTunnelDevice,
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
-	oTcpRcvBufPoll, oHPNDisabled,
+	oTcpRcvBufPoll, oHPNDisabled, oHPNMemoryLimit,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
@@ -332,6 +332,7 @@ static struct {
 	{ "knownhostscommand", oKnownHostsCommand },
 	{ "tcprcvbufpoll", oTcpRcvBufPoll },
 	{ "hpndisabled", oHPNDisabled },
+	{ "hpnmemorylimit", oHPNMemoryLimit },
 	{ "requiredrsasize", oRequiredRSASize },
 	{ "enableescapecommandline", oEnableEscapeCommandline },
 	{ "obscurekeystroketiming", oObscureKeystrokeTiming },
@@ -1118,6 +1119,13 @@ static const struct multistate multistate_warnweakcrypto[] = {
 	{ NULL, -1 }
 };
 
+static const struct multistate multistate_hpnmemorylimit[] = {
+	{ "default",			0 },	/* 128 MB */
+	{ "high",			1 },	/* 256 MB */
+	{ "max",			2 },	/* 512 MB */
+	{ NULL, -1 }
+};
+
 static int
 parse_multistate_value(const char *arg, const char *filename, int linenum,
     const struct multistate *multistate_ptr)
@@ -1353,6 +1361,11 @@ parse_time:
 	case oHPNDisabled:
 		intptr = &options->hpn_disabled;
 		goto parse_flag;
+
+	case oHPNMemoryLimit:
+		multistate_ptr = multistate_hpnmemorylimit;
+		intptr = &options->hpn_memory_limit;
+		goto parse_multistate;
 
 	case oTcpRcvBufPoll:
 		intptr = &options->tcp_rcv_buf_poll;
@@ -2897,6 +2910,7 @@ initialize_options(Options * options)
 	options->metrics_path = NULL;
 	options->metrics_interval = -1;
 	options->hpn_disabled = -1;
+	options->hpn_memory_limit = -1;
 	options->fallback = -1;
 	options->fallback_port = -1;
 	options->tcp_rcv_buf_poll = -1;
@@ -3074,6 +3088,8 @@ fill_default_options(Options * options)
 		options->server_alive_count_max = 3;
 	if (options->hpn_disabled == -1)
 		options->hpn_disabled = 0;
+	if (options->hpn_memory_limit == -1)
+		options->hpn_memory_limit = 0;
 	if (options->tcp_rcv_buf_poll == -1)
 		options->tcp_rcv_buf_poll = 1;
 	if (options->none_switch == -1)
@@ -3762,6 +3778,8 @@ fmt_intarg(OpCodes code, int val)
 		return fmt_multistate_int(val, multistate_yesnoaskconfirm);
 	case oPubkeyAuthentication:
 		return fmt_multistate_int(val, multistate_pubkey_auth);
+	case oHPNMemoryLimit:
+		return fmt_multistate_int(val, multistate_hpnmemorylimit);
 	case oFingerprintHash:
 		return ssh_digest_alg_name(val);
 	default:
@@ -3943,7 +3961,8 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oEnableEscapeCommandline, o->enable_escape_commandline);
 	dump_cfg_fmtint(oTcpRcvBufPoll, o->tcp_rcv_buf_poll);
 	dump_cfg_fmtint(oHPNDisabled, o->hpn_disabled);
-	dump_cfg_fmtint(oNoneSwitch, o->none_switch);
+	dump_cfg_fmtint(oHPNMemoryLimit, o->hpn_memory_limit);
+	/* NoneSwitch is command-line only; omit from -G dump to allow reparse */
 	dump_cfg_fmtint(oNoneEnabled, o->none_enabled);
 	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
 	dump_cfg_fmtint(oFallback, o->fallback);
