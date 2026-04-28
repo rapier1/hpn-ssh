@@ -1382,10 +1382,17 @@ static void
 channel_pre_open(struct ssh *ssh, Channel *c)
 {
 	c->io_want = 0;
+	/*
+	 * Make sure rfd reads havie room for one full packet. Since we might have
+	 * a larger packet than the remote we need to restrict it when then do.
+	 * if we don't the input buffer won't drain and it kills performance.
+	 * cjr 28 Apr 2026 */
+	u_int rbuf = (c->remote_maxpacket > 0 && c->remote_maxpacket < CHAN_RBUF) ?
+	    c->remote_maxpacket : CHAN_RBUF;
 	if (c->istate == CHAN_INPUT_OPEN &&
 	    c->remote_window > 0 &&
 	    sshbuf_len(c->input) < c->remote_window &&
-	    sshbuf_check_reserve(c->input, CHAN_RBUF) == 0)
+	    sshbuf_check_reserve(c->input, rbuf) == 0)
 		c->io_want |= SSH_CHAN_IO_RFD;
 	if (c->ostate == CHAN_OUTPUT_OPEN ||
 	    c->ostate == CHAN_OUTPUT_WAIT_DRAIN) {
@@ -1541,8 +1548,11 @@ static void
 channel_pre_mux_client(struct ssh *ssh, Channel *c)
 {
 	c->io_want = 0;
+	/* Cap reserve check at remote_maxpacket; see channel_pre_open. */
+	u_int rbuf = (c->remote_maxpacket > 0 && c->remote_maxpacket < CHAN_RBUF) ?
+	    c->remote_maxpacket : CHAN_RBUF;
 	if (c->istate == CHAN_INPUT_OPEN && !c->mux_pause &&
-	    sshbuf_check_reserve(c->input, CHAN_RBUF) == 0)
+	    sshbuf_check_reserve(c->input, rbuf) == 0)
 		c->io_want |= SSH_CHAN_IO_RFD;
 	if (c->istate == CHAN_INPUT_WAIT_DRAIN) {
 		/* clear buffer immediately (discard any partial packet) */
@@ -2260,6 +2270,11 @@ channel_handle_rfd(struct ssh *ssh, Channel *c)
 				return 1; /* shouldn't happen */
 			if (maxlen > c->remote_window - have)
 				maxlen = c->remote_window - have;
+			/* Read at most one packet's worth so c->input drains
+			 * in a single pass through channel_output_poll. */
+			if (c->remote_maxpacket > 0 &&
+			    maxlen > c->remote_maxpacket)
+				maxlen = c->remote_maxpacket;
 		}
 		if (maxlen > avail)
 			maxlen = avail;

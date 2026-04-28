@@ -229,7 +229,7 @@ struct Channel {
 #define CHAN_EXTENDED_WRITE		2
 
 /* default window/packet sizes for tcp/x11-fwd-channel */
-#define CHAN_SES_PACKET_DEFAULT	(32*1024)
+#define CHAN_SES_PACKET_DEFAULT	(64*1024)
 #define CHAN_SES_WINDOW_DEFAULT	(64*CHAN_SES_PACKET_DEFAULT)
 #define CHAN_TCP_PACKET_DEFAULT	(32*1024)
 #define CHAN_TCP_WINDOW_DEFAULT	(64*CHAN_TCP_PACKET_DEFAULT)

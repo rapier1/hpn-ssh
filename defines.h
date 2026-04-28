@@ -944,7 +944,7 @@ struct winsize {
 #endif
 
 #ifndef SSH_IOBUFSZ
-# define SSH_IOBUFSZ (32*1024)
+# define SSH_IOBUFSZ (64*1024)
 #endif
 
 #ifndef IPPROTO_MPTCP
