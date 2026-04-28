@@ -1,21 +1,10 @@
-#	$OpenBSD: scp.sh,v 1.19 2023/09/08 05:50:57 djm Exp $
 #	Placed in the Public Domain.
 
 tid="scp-resume"
 
-#set -x
-
 COPY2=${OBJ}/copy2
 DIR=${COPY}.dd
 DIR2=${COPY}.dd2
-COPY3=${OBJ}/copy.glob[123]
-DIR3=${COPY}.dd.glob[456]
-DIFFOPT="-rN"
-
-# Figure out if diff does not understand "-N"
-if ! diff -N ${SRC}/scp.sh ${SRC}/scp.sh 2>/dev/null; then
-	DIFFOPT="-r"
-fi
 
 maybe_add_scp_path_to_sshd
 
@@ -24,50 +13,102 @@ cp ${SRC}/scp-ssh-wrapper.sh ${OBJ}/scp-ssh-wrapper.scp
 chmod 755 ${OBJ}/scp-ssh-wrapper.scp
 export SCP # used in scp-ssh-wrapper.scp
 
+# We test up to 1MB, ensure source data is large enough.
+increase_datafile_size 1200
+
 scpclean() {
-	rm -rf ${COPY} ${COPY2} ${DIR} ${DIR2} ${COPY3} ${DIR3}
-	mkdir ${DIR} ${DIR2} ${DIR3}
-	chmod 755 ${DIR} ${DIR2} ${DIR3}
+	rm -rf ${COPY} ${COPY2} ${DIR} ${DIR2}
+	mkdir -p ${DIR} ${DIR2}
+	chmod 755 ${DIR} ${DIR2}
 }
 
-# Create directory structure for recursive copy tests.
-forest() {
-	scpclean
-	rm -rf ${DIR2}
-	cp ${DATA} ${DIR}/copy
-	ln -s ${DIR}/copy ${DIR}/copy-sym
-	mkdir ${DIR}/subdir
-	cp ${DATA} ${DIR}/subdir/copy
-	ln -s ${DIR}/subdir ${DIR}/subdir-sym
-}
+# The resume function uses xxhash (bundled, header-only) -- no OpenSSL needed.
+# Test both legacy SCP protocol (-O -Z) and normal SFTP-path (-Z), and both
+# put and get directions.
 
-for mode in scp sftp ; do
-	tag="$tid: $mode mode"
-	if test $mode = scp ; then
+for mode in legacy sftp; do
+	if test $mode = legacy; then
+		# -O forces legacy SCP protocol; -S wires in the ssh wrapper
 		scpopts="-O -S ${OBJ}/scp-ssh-wrapper.scp"
+		tag="$tid: legacy (-O)"
 	else
-		scpopts="-qs -D ${SFTPSERVER}"
+		scpopts="-D ${SFTPSERVER}"
+		tag="$tid: sftp"
 	fi
 
-	# we don't want to run this test if openssl is not installed
-	# if isn't then the usage text won't have the "vZ" in the
-	# output
-	if $SCP -Z 2>&1 | grep "vZ" > /dev/null 2>&1
-	then
-	    verbose "$tag: resume remote dir to local dir"
-	    scpclean
-	    rm -rf ${DIR2}
-	    cp ${DATA} ${DIR}/copy1
-	    cp ${DATA} ${DIR}/copy2
-	    cp ${DATA} ${DIR}/copy3
-	    $SCP -r $scpopts somehost:${DIR} ${DIR2} || fail "copy failed"
-	    truncate --size=-512 ${DIR2}/copy1
-	    truncate --size=+512 ${DIR2}/copy2
-	    $SCP -Z $scpopts somehost:${DIR}/* ${DIR2} || fail "resume failed"
-	    for i in $(cd ${DIR} && echo *); do
-		cmp ${DIR}/$i ${DIR2}/$i || fail "corrupted resume copy"
-	    done
-	fi
+	for direction in put get; do
+		for size in 0 1k size-1 larger corrupt same; do
+			verbose "$tag: $direction size=${size}"
+			trace "$tag: test $direction $size"
+			scpclean
+			rm -f ${COPY}.1 ${COPY}.2
+
+			# COPY.1 is the reference (complete) source file.
+			cp ${DATA} ${COPY}.1
+
+			# COPY.2 is the destination (partial/empty/etc).
+			case "${size}" in
+			0)
+				touch ${COPY}.2
+				;;
+			size-1)
+				dd if=${COPY}.1 of=${COPY}.2 bs=1023 count=1 \
+				    >/dev/null 2>&1
+				;;
+			larger)
+				# Dest is larger than source; should overwrite fully
+				# and ftruncate to source size.
+				cp ${COPY}.1 ${COPY}.2
+				dd if=/dev/urandom bs=512 count=1 >>${COPY}.2 \
+				    2>/dev/null
+				;;
+			corrupt)
+				# Same length as 1k partial but wrong content;
+				# hash mismatch should trigger full retransfer.
+				dd if=/dev/urandom of=${COPY}.2 bs=1024 count=1 \
+				    >/dev/null 2>&1
+				;;
+			same)
+				cp ${COPY}.1 ${COPY}.2
+				;;
+			*)
+				dd if=${COPY}.1 of=${COPY}.2 bs=${size} count=1 \
+				    >/dev/null 2>&1
+				;;
+			esac
+
+			if test $direction = put; then
+				if test $mode = sftp; then
+					case "${size}" in
+					same)
+						# SFTP put skips identical files (exit 0).
+						$SCP -Z $scpopts ${COPY}.1 somehost:${COPY}.2 \
+						    || fail "$tag put -Z failed size=${size}"
+						cmp ${COPY}.1 ${COPY}.2 \
+						    || fail "$tag corrupted after put -Z size=${size}"
+						continue
+						;;
+					larger)
+						# SFTP put skips when dest is larger (exit 0);
+						# dest is intentionally left untouched.
+						$SCP -Z $scpopts ${COPY}.1 somehost:${COPY}.2 \
+						    || fail "$tag put -Z failed size=${size}"
+						continue
+						;;
+					esac
+				fi
+				$SCP -Z $scpopts ${COPY}.1 somehost:${COPY}.2 \
+				    || fail "$tag put -Z failed size=${size}"
+				cmp ${COPY}.1 ${COPY}.2 \
+				    || fail "$tag corrupted after put -Z size=${size}"
+			else
+				$SCP -Z $scpopts somehost:${COPY}.1 ${COPY}.2 \
+				    || fail "$tag get -Z failed size=${size}"
+				cmp ${COPY}.1 ${COPY}.2 \
+				    || fail "$tag corrupted after get -Z size=${size}"
+			fi
+		done
+	done
 done
 
 scpclean

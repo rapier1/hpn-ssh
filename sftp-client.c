@@ -53,6 +53,9 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
 extern volatile sig_atomic_t interrupted;
 extern int showprogress;
 
@@ -94,6 +97,7 @@ struct sftp_conn {
 #define SFTP_EXT_PATH_EXPAND		0x00000080
 #define SFTP_EXT_COPY_DATA		0x00000100
 #define SFTP_EXT_GETUSERSGROUPS_BY_ID	0x00000200
+#define SFTP_EXT_HPN_CHECK_FILE		0x00000400
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
@@ -112,6 +116,11 @@ TAILQ_HEAD(requests, request);
 static u_char *
 get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
     const char *errfmt, ...) __attribute__((format(printf, 4, 5)));
+
+/* Forward declarations for hash helpers used by sftp_download (verified resume) */
+static int sftp_xxhash_local_fd(int, uint64_t, uint64_t *);
+static int sftp_hash_remote_file(struct sftp_conn *, const char *,
+    uint64_t, uint64_t *);
 
 static struct request *
 request_enqueue(struct requests *requests, u_int id, size_t len,
@@ -525,6 +534,10 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		    "users-groups-by-id@openssh.com") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_GETUSERSGROUPS_BY_ID;
+			known = 1;
+		} else if (strcmp(name, "hpn-check-file@hpnssh.org") == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			ret->exts |= SFTP_EXT_HPN_CHECK_FILE;
 			known = 1;
 		}
 		if (known) {
@@ -1533,7 +1546,7 @@ progress_meter_path(const char *path)
 int
 sftp_download(struct sftp_conn *conn, const char *remote_path,
     const char *local_path, Attrib *a, int preserve_flag, int resume_flag,
-    int fsync_flag, int inplace_flag)
+    int fsync_flag, int inplace_flag, int verify)
 {
 	struct sshbuf *msg = conn->msg;
 	u_char *handle;
@@ -1584,33 +1597,109 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	    &handle, &handle_len) != 0)
 		return -1;
 
-	local_fd = open(local_path, O_WRONLY | O_CREAT |
-	((resume_flag || inplace_flag) ? 0 : O_TRUNC), mode | S_IWUSR);
+	local_fd = open(local_path,
+	    ((resume_flag && verify) ? O_RDWR : O_WRONLY) | O_CREAT |
+	    ((resume_flag || inplace_flag) ? 0 : O_TRUNC), mode | S_IWUSR);
 	if (local_fd == -1) {
 		error("open local \"%s\": %s", local_path, strerror(errno));
-		goto fail;
+		sftp_close(conn, handle, handle_len);
+		free(handle);
+		return -1;
 	}
 	if (resume_flag) {
+		/* -1=error, 1=identical, 2=target larger than source */
+		int skip_ret = -1;
 		if (fstat(local_fd, &st) == -1) {
 			error("stat local \"%s\": %s",
 			    local_path, strerror(errno));
-			goto fail;
+			goto resume_fail;
 		}
 		if (st.st_size < 0) {
 			error("\"%s\" has negative size", local_path);
-			goto fail;
+			goto resume_fail;
 		}
-		if ((uint64_t)st.st_size > size) {
-			error("Unable to resume download of \"%s\": "
-			    "local file is larger than remote", local_path);
- fail:
-			sftp_close(conn, handle, handle_len);
-			free(handle);
-			if (local_fd != -1)
-				close(local_fd);
-			return -1;
+		if (verify) {
+			/*
+			 * Verified resume: refuse if local >= remote (nothing
+			 * useful to resume or verify).
+			 */
+			if ((uint64_t)st.st_size == size) {
+				/*
+				 * We could hash-verify here but that
+				 * imposes ~33s/TB plus I/O on each side.
+				 */
+				skip_ret = 1; /* identical */
+				goto resume_fail;
+			}
+			if ((uint64_t)st.st_size > size) {
+				skip_ret = 2; /* target larger than source */
+				goto resume_fail;
+			}
+			if (st.st_size > 0) {
+				if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0) {
+					error("verified resume of \"%s\": remote "
+					    "server does not support "
+					    "hpn-check-file@hpnssh.org; "
+					    "downloading from scratch",
+					    remote_path);
+					if (ftruncate(local_fd, 0) == -1) {
+						error("truncate \"%s\": %s",
+						    local_path, strerror(errno));
+						goto resume_fail;
+					}
+					/* offset stays 0; plain fresh download */
+				} else {
+					uint64_t local_hash, remote_hash;
+					int lret, rret;
+
+					lret = sftp_xxhash_local_fd(local_fd,
+					    (uint64_t)st.st_size, &local_hash);
+					rret = sftp_hash_remote_file(conn,
+					    remote_path, (uint64_t)st.st_size,
+					    &remote_hash);
+					if (lret == 0 && rret == 0 &&
+					    local_hash == remote_hash) {
+						debug("verified resume: hash "
+						    "match, resuming at "
+						    "offset %llu",
+						    (unsigned long long)
+						    st.st_size);
+						offset = highwater = maxack =
+						    st.st_size;
+					} else {
+						debug("verified resume: hash "
+						    "mismatch or error; "
+						    "restarting download");
+						if (ftruncate(local_fd, 0)
+						    == -1) {
+							error("truncate "
+							    "\"%s\": %s",
+							    local_path,
+							    strerror(errno));
+							goto resume_fail;
+						}
+						/* offset stays 0 */
+					}
+				}
+			}
+			/* st.st_size == 0: fresh download, offset stays 0 */
+		} else {
+			/* Plain size-only resume */
+			if ((uint64_t)st.st_size > size) {
+				skip_ret = 2; /* target larger than source */
+				goto resume_fail;
+			}
+			offset = highwater = maxack = st.st_size;
 		}
-		offset = highwater = maxack = st.st_size;
+		goto resume_done;
+ resume_fail:
+		sftp_close(conn, handle, handle_len);
+		free(handle);
+		if (local_fd != -1)
+			close(local_fd);
+		return skip_ret;
+ resume_done:
+		;
 	}
 
 	/* Read from remote and write to local */
@@ -1904,12 +1993,19 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			    fsync_flag, follow_link_flag, inplace_flag) == -1)
 				ret = -1;
 		} else if (S_ISREG(a->perm)) {
-			if (sftp_download(conn, new_src, new_dst, a,
+			int dr = sftp_download(conn, new_src, new_dst, a,
 			    preserve_flag, resume_flag, fsync_flag,
-			    inplace_flag) == -1) {
+			    inplace_flag, 0);
+			if (dr == -1) {
 				error("Download of file %s to %s failed",
 				    new_src, new_dst);
 				ret = -1;
+			} else if (dr == 1) {
+				mprintf("File skipped: %s: Identical.\n",
+				    new_src);
+			} else if (dr == 2) {
+				mprintf("File skipped: %s: Target is larger"
+				    " than source.\n", new_src);
 			}
 		} else
 			logit("download \"%s\": not a regular file", new_src);
@@ -1961,10 +2057,140 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	return ret;
 }
 
+/*
+ * Hash the first 'length' bytes of an already-open local file using
+ * XXH3_64bits (streaming API).  Seeks to offset 0 before reading.
+ * Returns 0 and writes the hash to *hash_out on success, -1 on error.
+ */
+static int
+sftp_xxhash_local_fd(int fd, uint64_t length, uint64_t *hash_out)
+{
+	XXH3_state_t *state;
+	XXH64_hash_t hash;
+	u_char buf[65536];
+	uint64_t remaining = length;
+	ssize_t nread;
+	off_t pos_before;
+
+	pos_before = lseek(fd, 0, SEEK_CUR);
+	debug3_f("local fd=%d length=%llu fd_pos_before=%lld",
+	    fd, (unsigned long long)length, (long long)pos_before);
+
+	if (lseek(fd, 0, SEEK_SET) == -1) {
+		error_f("lseek failed: %s", strerror(errno));
+		return -1;
+	}
+
+	if ((state = XXH3_createState()) == NULL) {
+		error_f("XXH3_createState failed");
+		return -1;
+	}
+	if (XXH3_64bits_reset(state) == XXH_ERROR) {
+		error_f("XXH3_64bits_reset failed");
+		XXH3_freeState(state);
+		return -1;
+	}
+
+	while (remaining > 0) {
+		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
+
+		nread = read(fd, buf, toread);
+		if (nread == 0)
+			break; /* EOF before length bytes */
+		if (nread < 0) {
+			error_f("read failed: %s", strerror(errno));
+			XXH3_freeState(state);
+			(void)lseek(fd, pos_before, SEEK_SET);
+			return -1;
+		}
+		if (XXH3_64bits_update(state, buf, (size_t)nread) == XXH_ERROR) {
+			error_f("XXH3_64bits_update failed");
+			XXH3_freeState(state);
+			(void)lseek(fd, pos_before, SEEK_SET);
+			return -1;
+		}
+		remaining -= (uint64_t)nread;
+	}
+	hash = XXH3_64bits_digest(state);
+	XXH3_freeState(state);
+	*hash_out = (uint64_t)hash;
+	debug3_f("local hash of first %llu bytes: %016llx",
+	    (unsigned long long)length, (unsigned long long)*hash_out);
+	if (lseek(fd, pos_before, SEEK_SET) == -1)
+		error_f("lseek restore failed: %s", strerror(errno));
+	return 0;
+}
+
+/*
+ * Request that the sender's sftp-server compute a XXH3_64bits hash of the
+ * first 'length' bytes of 'path' using the hpn-check-file@hpnssh.org
+ * extension.  Returns 0 and writes the hash value to *hash_out on success,
+ * or -1 if the extension is unavailable or an error occurred.
+ */
+static int
+sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
+    uint64_t length, uint64_t *hash_out)
+{
+	struct sshbuf *msg = conn->msg;
+	u_int id, rid;
+	u_char type;
+	int r;
+
+	if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0) {
+		debug_f("server does not support hpn-check-file extension");
+		return -1;
+	}
+
+	id = conn->msg_id++;
+	debug3_f("sending hpn-check-file for \"%s\" length=%llu id=%u",
+	    path, (unsigned long long)length, id);
+	sshbuf_reset(msg);
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "hpn-check-file@hpnssh.org")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
+	    (r = sshbuf_put_u64(msg, length)) != 0)
+		fatal_fr(r, "compose");
+	send_msg(conn, msg);
+
+	get_msg(conn, msg);
+	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+	    (r = sshbuf_get_u32(msg, &rid)) != 0)
+		fatal_fr(r, "parse");
+	debug3_f("got response type=%u rid=%u (expected id=%u)", type, rid, id);
+	if (rid != id)
+		fatal("ID mismatch (%u != %u)", rid, id);
+
+	if (type == SSH2_FXP_STATUS) {
+		u_int status;
+		char *errmsg = NULL;
+
+		if ((r = sshbuf_get_u32(msg, &status)) != 0)
+			fatal_fr(r, "parse status");
+		/* consume error-message and language-tag to leave msg clean */
+		(void)sshbuf_get_cstring(msg, &errmsg, NULL);
+		(void)sshbuf_get_cstring(msg, NULL, NULL);
+		error("hpn-check-file \"%s\": %s", path,
+		    (errmsg != NULL && *errmsg != '\0') ? errmsg : fx2txt(status));
+		debug3_f("server returned status %u for \"%s\"", status, path);
+		free(errmsg);
+		return -1;
+	} else if (type != SSH2_FXP_EXTENDED_REPLY) {
+		fatal("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
+		    SSH2_FXP_EXTENDED_REPLY, type);
+	}
+
+	if ((r = sshbuf_get_u64(msg, hash_out)) != 0)
+		fatal_fr(r, "parse hash");
+	debug3_f("remote hash of \"%s\" first %llu bytes: %016llx",
+	    path, (unsigned long long)length, (unsigned long long)*hash_out);
+	return 0;
+}
+
 int
 sftp_upload(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, int preserve_flag, int resume,
-    int fsync_flag, int inplace_flag)
+    int verify, int fsync_flag, int inplace_flag)
 {
 	int r, local_fd;
 	u_int openmode, id, status = SSH2_FX_OK, status2, reordered = 0;
@@ -1972,7 +2198,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	u_char type, *handle, *data;
 	struct sshbuf *msg = conn->msg;
 	struct stat sb;
-	Attrib a, t, c;
+	Attrib a, t, c = {0};
 	uint32_t startid, ackid;
 	uint64_t highwater = 0, maxack = 0;
 	struct request *ack = NULL;
@@ -2006,20 +2232,103 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	if (!preserve_flag)
 		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 
+	/*
+	 * Verified resume (verify=1): stat the remote file quietly.  If it
+	 * exists and has data, compare XXH3_64bits hashes of the overlapping
+	 * prefix.  A match means we can resume; a mismatch (or any error)
+	 * means we restart from scratch, forcing truncation of the remote file
+	 * regardless of inplace_flag.
+	 *
+	 * If the server does not advertise hpn-check-file@hpnssh.org we cannot
+	 * verify anything: warn the user and fall through to a fresh upload.
+	 * We deliberately do NOT fall back to a blind size-only resume here
+	 * because the caller explicitly requested hash verification.
+	 */
+	int effective_inplace = inplace_flag;
+	if (verify) {
+		debug3_f("verify=1 inplace_flag=%d exts=0x%x HPN_CHECK_FILE=0x%x",
+		    inplace_flag, conn->exts, SFTP_EXT_HPN_CHECK_FILE);
+		if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0) {
+			error("verified resume of \"%s\": remote server does "
+			    "not support hpn-check-file@hpnssh.org; "
+			    "uploading from scratch", local_path);
+			/* resume stays 0; effective_inplace=0 to truncate */
+			effective_inplace = 0;
+		} else if (sftp_stat(conn, remote_path, 1 /* quiet */, &c) == 0
+		    && c.size > 0) {
+			debug3_f("remote file exists, size=%llu local_size=%llu",
+			    (unsigned long long)c.size,
+			    (unsigned long long)sb.st_size);
+			if ((off_t)c.size == sb.st_size) {
+				/*
+				 * We could hash-verify here but that
+				 * imposes ~33s/TB plus I/O on each side.
+				 */
+				close(local_fd);
+				return 1; /* identical */
+			}
+			if ((off_t)c.size > sb.st_size) {
+				close(local_fd);
+				return 2; /* target larger than source */
+			}
+			{
+				uint64_t local_hash, remote_hash;
+				int lret, rret;
+
+				lret = sftp_xxhash_local_fd(local_fd, c.size,
+				    &local_hash);
+				rret = sftp_hash_remote_file(conn, remote_path,
+				    c.size, &remote_hash);
+				debug3_f("lret=%d rret=%d local_hash=%016llx "
+				    "remote_hash=%016llx match=%d",
+				    lret, rret,
+				    (unsigned long long)local_hash,
+				    (unsigned long long)remote_hash,
+				    (lret == 0 && rret == 0 &&
+				    local_hash == remote_hash));
+				if (lret == 0 && rret == 0 &&
+				    local_hash == remote_hash) {
+					debug("verified resume: hash match, "
+					    "resuming at offset %llu",
+					    (unsigned long long)c.size);
+					resume = 1;
+				} else {
+					debug("verified resume: hash mismatch "
+					    "or error; restarting upload");
+					resume = 0;           /* force fresh upload */
+					effective_inplace = 0; /* force TRUNC */
+				}
+			}
+		} else {
+			debug3_f("remote file absent or empty; fresh upload");
+		}
+		/* If resume is still 0 (no remote file, empty file, extension
+		 * missing, or hash mismatch) we fall through to a fresh upload. */
+	}
+	debug3_f("after verify: resume=%d effective_inplace=%d",
+	    resume, effective_inplace);
+
+	/*
+	 * Plain size-only resume (or verify already set resume=1 above).
+	 * When verify set resume=1 the stat and size check were already done;
+	 * skip them with the !verify guard.
+	 */
 	if (resume) {
-		/* Get remote file size if it exists */
-		if (sftp_stat(conn, remote_path, 0, &c) != 0) {
-			close(local_fd);
-			return -1;
+		if (!verify) {
+			/* Get remote file size if it exists */
+			if (sftp_stat(conn, remote_path, 0, &c) != 0) {
+				close(local_fd);
+				return -1;
+			}
+			if ((off_t)c.size == sb.st_size) {
+				close(local_fd);
+				return 1; /* identical */
+			}
+			if ((off_t)c.size > sb.st_size) {
+				close(local_fd);
+				return 2; /* target larger than source */
+			}
 		}
-
-		if ((off_t)c.size >= sb.st_size) {
-			error("resume \"%s\": destination file "
-			    "same size or larger", local_path);
-			close(local_fd);
-			return -1;
-		}
-
 		if (lseek(local_fd, (off_t)c.size, SEEK_SET) == -1) {
 			close(local_fd);
 			return -1;
@@ -2027,11 +2336,25 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 		highwater = c.size;
 	}
 
+	/*
+	 * If not resuming (fresh upload or verify-restart after hash mismatch),
+	 * ensure local_fd is at offset 0.  sftp_xxhash_local_fd() may have
+	 * left it positioned partway through the file.
+	 */
+	if (!resume && lseek(local_fd, 0, SEEK_SET) == -1) {
+		error("lseek local \"%s\": %s", local_path, strerror(errno));
+		close(local_fd);
+		return -1;
+	}
+
 	openmode = SSH2_FXF_WRITE|SSH2_FXF_CREAT;
 	if (resume)
 		openmode |= SSH2_FXF_APPEND;
-	else if (!inplace_flag)
+	else if (!effective_inplace)
 		openmode |= SSH2_FXF_TRUNC;
+	debug3_f("openmode=0x%x (WRITE=%x CREAT=%x APPEND=%x TRUNC=%x)",
+	    openmode, SSH2_FXF_WRITE, SSH2_FXF_CREAT,
+	    SSH2_FXF_APPEND, SSH2_FXF_TRUNC);
 
 	/* Send open request */
 	if (send_open(conn, remote_path, "dest", openmode, &a,
@@ -2181,8 +2504,8 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 
 static int
 upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
-    int depth, int preserve_flag, int print_flag, int resume, int fsync_flag,
-    int follow_link_flag, int inplace_flag)
+    int depth, int preserve_flag, int print_flag, int resume, int verify,
+    int fsync_flag, int follow_link_flag, int inplace_flag)
 {
 	int created = 0, ret = 0;
 	DIR *dirp;
@@ -2275,15 +2598,23 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 		if (S_ISDIR(sb.st_mode)) {
 			if (upload_dir_internal(conn, new_src, new_dst,
 			    depth + 1, preserve_flag, print_flag, resume,
-			    fsync_flag, follow_link_flag, inplace_flag) == -1)
+			    verify, fsync_flag, follow_link_flag,
+			    inplace_flag) == -1)
 				ret = -1;
 		} else if (S_ISREG(sb.st_mode)) {
-			if (sftp_upload(conn, new_src, new_dst,
-			    preserve_flag, resume, fsync_flag,
-			    inplace_flag) == -1) {
+			int ur = sftp_upload(conn, new_src, new_dst,
+			    preserve_flag, resume, verify, fsync_flag,
+			    inplace_flag);
+			if (ur == -1) {
 				error("upload \"%s\" to \"%s\" failed",
 				    new_src, new_dst);
 				ret = -1;
+			} else if (ur == 1) {
+				mprintf("File skipped: %s: Identical.\n",
+				    new_src);
+			} else if (ur == 2) {
+				mprintf("File skipped: %s: Target is larger"
+				    " than source.\n", new_src);
 			}
 		} else
 			logit("%s: not a regular file", filename);
@@ -2300,8 +2631,8 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 
 int
 sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
-    int preserve_flag, int print_flag, int resume, int fsync_flag,
-    int follow_link_flag, int inplace_flag)
+    int preserve_flag, int print_flag, int resume, int verify,
+    int fsync_flag, int follow_link_flag, int inplace_flag)
 {
 	char *dst_canon;
 	int ret;
@@ -2312,7 +2643,8 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	}
 
 	ret = upload_dir_internal(conn, src, dst_canon, 0, preserve_flag,
-	    print_flag, resume, fsync_flag, follow_link_flag, inplace_flag);
+	    print_flag, resume, verify, fsync_flag, follow_link_flag,
+	    inplace_flag);
 
 	free(dst_canon);
 	return ret;

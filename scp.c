@@ -114,12 +114,8 @@
 #include "misc.h"
 #include "progressmeter.h"
 #include "utf8.h"
-/* libressl doesn't support the blake2b512 digest so
- * we need to prevent libressl from using the resume feature
- * cjr 7/18/2023 */
-#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
-#include <openssl/evp.h>
-#endif
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 #include "sftp.h"
 
 #include "sftp-common.h"
@@ -187,8 +183,8 @@ int resume_flag = 0; /* 0 is off, 1 is on */
 char hostname[HOST_NAME_MAX + 1];
 
 /* defines for the resume function. Need them even if not supported */
-#define HASH_LEN 128               /*40 sha1, 64 blake2s256 128 blake2b512*/
-#define BUF_AND_HASH HASH_LEN + 64 /* length of the hash and other data to get size of buffer */
+#define HASH_LEN 16                /* XXH3_64bits: 8 bytes → 16 hex chars */
+#define BUF_AND_HASH (HASH_LEN + 64) /* length of the hash and other data to get size of buffer */
 #define HASH_BUFLEN 8192	   /* 8192 seems to be a good balance between freads
 				    * and the digest func*/
 static void
@@ -466,7 +462,7 @@ void source(int, char *[]);
 void tolocal(int, char *[], enum scp_mode_e, char *sftp_direct);
 void toremote(int, char *[], enum scp_mode_e, char *sftp_direct);
 void usage(void);
-void calculate_hash(char *, char *, off_t); /*get the hash of file to length*/
+void calculate_hash(char *, char *, off_t); /* get the XXH3_64bits hash of file to length */
 void rand_str(char *, size_t); /*gen randome char string */
 
 void source_sftp(int, char *, char *, struct sftp_conn *);
@@ -600,13 +596,9 @@ main(int argc, char **argv)
 			addargs(&remote_remote_args, "-q");
 			showprogress = 0;
 			break;
-#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 		case 'Z':
-			/* currently resume only works in SCP mode */
 			resume_flag = 1;
-			mode = MODE_SCP;
 			break;
-#endif
 		case 'X':
 			/* Please keep in sync with sftp.c -X */
 			if (strncmp(optarg, "buffer=", 7) == 0) {
@@ -1352,65 +1344,57 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 /* calculate the hash of a file up to length bytes
  * this is used to determine if remote and local file
  * fragments match. There may be a more efficient process for the hashing
- * Note: LibreSSL doesn't support blake2b512 so we can't offer them
- * the resume feature cjr 7/18/2023 */
-#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
+ * Uses XXH3_64bits (streaming) and writes the result as a 16-char hex string
+ * into output (caller must provide at least HASH_LEN+1 bytes). */
 void calculate_hash(char *filename, char *output, off_t length)
 {
-	int n, md_len;
-	EVP_MD_CTX *c;
-	const EVP_MD *md;
+	XXH3_state_t *state;
+	XXH64_hash_t hash;
 	char buf[HASH_BUFLEN];
-	ssize_t bytes;
-	unsigned char out[EVP_MAX_MD_SIZE];
-	char tmp[3];
+	size_t bytes;
 	FILE *file_ptr;
+
 	*output = '\0';
 
-	/* open file for calculating hash */
 	file_ptr = fopen(filename, "r");
-	if (file_ptr==NULL)
-	{
-		if (verbose_mode) {
-			fprintf(stderr, "%s: error opening file %s\n", hostname, filename);
-			/* file the expected output with spaces */
-			snprintf(output, HASH_LEN, "%s",  " ");
-		}
+	if (file_ptr == NULL) {
+		if (verbose_mode)
+			fprintf(stderr, "%s: error opening file %s\n",
+			    hostname, filename);
 		return;
 	}
 
-	md = EVP_get_digestbyname("blake2b512");
-	c = EVP_MD_CTX_new();
-	EVP_DigestInit_ex(c, md, NULL);
+	state = XXH3_createState();
+	if (state == NULL) {
+		fclose(file_ptr);
+		return;
+	}
+	XXH3_64bits_reset(state);
 
 	while (length > 0) {
-		if (length > HASH_BUFLEN)
-			/* fread returns the number of elements read.
-			 * in this case 1. Multiply by the length to get the bytes */
-			bytes=fread(buf, HASH_BUFLEN, 1, file_ptr) * HASH_BUFLEN;
-		else
-			bytes=fread(buf, length, 1, file_ptr) * length;
-		EVP_DigestUpdate(c, buf, bytes);
-		length -= HASH_BUFLEN;
+		size_t toread = (length > HASH_BUFLEN) ?
+		    HASH_BUFLEN : (size_t)length;
+
+		bytes = fread(buf, 1, toread, file_ptr);
+		if (bytes == 0) {
+			if (ferror(file_ptr))
+				error("calculate_hash: read error on %s: %s",
+				    filename, strerror(errno));
+			break;
+		}
+		XXH3_64bits_update(state, buf, bytes);
+		length -= (off_t)bytes;
 	}
-	EVP_DigestFinal(c, out, &md_len);
-	EVP_MD_CTX_free(c);
-	/* convert the hash into a string */
-	for(n=0; n < md_len; n++) {
-		snprintf(tmp, 3, "%02x", out[n]);
-		strncat(output, tmp, 3);
-	}
-#ifdef DEBUG
-	fprintf(stderr, "%s: HASH IS '%s' of length %ld\n", hostname, output, strlen(output));
-#endif
+	hash = XXH3_64bits_digest(state);
+	XXH3_freeState(state);
 	fclose(file_ptr);
+
+	/* Write hash as a fixed-width 16-char hex string (HASH_LEN). */
+	snprintf(output, HASH_LEN + 1, "%016llx", (unsigned long long)hash);
+#ifdef DEBUG
+	fprintf(stderr, "%s: HASH IS '%s'\n", hostname, output);
+#endif
 }
-#else
-void calculate_hash(char *filename, char *output, off_t length)
-{
-  /* empty function for builds without openssl or are using libressl */
-}
-#endif /* WITH_OPENSSL */
 
 #define TYPE_OVERFLOW(type, val) \
 	((sizeof(type) == 4 && (val) > INT32_MAX) || \
@@ -1485,13 +1469,21 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 
 	if (src_is_dir && iamrecursive) {
 		if (sftp_upload_dir(conn, src, abs_dst, pflag,
-		    SFTP_PROGRESS_ONLY, 0, 0, 1, 1) != 0) {
+		    SFTP_PROGRESS_ONLY, 0, resume_flag, 0, 1, 1) != 0) {
 			error("failed to upload directory %s to %s", src, targ);
 			errs = 1;
 		}
-	} else if (sftp_upload(conn, src, abs_dst, pflag, 0, 0, 1) != 0) {
-		error("failed to upload file %s to %s", src, targ);
-		errs = 1;
+	} else {
+		int ur = sftp_upload(conn, src, abs_dst, pflag, 0,
+		    resume_flag, 0, 1);
+		if (ur == -1) {
+			error("failed to upload file %s to %s", src, targ);
+			errs = 1;
+		} else if (ur == 1) {
+			mprintf("File skipped: %s: Identical.\n", src);
+		} else if (ur == 2) {
+			mprintf("File skipped: %s: Target is larger than source.\n", src);
+		}
 	}
 
 	free(abs_dst);
@@ -1595,6 +1587,10 @@ syserr:			run_err("%s: %s", name, strerror(errno));
 				fprintf(stderr, "%s: we got '%s' in inbuf length %ld buf was %ld\n",
 					hostname, inbuf, strlen(inbuf), strlen(buf));
 #endif
+			/* Check if remote sent an SCP error instead of a valid resume response */
+			if (inbuf[0] == '\x01')
+				fatal_f("Remote hpnscp is not compatible with the resume "
+				    "function. Please upgrade remote to latest version.");
 		}
 		if (response() < 0) {
 #ifdef DEBUG
@@ -1888,9 +1884,16 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 			    NULL, pflag, SFTP_PROGRESS_ONLY, 0, 0, 1, 1) == -1)
 				err = -1;
 		} else {
-			if (sftp_download(conn, g.gl_pathv[i], abs_dst, NULL,
-			    pflag, 0, 0, 1) == -1)
+			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
+			    NULL, pflag, 0, 0, 1, 0);
+			if (dr == -1)
 				err = -1;
+			else if (dr == 1)
+				mprintf("File skipped: %s: Identical.\n",
+				    g.gl_pathv[i]);
+			else if (dr == 2)
+				mprintf("File skipped: %s: Target is larger"
+				    " than source.\n", g.gl_pathv[i]);
 		}
 		free(abs_dst);
 		abs_dst = NULL;
@@ -1924,9 +1927,10 @@ sink(int argc, char **argv, const char *src)
 	int amt, exists, first, ofd;
 	mode_t mode, omode, mask;
 	off_t size, statbytes, xfer_size;
+	off_t resume_offset = 0; /* byte offset to seek to for direct resume; 0 = fresh write */
 	unsigned long long ull;
 	int setimes, targisdir, wrerr;
-	char ch, *cp, *np, *np_tmp, *targ, *why, *vect[1], buf[16384], visbuf[16384];
+	char ch, *cp, *np, *targ, *why, *vect[1], buf[16384], visbuf[16384];
 	char **patterns = NULL;
 	size_t n, npatterns = 0;
 	struct timeval tv[2];
@@ -1935,9 +1939,7 @@ sink(int argc, char **argv, const char *src)
 	char tmpbuf[BUF_AND_HASH];
 	char outbuf[BUF_AND_HASH];
 	char match;
-	int bad_match_flag = 0;
 	np = NULL; /* this was originally '/0' but that's wrong */
-	np_tmp = NULL;
 
 
 #define	atime	tv[0]
@@ -1984,7 +1986,6 @@ sink(int argc, char **argv, const char *src)
 	}
 
 	for (first = 1;; first = 0) {
-		bad_match_flag = 0; /* used in resume mode. */
 #ifdef DEBUG
 		fprintf(stderr, "%s: At start of loop buf is %s\n", hostname, buf);
 #endif
@@ -2130,8 +2131,10 @@ sink(int argc, char **argv, const char *src)
 #ifdef DEBUG
 			fprintf (stderr, "%s: '%s'\n", hostname, remote_hashsum);
 #endif
-			if (!cp || *cp++ != ' ')
-				SCREWUP("hash not delimited");
+			if (!cp || *cp != ' ')
+				fatal_f("Remote hpnscp is not compatible with the resume "
+				    "function. Please upgrade remote to latest version.");
+			cp++;
 		}
 #ifdef DEBUG
 		fprintf(stderr, "%s: cp is %s\n", hostname, cp);
@@ -2273,13 +2276,12 @@ sink(int argc, char **argv, const char *src)
 						 (long long)npstat.st_size, local_hashsum);
 					snprintf(outbuf, BUF_AND_HASH, "%-*s", BUF_AND_HASH-1, tmpbuf);
 					(void) atomicio(vwrite, remout, outbuf, strlen(outbuf));
-					bad_match_flag = 1;
+
 				}
 			}
 			/* if npstat.st_size is 0 then the local file doesn't exist and
 			 * we have to move it. Since we are in resume mode treat it as a resume */
 			if (npstat.st_size < xfer_size || (npstat.st_size == 0)) {
-				char rand_string[9];
 #ifdef DEBUG
 				fprintf (stderr, "%s: %s is smaller than %s\n", hostname, np, cp);
 #endif
@@ -2295,9 +2297,9 @@ sink(int argc, char **argv, const char *src)
 				fprintf(stderr, "%s: Sending new file (%s) modes: %s\n",
 					hostname, np, outbuf);
 #endif
-				/*now we have to send np's length and hash to the other end
-				 * if the computed hashes match then we seek to np's length in
-				 * file and append to np starting from there */
+				/* Send our partial size and hash to the source.  If the source
+				 * confirms a match we will seek directly to npstat.st_size in
+				 * the existing file and write the remainder there. */
 				(void) atomicio(vwrite, remout, outbuf, strlen(outbuf));
 #ifdef DEBUG
 				fprintf(stderr, "%s: New size: %ld, size: %ld, st_size: %ld\n",
@@ -2305,22 +2307,7 @@ sink(int argc, char **argv, const char *src)
 #endif
 				xfer_size = size - npstat.st_size;
 				resume_flag = 1;
-				np_tmp = xstrdup(np);
-				/* We should have a random component to avoid clobbering a
-				 * local file. Make sure it doesn't already exist and, if it does,
-				 * try again. Very unlikely for it to already exist though. */
-				rand_str(rand_string, 8);
-				strcat(np, rand_string);
-				while (stat(np, &stb) == 0) {
-					/* file exists, try a new suffix */
-					np[strlen(np) - 8] = '\0';  /* strip old suffix */
-					rand_str(rand_string, 8);
-					strcat(np, rand_string);
-				}
-#ifdef DEBUG
-				fprintf(stderr, "%s: Will concat %s to %s after xfer\n",
-					hostname, np, np_tmp);
-#endif
+				resume_offset = npstat.st_size;
 			} else if (npstat.st_size > size) {
 			/* the target file is larger than the source.
 			 * so we need to overwrite it. We don't need to send the hash though. */
@@ -2333,7 +2320,6 @@ sink(int argc, char **argv, const char *src)
 					 (long long)npstat.st_size);
 				snprintf(outbuf, BUF_AND_HASH, "%-*s", BUF_AND_HASH-1, tmpbuf);
 				(void) atomicio(vwrite, remout, outbuf, strlen(outbuf));
-				bad_match_flag = 1;
 			}
 
 #ifdef DEBUG
@@ -2352,45 +2338,38 @@ sink(int argc, char **argv, const char *src)
 			/* the remote is always going to send a match status
 			 * so we need to read it so we don't get out of sync */
 			(void) atomicio(read, remin, &match, 1);
-			if (match != 'M') {/*fragments do not match*/
-				/* expected response of F, M and NULL *but*
-				 * anything other than M is a failure
-				 * if it's a NULL then we reset xfer_size but
-				 * we retain the file pointers */
+			if (match != 'M') {
+				/* Hash mismatch or unexpected response — transfer full file. */
+#ifdef DEBUG
+				fprintf(stderr, "%s: match status is '%c', restarting full transfer\n",
+					hostname, match);
+#endif
 				xfer_size = size;
-				bad_match_flag = 1;
-				if (match == 'F') {
-					/* got an F for failure and not NULL
-					 * so we want to swap over the filename from
-					 * the temp back to the original */
-#ifdef DEBUG
-					fprintf(stderr, "%s: match status is F\n", hostname);
-#endif
-					if (np_tmp != NULL)
-						np = np_tmp;
-					else {
-						continue;
-					}
-				} else {
-#ifdef DEBUG
-					fprintf(stderr, "%s: match received is NULL\n", hostname);
-#endif
-				}
+				resume_offset = 0;
 			} else {
 #ifdef DEBUG
-				fprintf(stderr, "%s match status is M\n", hostname);
+				fprintf(stderr, "%s: match status is M, resuming at offset %lld\n",
+					hostname, (long long)resume_offset);
 #endif
-				bad_match_flag = 0; /* while this is set at the beginning of the
-                                                     * loop I'm setting it here explicitly as well */
+	
 			}
 		}
 
 #ifdef DEBUG
-		fprintf(stderr, "%s: Creating file. mode is %d for %s\n",
-			hostname, mode, np);
+		fprintf(stderr, "%s: Creating file. mode is %d for %s resume_offset=%lld\n",
+			hostname, mode, np, (long long)resume_offset);
 #endif
-		if ((ofd = open(np, O_WRONLY|O_CREAT, mode)) == -1) {
+		ofd = (resume_offset > 0)
+		    ? open(np, O_WRONLY|O_NOFOLLOW, mode)
+		    : open(np, O_WRONLY|O_CREAT, mode);
+		if (ofd == -1) {
 bad:			run_err("%s: %s", np, strerror(errno));
+			continue;
+		}
+		if (resume_offset > 0 &&
+		    lseek(ofd, resume_offset, SEEK_SET) == -1) {
+			run_err("%s: lseek: %s", np, strerror(errno));
+			close(ofd);
 			continue;
 		}
 
@@ -2464,78 +2443,9 @@ bad:			run_err("%s: %s", np, strerror(errno));
 			wrerr = 1;
 		}
 		if (!wrerr && (!exists || S_ISREG(stb.st_mode)) &&
-		    ftruncate(ofd, xfer_size) != 0)
+		    ftruncate(ofd, size) != 0)
 			note_err("%s: truncate: %s", np, strerror(errno));
 
-                /* if np_tmp isn't set then we don't have a resume file to cat */
-		/* likewise, bad match flag means no resume flag */
-#ifdef DEBUG
-		fprintf (stderr, "%s: resume_flag: %d, np_tmp: %s, bad_match_flag: %d\n",
-			 hostname, resume_flag, np_tmp, bad_match_flag);
-#endif
-		if (resume_flag && np_tmp && !bad_match_flag) {
-			FILE *orig, *resume;
-			char res_buf[512]; /* set at 512 just because, might want to increase*/
-			ssize_t res_bytes = 0;
-			off_t sum = 0;
-			struct stat res_stat;
-			*res_buf = '\0';
-			orig = NULL; /*supress warnings*/
-			resume = NULL; /*supress warnings*/
-#ifdef DEBUG
-			fprintf(stderr, "%s: Resume flag is set. Going to concat %s to %s  now\n",
-				hostname, np, np_tmp);
-#endif
-			/* np/ofd is the resume file so open np_tmp for appending
-			 * close ofd because we are going to be shifting it
-			 * and I don't wnat the same file open in multiple descriptors */
-			if (close(ofd) == -1)
-				note_err("%s: close: %s", np, strerror(errno));
-			/* orig is the target file, resume is the temp file */
-			orig = fopen(np_tmp, "a"); /*open for appending*/
-			if (orig == NULL) {
-				fprintf(stderr, "%s: Could not open %s for appending.", hostname, np_tmp);
-				goto stopcat;
-			}
-			resume = fopen(np, "r"); /*open for reading only*/
-			if (resume == NULL) {
-				fprintf(stderr, "%s: Could not open %s for reading.", hostname, np);
-				goto stopcat;
-			}
-			/* get the number of bytes in the temp file*/
-			if (fstat(fileno(resume), &res_stat) == -1) {
-				fprintf(stderr, "%s: Could not stat %s", hostname, np);
-				goto stopcat;
-			}
-			/* while the number of bytes read from the temp file
-			 * is less than the size of the file read in a chunk and
-			 * write it to the target file */
-			do {
-				res_bytes = fread(res_buf, 1, 512, resume);
-				fwrite(res_buf, 1, res_bytes, orig);
-				sum += res_bytes;
-			} while (sum < res_stat.st_size);
-
-stopcat:		if (orig)
-				fclose(orig);
-			if (resume)
-				fclose(resume);
-			/* delete the resume file */
-			remove(np);
-#ifdef DEBUG
-			fprintf (stderr, "%s: np(%s) and np_tmp(%s)\n", hostname, np, np_tmp);
-#endif
-			np = np_tmp;
-#ifdef DEBUG
-			fprintf (stderr, "%s np(%s) and np_tmp(%s)\n", hostname, np, np_tmp);
-#endif
-			/* reset ofd to the original np */
-			if ((ofd = open(np_tmp, O_WRONLY)) == -1) {
-				fprintf(stderr, "%s: couldn't open %s in append function\n", hostname, np_tmp);
-				atomicio(vwrite, remout, "", 1);
-				goto bad;
-			}
-		}
 		if (pflag) {
 			if (exists || omode != mode)
 #ifdef HAVE_FCHMOD
@@ -2575,11 +2485,7 @@ stopcat:		if (orig)
 			fprintf (stderr, "%s: Sending null to remout.\n", hostname);
 #endif
 			(void) atomicio(vwrite, remout, "", 1); }
-		/* we are in resume mode and we have allocated memory for np_tmp */
-		if (resume_flag && np_tmp != NULL) {
-			free(np_tmp);
-			np_tmp = NULL;
-		}
+		resume_offset = 0; /* reset for next file */
         }
 done:
 	for (n = 0; n < npatterns; n++)
@@ -2724,20 +2630,11 @@ response(void)
 void
 usage(void)
 {
-#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 	(void) fprintf(stderr,
 	    "usage: hpnscp [-346ABCOpqRrsTvZ] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n"
 	    "              [-i identity_file] [-J destination] [-l limit] [-o ssh_option]\n"
 	    "              [-P port] [-S program] [-X sftp_option] source ... target\n");
 	exit(1);
-#else
-	(void) fprintf(stderr,
-	    "usage: hpnscp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n"
-	    "              [-i identity_file] [-J destination] [-l limit]\n"
-	    "              [-o ssh_option] [-P port]"
-	    "              [-S program] source ... target\n");
-	exit(1);
-#endif
 
 }
 

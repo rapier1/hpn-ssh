@@ -422,6 +422,7 @@ void     channel_set_hpn_disabled(int);
 #define HPN_MEMLIMIT_DEFAULT	0	/* 128 MB */
 #define HPN_MEMLIMIT_HIGH	1	/* 256 MB */
 #define HPN_MEMLIMIT_MAX	2	/* 512 MB */
+#define HPN_MEMLIMIT_NLEVELS	3	/* must match number of entries in hpn_memlimit_caps[] */
 
 void     channel_set_hpn_memlimit(int);
 #endif

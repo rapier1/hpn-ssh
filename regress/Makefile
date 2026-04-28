@@ -26,6 +26,7 @@ distclean:	clean
 LTESTS= 	connect \
 		connect-mptcp \
 		connect-happy-eyeballs \
+		connect-memlimit \
 		proxy-connect \
 		sshfp-connect \
 		connect-privsep \
@@ -70,6 +71,7 @@ LTESTS= 	connect \
 		sftp-glob \
 		sftp-perm \
 		sftp-resume \
+		sftp-verified-resume \
 		sftp-uri \
 		reconfigure \
 		dynamic-forward \

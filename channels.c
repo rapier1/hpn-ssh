@@ -4012,7 +4012,11 @@ channel_set_hpn_disabled(int external_hpn_disabled)
  * access to the options struct */
 void
 channel_set_hpn_memlimit(int level)
-{	
+{
+	if (level < 0 || level >= HPN_MEMLIMIT_NLEVELS) {
+		error_f("invalid HPN memory limit level %d, using default", level);
+		level = HPN_MEMLIMIT_DEFAULT;
+	}
 	hpn_memlimit = level;
 	debug("HPN Memory Limit: %d (cap %.0f MB)", level,
 	    hpn_memlimit_caps[level] / (1024.0 * 1024.0));
