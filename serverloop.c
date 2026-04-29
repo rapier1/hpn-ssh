@@ -610,7 +610,7 @@ server_request_session(struct ssh *ssh)
 	    0, "server-session", 1);
 	if ((options.tcp_rcv_buf_poll) && (!options.hpn_disabled)) {
 		c->dynamic_window = 1;
-		ssh_packet_enable_hpn_bulk(ssh);
+		ssh_packet_enable_hpn_bulk(ssh, options.hpn_memory_limit);
 		channel_set_hpn_memlimit(options.hpn_memory_limit);
 	}
 	if (session_open(the_authctxt, c->self) != 1) {

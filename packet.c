@@ -235,6 +235,7 @@ struct session_state {
 
 	/* HPN: use SO_SNDBUF as bulk write threshold */
 	int hpn_dynamic_bulk;
+	int hpn_bulk_level;
 
 	/* Nagle disabled on socket */
 	int nodelay_set;
@@ -2357,7 +2358,8 @@ ssh_packet_not_very_much_data_to_write(struct ssh *ssh)
 	if (state->interactive_mode)
 		return sshbuf_len(state->output) < 16384;
 
-	if (state->hpn_dynamic_bulk) {
+	/* Only raise the threshold above 128 KB at HIGH or MAX memory levels. */
+	if (state->hpn_dynamic_bulk && state->hpn_bulk_level > HPN_MEMLIMIT_DEFAULT) {
 		u_int32_t sndbuf = 0;
 		socklen_t optlen = sizeof(sndbuf);
 
@@ -2375,7 +2377,8 @@ ssh_packet_bulk_write_limit(struct ssh *ssh)
 	struct session_state *state = ssh->state;
 	size_t limit = 128 * 1024;
 
-	if (state->hpn_dynamic_bulk) {
+	/* Only expand the bulk write limit above 128 KB at HIGH or MAX levels. */
+	if (state->hpn_dynamic_bulk && state->hpn_bulk_level > HPN_MEMLIMIT_DEFAULT) {
 		u_int32_t sndbuf = 0;
 		socklen_t optlen = sizeof(sndbuf);
 
@@ -2387,9 +2390,10 @@ ssh_packet_bulk_write_limit(struct ssh *ssh)
 }
 
 void
-ssh_packet_enable_hpn_bulk(struct ssh *ssh)
+ssh_packet_enable_hpn_bulk(struct ssh *ssh, int level)
 {
 	ssh->state->hpn_dynamic_bulk = 1;
+	ssh->state->hpn_bulk_level = level;
 }
 
 /*

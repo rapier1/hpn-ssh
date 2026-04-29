@@ -1361,7 +1361,10 @@ static int
 channel_tcpwinsz(struct ssh *ssh)
 {
 	u_int32_t tcpwinsz = 0;
-	u_int32_t memlimit_cap = hpn_memlimit_caps[hpn_memlimit];
+	/* At the default level preserve 18.9 behaviour: cap at SSHBUF_SIZE_MAX
+	 * (512 MB).  Higher levels enforce the tighter per-level limit. */
+	u_int32_t memlimit_cap = (hpn_memlimit == HPN_MEMLIMIT_DEFAULT)
+	    ? SSHBUF_SIZE_MAX : hpn_memlimit_caps[hpn_memlimit];
 	socklen_t optsz = sizeof(tcpwinsz);
 	int ret = -1;
 	

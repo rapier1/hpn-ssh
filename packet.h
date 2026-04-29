@@ -156,7 +156,7 @@ int	 ssh_packet_write_poll(struct ssh *);
 int	 ssh_packet_write_wait(struct ssh *);
 int      ssh_packet_have_data_to_write(struct ssh *);
 int      ssh_packet_not_very_much_data_to_write(struct ssh *);
-void	 ssh_packet_enable_hpn_bulk(struct ssh *);
+void	 ssh_packet_enable_hpn_bulk(struct ssh *, int level);
 size_t	 ssh_packet_bulk_write_limit(struct ssh *);
 int	 ssh_packet_interactive_data_to_write(struct ssh *);
 
