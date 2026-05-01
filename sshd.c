@@ -83,6 +83,7 @@
 #include "ssh-gss.h"
 #endif
 #include "monitor_wrap.h"
+#include "channels.h"
 #include "cipher-chachapoly-libcrypto-mt.h"
 
 /* Re-exec fds */
