@@ -88,7 +88,7 @@ chachapoly_set_keystream_len_mt(u_int packet_size)
 struct mt_keystream {
 	u_char poly_key[POLY1305_KEYLEN];     /* POLY1305_KEYLEN == 32 */
 	u_char headerStream[CHACHA_BLOCKLEN]; /* CHACHA_BLOCKLEN == 64 */
-	u_char mainStream[KEYSTREAMLEN_MAX];  /* sized for max packet */
+	u_char *mainStream;  /* dynamically allocated to hpn_keystream_len */
 };
 
 struct threadData {
@@ -113,7 +113,7 @@ struct chachapoly_ctx_mt {
 	pthread_t self_tid;
 
 	pid_t mainpid;
-	u_char zeros[KEYSTREAMLEN_MAX]; /* zeroed input for keystream generation */
+	u_char *zeros; /* dynamically allocated to hpn_keystream_len, zeroed */
 
   /* if OpenSSL has support for Poly1305 in the MAC EVPs
    * use that (OSSL >= 3.0) if not then it's OSSL 1.1 so
@@ -263,6 +263,19 @@ join_manager_thread(pthread_t manager_tid)
 	}
 }
 
+static void
+free_stream_buffers(struct chachapoly_ctx_mt *ctx_mt)
+{
+	for (int i = 0; i < 2; i++)
+		for (int j = 0; j < NUMSTREAMS; j++) {
+			freezero(ctx_mt->batches[i].streams[j].mainStream,
+			    hpn_keystream_len);
+			ctx_mt->batches[i].streams[j].mainStream = NULL;
+		}
+	freezero(ctx_mt->zeros, hpn_keystream_len);
+	ctx_mt->zeros = NULL;
+}
+
 void
 chachapoly_free_mt(struct chachapoly_ctx_mt * ctx_mt)
 {
@@ -306,6 +319,9 @@ chachapoly_free_mt(struct chachapoly_ctx_mt * ctx_mt)
 		for (int j=0; j<NUMTHREADS; j++)
 			free_threadData(&(ctx_mt->batches[i].tds[j]));
 
+	/* Free dynamically allocated keystream buffers. */
+	free_stream_buffers(ctx_mt);
+
 	/* Zero and free the whole multithreaded cipher context. */
 	freezero(ctx_mt, sizeof(*ctx_mt));
 
@@ -317,6 +333,16 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 {
 	struct chachapoly_ctx_mt * ctx_mt = xmalloc(sizeof(*ctx_mt));
 	memset(ctx_mt, 0, sizeof(*ctx_mt));
+
+	/* Allocate keystream buffers sized to hpn_keystream_len.
+	 * HPNLargePackets=no uses ~32K; =yes uses ~64K. Must happen before
+	 * Poly1305 init below, which reads ctx_mt->zeros. */
+	ctx_mt->zeros = xcalloc(1, hpn_keystream_len);
+	for (int bi = 0; bi < 2; bi++)
+		for (int si = 0; si < NUMSTREAMS; si++)
+			ctx_mt->batches[bi].streams[si].mainStream =
+			    xcalloc(1, hpn_keystream_len);
+
 	/* Initialize the sequence number. When rekeying, this won't be zero. */
 	ctx_mt->seqnr = startseqnr;
 	ctx_mt->batchID = startseqnr / NUMSTREAMS;
@@ -433,6 +459,7 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 		ctx_mt->pkey = NULL;
 	}
 #endif
+	free_stream_buffers(ctx_mt);
 	freezero(ctx_mt, sizeof(*ctx_mt));
 	explicit_bzero(&startseqnr, sizeof(startseqnr));
 	return NULL;
