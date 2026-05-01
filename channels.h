@@ -231,7 +231,21 @@ struct Channel {
 /* default window/packet sizes for tcp/x11-fwd-channel */
 #define CHAN_SES_PACKET_DEFAULT	(32*1024)  /* default: lower memory usage */
 #define CHAN_SES_PACKET_HPN	(64*1024)  /* HPNLargePackets=yes: higher throughput */
-#define CHAN_SES_WINDOW_DEFAULT	(64*CHAN_SES_PACKET_DEFAULT)
+#define CHAN_SES_WINDOW_DEFAULT	(64*CHAN_SES_PACKET_DEFAULT)  /* 2MB */
+#define CHAN_SES_WINDOW_HPN	(64*CHAN_SES_PACKET_HPN)      /* 4MB */
+
+static inline u_int
+chan_ses_packet_size(int large_packets)
+{
+	return large_packets ? CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT;
+}
+
+static inline u_int
+chan_ses_window_size(int large_packets)
+{
+	return large_packets ? CHAN_SES_WINDOW_HPN : CHAN_SES_WINDOW_DEFAULT;
+}
+
 #define CHAN_TCP_PACKET_DEFAULT	(32*1024)
 #define CHAN_TCP_WINDOW_DEFAULT	(64*CHAN_TCP_PACKET_DEFAULT)
 #define CHAN_X11_PACKET_DEFAULT	(16*1024)

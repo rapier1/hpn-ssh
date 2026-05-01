@@ -424,7 +424,7 @@ privsep_postauth(struct ssh *ssh, Authctxt *authctxt)
 	 * this information is not part of the key state.
 	 */
 	ssh_packet_set_authenticated(ssh,
-	    options.hpn_large_packets ? CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT);
+	    chan_ses_packet_size(options.hpn_large_packets));
 }
 
 static struct sshkey *

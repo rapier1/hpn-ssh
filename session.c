@@ -2239,7 +2239,7 @@ session_set_fds(struct ssh *ssh, Session *s,
         channel_set_fds(ssh, s->chanid,
 			fdout, fdin, fderr,
 			ignore_fderr ? CHAN_EXTENDED_IGNORE : CHAN_EXTENDED_READ,
-			1, is_tty, CHAN_SES_WINDOW_DEFAULT);
+			1, is_tty, chan_ses_window_size(options.hpn_large_packets));
 }
 
 /*

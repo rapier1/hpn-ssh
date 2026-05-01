@@ -607,7 +607,7 @@ server_request_session(struct ssh *ssh)
 	 */
 	c = channel_new(ssh, "session", SSH_CHANNEL_LARVAL,
 	    -1, -1, -1, /*window size*/0,
-	    options.hpn_large_packets ? CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT,
+	    chan_ses_packet_size(options.hpn_large_packets),
 	    0, "server-session", 1);
 	if ((options.tcp_rcv_buf_poll) && (!options.hpn_disabled)) {
 		c->dynamic_window = 1;

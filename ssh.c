@@ -2275,9 +2275,8 @@ ssh_session2_open(struct ssh *ssh)
 	if (in == -1 || out == -1 || err == -1)
 		fatal("dup() in/out/err failed");
 
-	window = CHAN_SES_WINDOW_DEFAULT;
-	packetmax = options.hpn_large_packets ?
-	    CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT;
+	window = chan_ses_window_size(options.hpn_large_packets);
+	packetmax = chan_ses_packet_size(options.hpn_large_packets);
 	if (tty_flag) {
 		window >>= 1;
 		packetmax >>= 1;
