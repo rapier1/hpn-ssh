@@ -15,4 +15,4 @@
  *
  */
 
-void cipher_switch (struct ssh *);
+void cipher_switch (struct ssh *, u_int packet_size);

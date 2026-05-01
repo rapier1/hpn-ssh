@@ -157,7 +157,7 @@ typedef enum {
 	oHashKnownHosts,
 	oTunnel, oTunnelDevice,
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
-	oTcpRcvBufPoll, oHPNDisabled, oHPNMemoryLimit,
+	oTcpRcvBufPoll, oHPNDisabled, oHPNLargePackets, oHPNMemoryLimit,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
@@ -332,6 +332,7 @@ static struct {
 	{ "knownhostscommand", oKnownHostsCommand },
 	{ "tcprcvbufpoll", oTcpRcvBufPoll },
 	{ "hpndisabled", oHPNDisabled },
+	{ "hpnlargepackets", oHPNLargePackets },
 	{ "hpnmemorylimit", oHPNMemoryLimit },
 	{ "requiredrsasize", oRequiredRSASize },
 	{ "enableescapecommandline", oEnableEscapeCommandline },
@@ -1360,6 +1361,10 @@ parse_time:
 
 	case oHPNDisabled:
 		intptr = &options->hpn_disabled;
+		goto parse_flag;
+
+	case oHPNLargePackets:
+		intptr = &options->hpn_large_packets;
 		goto parse_flag;
 
 	case oHPNMemoryLimit:
@@ -2910,6 +2915,7 @@ initialize_options(Options * options)
 	options->metrics_path = NULL;
 	options->metrics_interval = -1;
 	options->hpn_disabled = -1;
+	options->hpn_large_packets = -1;
 	options->hpn_memory_limit = -1;
 	options->fallback = -1;
 	options->fallback_port = -1;
@@ -3088,6 +3094,8 @@ fill_default_options(Options * options)
 		options->server_alive_count_max = 3;
 	if (options->hpn_disabled == -1)
 		options->hpn_disabled = 0;
+	if (options->hpn_large_packets == -1)
+		options->hpn_large_packets = 0;
 	if (options->hpn_memory_limit == -1)
 		options->hpn_memory_limit = 0;
 	if (options->tcp_rcv_buf_poll == -1)
@@ -3961,6 +3969,7 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oEnableEscapeCommandline, o->enable_escape_commandline);
 	dump_cfg_fmtint(oTcpRcvBufPoll, o->tcp_rcv_buf_poll);
 	dump_cfg_fmtint(oHPNDisabled, o->hpn_disabled);
+	dump_cfg_fmtint(oHPNLargePackets, o->hpn_large_packets);
 	dump_cfg_fmtint(oHPNMemoryLimit, o->hpn_memory_limit);
 	/* NoneSwitch is command-line only; omit from -G dump to allow reparse */
 	dump_cfg_fmtint(oNoneEnabled, o->none_enabled);

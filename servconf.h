@@ -218,6 +218,7 @@ typedef struct {
 	/* hpnssh options */
         int     tcp_rcv_buf_poll;       /* poll tcp rcv window in autotuning kernels*/
 	int	hpn_disabled;		/* disable hpn functionality. false by default */
+	int	hpn_large_packets;	/* use 64K channel packets; default is 32K */
 	int	hpn_memory_limit;	/* HPN memory limit: default, high, max */
 	int	none_enabled;		/* Enable NONE cipher switch */
 	int     nonemac_enabled;        /* Enable NONE MAC switch */

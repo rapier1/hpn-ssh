@@ -32,6 +32,12 @@ struct chachapoly_ctx_mt; /* defined in cipher-chachapoly-libcrypto-mt.c */
 struct chachapoly_ctx_mt *chachapoly_new_mt(u_int startseqnr, const u_char *key, u_int keylen)
                                             __attribute__((__bounded__(__buffer__, 2, 3)));
 
+/* Set the keystream length used for future batch generation.
+ * Call this after HPNLargePackets option is known, before the first kex
+ * (client/server main) and again at authentication (ssh_packet_set_authenticated).
+ * packet_size should be CHAN_SES_PACKET_DEFAULT or CHAN_SES_PACKET_HPN. */
+void   chachapoly_set_keystream_len_mt(u_int packet_size);
+
 void   chachapoly_free_mt(struct chachapoly_ctx_mt *cpctx);
 
 int    chachapoly_crypt_mt(struct chachapoly_ctx_mt *cpctx, u_int seqnr,

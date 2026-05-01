@@ -97,6 +97,7 @@
 #include "ssherr.h"
 #include "utf8.h"
 #include "cipher-switch.h"
+#include "cipher-chachapoly-libcrypto-mt.h"
 
 #ifdef ENABLE_PKCS11
 #include "ssh-pkcs11.h"
@@ -1287,6 +1288,10 @@ main(int ac, char **av)
 	if (fill_default_options(&options) != 0)
 		cleanup_exit(255);
 
+	/* Set ChaCha20-MT keystream length before first kex. */
+	chachapoly_set_keystream_len_mt(options.hpn_large_packets ?
+	    CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT);
+
 	if (options.user == NULL) {
 		user_was_default = 1;
 		options.user = xstrdup(pw->pw_name);
@@ -1946,7 +1951,8 @@ fork_postauth(struct ssh *ssh)
 		debug2_f("FIPS mode not found or disabled. Parallel ciphers are enabled");
 
 	if ((options.disable_multithreaded == 0) && (fips == 0))
-		cipher_switch(ssh);
+		cipher_switch(ssh, options.hpn_large_packets ?
+		    CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT);
 }
 
 static void
@@ -2270,9 +2276,9 @@ ssh_session2_open(struct ssh *ssh)
 		fatal("dup() in/out/err failed");
 
 	window = CHAN_SES_WINDOW_DEFAULT;
-	packetmax = CHAN_SES_PACKET_DEFAULT;
+	packetmax = options.hpn_large_packets ?
+	    CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT;
 	if (tty_flag) {
-		window = CHAN_SES_WINDOW_DEFAULT;
 		window >>= 1;
 		packetmax >>= 1;
 	}
@@ -2417,7 +2423,8 @@ ssh_session2(struct ssh *ssh, const struct ssh_conn_info *cinfo)
 			debug2_f("FIPS mode not found or disabled. Parallel ciphers are enabled");
 		if ((options.disable_multithreaded == 0)
 		    && (fips == 0))
-			cipher_switch(ssh);
+			cipher_switch(ssh, options.hpn_large_packets ?
+		    CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT);
 	}
 	return client_loop(ssh, tty_flag, tty_flag ?
 	    options.escape_char : SSH_ESCAPECHAR_NONE, id);

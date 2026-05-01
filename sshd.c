@@ -83,6 +83,7 @@
 #include "ssh-gss.h"
 #endif
 #include "monitor_wrap.h"
+#include "cipher-chachapoly-libcrypto-mt.h"
 
 /* Re-exec fds */
 #define REEXEC_DEVCRYPTO_RESERVED_FD	(STDERR_FILENO + 1)
@@ -1541,6 +1542,10 @@ main(int ac, char **av)
 
 	/* Fill in default values for those options not explicitly set. */
 	fill_default_server_options(&options);
+
+	/* Set ChaCha20-MT keystream length before first kex. */
+	chachapoly_set_keystream_len_mt(options.hpn_large_packets ?
+	    CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT);
 
 	/* Check that options are sensible */
 	if (options.authorized_keys_command_user == NULL &&

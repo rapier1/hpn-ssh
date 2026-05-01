@@ -27,6 +27,7 @@ LTESTS= 	connect \
 		connect-mptcp \
 		connect-happy-eyeballs \
 		connect-memlimit \
+		connect-largepackets \
 		proxy-connect \
 		sshfp-connect \
 		connect-privsep \

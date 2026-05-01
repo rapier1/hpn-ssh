@@ -2596,22 +2596,6 @@ channel_check_window(struct ssh *ssh, Channel *c)
 			    c->local_window_max);
 		}
 
-		/* Cap local_window to CHAN_WINDOW_PACKET_CAP × local_maxpacket.
-		 * The dynamic window can grow local_window_max to several MB to
-		 * match the TCP receive buffer, allowing many large packets in
-		 * flight simultaneously. This causes c->output to accumulate
-		 * faster than the drain loop clears it. The cap bounds peak
-		 * c->output size independent of how large the dynamic window grows.
-		 * CHAN_WINDOW_PACKET_CAP needs empirical tuning: too small throttles
-		 * high-BDP transfers; too large allows memory to grow unchecked. */
-		if (c->local_maxpacket > 0) {
-			u_int window_cap =
-			    (u_int)c->local_maxpacket * CHAN_WINDOW_PACKET_CAP;
-			if (c->local_window + grant > window_cap)
-				grant = (c->local_window < window_cap) ?
-				    window_cap - c->local_window : 0;
-		}
-
 		/* Always reset local_consumed — no deferral. */
 		c->local_consumed = 0;
 

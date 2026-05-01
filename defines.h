@@ -944,6 +944,9 @@ struct winsize {
 #endif
 
 #ifndef SSH_IOBUFSZ
+/* Must be >= CHAN_SES_PACKET_HPN (64K) to accommodate HPNLargePackets=yes.
+ * Used for cipher keystream buffer sizing and transport read buffers;
+ * packet_max_size is adjusted at runtime via ssh_packet_set_authenticated(). */
 # define SSH_IOBUFSZ (64*1024)
 #endif
 

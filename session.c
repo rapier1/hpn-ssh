@@ -533,7 +533,8 @@ do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 		debug2_f("FIPS mode not found or disabled. Parallel ciphers are enabled");
 
 	if ((options.disable_multithreaded == 0) && (fips == 0))
-		cipher_switch(ssh);
+		cipher_switch(ssh, options.hpn_large_packets ?
+		    CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT);
 	return 0;
 }
 
@@ -645,7 +646,8 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 		debug2_f("FIPS mode not found or disabled. Parallel ciphers are enabled");
 
 	if ((options.disable_multithreaded == 0) && (fips == 0))
-		cipher_switch(ssh);
+		cipher_switch(ssh, options.hpn_large_packets ?
+		    CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT);
 	return 0;
 }
 

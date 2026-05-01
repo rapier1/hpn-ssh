@@ -49,11 +49,28 @@
 # define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
-/* Size of keystream to pregenerate, measured in bytes
- * we want to round up to the nearest chacha block and have
- * 128 bytes for overhead */
+/* Maximum keystream to pregenerate, measured in bytes.
+ * Sized for the largest possible packet (SSH_IOBUFSZ == CHAN_SES_PACKET_HPN)
+ * plus overhead, rounded up to a ChaCha block boundary.
+ * The runtime value used for generation is hpn_keystream_len, which is
+ * set via chachapoly_set_keystream_len_mt() when options are applied. */
 #define ROUND_UP(x,y) (((((x)-1)/(y))+1)*(y))
-#define KEYSTREAMLEN (ROUND_UP((SSH_IOBUFSZ) + 128, (CHACHA_BLOCKLEN)))
+#define KEYSTREAMLEN_MAX (ROUND_UP((SSH_IOBUFSZ) + 128, (CHACHA_BLOCKLEN)))
+
+/* Runtime keystream length — updated when HPNLargePackets option is known.
+ * Defaults to KEYSTREAMLEN_MAX (safe for all packet sizes). Worker threads
+ * read this once per batch; it is written only at option-application time,
+ * well before any concurrent batch generation begins. */
+static u_int hpn_keystream_len = KEYSTREAMLEN_MAX;
+
+void
+chachapoly_set_keystream_len_mt(u_int packet_size)
+{
+	u_int len = ROUND_UP(packet_size + 128, CHACHA_BLOCKLEN);
+	if (len > KEYSTREAMLEN_MAX)
+		len = KEYSTREAMLEN_MAX;
+	hpn_keystream_len = len;
+}
 
 /* BEGIN TUNABLES */
 
@@ -71,7 +88,7 @@
 struct mt_keystream {
 	u_char poly_key[POLY1305_KEYLEN];     /* POLY1305_KEYLEN == 32 */
 	u_char headerStream[CHACHA_BLOCKLEN]; /* CHACHA_BLOCKLEN == 64 */
-	u_char mainStream[KEYSTREAMLEN];      /* KEYSTREAMLEN == 32768 */
+	u_char mainStream[KEYSTREAMLEN_MAX];  /* sized for max packet */
 };
 
 struct threadData {
@@ -96,7 +113,7 @@ struct chachapoly_ctx_mt {
 	pthread_t self_tid;
 
 	pid_t mainpid;
-	u_char zeros[KEYSTREAMLEN]; /* KEYSTREAMLEN == 32768 */
+	u_char zeros[KEYSTREAMLEN_MAX]; /* zeroed input for keystream generation */
 
   /* if OpenSSL has support for Poly1305 in the MAC EVPs
    * use that (OSSL >= 3.0) if not then it's OSSL 1.1 so
@@ -154,7 +171,7 @@ generate_keystream(struct mt_keystream * ks, u_int seqnr,
 	/* generate main keystream for encrypting payload */
 	td->seqbuf[0] = 1;
 	if (!EVP_CipherInit(td->main_evp, NULL, NULL, td->seqbuf, 1) ||
-	    EVP_Cipher(td->main_evp, ks->mainStream, zeros, KEYSTREAMLEN) < 0)
+	    EVP_Cipher(td->main_evp, ks->mainStream, zeros, hpn_keystream_len) < 0)
 		return -1;
 
 	return 0;

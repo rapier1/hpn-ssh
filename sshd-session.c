@@ -423,7 +423,8 @@ privsep_postauth(struct ssh *ssh, Authctxt *authctxt)
 	 * Tell the packet layer that authentication was successful, since
 	 * this information is not part of the key state.
 	 */
-	ssh_packet_set_authenticated(ssh);
+	ssh_packet_set_authenticated(ssh,
+	    options.hpn_large_packets ? CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT);
 }
 
 static struct sshkey *

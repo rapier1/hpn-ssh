@@ -38,7 +38,7 @@
  * cipher. */
 
 void
-cipher_switch(struct ssh *ssh) {
+cipher_switch(struct ssh *ssh, u_int packet_size) {
 #ifdef WITH_OPENSSL
 	/* get the send and receive context and extract the cipher name */
 	const void *send_cc = ssh_packet_get_send_context(ssh);
@@ -61,14 +61,14 @@ cipher_switch(struct ssh *ssh) {
 	 * if statement */
 	if (strstr(send, "ctr") || strstr(recv, "ctr")) {
 		debug("Serial to parallel AES-CTR cipher swap");
-		ssh_packet_set_authenticated(ssh);
+		ssh_packet_set_authenticated(ssh, packet_size);
 		packet_request_rekeying();
 	}
 	/* do the same for multithreaded chacha20 but with strcmp */
 	if ((strcmp(send, "chacha20-poly1305@openssh.com") == 0) ||
 	    (strcmp(recv, "chacha20-poly1305@openssh.com") == 0)) {
 		debug("Serial to parallel Chacha20-poly1305 cipher swap");
-		ssh_packet_set_authenticated(ssh);
+		ssh_packet_set_authenticated(ssh, packet_size);
 		packet_request_rekeying();
 	}
 #endif

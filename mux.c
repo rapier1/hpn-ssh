@@ -447,7 +447,8 @@ mux_master_process_new_session(struct ssh *ssh, u_int rid,
 		error_f("tcgetattr: %s", strerror(errno));
 
 	window = CHAN_SES_WINDOW_DEFAULT;
-	packetmax = CHAN_SES_PACKET_DEFAULT;
+	packetmax = options.hpn_large_packets ?
+	    CHAN_SES_PACKET_HPN : CHAN_SES_PACKET_DEFAULT;
 	if (cctx->want_tty) {
 		window >>= 1;
 		packetmax >>= 1;
