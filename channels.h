@@ -231,6 +231,7 @@ struct Channel {
 /* default window/packet sizes for tcp/x11-fwd-channel */
 #define CHAN_SES_PACKET_DEFAULT	(64*1024)
 #define CHAN_SES_WINDOW_DEFAULT	(64*CHAN_SES_PACKET_DEFAULT)
+#define CHAN_WINDOW_PACKET_CAP	64  /* max window in units of local_maxpacket */
 #define CHAN_TCP_PACKET_DEFAULT	(32*1024)
 #define CHAN_TCP_WINDOW_DEFAULT	(64*CHAN_TCP_PACKET_DEFAULT)
 #define CHAN_X11_PACKET_DEFAULT	(16*1024)

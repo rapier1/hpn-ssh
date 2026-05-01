@@ -2563,11 +2563,15 @@ channel_check_window(struct ssh *ssh, Channel *c)
 
 		/*
 		 * Throttle the window grant proportionally to output buffer
-		 * occupancy. When c->output fills due to a slow consumer,
-		 * fewer credits are returned to the sender, naturally reducing
-		 * its transmission rate. Deferred bytes remain in local_consumed
-		 * and are granted as the buffer drains. When output is empty
-		 * the scale factor is 1.0 and behaviour is identical to before.
+		 * occupancy. local_consumed is always reset to zero so unconsumed
+		 * credits are discarded rather than deferred. Deferral caused
+		 * burst-after-stall oscillations: accumulated debt was released as
+		 * a single large grant when the buffer drained, causing the sender
+		 * to flood the receiver and refill the buffer rapidly. Without
+		 * deferral the window shrinks gradually under backpressure and
+		 * recovers proportionally as the buffer drains — no burst, no
+		 * oscillation. When output is empty the scale factor is 1.0 and
+		 * behaviour is identical to before.
 		 */
 		output_len = (u_int)sshbuf_len(c->output);
 		full_grant = c->local_consumed + (u_int)addition;
@@ -2577,8 +2581,9 @@ channel_check_window(struct ssh *ssh, Channel *c)
 			 * Scale factor is 1.0; behaviour identical to before. */
 			grant = full_grant;
 		} else if (output_len >= c->local_window_max) {
-			/* Buffer fully saturated: withhold all credits until
-			 * the consumer catches up and the buffer drains. */
+			/* Buffer fully saturated: issue no credits this round.
+			 * Window shrinks; sender slows. Recovery begins once
+			 * the consumer drains the buffer and output_len drops. */
 			grant = 0;
 		} else {
 			/* Partial occupancy: grant credits proportional to
@@ -2591,10 +2596,24 @@ channel_check_window(struct ssh *ssh, Channel *c)
 			    c->local_window_max);
 		}
 
-		/* Ungranted bytes stay in local_consumed and are retried next
-		 * call; when grant == full_grant this is 0, matching the
-		 * original behaviour. */
-		c->local_consumed = full_grant - grant;
+		/* Cap local_window to CHAN_WINDOW_PACKET_CAP × local_maxpacket.
+		 * The dynamic window can grow local_window_max to several MB to
+		 * match the TCP receive buffer, allowing many large packets in
+		 * flight simultaneously. This causes c->output to accumulate
+		 * faster than the drain loop clears it. The cap bounds peak
+		 * c->output size independent of how large the dynamic window grows.
+		 * CHAN_WINDOW_PACKET_CAP needs empirical tuning: too small throttles
+		 * high-BDP transfers; too large allows memory to grow unchecked. */
+		if (c->local_maxpacket > 0) {
+			u_int window_cap =
+			    (u_int)c->local_maxpacket * CHAN_WINDOW_PACKET_CAP;
+			if (c->local_window + grant > window_cap)
+				grant = (c->local_window < window_cap) ?
+				    window_cap - c->local_window : 0;
+		}
+
+		/* Always reset local_consumed — no deferral. */
+		c->local_consumed = 0;
 
 		if (grant == 0)
 			return 1;
@@ -2608,8 +2627,8 @@ channel_check_window(struct ssh *ssh, Channel *c)
 		    (r = sshpkt_send(ssh)) != 0) {
 			fatal_fr(r, "channel %i", c->self);
 		}
-		debug2("channel %d: window %d sent adjust %d (deferred %d)",
-		    c->self, c->local_window, grant, c->local_consumed);
+		debug2("channel %d: window %d sent adjust %d",
+		    c->self, c->local_window, grant);
 		c->local_window += grant;
 	}
 	return 1;
