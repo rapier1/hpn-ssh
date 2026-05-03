@@ -2494,6 +2494,16 @@ main(int argc, char **argv)
 	size_t num_requests = 0;
 	long long llv, limit_kbps = 0;
 
+	/* Pass-through state for the parallel-streams ControlMaster.
+	 * Captured during getopt and forwarded into sftp_parallel_config so
+	 * the master and worker connections honor the same -i / -F / -o
+	 * options the user gave the main connection. */
+	const char *parallel_identity = NULL;
+	const char *parallel_config_file = NULL;
+	char **parallel_extra_o = NULL;
+	size_t parallel_extra_o_count = 0;
+	size_t parallel_extra_o_cap = 0;
+
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
 	msetlocale();
@@ -2521,13 +2531,35 @@ main(int argc, char **argv)
 			addargs(&args, "-%c", ch);
 			break;
 		/* Passed through to ssh(1) with argument */
-		case 'F':
 		case 'J':
 		case 'c':
+			addargs(&args, "-%c", ch);
+			addargs(&args, "%s", optarg);
+			break;
+		case 'F':
+			addargs(&args, "-%c", ch);
+			addargs(&args, "%s", optarg);
+			parallel_config_file = optarg;
+			break;
 		case 'i':
+			addargs(&args, "-%c", ch);
+			addargs(&args, "%s", optarg);
+			parallel_identity = optarg;
+			break;
 		case 'o':
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
+			if (parallel_extra_o_count + 2 > parallel_extra_o_cap) {
+				parallel_extra_o_cap =
+				    parallel_extra_o_cap ?
+				    parallel_extra_o_cap * 2 : 8;
+				parallel_extra_o = xreallocarray(
+				    parallel_extra_o, parallel_extra_o_cap,
+				    sizeof(*parallel_extra_o));
+			}
+			parallel_extra_o[parallel_extra_o_count++] =
+			    xstrdup(optarg);
+			parallel_extra_o[parallel_extra_o_count] = NULL;
 			break;
 		case 'q':
 			ll = SYSLOG_LEVEL_ERROR;
@@ -2739,9 +2771,8 @@ main(int argc, char **argv)
 	 * ControlMaster and N worker SSH connections. On failure, warn and
 	 * continue with single-stream mode (the existing conn).
 	 *
-	 * Note: this initial cut uses default ssh authentication only (agent
-	 * or ~/.ssh/id_*). Pass-through of -i/-F/-o to the parallel master
-	 * is a follow-up; users needing those today should stick with -j 1.
+	 * The master and workers honor the same -i / -F / -o options the
+	 * user gave the main connection (captured during getopt above).
 	 */
 	if (parallel_num_streams > 1 && sftp_direct == NULL) {
 		struct sftp_parallel_config pcfg;
@@ -2754,6 +2785,9 @@ main(int argc, char **argv)
 			pcfg.port = portbuf;
 		}
 		pcfg.ssh_binary       = ssh_program;
+		pcfg.identity         = parallel_identity;
+		pcfg.config_file      = parallel_config_file;
+		pcfg.extra_argv       = parallel_extra_o;
 		pcfg.transfer_buflen  = (unsigned int)copy_buffer_len;
 		pcfg.num_requests     = (unsigned int)num_requests;
 		pcfg.limit_kbps       = limit_kbps;
@@ -2773,6 +2807,12 @@ main(int argc, char **argv)
 	if (parallel_orch != NULL) {
 		sftp_parallel_stop(parallel_orch);
 		parallel_orch = NULL;
+	}
+	if (parallel_extra_o != NULL) {
+		for (size_t pi = 0; pi < parallel_extra_o_count; pi++)
+			free(parallel_extra_o[pi]);
+		free(parallel_extra_o);
+		parallel_extra_o = NULL;
 	}
 
 #if !defined(USE_PIPES)
