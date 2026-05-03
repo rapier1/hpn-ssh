@@ -135,6 +135,10 @@ struct sftp_parallel {
 	int                         saved_showprogress;
 	int                         progress_meter_started;
 	uint64_t                    aggregate_bytes_for_meter;
+	off_t                       aggregate_progress_counter; /* meter ctr */
+	char                        progress_label[128];        /* stable storage
+								   * for the meter
+								   * label string */
 
 	int                         started;
 	int                         stopped;
@@ -437,6 +441,7 @@ reporter_thread(void *arg)
 		uint64_t bytes;
 		snapshot_workers(p, &bytes, NULL, NULL);
 		p->aggregate_bytes_for_meter = bytes;
+		p->aggregate_progress_counter = (off_t)bytes;
 		if (p->progress_meter_started)
 			refresh_progress_meter(0);
 
@@ -683,6 +688,33 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	pthread_mutex_destroy(&p->pending_mu);
 	pthread_cond_destroy(&p->pending_cv);
 	free(p);
+}
+
+void
+sftp_parallel_progress_start(struct sftp_parallel *p, const char *label)
+{
+	if (p == NULL || p->progress_meter_started)
+		return;
+	if (label == NULL)
+		label = "transfer";
+	strlcpy(p->progress_label, label, sizeof(p->progress_label));
+	p->aggregate_progress_counter = 0;
+	/* total=0 -> indeterminate progress (rate without ETA). The
+	 * aggregate total isn't known until the producer finishes
+	 * submitting, which may be concurrent with transfer. Phase 2 may
+	 * compute a running total during submission and pass it here. */
+	start_progress_meter(p->progress_label, 0,
+	    &p->aggregate_progress_counter);
+	p->progress_meter_started = 1;
+}
+
+void
+sftp_parallel_progress_stop(struct sftp_parallel *p)
+{
+	if (p == NULL || !p->progress_meter_started)
+		return;
+	p->progress_meter_started = 0;
+	stop_progress_meter();
 }
 
 uint64_t

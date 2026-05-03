@@ -672,6 +672,14 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		goto out;
 	}
 
+	if (parallel_orch != NULL && !quiet && g.gl_matchc > 0) {
+		char label[64];
+		snprintf(label, sizeof(label),
+		    "Fetching %d file%s in parallel", (int)g.gl_matchc,
+		    g.gl_matchc == 1 ? "" : "s");
+		sftp_parallel_progress_start(parallel_orch, label);
+	}
+
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
 		tmp = xstrdup(g.gl_pathv[i]);
 		if ((filename = basename(tmp)) == NULL) {
@@ -727,8 +735,10 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		abs_dst = NULL;
 	}
 
-	if (parallel_orch != NULL)
+	if (parallel_orch != NULL) {
 		sftp_parallel_wait(parallel_orch);
+		sftp_parallel_progress_stop(parallel_orch);
+	}
 
 out:
 	free(abs_src);
@@ -771,6 +781,14 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		    "\"%s\" is not a directory", tmp_dst);
 		err = -1;
 		goto out;
+	}
+
+	if (parallel_orch != NULL && !quiet && g.gl_matchc > 0) {
+		char label[64];
+		snprintf(label, sizeof(label),
+		    "Uploading %d file%s in parallel", (int)g.gl_matchc,
+		    g.gl_matchc == 1 ? "" : "s");
+		sftp_parallel_progress_start(parallel_orch, label);
 	}
 
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
@@ -835,8 +853,10 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		}
 	}
 
-	if (parallel_orch != NULL)
+	if (parallel_orch != NULL) {
 		sftp_parallel_wait(parallel_orch);
+		sftp_parallel_progress_stop(parallel_orch);
+	}
 
 out:
 	free(abs_dst);

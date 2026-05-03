@@ -95,6 +95,19 @@ void sftp_parallel_wait(struct sftp_parallel *p);
 void sftp_parallel_abort(struct sftp_parallel *p);
 
 /*
+ * Drive a single global progress_meter for the duration of an aggregate
+ * batch (e.g. a put/get command's worth of submissions). Call _start
+ * before submitting; the orchestrator's reporter thread will update the
+ * meter's counter from snapshotted worker bytes_total. Call _stop after
+ * sftp_parallel_wait returns.
+ *
+ * Calling _start while a meter is already active is a no-op. Calling
+ * _stop without a started meter is a no-op. label is copied internally.
+ */
+void sftp_parallel_progress_start(struct sftp_parallel *p, const char *label);
+void sftp_parallel_progress_stop(struct sftp_parallel *p);
+
+/*
  * Tear down: signal workers to exit, join all threads, close worker SSH
  * subprocesses, stop the ControlMaster, free everything. Idempotent.
  */
