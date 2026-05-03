@@ -56,6 +56,33 @@
 extern volatile sig_atomic_t interrupted;
 extern int showprogress;
 
+/*
+ * Per-stream isolation audit (feature-parallel-streams, Phase 1 step 1).
+ *
+ * Every API in this file accepts struct sftp_conn *, and that struct (defined
+ * below) holds all per-connection state: fd pair, request ID counter,
+ * protocol version, server extension bits, and bandwidth limiters. The file
+ * has no file-scope state that requires locking; helper functions are
+ * stateless or take state through parameters. Two extern globals
+ * (interrupted, showprogress) are read-only from here. Two struct sftp_conn
+ * instances can therefore coexist in separate threads without sharing state,
+ * provided each owns a distinct fd pair and is touched by at most one thread
+ * at a time.
+ *
+ * Concurrency hazards live OUTSIDE this file:
+ *   - progressmeter.c is a single global; concurrent start/stop/refresh from
+ *     workers will collide. Parallel mode must use aggregate-driven progress
+ *     reporting rather than per-file calls into start_progress_meter.
+ *   - progressmeter.c installs a SIGALRM handler. Under pthreads the worker
+ *     threads must mask SIGALRM so timer ticks deliver only to the
+ *     producer/main thread.
+ *   - sftp.c keeps a single sshpid; the parallel orchestrator tracks an
+ *     array of pids (master + N workers).
+ *
+ * If any new file-scope state is introduced here, parallelizability must be
+ * reconsidered.
+ */
+
 /* Default size of buffer for up/download (fix sftp.1 scp.1 if changed) */
 #define DEFAULT_COPY_BUFLEN	32768
 
