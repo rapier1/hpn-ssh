@@ -81,6 +81,7 @@ enum sftp_op {
 	SFTP_OP_UPLOAD,
 	SFTP_OP_DOWNLOAD,
 	SFTP_OP_MKDIR,
+	SFTP_OP_EXIT_WORKER,	/* sentinel for sftp_parallel_remove_worker */
 };
 
 struct sftp_work_unit {
@@ -117,14 +118,25 @@ struct sftp_worker {
 	enum worker_health health;             /* set by reporter, read for log */
 
 	int                started;
+	int                exited;             /* set by worker on self-exit;
+						* read by reporter for reaping */
 };
 
 struct sftp_parallel {
 	struct sftp_parallel_config cfg;
 	struct sftp_controlmaster  *cm;
 	struct sftp_workqueue      *q;
-	struct sftp_worker         *workers;
+
+	/* Workers held as an array of pointers so add/remove can mutate
+	 * the array without invalidating pointers held by worker threads
+	 * via w->parent->workers[...]. workers_mu serializes structural
+	 * changes (add/remove/reap); the per-worker mu still serializes
+	 * counter updates. Lock ordering: workers_mu BEFORE w->mu. */
+	pthread_mutex_t             workers_mu;
+	struct sftp_worker        **workers;
 	int                         num_workers;
+	int                         workers_cap;
+	int                         next_worker_id;
 
 	pthread_t                   reporter_tid;
 	int                         reporter_started;
@@ -286,6 +298,10 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	case SFTP_OP_MKDIR:
 		rc = sftp_mkdir(w->conn, u->dst_path, NULL, /*print_flag=*/0);
 		break;
+	case SFTP_OP_EXIT_WORKER:
+		/* Intercepted in worker_thread before reaching here. */
+		rc = 0;
+		break;
 	}
 	return rc;
 }
@@ -313,6 +329,14 @@ worker_thread(void *arg)
 		if (u == NULL)
 			continue;
 
+		/* Self-exit sentinel from sftp_parallel_remove_worker. The
+		 * first worker to pop this exits its loop; the reporter
+		 * thread reaps it. */
+		if (u->op == SFTP_OP_EXIT_WORKER) {
+			free_unit(u);
+			break;
+		}
+
 		worker_record_start(w);
 		int rc = execute_unit(w, u);
 		if (rc == 0) {
@@ -337,6 +361,10 @@ worker_thread(void *arg)
 			pending_dec(p);
 		}
 	}
+	/* Mark exited so the reporter thread can reap us (join + free). */
+	pthread_mutex_lock(&w->mu);
+	w->exited = 1;
+	pthread_mutex_unlock(&w->mu);
 	return NULL;
 }
 
@@ -347,13 +375,16 @@ snapshot_workers(struct sftp_parallel *p, uint64_t *bytes_out,
     uint64_t *completed_out, uint64_t *failed_out)
 {
 	uint64_t b = 0, c = 0, f = 0;
+	pthread_mutex_lock(&p->workers_mu);
 	for (int i = 0; i < p->num_workers; i++) {
-		pthread_mutex_lock(&p->workers[i].mu);
-		b += p->workers[i].bytes_total;
-		c += p->workers[i].units_completed;
-		f += p->workers[i].units_failed;
-		pthread_mutex_unlock(&p->workers[i].mu);
+		struct sftp_worker *w = p->workers[i];
+		pthread_mutex_lock(&w->mu);
+		b += w->bytes_total;
+		c += w->units_completed;
+		f += w->units_failed;
+		pthread_mutex_unlock(&w->mu);
 	}
+	pthread_mutex_unlock(&p->workers_mu);
 	if (bytes_out) *bytes_out = b;
 	if (completed_out) *completed_out = c;
 	if (failed_out) *failed_out = f;
@@ -372,8 +403,9 @@ watchdog_check_workers(struct sftp_parallel *p)
 	uint64_t now = monotonic_ns();
 	int queue_has_work = (sftp_workqueue_depth(p->q) > 0);
 
+	pthread_mutex_lock(&p->workers_mu);
 	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = &p->workers[i];
+		struct sftp_worker *w = p->workers[i];
 		enum worker_health prev, next;
 
 		pthread_mutex_lock(&w->mu);
@@ -425,6 +457,7 @@ watchdog_check_workers(struct sftp_parallel *p)
 		if (next == WORKER_DEAD)
 			any_dead = 1;
 	}
+	pthread_mutex_unlock(&p->workers_mu);
 	return any_dead;
 }
 
@@ -469,6 +502,43 @@ reporter_thread(void *arg)
 				sftp_parallel_abort(p);
 				break;
 			}
+
+			/* Reap workers that self-exited via SFTP_OP_EXIT_WORKER
+			 * sentinel (sftp_parallel_remove_worker). Collect them
+			 * under workers_mu, then join and free outside the
+			 * lock so we don't block other operations on it. */
+			struct sftp_worker *to_reap[SFTP_PARALLEL_MAX_WORKERS];
+			int n_reap = 0;
+			pthread_mutex_lock(&p->workers_mu);
+			for (int i = p->num_workers - 1; i >= 0; i--) {
+				struct sftp_worker *w = p->workers[i];
+				int exited;
+				pthread_mutex_lock(&w->mu);
+				exited = w->exited;
+				pthread_mutex_unlock(&w->mu);
+				if (exited) {
+					to_reap[n_reap++] = w;
+					memmove(&p->workers[i],
+					    &p->workers[i + 1],
+					    (p->num_workers - i - 1) *
+					    sizeof(*p->workers));
+					p->num_workers--;
+				}
+			}
+			pthread_mutex_unlock(&p->workers_mu);
+			for (int i = 0; i < n_reap; i++) {
+				struct sftp_worker *w = to_reap[i];
+				pthread_join(w->tid, NULL);
+				if (w->conn) sftp_free(w->conn);
+				if (w->fd_in >= 0) close(w->fd_in);
+				if (w->fd_out >= 0) close(w->fd_out);
+				if (w->ssh_pid > 0) {
+					int s;
+					(void)waitpid(w->ssh_pid, &s, 0);
+				}
+				pthread_mutex_destroy(&w->mu);
+				free(w);
+			}
 		}
 	}
 	return NULL;
@@ -476,19 +546,108 @@ reporter_thread(void *arg)
 
 /* ---------- Public API ---------- */
 
+/*
+ * Spawn one worker: SSH child via the master's socket, sftp_init, attach
+ * to p->workers[] under workers_mu, then start the thread. Returns the
+ * worker on success, NULL on failure (with all resources cleaned up).
+ * Used by sftp_parallel_start (during initial bring-up) and
+ * sftp_parallel_add_worker (for dynamic scaling).
+ */
+static struct sftp_worker *
+spawn_one_worker(struct sftp_parallel *p)
+{
+	if (!sftp_cm_alive(p->cm))
+		return NULL;
+
+	struct sftp_worker *w = xcalloc(1, sizeof(*w));
+	w->parent = p;
+	w->fd_in = w->fd_out = -1;
+	w->ssh_pid = -1;
+	pthread_mutex_init(&w->mu, NULL);
+
+	const char *ssh_bin = p->cfg.ssh_binary ?
+	    p->cfg.ssh_binary : "hpnssh";
+	unsigned int buflen = p->cfg.transfer_buflen ?
+	    p->cfg.transfer_buflen : DEFAULT_TRANSFER_BUFLEN;
+	unsigned int nreq = p->cfg.num_requests ?
+	    p->cfg.num_requests : DEFAULT_NUM_REQUESTS;
+
+	if (spawn_worker_ssh(ssh_bin, sftp_cm_socket(p->cm), p->cfg.host,
+	    &w->fd_in, &w->fd_out, &w->ssh_pid) != 0) {
+		error_f("ssh spawn failed");
+		goto fail;
+	}
+	w->conn = sftp_init(w->fd_in, w->fd_out, buflen, nreq,
+	    p->cfg.limit_kbps);
+	if (w->conn == NULL) {
+		error_f("sftp_init failed");
+		goto fail;
+	}
+
+	/* Insert into workers array under lock. */
+	pthread_mutex_lock(&p->workers_mu);
+	if (p->num_workers >= SFTP_PARALLEL_MAX_WORKERS) {
+		pthread_mutex_unlock(&p->workers_mu);
+		goto fail;
+	}
+	if (p->num_workers >= p->workers_cap) {
+		int newcap = p->workers_cap ? p->workers_cap * 2 : 8;
+		if (newcap > SFTP_PARALLEL_MAX_WORKERS)
+			newcap = SFTP_PARALLEL_MAX_WORKERS;
+		p->workers = xreallocarray(p->workers, newcap,
+		    sizeof(*p->workers));
+		p->workers_cap = newcap;
+	}
+	w->id = p->next_worker_id++;
+	p->workers[p->num_workers++] = w;
+	pthread_mutex_unlock(&p->workers_mu);
+
+	if (pthread_create(&w->tid, NULL, worker_thread, w) != 0) {
+		error_f("pthread_create failed");
+		/* Roll back insertion. */
+		pthread_mutex_lock(&p->workers_mu);
+		for (int i = 0; i < p->num_workers; i++) {
+			if (p->workers[i] == w) {
+				memmove(&p->workers[i], &p->workers[i + 1],
+				    (p->num_workers - i - 1) *
+				    sizeof(*p->workers));
+				p->num_workers--;
+				break;
+			}
+		}
+		pthread_mutex_unlock(&p->workers_mu);
+		goto fail;
+	}
+	w->started = 1;
+	return w;
+
+ fail:
+	if (w->conn) sftp_free(w->conn);
+	if (w->fd_in >= 0) close(w->fd_in);
+	if (w->fd_out >= 0) close(w->fd_out);
+	if (w->ssh_pid > 0) {
+		int s;
+		(void)waitpid(w->ssh_pid, &s, 0);
+	}
+	pthread_mutex_destroy(&w->mu);
+	free(w);
+	return NULL;
+}
+
 struct sftp_parallel *
 sftp_parallel_start(const struct sftp_parallel_config *cfg)
 {
-	if (cfg == NULL || cfg->host == NULL || cfg->num_streams < 1) {
+	if (cfg == NULL || cfg->host == NULL || cfg->num_streams < 1 ||
+	    cfg->num_streams > SFTP_PARALLEL_MAX_WORKERS) {
 		errno = EINVAL;
 		return NULL;
 	}
 
 	struct sftp_parallel *p = xcalloc(1, sizeof(*p));
 	p->cfg = *cfg;
-	p->num_workers = cfg->num_streams;
 	pthread_mutex_init(&p->pending_mu, NULL);
 	pthread_cond_init(&p->pending_cv, NULL);
+	pthread_mutex_init(&p->workers_mu, NULL);
 
 	/* 1. ControlMaster */
 	struct sftp_cm_config cmcfg = {
@@ -507,66 +666,31 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		goto fail;
 	}
 
-	/* 2. Workqueue */
-	p->q = sftp_workqueue_new(WORK_QUEUE_DEPTH(p->num_workers));
+	/* 2. Workqueue. Sized for cfg->num_streams; if workers are added
+	 * later via sftp_parallel_add_worker, capacity stays the same.
+	 * That's fine — capacity is just backpressure, not a hard cap. */
+	p->q = sftp_workqueue_new(WORK_QUEUE_DEPTH(cfg->num_streams));
 	if (p->q == NULL) {
 		error_f("workqueue allocation failed");
 		goto fail;
 	}
 
-	/* 3. Workers — each gets its own SSH child via the master's socket */
-	p->workers = xcalloc(p->num_workers, sizeof(*p->workers));
-	const char *ssh_bin = cfg->ssh_binary ? cfg->ssh_binary : "hpnssh";
-	const char *cm_sock = sftp_cm_socket(p->cm);
-	unsigned int buflen = cfg->transfer_buflen ?
-	    cfg->transfer_buflen : DEFAULT_TRANSFER_BUFLEN;
-	unsigned int nreq = cfg->num_requests ?
-	    cfg->num_requests : DEFAULT_NUM_REQUESTS;
-
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = &p->workers[i];
-		w->id = i;
-		w->parent = p;
-		w->fd_in = w->fd_out = -1;
-		w->ssh_pid = -1;
-		pthread_mutex_init(&w->mu, NULL);
-		if (spawn_worker_ssh(ssh_bin, cm_sock, cfg->host,
-		    &w->fd_in, &w->fd_out, &w->ssh_pid) != 0) {
-			error_f("worker %d: ssh spawn failed", i);
-			goto fail;
-		}
-		w->conn = sftp_init(w->fd_in, w->fd_out, buflen, nreq,
-		    cfg->limit_kbps);
-		if (w->conn == NULL) {
-			error_f("worker %d: sftp_init failed", i);
-			goto fail;
-		}
-	}
-
-	/* 4. Suppress per-file progress in workers; orchestrate aggregate
-	 * progress here when requested. */
+	/* 3. Suppress per-file progress in workers; the orchestrator drives
+	 * aggregate progress when requested via sftp_parallel_progress_*. */
 	p->saved_showprogress = showprogress;
 	showprogress = 0;
-	if (cfg->print_flag != SFTP_QUIET) {
-		/* For now, leave aggregate progress meter as a step-6
-		 * concern. Reporter still ticks for telemetry but does not
-		 * call refresh_progress_meter unless we set it up. */
-	}
 
-	/* 5. Worker threads */
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = &p->workers[i];
-		if (pthread_create(&w->tid, NULL, worker_thread, w) != 0) {
-			error_f("worker %d: pthread_create failed", i);
+	/* 4. Spawn workers. */
+	for (int i = 0; i < cfg->num_streams; i++) {
+		if (spawn_one_worker(p) == NULL) {
+			error_f("worker %d setup failed", i);
 			goto fail;
 		}
-		w->started = 1;
 	}
 
-	/* 6. Reporter */
+	/* 5. Reporter — best-effort. */
 	if (pthread_create(&p->reporter_tid, NULL, reporter_thread, p) == 0)
 		p->reporter_started = 1;
-	/* Reporter is best-effort; failing to start it isn't fatal. */
 
 	p->started = 1;
 	return p;
@@ -655,27 +779,50 @@ sftp_parallel_stop(struct sftp_parallel *p)
 		sftp_workqueue_shutdown(p->q);
 
 	if (p->workers) {
-		for (int i = 0; i < p->num_workers; i++) {
-			struct sftp_worker *w = &p->workers[i];
-			if (w->started)
-				pthread_join(w->tid, NULL);
+		/* Iterate without holding workers_mu during pthread_join (it
+		 * would block). At this point p->stopped is set and the
+		 * queue is shut down, so no concurrent add/remove can happen
+		 * from the public API. The reporter may still be reaping
+		 * exited workers, which is why we join the reporter LATER —
+		 * after walking workers ourselves we accept that the reporter
+		 * may have removed some entries; we only join() those still
+		 * present. */
+		pthread_mutex_lock(&p->workers_mu);
+		int n = p->num_workers;
+		struct sftp_worker **snap = NULL;
+		if (n > 0) {
+			snap = xcalloc(n, sizeof(*snap));
+			memcpy(snap, p->workers, n * sizeof(*snap));
 		}
+		pthread_mutex_unlock(&p->workers_mu);
+
+		for (int i = 0; i < n; i++) {
+			if (snap[i]->started)
+				pthread_join(snap[i]->tid, NULL);
+		}
+		free(snap);
 	}
 	if (p->reporter_started)
 		pthread_join(p->reporter_tid, NULL);
 
 	if (p->workers) {
+		/* Reporter is now joined — no more concurrent reaping. We
+		 * own everything still in p->workers; tear it down. */
 		for (int i = 0; i < p->num_workers; i++) {
-			struct sftp_worker *w = &p->workers[i];
+			struct sftp_worker *w = p->workers[i];
+			if (w == NULL) continue;
 			if (w->conn) {
 				sftp_free(w->conn);
 				w->conn = NULL;
 			}
 			teardown_worker_ssh(w);
 			pthread_mutex_destroy(&w->mu);
+			free(w);
 		}
 		free(p->workers);
 		p->workers = NULL;
+		p->num_workers = 0;
+		p->workers_cap = 0;
 	}
 
 	if (p->cm) {
@@ -692,6 +839,7 @@ sftp_parallel_stop(struct sftp_parallel *p)
 
 	pthread_mutex_destroy(&p->pending_mu);
 	pthread_cond_destroy(&p->pending_cv);
+	pthread_mutex_destroy(&p->workers_mu);
 	free(p);
 }
 
@@ -998,4 +1146,105 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Retrieving %s\n", src);
 	return parallel_download_walk(p, conn, src, dst, 0, NULL);
+}
+
+/* ---------- Stats accessor (programmatic observability) ---------- */
+
+void
+sftp_parallel_get_stats(struct sftp_parallel *p,
+    struct sftp_parallel_stats *out)
+{
+	if (out == NULL) return;
+	memset(out, 0, sizeof(*out));
+	if (p == NULL) return;
+
+	uint64_t b = 0, c = 0, f = 0;
+	pthread_mutex_lock(&p->workers_mu);
+	out->num_workers = p->num_workers;
+	for (int i = 0; i < p->num_workers; i++) {
+		struct sftp_worker *w = p->workers[i];
+		pthread_mutex_lock(&w->mu);
+		b += w->bytes_total;
+		c += w->units_completed;
+		f += w->units_failed;
+		pthread_mutex_unlock(&w->mu);
+	}
+	pthread_mutex_unlock(&p->workers_mu);
+
+	out->bytes_total_aggregate = b;
+	out->units_completed_aggregate = c;
+	out->units_failed_aggregate = f;
+	if (p->q) {
+		out->queue_depth = sftp_workqueue_depth(p->q);
+		out->queue_high_watermark = sftp_workqueue_high_watermark(p->q);
+		/* queue capacity isn't directly queryable; derive from
+		 * the formula used at construction. Slightly indirect but
+		 * stable. */
+		out->queue_capacity = WORK_QUEUE_DEPTH(p->cfg.num_streams);
+	}
+}
+
+int
+sftp_parallel_get_worker_stats(struct sftp_parallel *p,
+    struct sftp_parallel_worker_stats *out, int max)
+{
+	if (p == NULL || out == NULL || max <= 0)
+		return 0;
+	int copied = 0;
+	pthread_mutex_lock(&p->workers_mu);
+	for (int i = 0; i < p->num_workers && copied < max; i++) {
+		struct sftp_worker *w = p->workers[i];
+		pthread_mutex_lock(&w->mu);
+		out[copied].id                  = w->id;
+		out[copied].health              = (int)w->health;
+		out[copied].bytes_total         = w->bytes_total;
+		out[copied].units_started       = w->units_started;
+		out[copied].units_completed     = w->units_completed;
+		out[copied].units_failed        = w->units_failed;
+		out[copied].reconnect_count     = w->reconnect_count;
+		out[copied].last_completion_ns  = w->last_completion_ns;
+		pthread_mutex_unlock(&w->mu);
+		copied++;
+	}
+	pthread_mutex_unlock(&p->workers_mu);
+	return copied;
+}
+
+/* ---------- Dynamic worker scaling ---------- */
+
+int
+sftp_parallel_add_worker(struct sftp_parallel *p)
+{
+	if (p == NULL || p->stopped || p->abort_flag) {
+		errno = EINVAL;
+		return -1;
+	}
+	struct sftp_worker *w = spawn_one_worker(p);
+	return (w == NULL) ? -1 : 0;
+}
+
+int
+sftp_parallel_remove_worker(struct sftp_parallel *p)
+{
+	if (p == NULL || p->stopped || p->abort_flag) {
+		errno = EINVAL;
+		return -1;
+	}
+	pthread_mutex_lock(&p->workers_mu);
+	if (p->num_workers <= 1) {
+		pthread_mutex_unlock(&p->workers_mu);
+		return -1;
+	}
+	pthread_mutex_unlock(&p->workers_mu);
+
+	/* Submit an exit sentinel; whichever worker pops it next will
+	 * exit at the next iteration of its loop. The reporter thread
+	 * reaps the exited worker. */
+	struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
+	u->op = SFTP_OP_EXIT_WORKER;
+	if (sftp_workqueue_push(p->q, u) != 0) {
+		free(u);
+		return -1;
+	}
+	return 0;
 }

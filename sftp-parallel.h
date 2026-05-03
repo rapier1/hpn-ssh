@@ -135,4 +135,69 @@ uint64_t sftp_parallel_bytes_total(struct sftp_parallel *p);
 uint64_t sftp_parallel_units_completed(struct sftp_parallel *p);
 uint64_t sftp_parallel_units_failed(struct sftp_parallel *p);
 
+/*
+ * Programmatic stats surface for adaptive control.
+ *
+ * sftp_parallel_get_stats() returns aggregate orchestrator state cheaply
+ * (one mutex per worker briefly held). sftp_parallel_get_worker_stats()
+ * fills a caller-provided array with per-worker snapshots; returns the
+ * number of workers actually copied (<= max). Both are safe to call from
+ * any thread including a control loop running on its own cadence.
+ *
+ * Worker IDs are stable across the lifetime of the orchestrator — when
+ * a worker is removed, its slot compacts but its id is not reused.
+ */
+
+/* Worker health classification — mirrors the internal enum. */
+#define SFTP_PARALLEL_HEALTHY  0
+#define SFTP_PARALLEL_STALLED  1
+#define SFTP_PARALLEL_DEAD     2
+
+struct sftp_parallel_stats {
+	int      num_workers;
+	size_t   queue_depth;
+	size_t   queue_capacity;
+	size_t   queue_high_watermark;
+	uint64_t bytes_total_aggregate;
+	uint64_t units_completed_aggregate;
+	uint64_t units_failed_aggregate;
+};
+
+struct sftp_parallel_worker_stats {
+	int      id;
+	int      health;          /* SFTP_PARALLEL_{HEALTHY,STALLED,DEAD} */
+	uint64_t bytes_total;
+	uint64_t units_started;
+	uint64_t units_completed;
+	uint64_t units_failed;
+	uint64_t reconnect_count;
+	uint64_t last_completion_ns; /* monotonic, 0 if no completion yet */
+};
+
+void sftp_parallel_get_stats(struct sftp_parallel *p,
+    struct sftp_parallel_stats *out);
+int sftp_parallel_get_worker_stats(struct sftp_parallel *p,
+    struct sftp_parallel_worker_stats *out, int max);
+
+/*
+ * Dynamic worker scaling for long-running transfers.
+ *
+ * sftp_parallel_add_worker() spawns a new SSH child via the master, runs
+ * sftp_init, and starts a worker thread. Synchronous — returns 0 on
+ * success or -1 on failure (capped at SFTP_PARALLEL_MAX_WORKERS, master
+ * dead, spawn failure, sftp_init failure).
+ *
+ * sftp_parallel_remove_worker() submits an exit sentinel; whichever
+ * worker pops it next finishes its current unit, sets its exited flag,
+ * and terminates. The reporter thread reaps exited workers. Asynchronous
+ * — returns 0 if the sentinel was queued (-1 if num_workers <= 1, queue
+ * is shut down, etc.). Removal is "any available worker", not targeted
+ * — targeted removal requires the in-flight cancel work that's deferred
+ * past Phase 1.
+ */
+#define SFTP_PARALLEL_MAX_WORKERS 64
+
+int sftp_parallel_add_worker(struct sftp_parallel *p);
+int sftp_parallel_remove_worker(struct sftp_parallel *p);
+
 #endif /* _SFTP_PARALLEL_H */
