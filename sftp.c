@@ -58,9 +58,14 @@ typedef void EditLine;
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-usergroup.h"
+#include "sftp-parallel.h"
 
 /* File to read commands from */
 FILE* infile;
+
+/* Parallel-streams orchestrator: NULL = single-stream (default) */
+static struct sftp_parallel *parallel_orch = NULL;
+static int parallel_num_streams = 1;
 
 /* Are we in batchfile mode? */
 int batchmode = 0;
@@ -703,9 +708,14 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		/* XXX follow link flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
 		    (rflag || global_rflag)) {
+			/* Recursive case stays synchronous in step 6. */
 			if (sftp_download_dir(conn, g.gl_pathv[i], abs_dst,
 			    NULL, pflag || global_pflag, 1, resume,
 			    fflag || global_fflag, 0, 0) == -1)
+				err = -1;
+		} else if (parallel_orch != NULL) {
+			if (sftp_parallel_submit_download(parallel_orch,
+			    g.gl_pathv[i], abs_dst, 0, 0) != 0)
 				err = -1;
 		} else {
 			if (sftp_download(conn, g.gl_pathv[i], abs_dst, NULL,
@@ -716,6 +726,9 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		free(abs_dst);
 		abs_dst = NULL;
 	}
+
+	if (parallel_orch != NULL)
+		sftp_parallel_wait(parallel_orch);
 
 out:
 	free(abs_src);
@@ -803,9 +816,16 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		/* XXX follow_link_flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
 		    (rflag || global_rflag)) {
+			/* Recursive case stays synchronous in step 6 —
+			 * directory walks parallelize in a later step. */
 			if (sftp_upload_dir(conn, g.gl_pathv[i], abs_dst,
 			    pflag || global_pflag, 1, resume,
 			    fflag || global_fflag, 0, 0) == -1)
+				err = -1;
+		} else if (parallel_orch != NULL) {
+			if (sftp_parallel_submit_upload(parallel_orch,
+			    g.gl_pathv[i], abs_dst,
+			    sb.st_size, sb.st_mode) != 0)
 				err = -1;
 		} else {
 			if (sftp_upload(conn, g.gl_pathv[i], abs_dst,
@@ -814,6 +834,9 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 				err = -1;
 		}
 	}
+
+	if (parallel_orch != NULL)
+		sftp_parallel_wait(parallel_orch);
 
 out:
 	free(abs_dst);
@@ -2446,9 +2469,9 @@ usage(void)
 	fprintf(stderr,
 	    "usage: %s [-46AaCfNpqrv] [-B buffer_size] [-b batchfile] [-c cipher]\n"
 	    "          [-D sftp_server_command] [-F ssh_config] [-i identity_file]\n"
-	    "          [-J destination] [-l limit] [-o ssh_option] [-P port]\n"
-	    "          [-R num_requests] [-S program] [-s subsystem | sftp_server]\n"
-	    "          [-X sftp_option] destination\n",
+	    "          [-J destination] [-j parallel_streams] [-l limit]\n"
+	    "          [-o ssh_option] [-P port] [-R num_requests] [-S program]\n"
+	    "          [-s subsystem | sftp_server] [-X sftp_option] destination\n",
 	    __progname);
 	exit(1);
 }
@@ -2488,7 +2511,7 @@ main(int argc, char **argv)
 	infile = stdin;
 
 	while ((ch = getopt(argc, argv,
-	    "1246AafhNpqrvCc:D:i:l:o:s:S:b:B:F:J:P:R:X:")) != -1) {
+	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:P:R:X:")) != -1) {
 		switch (ch) {
 		/* Passed through to ssh(1) */
 		case 'A':
@@ -2561,6 +2584,13 @@ main(int argc, char **argv)
 			break;
 		case 'D':
 			sftp_direct = optarg;
+			break;
+		case 'j':
+			parallel_num_streams = (int)strtonum(optarg, 1, 64,
+			    &errstr);
+			if (errstr != NULL)
+				fatal("Bad parallel streams \"%s\": %s",
+				    optarg, errstr);
 			break;
 		case 'l':
 			limit_kbps = strtonum(optarg, 1, 100 * 1024 * 1024,
@@ -2704,7 +2734,46 @@ main(int argc, char **argv)
 			fprintf(stderr, "Attached to %s.\n", sftp_direct);
 	}
 
+	/*
+	 * If -j N>1, start the parallel-streams orchestrator. This spawns a
+	 * ControlMaster and N worker SSH connections. On failure, warn and
+	 * continue with single-stream mode (the existing conn).
+	 *
+	 * Note: this initial cut uses default ssh authentication only (agent
+	 * or ~/.ssh/id_*). Pass-through of -i/-F/-o to the parallel master
+	 * is a follow-up; users needing those today should stick with -j 1.
+	 */
+	if (parallel_num_streams > 1 && sftp_direct == NULL) {
+		struct sftp_parallel_config pcfg;
+		char portbuf[16] = "";
+		memset(&pcfg, 0, sizeof(pcfg));
+		pcfg.num_streams      = parallel_num_streams;
+		pcfg.host             = host;
+		if (port > 0) {
+			snprintf(portbuf, sizeof(portbuf), "%d", port);
+			pcfg.port = portbuf;
+		}
+		pcfg.ssh_binary       = ssh_program;
+		pcfg.transfer_buflen  = (unsigned int)copy_buffer_len;
+		pcfg.num_requests     = (unsigned int)num_requests;
+		pcfg.limit_kbps       = limit_kbps;
+		pcfg.preserve_flag    = global_pflag;
+		pcfg.fsync_flag       = global_fflag;
+		pcfg.print_flag       = quiet ? 0 : 1;
+		parallel_orch = sftp_parallel_start(&pcfg);
+		if (parallel_orch == NULL) {
+			logit("Parallel-streams setup failed; "
+			    "falling back to single-stream mode.");
+			parallel_num_streams = 1;
+		}
+	}
+
 	err = interactive_loop(conn, file1, file2);
+
+	if (parallel_orch != NULL) {
+		sftp_parallel_stop(parallel_orch);
+		parallel_orch = NULL;
+	}
 
 #if !defined(USE_PIPES)
 	shutdown(in, SHUT_RDWR);
