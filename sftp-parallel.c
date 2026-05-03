@@ -30,9 +30,13 @@
 #include "includes.h"
 
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 
+#include <dirent.h>
 #include <errno.h>
+#include <libgen.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -43,6 +47,7 @@
 #include "xmalloc.h"
 #include "log.h"
 #include "misc.h"
+#include "utf8.h"
 #include "progressmeter.h"
 
 #include "sftp.h"
@@ -742,4 +747,255 @@ sftp_parallel_units_failed(struct sftp_parallel *p)
 	uint64_t f;
 	snapshot_workers(p, NULL, NULL, &f);
 	return f;
+}
+
+/* ---------- Recursive walkers (Approach B) ----------
+ *
+ * The walker runs on the producer (caller) thread and uses the control
+ * connection (`conn`) for metadata operations: mkdir on the destination
+ * tree, readdir/stat for downloads. Regular files are handed to the
+ * orchestrator via submit_*; the workers transfer them in parallel while
+ * the walker continues descending. The caller is expected to call
+ * sftp_parallel_wait after the walker returns.
+ *
+ * Mirrors the structure of upload_dir_internal / download_dir_internal in
+ * sftp-client.c. Symlinks honor the orchestrator's follow_link_flag;
+ * non-regular files are skipped with a warning, matching legacy behavior.
+ */
+
+#define PARALLEL_MAX_DIR_DEPTH 64
+
+static int
+parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *src, const char *dst, int depth)
+{
+	int created = 0, ret = 0;
+	DIR *dirp;
+	struct dirent *dp;
+	char *new_src = NULL, *new_dst = NULL;
+	struct stat sb;
+	Attrib a, dirattrib;
+	uint32_t saved_perm;
+	int preserve_flag = p->cfg.preserve_flag;
+	int follow_link_flag = p->cfg.follow_link_flag;
+
+	if (depth >= PARALLEL_MAX_DIR_DEPTH) {
+		error("Maximum directory depth exceeded: %d levels", depth);
+		return -1;
+	}
+	if (stat(src, &sb) == -1) {
+		error("stat local \"%s\": %s", src, strerror(errno));
+		return -1;
+	}
+	if (!S_ISDIR(sb.st_mode)) {
+		error("\"%s\" is not a directory", src);
+		return -1;
+	}
+
+	stat_to_attrib(&sb, &a);
+	a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+	a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+	a.perm &= 01777;
+	if (!preserve_flag)
+		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+	saved_perm = a.perm;
+	a.perm |= (S_IWUSR|S_IXUSR);
+	if (sftp_mkdir(conn, dst, &a, 0) == 0) {
+		created = 1;
+	} else {
+		if (sftp_stat(conn, dst, 0, &dirattrib) != 0)
+			return -1;
+		if (!S_ISDIR(dirattrib.perm)) {
+			error("\"%s\" exists but is not a directory", dst);
+			return -1;
+		}
+	}
+	a.perm = saved_perm;
+
+	if ((dirp = opendir(src)) == NULL) {
+		error("local opendir \"%s\": %s", src, strerror(errno));
+		return -1;
+	}
+	while (((dp = readdir(dirp)) != NULL) && !p->abort_flag) {
+		const char *filename = dp->d_name;
+		if (dp->d_ino == 0)
+			continue;
+		if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0)
+			continue;
+		free(new_dst); free(new_src);
+		new_dst = sftp_path_append(dst, filename);
+		new_src = sftp_path_append(src, filename);
+
+		if (lstat(new_src, &sb) == -1) {
+			logit("local lstat \"%s\": %s", filename,
+			    strerror(errno));
+			ret = -1;
+			continue;
+		}
+		if (S_ISLNK(sb.st_mode)) {
+			if (!follow_link_flag) {
+				logit("%s: not a regular file", filename);
+				continue;
+			}
+			if (stat(new_src, &sb) == -1) {
+				logit("local stat \"%s\": %s", filename,
+				    strerror(errno));
+				ret = -1;
+				continue;
+			}
+		}
+		if (S_ISDIR(sb.st_mode)) {
+			if (parallel_upload_walk(p, conn, new_src, new_dst,
+			    depth + 1) == -1)
+				ret = -1;
+		} else if (S_ISREG(sb.st_mode)) {
+			if (sftp_parallel_submit_upload(p, new_src, new_dst,
+			    sb.st_size, sb.st_mode) != 0) {
+				error("submit \"%s\" -> \"%s\" failed",
+				    new_src, new_dst);
+				ret = -1;
+			}
+		} else {
+			logit("%s: not a regular file", filename);
+		}
+	}
+	free(new_dst);
+	free(new_src);
+
+	if (created || preserve_flag)
+		sftp_setstat(conn, dst, &a);
+
+	(void)closedir(dirp);
+	return ret;
+}
+
+int
+sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *src, const char *dst, int print_flag)
+{
+	if (p == NULL || conn == NULL || src == NULL || dst == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
+		mprintf("Entering %s\n", src);
+	return parallel_upload_walk(p, conn, src, dst, 0);
+}
+
+static int
+parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *src, const char *dst, int depth, Attrib *dirattrib)
+{
+	int i, ret = 0;
+	SFTP_DIRENT **dir_entries;
+	char *new_src = NULL, *new_dst = NULL;
+	mode_t mode = 0777, tmpmode = mode;
+	Attrib *a, ldirattrib, lsym;
+	int preserve_flag = p->cfg.preserve_flag;
+	int follow_link_flag = p->cfg.follow_link_flag;
+
+	if (depth >= PARALLEL_MAX_DIR_DEPTH) {
+		error("Maximum directory depth exceeded: %d levels", depth);
+		return -1;
+	}
+	if (dirattrib == NULL) {
+		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
+			error("stat remote \"%s\" directory failed", src);
+			return -1;
+		}
+		dirattrib = &ldirattrib;
+	}
+	if (!S_ISDIR(dirattrib->perm)) {
+		error("\"%s\" is not a directory", src);
+		return -1;
+	}
+	if (dirattrib->flags & SSH2_FILEXFER_ATTR_PERMISSIONS) {
+		mode = dirattrib->perm & 01777;
+		tmpmode = mode | (S_IWUSR|S_IXUSR);
+	}
+	if (mkdir(dst, tmpmode) == -1 && errno != EEXIST) {
+		error("mkdir %s: %s", dst, strerror(errno));
+		return -1;
+	}
+	if (sftp_readdir(conn, src, &dir_entries) == -1) {
+		error("remote readdir \"%s\" failed", src);
+		return -1;
+	}
+
+	for (i = 0; dir_entries[i] != NULL && !p->abort_flag; i++) {
+		const char *filename = dir_entries[i]->filename;
+		free(new_dst); free(new_src);
+		new_dst = sftp_path_append(dst, filename);
+		new_src = sftp_path_append(src, filename);
+		a = &dir_entries[i]->a;
+
+		if (S_ISLNK(a->perm)) {
+			if (!follow_link_flag) {
+				logit("download \"%s\": not a regular file",
+				    new_src);
+				continue;
+			}
+			if (sftp_stat(conn, new_src, 1, &lsym) != 0) {
+				logit("remote stat \"%s\" failed", new_src);
+				ret = -1;
+				continue;
+			}
+			a = &lsym;
+		}
+
+		if (S_ISDIR(a->perm)) {
+			if (strcmp(filename, ".") == 0 ||
+			    strcmp(filename, "..") == 0)
+				continue;
+			if (parallel_download_walk(p, conn, new_src, new_dst,
+			    depth + 1, a) == -1)
+				ret = -1;
+		} else if (S_ISREG(a->perm)) {
+			off_t fsize = (a->flags & SSH2_FILEXFER_ATTR_SIZE) ?
+			    (off_t)a->size : 0;
+			mode_t fmode = (a->flags &
+			    SSH2_FILEXFER_ATTR_PERMISSIONS) ?
+			    (a->perm & 07777) : 0644;
+			if (sftp_parallel_submit_download(p, new_src, new_dst,
+			    fsize, fmode) != 0) {
+				error("submit download \"%s\" -> \"%s\" failed",
+				    new_src, new_dst);
+				ret = -1;
+			}
+		} else {
+			logit("download \"%s\": not a regular file", new_src);
+		}
+	}
+	free(new_dst);
+	free(new_src);
+
+	if (preserve_flag &&
+	    (dirattrib->flags & SSH2_FILEXFER_ATTR_ACMODTIME)) {
+		struct timeval tv[2];
+		tv[0].tv_sec = dirattrib->atime;
+		tv[1].tv_sec = dirattrib->mtime;
+		tv[0].tv_usec = tv[1].tv_usec = 0;
+		if (utimes(dst, tv) == -1)
+			error("local set times on \"%s\": %s",
+			    dst, strerror(errno));
+	}
+	if (mode != tmpmode && chmod(dst, mode) == -1)
+		error("local chmod directory \"%s\": %s",
+		    dst, strerror(errno));
+
+	sftp_free_dirents(dir_entries);
+	return ret;
+}
+
+int
+sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *src, const char *dst, int print_flag)
+{
+	if (p == NULL || conn == NULL || src == NULL || dst == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
+		mprintf("Retrieving %s\n", src);
+	return parallel_download_walk(p, conn, src, dst, 0, NULL);
 }

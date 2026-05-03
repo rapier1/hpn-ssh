@@ -31,6 +31,7 @@
 #include "sftp.h"		/* SFTP_QUIET / SFTP_PROGRESS_ONLY */
 
 struct sftp_parallel;
+struct sftp_conn;	/* opaque; defined in sftp-client.c */
 
 struct sftp_parallel_config {
 	int          num_streams;       /* N — must be >= 1 */
@@ -80,6 +81,22 @@ int sftp_parallel_submit_download(struct sftp_parallel *p,
     const char *remote_path, const char *local_path, off_t size, mode_t mode);
 int sftp_parallel_submit_mkdir(struct sftp_parallel *p,
     const char *remote_path, mode_t mode);
+
+/*
+ * Recursive walkers (Approach B): traverse the source tree on the control
+ * connection (`conn`), creating destination directories synchronously along
+ * the way, and submitting regular files to the orchestrator's worker pool.
+ * The walker returns once the tree has been fully visited and all files
+ * submitted; the caller is responsible for sftp_parallel_wait().
+ *
+ * preserve_flag and follow_link_flag are taken from the orchestrator's
+ * stored config.
+ */
+int sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *src, const char *dst, int print_flag);
+
+int sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *src, const char *dst, int print_flag);
 
 /*
  * Block until all submitted units have been completed (or failed past

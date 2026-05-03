@@ -716,9 +716,12 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		/* XXX follow link flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
 		    (rflag || global_rflag)) {
-			/* Recursive case stays synchronous in step 6. */
-			if (sftp_download_dir(conn, g.gl_pathv[i], abs_dst,
-			    NULL, pflag || global_pflag, 1, resume,
+			if (parallel_orch != NULL) {
+				if (sftp_parallel_download_dir(parallel_orch,
+				    conn, g.gl_pathv[i], abs_dst, 1) == -1)
+					err = -1;
+			} else if (sftp_download_dir(conn, g.gl_pathv[i],
+			    abs_dst, NULL, pflag || global_pflag, 1, resume,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
@@ -834,10 +837,12 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		/* XXX follow_link_flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
 		    (rflag || global_rflag)) {
-			/* Recursive case stays synchronous in step 6 —
-			 * directory walks parallelize in a later step. */
-			if (sftp_upload_dir(conn, g.gl_pathv[i], abs_dst,
-			    pflag || global_pflag, 1, resume,
+			if (parallel_orch != NULL) {
+				if (sftp_parallel_upload_dir(parallel_orch,
+				    conn, g.gl_pathv[i], abs_dst, 1) == -1)
+					err = -1;
+			} else if (sftp_upload_dir(conn, g.gl_pathv[i],
+			    abs_dst, pflag || global_pflag, 1, resume,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
