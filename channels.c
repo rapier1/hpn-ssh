@@ -2535,39 +2535,67 @@ channel_check_window(struct ssh *ssh, Channel *c)
 	    c->local_consumed > 0) {
 		int addition = 0;
 		u_int32_t tcpwinsz = channel_tcpwinsz(ssh);
-
-		/* /\* DEBUG: log window state for BDP analysis *\/ */
-		/* debug_f("Channel %d: tcpwinsz=%u (%.1fMB) " */
-		/*     "local_window=%u (%.1fMB) local_window_max=%u (%.1fMB) " */
-		/*     "local_consumed=%u dynamic=%d", */
-		/*     c->self, */
-		/*     tcpwinsz, tcpwinsz / (1024.0 * 1024.0), */
-		/*     c->local_window, c->local_window / (1024.0 * 1024.0), */
-		/*     c->local_window_max, c->local_window_max / (1024.0 * 1024.0), */
-		/*     c->local_consumed, c->dynamic_window); */
+		u_int output_len, full_grant, grant, headroom;
 
 		/* adjust max window size if we are in a dynamic environment
 		 * and the tcp receive buffer is larger than the ssh window */
 		if (c->dynamic_window && (tcpwinsz > c->local_window_max)) {
-			/* aggressively grow the window */
 			addition = tcpwinsz - c->local_window_max;
 			c->local_window_max += addition;
 			debug_f("Channel %d: Window growth to %d by %d bytes",c->self,
 			      c->local_window_max, addition);
 		}
+
+		/*
+		 * Throttle the window grant proportionally to output buffer
+		 * occupancy. When c->output fills due to a slow consumer,
+		 * fewer credits are returned to the sender, naturally reducing
+		 * its transmission rate. Deferred bytes remain in local_consumed
+		 * and are granted as the buffer drains. When output is empty
+		 * the scale factor is 1.0 and behaviour is identical to before.
+		 */
+		output_len = (u_int)sshbuf_len(c->output);
+		full_grant = c->local_consumed + (u_int)addition;
+
+		if (output_len == 0 || c->local_window_max == 0) {
+			/* Fast path: output buffer empty, no backpressure.
+			 * Scale factor is 1.0; behaviour identical to before. */
+			grant = full_grant;
+		} else if (output_len >= c->local_window_max) {
+			/* Buffer fully saturated: withhold all credits until
+			 * the consumer catches up and the buffer drains. */
+			grant = 0;
+		} else {
+			/* Partial occupancy: grant credits proportional to
+			 * remaining headroom.  At 50% full the sender gets
+			 * half the normal credits; the rate tapers smoothly
+			 * rather than stopping abruptly.  uint64_t prevents
+			 * overflow at large window sizes. */
+			headroom = c->local_window_max - output_len;
+			grant = (u_int)((uint64_t)full_grant * headroom /
+			    c->local_window_max);
+		}
+
+		/* Ungranted bytes stay in local_consumed and are retried next
+		 * call; when grant == full_grant this is 0, matching the
+		 * original behaviour. */
+		c->local_consumed = full_grant - grant;
+
+		if (grant == 0)
+			return 1;
+
 		if (!c->have_remote_id)
 			fatal_f("channel %d: no remote id", c->self);
 		if ((r = sshpkt_start(ssh,
 		    SSH2_MSG_CHANNEL_WINDOW_ADJUST)) != 0 ||
 		    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
-		    (r = sshpkt_put_u32(ssh, c->local_consumed + addition)) != 0 ||
+		    (r = sshpkt_put_u32(ssh, grant)) != 0 ||
 		    (r = sshpkt_send(ssh)) != 0) {
 			fatal_fr(r, "channel %i", c->self);
 		}
-		debug2("channel %d: window %d sent adjust %d", c->self,
-		       c->local_window, c->local_consumed + addition);
-		c->local_window += c->local_consumed + addition;
-		c->local_consumed = 0;
+		debug2("channel %d: window %d sent adjust %d (deferred %d)",
+		    c->self, c->local_window, grant, c->local_consumed);
+		c->local_window += grant;
 	}
 	return 1;
 }
