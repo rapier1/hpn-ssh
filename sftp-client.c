@@ -73,6 +73,11 @@ extern int showprogress;
  *   - progressmeter.c is a single global; concurrent start/stop/refresh from
  *     workers will collide. Parallel mode must use aggregate-driven progress
  *     reporting rather than per-file calls into start_progress_meter.
+ *     Verified (Phase 1 step 3): every start_progress_meter / stop_progress_meter
+ *     call site in this file is guarded by the extern int showprogress, so
+ *     the orchestrator can suppress per-file calls by setting showprogress=0
+ *     before invoking sftp_download/sftp_upload from workers, then drive a
+ *     single aggregate progress meter from the producer/reporter thread.
  *   - progressmeter.c installs a SIGALRM handler. Under pthreads the worker
  *     threads must mask SIGALRM so timer ticks deliver only to the
  *     producer/main thread.
