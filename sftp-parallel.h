@@ -36,15 +36,14 @@ struct sftp_conn;	/* opaque; defined in sftp-client.c */
 struct sftp_parallel_config {
 	int          num_streams;       /* N — must be >= 1 */
 
-	/* ControlMaster passthrough */
+	/* Worker SSH connection parameters */
 	const char  *host;              /* required */
 	const char  *port;
+	const char  *user;              /* NULL = no -l flag */
 	const char  *ssh_binary;        /* /path/to/hpnssh / NULL = "hpnssh" */
-	const char  *identity;
-	const char  *known_hosts;
+	const char  *identity;          /* NULL = rely on agent / default key */
+	const char  *known_hosts;       /* NULL = use system/user default */
 	const char  *config_file;
-	int          verbose;
-	int          cm_timeout_sec;    /* 0 = default */
 	char *const *extra_argv;        /* additional -o KEY=VALUE; may be NULL */
 
 	/* Per-worker sftp_init parameters */
@@ -64,9 +63,9 @@ struct sftp_parallel_config {
 };
 
 /*
- * Initialise the orchestrator: spawn ControlMaster, spawn N worker SSH
- * connections, start the worker and reporter threads. Returns NULL on
- * failure (caller should warn and fall back to single-stream mode).
+ * Initialise the orchestrator: spawn N independent worker SSH connections,
+ * start the worker and reporter threads. Returns NULL on failure (caller
+ * should warn and fall back to single-stream mode).
  */
 struct sftp_parallel *sftp_parallel_start(const struct sftp_parallel_config *cfg);
 
@@ -126,7 +125,7 @@ void sftp_parallel_progress_stop(struct sftp_parallel *p);
 
 /*
  * Tear down: signal workers to exit, join all threads, close worker SSH
- * subprocesses, stop the ControlMaster, free everything. Idempotent.
+ * subprocesses, free everything. Idempotent.
  */
 void sftp_parallel_stop(struct sftp_parallel *p);
 
@@ -182,10 +181,10 @@ int sftp_parallel_get_worker_stats(struct sftp_parallel *p,
 /*
  * Dynamic worker scaling for long-running transfers.
  *
- * sftp_parallel_add_worker() spawns a new SSH child via the master, runs
+ * sftp_parallel_add_worker() spawns a new independent SSH child, runs
  * sftp_init, and starts a worker thread. Synchronous — returns 0 on
- * success or -1 on failure (capped at SFTP_PARALLEL_MAX_WORKERS, master
- * dead, spawn failure, sftp_init failure).
+ * success or -1 on failure (capped at SFTP_PARALLEL_MAX_WORKERS,
+ * spawn failure, or sftp_init failure).
  *
  * sftp_parallel_remove_worker() submits an exit sentinel; whichever
  * worker pops it next finishes its current unit, sets its exited flag,

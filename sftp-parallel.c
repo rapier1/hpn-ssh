@@ -53,7 +53,6 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
-#include "sftp-controlmaster.h"
 #include "sftp-workqueue.h"
 #include "sftp-parallel.h"
 
@@ -124,7 +123,6 @@ struct sftp_worker {
 
 struct sftp_parallel {
 	struct sftp_parallel_config cfg;
-	struct sftp_controlmaster  *cm;
 	struct sftp_workqueue      *q;
 
 	/* Workers held as an array of pointers so add/remove can mutate
@@ -164,10 +162,20 @@ struct sftp_parallel {
 /* ---------- Worker SSH connection setup ---------- */
 
 static int
-spawn_worker_ssh(const char *ssh_binary, const char *cm_socket,
-    const char *host, int *fd_in_out, int *fd_out_out, pid_t *pid_out)
+spawn_worker_ssh(const struct sftp_parallel_config *cfg,
+    int *fd_in_out, int *fd_out_out, pid_t *pid_out)
 {
 	int p2c[2] = { -1, -1 }, c2p[2] = { -1, -1 };
+	char user_host[512];
+	char kh_opt[PATH_MAX + 32];
+
+	const char *ssh_bin = cfg->ssh_binary ? cfg->ssh_binary : "hpnssh";
+
+	if (cfg->user && cfg->user[0])
+		snprintf(user_host, sizeof(user_host), "%s@%s",
+		    cfg->user, cfg->host);
+	else
+		strlcpy(user_host, cfg->host, sizeof(user_host));
 
 	if (pipe(p2c) < 0)
 		return -1;
@@ -186,15 +194,51 @@ spawn_worker_ssh(const char *ssh_binary, const char *cm_socket,
 		dup2(c2p[1], STDOUT_FILENO);
 		close(p2c[0]); close(p2c[1]);
 		close(c2p[0]); close(c2p[1]);
-		execlp(ssh_binary, ssh_binary,
-		    "-S", cm_socket, "-s", host, "sftp", (char *)NULL);
+
+		/* Build argv for an independent (non-mux) SSH connection. */
+		char *argv[40];
+		int argc = 0;
+		argv[argc++] = (char *)ssh_bin;
+		argv[argc++] = "-oBatchMode=yes";
+		argv[argc++] = "-oControlMaster=no";
+		argv[argc++] = "-oControlPath=none";
+		argv[argc++] = "-oStrictHostKeyChecking=accept-new";
+		if (cfg->port && cfg->port[0]) {
+			argv[argc++] = "-p";
+			argv[argc++] = (char *)cfg->port;
+		}
+		if (cfg->identity) {
+			argv[argc++] = "-i";
+			argv[argc++] = (char *)cfg->identity;
+		}
+		if (cfg->config_file) {
+			argv[argc++] = "-F";
+			argv[argc++] = (char *)cfg->config_file;
+		}
+		if (cfg->known_hosts) {
+			snprintf(kh_opt, sizeof(kh_opt),
+			    "UserKnownHostsFile=%s", cfg->known_hosts);
+			argv[argc++] = "-o";
+			argv[argc++] = kh_opt;
+		}
+		if (cfg->extra_argv) {
+			for (int i = 0;
+			    cfg->extra_argv[i] != NULL && argc < 36; i++)
+				argv[argc++] = cfg->extra_argv[i];
+		}
+		argv[argc++] = user_host;
+		argv[argc++] = "-s";
+		argv[argc++] = "sftp";
+		argv[argc]   = NULL;
+
+		execvp(ssh_bin, argv);
 		_exit(127);
 	}
 	close(p2c[0]);
 	close(c2p[1]);
-	*fd_in_out = c2p[0];
+	*fd_in_out  = c2p[0];
 	*fd_out_out = p2c[1];
-	*pid_out = pid;
+	*pid_out    = pid;
 	return 0;
 }
 
@@ -487,12 +531,6 @@ reporter_thread(void *arg)
 		 * cheaper and watchdog timing doesn't need 200ms granularity. */
 		if (++slow_tick_counter >= 5) {
 			slow_tick_counter = 0;
-			if (!sftp_cm_alive(p->cm)) {
-				error_f("ControlMaster died — aborting "
-				    "parallel transfer");
-				sftp_parallel_abort(p);
-				break;
-			}
 			if (watchdog_check_workers(p)) {
 				/* Phase 1: any DEAD worker → abort the
 				 * whole orchestrator. Phase 2 will replace
@@ -556,23 +594,18 @@ reporter_thread(void *arg)
 static struct sftp_worker *
 spawn_one_worker(struct sftp_parallel *p)
 {
-	if (!sftp_cm_alive(p->cm))
-		return NULL;
-
 	struct sftp_worker *w = xcalloc(1, sizeof(*w));
 	w->parent = p;
 	w->fd_in = w->fd_out = -1;
 	w->ssh_pid = -1;
 	pthread_mutex_init(&w->mu, NULL);
 
-	const char *ssh_bin = p->cfg.ssh_binary ?
-	    p->cfg.ssh_binary : "hpnssh";
 	unsigned int buflen = p->cfg.transfer_buflen ?
 	    p->cfg.transfer_buflen : DEFAULT_TRANSFER_BUFLEN;
 	unsigned int nreq = p->cfg.num_requests ?
 	    p->cfg.num_requests : DEFAULT_NUM_REQUESTS;
 
-	if (spawn_worker_ssh(ssh_bin, sftp_cm_socket(p->cm), p->cfg.host,
+	if (spawn_worker_ssh(&p->cfg,
 	    &w->fd_in, &w->fd_out, &w->ssh_pid) != 0) {
 		error_f("ssh spawn failed");
 		goto fail;
@@ -649,24 +682,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_cond_init(&p->pending_cv, NULL);
 	pthread_mutex_init(&p->workers_mu, NULL);
 
-	/* 1. ControlMaster */
-	struct sftp_cm_config cmcfg = {
-		.host        = cfg->host,
-		.port        = cfg->port,
-		.ssh_binary  = cfg->ssh_binary,
-		.identity    = cfg->identity,
-		.known_hosts = cfg->known_hosts,
-		.config_file = cfg->config_file,
-		.verbose     = cfg->verbose,
-		.timeout_sec = cfg->cm_timeout_sec,
-		.extra_argv  = cfg->extra_argv,
-	};
-	if ((p->cm = sftp_cm_start(&cmcfg)) == NULL) {
-		error_f("ControlMaster setup failed");
-		goto fail;
-	}
-
-	/* 2. Workqueue. Sized for cfg->num_streams; if workers are added
+	/* 1. Workqueue. Sized for cfg->num_streams; if workers are added
 	 * later via sftp_parallel_add_worker, capacity stays the same.
 	 * That's fine — capacity is just backpressure, not a hard cap. */
 	p->q = sftp_workqueue_new(WORK_QUEUE_DEPTH(cfg->num_streams));
@@ -675,12 +691,12 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		goto fail;
 	}
 
-	/* 3. Suppress per-file progress in workers; the orchestrator drives
+	/* 2. Suppress per-file progress in workers; the orchestrator drives
 	 * aggregate progress when requested via sftp_parallel_progress_*. */
 	p->saved_showprogress = showprogress;
 	showprogress = 0;
 
-	/* 4. Spawn workers. */
+	/* 3. Spawn workers. */
 	for (int i = 0; i < cfg->num_streams; i++) {
 		if (spawn_one_worker(p) == NULL) {
 			error_f("worker %d setup failed", i);
@@ -688,7 +704,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		}
 	}
 
-	/* 5. Reporter — best-effort. */
+	/* 4. Reporter — best-effort. */
 	if (pthread_create(&p->reporter_tid, NULL, reporter_thread, p) == 0)
 		p->reporter_started = 1;
 
@@ -825,10 +841,6 @@ sftp_parallel_stop(struct sftp_parallel *p)
 		p->workers_cap = 0;
 	}
 
-	if (p->cm) {
-		sftp_cm_stop(p->cm);
-		p->cm = NULL;
-	}
 	if (p->q) {
 		sftp_workqueue_free(p->q);
 		p->q = NULL;

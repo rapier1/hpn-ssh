@@ -2805,6 +2805,7 @@ main(int argc, char **argv)
 		memset(&pcfg, 0, sizeof(pcfg));
 		pcfg.num_streams      = parallel_num_streams;
 		pcfg.host             = host;
+		pcfg.user             = user;
 		if (port > 0) {
 			snprintf(portbuf, sizeof(portbuf), "%d", port);
 			pcfg.port = portbuf;
