@@ -120,8 +120,12 @@ void sftp_parallel_abort(struct sftp_parallel *p);
  * Calling _start while a meter is already active is a no-op. Calling
  * _stop without a started meter is a no-op. label is copied internally.
  */
-void sftp_parallel_progress_start(struct sftp_parallel *p, const char *label);
+void sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
+    off_t total_bytes);
 void sftp_parallel_progress_stop(struct sftp_parallel *p);
+/* Scan a local path recursively; return total bytes of regular files and
+ * optionally the file count via file_count_out (may be NULL). */
+off_t sftp_parallel_scan_upload_total(const char *src, long *file_count_out);
 
 /*
  * Tear down: signal workers to exit, join all threads, close worker SSH

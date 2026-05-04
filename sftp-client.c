@@ -129,6 +129,9 @@ struct sftp_conn {
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
+	volatile uint64_t *live_counter; /* incremental progress hook;
+					  * updated per chunk during transfer;
+					  * NULL in normal (non-parallel) mode */
 };
 
 /* Tracks in-progress requests during file transfers */
@@ -471,6 +474,13 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 	sshbuf_free(msg);
 
 	return 0;
+}
+
+void
+sftp_set_live_counter(struct sftp_conn *conn, volatile uint64_t *counter)
+{
+	if (conn != NULL)
+		conn->live_counter = counter;
 }
 
 struct sftp_conn *
@@ -1789,6 +1799,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					reordered = 1;
 			}
 			progress_counter += len;
+			if (conn->live_counter != NULL)
+				__atomic_fetch_add(conn->live_counter, len,
+				    __ATOMIC_RELAXED);
 			free(data);
 
 			if (len == req->len) {
@@ -2204,6 +2217,9 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			    ack->id, ack->len, (unsigned long long)ack->offset);
 			++ackid;
 			progress_counter += ack->len;
+			if (conn->live_counter != NULL)
+				__atomic_fetch_add(conn->live_counter, ack->len,
+				    __ATOMIC_RELAXED);
 			/*
 			 * Track both the highest offset acknowledged and the
 			 * highest *contiguous* offset acknowledged.

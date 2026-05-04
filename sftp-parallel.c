@@ -109,6 +109,9 @@ struct sftp_worker {
 	 * holds the lock only while bumping counters. */
 	pthread_mutex_t    mu;
 	uint64_t           bytes_total;
+	volatile uint64_t  live_bytes;        /* incremental bytes for current
+					       * in-progress file; reset to 0
+					       * when file completes */
 	uint64_t           units_started;     /* dispatched, may be in flight */
 	uint64_t           units_completed;
 	uint64_t           units_failed;
@@ -150,6 +153,10 @@ struct sftp_parallel {
 	int                         saved_showprogress;
 	int                         progress_meter_started;
 	uint64_t                    aggregate_bytes_for_meter;
+	uint64_t                    progress_bytes_baseline;    /* bytes already
+								   * done when meter
+								   * started; delta
+								   * gives this-xfer */
 	off_t                       aggregate_progress_counter; /* meter ctr */
 	char                        progress_label[128];        /* stable storage
 								   * for the meter
@@ -308,6 +315,9 @@ worker_record_completion(struct sftp_worker *w, off_t bytes, int success)
 	} else {
 		w->units_failed++;
 	}
+	/* Reset live_bytes so the completed file's bytes aren't counted twice
+	 * (once here in bytes_total and once via the live_counter hook). */
+	__atomic_store_n(&w->live_bytes, 0, __ATOMIC_RELAXED);
 	w->last_completion_ns = monotonic_ns();
 	pthread_mutex_unlock(&w->mu);
 }
@@ -426,6 +436,10 @@ snapshot_workers(struct sftp_parallel *p, uint64_t *bytes_out,
 		struct sftp_worker *w = p->workers[i];
 		pthread_mutex_lock(&w->mu);
 		b += w->bytes_total;
+		/* live_bytes is written atomically by the worker without holding
+		 * w->mu (to avoid lock contention in the inner transfer loop),
+		 * so read it with a relaxed atomic load for the display value. */
+		b += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
 		c += w->units_completed;
 		f += w->units_failed;
 		pthread_mutex_unlock(&w->mu);
@@ -525,7 +539,8 @@ reporter_thread(void *arg)
 		uint64_t bytes;
 		snapshot_workers(p, &bytes, NULL, NULL);
 		p->aggregate_bytes_for_meter = bytes;
-		p->aggregate_progress_counter = (off_t)bytes;
+		p->aggregate_progress_counter =
+		    (off_t)(bytes - p->progress_bytes_baseline);
 		if (p->progress_meter_started)
 			refresh_progress_meter(0);
 
@@ -618,6 +633,7 @@ spawn_one_worker(struct sftp_parallel *p)
 		error_f("sftp_init failed");
 		goto fail;
 	}
+	sftp_set_live_counter(w->conn, &w->live_bytes);
 
 	/* Insert into workers array under lock. */
 	pthread_mutex_lock(&p->workers_mu);
@@ -896,20 +912,65 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	free(p);
 }
 
+static void
+scan_upload_recursive(const char *src, off_t *bytes_out, long *files_out)
+{
+	struct stat sb;
+	DIR *dirp;
+	struct dirent *dp;
+	char *child = NULL;
+
+	if (lstat(src, &sb) == -1)
+		return;
+	if (S_ISREG(sb.st_mode)) {
+		*bytes_out += sb.st_size;
+		(*files_out)++;
+		return;
+	}
+	if (!S_ISDIR(sb.st_mode))
+		return;
+	if ((dirp = opendir(src)) == NULL)
+		return;
+	while ((dp = readdir(dirp)) != NULL) {
+		if (dp->d_ino == 0)
+			continue;
+		if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0)
+			continue;
+		free(child);
+		xasprintf(&child, "%s/%s", src, dp->d_name);
+		scan_upload_recursive(child, bytes_out, files_out);
+	}
+	free(child);
+	closedir(dirp);
+}
+
+off_t
+sftp_parallel_scan_upload_total(const char *src, long *file_count_out)
+{
+	off_t bytes = 0;
+	long files = 0;
+
+	scan_upload_recursive(src, &bytes, &files);
+	if (file_count_out != NULL)
+		*file_count_out = files;
+	return bytes;
+}
+
 void
-sftp_parallel_progress_start(struct sftp_parallel *p, const char *label)
+sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
+    off_t total_bytes)
 {
 	if (p == NULL || p->progress_meter_started)
 		return;
 	if (label == NULL)
 		label = "transfer";
 	strlcpy(p->progress_label, label, sizeof(p->progress_label));
+	/* Snapshot current accumulated bytes across all workers so the meter
+	 * shows only bytes moved in this transfer, not prior transfers in the
+	 * same session. */
+	snapshot_workers(p, &p->progress_bytes_baseline, NULL, NULL);
 	p->aggregate_progress_counter = 0;
-	/* total=0 -> indeterminate progress (rate without ETA). The
-	 * aggregate total isn't known until the producer finishes
-	 * submitting, which may be concurrent with transfer. Phase 2 may
-	 * compute a running total during submission and pass it here. */
-	start_progress_meter(p->progress_label, 0,
+	start_progress_meter(p->progress_label, total_bytes,
 	    &p->aggregate_progress_counter);
 	p->progress_meter_started = 1;
 }

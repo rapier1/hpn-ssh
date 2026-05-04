@@ -66,6 +66,7 @@ struct sftp_limits {
  */
 struct sftp_conn *sftp_init(int, int, u_int, u_int, uint64_t);
 void sftp_free(struct sftp_conn *);
+void sftp_set_live_counter(struct sftp_conn *, volatile uint64_t *);
 
 u_int sftp_proto_version(struct sftp_conn *);
 

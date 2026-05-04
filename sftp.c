@@ -677,7 +677,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		snprintf(label, sizeof(label),
 		    "Fetching %d file%s in parallel", (int)g.gl_matchc,
 		    g.gl_matchc == 1 ? "" : "s");
-		sftp_parallel_progress_start(parallel_orch, label);
+		sftp_parallel_progress_start(parallel_orch, label, 0);
 	}
 
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
@@ -788,10 +788,18 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 
 	if (parallel_orch != NULL && !quiet && g.gl_matchc > 0) {
 		char label[64];
+		off_t total_bytes = 0;
+		long total_files = 0, fc = 0;
+		for (i = 0; g.gl_pathv[i]; i++) {
+			fc = 0;
+			total_bytes += sftp_parallel_scan_upload_total(
+			    g.gl_pathv[i], &fc);
+			total_files += fc;
+		}
 		snprintf(label, sizeof(label),
-		    "Uploading %d file%s in parallel", (int)g.gl_matchc,
-		    g.gl_matchc == 1 ? "" : "s");
-		sftp_parallel_progress_start(parallel_orch, label);
+		    "Uploading %ld file%s in parallel", total_files,
+		    total_files == 1 ? "" : "s");
+		sftp_parallel_progress_start(parallel_orch, label, total_bytes);
 	}
 
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
