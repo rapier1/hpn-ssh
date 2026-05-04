@@ -803,8 +803,22 @@ spawn_one_worker(struct sftp_parallel *p)
 
 /* ---------- Parallel spawn helper ---------- */
 
+/*
+ * Concurrency limiter for the auth phase: at most max_in_flight workers
+ * hold an unauthenticated SSH connection open simultaneously.  This keeps
+ * us well under the server's MaxStartups limit (default 10:30:100) even
+ * when spawning many workers.  A fixed sleep-based stagger is not used
+ * because the right limit depends on actual handshake duration, which
+ * varies with RTT and any tc-netem delay in effect.
+ */
 struct spawn_ctx {
 	struct sftp_parallel *p;
+	pthread_mutex_t      *auth_mu;
+	pthread_cond_t       *auth_cv;
+	int                  *auth_in_flight;
+	int                  *started;		/* workers that have begun connecting */
+	int                   total;		/* cfg->num_streams */
+	int                   max_in_flight;
 	int                   succeeded;
 };
 
@@ -812,7 +826,27 @@ static void *
 do_parallel_spawn(void *arg)
 {
 	struct spawn_ctx *ctx = arg;
+
+	pthread_mutex_lock(ctx->auth_mu);
+	while (*ctx->auth_in_flight >= ctx->max_in_flight)
+		pthread_cond_wait(ctx->auth_cv, ctx->auth_mu);
+	++*ctx->auth_in_flight;
+	int started = ++*ctx->started;
+	pthread_mutex_unlock(ctx->auth_mu);
+
+	if (ctx->p->cfg.print_flag != SFTP_QUIET) {
+		if (started % ctx->max_in_flight == 0 || started == ctx->total)
+			fprintf(stderr, "Connecting workers %d of %d\n",
+			    started, ctx->total);
+	}
+
 	ctx->succeeded = (spawn_one_worker(ctx->p) != NULL) ? 1 : 0;
+
+	pthread_mutex_lock(ctx->auth_mu);
+	--*ctx->auth_in_flight;
+	pthread_cond_signal(ctx->auth_cv);
+	pthread_mutex_unlock(ctx->auth_mu);
+
 	return NULL;
 }
 
@@ -847,22 +881,41 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	p->saved_showprogress = showprogress;
 	showprogress = 0;
 
-	/* 3. Spawn workers in parallel to overlap SSH handshakes. */
+	/* 3. Spawn workers in parallel to overlap SSH handshakes, but cap
+	 * the number of simultaneous unauthenticated connections to stay
+	 * under the server's MaxStartups limit (default 10:30:100). */
 	{
 		int n = cfg->num_streams;
+		int max_in_flight = cfg->max_auth_concurrent > 0
+		    ? cfg->max_auth_concurrent : 8;
+		int               auth_in_flight = 0;
+		int               started = 0;
+		pthread_mutex_t   auth_mu;
+		pthread_cond_t    auth_cv;
 		struct spawn_ctx  sctx[SFTP_PARALLEL_MAX_WORKERS];
 		pthread_t         stids[SFTP_PARALLEL_MAX_WORKERS];
 		int               failed = 0;
 
+		pthread_mutex_init(&auth_mu, NULL);
+		pthread_cond_init(&auth_cv, NULL);
+
 		for (int i = 0; i < n; i++) {
-			sctx[i].p         = p;
-			sctx[i].succeeded = 0;
+			sctx[i].p              = p;
+			sctx[i].auth_mu        = &auth_mu;
+			sctx[i].auth_cv        = &auth_cv;
+			sctx[i].auth_in_flight = &auth_in_flight;
+			sctx[i].started        = &started;
+			sctx[i].total          = n;
+			sctx[i].max_in_flight  = max_in_flight;
+			sctx[i].succeeded      = 0;
 			if (pthread_create(&stids[i], NULL,
 			    do_parallel_spawn, &sctx[i]) != 0) {
 				error_f("spawn thread %d failed", i);
 				/* Join threads already launched. */
 				for (int j = 0; j < i; j++)
 					pthread_join(stids[j], NULL);
+				pthread_mutex_destroy(&auth_mu);
+				pthread_cond_destroy(&auth_cv);
 				goto fail;
 			}
 		}
@@ -873,6 +926,8 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 				failed = 1;
 			}
 		}
+		pthread_mutex_destroy(&auth_mu);
+		pthread_cond_destroy(&auth_cv);
 		if (failed)
 			goto fail;
 	}

@@ -60,6 +60,14 @@ struct sftp_parallel_config {
 
 	/* Reporting: SFTP_QUIET / SFTP_PROGRESS_ONLY / SFTP_PRINT */
 	int          print_flag;
+
+	/*
+	 * Maximum number of workers allowed in the SSH authentication phase
+	 * simultaneously.  Caps concurrent unauthenticated connections to
+	 * stay under the server's MaxStartups limit (default 10:30:100).
+	 * 0 = auto (8, safely below the default MaxStartups threshold).
+	 */
+	int          max_auth_concurrent;
 };
 
 /*
