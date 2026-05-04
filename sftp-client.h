@@ -68,6 +68,10 @@ struct sftp_conn *sftp_init(int, int, u_int, u_int, uint64_t);
 void sftp_free(struct sftp_conn *);
 void sftp_set_live_counter(struct sftp_conn *, volatile uint64_t *);
 
+/* Returns non-zero if the connection suffered an unrecoverable I/O error.
+ * Workers should check this after a failed transfer and exit their loop. */
+int sftp_conn_is_dead(struct sftp_conn *);
+
 u_int sftp_proto_version(struct sftp_conn *);
 
 /* Query server limits */

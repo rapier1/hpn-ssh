@@ -31,6 +31,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -111,6 +112,14 @@ extern int showprogress;
 struct sftp_conn {
 	int fd_in;
 	int fd_out;
+	int dead;		/* set when an unrecoverable I/O error occurs;
+				 * prevents further send/recv on this conn */
+	/* TEST/DEBUG ONLY — remove before production release.
+	 * Part of the SFTP_FAULT_INJECT worker-death simulation.
+	 * See fi_state struct and all other TEST/DEBUG blocks. */
+	uint64_t fault_after_bytes; /* die after this many bytes sent (0=off) */
+	uint64_t fault_bytes_sent;  /* bytes sent so far on this connection */
+	/* END TEST/DEBUG */
 	u_int download_buflen;
 	u_int upload_buflen;
 	u_int num_requests;
@@ -146,6 +155,23 @@ TAILQ_HEAD(requests, request);
 static u_char *
 get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
     const char *errfmt, ...) __attribute__((format(printf, 4, 5)));
+
+/* =========================================================
+ * TEST/DEBUG ONLY — remove before production release.
+ * This block and all code marked TEST/DEBUG below implement
+ * the SFTP_FAULT_INJECT worker-death simulation used by
+ * benchmark/test_fault_injection.py.  Affected locations:
+ *   - fi_state struct (here)
+ *   - fault_after_bytes / fault_bytes_sent fields in sftp_conn
+ *   - fi_state_init() and sftp_set_live_counter() fault block
+ *   - send_msg() fault trigger block
+ * ========================================================= */
+static struct {
+	uint64_t       threshold;  /* byte threshold; 0 = disabled */
+	int            kills_left; /* remaining kill slots; INT_MAX = unlimited */
+	pthread_once_t once;
+} fi_state = { 0, 0, PTHREAD_ONCE_INIT };
+/* END TEST/DEBUG */
 
 static struct request *
 request_enqueue(struct requests *requests, u_int id, size_t len,
@@ -184,36 +210,77 @@ sftpio(void *_bwlimit, size_t amount)
 	return 0;
 }
 
-static void
+static int
 send_msg(struct sftp_conn *conn, struct sshbuf *m)
 {
 	u_char mlen[4];
 	struct iovec iov[2];
+	size_t msg_len = sshbuf_len(m);
 
-	if (sshbuf_len(m) > SFTP_MAX_MSG_LENGTH)
-		fatal("Outbound message too long %zu", sshbuf_len(m));
+	if (conn->dead)
+		return -1;
+
+	if (msg_len > SFTP_MAX_MSG_LENGTH)
+		fatal("Outbound message too long %zu", msg_len);
 
 	/* Send length first */
-	put_u32(mlen, sshbuf_len(m));
+	put_u32(mlen, msg_len);
 	iov[0].iov_base = mlen;
 	iov[0].iov_len = sizeof(mlen);
 	iov[1].iov_base = (u_char *)sshbuf_ptr(m);
-	iov[1].iov_len = sshbuf_len(m);
+	iov[1].iov_len = msg_len;
 
 	if (atomiciov6(writev, conn->fd_out, iov, 2, sftpio,
 	    conn->limit_kbps > 0 ? &conn->bwlimit_out : NULL) !=
-	    sshbuf_len(m) + sizeof(mlen))
-		fatal("Couldn't send packet: %s", strerror(errno));
+	    msg_len + sizeof(mlen)) {
+		error("sftp: send: %s", strerror(errno));
+		conn->dead = 1;
+		sshbuf_reset(m);
+		return -1;
+	}
 
 	sshbuf_reset(m);
+
+	/* TEST/DEBUG ONLY — remove before production release
+	 * Simulate connection death after N bytes sent.  Uses a shared atomic
+	 * kill-slot counter so only max_kills workers actually die; the rest
+	 * continue and pick up re-queued work. */
+	if (conn->fault_after_bytes > 0) {
+		conn->fault_bytes_sent += msg_len + sizeof(mlen);
+		if (conn->fault_bytes_sent >= conn->fault_after_bytes) {
+			/* Atomically claim a kill slot. */
+			int prev = __atomic_fetch_sub(&fi_state.kills_left, 1,
+			    __ATOMIC_SEQ_CST);
+			if (prev > 0) {
+				error("sftp: fault injection: simulating "
+				    "connection death after %llu bytes sent",
+				    (unsigned long long)conn->fault_bytes_sent);
+				close(conn->fd_in);
+				close(conn->fd_out);
+				conn->fd_in = conn->fd_out = -1;
+				conn->dead = 1;
+				return -1;
+			}
+			/* No slot — restore counter, disable for this conn. */
+			__atomic_fetch_add(&fi_state.kills_left, 1,
+			    __ATOMIC_SEQ_CST);
+			conn->fault_after_bytes = 0;
+		}
+	}
+	/* END TEST/DEBUG */
+
+	return 0;
 }
 
-static void
+static int
 get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 {
 	u_int msg_len;
 	u_char *p;
 	int r;
+
+	if (conn->dead)
+		return -1;
 
 	sshbuf_reset(m);
 	if ((r = sshbuf_reserve(m, 4, &p)) != 0)
@@ -221,9 +288,11 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 	if (atomicio6(read, conn->fd_in, p, 4, sftpio,
 	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL) != 4) {
 		if (errno == EPIPE || errno == ECONNRESET)
-			fatal("Connection closed");
+			error("sftp: connection closed");
 		else
-			fatal("Couldn't read packet: %s", strerror(errno));
+			error("sftp: read: %s", strerror(errno));
+		conn->dead = 1;
+		return -1;
 	}
 
 	if ((r = sshbuf_get_u32(m, &msg_len)) != 0)
@@ -241,16 +310,19 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL)
 	    != msg_len) {
 		if (errno == EPIPE)
-			fatal("Connection closed");
+			error("sftp: connection closed");
 		else
-			fatal("Read packet: %s", strerror(errno));
+			error("sftp: read: %s", strerror(errno));
+		conn->dead = 1;
+		return -1;
 	}
+	return 0;
 }
 
-static void
+static int
 get_msg(struct sftp_conn *conn, struct sshbuf *m)
 {
-	get_msg_extended(conn, m, 0);
+	return get_msg_extended(conn, m, 0);
 }
 
 static void
@@ -301,7 +373,10 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
-	get_msg(conn, msg);
+	if (get_msg(conn, msg) != 0) {
+		sshbuf_free(msg);
+		return SSH2_FX_CONNECTION_LOST;
+	}
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
 		fatal_fr(r, "compose");
@@ -340,7 +415,10 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
-	get_msg(conn, msg);
+	if (get_msg(conn, msg) != 0) {
+		sshbuf_free(msg);
+		return NULL;
+	}
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
 		fatal_fr(r, "parse");
@@ -379,7 +457,10 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 		memset(a, '\0', sizeof(*a));
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
-	get_msg(conn, msg);
+	if (get_msg(conn, msg) != 0) {
+		sshbuf_free(msg);
+		return -1;
+	}
 
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
@@ -476,11 +557,44 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 	return 0;
 }
 
+/* TEST/DEBUG ONLY — remove before production release
+ * Initialises fi_state once from SFTP_FAULT_INJECT=<bytes>[:<max_kills>].
+ *   bytes     — worker connection dies after sending this many bytes.
+ *   max_kills — optional; at most this many workers are killed (default: all).
+ * Example: SFTP_FAULT_INJECT=150000:2  kills at most 2 out of N workers.
+ */
+static void
+fi_state_init(void)
+{
+	const char *ev = getenv("SFTP_FAULT_INJECT");
+	if (ev == NULL)
+		return;
+	char *ep;
+	uint64_t bytes = strtoull(ev, &ep, 10);
+	if (bytes == 0)
+		return;
+	fi_state.threshold  = bytes;
+	fi_state.kills_left = (*ep == ':') ? (int)strtol(ep + 1, NULL, 10)
+	                                   : INT_MAX;
+}
+/* END TEST/DEBUG */
+
 void
 sftp_set_live_counter(struct sftp_conn *conn, volatile uint64_t *counter)
 {
-	if (conn != NULL)
-		conn->live_counter = counter;
+	if (conn == NULL)
+		return;
+	conn->live_counter = counter;
+
+	/* TEST/DEBUG ONLY — remove before production release */
+	pthread_once(&fi_state.once, fi_state_init);
+	if (fi_state.threshold > 0) {
+		conn->fault_after_bytes = fi_state.threshold;
+		error("sftp: fault injection enabled: "
+		    "connection will die after %llu bytes sent",
+		    (unsigned long long)fi_state.threshold);
+	}
+	/* END TEST/DEBUG */
 }
 
 struct sftp_conn *
@@ -643,6 +757,12 @@ u_int
 sftp_proto_version(struct sftp_conn *conn)
 {
 	return conn->version;
+}
+
+int
+sftp_conn_is_dead(struct sftp_conn *conn)
+{
+	return conn != NULL && conn->dead;
 }
 
 int
@@ -1746,7 +1866,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		}
 
 		sshbuf_reset(msg);
-		get_msg(conn, msg);
+		if (get_msg(conn, msg) != 0)
+			break;
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &id)) != 0)
 			fatal_fr(r, "parse");
@@ -2130,7 +2251,8 @@ do_upload_body(struct sftp_conn *conn,
 			    (r = sshbuf_put_u64(msg, offset)) != 0 ||
 			    (r = sshbuf_put_string(msg, data, len)) != 0)
 				fatal_fr(r, "compose");
-			send_msg(conn, msg);
+			if (send_msg(conn, msg) != 0)
+				break;
 			debug3("Sent message SSH2_FXP_WRITE I:%u O:%llu S:%u",
 			    id, (unsigned long long)offset, len);
 		} else if (TAILQ_FIRST(&acks) == NULL)
@@ -2144,7 +2266,8 @@ do_upload_body(struct sftp_conn *conn,
 			u_int rid;
 
 			sshbuf_reset(msg);
-			get_msg(conn, msg);
+			if (get_msg(conn, msg) != 0)
+				break;
 			if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 			    (r = sshbuf_get_u32(msg, &rid)) != 0)
 				fatal_fr(r, "parse");

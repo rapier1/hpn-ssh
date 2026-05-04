@@ -532,6 +532,12 @@ worker_thread(void *arg)
 			int rc = execute_unit(w, u0);
 			worker_process_result(w, u0, rc);
 		}
+
+		/* Connection died during the transfer — this worker cannot
+		 * continue.  The unit was already re-queued or failed above;
+		 * exit cleanly so the orchestrator can detect us as dead. */
+		if (sftp_conn_is_dead(w->conn))
+			break;
 	}
 	/* Mark exited so the reporter thread can reap us (join + free). */
 	pthread_mutex_lock(&w->mu);
@@ -709,6 +715,21 @@ reporter_thread(void *arg)
 				}
 				pthread_mutex_destroy(&w->mu);
 				free(w);
+			}
+
+			/* If every worker exited and work is still pending,
+			 * no one will ever decrement pending to zero — abort
+			 * rather than letting sftp_parallel_wait hang. */
+			pthread_mutex_lock(&p->pending_mu);
+			int all_gone = (p->num_workers == 0 &&
+			    p->pending > 0 && !p->abort_flag);
+			pthread_mutex_unlock(&p->pending_mu);
+			if (all_gone) {
+				error_f("all workers exited with %llu unit(s) "
+				    "still pending — aborting transfer",
+				    (unsigned long long)p->pending);
+				sftp_parallel_abort(p);
+				break;
 			}
 		}
 	}
