@@ -155,6 +155,31 @@ int sftp_upload(struct sftp_conn *, const char *, const char *,
     int, int, int, int);
 
 /*
+ * Per-file descriptor for sftp_upload_batch.  Caller fills local_path and
+ * remote_path; result is written by the function (0 = success, -1 = failure).
+ */
+struct sftp_upload_batch_entry {
+	const char *local_path;
+	const char *remote_path;
+	int         result;
+};
+
+/*
+ * Upload N files with pipelined SSH_FXP_OPEN and SSH_FXP_CLOSE: all N
+ * opens are sent in a single burst (1 RTT for all handles), files are
+ * transferred sequentially, then all N closes are sent in a single burst
+ * (1 RTT for all status replies). Amortises per-file open/close RTT from
+ * 2*N RTTs down to 2 RTTs for the batch, which matters greatly for
+ * many-small-file workloads at high latency.
+ *
+ * resume is not supported; all other flags apply to every entry.
+ * Returns 0 if every file succeeded, -1 if any failed (check entry->result
+ * for per-file status).
+ */
+int sftp_upload_batch(struct sftp_conn *, struct sftp_upload_batch_entry *,
+    int n, int preserve_flag, int fsync_flag, int inplace_flag);
+
+/*
  * Recursively upload 'local_directory' to 'remote_directory'. Preserve
  * times if 'pflag' is set
  */

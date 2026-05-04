@@ -112,6 +112,23 @@ sftp_workqueue_pop(struct sftp_workqueue *q, void **itemp)
 	return 0;
 }
 
+int
+sftp_workqueue_trypop(struct sftp_workqueue *q, void **itemp)
+{
+	pthread_mutex_lock(&q->mu);
+	if (q->count == 0 || q->shutdown) {
+		pthread_mutex_unlock(&q->mu);
+		return -1;
+	}
+	*itemp = q->ring[q->head];
+	q->ring[q->head] = NULL;
+	q->head = (q->head + 1) % q->capacity;
+	q->count--;
+	pthread_cond_signal(&q->not_full);
+	pthread_mutex_unlock(&q->mu);
+	return 0;
+}
+
 void
 sftp_workqueue_shutdown(struct sftp_workqueue *q)
 {

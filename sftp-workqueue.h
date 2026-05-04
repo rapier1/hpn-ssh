@@ -51,6 +51,13 @@ int sftp_workqueue_push(struct sftp_workqueue *q, void *item);
 int sftp_workqueue_pop(struct sftp_workqueue *q, void **itemp);
 
 /*
+ * Non-blocking pop. On success sets *itemp and returns 0. Returns -1
+ * immediately if the queue is empty or shutdown (does not drain).
+ * Used by workers to collect a batch of items without blocking.
+ */
+int sftp_workqueue_trypop(struct sftp_workqueue *q, void **itemp);
+
+/*
  * Signal shutdown. Wakes every thread currently blocked in push or pop.
  * Subsequent push calls fail immediately; pop calls drain remaining items
  * then fail. Idempotent.

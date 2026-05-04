@@ -58,11 +58,20 @@
 
 extern int showprogress;
 
-#define WORK_QUEUE_DEPTH(N)     ((size_t)((N) * 4 + 8))
+#define WORK_QUEUE_DEPTH(N)     ((size_t)((N) * UPLOAD_BATCH_SIZE * 4 + UPLOAD_BATCH_SIZE))
 #define MAX_RETRIES             3
 #define REPORTER_TICK_MS        200
 #define DEFAULT_TRANSFER_BUFLEN 131072	/* 128 KB; matches sftp-client.c */
 #define DEFAULT_NUM_REQUESTS    1024	/* 128 KB * 1024 = 128 MB in-flight per stream */
+
+/*
+ * Maximum files to pipeline in one open+write+close batch.  Sending N opens
+ * before waiting for any handle reduces per-file open overhead from 1 RTT
+ * each to 1 RTT total; same for closes.  64 is chosen to keep the burst
+ * small enough that SSH channel window pressure is negligible while still
+ * amortising RTT cost over a large group of small files.
+ */
+#define UPLOAD_BATCH_SIZE       64
 
 /* Watchdog thresholds. STALL: warn if a worker has had work available but
  * completed nothing for this long. DEAD: escalate to abort. Generous values
@@ -362,6 +371,33 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	return rc;
 }
 
+/* Handle the result of executing a single work unit (retry or completion). */
+static void
+worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
+{
+	struct sftp_parallel *p = w->parent;
+
+	if (rc == 0) {
+		worker_record_completion(w, u->size, 1);
+		free_unit(u);
+		pending_dec(p);
+	} else if (++u->attempt < MAX_RETRIES) {
+		/* Re-queue without freeing. Keeps pending counter consistent. */
+		if (sftp_workqueue_push(p->q, u) != 0) {
+			worker_record_completion(w, 0, 0);
+			free_unit(u);
+			pending_dec(p);
+		}
+	} else {
+		error_f("worker %d: unit failed after %d attempts: %s",
+		    w->id, u->attempt,
+		    u->src_path ? u->src_path : "(null)");
+		worker_record_completion(w, 0, 0);
+		free_unit(u);
+		pending_dec(p);
+	}
+}
+
 static void *
 worker_thread(void *arg)
 {
@@ -381,40 +417,120 @@ worker_thread(void *arg)
 		void *item = NULL;
 		if (sftp_workqueue_pop(p->q, &item) != 0)
 			break;	/* shutdown && empty */
-		struct sftp_work_unit *u = item;
-		if (u == NULL)
+		struct sftp_work_unit *u0 = item;
+		if (u0 == NULL)
 			continue;
 
-		/* Self-exit sentinel from sftp_parallel_remove_worker. The
-		 * first worker to pop this exits its loop; the reporter
-		 * thread reaps it. */
-		if (u->op == SFTP_OP_EXIT_WORKER) {
-			free_unit(u);
+		/* Self-exit sentinel from sftp_parallel_remove_worker. */
+		if (u0->op == SFTP_OP_EXIT_WORKER) {
+			free_unit(u0);
 			break;
 		}
 
-		worker_record_start(w);
-		int rc = execute_unit(w, u);
-		if (rc == 0) {
-			worker_record_completion(w, u->size, 1);
-			free_unit(u);
-			pending_dec(p);
-		} else if (++u->attempt < MAX_RETRIES) {
-			/* Re-queue without freeing. Keeps pending counter
-			 * consistent — we don't decrement here. */
-			if (sftp_workqueue_push(p->q, u) != 0) {
-				/* Queue shutdown — drop unit. */
-				worker_record_completion(w, 0, 0);
-				free_unit(u);
-				pending_dec(p);
+		/*
+		 * Batch-open optimisation for uploads: accumulate up to
+		 * UPLOAD_BATCH_SIZE upload units using non-blocking trypop,
+		 * then call sftp_upload_batch to pipeline all N SSH_FXP_OPEN
+		 * requests before waiting for any handle (1 RTT for N opens
+		 * instead of 1 RTT each).  Same pipelining for closes.
+		 * Falls back to single-unit execution if the first unit is
+		 * not an upload or if the batch stays at size 1.
+		 */
+		if (u0->op == SFTP_OP_UPLOAD) {
+			struct sftp_work_unit *batch[UPLOAD_BATCH_SIZE];
+			struct sftp_work_unit *leftover = NULL;
+			int bn = 0;
+
+			batch[bn++] = u0;
+			while (bn < UPLOAD_BATCH_SIZE && !p->abort_flag) {
+				void *nxt = NULL;
+				if (sftp_workqueue_trypop(p->q, &nxt) != 0)
+					break; /* queue empty or shutdown */
+				struct sftp_work_unit *nu = nxt;
+				if (nu->op == SFTP_OP_UPLOAD) {
+					batch[bn++] = nu;
+				} else {
+					/* Non-upload: stop collecting, handle after batch. */
+					leftover = nu;
+					break;
+				}
+			}
+
+			/*logit("sftp-parallel: worker %d batch_size=%d "
+			    "(queue_depth=%zu)", w->id, bn,
+			    sftp_workqueue_depth(p->q)); */
+
+			if (bn == 1) {
+				/* Single file — skip batch overhead. */
+				worker_record_start(w);
+				int rc = execute_unit(w, batch[0]);
+				worker_process_result(w, batch[0], rc);
+			} else {
+				/*
+				 * True batch: build entry array, run pipelined
+				 * open/write/close, then record per-file results.
+				 */
+				struct sftp_upload_batch_entry entries[UPLOAD_BATCH_SIZE];
+				for (int i = 0; i < bn; i++) {
+					entries[i].local_path  = batch[i]->src_path;
+					entries[i].remote_path = batch[i]->dst_path;
+					entries[i].result      = 0;
+					worker_record_start(w);
+				}
+
+				sftp_upload_batch(w->conn, entries, bn,
+				    p->cfg.preserve_flag,
+				    p->cfg.fsync_flag,
+				    p->cfg.inplace_flag);
+
+				for (int i = 0; i < bn; i++) {
+					int rc = entries[i].result;
+					if (rc == 0) {
+						worker_record_completion(w,
+						    batch[i]->size, 1);
+						free_unit(batch[i]);
+						pending_dec(p);
+					} else if (++batch[i]->attempt < MAX_RETRIES) {
+						/*
+						 * Re-queue without recording completion:
+						 * pending stays up, live_bytes reset inline.
+						 */
+						__atomic_store_n(&w->live_bytes, 0,
+						    __ATOMIC_RELAXED);
+						if (sftp_workqueue_push(p->q,
+						    batch[i]) != 0) {
+							worker_record_completion(w, 0, 0);
+							free_unit(batch[i]);
+							pending_dec(p);
+						}
+					} else {
+						error_f("worker %d: batch unit failed "
+						    "after %d attempts: %s",
+						    w->id, batch[i]->attempt,
+						    batch[i]->src_path ?
+						    batch[i]->src_path : "(null)");
+						worker_record_completion(w, 0, 0);
+						free_unit(batch[i]);
+						pending_dec(p);
+					}
+				}
+			}
+
+			/* Process the leftover non-upload unit (if any). */
+			if (leftover != NULL) {
+				if (leftover->op == SFTP_OP_EXIT_WORKER) {
+					free_unit(leftover);
+					break;
+				}
+				worker_record_start(w);
+				int rc = execute_unit(w, leftover);
+				worker_process_result(w, leftover, rc);
 			}
 		} else {
-			error_f("worker %d: unit failed after %d attempts: %s",
-			    w->id, u->attempt,
-			    u->src_path ? u->src_path : "(null)");
-			worker_record_completion(w, 0, 0);
-			free_unit(u);
-			pending_dec(p);
+			/* Download, mkdir, or other non-upload unit. */
+			worker_record_start(w);
+			int rc = execute_unit(w, u0);
+			worker_process_result(w, u0, rc);
 		}
 	}
 	/* Mark exited so the reporter thread can reap us (join + free). */

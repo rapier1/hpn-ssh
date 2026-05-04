@@ -2059,94 +2059,44 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	return ret;
 }
 
-int
-sftp_upload(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, int preserve_flag, int resume,
-    int fsync_flag, int inplace_flag)
+/*
+ * Core write loop shared by sftp_upload and sftp_upload_batch.
+ * See sftp-client.h sftp_upload_batch for design notes.
+ *
+ * Does NOT close local_fd or call sftp_close on the remote handle.
+ * resume_offset: 0 for normal uploads; caller has already seeked local_fd
+ *   when non-zero.
+ */
+static int
+do_upload_body(struct sftp_conn *conn,
+    int local_fd, off_t local_size,
+    const u_char *handle, size_t handle_len,
+    Attrib *a,
+    const char *local_path, const char *remote_path,
+    int preserve_flag, int fsync_flag, int inplace_flag,
+    int resume, off_t resume_offset)
 {
-	int r, local_fd;
-	u_int openmode, id, status = SSH2_FX_OK, status2, reordered = 0;
+	u_int id, status = SSH2_FX_OK, status2, reordered = 0;
 	off_t offset, progress_counter;
-	u_char type, *handle, *data;
+	u_char type, *data;
 	struct sshbuf *msg;
-	struct stat sb;
-	Attrib a, t, c;
+	Attrib t;
 	uint32_t startid, ackid;
-	uint64_t highwater = 0, maxack = 0;
+	uint64_t highwater = resume_offset, maxack = 0;
 	struct request *ack = NULL;
 	struct requests acks;
-	size_t handle_len;
-
-	debug2_f("upload local \"%s\" to remote \"%s\"",
-	    local_path, remote_path);
+	int r;
 
 	TAILQ_INIT(&acks);
-
-	if ((local_fd = open(local_path, O_RDONLY)) == -1) {
-		error("open local \"%s\": %s", local_path, strerror(errno));
-		return(-1);
-	}
-	if (fstat(local_fd, &sb) == -1) {
-		error("fstat local \"%s\": %s", local_path, strerror(errno));
-		close(local_fd);
-		return(-1);
-	}
-	if (!S_ISREG(sb.st_mode)) {
-		error("local \"%s\" is not a regular file", local_path);
-		close(local_fd);
-		return(-1);
-	}
-	stat_to_attrib(&sb, &a);
-
-	a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
-	a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
-	a.perm &= 0777;
-	if (!preserve_flag)
-		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-
-	if (resume) {
-		/* Get remote file size if it exists */
-		if (sftp_stat(conn, remote_path, 0, &c) != 0) {
-			close(local_fd);
-			return -1;
-		}
-
-		if ((off_t)c.size >= sb.st_size) {
-			error("resume \"%s\": destination file "
-			    "same size or larger", local_path);
-			close(local_fd);
-			return -1;
-		}
-
-		if (lseek(local_fd, (off_t)c.size, SEEK_SET) == -1) {
-			close(local_fd);
-			return -1;
-		}
-		highwater = c.size;
-	}
-
-	openmode = SSH2_FXF_WRITE|SSH2_FXF_CREAT;
-	if (resume)
-		openmode |= SSH2_FXF_APPEND;
-	else if (!inplace_flag)
-		openmode |= SSH2_FXF_TRUNC;
-
-	/* Send open request */
-	if (send_open(conn, remote_path, "dest", openmode, &a,
-	    &handle, &handle_len) != 0) {
-		close(local_fd);
-		return -1;
-	}
 
 	id = conn->msg_id;
 	startid = ackid = id + 1;
 	data = xmalloc(conn->upload_buflen);
 
-	/* Read from local and write to remote */
-	offset = progress_counter = (resume ? c.size : 0);
+	offset = progress_counter = resume_offset;
 	if (showprogress) {
 		start_progress_meter(progress_meter_path(local_path),
-		    sb.st_size, &progress_counter);
+		    local_size, &progress_counter);
 	}
 
 	if ((msg = sshbuf_new()) == NULL)
@@ -2246,10 +2196,8 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 		stop_progress_meter();
 	free(data);
 
-	if (status == SSH2_FX_OK && !interrupted) {
-		/* we got everything */
+	if (status == SSH2_FX_OK && !interrupted)
 		highwater = maxack;
-	}
 	if (status != SSH2_FX_OK) {
 		error("write remote \"%s\": %s", remote_path, fx2txt(status));
 		status = SSH2_FX_FAILURE;
@@ -2263,24 +2211,319 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 		sftp_fsetstat(conn, handle, handle_len, &t);
 	}
 
-	if (close(local_fd) == -1) {
-		error("close local \"%s\": %s", local_path, strerror(errno));
-		status = SSH2_FX_FAILURE;
-	}
-
 	/* Override umask and utimes if asked */
 	if (preserve_flag)
-		sftp_fsetstat(conn, handle, handle_len, &a);
+		sftp_fsetstat(conn, handle, handle_len, a);
 
 	if (fsync_flag)
-		(void)sftp_fsync(conn, handle, handle_len);
+		(void)sftp_fsync(conn, (u_char *)(uintptr_t)handle, handle_len);
+
+	return status == SSH2_FX_OK ? 0 : -1;
+}
+
+int
+sftp_upload(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, int preserve_flag, int resume,
+    int fsync_flag, int inplace_flag)
+{
+	int r, local_fd;
+	u_int openmode;
+	u_char *handle;
+	struct stat sb;
+	Attrib a, c;
+	size_t handle_len;
+	off_t resume_offset = 0;
+	int status = 0;
+
+	debug2_f("upload local \"%s\" to remote \"%s\"",
+	    local_path, remote_path);
+
+	if ((local_fd = open(local_path, O_RDONLY)) == -1) {
+		error("open local \"%s\": %s", local_path, strerror(errno));
+		return(-1);
+	}
+	if (fstat(local_fd, &sb) == -1) {
+		error("fstat local \"%s\": %s", local_path, strerror(errno));
+		close(local_fd);
+		return(-1);
+	}
+	if (!S_ISREG(sb.st_mode)) {
+		error("local \"%s\" is not a regular file", local_path);
+		close(local_fd);
+		return(-1);
+	}
+	stat_to_attrib(&sb, &a);
+
+	a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+	a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+	a.perm &= 0777;
+	if (!preserve_flag)
+		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+
+	if (resume) {
+		/* Get remote file size if it exists */
+		if (sftp_stat(conn, remote_path, 0, &c) != 0) {
+			close(local_fd);
+			return -1;
+		}
+
+		if ((off_t)c.size >= sb.st_size) {
+			error("resume \"%s\": destination file "
+			    "same size or larger", local_path);
+			close(local_fd);
+			return -1;
+		}
+
+		if (lseek(local_fd, (off_t)c.size, SEEK_SET) == -1) {
+			close(local_fd);
+			return -1;
+		}
+		resume_offset = (off_t)c.size;
+	}
+
+	openmode = SSH2_FXF_WRITE|SSH2_FXF_CREAT;
+	if (resume)
+		openmode |= SSH2_FXF_APPEND;
+	else if (!inplace_flag)
+		openmode |= SSH2_FXF_TRUNC;
+
+	/* Send open request */
+	if (send_open(conn, remote_path, "dest", openmode, &a,
+	    &handle, &handle_len) != 0) {
+		close(local_fd);
+		return -1;
+	}
+
+	r = do_upload_body(conn, local_fd, sb.st_size,
+	    handle, handle_len, &a,
+	    local_path, remote_path,
+	    preserve_flag, fsync_flag, inplace_flag,
+	    resume, resume_offset);
+
+	if (close(local_fd) == -1) {
+		error("close local \"%s\": %s", local_path, strerror(errno));
+		r = -1;
+	}
 
 	if (sftp_close(conn, handle, handle_len) != 0)
-		status = SSH2_FX_FAILURE;
+		status = -1;
 
 	free(handle);
 
-	return status == SSH2_FX_OK ? 0 : -1;
+	return (r != 0 || status != 0) ? -1 : 0;
+}
+
+/* Internal state for one file in a batch upload. */
+struct batch_file {
+	int      local_fd;     /* -1 if local open failed */
+	struct stat sb;
+	Attrib   a;
+	u_char  *handle;       /* NULL if remote open failed */
+	size_t   handle_len;
+	u_int    open_id;
+	u_int    close_id;
+	int      failed;
+};
+
+int
+sftp_upload_batch(struct sftp_conn *conn,
+    struct sftp_upload_batch_entry *entries, int n,
+    int preserve_flag, int fsync_flag, int inplace_flag)
+{
+	struct batch_file *bs;
+	struct sshbuf *msg;
+	u_int openmode = SSH2_FXF_WRITE | SSH2_FXF_CREAT | SSH2_FXF_TRUNC;
+	int i, r, any_fail = 0;
+
+	if (n <= 0)
+		return 0;
+
+	debug_f("batch upload: n=%d preserve=%d fsync=%d inplace=%d",
+	    n, preserve_flag, fsync_flag, inplace_flag);
+
+	bs = xcalloc(n, sizeof(*bs));
+	for (i = 0; i < n; i++) {
+		bs[i].local_fd = -1;
+		entries[i].result = 0;
+	}
+
+	/*
+	 * Phase 1: open each local file and send the corresponding
+	 * SSH_FXP_OPEN request without waiting for the handle reply.
+	 * All N requests go out in a burst; the server queues them.
+	 */
+	debug_f("batch upload phase 1: sending %d SSH_FXP_OPEN requests", n);
+	for (i = 0; i < n; i++) {
+		if ((bs[i].local_fd = open(entries[i].local_path, O_RDONLY)) == -1) {
+			error("batch open local \"%s\": %s",
+			    entries[i].local_path, strerror(errno));
+			bs[i].failed = 1;
+			entries[i].result = -1;
+			any_fail = 1;
+			/*
+			 * We still need to send a placeholder open so that the
+			 * handle-collection phase can account for it.  Skip
+			 * instead: send_open_async below is only called when
+			 * local_fd >= 0.  We handle the gap in Phase 2 by
+			 * only collecting handles for non-failed entries.
+			 *
+			 * BUT: since we send opens only for good entries, the
+			 * id sequence must skip failed entries too.  Track which
+			 * entries actually sent an open via open_id==0 meaning
+			 * "no open sent".
+			 */
+			bs[i].open_id = 0;
+			continue;
+		}
+		if (fstat(bs[i].local_fd, &bs[i].sb) == -1) {
+			error("batch fstat local \"%s\": %s",
+			    entries[i].local_path, strerror(errno));
+			close(bs[i].local_fd);
+			bs[i].local_fd = -1;
+			bs[i].failed = 1;
+			entries[i].result = -1;
+			any_fail = 1;
+			bs[i].open_id = 0;
+			continue;
+		}
+		stat_to_attrib(&bs[i].sb, &bs[i].a);
+		bs[i].a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+		bs[i].a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+		bs[i].a.perm &= 0777;
+		if (!preserve_flag)
+			bs[i].a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+
+		/* Send SSH_FXP_OPEN without waiting for the handle reply. */
+		bs[i].open_id = conn->msg_id++;
+		if ((msg = sshbuf_new()) == NULL)
+			fatal_f("sshbuf_new failed");
+		if ((r = sshbuf_put_u8(msg, SSH2_FXP_OPEN)) != 0 ||
+		    (r = sshbuf_put_u32(msg, bs[i].open_id)) != 0 ||
+		    (r = sshbuf_put_cstring(msg, entries[i].remote_path)) != 0 ||
+		    (r = sshbuf_put_u32(msg, openmode)) != 0 ||
+		    (r = encode_attrib(msg, &bs[i].a)) != 0)
+			fatal_fr(r, "compose batch open");
+		send_msg(conn, msg);
+		sshbuf_free(msg);
+	}
+
+	/*
+	 * Phase 2: collect handles in the same order the opens were sent.
+	 * One RTT covers all N replies.
+	 */
+	debug_f("batch upload phase 2: collecting %d handles", n);
+	for (i = 0; i < n; i++) {
+		if (bs[i].open_id == 0)
+			continue; /* no open was sent for this entry */
+		bs[i].handle = get_handle(conn, bs[i].open_id,
+		    &bs[i].handle_len,
+		    "batch dest open \"%s\"", entries[i].remote_path);
+		if (bs[i].handle == NULL) {
+			close(bs[i].local_fd);
+			bs[i].local_fd = -1;
+			bs[i].failed = 1;
+			entries[i].result = -1;
+			any_fail = 1;
+		}
+	}
+
+	/*
+	 * Phase 3: transfer each file sequentially.  preserve/fsync fsetstat
+	 * happen inside do_upload_body per file before we reach the batch-close
+	 * phase; close itself is deferred to Phase 4-5.
+	 */
+	debug_f("batch upload phase 3: transferring %d files", n);
+	for (i = 0; i < n; i++) {
+		if (bs[i].failed || bs[i].handle == NULL)
+			continue;
+		debug_f("batch upload file %d/%d: %s -> %s (%lld bytes)",
+		    i + 1, n, entries[i].local_path, entries[i].remote_path,
+		    (long long)bs[i].sb.st_size);
+		r = do_upload_body(conn, bs[i].local_fd, bs[i].sb.st_size,
+		    bs[i].handle, bs[i].handle_len, &bs[i].a,
+		    entries[i].local_path, entries[i].remote_path,
+		    preserve_flag, fsync_flag, inplace_flag,
+		    /*resume=*/0, /*resume_offset=*/0);
+		if (close(bs[i].local_fd) == -1) {
+			error("batch close local \"%s\": %s",
+			    entries[i].local_path, strerror(errno));
+			r = -1;
+		}
+		bs[i].local_fd = -1;
+		if (r != 0) {
+			bs[i].failed = 1;
+			entries[i].result = -1;
+			any_fail = 1;
+		}
+	}
+
+	/*
+	 * Phase 4: send all SSH_FXP_CLOSE requests in a burst (no waiting).
+	 */
+	debug_f("batch upload phase 4: sending %d SSH_FXP_CLOSE requests", n);
+	for (i = 0; i < n; i++) {
+		if (bs[i].handle == NULL)
+			continue;
+		bs[i].close_id = conn->msg_id++;
+		if ((msg = sshbuf_new()) == NULL)
+			fatal_f("sshbuf_new failed");
+		if ((r = sshbuf_put_u8(msg, SSH2_FXP_CLOSE)) != 0 ||
+		    (r = sshbuf_put_u32(msg, bs[i].close_id)) != 0 ||
+		    (r = sshbuf_put_string(msg, bs[i].handle,
+		    bs[i].handle_len)) != 0)
+			fatal_fr(r, "compose batch close");
+		send_msg(conn, msg);
+		sshbuf_free(msg);
+	}
+
+	/*
+	 * Phase 5: collect close STATUS replies in the same order.
+	 * One RTT covers all N replies.
+	 */
+	debug_f("batch upload phase 5: collecting %d close replies", n);
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	for (i = 0; i < n; i++) {
+		u_char type;
+		u_int status, rid;
+
+		if (bs[i].handle == NULL)
+			continue;
+		get_msg(conn, msg);
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &rid)) != 0)
+			fatal_fr(r, "parse batch close response");
+		if (type != SSH2_FXP_STATUS)
+			fatal("batch close: expected SSH2_FXP_STATUS(%d), got %d",
+			    SSH2_FXP_STATUS, type);
+		if ((r = sshbuf_get_u32(msg, &status)) != 0)
+			fatal_fr(r, "parse batch close status");
+		if (rid != bs[i].close_id)
+			fatal("batch close ID mismatch: got %u expected %u",
+			    rid, bs[i].close_id);
+		if (status != SSH2_FX_OK) {
+			error("batch close \"%s\": %s",
+			    entries[i].remote_path, fx2txt(status));
+			if (!bs[i].failed) {
+				bs[i].failed = 1;
+				entries[i].result = -1;
+				any_fail = 1;
+			}
+		}
+		free(bs[i].handle);
+		bs[i].handle = NULL;
+	}
+	sshbuf_free(msg);
+
+	/* Ensure any remaining local fds or handles are cleaned up. */
+	for (i = 0; i < n; i++) {
+		if (bs[i].local_fd >= 0)
+			close(bs[i].local_fd);
+		free(bs[i].handle);
+	}
+	free(bs);
+
+	return any_fail ? -1 : 0;
 }
 
 static int
