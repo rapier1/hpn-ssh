@@ -71,6 +71,7 @@ LTESTS= 	connect \
 		sftp-perm \
 		sftp-resume \
 		sftp-uri \
+		sftp-parallel \
 		reconfigure \
 		dynamic-forward \
 		forwarding \
@@ -311,6 +312,7 @@ unit unit-bench:
 			-d ${.CURDIR}/unittests/hostkeys/testdata $${ARGS}; \
 		$$V ${.OBJDIR}/unittests/match/test_match $${ARGS}; \
 		$$V ${.OBJDIR}/unittests/misc/test_misc $${ARGS}; \
+		$$V ${.OBJDIR}/unittests/sftp_workqueue/test_sftp_workqueue $${ARGS}; \
 		if test "x${TEST_SSH_UTF8}" = "xyes"  ; then \
 			$$V ${.OBJDIR}/unittests/utf8/test_utf8 $${ARGS}; \
 		fi \

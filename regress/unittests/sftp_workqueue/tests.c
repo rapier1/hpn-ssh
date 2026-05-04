@@ -1,13 +1,13 @@
 /*
- * Standalone test driver for sftp-workqueue. Compile and run with:
- *
- *   gcc -O2 -Wall -pthread -o /tmp/wq-test \
- *       sftp-workqueue.c sftp-workqueue-test.c
- *   /tmp/wq-test
+ * Unit tests for sftp-workqueue. Wired into the regress/unittests/
+ * harness; built as test_sftp_workqueue and invoked from the unit target
+ * of regress/Makefile. Provides its own main() and does not link against
+ * test_helper because the workqueue's correctness contract is simple
+ * enough that targeted assertions cover it.
  *
  * Exits 0 on success, nonzero on any failure with a diagnostic.
  *
- * Tests cover: basic push/pop, FIFO ordering, MPMC stress, shutdown drain,
+ * Coverage: basic push/pop, FIFO ordering, MPMC stress, shutdown drain,
  * shutdown wakes blocked threads, high-watermark tracking, capacity bound.
  */
 
