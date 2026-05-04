@@ -223,11 +223,13 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 		}
 		if (cfg->extra_argv) {
 			for (int i = 0;
-			    cfg->extra_argv[i] != NULL && argc < 36; i++)
+			    cfg->extra_argv[i] != NULL && argc < 35; i++) {
+				argv[argc++] = "-o";
 				argv[argc++] = cfg->extra_argv[i];
+			}
 		}
-		argv[argc++] = user_host;
 		argv[argc++] = "-s";
+		argv[argc++] = user_host;
 		argv[argc++] = "sftp";
 		argv[argc]   = NULL;
 
@@ -667,6 +669,23 @@ spawn_one_worker(struct sftp_parallel *p)
 	return NULL;
 }
 
+/* ---------- Parallel spawn helper ---------- */
+
+struct spawn_ctx {
+	struct sftp_parallel *p;
+	int                   succeeded;
+};
+
+static void *
+do_parallel_spawn(void *arg)
+{
+	struct spawn_ctx *ctx = arg;
+	ctx->succeeded = (spawn_one_worker(ctx->p) != NULL) ? 1 : 0;
+	return NULL;
+}
+
+/* ---------- Public API ---------- */
+
 struct sftp_parallel *
 sftp_parallel_start(const struct sftp_parallel_config *cfg)
 {
@@ -696,12 +715,34 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	p->saved_showprogress = showprogress;
 	showprogress = 0;
 
-	/* 3. Spawn workers. */
-	for (int i = 0; i < cfg->num_streams; i++) {
-		if (spawn_one_worker(p) == NULL) {
-			error_f("worker %d setup failed", i);
-			goto fail;
+	/* 3. Spawn workers in parallel to overlap SSH handshakes. */
+	{
+		int n = cfg->num_streams;
+		struct spawn_ctx  sctx[SFTP_PARALLEL_MAX_WORKERS];
+		pthread_t         stids[SFTP_PARALLEL_MAX_WORKERS];
+		int               failed = 0;
+
+		for (int i = 0; i < n; i++) {
+			sctx[i].p         = p;
+			sctx[i].succeeded = 0;
+			if (pthread_create(&stids[i], NULL,
+			    do_parallel_spawn, &sctx[i]) != 0) {
+				error_f("spawn thread %d failed", i);
+				/* Join threads already launched. */
+				for (int j = 0; j < i; j++)
+					pthread_join(stids[j], NULL);
+				goto fail;
+			}
 		}
+		for (int i = 0; i < n; i++) {
+			pthread_join(stids[i], NULL);
+			if (!sctx[i].succeeded) {
+				error_f("worker %d setup failed", i);
+				failed = 1;
+			}
+		}
+		if (failed)
+			goto fail;
 	}
 
 	/* 4. Reporter — best-effort. */
