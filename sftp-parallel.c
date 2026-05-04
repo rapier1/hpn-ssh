@@ -61,8 +61,8 @@ extern int showprogress;
 #define WORK_QUEUE_DEPTH(N)     ((size_t)((N) * 4 + 8))
 #define MAX_RETRIES             3
 #define REPORTER_TICK_MS        200
-#define DEFAULT_TRANSFER_BUFLEN 32768
-#define DEFAULT_NUM_REQUESTS    1024
+#define DEFAULT_TRANSFER_BUFLEN 131072	/* 128 KB; matches sftp-client.c */
+#define DEFAULT_NUM_REQUESTS    1024	/* 128 KB * 1024 = 128 MB in-flight per stream */
 
 /* Watchdog thresholds. STALL: warn if a worker has had work available but
  * completed nothing for this long. DEAD: escalate to abort. Generous values

@@ -89,10 +89,10 @@ extern int showprogress;
  */
 
 /* Default size of buffer for up/download (fix sftp.1 scp.1 if changed) */
-#define DEFAULT_COPY_BUFLEN	32768
+#define DEFAULT_COPY_BUFLEN	131072	/* 128 KB; raised from 32 KB for HPN */
 
 /* Default number of concurrent xfer requests (fix sftp.1 scp.1 if changed) */
-/* 1024 xfer requests gives us 32MB of receive buffer space */
+/* 1024 xfer requests * 128 KB = 128 MB in-flight; sized to not cap HPN channel window */
 #define DEFAULT_NUM_REQUESTS	1024
 
 /* Minimum amount of data to read at a time */
