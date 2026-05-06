@@ -53,6 +53,7 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
+#include "sftp-client-hpn.h" /* HPN */
 
 extern volatile sig_atomic_t interrupted;
 extern int showprogress;
@@ -112,14 +113,8 @@ extern int showprogress;
 struct sftp_conn {
 	int fd_in;
 	int fd_out;
-	int dead;		/* set when an unrecoverable I/O error occurs;
-				 * prevents further send/recv on this conn */
-	/* TEST/DEBUG ONLY — remove before production release.
-	 * Part of the SFTP_FAULT_INJECT worker-death simulation.
-	 * See fi_state struct and all other TEST/DEBUG blocks. */
-	uint64_t fault_after_bytes; /* die after this many bytes sent (0=off) */
-	uint64_t fault_bytes_sent;  /* bytes sent so far on this connection */
-	/* END TEST/DEBUG */
+	struct sftp_hpn_conn *hpn;  /* HPN: per-connection extensions (dead flag,
+				     * live counter, fault injection) */
 	u_int download_buflen;
 	u_int upload_buflen;
 	u_int num_requests;
@@ -138,9 +133,6 @@ struct sftp_conn {
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
-	volatile uint64_t *live_counter; /* incremental progress hook;
-					  * updated per chunk during transfer;
-					  * NULL in normal (non-parallel) mode */
 };
 
 /* Tracks in-progress requests during file transfers */
@@ -155,23 +147,6 @@ TAILQ_HEAD(requests, request);
 static u_char *
 get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
     const char *errfmt, ...) __attribute__((format(printf, 4, 5)));
-
-/* =========================================================
- * TEST/DEBUG ONLY — remove before production release.
- * This block and all code marked TEST/DEBUG below implement
- * the SFTP_FAULT_INJECT worker-death simulation used by
- * benchmark/test_fault_injection.py.  Affected locations:
- *   - fi_state struct (here)
- *   - fault_after_bytes / fault_bytes_sent fields in sftp_conn
- *   - fi_state_init() and sftp_set_live_counter() fault block
- *   - send_msg() fault trigger block
- * ========================================================= */
-static struct {
-	uint64_t       threshold;  /* byte threshold; 0 = disabled */
-	int            kills_left; /* remaining kill slots; INT_MAX = unlimited */
-	pthread_once_t once;
-} fi_state = { 0, 0, PTHREAD_ONCE_INIT };
-/* END TEST/DEBUG */
 
 static struct request *
 request_enqueue(struct requests *requests, u_int id, size_t len,
@@ -217,7 +192,7 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 	struct iovec iov[2];
 	size_t msg_len = sshbuf_len(m);
 
-	if (conn->dead)
+	if (conn->hpn->dead) /* HPN */
 		return -1;
 
 	if (msg_len > SFTP_MAX_MSG_LENGTH)
@@ -234,38 +209,19 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 	    conn->limit_kbps > 0 ? &conn->bwlimit_out : NULL) !=
 	    msg_len + sizeof(mlen)) {
 		error("sftp: send: %s", strerror(errno));
-		conn->dead = 1;
+		conn->hpn->dead = 1; /* HPN */
 		sshbuf_reset(m);
 		return -1;
 	}
 
 	sshbuf_reset(m);
 
-	/* TEST/DEBUG ONLY — remove before production release
-	 * Simulate connection death after N bytes sent.  Uses a shared atomic
-	 * kill-slot counter so only max_kills workers actually die; the rest
-	 * continue and pick up re-queued work. */
-	if (conn->fault_after_bytes > 0) {
-		conn->fault_bytes_sent += msg_len + sizeof(mlen);
-		if (conn->fault_bytes_sent >= conn->fault_after_bytes) {
-			/* Atomically claim a kill slot. */
-			int prev = __atomic_fetch_sub(&fi_state.kills_left, 1,
-			    __ATOMIC_SEQ_CST);
-			if (prev > 0) {
-				error("sftp: fault injection: simulating "
-				    "connection death after %llu bytes sent",
-				    (unsigned long long)conn->fault_bytes_sent);
-				close(conn->fd_in);
-				close(conn->fd_out);
-				conn->fd_in = conn->fd_out = -1;
-				conn->dead = 1;
-				return -1;
-			}
-			/* No slot — restore counter, disable for this conn. */
-			__atomic_fetch_add(&fi_state.kills_left, 1,
-			    __ATOMIC_SEQ_CST);
-			conn->fault_after_bytes = 0;
-		}
+	/* TEST/DEBUG ONLY — remove before production release */
+	if (sftp_hpn_check_fault(conn->hpn, msg_len + sizeof(mlen)) != 0) {
+		close(conn->fd_in);
+		close(conn->fd_out);
+		conn->fd_in = conn->fd_out = -1;
+		return -1;
 	}
 	/* END TEST/DEBUG */
 
@@ -279,7 +235,7 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 	u_char *p;
 	int r;
 
-	if (conn->dead)
+	if (conn->hpn->dead) /* HPN */
 		return -1;
 
 	sshbuf_reset(m);
@@ -291,7 +247,7 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 			error("sftp: connection closed");
 		else
 			error("sftp: read: %s", strerror(errno));
-		conn->dead = 1;
+		conn->hpn->dead = 1; /* HPN */
 		return -1;
 	}
 
@@ -313,7 +269,7 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 			error("sftp: connection closed");
 		else
 			error("sftp: read: %s", strerror(errno));
-		conn->dead = 1;
+		conn->hpn->dead = 1; /* HPN */
 		return -1;
 	}
 	return 0;
@@ -557,46 +513,6 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 	return 0;
 }
 
-/* TEST/DEBUG ONLY — remove before production release
- * Initialises fi_state once from SFTP_FAULT_INJECT=<bytes>[:<max_kills>].
- *   bytes     — worker connection dies after sending this many bytes.
- *   max_kills — optional; at most this many workers are killed (default: all).
- * Example: SFTP_FAULT_INJECT=150000:2  kills at most 2 out of N workers.
- */
-static void
-fi_state_init(void)
-{
-	const char *ev = getenv("SFTP_FAULT_INJECT");
-	if (ev == NULL)
-		return;
-	char *ep;
-	uint64_t bytes = strtoull(ev, &ep, 10);
-	if (bytes == 0)
-		return;
-	fi_state.threshold  = bytes;
-	fi_state.kills_left = (*ep == ':') ? (int)strtol(ep + 1, NULL, 10)
-	                                   : INT_MAX;
-}
-/* END TEST/DEBUG */
-
-void
-sftp_set_live_counter(struct sftp_conn *conn, volatile uint64_t *counter)
-{
-	if (conn == NULL)
-		return;
-	conn->live_counter = counter;
-
-	/* TEST/DEBUG ONLY — remove before production release */
-	pthread_once(&fi_state.once, fi_state_init);
-	if (fi_state.threshold > 0) {
-		conn->fault_after_bytes = fi_state.threshold;
-		error("sftp: fault injection enabled: "
-		    "connection will die after %llu bytes sent",
-		    (unsigned long long)fi_state.threshold);
-	}
-	/* END TEST/DEBUG */
-}
-
 struct sftp_conn *
 sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
     uint64_t limit_kbps)
@@ -607,6 +523,7 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	int r;
 
 	ret = xcalloc(1, sizeof(*ret));
+	ret->hpn = sftp_hpn_conn_init(); /* HPN */
 	ret->msg_id = 1;
 	ret->fd_in = fd_in;
 	ret->fd_out = fd_out;
@@ -750,6 +667,7 @@ sftp_free(struct sftp_conn *conn)
 {
 	if (conn == NULL)
 		return;
+	sftp_hpn_conn_free(conn->hpn); /* HPN */
 	freezero(conn, sizeof(*conn));
 }
 
@@ -759,11 +677,20 @@ sftp_proto_version(struct sftp_conn *conn)
 	return conn->version;
 }
 
+/* HPN: thin wrappers — logic lives in sftp-client-hpn.c */
 int
 sftp_conn_is_dead(struct sftp_conn *conn)
 {
-	return conn != NULL && conn->dead;
+	return conn != NULL && sftp_hpn_is_dead(conn->hpn);
 }
+
+void
+sftp_set_live_counter(struct sftp_conn *conn, volatile uint64_t *counter)
+{
+	if (conn != NULL)
+		sftp_hpn_set_live_counter(conn->hpn, counter);
+}
+/* END HPN */
 
 int
 sftp_get_limits(struct sftp_conn *conn, struct sftp_limits *limits)
@@ -1920,8 +1847,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					reordered = 1;
 			}
 			progress_counter += len;
-			if (conn->live_counter != NULL)
-				__atomic_fetch_add(conn->live_counter, len,
+			if (conn->hpn->live_counter != NULL) /* HPN */
+				__atomic_fetch_add(conn->hpn->live_counter, len,
 				    __ATOMIC_RELAXED);
 			free(data);
 
@@ -2290,8 +2217,8 @@ do_upload_body(struct sftp_conn *conn,
 			    ack->id, ack->len, (unsigned long long)ack->offset);
 			++ackid;
 			progress_counter += ack->len;
-			if (conn->live_counter != NULL)
-				__atomic_fetch_add(conn->live_counter, ack->len,
+			if (conn->hpn->live_counter != NULL) /* HPN */
+				__atomic_fetch_add(conn->hpn->live_counter, ack->len,
 				    __ATOMIC_RELAXED);
 			/*
 			 * Track both the highest offset acknowledged and the
