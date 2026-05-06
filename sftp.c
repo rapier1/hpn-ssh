@@ -2651,11 +2651,11 @@ main(int argc, char **argv)
 			sftp_direct = optarg;
 			break;
 		case 'j':
-			parallel_num_streams = (int)strtonum(optarg, 1, 64,
-			    &errstr);
+			parallel_num_streams = (int)strtonum(optarg, 1,
+			    SFTP_PARALLEL_MAX_WORKERS, &errstr);
 			if (errstr != NULL)
-				fatal("Bad parallel streams \"%s\": %s",
-				    optarg, errstr);
+				fatal("Number of parallel streams must be between 1 and %d: \"%s\": %s",
+				    SFTP_PARALLEL_MAX_WORKERS,optarg, errstr);
 			break;
 		case 'l':
 			limit_kbps = strtonum(optarg, 1, 100 * 1024 * 1024,

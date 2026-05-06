@@ -206,7 +206,19 @@ int sftp_parallel_get_worker_stats(struct sftp_parallel *p,
  * — targeted removal requires the in-flight cancel work that's deferred
  * past Phase 1.
  */
-#define SFTP_PARALLEL_MAX_WORKERS 64
+/*
+ * Hard cap on the number of parallel worker SSH connections per process.
+ *
+ * This is intentionally a compile-time constant, not a runtime parameter.
+ * Client-side rate limiting is advisory by nature — a malicious actor with
+ * control of their own system can bypass any client-side check — so the
+ * cap exists to prevent accidental self-DoS (e.g. scripts that launch many
+ * hpnsftp processes without realising each spawns N workers) rather than
+ * to defend against determined abuse.  The correct defence against abusive
+ * connection floods is server-side: MaxStartups, MaxSessions, pf/iptables
+ * rate limiting, and fail2ban-style tools.
+ */
+#define SFTP_PARALLEL_MAX_WORKERS 24
 
 int sftp_parallel_add_worker(struct sftp_parallel *p);
 int sftp_parallel_remove_worker(struct sftp_parallel *p);
