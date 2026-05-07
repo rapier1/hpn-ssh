@@ -78,6 +78,10 @@ extern int showprogress;
  * because legitimate single-file transfers can run for minutes. */
 #define STALL_THRESHOLD_SEC     60
 #define DEAD_THRESHOLD_SEC      300
+#define RESPAWN_MULTIPLIER      2  /* abort when total respawns exceeds
+				    * this * num_streams; each worker slot
+				    * gets one retry before concluding the
+				    * problem is systemic */
 
 enum worker_health {
 	WORKER_HEALTHY = 0,
@@ -155,6 +159,9 @@ struct sftp_parallel {
 	int                         pending_respawns; /* detached respawn threads
 						       * not yet in workers[];
 						       * guards premature abort */
+	int                         total_respawns;  /* lifetime respawn count;
+						       * abort when this exceeds
+						       * 2 * cfg.num_streams */
 	int                         protocol_violations; /* under workers_mu;
 						       * abort if any non-zero;
 						       * exposed via stats for
@@ -803,10 +810,28 @@ reporter_thread(void *arg)
 			/* Spawn replacements for non-voluntary exits
 			 * (connection died or watchdog-SIGTERMed). Run each
 			 * in a detached thread so the SSH handshake doesn't
-			 * block the reporter's progress ticks. */
+			 * block the reporter's progress ticks.
+			 *
+			 * Hard ceiling: abort if total lifetime respawns
+			 * exceeds 2 * num_streams. Each worker slot gets one
+			 * retry; beyond that the problem is systemic (sustained
+			 * failure, attack) and continuing only delays the
+			 * inevitable MAX_RETRIES drain. */
 			pthread_mutex_lock(&p->workers_mu);
-			int cur_workers = p->num_workers;
+			int cur_workers  = p->num_workers;
+			int respawn_ceil = p->cfg.num_streams * RESPAWN_MULTIPLIER;
+			int over_ceil    = (p->total_respawns >= respawn_ceil);
 			pthread_mutex_unlock(&p->workers_mu);
+
+			if (over_ceil && n_to_respawn > 0) {
+				error_f("respawn ceiling reached (%d of %d "
+				    "allowed) — persistent connection failure, "
+				    "aborting transfer", respawn_ceil,
+				    respawn_ceil);
+				sftp_parallel_abort(p);
+				break;
+			}
+
 			int target   = p->cfg.num_streams;
 			int slots    = target - cur_workers;
 			int to_spawn = (n_to_respawn < slots) ?
@@ -816,6 +841,7 @@ reporter_thread(void *arg)
 					break;
 				pthread_mutex_lock(&p->workers_mu);
 				p->pending_respawns++;
+				p->total_respawns++;
 				pthread_mutex_unlock(&p->workers_mu);
 				pthread_t rtid;
 				if (pthread_create(&rtid, NULL,
@@ -825,6 +851,7 @@ reporter_thread(void *arg)
 					error_f("respawn thread create failed");
 					pthread_mutex_lock(&p->workers_mu);
 					p->pending_respawns--;
+					p->total_respawns--;
 					pthread_mutex_unlock(&p->workers_mu);
 				}
 			}
