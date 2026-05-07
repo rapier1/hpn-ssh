@@ -337,11 +337,21 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
 		fatal_fr(r, "compose");
 
-	if (id != expected_id)
-		fatal("ID mismatch (%u != %u)", id, expected_id);
-	if (type != SSH2_FXP_STATUS)
-		fatal("Expected SSH2_FXP_STATUS(%u) packet, got %u",
+	if (id != expected_id) {
+		error_f("ID mismatch (%u != %u) — possible MITM or "
+		    "server protocol corruption", id, expected_id);
+		sshbuf_free(msg);
+		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		return SSH2_FX_CONNECTION_LOST;
+	}
+	if (type != SSH2_FXP_STATUS) {
+		error_f("expected SSH2_FXP_STATUS(%u) packet, got %u — "
+		    "possible MITM or server protocol corruption",
 		    SSH2_FXP_STATUS, type);
+		sshbuf_free(msg);
+		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		return SSH2_FX_CONNECTION_LOST;
+	}
 
 	if ((r = sshbuf_get_u32(msg, &status)) != 0)
 		fatal_fr(r, "parse");
@@ -379,19 +389,29 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
 		fatal_fr(r, "parse");
 
-	if (id != expected_id)
-		fatal("%s: ID mismatch (%u != %u)",
+	if (id != expected_id) {
+		error("%s: ID mismatch (%u != %u) — possible MITM or "
+		    "server protocol corruption",
 		    errfmt == NULL ? __func__ : errmsg, id, expected_id);
+		sshbuf_free(msg);
+		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		return NULL;
+	}
 	if (type == SSH2_FXP_STATUS) {
 		if ((r = sshbuf_get_u32(msg, &status)) != 0)
 			fatal_fr(r, "parse status");
 		if (errfmt != NULL)
 			error("%s: %s", errmsg, fx2txt(status));
 		sshbuf_free(msg);
-		return(NULL);
-	} else if (type != SSH2_FXP_HANDLE)
-		fatal("%s: Expected SSH2_FXP_HANDLE(%u) packet, got %u",
+		return NULL;
+	} else if (type != SSH2_FXP_HANDLE) {
+		error("%s: expected SSH2_FXP_HANDLE(%u) packet, got %u — "
+		    "possible MITM or server protocol corruption",
 		    errfmt == NULL ? __func__ : errmsg, SSH2_FXP_HANDLE, type);
+		sshbuf_free(msg);
+		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		return NULL;
+	}
 
 	if ((r = sshbuf_get_string(msg, &handle, len)) != 0)
 		fatal_fr(r, "parse handle");
@@ -422,8 +442,13 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
 		fatal_fr(r, "parse");
 
-	if (id != expected_id)
-		fatal("ID mismatch (%u != %u)", id, expected_id);
+	if (id != expected_id) {
+		error_f("ID mismatch (%u != %u) — possible MITM or "
+		    "server protocol corruption", id, expected_id);
+		sshbuf_free(msg);
+		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		return -1;
+	}
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
 
@@ -436,8 +461,12 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 		sshbuf_free(msg);
 		return -1;
 	} else if (type != SSH2_FXP_ATTRS) {
-		fatal("Expected SSH2_FXP_ATTRS(%u) packet, got %u",
+		error_f("expected SSH2_FXP_ATTRS(%u) packet, got %u — "
+		    "possible MITM or server protocol corruption",
 		    SSH2_FXP_ATTRS, type);
+		sshbuf_free(msg);
+		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		return -1;
 	}
 	if ((r = decode_attrib(msg, &attr)) != 0) {
 		error_fr(r, "decode_attrib");
@@ -473,8 +502,13 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 		fatal_fr(r, "parse");
 
 	debug3("Received statvfs reply T:%u I:%u", type, id);
-	if (id != expected_id)
-		fatal("ID mismatch (%u != %u)", id, expected_id);
+	if (id != expected_id) {
+		error_f("ID mismatch (%u != %u) — possible MITM or "
+		    "server protocol corruption", id, expected_id);
+		sshbuf_free(msg);
+		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		return -1;
+	}
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
 
@@ -487,8 +521,12 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 		sshbuf_free(msg);
 		return -1;
 	} else if (type != SSH2_FXP_EXTENDED_REPLY) {
-		fatal("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
+		error_f("expected SSH2_FXP_EXTENDED_REPLY(%u) packet, "
+		    "got %u — possible MITM or server protocol corruption",
 		    SSH2_FXP_EXTENDED_REPLY, type);
+		sshbuf_free(msg);
+		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		return -1;
 	}
 
 	memset(st, 0, sizeof(*st));
@@ -682,6 +720,12 @@ int
 sftp_conn_is_dead(struct sftp_conn *conn)
 {
 	return conn != NULL && sftp_hpn_is_dead(conn->hpn);
+}
+
+int
+sftp_conn_is_protocol_violation(struct sftp_conn *conn)
+{
+	return conn != NULL && sftp_hpn_is_protocol_violation(conn->hpn);
 }
 
 void

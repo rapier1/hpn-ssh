@@ -155,7 +155,10 @@ struct sftp_parallel {
 	int                         pending_respawns; /* detached respawn threads
 						       * not yet in workers[];
 						       * guards premature abort */
-
+	int                         protocol_violations; /* under workers_mu;
+						       * abort if any non-zero;
+						       * exposed via stats for
+						       * post-mortem inspection */
 
 	pthread_t                   reporter_tid;
 	int                         reporter_started;
@@ -551,6 +554,23 @@ worker_thread(void *arg)
 			worker_process_result(w, u0, rc);
 		}
 
+		/* Protocol violation (ID mismatch, unexpected packet type):
+		 * possible MITM attack or serious server corruption. Do not
+		 * retry — increment the orchestrator violation counter and
+		 * abort the entire transfer. A fresh connection to a MITM
+		 * would repeat the same violation. Unit cleanup already
+		 * handled above by worker_process_result / batch result loop. */
+		if (sftp_conn_is_protocol_violation(w->conn)) {
+			error_f("worker %d: protocol violation — possible MITM "
+			    "attack or server protocol corruption; "
+			    "aborting transfer", w->id);
+			pthread_mutex_lock(&p->workers_mu);
+			p->protocol_violations++;
+			pthread_mutex_unlock(&p->workers_mu);
+			sftp_parallel_abort(p);
+			break;
+		}
+
 		/* Connection died during the transfer — this worker cannot
 		 * continue.  The unit was already re-queued or failed above;
 		 * exit cleanly so the orchestrator can detect us as dead. */
@@ -684,8 +704,14 @@ static void *
 respawn_worker_thread(void *arg)
 {
 	struct sftp_parallel *p = arg;
-	if (spawn_one_worker(p) == NULL)
+	struct sftp_worker *w = spawn_one_worker(p);
+	if (w == NULL)
 		error_f("worker respawn failed");
+	else {
+		pthread_mutex_lock(&w->mu);
+		w->reconnect_count++;
+		pthread_mutex_unlock(&w->mu);
+	}
 	pthread_mutex_lock(&p->workers_mu);
 	p->pending_respawns--;
 	pthread_mutex_unlock(&p->workers_mu);
@@ -1558,7 +1584,8 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 
 	uint64_t b = 0, c = 0, f = 0;
 	pthread_mutex_lock(&p->workers_mu);
-	out->num_workers = p->num_workers;
+	out->num_workers        = p->num_workers;
+	out->protocol_violations = p->protocol_violations;
 	for (int i = 0; i < p->num_workers; i++) {
 		struct sftp_worker *w = p->workers[i];
 		pthread_mutex_lock(&w->mu);

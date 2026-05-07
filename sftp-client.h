@@ -72,6 +72,12 @@ void sftp_set_live_counter(struct sftp_conn *, volatile uint64_t *);
  * Workers should check this after a failed transfer and exit their loop. */
 int sftp_conn_is_dead(struct sftp_conn *);
 
+/* Returns non-zero if a protocol-level violation was detected (ID mismatch,
+ * unexpected packet type). Distinct from sftp_conn_is_dead: indicates possible
+ * MITM attack or serious server corruption. The parallel orchestrator aborts
+ * the entire transfer on violation rather than retrying the affected worker. */
+int sftp_conn_is_protocol_violation(struct sftp_conn *);
+
 u_int sftp_proto_version(struct sftp_conn *);
 
 /* Query server limits */

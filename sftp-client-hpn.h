@@ -27,6 +27,13 @@ struct sftp_hpn_conn {
 	 * send/recv on this connection. */
 	int              dead;
 
+	/* Set when a protocol-level violation is detected (ID mismatch,
+	 * unexpected packet type). Distinct from dead: this indicates
+	 * possible MITM attack or serious server corruption, not a simple
+	 * connection drop.  In parallel mode the orchestrator aborts the
+	 * entire transfer rather than retrying. */
+	int              protocol_violation;
+
 	/* Incremental progress hook for the parallel orchestrator.
 	 * Updated atomically per chunk during transfer; NULL in normal
 	 * (non-parallel) mode. */
@@ -55,6 +62,8 @@ void sftp_hpn_conn_free(struct sftp_hpn_conn *);
  * no dependency on the opaque struct sftp_conn.
  */
 int  sftp_hpn_is_dead(struct sftp_hpn_conn *);
+int  sftp_hpn_is_protocol_violation(struct sftp_hpn_conn *);
+void sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *);
 void sftp_hpn_set_live_counter(struct sftp_hpn_conn *, volatile uint64_t *);
 
 /*

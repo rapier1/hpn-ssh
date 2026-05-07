@@ -95,6 +95,21 @@ sftp_hpn_is_dead(struct sftp_hpn_conn *hpn)
 	return hpn != NULL && hpn->dead;
 }
 
+int
+sftp_hpn_is_protocol_violation(struct sftp_hpn_conn *hpn)
+{
+	return hpn != NULL && hpn->protocol_violation;
+}
+
+void
+sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *hpn)
+{
+	if (hpn == NULL)
+		return;
+	hpn->dead = 1;
+	hpn->protocol_violation = 1;
+}
+
 /*
  * Internal helper called by sftp_set_live_counter() in sftp-client.c.
  * Registers the parallel orchestrator's live-bytes counter and arms the

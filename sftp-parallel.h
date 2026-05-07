@@ -172,6 +172,9 @@ struct sftp_parallel_stats {
 	uint64_t bytes_total_aggregate;
 	uint64_t units_completed_aggregate;
 	uint64_t units_failed_aggregate;
+	int      protocol_violations; /* ID mismatches / bad packet types;
+				       * non-zero means the transfer was aborted
+				       * due to possible MITM or corruption */
 };
 
 struct sftp_parallel_worker_stats {
