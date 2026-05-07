@@ -2416,6 +2416,7 @@ struct batch_file {
 	size_t   handle_len;
 	u_int    open_id;
 	u_int    close_id;
+	u_int    write_id;     /* request ID for small-file single-write (0=none) */
 	int      failed;
 };
 
@@ -2522,15 +2523,126 @@ sftp_upload_batch(struct sftp_conn *conn,
 	}
 
 	/*
-	 * Phase 3: transfer each file sequentially.  preserve/fsync fsetstat
-	 * happen inside do_upload_body per file before we reach the batch-close
-	 * phase; close itself is deferred to Phase 4-5.
+	 * Phase 3a: burst-write all small files (size <= upload_buflen).
+	 * Each file fits in a single SSH_FXP_WRITE; we send all N requests
+	 * without collecting ACKs, so N round-trips collapse to one.
+	 * Large files and empty files are skipped here; they are handled
+	 * in Phase 3d below.
 	 */
 	debug_f("batch upload phase 3: transferring %d files", n);
+	{
+		u_char *data = xmalloc(conn->upload_buflen);
+
+		for (i = 0; i < n; i++) {
+			ssize_t len;
+
+			if (bs[i].failed || bs[i].handle == NULL)
+				continue;
+			if (bs[i].sb.st_size > (off_t)conn->upload_buflen)
+				continue; /* large file — handled in phase 3d */
+			if (bs[i].sb.st_size == 0) {
+				/* Empty file: remote is already zeroed by TRUNC open. */
+				close(bs[i].local_fd);
+				bs[i].local_fd = -1;
+				continue;
+			}
+			/* Read the entire file in one shot. */
+			do {
+				len = read(bs[i].local_fd, data,
+				    (size_t)bs[i].sb.st_size);
+			} while (len == -1 && (errno == EINTR ||
+			    errno == EAGAIN || errno == EWOULDBLOCK));
+			close(bs[i].local_fd);
+			bs[i].local_fd = -1;
+			if (len <= 0) {
+				error("read local \"%s\": %s",
+				    entries[i].local_path, strerror(errno));
+				bs[i].failed = 1;
+				entries[i].result = -1;
+				any_fail = 1;
+				continue;
+			}
+			/* Send SSH_FXP_WRITE; ACK collected in phase 3b. */
+			bs[i].write_id = conn->msg_id++;
+			if ((msg = sshbuf_new()) == NULL)
+				fatal_f("sshbuf_new failed");
+			if ((r = sshbuf_put_u8(msg, SSH2_FXP_WRITE)) != 0 ||
+			    (r = sshbuf_put_u32(msg, bs[i].write_id)) != 0 ||
+			    (r = sshbuf_put_string(msg, bs[i].handle,
+			    bs[i].handle_len)) != 0 ||
+			    (r = sshbuf_put_u64(msg, 0)) != 0 ||       /* offset=0 */
+			    (r = sshbuf_put_string(msg, data, len)) != 0)
+				fatal_fr(r, "compose batch write");
+			send_msg(conn, msg);
+			sshbuf_free(msg);
+		}
+		free(data);
+	}
+
+	/*
+	 * Phase 3b: collect STATUS replies for all small-file writes.
+	 * The server responds in request order; one RTT covers all N.
+	 */
+	{
+		if ((msg = sshbuf_new()) == NULL)
+			fatal_f("sshbuf_new failed");
+		for (i = 0; i < n; i++) {
+			u_char type;
+			u_int status, rid;
+
+			if (bs[i].write_id == 0)
+				continue; /* no write sent for this entry */
+			get_msg(conn, msg);
+			if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+			    (r = sshbuf_get_u32(msg, &rid)) != 0)
+				fatal_fr(r, "parse batch write response");
+			if (type != SSH2_FXP_STATUS)
+				fatal("batch write: expected SSH2_FXP_STATUS(%d), "
+				    "got %d", SSH2_FXP_STATUS, type);
+			if ((r = sshbuf_get_u32(msg, &status)) != 0)
+				fatal_fr(r, "parse batch write status");
+			if (rid != bs[i].write_id)
+				fatal("batch write ID mismatch: got %u expected %u",
+				    rid, bs[i].write_id);
+			if (conn->hpn->live_counter != NULL) /* HPN */
+				__atomic_fetch_add(conn->hpn->live_counter,
+				    (uint64_t)bs[i].sb.st_size, __ATOMIC_RELAXED);
+			if (status != SSH2_FX_OK) {
+				error("write remote \"%s\": %s",
+				    entries[i].remote_path, fx2txt(status));
+				bs[i].failed = 1;
+				entries[i].result = -1;
+				any_fail = 1;
+			}
+		}
+		sshbuf_free(msg);
+	}
+
+	/*
+	 * Phase 3c: apply preserve / fsync to successfully written small files.
+	 */
 	for (i = 0; i < n; i++) {
 		if (bs[i].failed || bs[i].handle == NULL)
 			continue;
-		debug_f("batch upload file %d/%d: %s -> %s (%lld bytes)",
+		if (bs[i].sb.st_size > (off_t)conn->upload_buflen)
+			continue; /* large file — handled below */
+		if (preserve_flag)
+			sftp_fsetstat(conn, bs[i].handle, bs[i].handle_len,
+			    &bs[i].a);
+		if (fsync_flag)
+			(void)sftp_fsync(conn, bs[i].handle, bs[i].handle_len);
+	}
+
+	/*
+	 * Phase 3d: large files — one at a time via do_upload_body.
+	 * preserve and fsync are applied inside do_upload_body per file.
+	 */
+	for (i = 0; i < n; i++) {
+		if (bs[i].failed || bs[i].handle == NULL)
+			continue;
+		if (bs[i].sb.st_size <= (off_t)conn->upload_buflen)
+			continue; /* small file — already handled */
+		debug_f("batch upload large file %d/%d: %s -> %s (%lld bytes)",
 		    i + 1, n, entries[i].local_path, entries[i].remote_path,
 		    (long long)bs[i].sb.st_size);
 		r = do_upload_body(conn, bs[i].local_fd, bs[i].sb.st_size,
