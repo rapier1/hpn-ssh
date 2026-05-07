@@ -370,7 +370,7 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	switch (u->op) {
 	case SFTP_OP_UPLOAD:
 		rc = sftp_upload(w->conn, u->src_path, u->dst_path,
-		    p->cfg.preserve_flag, /*print_flag=*/0,
+		    p->cfg.preserve_flag, /*resume=*/0,
 		    p->cfg.fsync_flag, p->cfg.inplace_flag);
 		break;
 	case SFTP_OP_DOWNLOAD:
