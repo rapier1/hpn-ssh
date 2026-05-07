@@ -9,22 +9,22 @@
  */
 
 /*
- * Phase 1 failure-handling note (known limitation, to be addressed later):
+ * Phase 2 worker fault isolation:
  *
- * sftp-client.c's I/O helpers call fatal() on EOF or read errors. That code
- * was written assuming a single connection, where exiting on a broken pipe
- * is correct. In our multi-worker context it means *any* worker's connection
- * death takes down the entire orchestrator process. Phase 1 accepts this:
- * we add visibility (stall logging, master-liveness polling) but do not
- * recover from worker connection loss.
+ * sftp-client.c's I/O helpers (send_msg, get_msg_extended) return -1 and set
+ * conn->hpn->dead on EOF or write errors rather than calling fatal(). A dead
+ * connection propagates up through execute_unit() back to the worker loop,
+ * which re-queues the in-flight unit (if under MAX_RETRIES) and then exits.
  *
- * Future work (Phase 2+): replace fatal() in sftp-client.c's I/O paths with
- * error returns, or move workers to fork() rather than pthread() for
- * automatic isolation. Both enable dynamically adding/removing workers and
- * resuming transfers after a worker dies. The watchdog hooks below
- * (last_completion_ns, kill(0) probes, sftp_cm_alive polling) are designed
- * with that future in mind — when we get true recovery, they tell us *which*
- * worker to replace.
+ * The reporter's watchdog detects dead workers via kill(0) probes and elapsed
+ * time since last completion. When a worker is classified DEAD, it sends
+ * SIGTERM to the SSH child (to unblock any pending I/O) and sets w->doomed.
+ * The reap loop joins the exited worker thread, frees its resources, and
+ * spawns a replacement in a detached thread so the SSH handshake doesn't
+ * block the reporter's 200ms progress ticks.
+ *
+ * Remaining Phase 2 work: convert protocol-level fatal()s (request ID
+ * mismatch, unexpected packet type) to conn->hpn->dead.
  */
 
 #include "includes.h"
@@ -131,6 +131,11 @@ struct sftp_worker {
 	int                started;
 	int                exited;             /* set by worker on self-exit;
 						* read by reporter for reaping */
+	int                exited_voluntary;   /* set when exiting via EXIT_WORKER
+						* sentinel; suppresses replacement
+						* spawn in the reap loop */
+	int                doomed;            /* set by watchdog before SIGTERM;
+						* prevents double-kill */
 };
 
 struct sftp_parallel {
@@ -147,6 +152,10 @@ struct sftp_parallel {
 	int                         num_workers;
 	int                         workers_cap;
 	int                         next_worker_id;
+	int                         pending_respawns; /* detached respawn threads
+						       * not yet in workers[];
+						       * guards premature abort */
+
 
 	pthread_t                   reporter_tid;
 	int                         reporter_started;
@@ -421,9 +430,15 @@ worker_thread(void *arg)
 		if (u0 == NULL)
 			continue;
 
-		/* Self-exit sentinel from sftp_parallel_remove_worker. */
+		/* Self-exit sentinel from sftp_parallel_remove_worker. The
+		 * first worker to pop this exits its loop; the reporter
+		 * thread reaps it. Mark voluntary so the reap loop does
+		 * not spawn a replacement. */
 		if (u0->op == SFTP_OP_EXIT_WORKER) {
 			free_unit(u0);
+			pthread_mutex_lock(&w->mu);
+			w->exited_voluntary = 1;
+			pthread_mutex_unlock(&w->mu);
 			break;
 		}
 
@@ -520,6 +535,9 @@ worker_thread(void *arg)
 			if (leftover != NULL) {
 				if (leftover->op == SFTP_OP_EXIT_WORKER) {
 					free_unit(leftover);
+					pthread_mutex_lock(&w->mu);
+					w->exited_voluntary = 1;
+					pthread_mutex_unlock(&w->mu);
 					break;
 				}
 				worker_record_start(w);
@@ -600,12 +618,10 @@ watchdog_check_workers(struct sftp_parallel *p)
 
 		next = WORKER_HEALTHY;
 
-		/* (3a-supporting) ssh child gone is the strongest signal.
-		 * In the current Phase-1 fatal-on-error design, the worker
-		 * thread's read() will have already triggered fatal() before
-		 * we get here — but probing kill(pid, 0) is cheap and gives
-		 * us correct telemetry for the future fork-or-error-return
-		 * recovery code. */
+		/* SSH child gone is the strongest signal — detectable
+		 * immediately via kill(0). The worker thread will notice
+		 * on its next I/O (pipe EOF), but the probe lets the
+		 * watchdog classify and act without waiting. */
 		if (w->ssh_pid > 0 && kill(w->ssh_pid, 0) != 0 &&
 		    errno == ESRCH) {
 			next = WORKER_DEAD;
@@ -636,11 +652,44 @@ watchdog_check_workers(struct sftp_parallel *p)
 				    (since_completion_ns / 1000000000ULL));
 			}
 		}
-		if (next == WORKER_DEAD)
+
+		/* Doom dead workers: SIGTERM the SSH child so any blocking
+		 * I/O in the worker thread unblocks immediately. Guard with
+		 * doomed to prevent double-SIGTERM on successive ticks. */
+		if (next == WORKER_DEAD) {
+			int already_doomed;
+			pthread_mutex_lock(&w->mu);
+			already_doomed = w->doomed || w->exited;
+			if (!already_doomed)
+				w->doomed = 1;
+			pthread_mutex_unlock(&w->mu);
+			if (!already_doomed) {
+				if (w->ssh_pid > 0)
+					(void)kill(w->ssh_pid, SIGTERM);
+				logit_f("worker %d: sent SIGTERM to ssh child "
+				    "(pid %ld)", w->id, (long)w->ssh_pid);
+			}
 			any_dead = 1;
+		}
 	}
 	pthread_mutex_unlock(&p->workers_mu);
 	return any_dead;
+}
+
+static struct sftp_worker *spawn_one_worker(struct sftp_parallel *);
+
+/* Spawns one replacement worker, called from a detached thread so
+ * the SSH handshake doesn't block the reporter's progress ticks. */
+static void *
+respawn_worker_thread(void *arg)
+{
+	struct sftp_parallel *p = arg;
+	if (spawn_one_worker(p) == NULL)
+		error_f("worker respawn failed");
+	pthread_mutex_lock(&p->workers_mu);
+	p->pending_respawns--;
+	pthread_mutex_unlock(&p->workers_mu);
+	return NULL;
 }
 
 static void *
@@ -670,31 +719,32 @@ reporter_thread(void *arg)
 		 * cheaper and watchdog timing doesn't need 200ms granularity. */
 		if (++slow_tick_counter >= 5) {
 			slow_tick_counter = 0;
-			if (watchdog_check_workers(p)) {
-				/* Phase 1: any DEAD worker → abort the
-				 * whole orchestrator. Phase 2 will replace
-				 * the failed worker instead. */
-				error_f("worker died — aborting parallel "
-				    "transfer (Phase 1 limitation)");
-				sftp_parallel_abort(p);
-				break;
-			}
 
-			/* Reap workers that self-exited via SFTP_OP_EXIT_WORKER
-			 * sentinel (sftp_parallel_remove_worker). Collect them
-			 * under workers_mu, then join and free outside the
-			 * lock so we don't block other operations on it. */
+			/* Watchdog classifies workers HEALTHY/STALLED/DEAD
+			 * and SIGTERMs newly DEAD ones. We don't abort here;
+			 * the reap loop below joins exited workers and spawns
+			 * replacements. */
+			(void)watchdog_check_workers(p);
+
+			/* Reap workers that have exited (either via
+			 * SFTP_OP_EXIT_WORKER sentinel or because their
+			 * connection died). Collect under workers_mu, then
+			 * join and free outside the lock. */
 			struct sftp_worker *to_reap[SFTP_PARALLEL_MAX_WORKERS];
+			int to_reap_voluntary[SFTP_PARALLEL_MAX_WORKERS];
 			int n_reap = 0;
 			pthread_mutex_lock(&p->workers_mu);
 			for (int i = p->num_workers - 1; i >= 0; i--) {
 				struct sftp_worker *w = p->workers[i];
-				int exited;
+				int exited, voluntary;
 				pthread_mutex_lock(&w->mu);
-				exited = w->exited;
+				exited    = w->exited;
+				voluntary = w->exited_voluntary;
 				pthread_mutex_unlock(&w->mu);
 				if (exited) {
-					to_reap[n_reap++] = w;
+					to_reap[n_reap] = w;
+					to_reap_voluntary[n_reap] = voluntary;
+					n_reap++;
 					memmove(&p->workers[i],
 					    &p->workers[i + 1],
 					    (p->num_workers - i - 1) *
@@ -703,33 +753,75 @@ reporter_thread(void *arg)
 				}
 			}
 			pthread_mutex_unlock(&p->workers_mu);
+
+			int n_to_respawn = 0;
 			for (int i = 0; i < n_reap; i++) {
 				struct sftp_worker *w = to_reap[i];
+				if (!to_reap_voluntary[i])
+					n_to_respawn++;
 				pthread_join(w->tid, NULL);
 				if (w->conn) sftp_free(w->conn);
 				if (w->fd_in >= 0) close(w->fd_in);
 				if (w->fd_out >= 0) close(w->fd_out);
 				if (w->ssh_pid > 0) {
 					int s;
+					/* Belt-and-suspenders: may already
+					 * be dead from SIGTERM above. */
+					(void)kill(w->ssh_pid, SIGKILL);
 					(void)waitpid(w->ssh_pid, &s, 0);
 				}
 				pthread_mutex_destroy(&w->mu);
 				free(w);
 			}
 
-			/* If every worker exited and work is still pending,
-			 * no one will ever decrement pending to zero — abort
+			/* Spawn replacements for non-voluntary exits
+			 * (connection died or watchdog-SIGTERMed). Run each
+			 * in a detached thread so the SSH handshake doesn't
+			 * block the reporter's progress ticks. */
+			pthread_mutex_lock(&p->workers_mu);
+			int cur_workers = p->num_workers;
+			pthread_mutex_unlock(&p->workers_mu);
+			int target   = p->cfg.num_streams;
+			int slots    = target - cur_workers;
+			int to_spawn = (n_to_respawn < slots) ?
+			    n_to_respawn : slots;
+			for (int i = 0; i < to_spawn; i++) {
+				if (p->abort_flag || p->stopped)
+					break;
+				pthread_mutex_lock(&p->workers_mu);
+				p->pending_respawns++;
+				pthread_mutex_unlock(&p->workers_mu);
+				pthread_t rtid;
+				if (pthread_create(&rtid, NULL,
+				    respawn_worker_thread, p) == 0) {
+					(void)pthread_detach(rtid);
+				} else {
+					error_f("respawn thread create failed");
+					pthread_mutex_lock(&p->workers_mu);
+					p->pending_respawns--;
+					pthread_mutex_unlock(&p->workers_mu);
+				}
+			}
+
+			/* If every worker is gone and no respawn is in
+			 * flight, all recovery attempts have failed; abort
 			 * rather than letting sftp_parallel_wait hang. */
-			pthread_mutex_lock(&p->pending_mu);
+			pthread_mutex_lock(&p->workers_mu);
 			int all_gone = (p->num_workers == 0 &&
-			    p->pending > 0 && !p->abort_flag);
-			pthread_mutex_unlock(&p->pending_mu);
-			if (all_gone) {
-				error_f("all workers exited with %llu unit(s) "
-				    "still pending — aborting transfer",
-				    (unsigned long long)p->pending);
-				sftp_parallel_abort(p);
-				break;
+			    p->pending_respawns == 0);
+			pthread_mutex_unlock(&p->workers_mu);
+			if (all_gone && !p->abort_flag) {
+				pthread_mutex_lock(&p->pending_mu);
+				int stuck = (p->pending > 0);
+				pthread_mutex_unlock(&p->pending_mu);
+				if (stuck) {
+					error_f("all workers gone with %llu "
+					    "unit(s) pending -- aborting "
+					    "transfer",
+					    (unsigned long long)p->pending);
+					sftp_parallel_abort(p);
+					break;
+				}
 			}
 		}
 	}
