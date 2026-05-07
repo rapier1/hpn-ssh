@@ -19,6 +19,12 @@
 #include <stdint.h>
 
 /*
+ * Uncomment to enable fault injection (SFTP_FAULT_INJECT / SFTP_FAULT_PROTOCOL
+ * environment variables).  Leave commented out for production builds.
+ */
+/* #define HPN_FAULT_INJECTION */
+
+/*
  * HPN per-connection state.  Embedded in struct sftp_conn as a single
  * pointer so the upstream struct definition gains exactly one line.
  */
@@ -39,14 +45,13 @@ struct sftp_hpn_conn {
 	 * (non-parallel) mode. */
 	volatile uint64_t *live_counter;
 
-	/* ----------------------------------------------------------------
-	 * TEST/DEBUG ONLY — remove before production release.
-	 * Part of the SFTP_FAULT_INJECT worker-death simulation used by
-	 * benchmark/test_fault_injection.py.
-	 * ---------------------------------------------------------------- */
-	uint64_t fault_after_bytes; /* die after this many bytes sent (0=off) */
-	uint64_t fault_bytes_sent;  /* bytes sent so far on this connection */
-	/* END TEST/DEBUG */
+#ifdef HPN_FAULT_INJECTION
+	/* SFTP_FAULT_INJECT=bytes[:max_kills]   — simulates connection death.
+	 * SFTP_FAULT_PROTOCOL=bytes[:max_kills] — simulates protocol violation. */
+	uint64_t fault_after_bytes;    /* die after N bytes sent (0=off) */
+	uint64_t fault_pv_after_bytes; /* protocol violation after N bytes (0=off) */
+	uint64_t fault_bytes_sent;     /* bytes sent so far on this connection */
+#endif
 };
 
 /* Allocate and initialise a zeroed sftp_hpn_conn. Never returns NULL. */
@@ -66,15 +71,14 @@ int  sftp_hpn_is_protocol_violation(struct sftp_hpn_conn *);
 void sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *);
 void sftp_hpn_set_live_counter(struct sftp_hpn_conn *, volatile uint64_t *);
 
+#ifdef HPN_FAULT_INJECTION
 /*
- * TEST/DEBUG ONLY — remove before production release.
- *
  * Called by send_msg after each successful write.  Tracks bytes sent and
  * fires the fault injection trigger when the threshold is reached.
  * Returns 0 normally; returns -1 and sets hpn->dead when a fault fires.
  * The caller is responsible for closing the file descriptors.
  */
 int sftp_hpn_check_fault(struct sftp_hpn_conn *, size_t bytes);
-/* END TEST/DEBUG */
+#endif /* HPN_FAULT_INJECTION */
 
 #endif /* _SFTP_CLIENT_HPN_H */

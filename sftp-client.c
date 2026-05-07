@@ -216,14 +216,14 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 
 	sshbuf_reset(m);
 
-	/* TEST/DEBUG ONLY — remove before production release */
+#ifdef HPN_FAULT_INJECTION
 	if (sftp_hpn_check_fault(conn->hpn, msg_len + sizeof(mlen)) != 0) {
 		close(conn->fd_in);
 		close(conn->fd_out);
 		conn->fd_in = conn->fd_out = -1;
 		return -1;
 	}
-	/* END TEST/DEBUG */
+#endif /* HPN_FAULT_INJECTION */
 
 	return 0;
 }
