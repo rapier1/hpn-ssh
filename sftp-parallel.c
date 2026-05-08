@@ -122,6 +122,17 @@ extern int showprogress;
 					 * suggests conditions have changed
 					 * enough that more workers may now help */
 
+/*
+ * Scale-up trigger uses queued bytes rather than queued unit count so the
+ * decision is correct across mixed workloads: a single 500 MiB unit and
+ * 500 small 1 MiB units both represent the same amount of work, even though
+ * one is a single queue entry and the other is hundreds.  Each added worker
+ * needs at least this many queued bytes to justify spawning it (open/close
+ * RTT cost, cipher state, SSH session overhead).  64 MiB matches
+ * RANGE_SPLIT_MIN_SIZE — below this, parallelism overhead dominates.
+ */
+#define SCALE_UP_MIN_BYTES_PER_WORKER  (64ULL * 1024 * 1024)
+
 #define RESPAWN_MULTIPLIER      2  /* abort when total respawns exceeds
 				    * this * num_streams; each worker slot
 				    * gets one retry before concluding the
@@ -233,6 +244,29 @@ struct sftp_parallel {
 	pthread_mutex_t             pending_mu;
 	pthread_cond_t              pending_cv;
 	uint64_t                    pending;
+
+	/*
+	 * Sum of u->size across units currently in the workqueue (waiting to
+	 * be popped — does NOT include in-flight work being processed by a
+	 * worker).  Updated atomically by submit/pop sites.  Read by the
+	 * adaptive scaler on each scale check tick to drive the byte-based
+	 * scale-up trigger.  Brief overcounts are possible during the gap
+	 * between increment and queue push (or decrement and queue pop), but
+	 * never undercounts — the order of operations ensures the counter
+	 * leads the queue state.
+	 */
+	volatile uint64_t           queued_bytes;
+
+	/*
+	 * Bytes carried by workers that have exited (scale-down or fault).
+	 * snapshot_workers iterates only the live workers[] array, so a
+	 * voluntary scale-down would otherwise erase the exited worker's
+	 * bytes_total from the aggregate.  Captured under workers_mu just
+	 * before the worker is removed from the array; read by
+	 * snapshot_workers under the same lock.  Keeps aggregate_bytes_for_meter
+	 * monotonic so the bps calculation in the scaler doesn't underflow.
+	 */
+	uint64_t                    retired_bytes;
 
 	/* Set by sftp_parallel_abort, read by workers between units. */
 	volatile sig_atomic_t       abort_flag;
@@ -512,7 +546,13 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		pending_dec(p);
 	} else if (++u->attempt < MAX_RETRIES) {
 		/* Re-queue without freeing. Keeps pending counter consistent. */
+		if (u->size > 0)
+			__atomic_fetch_add(&p->queued_bytes,
+			    (uint64_t)u->size, __ATOMIC_RELAXED);
 		if (sftp_workqueue_push(p->q, u) != 0) {
+			if (u->size > 0)
+				__atomic_fetch_sub(&p->queued_bytes,
+				    (uint64_t)u->size, __ATOMIC_RELAXED);
 			worker_record_completion(w, 0, 0);
 			free_unit(u);
 			pending_dec(p);
@@ -557,6 +597,9 @@ worker_thread(void *arg)
 		struct sftp_work_unit *u0 = item;
 		if (u0 == NULL)
 			continue;
+		if (u0->size > 0)
+			__atomic_fetch_sub(&p->queued_bytes,
+			    (uint64_t)u0->size, __ATOMIC_RELAXED);
 
 		/* Self-exit sentinel from sftp_parallel_remove_worker. The
 		 * first worker to pop this exits its loop; the reporter
@@ -590,6 +633,10 @@ worker_thread(void *arg)
 				if (sftp_workqueue_trypop(p->q, &nxt) != 0)
 					break; /* queue empty or shutdown */
 				struct sftp_work_unit *nu = nxt;
+				if (nu->size > 0)
+					__atomic_fetch_sub(&p->queued_bytes,
+					    (uint64_t)nu->size,
+					    __ATOMIC_RELAXED);
 				if (nu->op == SFTP_OP_UPLOAD) {
 					batch[bn++] = nu;
 				} else {
@@ -640,8 +687,18 @@ worker_thread(void *arg)
 						 */
 						__atomic_store_n(&w->live_bytes, 0,
 						    __ATOMIC_RELAXED);
+						if (batch[i]->size > 0)
+							__atomic_fetch_add(
+							    &p->queued_bytes,
+							    (uint64_t)batch[i]->size,
+							    __ATOMIC_RELAXED);
 						if (sftp_workqueue_push(p->q,
 						    batch[i]) != 0) {
+							if (batch[i]->size > 0)
+								__atomic_fetch_sub(
+								    &p->queued_bytes,
+								    (uint64_t)batch[i]->size,
+								    __ATOMIC_RELAXED);
 							worker_record_completion(w, 0, 0);
 							free_unit(batch[i]);
 							pending_dec(p);
@@ -726,6 +783,8 @@ snapshot_workers(struct sftp_parallel *p, uint64_t *bytes_out,
 {
 	uint64_t b = 0, c = 0, f = 0;
 	pthread_mutex_lock(&p->workers_mu);
+	/* Bytes from workers that have already exited and been reaped. */
+	b += p->retired_bytes;
 	for (int i = 0; i < p->num_workers; i++) {
 		struct sftp_worker *w = p->workers[i];
 		pthread_mutex_lock(&w->mu);
@@ -915,6 +974,12 @@ reporter_thread(void *arg)
 				pthread_mutex_lock(&w->mu);
 				exited    = w->exited;
 				voluntary = w->exited_voluntary;
+				/* Capture bytes_total before the worker leaves
+				 * the array so the aggregate stays monotonic.
+				 * live_bytes was reset to 0 at the worker's
+				 * last completion so it is not double-counted. */
+				if (exited)
+					p->retired_bytes += w->bytes_total;
 				pthread_mutex_unlock(&w->mu);
 				if (exited) {
 					to_reap[n_reap] = w;
@@ -1026,10 +1091,14 @@ reporter_thread(void *arg)
 		 * SCALE_CHECK_TICKS × 200ms = 5s by default).  The decision
 		 * uses two signals:
 		 *
-		 *  Scale UP:   queue depth >= num_workers × UPLOAD_BATCH_SIZE
-		 *              (workers can't drain the queue fast enough) AND
-		 *              no concurrent respawn or scale-up in flight AND
-		 *              below SFTP_PARALLEL_MAX_WORKERS.
+		 *  Scale UP:   queued bytes >= num_workers × MIN_BYTES_PER_WORKER
+		 *              (enough work in the queue to keep an additional
+		 *              worker busy long enough to amortise its setup
+		 *              cost) AND no concurrent respawn or scale-up in
+		 *              flight AND below SFTP_PARALLEL_MAX_WORKERS.
+		 *              Byte-based rather than count-based so a single
+		 *              500 MiB unit triggers scale-up the same way 500
+		 *              small 1 MiB units would.
 		 *
 		 *  Scale DOWN: queue has been empty for two consecutive checks
 		 *              (workers have more capacity than work) AND
@@ -1061,6 +1130,8 @@ reporter_thread(void *arg)
 				pthread_mutex_unlock(&p->workers_mu);
 
 				size_t qdepth = sftp_workqueue_depth(p->q);
+				uint64_t qbytes = __atomic_load_n(
+				    &p->queued_bytes, __ATOMIC_RELAXED);
 
 				/*
 				 * Ceiling reset: if bps has improved by at
@@ -1088,7 +1159,8 @@ reporter_thread(void *arg)
 					p->scale_bps_at_ceiling = 0.0;
 				}
 
-				if (qdepth >= (size_t)(nw * UPLOAD_BATCH_SIZE) &&
+				if (qbytes >= (uint64_t)nw *
+				        SCALE_UP_MIN_BYTES_PER_WORKER &&
 				    pending_up == 0 && pending_rs == 0 &&
 				    nw < p->scale_ceiling &&
 				    /*
@@ -1107,8 +1179,10 @@ reporter_thread(void *arg)
 				         SCALE_UP_MIN_GAIN)) {
 					/* Scale up. */
 					logit_f("scaling up: %d → %d workers "
-					    "(queue=%zu, %.1f MiB/s)",
+					    "(queue=%zu, %.1f MiB queued, "
+					    "%.1f MiB/s)",
 					    nw, nw + 1, qdepth,
+					    qbytes / (1024.0 * 1024.0),
 					    bps / (1024.0 * 1024.0));
 					p->scale_bps_at_last_up = bps;
 					pthread_mutex_lock(&p->workers_mu);
@@ -1526,23 +1600,42 @@ submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 		free_unit(u);
 		return -1;
 	}
+	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
 	pthread_mutex_lock(&p->pending_mu);
 	p->pending++;
 	pthread_mutex_unlock(&p->pending_mu);
+	if (add_bytes)
+		__atomic_fetch_add(&p->queued_bytes, add_bytes,
+		    __ATOMIC_RELAXED);
 	if (sftp_workqueue_push(p->q, u) != 0) {
 		pthread_mutex_lock(&p->pending_mu);
 		if (p->pending > 0) p->pending--;
 		pthread_mutex_unlock(&p->pending_mu);
+		if (add_bytes)
+			__atomic_fetch_sub(&p->queued_bytes, add_bytes,
+			    __ATOMIC_RELAXED);
 		free_unit(u);
 		return -1;
 	}
 	return 0;
 }
 
+/* Defined later in this file. */
+static int maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *local_path, const char *remote_path,
+    off_t file_size, mode_t mode);
+
 int
-sftp_parallel_submit_upload(struct sftp_parallel *p,
+sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode)
 {
+	/* When a control connection is supplied, route through the
+	 * speculative-split decision so a single large file produces
+	 * multiple range work units (feeds the byte-based scale-up
+	 * trigger).  Otherwise, fall back to a whole-file unit. */
+	if (conn != NULL)
+		return maybe_submit_upload(p, conn, local_path, remote_path,
+		    size, mode);
 	return submit(p,
 	    make_unit(SFTP_OP_UPLOAD, local_path, remote_path, size, mode));
 }
@@ -1820,23 +1913,19 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 	return 0;
 }
 
-/* Return the current live worker count under workers_mu. */
-static int
-live_worker_count(struct sftp_parallel *p)
-{
-	int n;
-	pthread_mutex_lock(&p->workers_mu);
-	n = p->num_workers;
-	pthread_mutex_unlock(&p->workers_mu);
-	return n;
-}
-
 /*
  * Decide whether and how to range-split a large file, then either submit
  * range units (via submit_upload_ranges) or fall back to a whole-file unit.
- * Uses conn to query fs-info and pre-create the remote file.
- * max_ranges tracks the current live worker count so Phase 3a's adaptive
- * scaler acts as the unified governor for both worker count and split factor.
+ *
+ * Range splitting is only safe on parallel filesystems (Lustre/GPFS) where
+ * different stripes live on different OSTs and concurrent writes to one
+ * file at different offsets do not contend.  On a regular POSIX filesystem
+ * (ext4/xfs/etc.) concurrent writes to the same inode contend on page
+ * cache, writeback, and inode locks — empirically this widens throughput
+ * variance dramatically without lifting the mean.  So we range-split
+ * exclusively when sftp_fs_info reports valid stripe geometry; otherwise
+ * the file is submitted as a single whole-file unit and the scaler relies
+ * on multi-file parallelism (one worker per file) to scale up.
  */
 static int
 maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
@@ -1847,38 +1936,39 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	off_t range_size;
 	int num_ranges, max_ranges;
 
-	if (file_size < RANGE_SPLIT_MIN_SIZE || p->cfg.num_streams < 2)
+	if (file_size < RANGE_SPLIT_MIN_SIZE)
 		goto whole_file;
 
-	max_ranges = live_worker_count(p);
+	/* Cap by scaler ceiling so we don't generate units the scaler has
+	 * decided not to use.  Also cap by file size so ranges stay above
+	 * RANGE_SPLIT_MIN_SIZE (open/close RTT cost would dominate). */
+	int ceil = __atomic_load_n(&p->scale_ceiling, __ATOMIC_RELAXED);
+	if (ceil < 1) ceil = 1;
+	if (ceil > SFTP_PARALLEL_MAX_WORKERS)
+		ceil = SFTP_PARALLEL_MAX_WORKERS;
+	int by_size = (int)(file_size / RANGE_SPLIT_MIN_SIZE);
+	max_ranges = (by_size < ceil) ? by_size : ceil;
 	if (max_ranges < 2)
 		goto whole_file;
 
 	memset(&info, 0, sizeof(info));
 	sftp_fs_info(conn, remote_path, &info);
 
-	if (info.stripe_size > 0 && info.stripe_count > 0) {
-		/* Stripe-aligned: use stripe_size as the range unit, cap at
-		 * stripe_count (writing to more workers than OSTs wastes locks). */
-		range_size  = (off_t)info.stripe_size;
-		num_ranges  = (int)(file_size / range_size);
-		if (num_ranges < 1)  num_ranges = 1;
-		if (num_ranges > (int)info.stripe_count)
-			num_ranges = (int)info.stripe_count;
-		if (num_ranges > max_ranges)
-			num_ranges = max_ranges;
-	} else {
-		/* No stripe info: divide evenly, aligned to block_size. */
-		uint64_t align = (info.block_size > 0) ? info.block_size : 4096;
-		num_ranges  = max_ranges;
-		range_size  = (file_size + num_ranges - 1) / num_ranges;
-		/* Round up to alignment boundary. */
-		range_size  = ((range_size + (off_t)align - 1) /
-		    (off_t)align) * (off_t)align;
-		/* Recompute actual number of ranges after alignment. */
-		num_ranges  = (int)((file_size + range_size - 1) / range_size);
-		if (num_ranges < 1) num_ranges = 1;
-	}
+	/* Only range-split when the server reports parallel-FS stripe info.
+	 * On regular filesystems concurrent writes to one inode contend; the
+	 * scaler will still grow workers across multiple files. */
+	if (!(info.stripe_size > 0 && info.stripe_count > 0))
+		goto whole_file;
+
+	/* Stripe-aligned: use stripe_size as the range unit, cap at
+	 * stripe_count (writing to more workers than OSTs wastes locks). */
+	range_size  = (off_t)info.stripe_size;
+	num_ranges  = (int)(file_size / range_size);
+	if (num_ranges < 1)  num_ranges = 1;
+	if (num_ranges > (int)info.stripe_count)
+		num_ranges = (int)info.stripe_count;
+	if (num_ranges > max_ranges)
+		num_ranges = max_ranges;
 
 	if (num_ranges < 2)
 		goto whole_file;

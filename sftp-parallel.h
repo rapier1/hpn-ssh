@@ -81,8 +81,14 @@ struct sftp_parallel *sftp_parallel_start(const struct sftp_parallel_config *cfg
  * Submit a work unit. These calls copy the path strings; the caller retains
  * ownership of its own buffers. Returns 0 on success, -1 if the orchestrator
  * is in shutdown / abort state.
+ *
+ * sftp_parallel_submit_upload accepts an optional control connection (conn)
+ * used to query filesystem stripe geometry and pre-create the remote file
+ * when speculative range-splitting applies.  Pass NULL to skip the split
+ * decision (the upload is submitted as a single whole-file work unit).
  */
 int sftp_parallel_submit_upload(struct sftp_parallel *p,
+    struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode);
 int sftp_parallel_submit_download(struct sftp_parallel *p,
     const char *remote_path, const char *local_path, off_t size, mode_t mode);

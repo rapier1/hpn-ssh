@@ -2596,6 +2596,14 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			error("write remote \"%s\" at offset %llu: %s",
 			    remote_path, (unsigned long long)ack->offset,
 			    fx2txt(status));
+		} else if (conn->hpn->live_counter != NULL) {
+			/* Report incremental progress so the orchestrator's
+			 * bps measurement window sees a steady stream of
+			 * bytes rather than a step at range completion.
+			 * Without this the scaler reads bps=0 mid-range and
+			 * misfires the saturation signal. */
+			__atomic_fetch_add(conn->hpn->live_counter,
+			    (uint64_t)ack->len, __ATOMIC_RELAXED);
 		}
 		TAILQ_REMOVE(&acks, ack, tq);
 		free(ack);

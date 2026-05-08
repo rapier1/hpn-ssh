@@ -66,6 +66,11 @@ FILE* infile;
 /* Parallel-streams orchestrator: NULL = single-stream (default) */
 static struct sftp_parallel *parallel_orch = NULL;
 static int parallel_num_streams = 1;
+/* 1 if the user explicitly passed -j N; 0 otherwise.  When 0, hpnsftp
+ * runs as a plain single-stream client (no orchestrator, no autotuning) so
+ * default behaviour matches upstream sftp.  -j N opts into the adaptive
+ * scaler, which treats N as the starting point. */
+static int parallel_user_opt_in = 0;
 
 /* Are we in batchfile mode? */
 int batchmode = 0;
@@ -854,7 +859,7 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
-			if (sftp_parallel_submit_upload(parallel_orch,
+			if (sftp_parallel_submit_upload(parallel_orch, conn,
 			    g.gl_pathv[i], abs_dst,
 			    sb.st_size, sb.st_mode) != 0)
 				err = -1;
@@ -2656,6 +2661,7 @@ main(int argc, char **argv)
 			if (errstr != NULL)
 				fatal("Number of parallel streams must be between 1 and %d: \"%s\": %s",
 				    SFTP_PARALLEL_MAX_WORKERS,optarg, errstr);
+			parallel_user_opt_in = 1;
 			break;
 		case 'l':
 			limit_kbps = strtonum(optarg, 1, 100 * 1024 * 1024,
@@ -2800,14 +2806,16 @@ main(int argc, char **argv)
 	}
 
 	/*
-	 * If -j N>1, start the parallel-streams orchestrator. This spawns a
-	 * ControlMaster and N worker SSH connections. On failure, warn and
-	 * continue with single-stream mode (the existing conn).
+	 * Start the parallel-streams orchestrator only when the user
+	 * explicitly opted in via -j N.  Without -j, hpnsftp behaves as a
+	 * plain single-stream client (no orchestrator, no autotuning) so
+	 * default behaviour is identical to upstream sftp.  -j N opts into
+	 * the adaptive scaler, treating N as the starting point.
 	 *
 	 * The master and workers honor the same -i / -F / -o options the
 	 * user gave the main connection (captured during getopt above).
 	 */
-	if (parallel_num_streams > 1 && sftp_direct == NULL) {
+	if (parallel_user_opt_in && sftp_direct == NULL) {
 		struct sftp_parallel_config pcfg;
 		char portbuf[16] = "";
 		memset(&pcfg, 0, sizeof(pcfg));
