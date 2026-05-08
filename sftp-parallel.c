@@ -78,6 +78,50 @@ extern int showprogress;
  * because legitimate single-file transfers can run for minutes. */
 #define STALL_THRESHOLD_SEC     60
 #define DEAD_THRESHOLD_SEC      300
+
+/*
+ * Adaptive scaling cadence.  SCALE_CHECK_TICKS controls how often (in
+ * reporter ticks) the scaler samples throughput and evaluates up/down
+ * decisions.  SCALE_COOLDOWN_TICKS is the minimum number of ticks that
+ * must elapse after any scale action before the next one is considered;
+ * expressed in the same unit so the comparison is trivial.
+ *
+ * At REPORTER_TICK_MS=200:
+ *   SCALE_CHECK_TICKS=25  → sample every 5 s
+ *   SCALE_COOLDOWN_TICKS=50 → min 10 s between consecutive scale events
+ */
+#define SCALE_CHECK_TICKS         25
+#define SCALE_COOLDOWN_TICKS      50
+
+/*
+ * Throughput thresholds for adaptive scaling decisions.
+ *
+ * SCALE_UP_MIN_GAIN and SCALE_DOWN_SAT_THRESHOLD are intentionally set to
+ * the same 15% band (1.15 and 0.85) so that a worker producing exactly 15%
+ * improvement is in a neutral dead-band: scale-up won't add another worker
+ * and scale-down won't remove the current one.  This dead-band prevents the
+ * system from oscillating between N and N+1 workers when throughput gain sits
+ * right at the margin.
+ *
+ * SCALE_CEIL_RESET_GAIN uses a wider 30% band so the ceiling only lifts when
+ * throughput has improved substantially — indicating conditions have genuinely
+ * changed (e.g. RTT dropped, server got faster) rather than normal variance.
+ */
+#define SCALE_DOWN_IDLE_FRAC      0.35  /* scale down if a worker is idle
+					 * >35% of wall time (underloaded) */
+#define SCALE_DOWN_SAT_THRESHOLD  0.85  /* scale down if bps < 85% of the bps
+					 * measured before the last scale-up,
+					 * meaning the extra worker gained <15% */
+#define SCALE_UP_MIN_GAIN         1.15  /* block another scale-up unless bps
+					 * has improved ≥15% since the last
+					 * scale-up; matches SCALE_DOWN_SAT_
+					 * THRESHOLD to form the dead-band */
+#define SCALE_CEIL_RESET_GAIN     1.30  /* raise the scale ceiling once bps
+					 * exceeds 130% of the bps at the time
+					 * the ceiling was set; a 30% jump
+					 * suggests conditions have changed
+					 * enough that more workers may now help */
+
 #define RESPAWN_MULTIPLIER      2  /* abort when total respawns exceeds
 				    * this * num_streams; each worker slot
 				    * gets one retry before concluding the
@@ -130,6 +174,17 @@ struct sftp_worker {
 	uint64_t           units_failed;
 	uint64_t           reconnect_count;
 	uint64_t           last_completion_ns; /* monotonic ns of last finish */
+	uint64_t           idle_ns;            /* ns blocked on workqueue pop,
+					        * for completed pops only */
+	uint64_t           work_ns;            /* ns actively processing */
+	/* Set to monotonic_ns() immediately before each blocking pop call,
+	 * cleared to 0 immediately after.  The reporter adds (now -
+	 * pop_start_ns) to idle_ns when computing idle fraction so that
+	 * an in-progress blocking wait is included even though the pop has
+	 * not yet returned.  Written/read with relaxed atomics — a brief
+	 * race between clearing and the accounting update causes at most
+	 * a single-tick undercount, which is harmless for a 35% threshold. */
+	uint64_t           pop_start_ns;
 	enum worker_health health;             /* set by reporter, read for log */
 
 	int                started;
@@ -192,6 +247,37 @@ struct sftp_parallel {
 
 	int                         started;
 	int                         stopped;
+
+	/*
+	 * Adaptive scaling state.  All fields except pending_scaleups are
+	 * touched only by the reporter thread (no lock needed).
+	 * pending_scaleups is incremented by the reporter before launching a
+	 * detached scale-up thread, and decremented by that thread on
+	 * completion; access is serialised under workers_mu.
+	 */
+	int      scale_tick_counter;    /* reporter ticks since last scale check */
+	int      scale_cooldown_ticks;  /* ticks until next scale action allowed */
+	uint64_t scale_bytes_snapshot;  /* aggregate bytes at last scale check */
+	double   scale_bps;             /* bytes/s measured at last scale check */
+	double   scale_bps_at_last_up;  /* bps snapshot when last scale-up fired;
+					 * used by SCALE_UP_MIN_GAIN guard (block
+					 * another scale-up if the last one did
+					 * not improve throughput enough) and by
+					 * SCALE_DOWN_SAT_THRESHOLD check */
+	int      scale_ceiling;         /* maximum worker count allowed; starts
+					 * at SFTP_PARALLEL_MAX_WORKERS and is
+					 * ratcheted down each time a saturation-
+					 * triggered scale-down fires, preventing
+					 * the system from repeatedly adding then
+					 * removing the same unhelpful worker;
+					 * raised again when bps improves by
+					 * SCALE_CEIL_RESET_GAIN */
+	double   scale_bps_at_ceiling;  /* bps at the moment scale_ceiling was
+					 * last lowered; baseline for the
+					 * SCALE_CEIL_RESET_GAIN comparison */
+	int      pending_scaleups;      /* detached scale-up threads in flight */
+	int      scale_shallow_streak;  /* consecutive checks satisfying a
+					 * scale-down signal */
 };
 
 /* ---------- Worker SSH connection setup ---------- */
@@ -214,10 +300,12 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 
 	if (pipe(p2c) < 0)
 		return -1;
+	FD_CLOSEONEXEC(p2c[0]); FD_CLOSEONEXEC(p2c[1]);
 	if (pipe(c2p) < 0) {
 		close(p2c[0]); close(p2c[1]);
 		return -1;
 	}
+	FD_CLOSEONEXEC(c2p[0]); FD_CLOSEONEXEC(c2p[1]);
 	pid_t pid = fork();
 	if (pid < 0) {
 		close(p2c[0]); close(p2c[1]);
@@ -434,8 +522,16 @@ worker_thread(void *arg)
 		if (p->abort_flag)
 			break;
 		void *item = NULL;
-		if (sftp_workqueue_pop(p->q, &item) != 0)
+		uint64_t t_idle_start = monotonic_ns();
+		__atomic_store_n(&w->pop_start_ns, t_idle_start,
+		    __ATOMIC_RELEASE);
+		if (sftp_workqueue_pop(p->q, &item) != 0) {
+			__atomic_store_n(&w->pop_start_ns, 0,
+			    __ATOMIC_RELEASE);
 			break;	/* shutdown && empty */
+		}
+		uint64_t t_work_start = monotonic_ns();
+		__atomic_store_n(&w->pop_start_ns, 0, __ATOMIC_RELEASE);
 		struct sftp_work_unit *u0 = item;
 		if (u0 == NULL)
 			continue;
@@ -559,6 +655,15 @@ worker_thread(void *arg)
 			worker_record_start(w);
 			int rc = execute_unit(w, u0);
 			worker_process_result(w, u0, rc);
+		}
+
+		/* Account for this iteration's idle and work time. */
+		{
+			uint64_t t_work_end = monotonic_ns();
+			pthread_mutex_lock(&w->mu);
+			w->idle_ns += t_work_start - t_idle_start;
+			w->work_ns += t_work_end - t_work_start;
+			pthread_mutex_unlock(&w->mu);
 		}
 
 		/* Protocol violation (ID mismatch, unexpected packet type):
@@ -725,6 +830,21 @@ respawn_worker_thread(void *arg)
 	return NULL;
 }
 
+/* Spawns one additional worker for adaptive scale-up; called from a
+ * detached thread so the SSH handshake doesn't block the reporter. */
+static void *
+scale_up_thread(void *arg)
+{
+	struct sftp_parallel *p = arg;
+	struct sftp_worker *w = spawn_one_worker(p);
+	if (w == NULL)
+		error_f("scale-up worker spawn failed");
+	pthread_mutex_lock(&p->workers_mu);
+	p->pending_scaleups--;
+	pthread_mutex_unlock(&p->workers_mu);
+	return NULL;
+}
+
 static void *
 reporter_thread(void *arg)
 {
@@ -876,6 +996,269 @@ reporter_thread(void *arg)
 					break;
 				}
 			}
+		}
+
+		/* ── Adaptive worker scaling ───────────────────────────────
+		 *
+		 * Runs on a slower cadence than the watchdog (every
+		 * SCALE_CHECK_TICKS × 200ms = 5s by default).  The decision
+		 * uses two signals:
+		 *
+		 *  Scale UP:   queue depth >= num_workers × UPLOAD_BATCH_SIZE
+		 *              (workers can't drain the queue fast enough) AND
+		 *              no concurrent respawn or scale-up in flight AND
+		 *              below SFTP_PARALLEL_MAX_WORKERS.
+		 *
+		 *  Scale DOWN: queue has been empty for two consecutive checks
+		 *              (workers have more capacity than work) AND
+		 *              num_workers is above the floor (-j N value).
+		 *
+		 * A SCALE_COOLDOWN_TICKS holddown prevents rapid-fire actions.
+		 * Scale-up is always launched in a detached thread so the SSH
+		 * handshake doesn't block the reporter's progress ticks.
+		 * Scale-down is async (EXIT_WORKER sentinel).
+		 */
+		if (++p->scale_tick_counter >= SCALE_CHECK_TICKS) {
+			p->scale_tick_counter = 0;
+
+			uint64_t now_bytes = p->aggregate_bytes_for_meter;
+			double bps = (double)(now_bytes - p->scale_bytes_snapshot)
+			    / (SCALE_CHECK_TICKS * REPORTER_TICK_MS * 0.001);
+			p->scale_bytes_snapshot = now_bytes;
+
+			if (p->scale_cooldown_ticks > 0) {
+				p->scale_cooldown_ticks -= SCALE_CHECK_TICKS;
+				if (p->scale_cooldown_ticks < 0)
+					p->scale_cooldown_ticks = 0;
+			} else if (!p->abort_flag && !p->stopped) {
+				pthread_mutex_lock(&p->workers_mu);
+				int nw         = p->num_workers;
+				int pending_up = p->pending_scaleups;
+				int pending_rs = p->pending_respawns;
+				pthread_mutex_unlock(&p->workers_mu);
+
+				size_t qdepth = sftp_workqueue_depth(p->q);
+
+				/*
+				 * Ceiling reset: if bps has improved by at
+				 * least SCALE_CEIL_RESET_GAIN relative to the
+				 * reference captured when the ceiling was last
+				 * lowered, the workload or network conditions
+				 * have changed enough to warrant trying more
+				 * workers again.
+				 */
+				if (p->scale_ceiling < SFTP_PARALLEL_MAX_WORKERS &&
+				    p->scale_bps_at_ceiling > 0.0 &&
+				    bps > p->scale_bps_at_ceiling *
+				        SCALE_CEIL_RESET_GAIN) {
+					logit_f("scale ceiling raised to %d: "
+					    "%.1f → %.1f MiB/s (≥%.0f%% "
+					    "improvement)",
+					    SFTP_PARALLEL_MAX_WORKERS,
+					    p->scale_bps_at_ceiling /
+					        (1024.0 * 1024.0),
+					    bps / (1024.0 * 1024.0),
+					    (SCALE_CEIL_RESET_GAIN - 1.0) *
+					        100.0);
+					p->scale_ceiling =
+					    SFTP_PARALLEL_MAX_WORKERS;
+					p->scale_bps_at_ceiling = 0.0;
+				}
+
+				if (qdepth >= (size_t)(nw * UPLOAD_BATCH_SIZE) &&
+				    pending_up == 0 && pending_rs == 0 &&
+				    nw < p->scale_ceiling &&
+				    /*
+				     * Saturation guard: only allow another
+				     * scale-up if the last one improved
+				     * throughput by at least SCALE_UP_MIN_GAIN.
+				     * Skipped on the first scale-up
+				     * (scale_bps_at_last_up == 0) because there
+				     * is no prior reference to compare against.
+				     * Together with SCALE_DOWN_SAT_THRESHOLD
+				     * this creates a dead-band that prevents
+				     * oscillation between N and N+1 workers.
+				     */
+				    (p->scale_bps_at_last_up == 0.0 ||
+				     bps >= p->scale_bps_at_last_up *
+				         SCALE_UP_MIN_GAIN)) {
+					/* Scale up. */
+					logit_f("scaling up: %d → %d workers "
+					    "(queue=%zu, %.1f MiB/s)",
+					    nw, nw + 1, qdepth,
+					    bps / (1024.0 * 1024.0));
+					p->scale_bps_at_last_up = bps;
+					pthread_mutex_lock(&p->workers_mu);
+					p->pending_scaleups++;
+					pthread_mutex_unlock(&p->workers_mu);
+					pthread_t stid;
+					if (pthread_create(&stid, NULL,
+					    scale_up_thread, p) == 0) {
+						(void)pthread_detach(stid);
+					} else {
+						pthread_mutex_lock(&p->workers_mu);
+						p->pending_scaleups--;
+						pthread_mutex_unlock(&p->workers_mu);
+					}
+					p->scale_shallow_streak = 0;
+					p->scale_cooldown_ticks = SCALE_COOLDOWN_TICKS;
+				} else {
+					/*
+					 * Scale-down evaluation.  Two independent
+					 * signals, either can trigger:
+					 *
+					 * Idle signal: at least one worker spent
+					 * >SCALE_DOWN_IDLE_FRAC of its wall time
+					 * blocked waiting for work, AND the queue
+					 * is not saturated.  Indicates genuine
+					 * surplus capacity.
+					 *
+					 * Saturation signal: current throughput is
+					 * <SCALE_DOWN_SAT_THRESHOLD of the
+					 * throughput measured just before the last
+					 * scale-up fired.  The extra worker did not
+					 * improve throughput — network is saturated.
+					 *
+					 * Both require two consecutive checks
+					 * (streak >= 2, i.e. ≥10s of signal) to
+					 * suppress noise from brief mkdir/setstat
+					 * pauses.
+					 */
+					double max_idle_frac = 0.0;
+					uint64_t now_ns = monotonic_ns();
+					pthread_mutex_lock(&p->workers_mu);
+					for (int wi = 0; wi < p->num_workers;
+					    wi++) {
+						struct sftp_worker *ww =
+						    p->workers[wi];
+						pthread_mutex_lock(&ww->mu);
+						/* Include any in-progress
+						 * blocking pop.  pop_start_ns
+						 * is non-zero while the worker
+						 * is blocked; adding the elapsed
+						 * time makes idle fraction
+						 * visible to the reporter even
+						 * when no pop has completed
+						 * since the last check. */
+						uint64_t ps =
+						    __atomic_load_n(
+						    &ww->pop_start_ns,
+						    __ATOMIC_ACQUIRE);
+						uint64_t cur_idle = (ps > 0 &&
+						    now_ns > ps) ?
+						    now_ns - ps : 0;
+						uint64_t eff_idle =
+						    ww->idle_ns + cur_idle;
+						uint64_t tot = eff_idle +
+						    ww->work_ns;
+						double frac = (tot > 0) ?
+						    (double)eff_idle /
+						    (double)tot : 0.0;
+						if (frac > max_idle_frac)
+							max_idle_frac = frac;
+						pthread_mutex_unlock(&ww->mu);
+					}
+					pthread_mutex_unlock(&p->workers_mu);
+
+					int idle_signal =
+					    nw > p->cfg.num_streams &&
+					    max_idle_frac > SCALE_DOWN_IDLE_FRAC &&
+					    qdepth < (size_t)(nw *
+					        UPLOAD_BATCH_SIZE);
+
+					int sat_signal =
+					    nw > p->cfg.num_streams &&
+					    p->scale_bps_at_last_up > 0.0 &&
+					    /* Only meaningful when work is in
+					     * flight: bps=0 with an empty queue
+					     * means the transfer completed, not
+					     * that the extra worker failed to
+					     * help.  Without this guard the
+					     * signal fires spuriously the moment
+					     * the last batch drains. */
+					    qdepth > 0 &&
+					    bps < p->scale_bps_at_last_up *
+					        SCALE_DOWN_SAT_THRESHOLD;
+
+					if (idle_signal || sat_signal) {
+						if (++p->scale_shallow_streak
+						    >= 2) {
+							logit_f("scaling down: "
+							    "%d → %d workers "
+							    "(%s, idle=%.0f%%, "
+							    "queue=%zu, "
+							    "%.1f MiB/s)",
+							    nw, nw - 1,
+							    sat_signal ?
+							    "saturation" :
+							    "idle",
+							    max_idle_frac * 100.0,
+							    qdepth,
+							    bps /
+							    (1024.0 * 1024.0));
+							sftp_parallel_remove_worker(p);
+							p->scale_shallow_streak = 0;
+							p->scale_cooldown_ticks =
+							    SCALE_COOLDOWN_TICKS;
+							/*
+							 * Saturation-triggered
+							 * scale-down: ratchet the
+							 * ceiling down to nw-1 so
+							 * we don't immediately re-
+							 * add a worker that just
+							 * proved unhelpful.  Idle-
+							 * triggered scale-down does
+							 * not set the ceiling —
+							 * light load is transient,
+							 * saturation is structural.
+							 */
+							if (sat_signal) {
+								int new_ceil =
+								    nw - 1;
+								/* Only set the ceiling
+								 * when we have a valid
+								 * bps reference.  If
+								 * bps=0 somehow slips
+								 * through (e.g. a race
+								 * on the last batch),
+								 * skip it: a zero
+								 * reference makes the
+								 * ceiling permanent
+								 * because the reset
+								 * condition requires
+								 * bps > 0 * 1.30. */
+								if (new_ceil <
+								    p->scale_ceiling &&
+								    bps > 0.0) {
+									p->scale_ceiling =
+									    new_ceil;
+									p->scale_bps_at_ceiling =
+									    bps;
+									logit_f(
+									    "scale "
+									    "ceiling "
+									    "set to "
+									    "%d "
+									    "(%.1f "
+									    "MiB/s)",
+									    new_ceil,
+									    bps /
+									    (1024.0 *
+									    1024.0));
+								}
+							}
+							/* Reset bps reference:
+							 * comparison is stale
+							 * after a scale-down. */
+							p->scale_bps_at_last_up =
+							    0.0;
+						}
+					} else {
+						p->scale_shallow_streak = 0;
+					}
+				}
+			}
+			p->scale_bps = bps;
 		}
 	}
 	return NULL;
@@ -1029,6 +1412,9 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 
 	struct sftp_parallel *p = xcalloc(1, sizeof(*p));
 	p->cfg = *cfg;
+	/* scale_ceiling starts at the hard cap; saturation-triggered scale-downs
+	 * ratchet it down, and SCALE_CEIL_RESET_GAIN lifts it back up. */
+	p->scale_ceiling = SFTP_PARALLEL_MAX_WORKERS;
 	pthread_mutex_init(&p->pending_mu, NULL);
 	pthread_cond_init(&p->pending_cv, NULL);
 	pthread_mutex_init(&p->workers_mu, NULL);
