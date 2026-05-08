@@ -130,6 +130,7 @@ struct sftp_conn {
 #define SFTP_EXT_PATH_EXPAND		0x00000080
 #define SFTP_EXT_COPY_DATA		0x00000100
 #define SFTP_EXT_GETUSERSGROUPS_BY_ID	0x00000200
+#define SFTP_EXT_HPN_FS_INFO		0x00000400
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
@@ -647,6 +648,10 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		    "users-groups-by-id@openssh.com") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_GETUSERSGROUPS_BY_ID;
+			known = 1;
+		} else if (strcmp(name, "hpn-fs-info@hpnssh.org") == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			ret->exts |= SFTP_EXT_HPN_FS_INFO;
 			known = 1;
 		}
 		if (known) {
@@ -2405,6 +2410,211 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	free(handle);
 
 	return (r != 0 || status != 0) ? -1 : 0;
+}
+
+int
+sftp_fs_info(struct sftp_conn *conn, const char *path, struct sftp_fs_info *info)
+{
+	struct sshbuf *msg;
+	u_char type;
+	u_int id;
+	char *fs_type = NULL;
+	int r;
+
+	memset(info, 0, sizeof(*info));
+
+	if ((conn->exts & SFTP_EXT_HPN_FS_INFO) == 0)
+		return -1;
+
+	debug2("Sending SSH2_FXP_EXTENDED(hpn-fs-info@hpnssh.org) \"%s\"", path);
+	id = conn->msg_id++;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "hpn-fs-info@hpnssh.org")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, path)) != 0)
+		fatal_fr(r, "compose");
+	send_msg(conn, msg);
+	sshbuf_free(msg);
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	get_msg_extended(conn, msg, 0);
+	if ((r = sshbuf_get_u8(msg, &type)) != 0)
+		fatal_fr(r, "parse type");
+	if (type != SSH2_FXP_EXTENDED_REPLY) {
+		debug_f("expected SSH2_FXP_EXTENDED_REPLY, got %u", type);
+		sshbuf_free(msg);
+		return -1;
+	}
+	if ((r = sshbuf_get_u32(msg, &id)) != 0 ||
+	    (r = sshbuf_get_cstring(msg, &fs_type, NULL)) != 0 ||
+	    (r = sshbuf_get_u64(msg, &info->stripe_size)) != 0 ||
+	    (r = sshbuf_get_u32(msg, &info->stripe_count)) != 0 ||
+	    (r = sshbuf_get_u64(msg, &info->block_size)) != 0) {
+		debug_f("parse reply: %s", ssh_err(r));
+		free(fs_type);
+		sshbuf_free(msg);
+		return -1;
+	}
+	strlcpy(info->fs_type, fs_type, sizeof(info->fs_type));
+	free(fs_type);
+	sshbuf_free(msg);
+	debug3("hpn-fs-info: fs=%s stripe_size=%llu stripe_count=%u block_size=%llu",
+	    info->fs_type, (unsigned long long)info->stripe_size,
+	    info->stripe_count, (unsigned long long)info->block_size);
+	return 0;
+}
+
+/*
+ * Pre-create a remote file at size bytes (O_CREAT|O_TRUNC) so that parallel
+ * range-upload workers can open it with O_WRONLY and write their byte ranges
+ * concurrently without racing on file creation.
+ */
+int
+sftp_precreate(struct sftp_conn *conn, const char *remote_path, off_t size)
+{
+	u_char *handle = NULL;
+	size_t handle_len;
+	Attrib a;
+	int r;
+
+	attrib_clear(&a);
+	a.flags = SSH2_FILEXFER_ATTR_SIZE;
+	a.size  = (uint64_t)size;
+
+	if (send_open(conn, remote_path, "precreate",
+	    SSH2_FXF_WRITE | SSH2_FXF_CREAT | SSH2_FXF_TRUNC,
+	    &a, &handle, &handle_len) != 0)
+		return -1;
+	r = sftp_close(conn, handle, handle_len);
+	free(handle);
+	return r;
+}
+
+int
+sftp_upload_range(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, off_t range_offset, off_t range_length)
+{
+	struct sshbuf *msg;
+	struct request {
+		u_int id;
+		size_t len;
+		uint64_t offset;
+		TAILQ_ENTRY(request) tq;
+	};
+	TAILQ_HEAD(, request) acks;
+	struct request *ack;
+	u_char *handle = NULL, *data = NULL, type;
+	size_t handle_len;
+	u_int id, ackid, startid;
+	uint32_t status = SSH2_FX_OK;
+	off_t offset, bytes_left;
+	int local_fd = -1, ret = -1, r;
+
+	TAILQ_INIT(&acks);
+
+	if ((local_fd = open(local_path, O_RDONLY)) < 0) {
+		error("open local \"%s\": %s", local_path, strerror(errno));
+		return -1;
+	}
+	if (lseek(local_fd, range_offset, SEEK_SET) < 0) {
+		error("lseek \"%s\" to %lld: %s", local_path,
+		    (long long)range_offset, strerror(errno));
+		goto out;
+	}
+	/* Open remote without O_CREAT/O_TRUNC — file was pre-created. */
+	if (send_open(conn, remote_path, "range-dest",
+	    SSH2_FXF_WRITE, NULL, &handle, &handle_len) != 0)
+		goto out;
+
+	data = xmalloc(conn->upload_buflen);
+	id = conn->msg_id;
+	startid = ackid = id + 1;
+	offset = range_offset;
+	bytes_left = range_length;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+
+	for (;;) {
+		int len = 0;
+		size_t outstanding = id - ackid + 1;
+
+		/* Send new requests while there is data and pipeline capacity. */
+		while (bytes_left > 0 && outstanding < conn->num_requests &&
+		    status == SSH2_FX_OK) {
+			size_t want = conn->upload_buflen;
+			if ((off_t)want > bytes_left)
+				want = (size_t)bytes_left;
+			do
+				len = read(local_fd, data, want);
+			while (len == -1 &&
+			    (errno == EINTR || errno == EAGAIN ||
+			     errno == EWOULDBLOCK));
+			if (len <= 0)
+				break;
+
+			ack = xcalloc(1, sizeof(*ack));
+			ack->id     = ++id;
+			ack->len    = (size_t)len;
+			ack->offset = (uint64_t)offset;
+			TAILQ_INSERT_TAIL(&acks, ack, tq);
+
+			sshbuf_reset(msg);
+			if ((r = sshbuf_put_u8(msg, SSH2_FXP_WRITE)) != 0 ||
+			    (r = sshbuf_put_u32(msg, ack->id)) != 0 ||
+			    (r = sshbuf_put_string(msg, handle,
+			    handle_len)) != 0 ||
+			    (r = sshbuf_put_u64(msg, (uint64_t)offset)) != 0 ||
+			    (r = sshbuf_put_string(msg, data, (size_t)len)) != 0)
+				fatal_fr(r, "compose write");
+			send_msg(conn, msg);
+
+			offset    += len;
+			bytes_left -= len;
+			outstanding = id - ackid + 1;
+		}
+
+		/* Drain one ACK per iteration. */
+		if (TAILQ_EMPTY(&acks))
+			break;
+		ack = TAILQ_FIRST(&acks);
+		sshbuf_reset(msg);
+		get_msg_extended(conn, msg, 0);
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &ackid)) != 0)
+			fatal_fr(r, "parse status");
+		if (type != SSH2_FXP_STATUS)
+			fatal_f("expected SSH2_FXP_STATUS(%u), got %u",
+			    SSH2_FXP_STATUS, type);
+		if ((r = sshbuf_get_u32(msg, &status)) != 0)
+			fatal_fr(r, "parse status code");
+		if (status != SSH2_FX_OK) {
+			error("write remote \"%s\" at offset %llu: %s",
+			    remote_path, (unsigned long long)ack->offset,
+			    fx2txt(status));
+		}
+		TAILQ_REMOVE(&acks, ack, tq);
+		free(ack);
+	}
+	sshbuf_free(msg);
+
+	if (sftp_close(conn, handle, handle_len) != 0)
+		status = SSH2_FX_FAILURE;
+
+	ret = (status == SSH2_FX_OK) ? 0 : -1;
+ out:
+	while ((ack = TAILQ_FIRST(&acks)) != NULL) {
+		TAILQ_REMOVE(&acks, ack, tq);
+		free(ack);
+	}
+	close(local_fd);
+	free(handle);
+	free(data);
+	return ret;
 }
 
 /* Internal state for one file in a batch upload. */

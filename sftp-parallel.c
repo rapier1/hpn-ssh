@@ -138,6 +138,7 @@ enum sftp_op {
 	SFTP_OP_DOWNLOAD,
 	SFTP_OP_MKDIR,
 	SFTP_OP_EXIT_WORKER,	/* sentinel for sftp_parallel_remove_worker */
+	SFTP_OP_UPLOAD_RANGE,	/* upload a byte range of a large file */
 };
 
 struct sftp_work_unit {
@@ -147,6 +148,9 @@ struct sftp_work_unit {
 	off_t    size;
 	mode_t   mode;
 	int      attempt;
+	/* Range fields: used only for SFTP_OP_UPLOAD_RANGE. */
+	off_t    range_offset;
+	off_t    range_length;
 };
 
 struct sftp_worker {
@@ -394,6 +398,20 @@ make_unit(enum sftp_op op, const char *src, const char *dst,
 	return u;
 }
 
+static struct sftp_work_unit *
+make_range_unit(const char *src, const char *dst,
+    off_t range_offset, off_t range_length)
+{
+	struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
+	u->op           = SFTP_OP_UPLOAD_RANGE;
+	u->src_path     = xstrdup(src);
+	u->dst_path     = xstrdup(dst);
+	u->size         = range_length;
+	u->range_offset = range_offset;
+	u->range_length = range_length;
+	return u;
+}
+
 static void
 free_unit(struct sftp_work_unit *u)
 {
@@ -460,6 +478,10 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		rc = sftp_upload(w->conn, u->src_path, u->dst_path,
 		    p->cfg.preserve_flag, /*resume=*/0,
 		    p->cfg.fsync_flag, p->cfg.inplace_flag);
+		break;
+	case SFTP_OP_UPLOAD_RANGE:
+		rc = sftp_upload_range(w->conn, u->src_path, u->dst_path,
+		    u->range_offset, u->range_length);
 		break;
 	case SFTP_OP_DOWNLOAD:
 		rc = sftp_download(w->conn, u->src_path, u->dst_path,
@@ -1011,7 +1033,8 @@ reporter_thread(void *arg)
 		 *
 		 *  Scale DOWN: queue has been empty for two consecutive checks
 		 *              (workers have more capacity than work) AND
-		 *              num_workers is above the floor (-j N value).
+		 *              num_workers is above the hard floor (1).
+		 *              -j N is the starting point, not a floor.
 		 *
 		 * A SCALE_COOLDOWN_TICKS holddown prevents rapid-fire actions.
 		 * Scale-up is always launched in a detached thread so the SSH
@@ -1161,13 +1184,13 @@ reporter_thread(void *arg)
 					pthread_mutex_unlock(&p->workers_mu);
 
 					int idle_signal =
-					    nw > p->cfg.num_streams &&
+					    nw > 1 &&
 					    max_idle_frac > SCALE_DOWN_IDLE_FRAC &&
 					    qdepth < (size_t)(nw *
 					        UPLOAD_BATCH_SIZE);
 
 					int sat_signal =
-					    nw > p->cfg.num_streams &&
+					    nw > 1 &&
 					    p->scale_bps_at_last_up > 0.0 &&
 					    /* Only meaningful when work is in
 					     * flight: bps=0 with an empty queue
@@ -1750,6 +1773,126 @@ sftp_parallel_units_failed(struct sftp_parallel *p)
 
 #define PARALLEL_MAX_DIR_DEPTH 64
 
+/*
+ * Pre-create remote file at the correct size, then split the local file
+ * into num_ranges byte ranges and submit one SFTP_OP_UPLOAD_RANGE work unit
+ * per range.  The pre-creation step (open+setstat+close) is synchronous on
+ * conn so all ranges see a fully allocated remote file before any worker
+ * starts writing.
+ *
+ * range_size    — size of each range in bytes (last range may be shorter)
+ * num_ranges    — number of ranges; must be >= 2
+ *
+ * Returns 0 if all ranges were submitted, -1 on pre-creation failure (caller
+ * should fall back to a single whole-file upload unit).
+ */
+static int
+submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *local_path, const char *remote_path,
+    off_t file_size, mode_t mode,
+    off_t range_size, int num_ranges)
+{
+	int i;
+
+	/* Pre-create remote file with O_CREAT|O_TRUNC at the correct size. */
+	if (sftp_precreate(conn, remote_path, file_size) != 0) {
+		error("pre-create \"%s\" failed", remote_path);
+		return -1;
+	}
+
+	debug3("range-split \"%s\": %d ranges of %lld bytes",
+	    remote_path, num_ranges, (long long)range_size);
+
+	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
+	for (i = 0; i < num_ranges; i++) {
+		off_t offset = (off_t)i * range_size;
+		off_t length = (i == num_ranges - 1) ?
+		    (file_size - offset) : range_size;
+
+		if (length <= 0)
+			break;
+		if (submit(p, make_range_unit(local_path, remote_path,
+		    offset, length)) != 0) {
+			error("submit range %d of \"%s\" failed", i, local_path);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* Return the current live worker count under workers_mu. */
+static int
+live_worker_count(struct sftp_parallel *p)
+{
+	int n;
+	pthread_mutex_lock(&p->workers_mu);
+	n = p->num_workers;
+	pthread_mutex_unlock(&p->workers_mu);
+	return n;
+}
+
+/*
+ * Decide whether and how to range-split a large file, then either submit
+ * range units (via submit_upload_ranges) or fall back to a whole-file unit.
+ * Uses conn to query fs-info and pre-create the remote file.
+ * max_ranges tracks the current live worker count so Phase 3a's adaptive
+ * scaler acts as the unified governor for both worker count and split factor.
+ */
+static int
+maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *local_path, const char *remote_path,
+    off_t file_size, mode_t mode)
+{
+	struct sftp_fs_info info;
+	off_t range_size;
+	int num_ranges, max_ranges;
+
+	if (file_size < RANGE_SPLIT_MIN_SIZE || p->cfg.num_streams < 2)
+		goto whole_file;
+
+	max_ranges = live_worker_count(p);
+	if (max_ranges < 2)
+		goto whole_file;
+
+	memset(&info, 0, sizeof(info));
+	sftp_fs_info(conn, remote_path, &info);
+
+	if (info.stripe_size > 0 && info.stripe_count > 0) {
+		/* Stripe-aligned: use stripe_size as the range unit, cap at
+		 * stripe_count (writing to more workers than OSTs wastes locks). */
+		range_size  = (off_t)info.stripe_size;
+		num_ranges  = (int)(file_size / range_size);
+		if (num_ranges < 1)  num_ranges = 1;
+		if (num_ranges > (int)info.stripe_count)
+			num_ranges = (int)info.stripe_count;
+		if (num_ranges > max_ranges)
+			num_ranges = max_ranges;
+	} else {
+		/* No stripe info: divide evenly, aligned to block_size. */
+		uint64_t align = (info.block_size > 0) ? info.block_size : 4096;
+		num_ranges  = max_ranges;
+		range_size  = (file_size + num_ranges - 1) / num_ranges;
+		/* Round up to alignment boundary. */
+		range_size  = ((range_size + (off_t)align - 1) /
+		    (off_t)align) * (off_t)align;
+		/* Recompute actual number of ranges after alignment. */
+		num_ranges  = (int)((file_size + range_size - 1) / range_size);
+		if (num_ranges < 1) num_ranges = 1;
+	}
+
+	if (num_ranges < 2)
+		goto whole_file;
+
+	if (submit_upload_ranges(p, conn, local_path, remote_path,
+	    file_size, mode, range_size, num_ranges) == 0)
+		return 0;
+	/* Pre-creation failed — fall back to whole-file. */
+
+ whole_file:
+	return submit(p, make_unit(SFTP_OP_UPLOAD, local_path, remote_path,
+	    file_size, mode));
+}
+
 static int
 parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *src, const char *dst, int depth)
@@ -1834,7 +1977,7 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			    depth + 1) == -1)
 				ret = -1;
 		} else if (S_ISREG(sb.st_mode)) {
-			if (sftp_parallel_submit_upload(p, new_src, new_dst,
+			if (maybe_submit_upload(p, conn, new_src, new_dst,
 			    sb.st_size, sb.st_mode) != 0) {
 				error("submit \"%s\" -> \"%s\" failed",
 				    new_src, new_dst);

@@ -90,6 +90,14 @@ int sftp_parallel_submit_mkdir(struct sftp_parallel *p,
     const char *remote_path, mode_t mode);
 
 /*
+ * Minimum file size (bytes) at which a single file is split across workers
+ * by byte range.  Below this threshold the file is treated as a whole-file
+ * work unit.  Splitting very small files would add more overhead (extra open
+ * round-trips, pre-creation) than it saves.
+ */
+#define RANGE_SPLIT_MIN_SIZE  (64 * 1024 * 1024)   /* 64 MiB */
+
+/*
  * Recursive walkers (Approach B): traverse the source tree on the control
  * connection (`conn`), creating destination directories synchronously along
  * the way, and submitting regular files to the orchestrator's worker pool.

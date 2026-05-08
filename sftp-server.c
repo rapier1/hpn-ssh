@@ -48,6 +48,7 @@
 
 #include "sftp.h"
 #include "sftp-common.h"
+#include "sftp-server-hpn.h"
 
 char *sftp_realpath(const char *, char *); /* sftp-realpath.c */
 
@@ -116,6 +117,7 @@ static void process_extended_expand(uint32_t id);
 static void process_extended_copy_data(uint32_t id);
 static void process_extended_home_directory(uint32_t id);
 static void process_extended_get_users_groups_by_id(uint32_t id);
+static void process_extended_hpn_fs_info(uint32_t id);
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -166,6 +168,8 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_home_directory, 0 },
 	{ "users-groups-by-id", "users-groups-by-id@openssh.com", 0,
 	    process_extended_get_users_groups_by_id, 0 },
+	{ "hpn-fs-info", HPN_EXT_FS_INFO, 0,
+	    process_extended_hpn_fs_info, 0 },
 	{ NULL, NULL, 0, NULL, 0 }
 };
 
@@ -725,6 +729,7 @@ process_init(void)
 	compose_extension(msg, "copy-data", "1");
 	compose_extension(msg, "home-directory", "1");
 	compose_extension(msg, "users-groups-by-id@openssh.com", "1");
+	compose_extension(msg, HPN_EXT_FS_INFO, "1");
 
 	send_msg(msg);
 	sshbuf_free(msg);
@@ -1766,6 +1771,12 @@ process_extended_get_users_groups_by_id(uint32_t id)
 	sshbuf_free(usernames);
 	sshbuf_free(groupnames);
 	sshbuf_free(msg);
+}
+
+static void
+process_extended_hpn_fs_info(uint32_t id)
+{
+	sftp_server_hpn_dispatch(id, HPN_EXT_FS_INFO, iqueue, oqueue);
 }
 
 static void

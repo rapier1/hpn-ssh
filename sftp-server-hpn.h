@@ -18,6 +18,9 @@
 #ifndef _SFTP_SERVER_HPN_H
 #define _SFTP_SERVER_HPN_H
 
+/* Extension name advertised in SSH_FXP_VERSION and dispatched by sftp-server.c. */
+#define HPN_EXT_FS_INFO "hpn-fs-info@hpnssh.org"
+
 struct sshbuf;
 
 /*

@@ -47,6 +47,19 @@ struct sftp_statvfs {
 	uint64_t f_namemax;
 };
 
+/*
+ * Filesystem information returned by the hpn-fs-info@hpnssh.org extension.
+ * Used by the parallel orchestrator to align byte-range splits to Lustre/GPFS
+ * stripe boundaries.  All fields zero/empty if the server does not support
+ * the extension.
+ */
+struct sftp_fs_info {
+	char     fs_type[32];   /* "lustre", "gpfs", "ext4", "xfs", etc. */
+	uint64_t stripe_size;   /* bytes per stripe; 0 if not applicable */
+	uint32_t stripe_count;  /* number of OSTs/stripes; 0 if not applicable */
+	uint64_t block_size;    /* optimal I/O block size (always present) */
+};
+
 /* Used for limits response on the wire from the server */
 struct sftp_limits {
 	uint64_t packet_length;
@@ -221,6 +234,38 @@ int sftp_get_users_groups_by_id(struct sftp_conn *conn,
     const u_int *uids, u_int nuids,
     const u_int *gids, u_int ngids,
     char ***usernamesp, char ***groupnamesp);
+
+/*
+ * Query the server for filesystem type and stripe geometry of the given path.
+ * Fills *info on success; on error or if the extension is unsupported, *info
+ * is zeroed (all-zeros is a safe "unknown" sentinel for callers).
+ * Returns 0 on success, -1 if the extension is unsupported or the query failed.
+ */
+int sftp_fs_info(struct sftp_conn *, const char *path, struct sftp_fs_info *info);
+
+/*
+ * Pre-create a remote file at exactly `size` bytes (O_CREAT|O_TRUNC + setstat
+ * size) so that parallel range-upload workers can subsequently open it with
+ * O_WRONLY and write their byte ranges concurrently without racing on creation.
+ * Returns 0 on success, -1 on error.
+ */
+int sftp_precreate(struct sftp_conn *, const char *remote_path, off_t size);
+
+/*
+ * Upload a byte range of a local file to the corresponding byte range of a
+ * remote file.  The remote file must already exist at the correct size (i.e.
+ * pre-created by the orchestrator).  Opens the remote file with O_WRONLY only
+ * (no O_CREAT, no O_TRUNC) so concurrent range workers don't clobber each other.
+ *
+ * local_path    — source file on the local filesystem
+ * remote_path   — destination file on the remote server
+ * range_offset  — byte offset in both files where this range starts
+ * range_length  — number of bytes to transfer
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int sftp_upload_range(struct sftp_conn *, const char *local_path,
+    const char *remote_path, off_t range_offset, off_t range_length);
 
 /* Concatenate paths, taking care of slashes. Caller must free result. */
 char *sftp_path_append(const char *, const char *);
