@@ -223,6 +223,7 @@ static void
 send_string_request(struct sftp_conn *conn, u_int id, u_int code, const char *s,
     u_int len)
 {
+	/* this gets our previously allocated message avoiding an alloc */
 	struct sshbuf *msg = conn->msg;
 	int r;
 
@@ -231,7 +232,9 @@ send_string_request(struct sftp_conn *conn, u_int id, u_int code, const char *s,
 	 * do not consume the full STATUS packet — error-message and
 	 * language-tag strings are left unread.  Without this reset, those
 	 * leftover bytes would be prepended to the outgoing request by
-	 * send_msg(), corrupting the message stream.
+	 * send_msg(), corrupting the message stream. You'll see this
+	 * in most functions where we were calling sshbuf_new() to instantiate
+	 * msg.
 	 */
 	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, code)) != 0 ||
@@ -246,6 +249,7 @@ static void
 send_string_attrs_request(struct sftp_conn *conn, u_int id, u_int code,
     const void *s, u_int len, Attrib *a)
 {
+	/* this gets our previously allocated message avoiding an alloc */
 	struct sshbuf *msg = conn->msg;
 	int r;
 
@@ -264,6 +268,7 @@ send_string_attrs_request(struct sftp_conn *conn, u_int id, u_int code,
 static u_int
 get_status(struct sftp_conn *conn, u_int expected_id)
 {
+	/* this gets our previously allocated message avoiding an alloc */
 	struct sshbuf *msg = conn->msg;
 	u_char type;
 	u_int id, status;
@@ -292,6 +297,7 @@ static u_char *
 get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
     const char *errfmt, ...)
 {
+	/* this gets our previously allocated message avoiding an alloc */
 	struct sshbuf *msg = conn->msg;
 	u_int id, status;
 	u_char type;
@@ -449,9 +455,10 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	ret->exts = 0;
 	ret->limit_kbps = 0;
 
+	/* create the buffer and store it in the struct */
 	if ((ret->msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
-	msg = ret->msg;
+	msg = ret->msg; /* just used to cut down rewriting existing code */
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_INIT)) != 0 ||
 	    (r = sshbuf_put_u32(msg, SSH2_FILEXFER_VERSION)) != 0)
 		fatal_fr(r, "parse");
@@ -2937,4 +2944,3 @@ sftp_globpath_is_dir(const char *pathname)
 
 	return l > 0 && pathname[l - 1] == '/';
 }
-
