@@ -12,10 +12,11 @@ HOST=juliet.psc.edu
 PORT=2222
 USER=rapier
 IFACE=enp129s0f0np0
-RTT_MS=25
-LOCAL_FILE=/tmp/phase3-bigtest/40gb.bin
+RTT_MS="${RTT_MS:-100}"
+SIZE_MIB="${SIZE_MIB:-102400}"   # 100 GiB default
+LOCAL_FILE=/tmp/phase3-bigtest/${SIZE_MIB}mib.bin
 REMOTE_DIR=/tmp/phase3-bigtest
-REMOTE_FILE="${REMOTE_DIR}/40gb.bin"
+REMOTE_FILE="${REMOTE_DIR}/${SIZE_MIB}mib.bin"
 SAMPLE_MS=300                    # NIC sampling interval
 
 # Mode: "auto" (with -j 1 = autotuning) or "direct" (no -j = plain sftp)
@@ -40,9 +41,10 @@ echo "=== Phase 3 autotuning test (mode=${MODE}, ${RTT_MS}ms RTT) ==="
 echo "Logs: ${LOG_DIR}"
 
 if [ ! -f "${LOCAL_FILE}" ]; then
-    echo "Creating 40 GiB test file..."
+    echo "Creating ${SIZE_MIB} MiB test file..."
     mkdir -p /tmp/phase3-bigtest
-    dd if=/dev/zero of="${LOCAL_FILE}" bs=1M count=40960 status=progress
+    dd if=/dev/zero of="${LOCAL_FILE}" bs=1M count="${SIZE_MIB}" \
+        status=progress
 fi
 
 echo "Setting up netem ${RTT_MS}ms one-way on ${IFACE}..."

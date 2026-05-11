@@ -73,6 +73,30 @@ extern int showprogress;
  */
 #define UPLOAD_BATCH_SIZE       64
 
+/*
+ * Soft byte cap on the size of a single upload batch.  Once a worker's
+ * batch crosses this many bytes it stops grabbing additional units, even
+ * if UPLOAD_BATCH_SIZE units have not been collected.  This is a SOFT cap
+ * — the first unit is always added to the batch even if its size already
+ * exceeds the cap (so a single huge file is never orphaned), and the cap
+ * is checked AFTER each addition (so the actual batch may end up larger
+ * than the cap by one unit's worth).
+ *
+ * Without this cap, a worker that finds many medium-to-large files in the
+ * queue would grab UPLOAD_BATCH_SIZE of them in one batch.  With four
+ * workers and 200x500 MiB files, all 200 files would be claimed in
+ * batches of 50 within the first second of the transfer; the queue then
+ * sits empty, the scaler has nothing to react to, and end-of-transfer
+ * tail dominates throughput as workers drain different-sized piles.
+ *
+ * 256 MiB is a balance: small enough that workers don't pre-claim large
+ * fractions of the workload, large enough that small-file batches still
+ * amortise per-batch open/close RTT cost.  Many-small workloads (1 MiB
+ * files) hit UPLOAD_BATCH_SIZE first; medium-to-large files hit this
+ * byte cap first.
+ */
+#define UPLOAD_BATCH_BYTE_CAP   ((uint64_t)256 * 1024 * 1024)
+
 /* Watchdog thresholds. STALL: warn if a worker has had work available but
  * completed nothing for this long. DEAD: escalate to abort. Generous values
  * because legitimate single-file transfers can run for minutes. */
@@ -267,6 +291,19 @@ struct sftp_parallel {
 	 * monotonic so the bps calculation in the scaler doesn't underflow.
 	 */
 	uint64_t                    retired_bytes;
+
+	/*
+	 * Cached result of sftp_fs_info() on the destination filesystem.
+	 * Without caching, the walker queries fs-info synchronously on the
+	 * control connection for every large file — at high RTT this stalls
+	 * the walker and prevents queued_bytes from rising fast enough for
+	 * the scale-up trigger to fire while there is still work to do.
+	 * Updated by maybe_submit_upload on the first invocation; read by
+	 * subsequent invocations.  Single-threaded access (the walker is the
+	 * only caller path that uses this).
+	 */
+	int                         fs_info_cached;
+	struct sftp_fs_info         fs_info_cache;
 
 	/* Set by sftp_parallel_abort, read by workers between units. */
 	volatile sig_atomic_t       abort_flag;
@@ -626,9 +663,16 @@ worker_thread(void *arg)
 			struct sftp_work_unit *batch[UPLOAD_BATCH_SIZE];
 			struct sftp_work_unit *leftover = NULL;
 			int bn = 0;
+			/* Soft byte cap: keep adding while batch_bytes is at or
+			 * below the cap.  The first unit is always added even if
+			 * its size alone exceeds the cap (so a single huge file
+			 * is never orphaned).  See UPLOAD_BATCH_BYTE_CAP. */
+			uint64_t batch_bytes = (u0->size > 0) ?
+			    (uint64_t)u0->size : 0;
 
 			batch[bn++] = u0;
-			while (bn < UPLOAD_BATCH_SIZE && !p->abort_flag) {
+			while (bn < UPLOAD_BATCH_SIZE && !p->abort_flag &&
+			    batch_bytes <= UPLOAD_BATCH_BYTE_CAP) {
 				void *nxt = NULL;
 				if (sftp_workqueue_trypop(p->q, &nxt) != 0)
 					break; /* queue empty or shutdown */
@@ -639,6 +683,9 @@ worker_thread(void *arg)
 					    __ATOMIC_RELAXED);
 				if (nu->op == SFTP_OP_UPLOAD) {
 					batch[bn++] = nu;
+					if (nu->size > 0)
+						batch_bytes +=
+						    (uint64_t)nu->size;
 				} else {
 					/* Non-upload: stop collecting, handle after batch. */
 					leftover = nu;
@@ -1951,8 +1998,20 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (max_ranges < 2)
 		goto whole_file;
 
-	memset(&info, 0, sizeof(info));
-	sftp_fs_info(conn, remote_path, &info);
+	/* fs-info costs one RTT on the control connection.  Cache the
+	 * answer per orchestrator: the destination filesystem does not
+	 * change within a transfer, and querying every file at high RTT
+	 * starves the workers (the walker can't keep the queue deep
+	 * enough to drive scale-up).  Single cache slot is enough for the
+	 * common "recursive put into one tree" case. */
+	if (p->fs_info_cached) {
+		info = p->fs_info_cache;
+	} else {
+		memset(&info, 0, sizeof(info));
+		sftp_fs_info(conn, remote_path, &info);
+		p->fs_info_cache = info;
+		p->fs_info_cached = 1;
+	}
 
 	/* Only range-split when the server reports parallel-FS stripe info.
 	 * On regular filesystems concurrent writes to one inode contend; the

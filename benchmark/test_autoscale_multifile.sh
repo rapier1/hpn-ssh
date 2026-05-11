@@ -12,8 +12,8 @@ HOST=juliet.psc.edu
 PORT=2222
 USER=rapier
 IFACE=enp129s0f0np0
-RTT_MS=25
-LOCAL_DIR=/home/rapier/claude-hpn-ssh/benchmark/testdata/large-files
+RTT_MS="${RTT_MS:-25}"
+LOCAL_DIR="${LOCAL_DIR:-/home/rapier/claude-hpn-ssh/benchmark/testdata/large-files}"
 REMOTE_DIR=/tmp/phase3-multifile
 SAMPLE_MS=300
 
@@ -84,11 +84,14 @@ POLL_PID=$!
 TAIL_PID=$!
 
 JFLAG=()
-[ "${MODE}" = "auto" ] && JFLAG=(-j 1)
+if [ "${MODE}" = "auto" ]; then
+    JFLAG=(-j "${STREAMS:-1}")
+fi
 
 echo "Starting hpnsftp ${JFLAG[*]:-(no -j)} ..."
 ${SFTP} "${JFLAG[@]}" -S "${SSH}" -P "${PORT}" \
     -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    -o LogLevel=INFO \
     -b "${BATCH}" "${USER}@${HOST}" \
     > "${LOG_DIR}/hpnsftp.stdout" 2> "${STDERR_LOG}"
 SFTP_RC=$?
