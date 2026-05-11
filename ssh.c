@@ -2283,6 +2283,7 @@ ssh_session2_open(struct ssh *ssh)
 
 	if (options.tcp_rcv_buf_poll > 0 && !options.hpn_disabled) {
 		c->dynamic_window = 1;
+		debug_f("Enabled Dynamic Window Scaling");
 		ssh_packet_enable_hpn_bulk(ssh, options.hpn_memory_limit);
 		channel_set_hpn_memlimit(options.hpn_memory_limit);
 	}

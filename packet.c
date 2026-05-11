@@ -2348,7 +2348,8 @@ ssh_packet_have_data_to_write(struct ssh *ssh)
 }
 
 /* Returns true if there is not too much data to write to the connection. */
-
+/* in a bulk session with higher memory limits allow for the limit to be
+ * more than 128k */
 int
 ssh_packet_not_very_much_data_to_write(struct ssh *ssh)
 {
@@ -2371,6 +2372,7 @@ ssh_packet_not_very_much_data_to_write(struct ssh *ssh)
 	return sshbuf_len(state->output) < limit;
 }
 
+/* used in channels.c */
 size_t
 ssh_packet_bulk_write_limit(struct ssh *ssh)
 {
@@ -2389,6 +2391,8 @@ ssh_packet_bulk_write_limit(struct ssh *ssh)
 	return limit;
 }
 
+/* used in serverloop.c and ssh.c to set bulk data flag and
+ * memory limit */
 void
 ssh_packet_enable_hpn_bulk(struct ssh *ssh, int level)
 {
