@@ -49,6 +49,7 @@
 #include "sftp.h"
 #include "sftp-common.h"
 
+/* inline all xxhash functions */
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
@@ -119,7 +120,7 @@ static void process_extended_expand(uint32_t id);
 static void process_extended_copy_data(uint32_t id);
 static void process_extended_home_directory(uint32_t id);
 static void process_extended_get_users_groups_by_id(uint32_t id);
-static void process_extended_hpn_check_file(uint32_t id);
+static void process_extended_hpn_check_file(uint32_t id); /* supports verified resume */
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -1799,6 +1800,7 @@ process_extended_hpn_check_file(uint32_t id)
 	logit("hpn-check-file \"%s\" length %llu", path,
 	    (unsigned long long)length);
 
+	/* open file */
 	if ((fd = open(path, O_RDONLY|O_NOFOLLOW)) == -1) {
 		send_status(id, errno_to_portable(errno));
 		goto out;
@@ -1813,10 +1815,12 @@ process_extended_hpn_check_file(uint32_t id)
 	if (length > (uint64_t)st.st_size)
 		length = (uint64_t)st.st_size;
 
+	/* create the xxhash */
 	if ((state = XXH3_createState()) == NULL) {
 		send_status(id, SSH2_FX_FAILURE);
 		goto out;
 	}
+	/* again, not sure we need this but it's in the example */
 	if (XXH3_64bits_reset(state) == XXH_ERROR) {
 		error_f("XXH3_64bits_reset failed");
 		send_status(id, SSH2_FX_FAILURE);
@@ -1824,12 +1828,17 @@ process_extended_hpn_check_file(uint32_t id)
 	}
 
 	remaining = length;
+	/* same process as on the client side. Work through the
+	 * file in buf size chunks updating the hash as we do it */
 	while (remaining > 0) {
+		/* if remaining is less than size of buf only get what's left */
 		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
 
 		nread = read(fd, buf, toread);
 		if (nread == 0)
-			break; /* EOF before length bytes — hash what we have */
+			break; /* EOF before length bytes — hash what we have
+				* this is a legit condition and likely will result
+				* in a hash match failure */
 		if (nread < 0) {
 			send_status(id, errno_to_portable(errno));
 			goto out;
@@ -1841,18 +1850,20 @@ process_extended_hpn_check_file(uint32_t id)
 		}
 		remaining -= (uint64_t)nread;
 	}
+	/* get the digest */
 	hash = XXH3_64bits_digest(state);
-	debug3("hpn-check-file: computed hash %016llx for \"%s\" "
+	debug3_f("hpn-check-file: computed hash %016llx for \"%s\" "
 	    "length %llu", (unsigned long long)hash, path,
 	    (unsigned long long)length);
 
+	/* create the message, add the hash, and send it */
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_u64(msg, (uint64_t)hash)) != 0)
 		fatal_fr(r, "compose");
-	debug3("hpn-check-file: sending EXTENDED_REPLY id=%u hash=%016llx",
+	debug3_f("hpn-check-file: sending EXTENDED_REPLY id=%u hash=%016llx",
 	    id, (unsigned long long)hash);
 	send_msg(msg);
 	sshbuf_free(msg);

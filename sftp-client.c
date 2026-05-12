@@ -53,7 +53,8 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 
-#define XXH_INLINE_ALL
+/* include xxhash menthods */
+#define XXH_INLINE_ALL /* this inlines the methods used in the include */
 #include "xxhash.h"
 
 extern volatile sig_atomic_t interrupted;
@@ -97,7 +98,7 @@ struct sftp_conn {
 #define SFTP_EXT_PATH_EXPAND		0x00000080
 #define SFTP_EXT_COPY_DATA		0x00000100
 #define SFTP_EXT_GETUSERSGROUPS_BY_ID	0x00000200
-#define SFTP_EXT_HPN_CHECK_FILE		0x00000400
+#define SFTP_EXT_HPN_CHECK_FILE		0x00000400 /* used to send hash values */
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
@@ -116,7 +117,8 @@ static u_char *
 get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
     const char *errfmt, ...) __attribute__((format(printf, 4, 5)));
 
-/* Forward declarations for hash helpers used by sftp_download (verified resume) */
+/* Forward declarations for hash helpers used by
+ * sftp_download (verified resume) */
 static int sftp_xxhash_local_fd(int, uint64_t, uint64_t *);
 static int sftp_hash_remote_file(struct sftp_conn *, const char *,
     uint64_t, uint64_t *);
@@ -1685,6 +1687,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				goto resume_fail;
 			}
 			if (st.st_size > 0) {
+				/* remote does not support verified resume. Right now we
+				 * are starting over. We could just use a verified resume
+				 * but the user specifically requested verification. So we
+				 * start over */
 				if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0) {
 					error("verified resume of \"%s\": remote "
 					    "server does not support "
@@ -1698,6 +1704,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					}
 					/* offset stays 0; plain fresh download */
 				} else {
+					/* get the hash data */
 					uint64_t local_hash, remote_hash;
 					int lret, rret;
 
@@ -1742,12 +1749,15 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		}
 		goto resume_done;
  resume_fail:
+		/* needed to rework failure block */
 		sftp_close(conn, handle, handle_len);
 		free(handle);
 		if (local_fd != -1)
 			close(local_fd);
 		return skip_ret;
  resume_done:
+		/* needed to rework this as well so we could skip over
+		 * resumes that are not verified */
 		;
 	}
 
@@ -2046,6 +2056,7 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			    fsync_flag, follow_link_flag, inplace_flag) == -1)
 				ret = -1;
 		} else if (S_ISREG(a->perm)) {
+			/* figure out what is happening with the resume download */
 			int dr = sftp_download(conn, new_src, new_dst, a,
 			    preserve_flag, resume_flag, fsync_flag,
 			    inplace_flag, 0);
@@ -2138,13 +2149,17 @@ sftp_xxhash_local_fd(int fd, uint64_t length, uint64_t *hash_out)
 		error_f("XXH3_createState failed");
 		return -1;
 	}
+	/* not sure this is necessary but it's in the
+	 * example in the xxhash docs */
 	if (XXH3_64bits_reset(state) == XXH_ERROR) {
 		error_f("XXH3_64bits_reset failed");
 		XXH3_freeState(state);
 		return -1;
 	}
 
+	/* loop through the file updating the hash on each read */
 	while (remaining > 0) {
+		/* read remaining if less than buf */
 		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
 
 		nread = read(fd, buf, toread);
@@ -2164,11 +2179,13 @@ sftp_xxhash_local_fd(int fd, uint64_t length, uint64_t *hash_out)
 		}
 		remaining -= (uint64_t)nread;
 	}
+	/* convert to a digest - that's what we use */
 	hash = XXH3_64bits_digest(state);
 	XXH3_freeState(state);
 	*hash_out = (uint64_t)hash;
 	debug3_f("local hash of first %llu bytes: %016llx",
 	    (unsigned long long)length, (unsigned long long)*hash_out);
+	/* important - reset the pointer */
 	if (lseek(fd, pos_before, SEEK_SET) == -1)
 		error_f("lseek restore failed: %s", strerror(errno));
 	return 0;
@@ -2198,6 +2215,7 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 	debug3_f("sending hpn-check-file for \"%s\" length=%llu id=%u",
 	    path, (unsigned long long)length, id);
 	sshbuf_reset(msg);
+	/* create the message requesting the hash */
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, "hpn-check-file@hpnssh.org")) != 0 ||
@@ -2206,14 +2224,17 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 		fatal_fr(r, "compose");
 	send_msg(conn, msg);
 
+	/* wait for the response and get the results */
 	get_msg(conn, msg);
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 	    (r = sshbuf_get_u32(msg, &rid)) != 0)
 		fatal_fr(r, "parse");
 	debug3_f("got response type=%u rid=%u (expected id=%u)", type, rid, id);
+	/* go the wrong message response */
 	if (rid != id)
 		fatal("ID mismatch (%u != %u)", rid, id);
 
+	/* make sure we get thre right type of response */
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
 		char *errmsg = NULL;
@@ -2233,6 +2254,7 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 		    SSH2_FXP_EXTENDED_REPLY, type);
 	}
 
+	/* finally get the hash and put it in hash_out */
 	if ((r = sshbuf_get_u64(msg, hash_out)) != 0)
 		fatal_fr(r, "parse hash");
 	debug3_f("remote hash of \"%s\" first %llu bytes: %016llx",
@@ -2325,6 +2347,8 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				return 2; /* target larger than source */
 			}
 			{
+				/* Use a code block to reduce scope.
+				 * Not sure if this is entirely necessary */
 				uint64_t local_hash, remote_hash;
 				int lret, rret;
 
@@ -2362,7 +2386,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	    resume, effective_inplace);
 
 	/*
-	 * Plain size-only resume (or verify already set resume=1 above).
+	 * Plain size-only resume or verify already set resume=1 above.
 	 * When verify set resume=1 the stat and size check were already done;
 	 * skip them with the !verify guard.
 	 */
@@ -2392,7 +2416,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	/*
 	 * If not resuming (fresh upload or verify-restart after hash mismatch),
 	 * ensure local_fd is at offset 0.  sftp_xxhash_local_fd() may have
-	 * left it positioned partway through the file.
+	 * left it positioned partway through the file. That shouldn't happen.
 	 */
 	if (!resume && lseek(local_fd, 0, SEEK_SET) == -1) {
 		error("lseek local \"%s\": %s", local_path, strerror(errno));
@@ -2658,6 +2682,7 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			    inplace_flag) == -1)
 				ret = -1;
 		} else if (S_ISREG(sb.st_mode)) {
+			/* determine what we are doing here with the upload */
 			int ur = sftp_upload(conn, new_src, new_dst,
 			    preserve_flag, resume, verify, fsync_flag,
 			    inplace_flag);
@@ -3333,4 +3358,3 @@ sftp_globpath_is_dir(const char *pathname)
 
 	return l > 0 && pathname[l - 1] == '/';
 }
-
