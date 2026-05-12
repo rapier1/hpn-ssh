@@ -729,14 +729,16 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0, verify);
 			if (dr == -1)
 				err = -1;
-			else if (dr == 1)
+			else if (dr == 1) {
 				if (!quiet)
 					mprintf("File skipped: %s: Identical.\n",
 					    g.gl_pathv[i]);
-			else if (dr == 2)
+			}
+			else if (dr == 2) {
 				if (!quiet)
 					mprintf("File skipped: %s: Target is larger"
 				            " than source.\n", g.gl_pathv[i]);
+			}
 		}
 		free(abs_dst);
 		abs_dst = NULL;
@@ -841,12 +843,16 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0);
 			if (ur == -1)
 				err = -1;
-			else if (ur == 1)
-				mprintf("File skipped: %s: Identical.\n",
-				    g.gl_pathv[i]);
-			else if (ur == 2)
-				mprintf("File skipped: %s: Target is larger"
-				    " than source.\n", g.gl_pathv[i]);
+			else if (ur == 1) {
+				if (!quiet)
+					mprintf("File skipped: %s: Identical.\n",
+				            g.gl_pathv[i]);
+			}
+			else if (ur == 2) {
+				if (!quiet)
+					mprintf("File skipped: %s: Target is larger"
+				            " than source.\n", g.gl_pathv[i]);
+			}
 		}
 	}
 

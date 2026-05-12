@@ -1488,9 +1488,9 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 			error("failed to upload file %s to %s", src, targ);
 			errs = 1;
 		} else if (ur == 1) {
-			fmprintf(stderr, "File skipped: %s: Identical.\n", src);
+			mprintf(stderr, "File skipped: %s: Identical.\n", src);
 		} else if (ur == 2) {
-			fmprintf(stderr, "File skipped: %s: Target is larger than source.\n", src);
+			mprintf(stderr, "File skipped: %s: Target is larger than source.\n", src);
 		}
 	}
 
@@ -1898,10 +1898,10 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 			if (dr == -1)
 				err = -1;
 			else if (dr == 1)
-				fmprintf(stderr, "File skipped: %s: Identical.\n",
+				mprintf(stderr, "File skipped: %s: Identical.\n",
 				    g.gl_pathv[i]);
 			else if (dr == 2)
-				fmprintf(stderr, "File skipped: %s: Target is larger"
+				mprintf(stderr, "File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
 		}
 		free(abs_dst);
