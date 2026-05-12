@@ -17,7 +17,7 @@
 /*
  * Copyright (c) 1999 Theo de Raadt.  All rights reserved.
  * Copyright (c) 1999 Aaron Campbell.  All rights reserved.
- * Copyright (c) 2021 Chris Rapier. All rights reserved.
+ * Copyright (c) 2026 Chris Rapier. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -114,6 +114,10 @@
 #include "misc.h"
 #include "progressmeter.h"
 #include "utf8.h"
+/* we were using blake2b512 but xxhash is a *lot* faster and what
+ * rsync uses. This does break backward compatibility but I don't thin
+ * that will be a major issue and building in a fallback would have been
+ * overly complex for not much gain. */
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #include "sftp.h"
@@ -184,7 +188,8 @@ char hostname[HOST_NAME_MAX + 1];
 
 /* defines for the resume function. Need them even if not supported */
 #define HASH_LEN 16                /* XXH3_64bits: 8 bytes → 16 hex chars */
-#define BUF_AND_HASH (HASH_LEN + 64) /* length of the hash and other data to get size of buffer */
+#define BUF_AND_HASH (HASH_LEN + 64) /* length of the hash and other data
+				      * to get size of buffer */
 #define HASH_BUFLEN 8192	   /* 8192 seems to be a good balance between freads
 				    * and the digest func*/
 static void
@@ -462,9 +467,7 @@ void source(int, char *[]);
 void tolocal(int, char *[], enum scp_mode_e, char *sftp_direct);
 void toremote(int, char *[], enum scp_mode_e, char *sftp_direct);
 void usage(void);
-void calculate_hash(char *, char *, off_t); /* get the XXH3_64bits hash of file to length */
-void rand_str(char *, size_t); /*gen randome char string */
-
+void calculate_hash(char *, char *, off_t); /* get the xxhash of file to length offset */
 void source_sftp(int, char *, char *, struct sftp_conn *);
 void sink_sftp(int, char *, const char *, struct sftp_conn *);
 void throughlocal_sftp(struct sftp_conn *, struct sftp_conn *,
@@ -1364,6 +1367,7 @@ void calculate_hash(char *filename, char *output, off_t length)
 		return;
 	}
 
+	/* init the xxhash */
 	state = XXH3_createState();
 	if (state == NULL) {
 		fclose(file_ptr);
@@ -1372,6 +1376,7 @@ void calculate_hash(char *filename, char *output, off_t length)
 	XXH3_64bits_reset(state);
 
 	while (length > 0) {
+		/* how much to read at once. don't go past end of file */
 		size_t toread = (length > HASH_BUFLEN) ?
 		    HASH_BUFLEN : (size_t)length;
 
@@ -1382,9 +1387,11 @@ void calculate_hash(char *filename, char *output, off_t length)
 				    filename, strerror(errno));
 			break;
 		}
+		/* update the hash in state */
 		XXH3_64bits_update(state, buf, bytes);
 		length -= (off_t)bytes;
 	}
+	/* convert to digest */
 	hash = XXH3_64bits_digest(state);
 	XXH3_freeState(state);
 	fclose(file_ptr);
@@ -1474,15 +1481,16 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 			errs = 1;
 		}
 	} else {
+		/* sftp now support verified resume so we can use that here */
 		int ur = sftp_upload(conn, src, abs_dst, pflag, 0,
 		    resume_flag, 0, 1);
 		if (ur == -1) {
 			error("failed to upload file %s to %s", src, targ);
 			errs = 1;
 		} else if (ur == 1) {
-			mprintf("File skipped: %s: Identical.\n", src);
+			fmprintf(stderr, "File skipped: %s: Identical.\n", src);
 		} else if (ur == 2) {
-			mprintf("File skipped: %s: Target is larger than source.\n", src);
+			fmprintf(stderr, "File skipped: %s: Target is larger than source.\n", src);
 		}
 	}
 
@@ -1884,15 +1892,16 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 			    NULL, pflag, SFTP_PROGRESS_ONLY, 0, 0, 1, 1) == -1)
 				err = -1;
 		} else {
+			/* sftp now supports resume so we can use that */
 			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
 			    NULL, pflag, 0, 0, 1, 0);
 			if (dr == -1)
 				err = -1;
 			else if (dr == 1)
-				mprintf("File skipped: %s: Identical.\n",
+				fmprintf(stderr, "File skipped: %s: Identical.\n",
 				    g.gl_pathv[i]);
 			else if (dr == 2)
-				mprintf("File skipped: %s: Target is larger"
+				fmprintf(stderr, "File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
 		}
 		free(abs_dst);
@@ -1927,7 +1936,8 @@ sink(int argc, char **argv, const char *src)
 	int amt, exists, first, ofd;
 	mode_t mode, omode, mask;
 	off_t size, statbytes, xfer_size;
-	off_t resume_offset = 0; /* byte offset to seek to for direct resume; 0 = fresh write */
+	off_t resume_offset = 0; /* byte offset to seek to for direct resume;
+				  * 0 = fresh write */
 	unsigned long long ull;
 	int setimes, targisdir, wrerr;
 	char ch, *cp, *np, *targ, *why, *vect[1], buf[16384], visbuf[16384];
@@ -2351,7 +2361,7 @@ sink(int argc, char **argv, const char *src)
 				fprintf(stderr, "%s: match status is M, resuming at offset %lld\n",
 					hostname, (long long)resume_offset);
 #endif
-	
+
 			}
 		}
 
@@ -2772,17 +2782,6 @@ lostconn(int signo)
 		_exit(1);
 	else
 		exit(1);
-}
-
-void rand_str(char *dest, size_t length) {
-	char charset[] = "0123456789"
-		"abcdefghijklmnopqrstuvwxyz"
-		"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-
-	while (length-- > 0) {
-		*dest++ = charset[arc4random_uniform(sizeof(charset) - 1)];
-	}
-	*dest = '\0';
 }
 
 void
