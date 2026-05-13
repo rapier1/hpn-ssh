@@ -2201,7 +2201,7 @@ static int
 sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
     uint64_t length, uint64_t *hash_out)
 {
-	struct sshbuf *msg = conn->msg;
+	struct sshbuf *msg;
 	u_int id, rid;
 	u_char type;
 	int r;
@@ -2211,10 +2211,13 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 		return -1;
 	}
 
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	
 	id = conn->msg_id++;
 	debug3_f("sending hpn-check-file for \"%s\" length=%llu id=%u",
 	    path, (unsigned long long)length, id);
-	sshbuf_reset(msg);
+
 	/* create the message requesting the hash */
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
