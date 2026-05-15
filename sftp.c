@@ -71,6 +71,14 @@ static int parallel_num_streams = 1;
  * default behaviour matches upstream sftp.  -j N opts into the adaptive
  * scaler, which treats N as the starting point. */
 static int parallel_user_opt_in = 0;
+/*
+ * Adaptive worker scaling: off by default.  Set to 1 by
+ * "-o AdaptiveScaling=yes".  When off, the worker pool stays fixed at
+ * parallel_num_streams for the lifetime of the transfer.  Default is off
+ * because the current scale-down path has shown pathological behaviour at
+ * high RTT.
+ */
+static int parallel_adaptive_scaling = 0;
 
 /* Are we in batchfile mode? */
 int batchmode = 0;
@@ -2585,6 +2593,32 @@ main(int argc, char **argv)
 			parallel_identity = optarg;
 			break;
 		case 'o':
+			/*
+			 * Intercept hpnsftp-local -o keys before forwarding the
+			 * rest to the worker SSH connections.  Case-insensitive
+			 * match on the key, value parsed as a boolean.
+			 */
+			if (strncasecmp(optarg, "AdaptiveScaling=",
+			    sizeof("AdaptiveScaling=") - 1) == 0) {
+				const char *val = optarg +
+				    sizeof("AdaptiveScaling=") - 1;
+				if (strcasecmp(val, "yes") == 0 ||
+				    strcasecmp(val, "true") == 0 ||
+				    strcasecmp(val, "on") == 0 ||
+				    strcmp(val, "1") == 0) {
+					parallel_adaptive_scaling = 1;
+				} else if (strcasecmp(val, "no") == 0 ||
+				    strcasecmp(val, "false") == 0 ||
+				    strcasecmp(val, "off") == 0 ||
+				    strcmp(val, "0") == 0) {
+					parallel_adaptive_scaling = 0;
+				} else {
+					fatal("Invalid value for "
+					    "AdaptiveScaling: \"%s\" "
+					    "(use yes/no)", val);
+				}
+				break;
+			}
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
 			if (parallel_extra_o_count + 2 > parallel_extra_o_cap) {
@@ -2836,6 +2870,11 @@ main(int argc, char **argv)
 		pcfg.preserve_flag    = global_pflag;
 		pcfg.fsync_flag       = global_fflag;
 		pcfg.print_flag       = quiet ? 0 : 1;
+		pcfg.adaptive_scaling = parallel_adaptive_scaling;
+		if (!quiet)
+			logit("Parallel streams: -j %d, adaptive scaling %s",
+			    parallel_num_streams,
+			    parallel_adaptive_scaling ? "on" : "off");
 		parallel_orch = sftp_parallel_start(&pcfg);
 		if (parallel_orch == NULL) {
 			logit("Parallel-streams setup failed; "

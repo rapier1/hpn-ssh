@@ -98,10 +98,14 @@ extern int showprogress;
 #define UPLOAD_BATCH_BYTE_CAP   ((uint64_t)256 * 1024 * 1024)
 
 /* Watchdog thresholds. STALL: warn if a worker has had work available but
- * completed nothing for this long. DEAD: escalate to abort. Generous values
- * because legitimate single-file transfers can run for minutes. */
+ * completed nothing for this long. DEAD: escalate to SIGTERM. Values
+ * tuned for high-RTT shared-filesystem environments where a stuck worker
+ * holds back the whole transfer (its in-flight unit keeps pending > 0).
+ * STALL classification is also escalated to DEAD via the
+ * "queue empty + this worker is the only thing holding pending up"
+ * isolation check in watchdog_check_workers — see there for details. */
 #define STALL_THRESHOLD_SEC     60
-#define DEAD_THRESHOLD_SEC      300
+#define DEAD_THRESHOLD_SEC      120
 
 /*
  * Adaptive scaling cadence.  SCALE_CHECK_TICKS controls how often (in
@@ -527,6 +531,36 @@ worker_record_completion(struct sftp_worker *w, off_t bytes, int success)
 	pthread_mutex_unlock(&w->mu);
 }
 
+/*
+ * Pending-counter trace: enabled when SFTP_PENDING_TRACE=1 in the
+ * environment.  Writes one line per inc/dec to stderr so we can pair
+ * them post-run and find any leaks.  Cheap when disabled.
+ */
+static int pending_trace_enabled = -1;
+static int
+pending_trace_on(void)
+{
+	if (pending_trace_enabled < 0) {
+		const char *e = getenv("SFTP_PENDING_TRACE");
+		pending_trace_enabled = (e && e[0] == '1') ? 1 : 0;
+	}
+	return pending_trace_enabled;
+}
+
+static void
+pending_trace(const char *action, struct sftp_parallel *p,
+    const struct sftp_work_unit *u, int worker_id, const char *site)
+{
+	if (!pending_trace_on())
+		return;
+	const char *src = (u && u->src_path) ? u->src_path : "(null)";
+	const char *dst = (u && u->dst_path) ? u->dst_path : "(null)";
+	int op = u ? u->op : -1;
+	logit_f("PTRACE %s pending=%llu op=%d u=%p w=%d site=%s src=%s dst=%s",
+	    action, (unsigned long long)p->pending, op, (const void *)u,
+	    worker_id, site, src, dst);
+}
+
 static void
 pending_dec(struct sftp_parallel *p)
 {
@@ -536,6 +570,19 @@ pending_dec(struct sftp_parallel *p)
 	if (p->pending == 0)
 		pthread_cond_broadcast(&p->pending_cv);
 	pthread_mutex_unlock(&p->pending_mu);
+}
+
+/* Traced variant: pass the unit and a call-site label so the trace can
+ * pair each dec with the corresponding inc.  Production callers should
+ * use the macro PENDING_DEC defined below, which expands to the traced
+ * variant when pending_trace_on(). */
+static void
+pending_dec_traced(struct sftp_parallel *p, const struct sftp_work_unit *u,
+    int worker_id, const char *site)
+{
+	if (pending_trace_on())
+		pending_trace("DEC", p, u, worker_id, site);
+	pending_dec(p);
 }
 
 static int
@@ -579,28 +626,30 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 
 	if (rc == 0) {
 		worker_record_completion(w, u->size, 1);
+		pending_dec_traced(p, u, w->id, "wpr/success");
 		free_unit(u);
-		pending_dec(p);
 	} else if (++u->attempt < MAX_RETRIES) {
 		/* Re-queue without freeing. Keeps pending counter consistent. */
 		if (u->size > 0)
 			__atomic_fetch_add(&p->queued_bytes,
 			    (uint64_t)u->size, __ATOMIC_RELAXED);
+		if (pending_trace_on())
+			pending_trace("REQUEUE", p, u, w->id, "wpr/retry");
 		if (sftp_workqueue_push(p->q, u) != 0) {
 			if (u->size > 0)
 				__atomic_fetch_sub(&p->queued_bytes,
 				    (uint64_t)u->size, __ATOMIC_RELAXED);
 			worker_record_completion(w, 0, 0);
+			pending_dec_traced(p, u, w->id, "wpr/pushfail");
 			free_unit(u);
-			pending_dec(p);
 		}
 	} else {
 		error_f("worker %d: unit failed after %d attempts: %s",
 		    w->id, u->attempt,
 		    u->src_path ? u->src_path : "(null)");
 		worker_record_completion(w, 0, 0);
+		pending_dec_traced(p, u, w->id, "wpr/maxretries");
 		free_unit(u);
-		pending_dec(p);
 	}
 }
 
@@ -725,8 +774,9 @@ worker_thread(void *arg)
 					if (rc == 0) {
 						worker_record_completion(w,
 						    batch[i]->size, 1);
+						pending_dec_traced(p, batch[i],
+						    w->id, "batch/success");
 						free_unit(batch[i]);
-						pending_dec(p);
 					} else if (++batch[i]->attempt < MAX_RETRIES) {
 						/*
 						 * Re-queue without recording completion:
@@ -739,6 +789,10 @@ worker_thread(void *arg)
 							    &p->queued_bytes,
 							    (uint64_t)batch[i]->size,
 							    __ATOMIC_RELAXED);
+						if (pending_trace_on())
+							pending_trace("REQUEUE",
+							    p, batch[i], w->id,
+							    "batch/retry");
 						if (sftp_workqueue_push(p->q,
 						    batch[i]) != 0) {
 							if (batch[i]->size > 0)
@@ -747,8 +801,10 @@ worker_thread(void *arg)
 								    (uint64_t)batch[i]->size,
 								    __ATOMIC_RELAXED);
 							worker_record_completion(w, 0, 0);
+							pending_dec_traced(p,
+							    batch[i], w->id,
+							    "batch/pushfail");
 							free_unit(batch[i]);
-							pending_dec(p);
 						}
 					} else {
 						error_f("worker %d: batch unit failed "
@@ -757,8 +813,9 @@ worker_thread(void *arg)
 						    batch[i]->src_path ?
 						    batch[i]->src_path : "(null)");
 						worker_record_completion(w, 0, 0);
+						pending_dec_traced(p, batch[i],
+						    w->id, "batch/maxretries");
 						free_unit(batch[i]);
-						pending_dec(p);
 					}
 				}
 			}
@@ -892,6 +949,21 @@ watchdog_check_workers(struct sftp_parallel *p)
 				next = WORKER_DEAD;
 			else if (s > STALL_THRESHOLD_SEC)
 				next = WORKER_STALLED;
+		} else if (!queue_has_work && in_flight > 0 &&
+		    since_completion_ns > 0) {
+			/*
+			 * Isolation escalation: queue is empty but this
+			 * worker still has in-flight units (keeping pending
+			 * > 0).  No other worker can take over its work —
+			 * if it doesn't progress, sftp_parallel_wait hangs
+			 * forever.  Apply a tighter threshold here: any
+			 * worker that's been mute for STALL_THRESHOLD_SEC
+			 * while no other work exists is the holdout, kill
+			 * it so the unit gets re-queued and respawned.
+			 */
+			uint64_t s = since_completion_ns / 1000000000ULL;
+			if (s > STALL_THRESHOLD_SEC)
+				next = WORKER_DEAD;
 		}
 
 		if (next != prev) {
@@ -1156,8 +1228,14 @@ reporter_thread(void *arg)
 		 * Scale-up is always launched in a detached thread so the SSH
 		 * handshake doesn't block the reporter's progress ticks.
 		 * Scale-down is async (EXIT_WORKER sentinel).
+		 *
+		 * Skipped entirely when cfg.adaptive_scaling is off (default).
+		 * In that mode the worker pool stays fixed at num_streams for
+		 * the lifetime of the transfer; the reap-and-respawn path
+		 * above still handles fault recovery.
 		 */
-		if (++p->scale_tick_counter >= SCALE_CHECK_TICKS) {
+		if (p->cfg.adaptive_scaling &&
+		    ++p->scale_tick_counter >= SCALE_CHECK_TICKS) {
 			p->scale_tick_counter = 0;
 
 			uint64_t now_bytes = p->aggregate_bytes_for_meter;
@@ -1651,6 +1729,8 @@ submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 	pthread_mutex_lock(&p->pending_mu);
 	p->pending++;
 	pthread_mutex_unlock(&p->pending_mu);
+	if (pending_trace_on())
+		pending_trace("INC", p, u, -1, "submit");
 	if (add_bytes)
 		__atomic_fetch_add(&p->queued_bytes, add_bytes,
 		    __ATOMIC_RELAXED);
@@ -1658,6 +1738,9 @@ submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 		pthread_mutex_lock(&p->pending_mu);
 		if (p->pending > 0) p->pending--;
 		pthread_mutex_unlock(&p->pending_mu);
+		if (pending_trace_on())
+			pending_trace("DEC_PUSHFAIL", p, u, -1,
+			    "submit/pushfail");
 		if (add_bytes)
 			__atomic_fetch_sub(&p->queued_bytes, add_bytes,
 			    __ATOMIC_RELAXED);

@@ -2638,6 +2638,29 @@ struct batch_file {
 	int      failed;
 };
 
+/*
+ * Mark every entry in the batch that has not already been recorded as
+ * failed as failed.  Used by sftp_upload_batch when a collection phase
+ * hits a dead connection or a protocol problem mid-batch: rather than
+ * calling fatal_fr (which terminates the entire process — catastrophic
+ * for parallel workers handling unrelated transfers), we abandon the
+ * batch.  The caller (worker_thread) re-queues each failed entry via
+ * worker_process_result on a fresh connection.
+ */
+static void
+batch_fail_all_remaining(struct batch_file *bs,
+    struct sftp_upload_batch_entry *entries, int n, int *any_fail)
+{
+	int i;
+	for (i = 0; i < n; i++) {
+		if (!bs[i].failed) {
+			bs[i].failed = 1;
+			entries[i].result = -1;
+			*any_fail = 1;
+		}
+	}
+}
+
 int
 sftp_upload_batch(struct sftp_conn *conn,
     struct sftp_upload_batch_entry *entries, int n,
@@ -2800,6 +2823,12 @@ sftp_upload_batch(struct sftp_conn *conn,
 	/*
 	 * Phase 3b: collect STATUS replies for all small-file writes.
 	 * The server responds in request order; one RTT covers all N.
+	 *
+	 * On dead connection or protocol violation here we abandon the
+	 * rest of the batch (mark all unfailed entries failed, skip to
+	 * cleanup).  Calling fatal_fr in this loop would terminate the
+	 * whole process — catastrophic for parallel workers handling
+	 * unrelated transfers — so we degrade gracefully instead.
 	 */
 	{
 		if ((msg = sshbuf_new()) == NULL)
@@ -2810,18 +2839,44 @@ sftp_upload_batch(struct sftp_conn *conn,
 
 			if (bs[i].write_id == 0)
 				continue; /* no write sent for this entry */
-			get_msg(conn, msg);
+			if (get_msg(conn, msg) != 0) {
+				error_f("batch write: connection closed while "
+				    "collecting responses (entry %d/%d)", i, n);
+				batch_fail_all_remaining(bs, entries, n, &any_fail);
+				sshbuf_free(msg);
+				goto cleanup;
+			}
 			if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-			    (r = sshbuf_get_u32(msg, &rid)) != 0)
-				fatal_fr(r, "parse batch write response");
-			if (type != SSH2_FXP_STATUS)
-				fatal("batch write: expected SSH2_FXP_STATUS(%d), "
-				    "got %d", SSH2_FXP_STATUS, type);
-			if ((r = sshbuf_get_u32(msg, &status)) != 0)
-				fatal_fr(r, "parse batch write status");
-			if (rid != bs[i].write_id)
-				fatal("batch write ID mismatch: got %u expected %u",
+			    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+				error_fr(r, "parse batch write response");
+				batch_fail_all_remaining(bs, entries, n, &any_fail);
+				sshbuf_free(msg);
+				goto cleanup;
+			}
+			if (type != SSH2_FXP_STATUS) {
+				error_f("batch write: expected SSH2_FXP_STATUS(%d), "
+				    "got %d — connection may be corrupt",
+				    SSH2_FXP_STATUS, type);
+				sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+				batch_fail_all_remaining(bs, entries, n, &any_fail);
+				sshbuf_free(msg);
+				goto cleanup;
+			}
+			if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+				error_fr(r, "parse batch write status");
+				batch_fail_all_remaining(bs, entries, n, &any_fail);
+				sshbuf_free(msg);
+				goto cleanup;
+			}
+			if (rid != bs[i].write_id) {
+				error_f("batch write ID mismatch: got %u expected "
+				    "%u — possible MITM or server corruption",
 				    rid, bs[i].write_id);
+				sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+				batch_fail_all_remaining(bs, entries, n, &any_fail);
+				sshbuf_free(msg);
+				goto cleanup;
+			}
 			if (conn->hpn->live_counter != NULL) /* HPN */
 				__atomic_fetch_add(conn->hpn->live_counter,
 				    (uint64_t)bs[i].sb.st_size, __ATOMIC_RELAXED);
@@ -2903,6 +2958,10 @@ sftp_upload_batch(struct sftp_conn *conn,
 	/*
 	 * Phase 5: collect close STATUS replies in the same order.
 	 * One RTT covers all N replies.
+	 *
+	 * Same dead-connection / protocol-violation handling as Phase 3b:
+	 * mark all unfailed entries failed and goto cleanup rather than
+	 * calling fatal_fr, which would terminate the whole process.
 	 */
 	debug_f("batch upload phase 5: collecting %d close replies", n);
 	if ((msg = sshbuf_new()) == NULL)
@@ -2913,18 +2972,44 @@ sftp_upload_batch(struct sftp_conn *conn,
 
 		if (bs[i].handle == NULL)
 			continue;
-		get_msg(conn, msg);
+		if (get_msg(conn, msg) != 0) {
+			error_f("batch close: connection closed while "
+			    "collecting responses (entry %d/%d)", i, n);
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &rid)) != 0)
-			fatal_fr(r, "parse batch close response");
-		if (type != SSH2_FXP_STATUS)
-			fatal("batch close: expected SSH2_FXP_STATUS(%d), got %d",
+		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+			error_fr(r, "parse batch close response");
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
+		if (type != SSH2_FXP_STATUS) {
+			error_f("batch close: expected SSH2_FXP_STATUS(%d), "
+			    "got %d — connection may be corrupt",
 			    SSH2_FXP_STATUS, type);
-		if ((r = sshbuf_get_u32(msg, &status)) != 0)
-			fatal_fr(r, "parse batch close status");
-		if (rid != bs[i].close_id)
-			fatal("batch close ID mismatch: got %u expected %u",
+			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
+		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+			error_fr(r, "parse batch close status");
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
+		if (rid != bs[i].close_id) {
+			error_f("batch close ID mismatch: got %u expected %u "
+			    "— possible MITM or server corruption",
 			    rid, bs[i].close_id);
+			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
 		if (status != SSH2_FX_OK) {
 			error("batch close \"%s\": %s",
 			    entries[i].remote_path, fx2txt(status));
@@ -2939,6 +3024,7 @@ sftp_upload_batch(struct sftp_conn *conn,
 	}
 	sshbuf_free(msg);
 
+ cleanup:
 	/* Ensure any remaining local fds or handles are cleaned up. */
 	for (i = 0; i < n; i++) {
 		if (bs[i].local_fd >= 0)
