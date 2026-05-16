@@ -1427,10 +1427,30 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 
 	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &target,
 	    sizeof(target)) != 0) {
-		debug_f("rcvbuf rescue: setsockopt(%u) failed: %s",
+		debug_f("rcvbuf rescue: setsockopt(SO_RCVBUF=%u) failed: %s",
 		    target, strerror(errno));
 		return current_size;
 	}
+
+	/*
+	 * Setting SO_RCVBUF also sets SOCK_RCVBUF_LOCK, which freezes
+	 * tcp_rcv_space_adjust() — so rcv_ssthresh (which the kernel uses
+	 * to clamp the *advertised* window) stays at whatever autotune
+	 * had it at the moment of rescue. Force the window clamp up to
+	 * the new buffer size so subsequent ACKs can actually advertise
+	 * the larger window to the peer. Non-fatal on failure.
+	 */
+#ifdef TCP_WINDOW_CLAMP
+	{
+		int clamp = (int)target;
+		if (setsockopt(sockfd, IPPROTO_TCP, TCP_WINDOW_CLAMP,
+		    &clamp, sizeof(clamp)) != 0) {
+			debug_f("rcvbuf rescue: setsockopt("
+			    "TCP_WINDOW_CLAMP=%d) failed: %s",
+			    clamp, strerror(errno));
+		}
+	}
+#endif
 
 	/* re-read; kernel caps at net.core.rmem_max */
 	nslen = sizeof(new_size);
