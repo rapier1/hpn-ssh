@@ -1373,40 +1373,62 @@ channel_pre_connecting(struct ssh *ssh, Channel *c)
 static u_int32_t
 channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 {
-	static time_t last_rescue = 0;
+	static time_t last_check = 0;
 	struct tcp_info ti;
 	socklen_t tilen = sizeof(ti);
 	u_int32_t target, new_size;
 	socklen_t nslen;
 	time_t now;
 
-	/* cooldown: at most one rescue attempt per second */
+	/* cooldown: probe TCP_INFO at most once per second */
 	now = monotime();
-	if (now - last_rescue < 1)
+	if (now - last_check < 1)
 		return current_size;
+	last_check = now;
 
-	if (getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &ti, &tilen) != 0)
+	if (getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &ti, &tilen) != 0) {
+		debug_f("rcvbuf check: TCP_INFO failed: %s",
+		    strerror(errno));
 		return current_size;
+	}
+
+	/* Diagnostic snapshot every check so we can see why rescue does or
+	 * doesn't fire. tcpi_total_retrans is sender-side, so on the receiver
+	 * it's typically 0 — we don't gate on it. */
+	debug_f("rcvbuf check: cur=%u min_rtt=%uus rtt=%uus retrans=%u "
+	    "rcv_space=%u bytes_recv=%llu",
+	    current_size, ti.tcpi_min_rtt, ti.tcpi_rtt,
+	    ti.tcpi_total_retrans, ti.tcpi_rcv_space,
+	    (unsigned long long)ti.tcpi_bytes_received);
 
 	/* skip LAN paths: rescuing on a sub-ms RTT path is pointless */
-	if (ti.tcpi_min_rtt < 5000)	/* microseconds; 5 ms */
+	if (ti.tcpi_min_rtt < 5000) {	/* microseconds; 5 ms */
+		debug_f("rcvbuf check: skip (LAN: min_rtt=%uus)",
+		    ti.tcpi_min_rtt);
 		return current_size;
+	}
 
-	/* skip loss-free paths: autotune is fine when nothing's getting lost */
-	if (ti.tcpi_total_retrans == 0)
+	/* skip already-comfortable buffers to avoid runaway growth on
+	 * healthy connections */
+	if (current_size >= 16 * 1024 * 1024) {
+		debug_f("rcvbuf check: skip (already large: %u)",
+		    current_size);
 		return current_size;
+	}
 
 	/* target: double, capped at SSHBUF_SIZE_MAX (128 MB) */
 	target = current_size * 2;
 	if (target > SSHBUF_SIZE_MAX)
 		target = SSHBUF_SIZE_MAX;
-	if (target <= current_size)
-		return current_size;	/* already at cap */
+	if (target <= current_size) {
+		debug_f("rcvbuf check: skip (at SSHBUF cap)");
+		return current_size;
+	}
 
 	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &target,
 	    sizeof(target)) != 0) {
-		debug_f("rcvbuf rescue: setsockopt failed: %s",
-		    strerror(errno));
+		debug_f("rcvbuf rescue: setsockopt(%u) failed: %s",
+		    target, strerror(errno));
 		return current_size;
 	}
 
@@ -1417,11 +1439,11 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 		return current_size;
 
 	if (new_size > current_size) {
-		debug_f("rcvbuf rescued: %u -> %u "
-		    "(retrans=%u, min_rtt=%uus)",
-		    current_size, new_size, ti.tcpi_total_retrans,
-		    ti.tcpi_min_rtt);
-		last_rescue = now;
+		debug_f("rcvbuf rescued: %u -> %u (min_rtt=%uus)",
+		    current_size, new_size, ti.tcpi_min_rtt);
+	} else {
+		debug_f("rcvbuf rescue: kernel kept it at %u "
+		    "(likely net.core.rmem_max cap)", new_size);
 	}
 	return new_size;
 }
