@@ -217,6 +217,7 @@ typedef struct {
 
 	/* hpnssh options */
         int     tcp_rcv_buf_poll;       /* poll tcp rcv window in autotuning kernels*/
+        int     tcp_rcv_buf_rescue;     /* forcibly grow SO_RCVBUF when autotune stuck on lossy paths */
 	int	hpn_disabled;		/* disable hpn functionality. false by default */
 	int	none_enabled;		/* Enable NONE cipher switch */
 	int     nonemac_enabled;        /* Enable NONE MAC switch */

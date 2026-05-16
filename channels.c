@@ -49,6 +49,14 @@
 #include <sys/queue.h>
 
 #include <netinet/in.h>
+/* For TCP_INFO + the modern struct tcp_info with tcpi_min_rtt.
+ * Glibc's <netinet/tcp.h> has an older struct; <linux/tcp.h> has the
+ * full kernel definition. Mirror the conditional from metrics.h. */
+#if defined(__linux__) && !defined(__alpine__)
+#include <linux/tcp.h>
+#elif defined(__FreeBSD__) || defined(__NetBSD__)
+#include <netinet/tcp.h>
+#endif
 #include <arpa/inet.h>
 
 #include <errno.h>
@@ -568,6 +576,7 @@ channel_new(struct ssh *ssh, char *ctype, int type, int rfd, int wfd, int efd,
 	c->local_window_max = window;
 	c->local_maxpacket = maxpack;
 	c->dynamic_window = 0;
+	c->rcvbuf_rescue = 0;
 	c->remote_name = xstrdup(remote_name);
 	c->ctl_chan = -1;
 	c->delayed = 1;		/* prevent call to channel_post handler */
@@ -1342,20 +1351,98 @@ channel_pre_connecting(struct ssh *ssh, Channel *c)
 	c->io_want = SSH_CHAN_IO_SOCK_W;
 }
 
+#ifdef TCP_INFO
+/*
+ * Attempt to forcibly grow SO_RCVBUF on a stuck connection.
+ *
+ * Kernel autotune is reactive: it grows the receive buffer in response to
+ * observed demand. On a lossy path, cwnd collapses → very little data is
+ * delivered per RTT → autotune never sees pressure → the receive buffer
+ * stays small → peer's advertised-window-to-us stays small → cwnd recovery
+ * can't make use of any extra capacity. The connection gets stuck in a
+ * pathologically small-window state for the rest of its life.
+ *
+ * This routine breaks that trap by forcibly setting SO_RCVBUF larger when
+ * we see the signature: non-trivial RTT (not a LAN) AND retransmits seen.
+ * Setting SO_RCVBUF sets SOCK_RCVBUF_LOCK in the kernel, which disables
+ * native autotune for this socket — so subsequent calls here act as a
+ * userspace autotune that can grow further if needed.
+ *
+ * Returns the (possibly grown) SO_RCVBUF size.
+ */
+static u_int32_t
+channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
+{
+	static time_t last_rescue = 0;
+	struct tcp_info ti;
+	socklen_t tilen = sizeof(ti);
+	u_int32_t target, new_size;
+	socklen_t nslen;
+	time_t now;
+
+	/* cooldown: at most one rescue attempt per second */
+	now = monotime();
+	if (now - last_rescue < 1)
+		return current_size;
+
+	if (getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &ti, &tilen) != 0)
+		return current_size;
+
+	/* skip LAN paths: rescuing on a sub-ms RTT path is pointless */
+	if (ti.tcpi_min_rtt < 5000)	/* microseconds; 5 ms */
+		return current_size;
+
+	/* skip loss-free paths: autotune is fine when nothing's getting lost */
+	if (ti.tcpi_total_retrans == 0)
+		return current_size;
+
+	/* target: double, capped at SSHBUF_SIZE_MAX (128 MB) */
+	target = current_size * 2;
+	if (target > SSHBUF_SIZE_MAX)
+		target = SSHBUF_SIZE_MAX;
+	if (target <= current_size)
+		return current_size;	/* already at cap */
+
+	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &target,
+	    sizeof(target)) != 0) {
+		debug_f("rcvbuf rescue: setsockopt failed: %s",
+		    strerror(errno));
+		return current_size;
+	}
+
+	/* re-read; kernel caps at net.core.rmem_max */
+	nslen = sizeof(new_size);
+	if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &new_size,
+	    &nslen) != 0)
+		return current_size;
+
+	if (new_size > current_size) {
+		debug_f("rcvbuf rescued: %u -> %u "
+		    "(retrans=%u, min_rtt=%uus)",
+		    current_size, new_size, ti.tcpi_total_retrans,
+		    ti.tcpi_min_rtt);
+		last_rescue = now;
+	}
+	return new_size;
+}
+#endif /* TCP_INFO */
+
 static int
-channel_tcpwinsz(struct ssh *ssh)
+channel_tcpwinsz(struct ssh *ssh, Channel *c)
 {
 	u_int32_t tcpwinsz = 0;
 	socklen_t optsz = sizeof(tcpwinsz);
 	int ret = -1;
-	
+	int sockfd;
+
 	/* if we aren't on a socket return 128KB */
 	if (!ssh_packet_connection_is_on_socket(ssh))
 		return 128 * 1024;
 
+	sockfd = ssh_packet_get_connection_in(ssh);
+
 	/* get the current size of the receive buffer */
-	ret = getsockopt(ssh_packet_get_connection_in(ssh),
-			 SOL_SOCKET, SO_RCVBUF, &tcpwinsz, &optsz);
+	ret = getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &tcpwinsz, &optsz);
 
 	/* error on the socket - this should never happen */
 	/* return OpenSSH's max window size */
@@ -1363,7 +1450,17 @@ channel_tcpwinsz(struct ssh *ssh)
 		debug_f("getsockopt SO_RCVBUF failed: %s", strerror(errno));
 		return (2 * 1024 * 1024);
 	}
-	
+
+#ifdef TCP_INFO
+	/* If this channel has rcvbuf rescue enabled, try to forcibly grow
+	 * SO_RCVBUF when the connection looks stuck on a lossy path. */
+	if (c != NULL && c->rcvbuf_rescue) {
+		u_int32_t rescued = channel_rescue_rcvbuf(sockfd, tcpwinsz);
+		if (rescued > tcpwinsz)
+			tcpwinsz = rescued;
+	}
+#endif
+
 	/* return no more than SSHBUF_SIZE_MAX (currently 128MB) */
 	if (tcpwinsz > SSHBUF_SIZE_MAX)
 		tcpwinsz = SSHBUF_SIZE_MAX;
@@ -2517,7 +2614,7 @@ channel_check_window(struct ssh *ssh, Channel *c)
 	    c->local_window < c->local_window_max/2) &&
 	    c->local_consumed > 0) {
 		int addition = 0;
-		u_int32_t tcpwinsz = channel_tcpwinsz(ssh);
+		u_int32_t tcpwinsz = channel_tcpwinsz(ssh, c);
 		/* adjust max window size if we are in a dynamic environment
 		 * and the tcp receive buffer is larger than the ssh window */
 		if (c->dynamic_window && (tcpwinsz > c->local_window_max)) {

@@ -124,6 +124,7 @@ typedef struct {
 
 	/* hpnssh options */
 	int     tcp_rcv_buf_poll; /* Option to poll recv buf every window transfer */
+	int     tcp_rcv_buf_rescue; /* Forcibly grow SO_RCVBUF when autotune stuck on lossy paths */
 	int     hpn_disabled;     /* Switch to disable HPN buffer management */
 	int     none_switch;    /* Use none cipher */
 	int     none_enabled;   /* Allow none to be used */

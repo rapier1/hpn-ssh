@@ -202,6 +202,7 @@ initialize_server_options(ServerOptions *options)
 	options->authorized_principals_command = NULL;
 	options->authorized_principals_command_user = NULL;
 	options->tcp_rcv_buf_poll = -1;
+	options->tcp_rcv_buf_rescue = -1;
 	options->hpn_disabled = -1;
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
@@ -484,6 +485,8 @@ fill_default_server_options(ServerOptions *options)
 	}
 	if (options->tcp_rcv_buf_poll == -1)
 		options->tcp_rcv_buf_poll = 1;
+	if (options->tcp_rcv_buf_rescue == -1)
+		options->tcp_rcv_buf_rescue = 0; /* opt-in until validated */
 	if (options->disable_multithreaded == -1)
 		options->disable_multithreaded = 0;
 	if (options->hpn_disabled == -1)
@@ -575,7 +578,7 @@ typedef enum {
 	sKerberosGetAFSToken, sPasswordAuthentication,
 	sKbdInteractiveAuthentication, sListenAddress, sAddressFamily,
 	sPrintMotd, sPrintLastLog, sIgnoreRhosts,
-	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sHPNDisabled,
+	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sTcpRcvBufRescue, sHPNDisabled,
 	sDisableMTAES, sUseMPTCP,
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
@@ -753,6 +756,7 @@ static struct {
 	{ "authorizedprincipalsfile", sAuthorizedPrincipalsFile, SSHCFG_ALL },
 	{ "hpndisabled", sHPNDisabled, SSHCFG_ALL },
 	{ "tcprcvbufpoll", sTcpRcvBufPoll, SSHCFG_ALL },
+	{ "tcprcvbufrescue", sTcpRcvBufRescue, SSHCFG_ALL },
 	{ "noneenabled", sNoneEnabled, SSHCFG_ALL },
 	{ "nonemacenabled", sNoneMacEnabled, SSHCFG_ALL },
 	{ "usemptcp", sUseMPTCP, SSHCFG_GLOBAL },
@@ -1594,6 +1598,10 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 
 	case sTcpRcvBufPoll:
 		intptr = &options->tcp_rcv_buf_poll;
+		goto parse_flag;
+
+	case sTcpRcvBufRescue:
+		intptr = &options->tcp_rcv_buf_rescue;
 		goto parse_flag;
 
 	case sHPNDisabled:
@@ -3376,6 +3384,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sExposeAuthInfo, o->expose_userauth_info);
 	dump_cfg_fmtint(sHPNDisabled, o->hpn_disabled);
 	dump_cfg_fmtint(sTcpRcvBufPoll, o->tcp_rcv_buf_poll);
+	dump_cfg_fmtint(sTcpRcvBufRescue, o->tcp_rcv_buf_rescue);
 	dump_cfg_fmtint(sNoneEnabled, o->none_enabled);
 	dump_cfg_fmtint(sNoneMacEnabled, o->nonemac_enabled);
 	dump_cfg_fmtint(sUseMPTCP, o->use_mptcp);

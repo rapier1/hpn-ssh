@@ -608,8 +608,11 @@ server_request_session(struct ssh *ssh)
 	c = channel_new(ssh, "session", SSH_CHANNEL_LARVAL,
 	    -1, -1, -1, /*window size*/0, CHAN_SES_PACKET_DEFAULT,
 	    0, "server-session", 1);
-	if ((options.tcp_rcv_buf_poll) && (!options.hpn_disabled))
+	if ((options.tcp_rcv_buf_poll) && (!options.hpn_disabled)) {
 		c->dynamic_window = 1;
+		if (options.tcp_rcv_buf_rescue > 0)
+			c->rcvbuf_rescue = 1;
+	}
 	if (session_open(the_authctxt, c->self) != 1) {
 		debug("session open failed, free channel %d", c->self);
 		channel_free(ssh, c);
