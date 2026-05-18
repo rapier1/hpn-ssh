@@ -245,9 +245,9 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 	if (atomicio6(read, conn->fd_in, p, 4, sftpio,
 	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL) != 4) {
 		if (errno == EPIPE || errno == ECONNRESET)
-			error("sftp: connection closed");
+			debug("sftp: connection closed");
 		else
-			error("sftp: read: %s", strerror(errno));
+			debug("sftp: read: %s", strerror(errno));
 		conn->hpn->dead = 1; /* HPN */
 		return -1;
 	}
@@ -267,9 +267,9 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL)
 	    != msg_len) {
 		if (errno == EPIPE)
-			error("sftp: connection closed");
+			debug("sftp: connection closed");
 		else
-			error("sftp: read: %s", strerror(errno));
+			debug("sftp: read: %s", strerror(errno));
 		conn->hpn->dead = 1; /* HPN */
 		return -1;
 	}
@@ -828,7 +828,7 @@ sftp_close(struct sftp_conn *conn, const u_char *handle, u_int handle_len)
 
 	status = get_status(conn, id);
 	if (status != SSH2_FX_OK)
-		error("close remote: %s", fx2txt(status));
+		debug("close remote: %s", fx2txt(status));
 
 	sshbuf_free(msg);
 

@@ -489,6 +489,37 @@ sshlogv(const char *file, const char *func, int line, int showfunc,
 }
 
 void
+sshlogv_ts(const char *file, const char *func, int line, int showfunc,
+    LogLevel level, const char *suffix, const char *fmt, va_list args)
+{
+	char ts[20], tsfmt[MSGBUFSIZ + 32];
+	struct timeval tv;
+	struct tm tm;
+
+	gettimeofday(&tv, NULL);
+	if (localtime_r(&tv.tv_sec, &tm) != NULL)
+		snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03d",
+		    tm.tm_hour, tm.tm_min, tm.tm_sec,
+		    (int)(tv.tv_usec / 1000));
+	else
+		strlcpy(ts, "??:??:??.???", sizeof(ts));
+
+	snprintf(tsfmt, sizeof(tsfmt), "[%s] %s", ts, fmt);
+	sshlogv(file, func, line, showfunc, level, suffix, tsfmt, args);
+}
+
+void
+sshlog_ts(const char *file, const char *func, int line, int showfunc,
+    LogLevel level, const char *suffix, const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	sshlogv_ts(file, func, line, showfunc, level, suffix, fmt, args);
+	va_end(args);
+}
+
+void
 sshlogdirect(LogLevel level, int forced, const char *fmt, ...)
 {
 	va_list args;

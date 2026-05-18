@@ -201,6 +201,19 @@ void sftp_parallel_wait(struct sftp_parallel *p);
 void sftp_parallel_abort(struct sftp_parallel *p);
 
 /*
+ * Register an external interrupt flag (typically sftp.c's `interrupted`,
+ * a volatile sig_atomic_t set by the SIGINT handler).  The reporter thread
+ * polls this pointer each tick (~200ms); when non-zero it calls
+ * sftp_parallel_abort(), which wakes sftp_parallel_wait() promptly instead
+ * of waiting for all in-flight units to complete naturally.
+ *
+ * Call once after sftp_parallel_start() returns non-NULL.  Pass NULL to
+ * clear a previously registered flag.
+ */
+void sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
+    volatile sig_atomic_t *flag);
+
+/*
  * Drive a single global progress_meter for the duration of an aggregate
  * batch (e.g. a put/get command's worth of submissions). Call _start
  * before submitting; the orchestrator's reporter thread will update the

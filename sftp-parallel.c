@@ -387,6 +387,13 @@ struct sftp_parallel {
 	/* Set by sftp_parallel_abort, read by workers between units. */
 	volatile sig_atomic_t       abort_flag;
 
+	/* Optional pointer to caller's interrupt flag (e.g. sftp.c's
+	 * `interrupted`).  When non-NULL, the reporter thread calls
+	 * sftp_parallel_abort() as soon as *ext_interrupt_flag becomes
+	 * non-zero, which wakes sftp_parallel_wait() within one reporter
+	 * tick (~200ms) rather than waiting for workers to finish naturally. */
+	volatile sig_atomic_t      *ext_interrupt_flag;
+
 	int                         saved_showprogress;
 	int                         progress_meter_started;
 	uint64_t                    aggregate_bytes_for_meter;
@@ -508,14 +515,15 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 		 * to /tmp/hpnssh-worker-PID.stderr by the dup2() above, so
 		 * it does not pollute the orchestrator's stdout/stderr.
 		 * HPNSSH_WORKER_VERBOSE controls level: 1=-v, 2=-vv, 3=-vvv.
-		 * Default 1 while we are validating the respawn path.
+		 * Default 0 (off); set to 1 or higher to capture worker SSH
+		 * debug output when diagnosing connection or respawn failures.
 		 */
 		{
 			const char *e = getenv("HPNSSH_WORKER_VERBOSE");
-			int lvl = (e && *e) ? atoi(e) : 1;
+			int lvl = (e && *e) ? atoi(e) : 0;
 			if (lvl >= 1) argv[argc++] = "-v";
-			if (lvl >= 2) argv[argc++] = "-v";
-			if (lvl >= 3) argv[argc++] = "-v";
+			if (lvl >= 2) argv[argc++] = "-vv";
+			if (lvl >= 3) argv[argc++] = "-vvv";
 		}
 		if (cfg->port && cfg->port[0]) {
 			argv[argc++] = "-p";
@@ -981,8 +989,12 @@ worker_thread(void *arg)
 		/* Connection died during the transfer — this worker cannot
 		 * continue.  The unit was already re-queued or failed above;
 		 * exit cleanly so the orchestrator can detect us as dead. */
-		if (sftp_conn_is_dead(w->conn))
+		if (sftp_conn_is_dead(w->conn)) {
+			if (!p->abort_flag && !p->stopped)
+				debug_ft("worker %d: connection lost - "
+				    "will attempt to respawn", w->id);
 			break;
+		}
 	}
 	/* Mark exited so the reporter thread can reap us (join + free). */
 	pthread_mutex_lock(&w->mu);
@@ -1038,40 +1050,6 @@ snapshot_workers(struct sftp_parallel *p, uint64_t *bytes_out,
  * noisy or when we want to confirm the rwnd rescue has already fired.
  * For now we rely on local bytes_total deltas only.
  */
-/* Format current wall-clock for embedded log timestamps.  Reused by
- * the diagnostic log lines below; not stored. */
-static const char *
-watchdog_tstamp(char *buf, size_t bufsz)
-{
-	struct timeval tv;
-	struct tm tm;
-	gettimeofday(&tv, NULL);
-	if (localtime_r(&tv.tv_sec, &tm) != NULL) {
-		snprintf(buf, bufsz, "%02d:%02d:%02d.%03d",
-		    tm.tm_hour, tm.tm_min, tm.tm_sec,
-		    (int)(tv.tv_usec / 1000));
-	} else {
-		snprintf(buf, bufsz, "??:??:??.???");
-	}
-	return buf;
-}
-
-/*
- * Timestamp-prefixed log macros for watchdog / respawn / reporter
- * diagnostics.  Wall-clock prefix [HH:MM:SS.mmm] lets us see how long
- * a worker was hung between events (e.g. between "stalled" and "dead",
- * or between "SIGTERM" and "respawn failed").
- */
-#define WD_LOGIT(fmt, ...) do { \
-	char _ts[16]; \
-	logit_f("[%s] " fmt, watchdog_tstamp(_ts, sizeof(_ts)), \
-	    ##__VA_ARGS__); \
-} while (0)
-#define WD_ERROR(fmt, ...) do { \
-	char _ts[16]; \
-	error_f("[%s] " fmt, watchdog_tstamp(_ts, sizeof(_ts)), \
-	    ##__VA_ARGS__); \
-} while (0)
 
 static void
 watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
@@ -1158,7 +1136,7 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 				break;
 			off += n;
 		}
-		WD_LOGIT("tput sample: max_kbps=%llu max_ema=%llu "
+		debug_ft("tput sample: max_kbps=%llu max_ema=%llu "
 		    "path_healthy=%llu%s",
 		    (unsigned long long)max_kbps,
 		    (unsigned long long)max_ema_kbps,
@@ -1209,7 +1187,7 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 
 		if (w->tput_ema_kbps < threshold_kbps) {
 			w->tput_outlier_ticks++;
-			WD_LOGIT("worker %d tput-outlier: "
+			debug_ft("worker %d tput-outlier: "
 			    "kbps=%llu ema=%llu threshold=%llu "
 			    "consec=%d in_flight=%llu",
 			    w->id,
@@ -1347,13 +1325,13 @@ watchdog_check_workers(struct sftp_parallel *p)
 			w->health = next;
 			pthread_mutex_unlock(&w->mu);
 			if (next == WORKER_STALLED) {
-				WD_LOGIT("worker %d stalled: no progress in "
+				debug_ft("worker %d stalled: no progress in "
 				    "%llu sec while queue has work",
 				    w->id,
 				    (unsigned long long)
 				    (since_completion_ns / 1000000000ULL));
 			} else if (next == WORKER_DEAD) {
-				WD_ERROR("worker %d declared dead: "
+				debug_ft("worker %d declared dead: "
 				    "ssh_pid=%ld since_completion=%llus",
 				    w->id, (long)w->ssh_pid,
 				    (unsigned long long)
@@ -1376,7 +1354,7 @@ watchdog_check_workers(struct sftp_parallel *p)
 			if (!already_doomed) {
 				if (w->ssh_pid > 0)
 					(void)kill(w->ssh_pid, SIGTERM);
-				WD_LOGIT("worker %d: sent SIGTERM to ssh "
+				debug_ft("worker %d: sent SIGTERM to ssh "
 				    "child (pid %ld)", w->id,
 				    (long)w->ssh_pid);
 			}
@@ -1395,7 +1373,7 @@ watchdog_check_workers(struct sftp_parallel *p)
 		    now - w->doom_ns >
 		    (uint64_t)SIGKILL_ESCALATION_SEC * 1000000000ULL) {
 			(void)kill(w->ssh_pid, SIGKILL);
-			WD_ERROR("worker %d: escalated to SIGKILL after "
+			debug_ft("worker %d: escalated to SIGKILL after "
 			    "%llus (SSH child unresponsive to SIGTERM, "
 			    "pid %ld)",
 			    w->id,
@@ -1446,12 +1424,12 @@ respawn_worker_thread(void *arg)
 
 	struct sftp_worker *w = spawn_one_worker(p);
 	if (w == NULL) {
-		WD_ERROR("worker respawn failed");
+		error_ft("worker respawn failed");
 	} else {
 		pthread_mutex_lock(&w->mu);
 		w->reconnect_count++;
 		pthread_mutex_unlock(&w->mu);
-		WD_LOGIT("worker %d respawned (reconnect_count=%llu)",
+		debug_ft("worker %d respawned (reconnect_count=%llu)",
 		    w->id, (unsigned long long)w->reconnect_count);
 	}
 	pthread_mutex_lock(&p->workers_mu);
@@ -1468,7 +1446,7 @@ scale_up_thread(void *arg)
 	struct sftp_parallel *p = arg;
 	struct sftp_worker *w = spawn_one_worker(p);
 	if (w == NULL)
-		WD_ERROR("scale-up worker spawn failed");
+		error_ft("scale-up worker spawn failed");
 	pthread_mutex_lock(&p->workers_mu);
 	p->pending_scaleups--;
 	pthread_mutex_unlock(&p->workers_mu);
@@ -1489,6 +1467,12 @@ reporter_thread(void *arg)
 		nanosleep(&sleep_ts, NULL);
 		if (p->stopped)
 			break;
+
+		/* Propagate caller's interrupt signal (e.g. SIGINT / Ctrl+C).
+		 * sftp_parallel_abort is idempotent; calling it every tick while
+		 * the flag stays set is harmless. */
+		if (p->ext_interrupt_flag != NULL && *p->ext_interrupt_flag)
+			sftp_parallel_abort(p);
 
 		uint64_t bytes;
 		snapshot_workers(p, &bytes, NULL, NULL);
@@ -1515,7 +1499,7 @@ reporter_thread(void *arg)
 				    (uint64_t)RESPAWN_STABILITY_SEC * 1000000000ULL;
 				if (now_ns - p->respawn_last_cooldown_ns
 				    > stability_ns) {
-					WD_LOGIT("respawn stability window "
+					debug_ft("respawn stability window "
 					    "expired (%ds clean) — resetting "
 					    "cooldown count from %d to 0",
 					    RESPAWN_STABILITY_SEC,
@@ -1619,7 +1603,7 @@ reporter_thread(void *arg)
 					in_cooldown = 1;
 				} else {
 					/* Cooldown expired — resume respawning. */
-					WD_LOGIT("respawn cooldown ended, "
+					debug_ft("respawn cooldown ended, "
 					    "resuming (epoch reset, owed=%d)",
 					    p->respawn_owed);
 					p->respawn_resume_ns = 0;
@@ -1642,7 +1626,7 @@ reporter_thread(void *arg)
 					    1000000000ULL;
 					p->respawn_epoch_count = 0;
 					in_cooldown = 1;
-					WD_ERROR("respawn epoch ceiling reached "
+					error_ft("respawn epoch ceiling reached "
 					    "(%d/%d) — entering cooldown %d/%d "
 					    "for %ds; healthy workers continue",
 					    p->total_respawns, respawn_ceil,
@@ -1669,7 +1653,7 @@ reporter_thread(void *arg)
 						    now_ns;
 						p->respawn_epoch_count = 0;
 						in_cooldown = 1;
-						WD_ERROR("WARNING: respawn "
+						error_ft("WARNING: respawn "
 						    "cooldowns exhausted but "
 						    "path still healthy "
 						    "(max=%llukbps) — extending "
@@ -1679,7 +1663,7 @@ reporter_thread(void *arg)
 						    (unsigned long long)
 						    p->tput_last_raw_max_kbps);
 					} else {
-						WD_ERROR("respawn cooldowns "
+						error_ft("respawn cooldowns "
 						    "exhausted and path "
 						    "unhealthy (max=%llukbps) "
 						    "— persistent connection "
@@ -1699,7 +1683,7 @@ reporter_thread(void *arg)
 			    ? ((p->respawn_owed < slots) ? p->respawn_owed : slots)
 			    : 0;
 			if (to_spawn > 0) {
-				WD_LOGIT("initiating respawn for %d worker(s) "
+				debug_ft("initiating respawn for %d worker(s) "
 				    "(current=%d target=%d owed=%d "
 				    "epoch=%d/%d cooldowns=%d/%d)",
 				    to_spawn, cur_workers, target,
@@ -1726,7 +1710,7 @@ reporter_thread(void *arg)
 					 * so we retry on the next tick. */
 					p->respawn_owed--;
 				} else {
-					WD_ERROR("respawn thread create failed");
+					error_ft("respawn thread create failed");
 					pthread_mutex_lock(&p->workers_mu);
 					p->pending_respawns--;
 					p->total_respawns--;
@@ -1747,7 +1731,7 @@ reporter_thread(void *arg)
 				int stuck = (p->pending > 0);
 				pthread_mutex_unlock(&p->pending_mu);
 				if (stuck) {
-					WD_ERROR("all workers gone with %llu "
+					error_ft("all workers gone with %llu "
 					    "unit(s) pending -- aborting "
 					    "transfer",
 					    (unsigned long long)p->pending);
@@ -1823,7 +1807,7 @@ reporter_thread(void *arg)
 				    p->scale_bps_at_ceiling > 0.0 &&
 				    bps > p->scale_bps_at_ceiling *
 				        SCALE_CEIL_RESET_GAIN) {
-					WD_LOGIT("scale ceiling raised to %d: "
+					debug_ft("scale ceiling raised to %d: "
 					    "%.1f → %.1f MiB/s (≥%.0f%% "
 					    "improvement)",
 					    SFTP_PARALLEL_MAX_WORKERS,
@@ -1856,7 +1840,7 @@ reporter_thread(void *arg)
 				     bps >= p->scale_bps_at_last_up *
 				         SCALE_UP_MIN_GAIN)) {
 					/* Scale up. */
-					WD_LOGIT("scaling up: %d → %d workers "
+					debug_ft("scaling up: %d → %d workers "
 					    "(queue=%zu, %.1f MiB queued, "
 					    "%.1f MiB/s)",
 					    nw, nw + 1, qdepth,
@@ -1958,7 +1942,7 @@ reporter_thread(void *arg)
 					if (idle_signal || sat_signal) {
 						if (++p->scale_shallow_streak
 						    >= 2) {
-							WD_LOGIT("scaling down: "
+							debug_ft("scaling down: "
 							    "%d → %d workers "
 							    "(%s, idle=%.0f%%, "
 							    "queue=%zu, "
@@ -2009,7 +1993,7 @@ reporter_thread(void *arg)
 									    new_ceil;
 									p->scale_bps_at_ceiling =
 									    bps;
-									WD_LOGIT(
+									debug_ft(
 									    "scale "
 									    "ceiling "
 									    "set to "
@@ -2064,13 +2048,13 @@ spawn_one_worker(struct sftp_parallel *p)
 
 	if (spawn_worker_ssh(&p->cfg,
 	    &w->fd_in, &w->fd_out, &w->ssh_pid) != 0) {
-		WD_ERROR("ssh spawn failed");
+		error_ft("ssh spawn failed");
 		goto fail;
 	}
 	w->conn = sftp_init(w->fd_in, w->fd_out, buflen, nreq,
 	    p->cfg.limit_kbps);
 	if (w->conn == NULL) {
-		WD_ERROR("sftp_init failed");
+		error_ft("sftp_init failed");
 		goto fail;
 	}
 	sftp_set_live_counter(w->conn, &w->live_bytes);
@@ -2094,7 +2078,7 @@ spawn_one_worker(struct sftp_parallel *p)
 	pthread_mutex_unlock(&p->workers_mu);
 
 	if (pthread_create(&w->tid, NULL, worker_thread, w) != 0) {
-		WD_ERROR("pthread_create failed");
+		error_ft("pthread_create failed");
 		/* Roll back insertion. */
 		pthread_mutex_lock(&p->workers_mu);
 		for (int i = 0; i < p->num_workers; i++) {
@@ -2244,7 +2228,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 			sctx[i].succeeded      = 0;
 			if (pthread_create(&stids[i], NULL,
 			    do_parallel_spawn, &sctx[i]) != 0) {
-				WD_ERROR("spawn thread %d failed", i);
+				error_ft("spawn thread %d failed", i);
 				/* Join threads already launched. */
 				for (int j = 0; j < i; j++)
 					pthread_join(stids[j], NULL);
@@ -2256,7 +2240,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		for (int i = 0; i < n; i++) {
 			pthread_join(stids[i], NULL);
 			if (!sctx[i].succeeded) {
-				WD_ERROR("worker %d setup failed", i);
+				error_ft("worker %d setup failed", i);
 				failed = 1;
 			}
 		}
@@ -2366,6 +2350,14 @@ sftp_parallel_abort(struct sftp_parallel *p)
 	pthread_mutex_lock(&p->pending_mu);
 	pthread_cond_broadcast(&p->pending_cv);
 	pthread_mutex_unlock(&p->pending_mu);
+}
+
+void
+sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
+    volatile sig_atomic_t *flag)
+{
+	if (p != NULL)
+		p->ext_interrupt_flag = flag;
 }
 
 void

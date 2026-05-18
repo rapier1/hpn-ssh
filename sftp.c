@@ -2579,23 +2579,6 @@ main(int argc, char **argv)
 	addargs(&args, "-oClearAllForwardings yes");
 	addargs(&args, "-oControlMaster no");
 
-	/*
-	 * HPNSFTP_CONTROL_VERBOSE adds -v flags to the control ssh child
-	 * without bumping sftp's own log verbosity (which `sftp -v` would).
-	 * Mirrors HPNSSH_WORKER_VERBOSE for worker SSH children.
-	 * Levels: 1=-v, 2=-vv, 3=-vvv.  The control's ssh stderr is
-	 * inherited from sftp itself, so the debug output appears inline in
-	 * the same stream as the watchdog log — useful for correlating a
-	 * control-connection death with worker events in time order.
-	 */
-	{
-		const char *e = getenv("HPNSFTP_CONTROL_VERBOSE");
-		int lvl = (e && *e) ? atoi(e) : 0;
-		if (lvl >= 1) addargs(&args, "-v");
-		if (lvl >= 2) addargs(&args, "-v");
-		if (lvl >= 3) addargs(&args, "-v");
-	}
-
 	ll = SYSLOG_LEVEL_INFO;
 	infile = stdin;
 
@@ -2906,28 +2889,28 @@ main(int argc, char **argv)
 		pcfg.adaptive_scaling = parallel_adaptive_scaling;
 
 		/*
-		 * Adaptive throughput-outlier stall detection. Opt-in via
-		 * env vars for first-pass testing; promote to proper
-		 * cmdline flags once tuning settles.
+		 * Adaptive throughput-outlier stall detection.  On by default
+		 * in parallel mode with conservative settings suited to WAN
+		 * bulk transfer.  Override or disable via env vars:
 		 *
-		 *   SFTP_TPUT_HEALTHY_KBPS=N  enables; fastest worker must
-		 *                             clear N KB/s before any outlier
-		 *                             classification fires
+		 *   SFTP_TPUT_HEALTHY_KBPS=N  override minimum path rate (kbps)
+		 *                             that must be seen before outlier
+		 *                             classification fires; set to 0 to
+		 *                             disable the feature entirely
 		 *   SFTP_TPUT_FRACTION=F      worker is outlier if its kbps
 		 *                             is less than F * max_kbps
 		 *                             (default 0.25)
 		 *   SFTP_TPUT_CONSEC=N        consecutive outlier ticks before
 		 *                             STALLED (default 5); DEAD at 2N
+		 *   SFTP_TPUT_EMA_ALPHA=F     EMA smoothing factor (default 0.2)
 		 */
 		{
 			const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
 			const char *e_f = getenv("SFTP_TPUT_FRACTION");
 			const char *e_c = getenv("SFTP_TPUT_CONSEC");
 			const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
-			if (e_h && *e_h) {
-				pcfg.tput_path_healthy_kbps =
-				    strtoull(e_h, NULL, 10);
-			}
+			pcfg.tput_path_healthy_kbps =
+			    (e_h && *e_h) ? strtoull(e_h, NULL, 10) : 2000;
 			pcfg.tput_outlier_fraction =
 			    (e_f && *e_f) ? strtod(e_f, NULL) : 0.25;
 			pcfg.tput_consec_required =
@@ -2941,15 +2924,11 @@ main(int argc, char **argv)
 			    parallel_num_streams,
 			    parallel_adaptive_scaling ? "on" : "off");
 		}
-		/* Always print when tput-outlier is enabled, even in batch
-		 * mode — this is the only way to confirm env vars were
-		 * picked up. Goes to stderr directly. */
 		if (pcfg.tput_path_healthy_kbps > 0) {
 			double eff_alpha = pcfg.tput_ema_alpha > 0.0
 			    ? pcfg.tput_ema_alpha : 0.2;
-			fprintf(stderr,
-			    "tput-outlier detection: healthy_kbps=%llu "
-			    "frac=%.2f consec=%d ema_alpha=%.2f\n",
+			debug_f("tput-outlier detection: healthy_kbps=%llu "
+			    "frac=%.2f consec=%d ema_alpha=%.2f",
 			    (unsigned long long)pcfg.tput_path_healthy_kbps,
 			    pcfg.tput_outlier_fraction,
 			    pcfg.tput_consec_required,
@@ -2960,6 +2939,9 @@ main(int argc, char **argv)
 			logit("Parallel-streams setup failed; "
 			    "falling back to single-stream mode.");
 			parallel_num_streams = 1;
+		} else {
+			sftp_parallel_set_interrupt_flag(parallel_orch,
+			    &interrupted);
 		}
 	}
 
