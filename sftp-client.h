@@ -85,6 +85,21 @@ void sftp_set_live_counter(struct sftp_conn *, volatile uint64_t *);
  * Workers should check this after a failed transfer and exit their loop. */
 int sftp_conn_is_dead(struct sftp_conn *);
 
+/*
+ * Mark a connection as dead with prominent diagnostic logging, without
+ * terminating the process. Used to replace fatal() in code paths that
+ * may run inside a parallel-streams worker, where fatal() would crash
+ * the entire orchestrator.
+ *
+ * After this call, sftp_conn_is_dead() returns true and subsequent RPC
+ * calls on this connection short-circuit to error returns. Callers must
+ * still propagate the failure via their own return value (or rely on
+ * the worker thread's per-unit conn->dead post-check to abandon the
+ * unit and exit so the watchdog can respawn).
+ */
+void sftp_conn_die(struct sftp_conn *, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
 /* Returns non-zero if a protocol-level violation was detected (ID mismatch,
  * unexpected packet type). Distinct from sftp_conn_is_dead: indicates possible
  * MITM attack or serious server corruption. The parallel orchestrator aborts

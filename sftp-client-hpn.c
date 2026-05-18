@@ -24,6 +24,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <stdarg.h>
+#include <stdio.h>
+
 #include "xmalloc.h"
 #include "log.h"
 #include "sftp-client-hpn.h"
@@ -123,6 +126,32 @@ sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *hpn)
 		return;
 	hpn->dead = 1;
 	hpn->protocol_violation = 1;
+}
+
+/*
+ * Mark a connection as dead with prominent diagnostic logging, without
+ * terminating the process. See header comment for full semantics.
+ *
+ * Implementation detail: format the message into a stack buffer (avoid
+ * heap allocation in error paths), call error() at the standard ERROR
+ * log level, then set hpn->dead so subsequent RPC calls bail.
+ */
+void
+sftp_hpn_conn_die(struct sftp_hpn_conn *hpn, const char *fmt, ...)
+{
+	char buf[1024];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	/* Distinctive prefix so these are easy to grep out of logs:
+	 * "sftp: connection died: <reason>" */
+	error("sftp: connection died: %s", buf);
+
+	if (hpn != NULL)
+		hpn->dead = 1;
 }
 
 /*

@@ -81,6 +81,61 @@ struct sftp_parallel_config {
 	 * queue empty between producer bursts is misread as over-provision).
 	 */
 	int          adaptive_scaling;
+
+	/*
+	 * Adaptive throughput-based stall detection (FIRST PASS, opt-in).
+	 *
+	 * The existing watchdog detects STALLED/DEAD via TIME since last
+	 * completion. A worker whose TCP cwnd has been hammered into
+	 * collapse may still complete the occasional 10 MiB file at
+	 * ~800 kbps — well below useful throughput, but never crossing
+	 * the 60/120 s time threshold. We add an outlier-based detector
+	 * for that case.
+	 *
+	 * The detector is intentionally ADAPTIVE: it compares each
+	 * worker's throughput to the FASTEST peer worker. Two consequences:
+	 *
+	 * - "Slow link" case: if the fastest worker is itself slow
+	 *   (under tput_path_healthy_kbps), the PATH is the bottleneck
+	 *   and we skip — respawning would only churn.
+	 * - "Congestion" case: if all workers are similarly slow, no
+	 *   outlier exists, no action taken — respawning would not help.
+	 *
+	 * The detector only acts when one worker is dramatically slower
+	 * than its healthy peers — the cwnd-collapse signature.
+	 *
+	 * Enabled iff tput_path_healthy_kbps > 0. Per watchdog tick (~1s):
+	 *   1. Sample each worker's bytes_total+live_bytes delta -> raw kbps.
+	 *   2. Update per-worker EMA: ema = alpha*raw + (1-alpha)*ema.
+	 *      Cold-starts at the first real measurement (seeds EMA = raw).
+	 *      Raw max_kbps is used only for the path-health gate (step 3);
+	 *      all outlier decisions use EMA values so a single-tick burst
+	 *      from one worker cannot instantly spike the threshold.
+	 *   3. If raw max_kbps < tput_path_healthy_kbps, skip (path-limited).
+	 *   4. threshold = max_ema_kbps * tput_outlier_fraction.
+	 *   5. A worker is an outlier if its ema_kbps < threshold. After
+	 *      tput_consec_required consecutive outlier ticks, STALLED;
+	 *      after 2 * tput_consec_required, DEAD.
+	 *
+	 * Reasonable starting values for WAN bulk transfer:
+	 *   tput_path_healthy_kbps = 2000   (best worker must clear 2 MB/s)
+	 *   tput_outlier_fraction  = 0.25   (outlier if < 25% of EMA max)
+	 *   tput_consec_required   = 5      (sustained for ~5 sec)
+	 *   tput_ema_alpha         = 0.2    (5-tick / ~5 sec time constant)
+	 *
+	 * Set tput_path_healthy_kbps to 0 to disable entirely.
+	 *
+	 * FUTURE: an SSH global request such as
+	 * `hpn-conn-stats@hpnssh.org` would let the orchestrator query
+	 * the server's TCP_INFO and cross-check the local-side signal
+	 * against what the receiver actually observed.  Not in this
+	 * first pass — see watchdog_check_workers() for the integration
+	 * point.
+	 */
+	uint64_t     tput_path_healthy_kbps;
+	double       tput_outlier_fraction;
+	int          tput_consec_required;
+	double       tput_ema_alpha;  /* EMA smoothing [0,1]; 0 = default 0.2 */
 };
 
 /*

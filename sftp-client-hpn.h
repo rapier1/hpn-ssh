@@ -71,6 +71,25 @@ int  sftp_hpn_is_protocol_violation(struct sftp_hpn_conn *);
 void sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *);
 void sftp_hpn_set_live_counter(struct sftp_hpn_conn *, volatile uint64_t *);
 
+/*
+ * Mark a connection as dead due to a non-recoverable error, log the
+ * cause at ERROR level for diagnostic visibility, but do NOT terminate
+ * the process. Used by the SFTP RPC layer to replace fatal() in code
+ * paths that may run inside a parallel-streams worker, where a true
+ * fatal() would crash the entire orchestrator process and take down
+ * all other workers.
+ *
+ * After this is called, sftp_hpn_is_dead() returns true; subsequent
+ * RPC calls on this connection short-circuit to error returns. Callers
+ * must propagate the failure via their own return value, OR rely on
+ * the worker thread's per-unit conn->dead post-check to abandon the
+ * unit and exit so the watchdog can respawn.
+ *
+ * Format string matches fatal() for mechanical conversion.
+ */
+void sftp_hpn_conn_die(struct sftp_hpn_conn *, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
 #ifdef HPN_FAULT_INJECTION
 /*
  * Called by send_msg after each successful write.  Tracks bytes sent and

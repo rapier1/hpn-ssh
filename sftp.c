@@ -2505,6 +2505,12 @@ connect_to_server(char *path, char **args, int *in, int *out)
 	ssh_signal(SIGCHLD, sigchld_handler);
 	close(c_in);
 	close(c_out);
+
+	/* Announce the control ssh child PID so post-mortem diagnostics can
+	 * tell it apart from worker PIDs (worker PIDs are logged by the
+	 * parallel orchestrator's watchdog as "worker N: ... pid=...").
+	 * Useful when investigating control-connection deaths in -j mode. */
+	logit("hpnsftp control: ssh child pid=%ld", (long)sshpid);
 }
 
 static void
@@ -2554,6 +2560,16 @@ main(int argc, char **argv)
 	sanitise_stdfd();
 	msetlocale();
 
+	/*
+	 * Ignore SIGPIPE process-wide.  Without this, a write to a closed
+	 * pipe terminates the entire process — fatal in parallel mode
+	 * because a worker thread writing to its (now-dead) ssh child
+	 * delivers SIGPIPE to the whole sftp process, killing the control
+	 * connection and the orchestrator as collateral damage.  After this
+	 * call, those writes return EPIPE which our code already handles.
+	 */
+	ssh_signal(SIGPIPE, SIG_IGN);
+
 	__progname = ssh_get_progname(argv[0]);
 	memset(&args, '\0', sizeof(args));
 	args.list = NULL;
@@ -2562,6 +2578,23 @@ main(int argc, char **argv)
 	addargs(&args, "-oPermitLocalCommand no");
 	addargs(&args, "-oClearAllForwardings yes");
 	addargs(&args, "-oControlMaster no");
+
+	/*
+	 * HPNSFTP_CONTROL_VERBOSE adds -v flags to the control ssh child
+	 * without bumping sftp's own log verbosity (which `sftp -v` would).
+	 * Mirrors HPNSSH_WORKER_VERBOSE for worker SSH children.
+	 * Levels: 1=-v, 2=-vv, 3=-vvv.  The control's ssh stderr is
+	 * inherited from sftp itself, so the debug output appears inline in
+	 * the same stream as the watchdog log — useful for correlating a
+	 * control-connection death with worker events in time order.
+	 */
+	{
+		const char *e = getenv("HPNSFTP_CONTROL_VERBOSE");
+		int lvl = (e && *e) ? atoi(e) : 0;
+		if (lvl >= 1) addargs(&args, "-v");
+		if (lvl >= 2) addargs(&args, "-v");
+		if (lvl >= 3) addargs(&args, "-v");
+	}
 
 	ll = SYSLOG_LEVEL_INFO;
 	infile = stdin;
@@ -2871,10 +2904,57 @@ main(int argc, char **argv)
 		pcfg.fsync_flag       = global_fflag;
 		pcfg.print_flag       = quiet ? 0 : 1;
 		pcfg.adaptive_scaling = parallel_adaptive_scaling;
-		if (!quiet)
+
+		/*
+		 * Adaptive throughput-outlier stall detection. Opt-in via
+		 * env vars for first-pass testing; promote to proper
+		 * cmdline flags once tuning settles.
+		 *
+		 *   SFTP_TPUT_HEALTHY_KBPS=N  enables; fastest worker must
+		 *                             clear N KB/s before any outlier
+		 *                             classification fires
+		 *   SFTP_TPUT_FRACTION=F      worker is outlier if its kbps
+		 *                             is less than F * max_kbps
+		 *                             (default 0.25)
+		 *   SFTP_TPUT_CONSEC=N        consecutive outlier ticks before
+		 *                             STALLED (default 5); DEAD at 2N
+		 */
+		{
+			const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
+			const char *e_f = getenv("SFTP_TPUT_FRACTION");
+			const char *e_c = getenv("SFTP_TPUT_CONSEC");
+			const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
+			if (e_h && *e_h) {
+				pcfg.tput_path_healthy_kbps =
+				    strtoull(e_h, NULL, 10);
+			}
+			pcfg.tput_outlier_fraction =
+			    (e_f && *e_f) ? strtod(e_f, NULL) : 0.25;
+			pcfg.tput_consec_required =
+			    (e_c && *e_c) ? atoi(e_c) : 5;
+			pcfg.tput_ema_alpha =
+			    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
+		}
+
+		if (!quiet) {
 			logit("Parallel streams: -j %d, adaptive scaling %s",
 			    parallel_num_streams,
 			    parallel_adaptive_scaling ? "on" : "off");
+		}
+		/* Always print when tput-outlier is enabled, even in batch
+		 * mode — this is the only way to confirm env vars were
+		 * picked up. Goes to stderr directly. */
+		if (pcfg.tput_path_healthy_kbps > 0) {
+			double eff_alpha = pcfg.tput_ema_alpha > 0.0
+			    ? pcfg.tput_ema_alpha : 0.2;
+			fprintf(stderr,
+			    "tput-outlier detection: healthy_kbps=%llu "
+			    "frac=%.2f consec=%d ema_alpha=%.2f\n",
+			    (unsigned long long)pcfg.tput_path_healthy_kbps,
+			    pcfg.tput_outlier_fraction,
+			    pcfg.tput_consec_required,
+			    eff_alpha);
+		}
 		parallel_orch = sftp_parallel_start(&pcfg);
 		if (parallel_orch == NULL) {
 			logit("Parallel-streams setup failed; "

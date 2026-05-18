@@ -739,6 +739,19 @@ sftp_set_live_counter(struct sftp_conn *conn, volatile uint64_t *counter)
 	if (conn != NULL)
 		sftp_hpn_set_live_counter(conn->hpn, counter);
 }
+
+void
+sftp_conn_die(struct sftp_conn *conn, const char *fmt, ...)
+{
+	char buf[1024];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	sftp_hpn_conn_die(conn != NULL ? conn->hpn : NULL, "%s", buf);
+}
 /* END HPN */
 
 int
@@ -2234,8 +2247,16 @@ do_upload_body(struct sftp_conn *conn,
 		} else if (TAILQ_FIRST(&acks) == NULL)
 			break;
 
-		if (ack == NULL)
-			fatal("Unexpected ACK %u", id);
+		if (ack == NULL) {
+			/* Was fatal("Unexpected ACK %u", id); — would crash the
+			 * entire orchestrator if this worker is one of N in a
+			 * parallel-streams transfer.  Mark this connection dead
+			 * and bail to the worker thread's safety net, which
+			 * checks conn->dead and triggers respawn. */
+			sftp_conn_die(conn, "Unexpected ACK %u", id);
+			status = -1;
+			break;
+		}
 
 		if (id == startid || len == 0 ||
 		    id - ackid >= conn->num_requests) {
@@ -2248,9 +2269,14 @@ do_upload_body(struct sftp_conn *conn,
 			    (r = sshbuf_get_u32(msg, &rid)) != 0)
 				fatal_fr(r, "parse");
 
-			if (type != SSH2_FXP_STATUS)
-				fatal("Expected SSH2_FXP_STATUS(%d) packet, "
+			if (type != SSH2_FXP_STATUS) {
+				/* Was fatal("Expected SSH2_FXP_STATUS..."). */
+				sftp_conn_die(conn,
+				    "Expected SSH2_FXP_STATUS(%d) packet, "
 				    "got %d", SSH2_FXP_STATUS, type);
+				status = -1;
+				break;
+			}
 
 			if ((r = sshbuf_get_u32(msg, &status2)) != 0)
 				fatal_fr(r, "parse status");
@@ -2259,8 +2285,13 @@ do_upload_body(struct sftp_conn *conn,
 				status = status2; /* remember errors */
 
 			/* Find the request in our queue */
-			if ((ack = request_find(&acks, rid)) == NULL)
-				fatal("Can't find request for ID %u", rid);
+			if ((ack = request_find(&acks, rid)) == NULL) {
+				/* Was fatal("Can't find request for ID %u"). */
+				sftp_conn_die(conn,
+				    "Can't find request for ID %u", rid);
+				status = -1;
+				break;
+			}
 			TAILQ_REMOVE(&acks, ack, tq);
 			debug3("In write loop, ack for %u %zu bytes at %lld",
 			    ack->id, ack->len, (unsigned long long)ack->offset);
@@ -2583,13 +2614,25 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			break;
 		ack = TAILQ_FIRST(&acks);
 		sshbuf_reset(msg);
-		get_msg_extended(conn, msg, 0);
+		/* Check get_msg_extended return — connection death (EPIPE)
+		 * already sets conn->hpn->dead inside get_msg_extended.
+		 * Without this check, the subsequent parse would fatal_fr
+		 * on the empty msg buffer and crash the orchestrator. */
+		if (get_msg_extended(conn, msg, 0) != 0) {
+			status = SSH2_FX_FAILURE;
+			break;
+		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &ackid)) != 0)
 			fatal_fr(r, "parse status");
-		if (type != SSH2_FXP_STATUS)
-			fatal_f("expected SSH2_FXP_STATUS(%u), got %u",
+		if (type != SSH2_FXP_STATUS) {
+			/* Was fatal_f("expected SSH2_FXP_STATUS..."). */
+			sftp_conn_die(conn,
+			    "expected SSH2_FXP_STATUS(%u), got %u",
 			    SSH2_FXP_STATUS, type);
+			status = SSH2_FX_FAILURE;
+			break;
+		}
 		if ((r = sshbuf_get_u32(msg, &status)) != 0)
 			fatal_fr(r, "parse status code");
 		if (status != SSH2_FX_OK) {

@@ -108,6 +108,27 @@ extern int showprogress;
 #define DEAD_THRESHOLD_SEC      120
 
 /*
+ * Number of watchdog ticks (~1 s each) to wait before a worker becomes
+ * eligible for throughput-outlier classification.  During this window the
+ * worker's EMA is still warming up from its cold-start seed, so any
+ * comparison against the peer-max threshold would be unreliable.
+ *
+ * 5 ticks covers TCP slow-start ramp-up at RTTs up to ~50 ms.  At higher
+ * RTTs (100–200 ms) slow-start takes proportionally longer in wall-clock
+ * time, but the EMA warmup window still covers it because both the worker's
+ * EMA and the threshold EMA are climbing together — neither side is "warm"
+ * before the other.
+ *
+ * NOTE: an alternative approach is to measure the actual per-worker RTT
+ * (e.g. via a timed SFTP extension round-trip immediately after sftp_init,
+ * or by reading tcpi_rtt from TCP_INFO on the worker's socket) and compute
+ * a RTT-proportional grace period.  That would be more accurate on highly
+ * variable paths.  The fixed-tick approach is sufficient for the current
+ * use case and avoids the complexity of per-worker RTT measurement.
+ */
+#define TPUT_EMA_WARMUP_TICKS   5
+
+/*
  * Adaptive scaling cadence.  SCALE_CHECK_TICKS controls how often (in
  * reporter ticks) the scaler samples throughput and evaluates up/down
  * decisions.  SCALE_COOLDOWN_TICKS is the minimum number of ticks that
@@ -161,10 +182,28 @@ extern int showprogress;
  */
 #define SCALE_UP_MIN_BYTES_PER_WORKER  (64ULL * 1024 * 1024)
 
-#define RESPAWN_MULTIPLIER      2  /* abort when total respawns exceeds
-				    * this * num_streams; each worker slot
-				    * gets one retry before concluding the
-				    * problem is systemic */
+/*
+ * Escalation timeout: how long we let a SIGTERMed SSH child clean up before
+ * promoting to SIGKILL.  When the receiving TCP socket is hung (the worker's
+ * I/O is stalled — exactly when we declare DEAD), SSH's clean-shutdown path
+ * tries to send SSH_MSG_DISCONNECT on the same broken socket and blocks
+ * indefinitely.  The worker thread is meanwhile blocked reading the ssh
+ * child's now-frozen stdout pipe, so it never sets exited=1, so reap (which
+ * runs the SIGKILL belt-and-suspenders) never fires.  5 seconds is generous
+ * for a healthy SSH disconnect and short enough to keep zombie workers from
+ * holding their in-flight unit hostage.
+ */
+#define SIGKILL_ESCALATION_SEC  5
+
+#define RESPAWN_MULTIPLIER      2  /* epoch ceiling = this * num_streams;
+				    * each worker slot gets one retry before
+				    * triggering a cooldown pause */
+#define RESPAWN_MAX_COOLDOWNS   3  /* cooldown cycles before throughput gate */
+#define RESPAWN_COOLDOWN_SEC    30 /* seconds to pause respawning per cooldown */
+#define RESPAWN_STABILITY_SEC  300 /* seconds without a new cooldown before the
+				    * cooldown count resets; prevents a long-
+				    * running transfer from accumulating a fatal
+				    * count from churn spread across hours */
 
 enum worker_health {
 	WORKER_HEALTHY = 0,
@@ -217,6 +256,17 @@ struct sftp_worker {
 	uint64_t           units_failed;
 	uint64_t           reconnect_count;
 	uint64_t           last_completion_ns; /* monotonic ns of last finish */
+
+	/* Adaptive throughput-based stall detection state.  See
+	 * cfg.tput_path_healthy_kbps in sftp-parallel.h for the algorithm.
+	 * Updated at each watchdog tick. */
+	uint64_t           tput_check_bytes;     /* bytes_total at last check */
+	uint64_t           tput_check_ns;        /* monotime of last check */
+	uint64_t           tput_current_kbps;    /* most recent raw estimate */
+	uint64_t           tput_ema_kbps;        /* EMA-smoothed estimate */
+	int                tput_ema_warmup_ticks; /* ticks since EMA cold-start */
+	int                tput_outlier_ticks;   /* consecutive outlier ticks */
+
 	uint64_t           idle_ns;            /* ns blocked on workqueue pop,
 					        * for completed pops only */
 	uint64_t           work_ns;            /* ns actively processing */
@@ -238,10 +288,17 @@ struct sftp_worker {
 						* spawn in the reap loop */
 	int                doomed;            /* set by watchdog before SIGTERM;
 						* prevents double-kill */
+	uint64_t           doom_ns;           /* monotonic ns when SIGTERM was
+						* sent; used to escalate to
+						* SIGKILL when SSH hangs in its
+						* clean-shutdown path (worker
+						* thread otherwise blocks on
+						* unresponsive pipes forever) */
 };
 
 struct sftp_parallel {
 	struct sftp_parallel_config cfg;
+	char                        cfg_port_buf[16]; /* owns cfg.port string */
 	struct sftp_workqueue      *q;
 
 	/* Workers held as an array of pointers so add/remove can mutate
@@ -257,9 +314,27 @@ struct sftp_parallel {
 	int                         pending_respawns; /* detached respawn threads
 						       * not yet in workers[];
 						       * guards premature abort */
-	int                         total_respawns;  /* lifetime respawn count;
-						       * abort when this exceeds
-						       * 2 * cfg.num_streams */
+	int                         total_respawns;  /* lifetime respawn count */
+	int                         respawn_epoch_count;   /* respawns in current
+							    * epoch; reset when a
+							    * cooldown ends */
+	int                         respawn_cooldown_count; /* cooldown cycles used
+							    * this stability window */
+	uint64_t                    respawn_resume_ns;  /* monotonic ns when
+							* cooldown ends; 0 = not
+							* in cooldown */
+	uint64_t                    respawn_last_cooldown_ns; /* when last cooldown
+							       * was entered; drives
+							       * stability timer */
+	uint64_t                    tput_last_raw_max_kbps;  /* freshest raw max
+							       * from watchdog; used
+							       * by throughput gate */
+	int                         respawn_owed;  /* involuntary deaths reaped
+						    * but not yet replaced; carries
+						    * across cooldowns + pthread
+						    * failures so a long-lived
+						    * transfer doesn't drift below
+						    * num_streams over time */
 	int                         protocol_violations; /* under workers_mu;
 						       * abort if any non-zero;
 						       * exposed via stats for
@@ -394,6 +469,29 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 	if (pid == 0) {
 		dup2(p2c[0], STDIN_FILENO);
 		dup2(c2p[1], STDOUT_FILENO);
+
+		/*
+		 * Redirect this SSH child's stderr to a per-child log file
+		 * so we can post-mortem failed handshakes that would
+		 * otherwise vanish into the orchestrator's interleaved
+		 * stderr stream.  Path is /tmp/hpnssh-worker-PID.stderr;
+		 * the child's PID becomes part of the SSH child's command
+		 * line so it's easy to correlate.  Best-effort: if open
+		 * fails for any reason, fall through to inherited stderr
+		 * (current behaviour).
+		 */
+		{
+			char path[64];
+			int fd;
+			snprintf(path, sizeof(path),
+			    "/tmp/hpnssh-worker-%d.stderr", (int)getpid());
+			fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (fd >= 0) {
+				dup2(fd, STDERR_FILENO);
+				close(fd);
+			}
+		}
+
 		close(p2c[0]); close(p2c[1]);
 		close(c2p[0]); close(c2p[1]);
 
@@ -405,6 +503,20 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 		argv[argc++] = "-oControlMaster=no";
 		argv[argc++] = "-oControlPath=none";
 		argv[argc++] = "-oStrictHostKeyChecking=accept-new";
+		/*
+		 * Per-child verbose output for respawn diagnostics. Routed
+		 * to /tmp/hpnssh-worker-PID.stderr by the dup2() above, so
+		 * it does not pollute the orchestrator's stdout/stderr.
+		 * HPNSSH_WORKER_VERBOSE controls level: 1=-v, 2=-vv, 3=-vvv.
+		 * Default 1 while we are validating the respawn path.
+		 */
+		{
+			const char *e = getenv("HPNSSH_WORKER_VERBOSE");
+			int lvl = (e && *e) ? atoi(e) : 1;
+			if (lvl >= 1) argv[argc++] = "-v";
+			if (lvl >= 2) argv[argc++] = "-v";
+			if (lvl >= 3) argv[argc++] = "-v";
+		}
 		if (cfg->port && cfg->port[0]) {
 			argv[argc++] = "-p";
 			argv[argc++] = (char *)cfg->port;
@@ -908,10 +1020,217 @@ snapshot_workers(struct sftp_parallel *p, uint64_t *bytes_out,
 }
 
 /*
+ * Adaptive throughput-based stall detection (first pass).
+ *
+ * For each worker, computes kbps since the last tick.  Identifies the
+ * fastest worker (max_kbps).  If the path looks healthy (max_kbps >=
+ * cfg.tput_path_healthy_kbps), increments outlier_ticks for any worker
+ * whose kbps is dramatically below max.  Returns the per-worker outlier
+ * tick count via *worker_outlier_ticks[i] (caller-allocated array of
+ * length p->num_workers; must be called under workers_mu).
+ *
+ * The caller (watchdog_check_workers) combines this with the existing
+ * time-based and ssh-child-existence checks to make final classifications.
+ *
+ * FUTURE: a server-side query (e.g. hpn-conn-stats@hpnssh.org SSH global
+ * request) could provide an independent signal about each worker's
+ * receive-side state — useful when the local-side tput estimate is
+ * noisy or when we want to confirm the rwnd rescue has already fired.
+ * For now we rely on local bytes_total deltas only.
+ */
+/* Format current wall-clock for embedded log timestamps.  Reused by
+ * the diagnostic log lines below; not stored. */
+static const char *
+watchdog_tstamp(char *buf, size_t bufsz)
+{
+	struct timeval tv;
+	struct tm tm;
+	gettimeofday(&tv, NULL);
+	if (localtime_r(&tv.tv_sec, &tm) != NULL) {
+		snprintf(buf, bufsz, "%02d:%02d:%02d.%03d",
+		    tm.tm_hour, tm.tm_min, tm.tm_sec,
+		    (int)(tv.tv_usec / 1000));
+	} else {
+		snprintf(buf, bufsz, "??:??:??.???");
+	}
+	return buf;
+}
+
+/*
+ * Timestamp-prefixed log macros for watchdog / respawn / reporter
+ * diagnostics.  Wall-clock prefix [HH:MM:SS.mmm] lets us see how long
+ * a worker was hung between events (e.g. between "stalled" and "dead",
+ * or between "SIGTERM" and "respawn failed").
+ */
+#define WD_LOGIT(fmt, ...) do { \
+	char _ts[16]; \
+	logit_f("[%s] " fmt, watchdog_tstamp(_ts, sizeof(_ts)), \
+	    ##__VA_ARGS__); \
+} while (0)
+#define WD_ERROR(fmt, ...) do { \
+	char _ts[16]; \
+	error_f("[%s] " fmt, watchdog_tstamp(_ts, sizeof(_ts)), \
+	    ##__VA_ARGS__); \
+} while (0)
+
+static void
+watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
+{
+	if (p->cfg.tput_path_healthy_kbps == 0)
+		return;	/* feature disabled */
+
+	uint64_t max_kbps = 0;      /* raw max — path-health gate only */
+	uint64_t max_ema_kbps = 0;  /* smoothed max — threshold basis */
+
+	double alpha = (p->cfg.tput_ema_alpha > 0.0)
+	    ? p->cfg.tput_ema_alpha : 0.2;
+
+	/* First pass: compute per-worker raw kbps, update EMA, find maxima.
+	 *
+	 * Use bytes_total + live_bytes (continuous progress) rather than
+	 * bytes_total alone (file-completion-granular).  Without live_bytes,
+	 * a worker mid-transfer shows bytes_delta=0 for several seconds then
+	 * a spike at completion — the outlier ticks oscillate and the consec
+	 * counter never sticks.
+	 *
+	 * EMA smoothing (alpha default 0.2, ~5-tick time constant) prevents
+	 * a single-tick burst from one worker from instantly spiking the
+	 * threshold and falsely classifying slower-but-healthy peers.  The
+	 * raw max is kept separately so the path-health gate (step 3) still
+	 * reacts immediately to actual path state. */
+	for (int i = 0; i < p->num_workers; i++) {
+		struct sftp_worker *w = p->workers[i];
+		uint64_t now_bytes;
+		pthread_mutex_lock(&w->mu);
+		now_bytes = w->bytes_total;
+		pthread_mutex_unlock(&w->mu);
+		now_bytes += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
+
+		if (w->tput_check_ns == 0) {
+			/* First sample: initialize baselines, skip this tick. */
+			w->tput_check_bytes = now_bytes;
+			w->tput_check_ns = now;
+			w->tput_current_kbps = 0;
+			w->tput_ema_kbps = 0;
+			continue;
+		}
+
+		uint64_t elapsed_ns = now - w->tput_check_ns;
+		uint64_t bytes_delta = (now_bytes >= w->tput_check_bytes)
+		    ? (now_bytes - w->tput_check_bytes) : 0;
+		w->tput_current_kbps = (elapsed_ns > 0)
+		    ? bytes_delta * 1000000000ULL / elapsed_ns / 1024ULL : 0;
+		w->tput_check_bytes = now_bytes;
+		w->tput_check_ns = now;
+
+		/* EMA update.  Cold-start: seed EMA from first real measurement
+		 * so a fast worker registers immediately rather than spending
+		 * several ticks climbing out of zero. */
+		if (w->tput_ema_kbps == 0)
+			w->tput_ema_kbps = w->tput_current_kbps;
+		else
+			w->tput_ema_kbps = (uint64_t)(
+			    alpha * (double)w->tput_current_kbps +
+			    (1.0 - alpha) * (double)w->tput_ema_kbps);
+		if (w->tput_ema_warmup_ticks < TPUT_EMA_WARMUP_TICKS)
+			w->tput_ema_warmup_ticks++;
+
+		if (w->tput_current_kbps > max_kbps)
+			max_kbps = w->tput_current_kbps;
+		if (w->tput_ema_kbps > max_ema_kbps)
+			max_ema_kbps = w->tput_ema_kbps;
+	}
+
+	/* Diagnostic: log per-worker raw and EMA kbps once every ~5 sec. */
+	static int sample_ticks = 0;
+	if ((sample_ticks++ % 5) == 0) {
+		char per_worker[256];
+		int off = 0;
+		per_worker[0] = '\0';
+		for (int i = 0; i < p->num_workers; i++) {
+			struct sftp_worker *w = p->workers[i];
+			int n = snprintf(per_worker + off,
+			    sizeof(per_worker) - off,
+			    " w%d=%llu(ema=%llu)", w->id,
+			    (unsigned long long)w->tput_current_kbps,
+			    (unsigned long long)w->tput_ema_kbps);
+			if (n < 0 || (size_t)(off + n) >= sizeof(per_worker))
+				break;
+			off += n;
+		}
+		WD_LOGIT("tput sample: max_kbps=%llu max_ema=%llu "
+		    "path_healthy=%llu%s",
+		    (unsigned long long)max_kbps,
+		    (unsigned long long)max_ema_kbps,
+		    (unsigned long long)p->cfg.tput_path_healthy_kbps,
+		    per_worker);
+	}
+
+	/* Snapshot for the respawn throughput gate (checked in the reporter). */
+	p->tput_last_raw_max_kbps = max_kbps;
+
+	/* Path-health gate uses raw max_kbps so it reacts immediately when
+	 * the link recovers (an EMA-smoothed gate would lag). */
+	if (max_kbps < p->cfg.tput_path_healthy_kbps) {
+		for (int i = 0; i < p->num_workers; i++)
+			p->workers[i]->tput_outlier_ticks = 0;
+		return;
+	}
+
+	/* Second pass: classify outliers using smoothed values.
+	 *
+	 * threshold = max_ema_kbps * fraction — both the reference and the
+	 * per-worker value are EMA-smoothed, so neither side of the comparison
+	 * can be swung by a single noisy tick.
+	 *
+	 * Only count as outlier when the worker has IN-FLIGHT WORK. An idle
+	 * worker between queue pops legitimately shows kbps=0 and must not be
+	 * penalised. */
+	uint64_t threshold_kbps =
+	    (uint64_t)(max_ema_kbps * p->cfg.tput_outlier_fraction);
+	for (int i = 0; i < p->num_workers; i++) {
+		struct sftp_worker *w = p->workers[i];
+		uint64_t in_flight;
+		pthread_mutex_lock(&w->mu);
+		in_flight = w->units_started - w->units_completed -
+		    w->units_failed;
+		pthread_mutex_unlock(&w->mu);
+
+		if (w->tput_ema_warmup_ticks < TPUT_EMA_WARMUP_TICKS) {
+			/* EMA not yet warm — skip outlier detection. */
+			w->tput_outlier_ticks = 0;
+			continue;
+		}
+
+		if (in_flight == 0) {
+			w->tput_outlier_ticks = 0;
+			continue;
+		}
+
+		if (w->tput_ema_kbps < threshold_kbps) {
+			w->tput_outlier_ticks++;
+			WD_LOGIT("worker %d tput-outlier: "
+			    "kbps=%llu ema=%llu threshold=%llu "
+			    "consec=%d in_flight=%llu",
+			    w->id,
+			    (unsigned long long)w->tput_current_kbps,
+			    (unsigned long long)w->tput_ema_kbps,
+			    (unsigned long long)threshold_kbps,
+			    w->tput_outlier_ticks,
+			    (unsigned long long)in_flight);
+		} else {
+			w->tput_outlier_ticks = 0;
+		}
+	}
+}
+
+/*
  * Watchdog: classify each worker as HEALTHY/STALLED/DEAD based on (a) its
  * ssh child's existence and (b) elapsed time since last completion when
- * the queue had work to feed it. Returns nonzero if any worker has
- * transitioned to DEAD, signaling the reporter to abort the orchestrator.
+ * the queue had work to feed it, and (c) adaptive throughput-outlier
+ * detection (if cfg.tput_path_healthy_kbps > 0). Returns nonzero if any
+ * worker has transitioned to DEAD, signaling the reporter to abort the
+ * orchestrator.
  */
 static int
 watchdog_check_workers(struct sftp_parallel *p)
@@ -921,6 +1240,16 @@ watchdog_check_workers(struct sftp_parallel *p)
 	int queue_has_work = (sftp_workqueue_depth(p->q) > 0);
 
 	pthread_mutex_lock(&p->workers_mu);
+
+	/* Adaptive throughput sample for outlier detection (no-op if
+	 * cfg.tput_path_healthy_kbps == 0). Sets w->tput_outlier_ticks. */
+	watchdog_sample_throughput(p, now);
+
+	/* Throttle: at most one DEAD promotion per tick from the
+	 * throughput-outlier path.  See the comment by the outlier
+	 * escalation block below for rationale. */
+	int tput_dead_this_tick = 0;
+
 	for (int i = 0; i < p->num_workers; i++) {
 		struct sftp_worker *w = p->workers[i];
 		enum worker_health prev, next;
@@ -966,18 +1295,65 @@ watchdog_check_workers(struct sftp_parallel *p)
 				next = WORKER_DEAD;
 		}
 
+		/*
+		 * Adaptive throughput-outlier escalation. tput_outlier_ticks
+		 * is set by watchdog_sample_throughput above and is non-zero
+		 * only when (a) the feature is enabled and (b) the fastest
+		 * worker meets the path-healthy floor (so we know respawning
+		 * could help). This catches cwnd-collapsed workers that the
+		 * time-based detector misses because they're still completing
+		 * the occasional file, just slowly.
+		 *
+		 * Only ESCALATE here, never de-escalate: if the SSH child or
+		 * time-based path already classified DEAD, leave it DEAD.
+		 *
+		 * Throttle: kill at most ONE worker per tick via the
+		 * throughput path.  Multiple workers may simultaneously hit
+		 * the consec=2*req threshold on the same tick (when the
+		 * tputs are uniformly low against a fast peer); killing
+		 * them all at once stresses any server-side rate limit and
+		 * burns the respawn budget faster than necessary.  The
+		 * holdover workers stay STALLED and will be re-evaluated next
+		 * tick — by then one respawn may already be in flight.
+		 *
+		 * Respawn budget: triggered respawns count against the
+		 * epoch budget (RESPAWN_MULTIPLIER * num_streams). On
+		 * budget exhaustion the orchestrator enters a cooldown
+		 * pause rather than aborting immediately — see the
+		 * respawn section in the reporter thread for details.
+		 */
+		if (next != WORKER_DEAD && p->cfg.tput_path_healthy_kbps > 0) {
+			int consec = w->tput_outlier_ticks;
+			int req = p->cfg.tput_consec_required > 0
+			    ? p->cfg.tput_consec_required : 5;
+			if (consec >= 2 * req) {
+				if (!tput_dead_this_tick) {
+					next = WORKER_DEAD;
+					tput_dead_this_tick = 1;
+				} else {
+					/* Throttle: another worker already
+					 * promoted to DEAD this tick.  Stay
+					 * STALLED. */
+					if (next == WORKER_HEALTHY)
+						next = WORKER_STALLED;
+				}
+			} else if (consec >= req && next == WORKER_HEALTHY) {
+				next = WORKER_STALLED;
+			}
+		}
+
 		if (next != prev) {
 			pthread_mutex_lock(&w->mu);
 			w->health = next;
 			pthread_mutex_unlock(&w->mu);
 			if (next == WORKER_STALLED) {
-				logit_f("worker %d stalled: no progress in "
+				WD_LOGIT("worker %d stalled: no progress in "
 				    "%llu sec while queue has work",
 				    w->id,
 				    (unsigned long long)
 				    (since_completion_ns / 1000000000ULL));
 			} else if (next == WORKER_DEAD) {
-				error_f("worker %d declared dead: "
+				WD_ERROR("worker %d declared dead: "
 				    "ssh_pid=%ld since_completion=%llus",
 				    w->id, (long)w->ssh_pid,
 				    (unsigned long long)
@@ -992,16 +1368,44 @@ watchdog_check_workers(struct sftp_parallel *p)
 			int already_doomed;
 			pthread_mutex_lock(&w->mu);
 			already_doomed = w->doomed || w->exited;
-			if (!already_doomed)
+			if (!already_doomed) {
 				w->doomed = 1;
+				w->doom_ns = now;
+			}
 			pthread_mutex_unlock(&w->mu);
 			if (!already_doomed) {
 				if (w->ssh_pid > 0)
 					(void)kill(w->ssh_pid, SIGTERM);
-				logit_f("worker %d: sent SIGTERM to ssh child "
-				    "(pid %ld)", w->id, (long)w->ssh_pid);
+				WD_LOGIT("worker %d: sent SIGTERM to ssh "
+				    "child (pid %ld)", w->id,
+				    (long)w->ssh_pid);
 			}
 			any_dead = 1;
+		}
+
+		/* SIGKILL escalation: if a doomed worker hasn't exited within
+		 * SIGKILL_ESCALATION_SEC, the SSH child is hung in its clean-
+		 * shutdown path (broken socket) and the worker thread is
+		 * blocked on its stdout pipe.  SIGKILL closes the pipes
+		 * immediately, the worker thread sees EOF/EPIPE on its next
+		 * I/O call, sets exited=1, and gets reaped.  Without this we
+		 * deadlock: the SIGKILL-on-reap path is gated on exited=1. */
+		if (w->doomed && !w->exited && w->doom_ns > 0 &&
+		    w->ssh_pid > 0 &&
+		    now - w->doom_ns >
+		    (uint64_t)SIGKILL_ESCALATION_SEC * 1000000000ULL) {
+			(void)kill(w->ssh_pid, SIGKILL);
+			WD_ERROR("worker %d: escalated to SIGKILL after "
+			    "%llus (SSH child unresponsive to SIGTERM, "
+			    "pid %ld)",
+			    w->id,
+			    (unsigned long long)
+			    ((now - w->doom_ns) / 1000000000ULL),
+			    (long)w->ssh_pid);
+			/* Clear doom_ns so we don't re-escalate every tick. */
+			pthread_mutex_lock(&w->mu);
+			w->doom_ns = 0;
+			pthread_mutex_unlock(&w->mu);
 		}
 	}
 	pthread_mutex_unlock(&p->workers_mu);
@@ -1016,13 +1420,39 @@ static void *
 respawn_worker_thread(void *arg)
 {
 	struct sftp_parallel *p = arg;
+
+	/*
+	 * Brief delay before attempting the replacement's SFTP handshake.
+	 * Without this, observed failures: respawn fires within ~7 ms of
+	 * the dying worker's SIGTERM, the receiver's sftp-server subsystem
+	 * hasn't finished cleaning up the prior session, and the new
+	 * connection's SSH_FXP_INIT gets a malformed reply (type 0,
+	 * "Invalid packet back from SSH2_FXP_INIT").
+	 *
+	 * Configurable via SFTP_RESPAWN_DELAY_MS env var; default 2000 ms.
+	 * Set to 0 to disable for testing.
+	 */
+	{
+		const char *e = getenv("SFTP_RESPAWN_DELAY_MS");
+		long delay_ms = (e && *e) ? strtol(e, NULL, 10) : 2000;
+		if (delay_ms > 0) {
+			struct timespec ts = {
+				.tv_sec  = delay_ms / 1000,
+				.tv_nsec = (delay_ms % 1000) * 1000000L,
+			};
+			nanosleep(&ts, NULL);
+		}
+	}
+
 	struct sftp_worker *w = spawn_one_worker(p);
-	if (w == NULL)
-		error_f("worker respawn failed");
-	else {
+	if (w == NULL) {
+		WD_ERROR("worker respawn failed");
+	} else {
 		pthread_mutex_lock(&w->mu);
 		w->reconnect_count++;
 		pthread_mutex_unlock(&w->mu);
+		WD_LOGIT("worker %d respawned (reconnect_count=%llu)",
+		    w->id, (unsigned long long)w->reconnect_count);
 	}
 	pthread_mutex_lock(&p->workers_mu);
 	p->pending_respawns--;
@@ -1038,7 +1468,7 @@ scale_up_thread(void *arg)
 	struct sftp_parallel *p = arg;
 	struct sftp_worker *w = spawn_one_worker(p);
 	if (w == NULL)
-		error_f("scale-up worker spawn failed");
+		WD_ERROR("scale-up worker spawn failed");
 	pthread_mutex_lock(&p->workers_mu);
 	p->pending_scaleups--;
 	pthread_mutex_unlock(&p->workers_mu);
@@ -1072,6 +1502,28 @@ reporter_thread(void *arg)
 		 * cheaper and watchdog timing doesn't need 200ms granularity. */
 		if (++slow_tick_counter >= 5) {
 			slow_tick_counter = 0;
+
+			/* Stability timer: if no new cooldown was needed for
+			 * RESPAWN_STABILITY_SEC, the cluster has been running
+			 * cleanly — reset the cooldown count so a very long
+			 * transfer doesn't accumulate a fatal count from
+			 * isolated churn events spread over hours. */
+			if (p->respawn_last_cooldown_ns != 0 &&
+			    p->respawn_resume_ns == 0) {
+				uint64_t now_ns = monotonic_ns();
+				uint64_t stability_ns =
+				    (uint64_t)RESPAWN_STABILITY_SEC * 1000000000ULL;
+				if (now_ns - p->respawn_last_cooldown_ns
+				    > stability_ns) {
+					WD_LOGIT("respawn stability window "
+					    "expired (%ds clean) — resetting "
+					    "cooldown count from %d to 0",
+					    RESPAWN_STABILITY_SEC,
+					    p->respawn_cooldown_count);
+					p->respawn_cooldown_count = 0;
+					p->respawn_last_cooldown_ns = 0;
+				}
+			}
 
 			/* Watchdog classifies workers HEALTHY/STALLED/DEAD
 			 * and SIGTERMs newly DEAD ones. We don't abort here;
@@ -1138,46 +1590,147 @@ reporter_thread(void *arg)
 			 * in a detached thread so the SSH handshake doesn't
 			 * block the reporter's progress ticks.
 			 *
-			 * Hard ceiling: abort if total lifetime respawns
-			 * exceeds 2 * num_streams. Each worker slot gets one
-			 * retry; beyond that the problem is systemic (sustained
-			 * failure, attack) and continuing only delays the
-			 * inevitable MAX_RETRIES drain. */
+			 * Epoch ceiling: each epoch allows RESPAWN_MULTIPLIER
+			 * * num_streams respawns.  On ceiling:
+			 *  - If cooldowns remain: pause for RESPAWN_COOLDOWN_SEC,
+			 *    reset the epoch counter, let healthy workers continue.
+			 *  - After RESPAWN_MAX_COOLDOWNS: throughput gate — if any
+			 *    worker is still healthy (raw max_kbps >= healthy
+			 *    threshold), grant an uncounted extension cooldown
+			 *    rather than killing a transfer 85% through petabytes.
+			 *    Only abort when the path itself is unhealthy. */
 			pthread_mutex_lock(&p->workers_mu);
 			int cur_workers  = p->num_workers;
 			int respawn_ceil = p->cfg.num_streams * RESPAWN_MULTIPLIER;
-			int over_ceil    = (p->total_respawns >= respawn_ceil);
 			pthread_mutex_unlock(&p->workers_mu);
 
-			if (over_ceil && n_to_respawn > 0) {
-				error_f("respawn ceiling reached (%d of %d "
-				    "allowed) — persistent connection failure, "
-				    "aborting transfer", respawn_ceil,
-				    respawn_ceil);
-				sftp_parallel_abort(p);
-				break;
+			/* Absorb this tick's involuntary deaths into the
+			 * backlog.  respawn_owed carries across cooldowns and
+			 * pthread_create failures, so the worker pool drains
+			 * back up to num_streams once spawning resumes. */
+			if (n_to_respawn > 0)
+				p->respawn_owed += n_to_respawn;
+
+			/* Check cooldown: suppress respawns until timer expires. */
+			int in_cooldown = 0;
+			if (p->respawn_resume_ns != 0) {
+				uint64_t now_ns = monotonic_ns();
+				if (now_ns < p->respawn_resume_ns) {
+					in_cooldown = 1;
+				} else {
+					/* Cooldown expired — resume respawning. */
+					WD_LOGIT("respawn cooldown ended, "
+					    "resuming (epoch reset, owed=%d)",
+					    p->respawn_owed);
+					p->respawn_resume_ns = 0;
+					p->respawn_epoch_count = 0;
+				}
+			}
+
+			/* Ceiling check and cooldown entry (only when we owe
+			 * a respawn and are not already in cooldown). */
+			if (!in_cooldown && p->respawn_owed > 0 &&
+			    p->respawn_epoch_count >= respawn_ceil) {
+				uint64_t now_ns = monotonic_ns();
+				if (p->respawn_cooldown_count <
+				    RESPAWN_MAX_COOLDOWNS) {
+					/* Enter a counted cooldown. */
+					p->respawn_cooldown_count++;
+					p->respawn_last_cooldown_ns = now_ns;
+					p->respawn_resume_ns = now_ns +
+					    (uint64_t)RESPAWN_COOLDOWN_SEC *
+					    1000000000ULL;
+					p->respawn_epoch_count = 0;
+					in_cooldown = 1;
+					WD_ERROR("respawn epoch ceiling reached "
+					    "(%d/%d) — entering cooldown %d/%d "
+					    "for %ds; healthy workers continue",
+					    p->total_respawns, respawn_ceil,
+					    p->respawn_cooldown_count,
+					    RESPAWN_MAX_COOLDOWNS,
+					    RESPAWN_COOLDOWN_SEC);
+				} else {
+					/* Cooldowns exhausted — check whether
+					 * any healthy throughput remains. */
+					int path_ok =
+					    (p->cfg.tput_path_healthy_kbps > 0)
+					    && (p->tput_last_raw_max_kbps >=
+					        p->cfg.tput_path_healthy_kbps);
+					if (path_ok) {
+						/* Some workers are still
+						 * productive — grant an
+						 * uncounted extension and warn
+						 * loudly rather than killing a
+						 * partially-complete transfer. */
+						p->respawn_resume_ns = now_ns +
+						    (uint64_t)RESPAWN_COOLDOWN_SEC
+						    * 1000000000ULL;
+						p->respawn_last_cooldown_ns =
+						    now_ns;
+						p->respawn_epoch_count = 0;
+						in_cooldown = 1;
+						WD_ERROR("WARNING: respawn "
+						    "cooldowns exhausted but "
+						    "path still healthy "
+						    "(max=%llukbps) — extending "
+						    "rather than aborting; "
+						    "investigate connection "
+						    "churn",
+						    (unsigned long long)
+						    p->tput_last_raw_max_kbps);
+					} else {
+						WD_ERROR("respawn cooldowns "
+						    "exhausted and path "
+						    "unhealthy (max=%llukbps) "
+						    "— persistent connection "
+						    "failure, aborting transfer",
+						    (unsigned long long)
+						    p->tput_last_raw_max_kbps);
+						sftp_parallel_abort(p);
+						break;
+					}
+				}
 			}
 
 			int target   = p->cfg.num_streams;
 			int slots    = target - cur_workers;
-			int to_spawn = (n_to_respawn < slots) ?
-			    n_to_respawn : slots;
+			int to_spawn = (!in_cooldown && p->respawn_owed > 0 &&
+			    slots > 0)
+			    ? ((p->respawn_owed < slots) ? p->respawn_owed : slots)
+			    : 0;
+			if (to_spawn > 0) {
+				WD_LOGIT("initiating respawn for %d worker(s) "
+				    "(current=%d target=%d owed=%d "
+				    "epoch=%d/%d cooldowns=%d/%d)",
+				    to_spawn, cur_workers, target,
+				    p->respawn_owed,
+				    p->respawn_epoch_count + to_spawn,
+				    respawn_ceil,
+				    p->respawn_cooldown_count,
+				    RESPAWN_MAX_COOLDOWNS);
+			}
 			for (int i = 0; i < to_spawn; i++) {
 				if (p->abort_flag || p->stopped)
 					break;
 				pthread_mutex_lock(&p->workers_mu);
 				p->pending_respawns++;
 				p->total_respawns++;
+				p->respawn_epoch_count++;
 				pthread_mutex_unlock(&p->workers_mu);
 				pthread_t rtid;
 				if (pthread_create(&rtid, NULL,
 				    respawn_worker_thread, p) == 0) {
 					(void)pthread_detach(rtid);
+					/* Drain the backlog only on success;
+					 * a failed create leaves owed in place
+					 * so we retry on the next tick. */
+					p->respawn_owed--;
 				} else {
-					error_f("respawn thread create failed");
+					WD_ERROR("respawn thread create failed");
 					pthread_mutex_lock(&p->workers_mu);
 					p->pending_respawns--;
 					p->total_respawns--;
+					p->respawn_epoch_count--;
 					pthread_mutex_unlock(&p->workers_mu);
 				}
 			}
@@ -1194,7 +1747,7 @@ reporter_thread(void *arg)
 				int stuck = (p->pending > 0);
 				pthread_mutex_unlock(&p->pending_mu);
 				if (stuck) {
-					error_f("all workers gone with %llu "
+					WD_ERROR("all workers gone with %llu "
 					    "unit(s) pending -- aborting "
 					    "transfer",
 					    (unsigned long long)p->pending);
@@ -1270,7 +1823,7 @@ reporter_thread(void *arg)
 				    p->scale_bps_at_ceiling > 0.0 &&
 				    bps > p->scale_bps_at_ceiling *
 				        SCALE_CEIL_RESET_GAIN) {
-					logit_f("scale ceiling raised to %d: "
+					WD_LOGIT("scale ceiling raised to %d: "
 					    "%.1f → %.1f MiB/s (≥%.0f%% "
 					    "improvement)",
 					    SFTP_PARALLEL_MAX_WORKERS,
@@ -1303,7 +1856,7 @@ reporter_thread(void *arg)
 				     bps >= p->scale_bps_at_last_up *
 				         SCALE_UP_MIN_GAIN)) {
 					/* Scale up. */
-					logit_f("scaling up: %d → %d workers "
+					WD_LOGIT("scaling up: %d → %d workers "
 					    "(queue=%zu, %.1f MiB queued, "
 					    "%.1f MiB/s)",
 					    nw, nw + 1, qdepth,
@@ -1405,7 +1958,7 @@ reporter_thread(void *arg)
 					if (idle_signal || sat_signal) {
 						if (++p->scale_shallow_streak
 						    >= 2) {
-							logit_f("scaling down: "
+							WD_LOGIT("scaling down: "
 							    "%d → %d workers "
 							    "(%s, idle=%.0f%%, "
 							    "queue=%zu, "
@@ -1456,7 +2009,7 @@ reporter_thread(void *arg)
 									    new_ceil;
 									p->scale_bps_at_ceiling =
 									    bps;
-									logit_f(
+									WD_LOGIT(
 									    "scale "
 									    "ceiling "
 									    "set to "
@@ -1511,13 +2064,13 @@ spawn_one_worker(struct sftp_parallel *p)
 
 	if (spawn_worker_ssh(&p->cfg,
 	    &w->fd_in, &w->fd_out, &w->ssh_pid) != 0) {
-		error_f("ssh spawn failed");
+		WD_ERROR("ssh spawn failed");
 		goto fail;
 	}
 	w->conn = sftp_init(w->fd_in, w->fd_out, buflen, nreq,
 	    p->cfg.limit_kbps);
 	if (w->conn == NULL) {
-		error_f("sftp_init failed");
+		WD_ERROR("sftp_init failed");
 		goto fail;
 	}
 	sftp_set_live_counter(w->conn, &w->live_bytes);
@@ -1541,7 +2094,7 @@ spawn_one_worker(struct sftp_parallel *p)
 	pthread_mutex_unlock(&p->workers_mu);
 
 	if (pthread_create(&w->tid, NULL, worker_thread, w) != 0) {
-		error_f("pthread_create failed");
+		WD_ERROR("pthread_create failed");
 		/* Roll back insertion. */
 		pthread_mutex_lock(&p->workers_mu);
 		for (int i = 0; i < p->num_workers; i++) {
@@ -1634,6 +2187,13 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 
 	struct sftp_parallel *p = xcalloc(1, sizeof(*p));
 	p->cfg = *cfg;
+	/* cfg.port may point to a stack buffer in the caller that is only
+	 * valid until the enclosing scope exits.  Copy it into p->cfg_port_buf
+	 * so the orchestrator owns the string for its entire lifetime. */
+	if (cfg->port && cfg->port[0]) {
+		strlcpy(p->cfg_port_buf, cfg->port, sizeof(p->cfg_port_buf));
+		p->cfg.port = p->cfg_port_buf;
+	}
 	/* scale_ceiling starts at the hard cap; saturation-triggered scale-downs
 	 * ratchet it down, and SCALE_CEIL_RESET_GAIN lifts it back up. */
 	p->scale_ceiling = SFTP_PARALLEL_MAX_WORKERS;
@@ -1684,7 +2244,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 			sctx[i].succeeded      = 0;
 			if (pthread_create(&stids[i], NULL,
 			    do_parallel_spawn, &sctx[i]) != 0) {
-				error_f("spawn thread %d failed", i);
+				WD_ERROR("spawn thread %d failed", i);
 				/* Join threads already launched. */
 				for (int j = 0; j < i; j++)
 					pthread_join(stids[j], NULL);
@@ -1696,7 +2256,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		for (int i = 0; i < n; i++) {
 			pthread_join(stids[i], NULL);
 			if (!sctx[i].succeeded) {
-				error_f("worker %d setup failed", i);
+				WD_ERROR("worker %d setup failed", i);
 				failed = 1;
 			}
 		}
