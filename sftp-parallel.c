@@ -2693,6 +2693,17 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 		p->fs_info_cached = 1;
 	}
 
+	/* Lustre heuristic: server reports fs_type="lustre" but lfs getstripe
+	 * was unavailable so stripe_size=0.  1 MiB is the Lustre installation
+	 * default stripe unit.  stripe_count is unknown so set it high and let
+	 * max_ranges govern instead. */
+	if (strcmp(info.fs_type, "lustre") == 0 && info.stripe_size == 0) {
+		info.stripe_size  = 1024 * 1024;
+		info.stripe_count = SFTP_PARALLEL_MAX_WORKERS;
+		debug3("hpn-fs-info: lustre lfs unavailable, "
+		    "applying 1 MiB stripe heuristic");
+	}
+
 	/* Only range-split when the server reports parallel-FS stripe info.
 	 * On regular filesystems concurrent writes to one inode contend; the
 	 * scaler will still grow workers across multiple files. */
