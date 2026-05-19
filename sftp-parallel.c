@@ -2693,15 +2693,28 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 		p->fs_info_cached = 1;
 	}
 
-	/* Lustre heuristic: server reports fs_type="lustre" but lfs getstripe
-	 * was unavailable so stripe_size=0.  1 MiB is the Lustre installation
-	 * default stripe unit.  stripe_count is unknown so set it high and let
-	 * max_ranges govern instead. */
-	if (strcmp(info.fs_type, "lustre") == 0 && info.stripe_size == 0) {
-		info.stripe_size  = 1024 * 1024;
-		info.stripe_count = SFTP_PARALLEL_MAX_WORKERS;
-		debug3("hpn-fs-info: lustre lfs unavailable, "
-		    "applying 1 MiB stripe heuristic");
+	/* Lustre: only range-split when lfs getstripe returned values within
+	 * the known-valid range (64 KiB–1 GiB, stripe_count 1–4096).  Any
+	 * other result — including stripe_size=0 (lfs unavailable) — is
+	 * unexpected; warn and fall back to whole-file.
+	 * NOTE: the 1 GiB upper bound on stripe_size is conservative and may
+	 * need to be raised — Lustre installations with very large OSTs can
+	 * be configured with stripe sizes well above 1 GiB.  Needs further
+	 * investigation before widening the gate. */
+	if (strcmp(info.fs_type, "lustre") == 0) {
+		if (info.stripe_size < 64 * 1024 ||
+		    info.stripe_size > (uint64_t)1024 * 1024 * 1024 ||
+		    info.stripe_count == 0 ||
+		    info.stripe_count > 4096) {
+			logit("hpn-fs-info: Lustre detected but"
+			    " stripe_size=%llu stripe_count=%u"
+			    " is outside expected range"
+			    " (64 KiB–1 GiB, 1–4096);"
+			    " skipping range split for \"%s\"",
+			    (unsigned long long)info.stripe_size,
+			    info.stripe_count, remote_path);
+			goto whole_file;
+		}
 	}
 
 	/* GPFS heuristic: block_size from statvfs() is the GPFS I/O block size.
