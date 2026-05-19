@@ -675,7 +675,7 @@ pending_trace(const char *action, struct sftp_parallel *p,
 		return;
 	const char *src = (u && u->src_path) ? u->src_path : "(null)";
 	const char *dst = (u && u->dst_path) ? u->dst_path : "(null)";
-	int op = u ? u->op : -1;
+	int op = u ? (int)u->op : -1;
 	logit_f("PTRACE %s pending=%llu op=%d u=%p w=%d site=%s src=%s dst=%s",
 	    action, (unsigned long long)p->pending, op, (const void *)u,
 	    worker_id, site, src, dst);
@@ -2702,6 +2702,28 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 		info.stripe_count = SFTP_PARALLEL_MAX_WORKERS;
 		debug3("hpn-fs-info: lustre lfs unavailable, "
 		    "applying 1 MiB stripe heuristic");
+	}
+
+	/* GPFS heuristic: block_size from statvfs() is the GPFS I/O block size.
+	 * Valid GPFS block sizes are 256K–16M (IBM Spectrum Scale docs); 1 MiB
+	 * is the common HPC default.  If block_size is below the minimum valid
+	 * GPFS value it means statvfs returned a bogus result or the GPFS magic
+	 * number matched a false positive — warn and skip range splitting rather
+	 * than guessing.  GPFS has no fixed stripe_count equivalent so set it
+	 * high and let max_ranges govern. */
+	if (strcmp(info.fs_type, "gpfs") == 0 && info.stripe_size == 0) {
+		if (info.block_size < 256 * 1024 ||
+		    info.block_size > 16 * 1024 * 1024) {
+			logit("hpn-fs-info: GPFS detected but block_size=%llu "
+			    "is outside the valid GPFS range (256 KiB–16 MiB);"
+			    " skipping range split for \"%s\"",
+			    (unsigned long long)info.block_size, remote_path);
+			goto whole_file;
+		}
+		info.stripe_size  = info.block_size;
+		info.stripe_count = SFTP_PARALLEL_MAX_WORKERS;
+		debug3("hpn-fs-info: gpfs, using block_size=%llu as stripe unit",
+		    (unsigned long long)info.stripe_size);
 	}
 
 	/* Only range-split when the server reports parallel-FS stripe info.
