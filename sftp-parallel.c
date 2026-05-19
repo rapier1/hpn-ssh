@@ -1934,6 +1934,7 @@ reporter_thread(void *arg)
 					 * pauses.
 					 */
 					double max_idle_frac = 0.0;
+					uint64_t total_in_flight = 0;
 					uint64_t now_ns = monotonic_ns();
 					pthread_mutex_lock(&p->workers_mu);
 					for (int wi = 0; wi < p->num_workers;
@@ -1965,15 +1966,37 @@ reporter_thread(void *arg)
 						    (double)tot : 0.0;
 						if (frac > max_idle_frac)
 							max_idle_frac = frac;
+						total_in_flight +=
+						    ww->units_started -
+						    ww->units_completed -
+						    ww->units_failed;
 						pthread_mutex_unlock(&ww->mu);
 					}
 					pthread_mutex_unlock(&p->workers_mu);
 
+					/*
+					 * Idle signal: a worker was mostly
+					 * blocked waiting for work AND there
+					 * is genuinely less work than workers
+					 * (queued + in-flight < num_workers).
+					 *
+					 * The in-flight guard is the critical
+					 * fix for the Phase 3a deadlock: the
+					 * original condition used only qdepth,
+					 * which is 0 when all work has been
+					 * popped but workers are still
+					 * actively transferring.  That caused
+					 * spurious scale-down while files were
+					 * in progress, starving the transfer
+					 * of workers and leaving threads
+					 * blocked in futex for the duration
+					 * of the remaining large files.
+					 */
 					int idle_signal =
 					    nw > 1 &&
 					    max_idle_frac > SCALE_DOWN_IDLE_FRAC &&
-					    qdepth < (size_t)(nw *
-					        UPLOAD_BATCH_SIZE);
+					    total_in_flight + qdepth <
+					        (size_t)nw;
 
 					int sat_signal =
 					    nw > 1 &&
