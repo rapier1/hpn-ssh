@@ -215,6 +215,17 @@ void sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
     volatile sig_atomic_t *flag);
 
 /*
+ * Register an app-layer round-trip-time estimate (microseconds) for the
+ * remote path.  Used by the reporter's tput-outlier check to compute a
+ * BDP-sized warmup threshold so newly-respawned workers in TCP slow-start
+ * are not killed before they have a chance to ramp.  Sampling RTT once on
+ * the control connection right after sftp_parallel_start() is sufficient:
+ * every worker connection traverses the same path.  Pass 0 to indicate
+ * "unknown" and fall back to the fixed-tick warmup gate.
+ */
+void sftp_parallel_set_path_rtt(struct sftp_parallel *p, uint64_t rtt_us);
+
+/*
  * Drive a single global progress_meter for the duration of an aggregate
  * batch (e.g. a put/get command's worth of submissions). Call _start
  * before submitting; the orchestrator's reporter thread will update the

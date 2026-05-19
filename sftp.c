@@ -3026,6 +3026,51 @@ main(int argc, char **argv)
 		} else {
 			sftp_parallel_set_interrupt_flag(parallel_orch,
 			    &interrupted);
+
+			/*
+			 * Sample app-layer path RTT on the control connection.
+			 * sftp_realpath does one SSH2_FXP_REALPATH round trip,
+			 * which is the cheapest small request available after
+			 * do_init has run.  Median of a few samples filters
+			 * jitter from a single noisy round-trip without paying
+			 * many extra RTTs at startup.  Passed to the orchestrator
+			 * so the reporter can size its outlier-warmup correctly
+			 * (see RAMP_RTTS in sftp-parallel.c).
+			 */
+			{
+				uint64_t samples[3] = {0, 0, 0};
+				int got = 0;
+				for (int i = 0; i < 3; i++) {
+					double t0 = monotime_double();
+					char *r = sftp_realpath(conn, ".");
+					double t1 = monotime_double();
+					if (r == NULL)
+						break;
+					free(r);
+					samples[got++] = (uint64_t)
+					    ((t1 - t0) * 1e6);
+				}
+				if (got > 0) {
+					/* Simple insertion sort + median. */
+					for (int i = 1; i < got; i++) {
+						uint64_t v = samples[i];
+						int j = i - 1;
+						while (j >= 0 &&
+						    samples[j] > v) {
+							samples[j+1] =
+							    samples[j];
+							j--;
+						}
+						samples[j+1] = v;
+					}
+					uint64_t rtt_us = samples[got / 2];
+					sftp_parallel_set_path_rtt(
+					    parallel_orch, rtt_us);
+					debug_f("control-path RTT: "
+					    "%llu us (median of %d samples)",
+					    (unsigned long long)rtt_us, got);
+				}
+			}
 		}
 	}
 

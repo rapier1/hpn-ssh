@@ -129,6 +129,23 @@ extern int showprogress;
 #define TPUT_EMA_WARMUP_TICKS   5
 
 /*
+ * Outlier-detection ramp gate.  A worker's tput EMA cannot be fairly
+ * compared against the path max until the worker's TCP connection has had
+ * time to ramp through slow-start.  Number of RTTs we wait for that ramp
+ * before applying the outlier check.  log2(BDP / initial_cwnd) ≈ 7-9 on
+ * typical Gbps/50ms paths; doubling that for safety gives ~RAMP_RTTS = 20.
+ * Multiplied by the path RTT and peer throughput, this becomes a per-worker
+ * "minimum bytes transferred" threshold (see watchdog_sample_throughput).
+ *
+ * RAMP_WARMUP_BYTES_MIN/MAX clamp the computed threshold so warmup never
+ * dips below a useful floor or blows up on a high-BDP path where the EMA
+ * may itself be misleading early on.
+ */
+#define RAMP_RTTS                 20
+#define RAMP_WARMUP_BYTES_MIN     (16ULL * 1024 * 1024)    /* 16 MiB */
+#define RAMP_WARMUP_BYTES_MAX     (256ULL * 1024 * 1024)   /* 256 MiB */
+
+/*
  * Adaptive scaling cadence.  SCALE_CHECK_TICKS controls how often (in
  * reporter ticks) the scaler samples throughput and evaluates up/down
  * decisions.  SCALE_COOLDOWN_TICKS is the minimum number of ticks that
@@ -394,6 +411,16 @@ struct sftp_parallel {
 	 * non-zero, which wakes sftp_parallel_wait() within one reporter
 	 * tick (~200ms) rather than waiting for workers to finish naturally. */
 	volatile sig_atomic_t      *ext_interrupt_flag;
+
+	/*
+	 * App-layer RTT measured on the control connection at startup
+	 * (microseconds; 0 = not measured).  Used to size the per-worker
+	 * outlier-detection warmup so newly-respawned workers in TCP
+	 * slow-start aren't killed before their cwnd has had ~RAMP_RTTS
+	 * round-trips to ramp.  Set once via sftp_parallel_set_path_rtt;
+	 * read by the reporter thread.
+	 */
+	uint64_t                    path_rtt_us;
 
 	int                         saved_showprogress;
 	int                         progress_meter_started;
@@ -1235,6 +1262,37 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 			continue;
 		}
 
+		/*
+		 * TCP slow-start gate.  A worker must transfer at least
+		 * (peer-throughput × path_rtt × RAMP_RTTS) bytes before its
+		 * EMA is comparable to the path max.  Without this, a fresh
+		 * worker is condemned as an outlier while its cwnd is still
+		 * ramping — the very failure mode that drove respawn-churn
+		 * loops when one worker died and its replacement got killed
+		 * on its first tick of slow-start traffic.
+		 *
+		 * Skip when no RTT is known (p->path_rtt_us == 0); the
+		 * tick-based EMA warmup above is the fallback in that case.
+		 */
+		if (p->path_rtt_us > 0 && max_ema_kbps > 0) {
+			uint64_t warmup_bytes =
+			    ((uint64_t)max_ema_kbps * p->path_rtt_us *
+			        (uint64_t)RAMP_RTTS) / 8000ULL;
+			if (warmup_bytes < RAMP_WARMUP_BYTES_MIN)
+				warmup_bytes = RAMP_WARMUP_BYTES_MIN;
+			if (warmup_bytes > RAMP_WARMUP_BYTES_MAX)
+				warmup_bytes = RAMP_WARMUP_BYTES_MAX;
+
+			uint64_t b;
+			pthread_mutex_lock(&w->mu);
+			b = w->bytes_total;
+			pthread_mutex_unlock(&w->mu);
+			if (b < warmup_bytes) {
+				w->tput_outlier_ticks = 0;
+				continue;
+			}
+		}
+
 		if (w->tput_ema_kbps < threshold_kbps) {
 			w->tput_outlier_ticks++;
 			debug_ft("worker %d tput-outlier: "
@@ -1293,13 +1351,24 @@ watchdog_check_workers(struct sftp_parallel *p)
 		next = WORKER_HEALTHY;
 
 		/* SSH child gone is the strongest signal — detectable
-		 * immediately via kill(0). The worker thread will notice
-		 * on its next I/O (pipe EOF), but the probe lets the
-		 * watchdog classify and act without waiting. */
-		if (w->ssh_pid > 0 && kill(w->ssh_pid, 0) != 0 &&
-		    errno == ESRCH) {
-			next = WORKER_DEAD;
-		} else if (queue_has_work && in_flight > 0 &&
+		 * without waiting for the worker thread's next I/O.
+		 *
+		 * waitpid(WNOHANG|WNOWAIT) returns the pid if the child
+		 * has exited (including zombies), 0 if it is still running,
+		 * and -1/ECHILD if it has already been reaped.  WNOWAIT
+		 * leaves the zombie in place so the reap loop's blocking
+		 * waitpid still succeeds.  kill(0) alone misses the
+		 * SIGKILL-then-zombie case because a zombie's pid is still
+		 * present in the process table. */
+		if (w->ssh_pid > 0) {
+			int wstatus;
+			pid_t wr = waitpid(w->ssh_pid, &wstatus,
+			    WNOHANG | WNOWAIT);
+			if (wr == w->ssh_pid ||
+			    (wr == -1 && errno == ECHILD))
+				next = WORKER_DEAD;
+		}
+		if (next != WORKER_DEAD && queue_has_work && in_flight > 0 &&
 		    since_completion_ns > 0) {
 			uint64_t s = since_completion_ns / 1000000000ULL;
 			if (s > DEAD_THRESHOLD_SEC)
@@ -1407,6 +1476,19 @@ watchdog_check_workers(struct sftp_parallel *p)
 				debug_ft("worker %d: sent SIGTERM to ssh "
 				    "child (pid %ld)", w->id,
 				    (long)w->ssh_pid);
+				/*
+				 * A dying worker causes a throughput drop that
+				 * would misfire sat_signal against the stale
+				 * pre-death bps reference.  Clear it so the
+				 * next scale evaluation starts fresh, and
+				 * impose a cooldown so the scaler waits for
+				 * the respawn to settle before acting.
+				 */
+				p->scale_bps_at_last_up = 0.0;
+				p->scale_cooldown_ticks = SCALE_COOLDOWN_TICKS;
+				debug_ft("adaptive scaling: worker %d died — "
+				    "bps reference cleared, cooldown imposed",
+				    w->id);
 			}
 			any_dead = 1;
 		}
@@ -1911,10 +1993,16 @@ reporter_thread(void *arg)
 					}
 					p->scale_shallow_streak = 0;
 					p->scale_cooldown_ticks = SCALE_COOLDOWN_TICKS;
-				} else {
+				} else if (pending_rs == 0) {
 					/*
-					 * Scale-down evaluation.  Two independent
-					 * signals, either can trigger:
+					 * Scale-down evaluation.  Skipped entirely
+					 * while a respawn is in progress: a dying
+					 * worker causes an apparent throughput drop
+					 * that would misfire sat_signal and remove a
+					 * healthy worker, compounding the problem.
+					 * Wait for the respawn to settle first.
+					 *
+					 * Two independent signals, either can trigger:
 					 *
 					 * Idle signal: at least one worker spent
 					 * >SCALE_DOWN_IDLE_FRAC of its wall time
@@ -2087,6 +2175,26 @@ reporter_thread(void *arg)
 						}
 					} else {
 						p->scale_shallow_streak = 0;
+						/* Log when the in-flight gate is
+						 * actively suppressing scale-down
+						 * (queue empty but workers have
+						 * in-flight units).  The test
+						 * harness checks for this string
+						 * to verify the fix is working. */
+						if (nw > 1 &&
+						    max_idle_frac >
+						        SCALE_DOWN_IDLE_FRAC &&
+						    qdepth == 0 &&
+						    total_in_flight >=
+						        (uint64_t)nw)
+							debug_ft("adaptive "
+							    "scaling: idle_signal "
+							    "suppressed: "
+							    "%llu in-flight, "
+							    "queue=0, "
+							    "%d workers",
+							    (unsigned long long)
+							    total_in_flight, nw);
 					}
 				}
 			}
@@ -2438,6 +2546,13 @@ sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
 {
 	if (p != NULL)
 		p->ext_interrupt_flag = flag;
+}
+
+void
+sftp_parallel_set_path_rtt(struct sftp_parallel *p, uint64_t rtt_us)
+{
+	if (p != NULL)
+		p->path_rtt_us = rtt_us;
 }
 
 void
@@ -2864,16 +2979,21 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (!stripe_info_viable(&info, remote_path))
 		goto whole_file;
 
-	range_size = (off_t)info.stripe_size;
-	num_ranges = (int)(file_size / range_size);
-	if (num_ranges < 1)  num_ranges = 1;
-	if (num_ranges > (int)info.stripe_count)
-		num_ranges = (int)info.stripe_count;
+	/* Same rationale as maybe_submit_upload: pick num_ranges first
+	 * (one per OST up to stripe_count, capped by max_ranges), then
+	 * size each range to file_size/num_ranges rounded up to a stripe
+	 * boundary so workers don't share a stripe. */
+	num_ranges = (int)info.stripe_count;
 	if (num_ranges > max_ranges)
 		num_ranges = max_ranges;
-
 	if (num_ranges < 2)
 		goto whole_file;
+
+	{
+		off_t per_range = (file_size + num_ranges - 1) / num_ranges;
+		off_t stripe   = (off_t)info.stripe_size;
+		range_size = ((per_range + stripe - 1) / stripe) * stripe;
+	}
 
 	if (submit_download_ranges(p, remote_path, local_path,
 	    file_size, mode, range_size, num_ranges) == 0)
@@ -2941,18 +3061,24 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (!stripe_info_viable(&info, remote_path))
 		goto whole_file;
 
-	/* Stripe-aligned: use stripe_size as the range unit, cap at
-	 * stripe_count (writing to more workers than OSTs wastes locks). */
-	range_size  = (off_t)info.stripe_size;
-	num_ranges  = (int)(file_size / range_size);
-	if (num_ranges < 1)  num_ranges = 1;
-	if (num_ranges > (int)info.stripe_count)
-		num_ranges = (int)info.stripe_count;
+	/* Stripe-aware: pick one range per OST up to stripe_count, capped
+	 * by max_ranges (scaler ceiling).  Each range then gets
+	 * file_size/num_ranges bytes, rounded up to a stripe_size boundary
+	 * so neighbouring workers don't share a stripe and contend on OST
+	 * locks.  (The previous version used stripe_size itself as the
+	 * range unit, which gave one worker ~all of a large file and left
+	 * the rest with a single stripe each.) */
+	num_ranges = (int)info.stripe_count;
 	if (num_ranges > max_ranges)
 		num_ranges = max_ranges;
-
 	if (num_ranges < 2)
 		goto whole_file;
+
+	{
+		off_t per_range = (file_size + num_ranges - 1) / num_ranges;
+		off_t stripe   = (off_t)info.stripe_size;
+		range_size = ((per_range + stripe - 1) / stripe) * stripe;
+	}
 
 	if (submit_upload_ranges(p, conn, local_path, remote_path,
 	    file_size, mode, range_size, num_ranges) == 0)
