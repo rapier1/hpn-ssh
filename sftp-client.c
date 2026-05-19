@@ -785,8 +785,13 @@ sftp_get_limits(struct sftp_conn *conn, struct sftp_limits *limits)
 		fatal_fr(r, "parse");
 
 	debug3("Received limits reply T:%u I:%u", type, msg_id);
-	if (id != msg_id)
-		fatal("ID mismatch (%u != %u)", msg_id, id);
+	if (id != msg_id) {
+		error_f("ID mismatch (%u != %u) - possible protocol corruption",
+		    msg_id, id);
+		sftp_hpn_set_protocol_violation(conn->hpn);
+		sshbuf_free(msg);
+		return -1;
+	}
 	if (type != SSH2_FXP_EXTENDED_REPLY) {
 		debug_f("expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
 		    SSH2_FXP_EXTENDED_REPLY, type);
@@ -895,8 +900,13 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 
 		debug3("Received reply T:%u I:%u", type, id);
 
-		if (id != expected_id)
-			fatal("ID mismatch (%u != %u)", id, expected_id);
+		if (id != expected_id) {
+			error_f("ID mismatch (%u != %u) - possible protocol corruption",
+			    id, expected_id);
+			sftp_hpn_set_protocol_violation(conn->hpn);
+			status = -1;
+			goto out;
+		}
 
 		if (type == SSH2_FXP_STATUS) {
 			u_int rstatus;
@@ -908,9 +918,13 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 				break;
 			error("Couldn't read directory: %s", fx2txt(rstatus));
 			goto out;
-		} else if (type != SSH2_FXP_NAME)
-			fatal("Expected SSH2_FXP_NAME(%u) packet, got %u",
-			    SSH2_FXP_NAME, type);
+		} else if (type != SSH2_FXP_NAME) {
+			error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
+			    "possible protocol corruption", SSH2_FXP_NAME, type);
+			sftp_hpn_set_protocol_violation(conn->hpn);
+			status = -1;
+			goto out;
+		}
 
 		if ((r = sshbuf_get_u32(msg, &count)) != 0)
 			fatal_fr(r, "parse count");
@@ -1176,8 +1190,13 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
 		fatal_fr(r, "parse");
 
-	if (id != expected_id)
-		fatal("ID mismatch (%u != %u)", id, expected_id);
+	if (id != expected_id) {
+		error_f("ID mismatch (%u != %u) - possible protocol corruption",
+		    id, expected_id);
+		sftp_hpn_set_protocol_violation(conn->hpn);
+		sshbuf_free(msg);
+		return NULL;
+	}
 
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
@@ -1191,9 +1210,13 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 		free(errmsg);
 		sshbuf_free(msg);
 		return NULL;
-	} else if (type != SSH2_FXP_NAME)
-		fatal("Expected SSH2_FXP_NAME(%u) packet, got %u",
-		    SSH2_FXP_NAME, type);
+	} else if (type != SSH2_FXP_NAME) {
+		error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
+		    "possible protocol corruption", SSH2_FXP_NAME, type);
+		sftp_hpn_set_protocol_violation(conn->hpn);
+		sshbuf_free(msg);
+		return NULL;
+	}
 
 	if ((r = sshbuf_get_u32(msg, &count)) != 0)
 		fatal_fr(r, "parse count");
@@ -1526,8 +1549,13 @@ sftp_readlink(struct sftp_conn *conn, const char *path)
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
 		fatal_fr(r, "parse");
 
-	if (id != expected_id)
-		fatal("ID mismatch (%u != %u)", id, expected_id);
+	if (id != expected_id) {
+		error_f("ID mismatch (%u != %u) - possible protocol corruption",
+		    id, expected_id);
+		sftp_hpn_set_protocol_violation(conn->hpn);
+		sshbuf_free(msg);
+		return NULL;
+	}
 
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
@@ -1537,9 +1565,13 @@ sftp_readlink(struct sftp_conn *conn, const char *path)
 		error("Couldn't readlink: %s", fx2txt(status));
 		sshbuf_free(msg);
 		return(NULL);
-	} else if (type != SSH2_FXP_NAME)
-		fatal("Expected SSH2_FXP_NAME(%u) packet, got %u",
-		    SSH2_FXP_NAME, type);
+	} else if (type != SSH2_FXP_NAME) {
+		error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
+		    "possible protocol corruption", SSH2_FXP_NAME, type);
+		sftp_hpn_set_protocol_violation(conn->hpn);
+		sshbuf_free(msg);
+		return NULL;
+	}
 
 	if ((r = sshbuf_get_u32(msg, &count)) != 0)
 		fatal_fr(r, "parse count");
@@ -1948,8 +1980,26 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			}
 			break;
 		default:
-			fatal("Expected SSH2_FXP_DATA(%u) packet, got %u",
-			    SSH2_FXP_DATA, type);
+			error_f("Expected SSH2_FXP_DATA(%u) packet, got %u - "
+			    "possible protocol corruption", SSH2_FXP_DATA, type);
+			sftp_hpn_set_protocol_violation(conn->hpn);
+			read_error = 1;
+			/*
+			 * Drain the in-flight TAILQ inline so the outer while
+			 * exits on the NEXT condition check (num_req == 0 &&
+			 * max_req == 0) rather than waiting for get_msg() to
+			 * fail.  This guarantees the "requests still in queue"
+			 * sanity fatal() below is unreachable on the protocol-
+			 * violation path, and avoids one extra get_msg() RTT
+			 * against a connection we already know is dead.
+			 */
+			while ((req = TAILQ_FIRST(&requests)) != NULL) {
+				TAILQ_REMOVE(&requests, req, tq);
+				free(req);
+			}
+			num_req = 0;
+			max_req = 0;
+			break;
 		}
 	}
 
@@ -3253,8 +3303,20 @@ handle_dest_replies(struct sftp_conn *to, const char *to_path, int synchronous,
 			fatal_fr(r, "dest parse");
 		debug3("Received dest reply T:%u I:%u R:%u", type, id, *nreqsp);
 		if (type != SSH2_FXP_STATUS) {
-			fatal_f("Expected SSH2_FXP_STATUS(%d) packet, got %d",
-			    SSH2_FXP_STATUS, type);
+			error_f("Expected SSH2_FXP_STATUS(%d) packet, got %d - "
+			    "possible protocol corruption", SSH2_FXP_STATUS, type);
+			sftp_hpn_set_protocol_violation(to->hpn);
+			if (*write_errorp == 0)
+				*write_errorp = SSH2_FX_CONNECTION_LOST;
+			/*
+			 * NOTE: *nreqsp is intentionally NOT decremented on
+			 * this exit path - we break with replies still
+			 * "outstanding".  Callers (sftp_crossload, scp) must
+			 * check *write_errorp for completion; do not trust
+			 * *nreqsp == 0 to mean "all writes acked" without
+			 * also verifying *write_errorp == 0.
+			 */
+			break;
 		}
 		if ((r = sshbuf_get_u32(msg, &status)) != 0)
 			fatal_fr(r, "parse dest status");
@@ -3473,8 +3535,18 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 			}
 			break;
 		default:
-			fatal("Expected SSH2_FXP_DATA(%u) packet, got %u",
-			    SSH2_FXP_DATA, type);
+			error_f("Expected SSH2_FXP_DATA(%u) packet, got %u - "
+			    "possible protocol corruption", SSH2_FXP_DATA, type);
+			sftp_hpn_set_protocol_violation(from->hpn);
+			read_error = 1;
+			/* See sftp_download() switch-default for rationale. */
+			while ((req = TAILQ_FIRST(&requests)) != NULL) {
+				TAILQ_REMOVE(&requests, req, tq);
+				free(req);
+			}
+			num_req = 0;
+			max_req = 0;
+			break;
 		}
 	}
 
@@ -3724,8 +3796,15 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
 		fatal_fr(r, "parse");
-	if (id != expected_id)
-		fatal("ID mismatch (%u != %u)", id, expected_id);
+	if (id != expected_id) {
+		error_f("ID mismatch (%u != %u) - possible protocol corruption",
+		    id, expected_id);
+		sftp_hpn_set_protocol_violation(conn->hpn);
+		sshbuf_free(msg);
+		sshbuf_free(uidbuf);
+		sshbuf_free(gidbuf);
+		return -1;
+	}
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
 		char *errmsg;
@@ -3740,9 +3819,15 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 		sshbuf_free(uidbuf);
 		sshbuf_free(gidbuf);
 		return -1;
-	} else if (type != SSH2_FXP_EXTENDED_REPLY)
-		fatal("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
-		    SSH2_FXP_EXTENDED_REPLY, type);
+	} else if (type != SSH2_FXP_EXTENDED_REPLY) {
+		error_f("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u - "
+		    "possible protocol corruption", SSH2_FXP_EXTENDED_REPLY, type);
+		sftp_hpn_set_protocol_violation(conn->hpn);
+		sshbuf_free(msg);
+		sshbuf_free(uidbuf);
+		sshbuf_free(gidbuf);
+		return -1;
+	}
 
 	/* reuse */
 	sshbuf_free(uidbuf);

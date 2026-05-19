@@ -752,8 +752,34 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 	}
 
 	if (parallel_orch != NULL) {
+		struct sftp_parallel_stats pstats;
+
 		sftp_parallel_wait(parallel_orch);
 		sftp_parallel_progress_stop(parallel_orch);
+		/*
+		 * Surface protocol violations to the user as a final summary.
+		 *
+		 * Reaching here with protocol_violations > 0 means exactly
+		 * one violation occurred during the transfer (two would have
+		 * fatal()'d in worker_thread under the two-strikes rule).
+		 * The transfer itself may have succeeded via worker respawn
+		 * - retry of the affected work unit by a fresh worker - so
+		 * we do NOT force err = -1 here.  Per-unit failures, if any,
+		 * have already been reflected in err by the dispatch loop
+		 * above.
+		 *
+		 * The point of this message is to keep the user aware: a
+		 * single violation can be a NIC bit-flip on a long run, but
+		 * if they see it repeatedly across transfers they should
+		 * investigate the path / server / hardware.
+		 */
+		sftp_parallel_get_stats(parallel_orch, &pstats);
+		if (pstats.protocol_violations > 0) {
+			logit("warning: %d worker protocol violation detected "
+			    "(recovered via worker respawn) - investigate if "
+			    "this recurs across transfers",
+			    pstats.protocol_violations);
+		}
 	}
 
 out:
@@ -880,8 +906,18 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 	}
 
 	if (parallel_orch != NULL) {
+		struct sftp_parallel_stats pstats;
+
 		sftp_parallel_wait(parallel_orch);
 		sftp_parallel_progress_stop(parallel_orch);
+		/* See process_get parallel_orch wait — same rationale. */
+		sftp_parallel_get_stats(parallel_orch, &pstats);
+		if (pstats.protocol_violations > 0) {
+			logit("warning: %d worker protocol violation detected "
+			    "(recovered via worker respawn) - investigate if "
+			    "this recurs across transfers",
+			    pstats.protocol_violations);
+		}
 	}
 
 out:
@@ -2335,8 +2371,14 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	}
 #endif /* USE_LIBEDIT */
 
-	if ((remote_path = sftp_realpath(conn, ".")) == NULL)
+	if ((remote_path = sftp_realpath(conn, ".")) == NULL) {
+		/* Distinguish protocol corruption from a generic "no cwd" so
+		 * the user knows whether to investigate the server. */
+		if (sftp_conn_is_protocol_violation(conn))
+			fatal("control connection protocol violation during "
+			    "init - possible MITM or server corruption");
 		fatal("Need cwd");
+	}
 	startdir = xstrdup(remote_path);
 
 	if (file1 != NULL) {
@@ -2349,6 +2391,13 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 			snprintf(cmd, sizeof cmd, "cd \"%s\"", dir);
 			if (parse_dispatch_command(conn, cmd,
 			    &remote_path, startdir, 1, 0) != 0) {
+				/* Early dispatch (pre-interactive_loop): same
+				 * fail-stop on protocol violation as the main
+				 * loop check at the bottom of interactive_loop. */
+				if (sftp_conn_is_protocol_violation(conn))
+					fatal("control connection protocol "
+					    "violation - possible MITM or "
+					    "server corruption");
 				free(dir);
 				free(startdir);
 				free(remote_path);
@@ -2363,6 +2412,11 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 			    file2 == NULL ? "" : file2);
 			err = parse_dispatch_command(conn, cmd,
 			    &remote_path, startdir, 1, 0);
+			/* Early dispatch (pre-interactive_loop): same
+			 * fail-stop on protocol violation as the main loop. */
+			if (sftp_conn_is_protocol_violation(conn))
+				fatal("control connection protocol violation "
+				    "- possible MITM or server corruption");
 			free(dir);
 			free(startdir);
 			free(remote_path);
@@ -2428,6 +2482,9 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 
 		err = parse_dispatch_command(conn, cmd, &remote_path,
 		    startdir, batchmode, !interactive && el == NULL);
+		if (sftp_conn_is_protocol_violation(conn))
+			fatal("control connection protocol violation - "
+			    "possible MITM or server corruption");
 		if (err != 0)
 			break;
 	}

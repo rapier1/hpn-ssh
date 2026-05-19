@@ -969,21 +969,66 @@ worker_thread(void *arg)
 			pthread_mutex_unlock(&w->mu);
 		}
 
-		/* Protocol violation (ID mismatch, unexpected packet type):
-		 * possible MITM attack or serious server corruption. Do not
-		 * retry — increment the orchestrator violation counter and
-		 * abort the entire transfer. A fresh connection to a MITM
-		 * would repeat the same violation. Unit cleanup already
-		 * handled above by worker_process_result / batch result loop. */
+		/*
+		 * Protocol violation handling: two-strikes policy.
+		 *
+		 * A protocol violation (ID mismatch or unexpected packet
+		 * type at sftp-client.c boundaries) means the wire data
+		 * does not match what we expect.  Possible causes:
+		 *
+		 *   (a) Random bit-flip on a long transfer.  Historically
+		 *       seen with a NIC silicon bug that occasionally
+		 *       corrupted a byte over multi-hour runs.  This is the
+		 *       common, benign-but-noisy case we want to tolerate.
+		 *   (b) Buggy / compromised server, in-channel tampering,
+		 *       persistent hardware fault.  Rare but serious — we
+		 *       must not paper over it.
+		 *
+		 * Strike 1: log loudly, increment p->protocol_violations,
+		 * fall through to the sftp_conn_is_dead() branch below.
+		 * The connection is already marked dead by
+		 * sftp_hpn_set_protocol_violation (in sftp-client.c) so the
+		 * worker exits involuntarily and the reporter's respawn
+		 * machinery (respawn_owed) replaces it with a fresh SSH
+		 * child.  Other workers and the control connection are
+		 * unaffected and the transfer continues.
+		 *
+		 * Strike 2 (lifetime per hpnsftp process): two independent
+		 * violations is a pattern, not bad luck.  fatal() out
+		 * immediately — the OS reaps the remaining SSH children
+		 * when the parent dies.  Unit cleanup for the current
+		 * work-unit was already handled above by
+		 * worker_process_result / the batch result loop.
+		 *
+		 * The threshold is intentionally a fixed count (2), not a
+		 * rate.  A correctly-functioning server should produce
+		 * zero violations even with many workers and long-running
+		 * transfers — SSH MAC integrity catches all in-channel
+		 * tampering at the cipher layer.  Anything that reaches
+		 * this code path is, by definition, abnormal.
+		 */
 		if (sftp_conn_is_protocol_violation(w->conn)) {
-			error_f("worker %d: protocol violation — possible MITM "
-			    "attack or server protocol corruption; "
-			    "aborting transfer", w->id);
+			int total;
+
 			pthread_mutex_lock(&p->workers_mu);
 			p->protocol_violations++;
+			total = p->protocol_violations;
 			pthread_mutex_unlock(&p->workers_mu);
-			sftp_parallel_abort(p);
-			break;
+
+			if (total >= 2) {
+				/* Strike 2: sustained pattern — abort process. */
+				fatal("worker %d: protocol violation #%d in "
+				    "this session - sustained pattern, "
+				    "aborting hpnsftp (possible server "
+				    "corruption, MITM, or persistent "
+				    "hardware fault)", w->id, total);
+			}
+			/* Strike 1: kill this worker, let orchestrator respawn.
+			 * The conn is already dead; falling through reaches
+			 * the sftp_conn_is_dead() check immediately below. */
+			error_f("worker %d: protocol violation #%d - killing "
+			    "worker and respawning; one more this session "
+			    "will exit hpnsftp", w->id, total);
 		}
 
 		/* Connection died during the transfer — this worker cannot
