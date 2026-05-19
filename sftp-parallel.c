@@ -146,6 +146,24 @@ extern int showprogress;
 #define RAMP_WARMUP_BYTES_MAX     (256ULL * 1024 * 1024)   /* 256 MiB */
 
 /*
+ * Isolation progress-rate gate.  When a worker is alone with an in-flight
+ * unit (queue empty, no peers transferring) the peer-EMA-based outlier path
+ * has no signal to compare against — max_kbps decays to zero as peers go
+ * idle, the "path is healthy" gate suppresses outlier escalation, and the
+ * worker falls through to the full STALL_THRESHOLD_SEC timeout (60 s) even
+ * if it's dribbling at a tiny fraction of expected throughput.
+ *
+ * ISOLATION_PROGRESS_STALL_SEC is a tighter timeout for that case: when a
+ * worker has held a unit for at least this long AND its EMA is below the
+ * configured tput_path_healthy_kbps floor, declare DEAD without waiting
+ * the full STALL_THRESHOLD_SEC.  Defense-in-depth for the "last worker
+ * holding the queue" wedge; the architectural fix (non-blocking
+ * sftp_parallel_wait between batch commands) is the cleaner long-term
+ * answer because it removes the isolation condition entirely.
+ */
+#define ISOLATION_PROGRESS_STALL_SEC  15
+
+/*
  * Adaptive scaling cadence.  SCALE_CHECK_TICKS controls how often (in
  * reporter ticks) the scaler samples throughput and evaluates up/down
  * decisions.  SCALE_COOLDOWN_TICKS is the minimum number of ticks that
@@ -296,6 +314,15 @@ struct sftp_worker {
 	 * race between clearing and the accounting update causes at most
 	 * a single-tick undercount, which is harmless for a 35% threshold. */
 	uint64_t           pop_start_ns;
+	/* Set to monotonic_ns() when a unit is popped off the workqueue
+	 * (after pop_start_ns is cleared), reset to 0 when the unit's
+	 * execute_unit returns.  Lets the watchdog measure how long the
+	 * worker has been holding its current unit even when
+	 * last_completion_ns is still 0 (worker wedged on its very first
+	 * unit — last_completion_ns never gets set, so the existing
+	 * since_completion_ns gate misses this case).  Atomic ACQUIRE/
+	 * RELEASE so the reporter sees a coherent value. */
+	uint64_t           unit_start_ns;
 	enum worker_health health;             /* set by reporter, read for log */
 
 	int                started;
@@ -818,6 +845,12 @@ worker_thread(void *arg)
 	sigaddset(&mask, SIGALRM);
 	pthread_sigmask(SIG_BLOCK, &mask, NULL);
 
+	/* DISPATCH-DIAG: worker has reached the main loop entry, fully
+	 * past spawn_one_worker / sftp_init.  If a worker is alive in
+	 * p->workers[] but this line never appears for its id, the
+	 * worker_thread itself never got scheduled / never started. */
+	debug_ft("dispatch-diag: worker %d entered main loop", w->id);
+
 	while (1) {
 		if (p->abort_flag)
 			break;
@@ -832,9 +865,34 @@ worker_thread(void *arg)
 		}
 		uint64_t t_work_start = monotonic_ns();
 		__atomic_store_n(&w->pop_start_ns, 0, __ATOMIC_RELEASE);
+		/* Mark when this worker took possession of a unit so the
+		 * watchdog can measure "how long has this worker been
+		 * holding the current unit" even if the worker has never
+		 * completed a previous unit.  Cleared at the end of this
+		 * iteration after the unit (or batch) has been processed. */
+		__atomic_store_n(&w->unit_start_ns, t_work_start,
+		    __ATOMIC_RELEASE);
 		struct sftp_work_unit *u0 = item;
-		if (u0 == NULL)
+		if (u0 == NULL) {
+			__atomic_store_n(&w->unit_start_ns, 0,
+			    __ATOMIC_RELEASE);
 			continue;
+		}
+
+		/* DISPATCH-DIAG: worker pulled a unit off the queue.  If
+		 * "entered main loop" appears for a worker but no "popped"
+		 * line ever follows, the worker is blocked in pop_blocking
+		 * with no signal reaching it. */
+		debug_ft("dispatch-diag: worker %d popped op=%d "
+		    "offset=%lld length=%lld src=\"%s\" dst=\"%s\" "
+		    "idle_us=%llu",
+		    w->id, (int)u0->op,
+		    (long long)u0->range_offset,
+		    (long long)u0->range_length,
+		    u0->src_path ? u0->src_path : "(null)",
+		    u0->dst_path ? u0->dst_path : "(null)",
+		    (unsigned long long)
+		        ((t_work_start - t_idle_start) / 1000ULL));
 		if (u0->size > 0)
 			__atomic_fetch_sub(&p->queued_bytes,
 			    (uint64_t)u0->size, __ATOMIC_RELAXED);
@@ -902,6 +960,17 @@ worker_thread(void *arg)
 				/* Single file — skip batch overhead. */
 				worker_record_start(w);
 				int rc = execute_unit(w, batch[0]);
+				/* DISPATCH-DIAG: log per-unit completion so we
+				 * can correlate transferred bytes back to the
+				 * specific worker.  Captured BEFORE
+				 * worker_process_result, which may re-queue or
+				 * free the unit. */
+				debug_ft("dispatch-diag: worker %d "
+				    "executed op=%d rc=%d offset=%lld "
+				    "length=%lld",
+				    w->id, (int)batch[0]->op, rc,
+				    (long long)batch[0]->range_offset,
+				    (long long)batch[0]->range_length);
 				worker_process_result(w, batch[0], rc);
 			} else {
 				/*
@@ -986,9 +1055,19 @@ worker_thread(void *arg)
 				worker_process_result(w, leftover, rc);
 			}
 		} else {
-			/* Download, mkdir, or other non-upload unit. */
+			/* Download, mkdir, or any range op (UPLOAD_RANGE /
+			 * DOWNLOAD_RANGE) — all bypass the upload-batch path. */
 			worker_record_start(w);
 			int rc = execute_unit(w, u0);
+			/* DISPATCH-DIAG: per-unit completion for range and
+			 * non-batched ops.  This is the path SFTP_OP_UPLOAD_RANGE
+			 * (op=4) takes — the earlier diag in the bn==1 branch
+			 * only covers whole-file uploads. */
+			debug_ft("dispatch-diag: worker %d executed op=%d "
+			    "rc=%d offset=%lld length=%lld",
+			    w->id, (int)u0->op, rc,
+			    (long long)u0->range_offset,
+			    (long long)u0->range_length);
 			worker_process_result(w, u0, rc);
 		}
 
@@ -1000,6 +1079,11 @@ worker_thread(void *arg)
 			w->work_ns += t_work_end - t_work_start;
 			pthread_mutex_unlock(&w->mu);
 		}
+
+		/* Unit (or batch) finished — clear the wedge-detection
+		 * timestamp so the watchdog only ever counts time spent
+		 * actually holding work. */
+		__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
 
 		/*
 		 * Protocol violation handling: two-strikes policy.
@@ -1283,10 +1367,22 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 			if (warmup_bytes > RAMP_WARMUP_BYTES_MAX)
 				warmup_bytes = RAMP_WARMUP_BYTES_MAX;
 
+			/*
+			 * Use bytes_total + live_bytes (continuous progress)
+			 * rather than bytes_total alone (completion-granular).
+			 * A worker whose first unit is hung at the server
+			 * never increments bytes_total — using it alone keeps
+			 * the warmup gate suppressed forever and lets the
+			 * outlier path miss a dribbling-but-not-zero worker.
+			 * live_bytes counts writes-in-flight on the current
+			 * unit, so once a worker has *pushed* enough bytes
+			 * the gate lifts even if no unit has yet completed.
+			 */
 			uint64_t b;
 			pthread_mutex_lock(&w->mu);
 			b = w->bytes_total;
 			pthread_mutex_unlock(&w->mu);
+			b += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
 			if (b < warmup_bytes) {
 				w->tput_outlier_ticks = 0;
 				continue;
@@ -1348,6 +1444,23 @@ watchdog_check_workers(struct sftp_parallel *p)
 		    w->units_failed;
 		pthread_mutex_unlock(&w->mu);
 
+		/*
+		 * Effective silence: how long has this worker been "not
+		 * making forward progress on a completion".  Prefer
+		 * since_completion_ns (it measures time since the worker
+		 * last finished any unit, the cleanest signal); fall back
+		 * to time since the current unit was popped when the worker
+		 * has never completed anything (the wedged-on-first-unit
+		 * case).  Either way, only meaningful when in_flight > 0.
+		 */
+		uint64_t unit_start = __atomic_load_n(&w->unit_start_ns,
+		    __ATOMIC_ACQUIRE);
+		uint64_t since_unit_start_ns = (unit_start > 0 &&
+		    now > unit_start) ? (now - unit_start) : 0;
+		uint64_t effective_silence_ns = since_completion_ns > 0
+		    ? since_completion_ns
+		    : since_unit_start_ns;
+
 		next = WORKER_HEALTHY;
 
 		/* SSH child gone is the strongest signal — detectable
@@ -1369,14 +1482,14 @@ watchdog_check_workers(struct sftp_parallel *p)
 				next = WORKER_DEAD;
 		}
 		if (next != WORKER_DEAD && queue_has_work && in_flight > 0 &&
-		    since_completion_ns > 0) {
-			uint64_t s = since_completion_ns / 1000000000ULL;
+		    effective_silence_ns > 0) {
+			uint64_t s = effective_silence_ns / 1000000000ULL;
 			if (s > DEAD_THRESHOLD_SEC)
 				next = WORKER_DEAD;
 			else if (s > STALL_THRESHOLD_SEC)
 				next = WORKER_STALLED;
 		} else if (!queue_has_work && in_flight > 0 &&
-		    since_completion_ns > 0) {
+		    effective_silence_ns > 0) {
 			/*
 			 * Isolation escalation: queue is empty but this
 			 * worker still has in-flight units (keeping pending
@@ -1386,10 +1499,31 @@ watchdog_check_workers(struct sftp_parallel *p)
 			 * worker that's been mute for STALL_THRESHOLD_SEC
 			 * while no other work exists is the holdout, kill
 			 * it so the unit gets re-queued and respawned.
+			 *
+			 * effective_silence_ns falls back to "time since
+			 * unit was popped" when the worker has never
+			 * completed anything — catches a worker wedged on
+			 * its very first unit, where since_completion_ns
+			 * would still be 0.
+			 *
+			 * Fast path: when the worker is dribbling below the
+			 * configured healthy floor (peer-EMA outlier check
+			 * can't fire because there are no peers), declare
+			 * DEAD at ISOLATION_PROGRESS_STALL_SEC instead of
+			 * the full STALL_THRESHOLD_SEC.  Gated on EMA
+			 * warmup so we don't kill a worker that just popped
+			 * a unit and is mid slow-start.
 			 */
-			uint64_t s = since_completion_ns / 1000000000ULL;
-			if (s > STALL_THRESHOLD_SEC)
+			uint64_t s = effective_silence_ns / 1000000000ULL;
+			if (s > (uint64_t)ISOLATION_PROGRESS_STALL_SEC &&
+			    p->cfg.tput_path_healthy_kbps > 0 &&
+			    w->tput_ema_warmup_ticks >= TPUT_EMA_WARMUP_TICKS &&
+			    w->tput_ema_kbps <
+			        p->cfg.tput_path_healthy_kbps) {
 				next = WORKER_DEAD;
+			} else if (s > STALL_THRESHOLD_SEC) {
+				next = WORKER_DEAD;
+			}
 		}
 
 		/*
@@ -1445,16 +1579,27 @@ watchdog_check_workers(struct sftp_parallel *p)
 			pthread_mutex_unlock(&w->mu);
 			if (next == WORKER_STALLED) {
 				debug_ft("worker %d stalled: no progress in "
-				    "%llu sec while queue has work",
+				    "%llu sec (since_completion=%llus, "
+				    "since_unit_start=%llus)",
 				    w->id,
 				    (unsigned long long)
-				    (since_completion_ns / 1000000000ULL));
+				    (effective_silence_ns / 1000000000ULL),
+				    (unsigned long long)
+				    (since_completion_ns / 1000000000ULL),
+				    (unsigned long long)
+				    (since_unit_start_ns / 1000000000ULL));
 			} else if (next == WORKER_DEAD) {
 				debug_ft("worker %d declared dead: "
-				    "ssh_pid=%ld since_completion=%llus",
+				    "ssh_pid=%ld silence=%llus "
+				    "(since_completion=%llus, "
+				    "since_unit_start=%llus)",
 				    w->id, (long)w->ssh_pid,
 				    (unsigned long long)
-				    (since_completion_ns / 1000000000ULL));
+				    (effective_silence_ns / 1000000000ULL),
+				    (unsigned long long)
+				    (since_completion_ns / 1000000000ULL),
+				    (unsigned long long)
+				    (since_unit_start_ns / 1000000000ULL));
 			}
 		}
 
