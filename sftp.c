@@ -119,6 +119,7 @@ struct complete_ctx {
 
 int sftp_glob(struct sftp_conn *, const char *, int,
     int (*)(const char *, int), glob_t *); /* proto for sftp-glob.c */
+int sftp_glob_get_attrib(const char *, Attrib *);  /* proto for sftp-glob.c */
 
 extern char *__progname;
 
@@ -738,8 +739,34 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
+			/*
+			 * Recover size and mode from the glob attrib cache so
+			 * maybe_submit_download can decide whether to range-
+			 * split this file.  sftp_glob already paid an RTT for
+			 * the stat via fudge_stat/fudge_lstat; we just reuse it.
+			 *
+			 * If the lookup misses (rare — typically only the
+			 * GLOB_NOCHECK fallback path), do an explicit stat so
+			 * that the single-file get case (the workload most
+			 * likely to benefit from range splitting) still gets
+			 * a known size.
+			 */
+			Attrib ga;
+			off_t fsize = 0;
+			mode_t fmode = 0;
+			int have = (sftp_glob_get_attrib(g.gl_pathv[i],
+			    &ga) == 0);
+			if (!have &&
+			    sftp_stat(conn, g.gl_pathv[i], 1, &ga) == 0)
+				have = 1;
+			if (have) {
+				if (ga.flags & SSH2_FILEXFER_ATTR_SIZE)
+					fsize = (off_t)ga.size;
+				if (ga.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
+					fmode = ga.perm & 07777;
+			}
 			if (sftp_parallel_submit_download(parallel_orch, conn,
-			    g.gl_pathv[i], abs_dst, 0, 0) != 0)
+			    g.gl_pathv[i], abs_dst, fsize, fmode) != 0)
 				err = -1;
 		} else {
 			if (sftp_download(conn, g.gl_pathv[i], abs_dst, NULL,

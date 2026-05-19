@@ -2806,6 +2806,14 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	off_t range_size;
 	int num_ranges, max_ranges;
 
+	/* Range splitting requires a known file size.  Callers always pass it:
+	 *   - recursive walk      — from the SFTP directory listing
+	 *   - upload              — from the local stat
+	 *   - process_get (sftp.c) — from the glob attrib cache (free, since
+	 *                            glob already stat'd via fudge_stat), with
+	 *                            an explicit stat as defensive fallback.
+	 * If size is still zero here (very small file or unknown), fall back
+	 * to whole-file. */
 	if (file_size <= 0)
 		goto whole_file;
 
