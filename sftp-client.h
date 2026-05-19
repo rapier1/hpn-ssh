@@ -282,6 +282,23 @@ int sftp_precreate(struct sftp_conn *, const char *remote_path, off_t size);
 int sftp_upload_range(struct sftp_conn *, const char *local_path,
     const char *remote_path, off_t range_offset, off_t range_length);
 
+/*
+ * Download a byte range of a remote file into the corresponding byte range
+ * of a local file.  The local file must already exist at the correct size
+ * (pre-created by the orchestrator).  Opens the local file with O_WRONLY
+ * only (no O_CREAT, no O_TRUNC) so concurrent range workers don't clobber
+ * each other.
+ *
+ * remote_path   — source file on the remote server
+ * local_path    — destination file on the local filesystem
+ * range_offset  — byte offset in both files where this range starts
+ * range_length  — number of bytes to transfer
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int sftp_download_range(struct sftp_conn *, const char *remote_path,
+    const char *local_path, off_t range_offset, off_t range_length);
+
 /* Concatenate paths, taking care of slashes. Caller must free result. */
 char *sftp_path_append(const char *, const char *);
 

@@ -217,6 +217,7 @@ enum sftp_op {
 	SFTP_OP_MKDIR,
 	SFTP_OP_EXIT_WORKER,	/* sentinel for sftp_parallel_remove_worker */
 	SFTP_OP_UPLOAD_RANGE,	/* upload a byte range of a large file */
+	SFTP_OP_DOWNLOAD_RANGE,	/* download a byte range of a large file */
 };
 
 struct sftp_work_unit {
@@ -719,6 +720,10 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		break;
 	case SFTP_OP_UPLOAD_RANGE:
 		rc = sftp_upload_range(w->conn, u->src_path, u->dst_path,
+		    u->range_offset, u->range_length);
+		break;
+	case SFTP_OP_DOWNLOAD_RANGE:
+		rc = sftp_download_range(w->conn, u->src_path, u->dst_path,
 		    u->range_offset, u->range_length);
 		break;
 	case SFTP_OP_DOWNLOAD:
@@ -2343,6 +2348,9 @@ submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 static int maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
     off_t file_size, mode_t mode);
+static int maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *remote_path, const char *local_path,
+    off_t file_size, mode_t mode);
 
 int
 sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
@@ -2361,8 +2369,12 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 
 int
 sftp_parallel_submit_download(struct sftp_parallel *p,
+    struct sftp_conn *conn,
     const char *remote_path, const char *local_path, off_t size, mode_t mode)
 {
+	if (conn != NULL)
+		return maybe_submit_download(p, conn, remote_path, local_path,
+		    size, mode);
 	return submit(p,
 	    make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path, size, mode));
 }
@@ -2641,6 +2653,208 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 }
 
 /*
+ * Validate and normalise stripe geometry from an sftp_fs_info reply.
+ * Mutates *info in place for the GPFS block-size heuristic.
+ * Returns 1 if range splitting is viable (values within known-valid bounds),
+ * 0 if the geometry is absent or suspect (caller should fall back to
+ * whole-file and log accordingly).
+ */
+static int
+stripe_info_viable(struct sftp_fs_info *info, const char *path)
+{
+	if (strcmp(info->fs_type, "lustre") == 0) {
+		/* Lustre: only range-split when lfs getstripe returned values
+		 * within the known-valid range (64 KiB–1 GiB, 1–4096).  Any
+		 * other result — including stripe_size=0 (lfs unavailable) —
+		 * is unexpected; warn and fall back to whole-file.
+		 * NOTE: the 1 GiB upper bound on stripe_size is conservative
+		 * and may need to be raised — Lustre installations with very
+		 * large OSTs can be configured with stripe sizes well above
+		 * 1 GiB.  Needs further investigation before widening the
+		 * gate. */
+		if (info->stripe_size < 64 * 1024 ||
+		    info->stripe_size > (uint64_t)1024 * 1024 * 1024 ||
+		    info->stripe_count == 0 ||
+		    info->stripe_count > 4096) {
+			logit("hpn-fs-info: Lustre detected but"
+			    " stripe_size=%llu stripe_count=%u"
+			    " is outside expected range"
+			    " (64 KiB–1 GiB, 1–4096);"
+			    " skipping range split for \"%s\"",
+			    (unsigned long long)info->stripe_size,
+			    info->stripe_count, path);
+			return 0;
+		}
+		return 1;
+	}
+	if (strcmp(info->fs_type, "gpfs") == 0 && info->stripe_size == 0) {
+		/* GPFS: block_size from statvfs() is the GPFS I/O block size.
+		 * Valid GPFS block sizes are 256K–16M (IBM Spectrum Scale docs);
+		 * 1 MiB is the common HPC default.  If block_size is below the
+		 * minimum valid GPFS value it means statvfs returned a bogus
+		 * result or the GPFS magic number matched a false positive —
+		 * warn and skip range splitting rather than guessing.  GPFS has
+		 * no fixed stripe_count equivalent so set it high and let
+		 * max_ranges govern. */
+		if (info->block_size < 256 * 1024 ||
+		    info->block_size > 16 * 1024 * 1024) {
+			logit("hpn-fs-info: GPFS detected but block_size=%llu "
+			    "is outside the valid GPFS range (256 KiB–16 MiB);"
+			    " skipping range split for \"%s\"",
+			    (unsigned long long)info->block_size, path);
+			return 0;
+		}
+		info->stripe_size  = info->block_size;
+		info->stripe_count = SFTP_PARALLEL_MAX_WORKERS;
+		debug3("hpn-fs-info: gpfs, using block_size=%llu as stripe unit",
+		    (unsigned long long)info->stripe_size);
+		return 1;
+	}
+	/* Not a filesystem we know how to stripe-split. */
+	return (info->stripe_size > 0 && info->stripe_count > 0);
+}
+
+/*
+ * Pre-create a local file at exactly size bytes so that parallel range-download
+ * workers can open it O_WRONLY and write their ranges concurrently without
+ * racing on creation.
+ */
+static int
+precreate_local(const char *local_path, off_t size, mode_t mode)
+{
+	int fd;
+
+	if (mode == 0)
+		mode = 0644;
+	fd = open(local_path, O_WRONLY | O_CREAT | O_TRUNC, mode | S_IWUSR);
+	if (fd < 0) {
+		error("local pre-create \"%s\": %s", local_path,
+		    strerror(errno));
+		return -1;
+	}
+	if (ftruncate(fd, size) < 0) {
+		error("local ftruncate \"%s\" to %lld: %s",
+		    local_path, (long long)size, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	return 0;
+}
+
+static struct sftp_work_unit *
+make_download_range_unit(const char *remote_path, const char *local_path,
+    off_t range_offset, off_t range_length)
+{
+	struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
+	u->op           = SFTP_OP_DOWNLOAD_RANGE;
+	u->src_path     = xstrdup(remote_path);
+	u->dst_path     = xstrdup(local_path);
+	u->size         = range_length;
+	u->range_offset = range_offset;
+	u->range_length = range_length;
+	return u;
+}
+
+/*
+ * Pre-create the local file at file_size, then split the remote file into
+ * num_ranges byte ranges and submit one SFTP_OP_DOWNLOAD_RANGE work unit
+ * per range.
+ *
+ * Returns 0 if all ranges were submitted, -1 on pre-creation failure (caller
+ * should fall back to a single whole-file download unit).
+ */
+static int
+submit_download_ranges(struct sftp_parallel *p,
+    const char *remote_path, const char *local_path,
+    off_t file_size, mode_t mode,
+    off_t range_size, int num_ranges)
+{
+	int i;
+
+	if (precreate_local(local_path, file_size, mode) != 0) {
+		error("local pre-create \"%s\" failed", local_path);
+		return -1;
+	}
+
+	debug3("range-split download \"%s\": %d ranges of %lld bytes",
+	    remote_path, num_ranges, (long long)range_size);
+
+	for (i = 0; i < num_ranges; i++) {
+		off_t offset = (off_t)i * range_size;
+		off_t length = (i == num_ranges - 1) ?
+		    (file_size - offset) : range_size;
+
+		if (length <= 0)
+			break;
+		if (submit(p, make_download_range_unit(remote_path, local_path,
+		    offset, length)) != 0) {
+			error("submit download range %d of \"%s\" failed",
+			    i, remote_path);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int
+maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *remote_path, const char *local_path,
+    off_t file_size, mode_t mode)
+{
+	struct sftp_fs_info info;
+	off_t range_size;
+	int num_ranges, max_ranges;
+
+	if (file_size <= 0)
+		goto whole_file;
+
+	if (file_size < RANGE_SPLIT_MIN_SIZE)
+		goto whole_file;
+
+	int ceil = __atomic_load_n(&p->scale_ceiling, __ATOMIC_RELAXED);
+	if (ceil < 1) ceil = 1;
+	if (ceil > SFTP_PARALLEL_MAX_WORKERS)
+		ceil = SFTP_PARALLEL_MAX_WORKERS;
+	int by_size = (int)(file_size / RANGE_SPLIT_MIN_SIZE);
+	max_ranges = (by_size < ceil) ? by_size : ceil;
+	if (max_ranges < 2)
+		goto whole_file;
+
+	if (p->fs_info_cached) {
+		info = p->fs_info_cache;
+	} else {
+		memset(&info, 0, sizeof(info));
+		sftp_fs_info(conn, remote_path, &info);
+		p->fs_info_cache = info;
+		p->fs_info_cached = 1;
+	}
+
+	if (!stripe_info_viable(&info, remote_path))
+		goto whole_file;
+
+	range_size = (off_t)info.stripe_size;
+	num_ranges = (int)(file_size / range_size);
+	if (num_ranges < 1)  num_ranges = 1;
+	if (num_ranges > (int)info.stripe_count)
+		num_ranges = (int)info.stripe_count;
+	if (num_ranges > max_ranges)
+		num_ranges = max_ranges;
+
+	if (num_ranges < 2)
+		goto whole_file;
+
+	if (submit_download_ranges(p, remote_path, local_path,
+	    file_size, mode, range_size, num_ranges) == 0)
+		return 0;
+	/* Pre-creation failed — fall back to whole-file. */
+
+ whole_file:
+	return submit(p, make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path,
+	    file_size, mode));
+}
+
+/*
  * Decide whether and how to range-split a large file, then either submit
  * range units (via submit_upload_ranges) or fall back to a whole-file unit.
  *
@@ -2693,56 +2907,7 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 		p->fs_info_cached = 1;
 	}
 
-	/* Lustre: only range-split when lfs getstripe returned values within
-	 * the known-valid range (64 KiB–1 GiB, stripe_count 1–4096).  Any
-	 * other result — including stripe_size=0 (lfs unavailable) — is
-	 * unexpected; warn and fall back to whole-file.
-	 * NOTE: the 1 GiB upper bound on stripe_size is conservative and may
-	 * need to be raised — Lustre installations with very large OSTs can
-	 * be configured with stripe sizes well above 1 GiB.  Needs further
-	 * investigation before widening the gate. */
-	if (strcmp(info.fs_type, "lustre") == 0) {
-		if (info.stripe_size < 64 * 1024 ||
-		    info.stripe_size > (uint64_t)1024 * 1024 * 1024 ||
-		    info.stripe_count == 0 ||
-		    info.stripe_count > 4096) {
-			logit("hpn-fs-info: Lustre detected but"
-			    " stripe_size=%llu stripe_count=%u"
-			    " is outside expected range"
-			    " (64 KiB–1 GiB, 1–4096);"
-			    " skipping range split for \"%s\"",
-			    (unsigned long long)info.stripe_size,
-			    info.stripe_count, remote_path);
-			goto whole_file;
-		}
-	}
-
-	/* GPFS heuristic: block_size from statvfs() is the GPFS I/O block size.
-	 * Valid GPFS block sizes are 256K–16M (IBM Spectrum Scale docs); 1 MiB
-	 * is the common HPC default.  If block_size is below the minimum valid
-	 * GPFS value it means statvfs returned a bogus result or the GPFS magic
-	 * number matched a false positive — warn and skip range splitting rather
-	 * than guessing.  GPFS has no fixed stripe_count equivalent so set it
-	 * high and let max_ranges govern. */
-	if (strcmp(info.fs_type, "gpfs") == 0 && info.stripe_size == 0) {
-		if (info.block_size < 256 * 1024 ||
-		    info.block_size > 16 * 1024 * 1024) {
-			logit("hpn-fs-info: GPFS detected but block_size=%llu "
-			    "is outside the valid GPFS range (256 KiB–16 MiB);"
-			    " skipping range split for \"%s\"",
-			    (unsigned long long)info.block_size, remote_path);
-			goto whole_file;
-		}
-		info.stripe_size  = info.block_size;
-		info.stripe_count = SFTP_PARALLEL_MAX_WORKERS;
-		debug3("hpn-fs-info: gpfs, using block_size=%llu as stripe unit",
-		    (unsigned long long)info.stripe_size);
-	}
-
-	/* Only range-split when the server reports parallel-FS stripe info.
-	 * On regular filesystems concurrent writes to one inode contend; the
-	 * scaler will still grow workers across multiple files. */
-	if (!(info.stripe_size > 0 && info.stripe_count > 0))
+	if (!stripe_info_viable(&info, remote_path))
 		goto whole_file;
 
 	/* Stripe-aligned: use stripe_size as the range unit, cap at
@@ -2959,8 +3124,8 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			mode_t fmode = (a->flags &
 			    SSH2_FILEXFER_ATTR_PERMISSIONS) ?
 			    (a->perm & 07777) : 0644;
-			if (sftp_parallel_submit_download(p, new_src, new_dst,
-			    fsize, fmode) != 0) {
+			if (sftp_parallel_submit_download(p, conn,
+			    new_src, new_dst, fsize, fmode) != 0) {
 				error("submit download \"%s\" -> \"%s\" failed",
 				    new_src, new_dst);
 				ret = -1;

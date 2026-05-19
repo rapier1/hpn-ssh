@@ -2718,6 +2718,165 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	return ret;
 }
 
+int
+sftp_download_range(struct sftp_conn *conn, const char *remote_path,
+    const char *local_path, off_t range_offset, off_t range_length)
+{
+	struct sshbuf *msg;
+	struct requests requests;
+	struct request *req;
+	u_char *handle = NULL, type;
+	size_t handle_len;
+	u_int id, buflen, num_req, max_req, status = SSH2_FX_OK;
+	uint64_t remote_offset;
+	off_t bytes_left;
+	int local_fd = -1, read_error = 0, write_error = 0, write_errno = 0;
+	int ret = -1, r;
+
+	TAILQ_INIT(&requests);
+
+	/* Open remote file for reading. */
+	if (send_open(conn, remote_path, "range-src",
+	    SSH2_FXF_READ, NULL, &handle, &handle_len) != 0)
+		return -1;
+
+	/* Open pre-created local file for writing; no O_CREAT/O_TRUNC —
+	 * the orchestrator pre-created it at the correct size. */
+	if ((local_fd = open(local_path, O_WRONLY)) < 0) {
+		error("open local \"%s\": %s", local_path, strerror(errno));
+		goto out;
+	}
+
+	buflen = conn->download_buflen;
+	num_req = 0;
+	max_req = 1;
+	remote_offset = (uint64_t)range_offset;
+	bytes_left = range_length;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+
+	while (num_req > 0 || (bytes_left > 0 && max_req > 0)) {
+		/* Fill the pipeline with read requests. */
+		while (bytes_left > 0 && num_req < max_req) {
+			size_t want = buflen;
+			if ((off_t)want > bytes_left)
+				want = (size_t)bytes_left;
+			req = request_enqueue(&requests, conn->msg_id++,
+			    want, remote_offset);
+			send_read_request(conn, req->id, req->offset,
+			    (u_int)req->len, handle, handle_len);
+			remote_offset += want;
+			bytes_left    -= (off_t)want;
+			num_req++;
+		}
+
+		sshbuf_reset(msg);
+		if (get_msg_extended(conn, msg, 0) != 0) {
+			read_error = 1;
+			while ((req = TAILQ_FIRST(&requests)) != NULL) {
+				TAILQ_REMOVE(&requests, req, tq);
+				free(req);
+			}
+			num_req = max_req = 0;
+			break;
+		}
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &id)) != 0)
+			fatal_fr(r, "parse");
+		if ((req = request_find(&requests, id)) == NULL)
+			fatal_f("unexpected reply id %u", id);
+
+		switch (type) {
+		case SSH2_FXP_STATUS:
+			if ((r = sshbuf_get_u32(msg, &status)) != 0)
+				fatal_fr(r, "parse status");
+			if (status == SSH2_FX_EOF)
+				error("read remote \"%s\": unexpected EOF "
+				    "within range", remote_path);
+			else
+				error("read remote \"%s\": %s",
+				    remote_path, fx2txt(status));
+			read_error = 1;
+			TAILQ_REMOVE(&requests, req, tq);
+			free(req);
+			while ((req = TAILQ_FIRST(&requests)) != NULL) {
+				TAILQ_REMOVE(&requests, req, tq);
+				free(req);
+			}
+			num_req = max_req = 0;
+			break;
+		case SSH2_FXP_DATA: {
+			u_char *data;
+			size_t len;
+			if ((r = sshbuf_get_string(msg, &data, &len)) != 0)
+				fatal_fr(r, "parse data");
+			if (len > req->len)
+				fatal("received more data than requested "
+				    "%zu > %zu", len, req->len);
+			if ((lseek(local_fd, (off_t)req->offset,
+			    SEEK_SET) == -1 ||
+			    atomicio(vwrite, local_fd, data, len) != len) &&
+			    !write_error) {
+				write_errno = errno;
+				write_error = 1;
+				max_req = 0;
+			} else if (conn->hpn->live_counter != NULL) {
+				__atomic_fetch_add(conn->hpn->live_counter,
+				    (uint64_t)len, __ATOMIC_RELAXED);
+			}
+			free(data);
+			if (len == req->len) {
+				TAILQ_REMOVE(&requests, req, tq);
+				free(req);
+				num_req--;
+			} else {
+				/* Short read — re-request remainder. */
+				req->id = conn->msg_id++;
+				req->len -= len;
+				req->offset += len;
+				send_read_request(conn, req->id, req->offset,
+				    (u_int)req->len, handle, handle_len);
+			}
+			if (max_req > 0 && max_req < conn->num_requests)
+				max_req++;
+			break;
+		}
+		default:
+			error_f("expected SSH2_FXP_DATA(%u) packet, got %u - "
+			    "possible protocol corruption",
+			    SSH2_FXP_DATA, type);
+			sftp_hpn_set_protocol_violation(conn->hpn);
+			read_error = 1;
+			while ((req = TAILQ_FIRST(&requests)) != NULL) {
+				TAILQ_REMOVE(&requests, req, tq);
+				free(req);
+			}
+			num_req = max_req = 0;
+			break;
+		}
+	}
+	sshbuf_free(msg);
+
+	if (TAILQ_FIRST(&requests) != NULL)
+		fatal("range download complete but requests still in queue");
+
+	if (read_error)
+		sftp_close(conn, handle, handle_len);
+	else if (write_error) {
+		error("write local \"%s\": %s", local_path,
+		    strerror(write_errno));
+		sftp_close(conn, handle, handle_len);
+	} else
+		ret = (sftp_close(conn, handle, handle_len) == 0) ? 0 : -1;
+
+ out:
+	if (local_fd != -1)
+		close(local_fd);
+	free(handle);
+	return ret;
+}
+
 /* Internal state for one file in a batch upload. */
 struct batch_file {
 	int      local_fd;     /* -1 if local open failed */

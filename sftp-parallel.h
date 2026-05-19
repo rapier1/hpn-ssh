@@ -159,6 +159,7 @@ int sftp_parallel_submit_upload(struct sftp_parallel *p,
     struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode);
 int sftp_parallel_submit_download(struct sftp_parallel *p,
+    struct sftp_conn *conn,
     const char *remote_path, const char *local_path, off_t size, mode_t mode);
 int sftp_parallel_submit_mkdir(struct sftp_parallel *p,
     const char *remote_path, mode_t mode);

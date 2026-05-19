@@ -738,7 +738,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
-			if (sftp_parallel_submit_download(parallel_orch,
+			if (sftp_parallel_submit_download(parallel_orch, conn,
 			    g.gl_pathv[i], abs_dst, 0, 0) != 0)
 				err = -1;
 		} else {
