@@ -80,6 +80,22 @@ static int parallel_user_opt_in = 0;
  */
 static int parallel_adaptive_scaling = 0;
 
+/*
+ * When non-zero, process_put / process_get do NOT call sftp_parallel_wait
+ * after submitting their files.  Submissions pile up in the queue and the
+ * caller is responsible for calling parallel_flush() at the appropriate time
+ * (typically end-of-batch).  Enabled automatically in batch mode so that
+ *     put file1
+ *     put file2
+ *     put file3
+ * pipelines all three files instead of serialising on each command's wait.
+ *
+ * Interactive mode leaves this at 0 by default — users expect their prompt
+ * to come back when an upload completes.  A future "job submission mode" in
+ * the interactive shell can flip this on per-session via the same hook.
+ */
+static int defer_parallel_wait = 0;
+
 /* Are we in batchfile mode? */
 int batchmode = 0;
 
@@ -653,6 +669,36 @@ local_is_dir(const char *path)
 	return S_ISDIR(sb.st_mode);
 }
 
+/*
+ * Drain all submissions sitting in the parallel orchestrator's queue.
+ *
+ * Centralises the wait + progress_stop + protocol-violation summary that
+ * process_get / process_put used to do at the end of each command.  Called
+ * directly by those functions in interactive mode, or once at end-of-batch
+ * by the caller (interactive_loop) when defer_parallel_wait is set.
+ *
+ * Safe to call when parallel_orch is NULL (no-op) or when no submissions are
+ * outstanding (sftp_parallel_wait returns immediately).
+ */
+static void
+parallel_flush(void)
+{
+	struct sftp_parallel_stats pstats;
+
+	if (parallel_orch == NULL)
+		return;
+
+	sftp_parallel_wait(parallel_orch);
+	sftp_parallel_progress_stop(parallel_orch);
+	sftp_parallel_get_stats(parallel_orch, &pstats);
+	if (pstats.protocol_violations > 0) {
+		logit("warning: %d worker protocol violation detected "
+		    "(recovered via worker respawn) - investigate if "
+		    "this recurs across transfers",
+		    pstats.protocol_violations);
+	}
+}
+
 static int
 process_get(struct sftp_conn *conn, const char *src, const char *dst,
     const char *pwd, int pflag, int rflag, int resume, int fflag)
@@ -778,36 +824,16 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		abs_dst = NULL;
 	}
 
-	if (parallel_orch != NULL) {
-		struct sftp_parallel_stats pstats;
-
-		sftp_parallel_wait(parallel_orch);
-		sftp_parallel_progress_stop(parallel_orch);
-		/*
-		 * Surface protocol violations to the user as a final summary.
-		 *
-		 * Reaching here with protocol_violations > 0 means exactly
-		 * one violation occurred during the transfer (two would have
-		 * fatal()'d in worker_thread under the two-strikes rule).
-		 * The transfer itself may have succeeded via worker respawn
-		 * - retry of the affected work unit by a fresh worker - so
-		 * we do NOT force err = -1 here.  Per-unit failures, if any,
-		 * have already been reflected in err by the dispatch loop
-		 * above.
-		 *
-		 * The point of this message is to keep the user aware: a
-		 * single violation can be a NIC bit-flip on a long run, but
-		 * if they see it repeatedly across transfers they should
-		 * investigate the path / server / hardware.
-		 */
-		sftp_parallel_get_stats(parallel_orch, &pstats);
-		if (pstats.protocol_violations > 0) {
-			logit("warning: %d worker protocol violation detected "
-			    "(recovered via worker respawn) - investigate if "
-			    "this recurs across transfers",
-			    pstats.protocol_violations);
-		}
-	}
+	/*
+	 * In deferred-wait mode (batch mode or future "job submission mode"),
+	 * skip the drain — the caller (interactive_loop end-of-batch) will
+	 * flush the queue once after all commands have been submitted, which
+	 * lets multiple get commands pipeline their files instead of stalling
+	 * each get on a slow chunk from the previous one.  Err reporting and
+	 * the protocol-violation summary then happen at flush time.
+	 */
+	if (parallel_orch != NULL && !defer_parallel_wait)
+		parallel_flush();
 
 out:
 	free(abs_src);
@@ -932,20 +958,11 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		}
 	}
 
-	if (parallel_orch != NULL) {
-		struct sftp_parallel_stats pstats;
-
-		sftp_parallel_wait(parallel_orch);
-		sftp_parallel_progress_stop(parallel_orch);
-		/* See process_get parallel_orch wait — same rationale. */
-		sftp_parallel_get_stats(parallel_orch, &pstats);
-		if (pstats.protocol_violations > 0) {
-			logit("warning: %d worker protocol violation detected "
-			    "(recovered via worker respawn) - investigate if "
-			    "this recurs across transfers",
-			    pstats.protocol_violations);
-		}
-	}
+	/* See process_get — deferred mode skips the per-command drain so
+	 * successive put commands pipeline their files instead of each one
+	 * stalling on a slow tail chunk from the previous file. */
+	if (parallel_orch != NULL && !defer_parallel_wait)
+		parallel_flush();
 
 out:
 	free(abs_dst);
@@ -2515,6 +2532,20 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 		if (err != 0)
 			break;
 	}
+
+	/*
+	 * End-of-batch drain.  In deferred mode (batch mode, or a future
+	 * interactive "job submission mode") process_put / process_get only
+	 * submit to the queue and return; the actual wait happens here.  Safe
+	 * to call unconditionally — parallel_flush() is a no-op when no
+	 * orchestrator exists or no submissions are outstanding.
+	 *
+	 * In non-deferred interactive mode this is also safe: each command
+	 * already drained itself, so the queue is empty and the wait returns
+	 * immediately.
+	 */
+	parallel_flush();
+
 	ssh_signal(SIGCHLD, SIG_DFL);
 	free(remote_path);
 	free(startdir);
@@ -2775,6 +2806,15 @@ main(int argc, char **argv)
 				fatal("%s (%s).", strerror(errno), optarg);
 			showprogress = 0;
 			quiet = batchmode = 1;
+			/*
+			 * Batch mode submits commands sequentially from a file.
+			 * Deferring the per-command parallel_flush lets multiple
+			 * `put`/`get` commands pipeline their files through the
+			 * worker pool instead of each command stalling on the
+			 * slowest chunk of the previous one.  parallel_flush() is
+			 * called once after the command loop exits.
+			 */
+			defer_parallel_wait = 1;
 			addargs(&args, "-obatchmode yes");
 			break;
 		case 'f':
@@ -3008,6 +3048,15 @@ main(int argc, char **argv)
 			    parallel_num_streams,
 			    parallel_adaptive_scaling ? "on" : "off");
 		}
+		/* Mirror to debug so batch-mode runs (quiet=1) can still
+		 * verify what state the orchestrator was started in.
+		 * Visible at -v.  This costs nothing and saves diagnosing
+		 * "did I really pass AdaptiveScaling=no?" later. */
+		debug_f("parallel mode: -j %d adaptive_scaling=%s "
+		    "defer_parallel_wait=%d",
+		    parallel_num_streams,
+		    parallel_adaptive_scaling ? "yes" : "no",
+		    defer_parallel_wait);
 		if (pcfg.tput_path_healthy_kbps > 0) {
 			double eff_alpha = pcfg.tput_ema_alpha > 0.0
 			    ? pcfg.tput_ema_alpha : 0.2;

@@ -144,6 +144,42 @@ extern int showprogress;
 #define RAMP_RTTS                 20
 #define RAMP_WARMUP_BYTES_MIN     (16ULL * 1024 * 1024)    /* 16 MiB */
 #define RAMP_WARMUP_BYTES_MAX     (256ULL * 1024 * 1024)   /* 256 MiB */
+/*
+ * Hard wall-clock cap on the bytes-based warmup gate.  At 30 Mbps a
+ * worker needs ~60 s to transfer 256 MiB, so without this cap a
+ * genuinely-slow respawned worker stays protected from outlier detection
+ * for its entire slow lifetime.  After RAMP_MAX_WARMUP_SEC seconds from
+ * unit_start_ns the gate lifts unconditionally — a healthy TCP slow-start
+ * always completes in well under this.
+ */
+#define RAMP_MAX_WARMUP_SEC       15
+
+/*
+ * Born-dead fast-kill threshold.  A worker that has popped a unit but
+ * has zero progress (bytes_total + live_bytes + units_completed all 0)
+ * for this many seconds is killed and respawned.  The server-side path
+ * for that SSH session is wedged — usually a Lustre OST stall that
+ * froze the SSH channel window.  Waiting the full STALL_THRESHOLD_SEC
+ * (60s) or even ISOLATION_PROGRESS_STALL_SEC (15s) wastes capacity:
+ * we know after a few seconds that no bytes have arrived, and zero is
+ * unambiguous — no peer comparison or EMA warmup needed.
+ *
+ * Set conservatively: 5 seconds is well above SSH auth completion
+ * (~1 RTT after the worker enters the main loop) and the first OPEN
+ * round-trip (~1 RTT on a 50ms path).  Anything faster risks killing
+ * workers whose first chunk happens to span a slow OST.
+ */
+#define BORN_DEAD_KILL_SEC        5
+
+/*
+ * Range-split chunk multiplier.  Each large file is split into
+ * RANGE_CHUNK_MULTIPLIER × num_workers chunks rather than 1 per worker.
+ * Fast workers that finish early pick up additional chunks from the queue,
+ * naturally absorbing the tail cost of a slow OST without any detection
+ * or respawn machinery.  Ranges align to stripe_size boundaries regardless
+ * of this multiplier — no simultaneous OST contention results.
+ */
+#define RANGE_CHUNK_MULTIPLIER    4
 
 /*
  * Isolation progress-rate gate.  When a worker is alone with an in-flight
@@ -176,6 +212,29 @@ extern int showprogress;
  */
 #define SCALE_CHECK_TICKS         25
 #define SCALE_COOLDOWN_TICKS      50
+
+/*
+ * Synchronous-stall detector.
+ *
+ * A synchronous stall is a watchdog slow-tick (~1s) in which aggregate
+ * bytes transferred across ALL workers is zero while at least one worker
+ * has a unit in flight.  This is the collective write-cache saturation
+ * signature: all writers hit the same storage bottleneck simultaneously
+ * (e.g. a Lustre OST writeback stall).  It differs from:
+ *   - inter-file idle: in_flight == 0, not a stall
+ *   - outlier stall: one worker slow, others fast, caught by tput-outlier
+ *
+ * SYNC_STALL_WINDOW is the rolling window size in slow-ticks.  At ~1 s
+ * per tick, 20 ticks = ~20 s.  When the window closes, the stall fraction
+ * is logged.  Currently observation-only; a future change can use the
+ * fraction as a congestion-aware scale-down signal.
+ *
+ * SYNC_STALL_THRESHOLD is the fraction at which the log line is flagged
+ * as "possible write-cache saturation" (observation label only; no action
+ * taken yet).
+ */
+#define SYNC_STALL_WINDOW     20    /* slow-ticks per rolling window (~20s) */
+#define SYNC_STALL_THRESHOLD  0.20  /* flag if ≥20% of ticks are stalls */
 
 /*
  * Throughput thresholds for adaptive scaling decisions.
@@ -302,6 +361,11 @@ struct sftp_worker {
 	uint64_t           tput_ema_kbps;        /* EMA-smoothed estimate */
 	int                tput_ema_warmup_ticks; /* ticks since EMA cold-start */
 	int                tput_outlier_ticks;   /* consecutive outlier ticks */
+	uint64_t           tput_last_unit_start_ns; /* unit_start_ns at last tick;
+	                                         * used to detect new-unit starts
+	                                         * and reset EMA so stale frozen
+	                                         * values don't suppress outlier
+	                                         * detection on the new unit */
 
 	uint64_t           idle_ns;            /* ns blocked on workqueue pop,
 					        * for completed pops only */
@@ -494,6 +558,14 @@ struct sftp_parallel {
 	int      pending_scaleups;      /* detached scale-up threads in flight */
 	int      scale_shallow_streak;  /* consecutive checks satisfying a
 					 * scale-down signal */
+
+	/*
+	 * Synchronous-stall detector state.  Touched only by the reporter's
+	 * slow-tick path (no lock needed).
+	 */
+	uint32_t sync_stall_ticks;      /* stall slow-ticks in current window */
+	uint32_t sync_stall_window_pos; /* slow-ticks elapsed in current window */
+	uint64_t sync_stall_prev_bytes; /* aggregate bytes at previous slow-tick */
 };
 
 /* ---------- Worker SSH connection setup ---------- */
@@ -1262,22 +1334,46 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		w->tput_check_bytes = now_bytes;
 		w->tput_check_ns = now;
 
-		/* EMA update.  Cold-start: seed EMA from first real measurement
-		 * so a fast worker registers immediately rather than spending
-		 * several ticks climbing out of zero. */
-		if (w->tput_ema_kbps == 0)
-			w->tput_ema_kbps = w->tput_current_kbps;
-		else
-			w->tput_ema_kbps = (uint64_t)(
-			    alpha * (double)w->tput_current_kbps +
-			    (1.0 - alpha) * (double)w->tput_ema_kbps);
-		if (w->tput_ema_warmup_ticks < TPUT_EMA_WARMUP_TICKS)
-			w->tput_ema_warmup_ticks++;
+		/* EMA update.  Skip when the worker has no unit in flight so
+		 * idle gaps between files don't decay the EMA toward zero and
+		 * produce spurious outlier warnings when the next unit starts.
+		 * Cold-start: seed EMA from first real measurement so a fast
+		 * worker registers immediately rather than climbing out of zero.
+		 * Only actively-transferring workers contribute to max_ema_kbps
+		 * so idle workers' frozen EMAs don't inflate the threshold.
+		 *
+		 * New-unit detection: when unit_start_ns changes (worker picked
+		 * up a fresh work unit), reset EMA and warmup so the EMA builds
+		 * from actual current throughput rather than the stale frozen
+		 * value.  Without this reset the frozen healthy EMA makes the
+		 * else-branch clear tput_outlier_ticks on the first tick of every
+		 * new unit, preventing the consec counter from ever reaching the
+		 * STALLED threshold on a persistently slow worker. */
+		uint64_t cur_unit_start = __atomic_load_n(&w->unit_start_ns,
+		    __ATOMIC_RELAXED);
+		int w_idle = (cur_unit_start == 0);
+		if (!w_idle) {
+			if (cur_unit_start != w->tput_last_unit_start_ns) {
+				/* Worker transitioned to a new unit: cold-start
+				 * EMA so next ticks reflect actual performance. */
+				w->tput_ema_kbps = 0;
+				w->tput_ema_warmup_ticks = 0;
+				w->tput_last_unit_start_ns = cur_unit_start;
+			}
+			if (w->tput_ema_kbps == 0)
+				w->tput_ema_kbps = w->tput_current_kbps;
+			else
+				w->tput_ema_kbps = (uint64_t)(
+				    alpha * (double)w->tput_current_kbps +
+				    (1.0 - alpha) * (double)w->tput_ema_kbps);
+			if (w->tput_ema_warmup_ticks < TPUT_EMA_WARMUP_TICKS)
+				w->tput_ema_warmup_ticks++;
+			if (w->tput_ema_kbps > max_ema_kbps)
+				max_ema_kbps = w->tput_ema_kbps;
+		}
 
 		if (w->tput_current_kbps > max_kbps)
 			max_kbps = w->tput_current_kbps;
-		if (w->tput_ema_kbps > max_ema_kbps)
-			max_ema_kbps = w->tput_ema_kbps;
 	}
 
 	/* Diagnostic: log per-worker raw and EMA kbps once every ~5 sec. */
@@ -1336,13 +1432,24 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		pthread_mutex_unlock(&w->mu);
 
 		if (w->tput_ema_warmup_ticks < TPUT_EMA_WARMUP_TICKS) {
-			/* EMA not yet warm — skip outlier detection. */
-			w->tput_outlier_ticks = 0;
+			/* EMA not yet warm — skip outlier detection, but don't
+			 * reset tput_outlier_ticks: a pre-accumulated consec count
+			 * from before this unit boundary should carry forward so a
+			 * persistently slow worker is caught after fewer post-warmup
+			 * ticks. */
 			continue;
 		}
 
 		if (in_flight == 0) {
-			w->tput_outlier_ticks = 0;
+			/* Pause — don't reset.  A persistently slow worker
+			 * oscillates between in-flight and idle between units;
+			 * resetting here wipes the accumulated consec count and
+			 * prevents the detector from ever reaching the DEAD
+			 * threshold.  Skipping the tick (without clearing) lets
+			 * consec carry across unit boundaries, so a worker that
+			 * is consistently slow across multiple units gets caught.
+			 * The counter is cleared only when EMA >= threshold
+			 * (genuine recovery) in the else branch below. */
 			continue;
 		}
 
@@ -1383,7 +1490,17 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 			b = w->bytes_total;
 			pthread_mutex_unlock(&w->mu);
 			b += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
-			if (b < warmup_bytes) {
+
+			/* Time cap: lift the gate after RAMP_MAX_WARMUP_SEC
+			 * regardless of bytes so a genuinely-slow worker is
+			 * not protected for its entire slow lifetime. */
+			uint64_t unit_start = __atomic_load_n(
+			    &w->unit_start_ns, __ATOMIC_RELAXED);
+			int past_time_cap = (unit_start > 0 &&
+			    now - unit_start >
+			    (uint64_t)RAMP_MAX_WARMUP_SEC * 1000000000ULL);
+
+			if (b < warmup_bytes && !past_time_cap) {
 				w->tput_outlier_ticks = 0;
 				continue;
 			}
@@ -1403,6 +1520,58 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		} else {
 			w->tput_outlier_ticks = 0;
 		}
+	}
+}
+
+/*
+ * Synchronous-stall detector.  Called once per slow-tick (~1s).
+ *
+ * Measures aggregate bytes transferred (completions + in-progress writes)
+ * across all live workers since the previous slow-tick.  If the delta is
+ * zero while at least one worker has a unit in flight, it is a synchronous
+ * stall: all writers hit the same storage bottleneck simultaneously.
+ *
+ * Keeps a rolling window of SYNC_STALL_WINDOW slow-ticks and logs the
+ * stall fraction when the window closes.  Observation-only for now;
+ * the fraction is intended as a future congestion-aware scale-down signal.
+ */
+static void
+watchdog_check_sync_stall(struct sftp_parallel *p)
+{
+	uint64_t now_bytes = 0;
+	uint64_t total_in_flight = 0;
+
+	pthread_mutex_lock(&p->workers_mu);
+	for (int i = 0; i < p->num_workers; i++) {
+		struct sftp_worker *w = p->workers[i];
+		pthread_mutex_lock(&w->mu);
+		now_bytes += w->bytes_total;
+		total_in_flight += w->units_started - w->units_completed -
+		    w->units_failed;
+		pthread_mutex_unlock(&w->mu);
+		now_bytes += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
+	}
+	now_bytes += p->retired_bytes;
+	pthread_mutex_unlock(&p->workers_mu);
+
+	uint64_t delta = (now_bytes >= p->sync_stall_prev_bytes)
+	    ? (now_bytes - p->sync_stall_prev_bytes) : 0;
+	p->sync_stall_prev_bytes = now_bytes;
+
+	/* First tick: prev_bytes was 0; delta = all bytes ever, not a stall. */
+	if (p->sync_stall_window_pos > 0 && delta == 0 && total_in_flight > 0)
+		p->sync_stall_ticks++;
+
+	if (++p->sync_stall_window_pos >= SYNC_STALL_WINDOW) {
+		double frac = (double)p->sync_stall_ticks / SYNC_STALL_WINDOW;
+		debug_ft("sync-stall: %u/%u ticks (%.0f%%) — %s",
+		    p->sync_stall_ticks, SYNC_STALL_WINDOW,
+		    frac * 100.0,
+		    frac >= SYNC_STALL_THRESHOLD
+		        ? "possible write-cache saturation"
+		        : "nominal");
+		p->sync_stall_ticks = 0;
+		p->sync_stall_window_pos = 0;
 	}
 }
 
@@ -1442,7 +1611,11 @@ watchdog_check_workers(struct sftp_parallel *p)
 		    (now - w->last_completion_ns) : 0;
 		uint64_t in_flight = w->units_started - w->units_completed -
 		    w->units_failed;
+		uint64_t w_bytes_total = w->bytes_total;
+		uint64_t w_units_completed = w->units_completed;
 		pthread_mutex_unlock(&w->mu);
+		uint64_t w_live_bytes = __atomic_load_n(&w->live_bytes,
+		    __ATOMIC_RELAXED);
 
 		/*
 		 * Effective silence: how long has this worker been "not
@@ -1481,6 +1654,42 @@ watchdog_check_workers(struct sftp_parallel *p)
 			    (wr == -1 && errno == ECHILD))
 				next = WORKER_DEAD;
 		}
+
+		/*
+		 * Born-dead fast-kill.  Worker popped a unit but has zero
+		 * forward progress (no completions, no bytes ever, no live
+		 * bytes on the current unit) for BORN_DEAD_KILL_SEC.  This is
+		 * unambiguous: the SSH session reached the SFTP layer (the
+		 * worker thread popped a unit) but no bytes have flowed at
+		 * all.  Almost always a server-side channel-window freeze
+		 * (e.g. Lustre OST stall).  Kill fast so the respawn slot
+		 * gets a fresh SSH session into the same dst — usually that
+		 * one lands on a healthier server-side path and recovers the
+		 * capacity within ~5s instead of ~24s.
+		 *
+		 * Gates:
+		 *  - in_flight > 0    : worker actually has a unit in hand
+		 *  - units_completed == 0 && bytes_total == 0 : never made
+		 *    any successful progress ever
+		 *  - live_bytes == 0  : not even mid-write on the current
+		 *    chunk (a slow OST that's still grinding bytes
+		 *    through pwrite shouldn't be killed)
+		 *  - since_unit_start > BORN_DEAD_KILL_SEC : enough time
+		 *    has passed that auth + first OPEN should have completed
+		 */
+		if (next != WORKER_DEAD && in_flight > 0
+		    && w_units_completed == 0 && w_bytes_total == 0
+		    && w_live_bytes == 0
+		    && since_unit_start_ns > (uint64_t)BORN_DEAD_KILL_SEC
+		        * 1000000000ULL) {
+			debug_ft("worker %d: born-dead fast-kill "
+			    "(unit_start=%llus, 0 bytes, 0 completions)",
+			    w->id,
+			    (unsigned long long)
+			    (since_unit_start_ns / 1000000000ULL));
+			next = WORKER_DEAD;
+		}
+
 		if (next != WORKER_DEAD && queue_has_work && in_flight > 0 &&
 		    effective_silence_ns > 0) {
 			uint64_t s = effective_silence_ns / 1000000000ULL;
@@ -1792,30 +2001,49 @@ reporter_thread(void *arg)
 			 * replacements. */
 			(void)watchdog_check_workers(p);
 
+			/* Track synchronous stalls (all workers at zero bytes
+			 * while work is in flight) as a leading indicator of
+			 * write-cache saturation from too many parallel writers.
+			 * Observation-only for now; future use as a scale-down
+			 * signal. */
+			watchdog_check_sync_stall(p);
+
 			/* Reap workers that have exited (either via
 			 * SFTP_OP_EXIT_WORKER sentinel or because their
 			 * connection died). Collect under workers_mu, then
 			 * join and free outside the lock. */
 			struct sftp_worker *to_reap[SFTP_PARALLEL_MAX_WORKERS];
 			int to_reap_voluntary[SFTP_PARALLEL_MAX_WORKERS];
+			int to_reap_born_dead[SFTP_PARALLEL_MAX_WORKERS];
 			int n_reap = 0;
 			pthread_mutex_lock(&p->workers_mu);
 			for (int i = p->num_workers - 1; i >= 0; i--) {
 				struct sftp_worker *w = p->workers[i];
 				int exited, voluntary;
+				uint64_t bt, uc;
 				pthread_mutex_lock(&w->mu);
 				exited    = w->exited;
 				voluntary = w->exited_voluntary;
+				bt        = w->bytes_total;
+				uc        = w->units_completed;
 				/* Capture bytes_total before the worker leaves
 				 * the array so the aggregate stays monotonic.
 				 * live_bytes was reset to 0 at the worker's
 				 * last completion so it is not double-counted. */
 				if (exited)
-					p->retired_bytes += w->bytes_total;
+					p->retired_bytes += bt;
 				pthread_mutex_unlock(&w->mu);
 				if (exited) {
 					to_reap[n_reap] = w;
 					to_reap_voluntary[n_reap] = voluntary;
+					/* "Born dead": worker died having never
+					 * transferred a single byte.  In adaptive
+					 * mode this is a path-saturation signal —
+					 * the connection never got bandwidth.
+					 * Re-queuing its unit is correct; spawning
+					 * a replacement just repeats the churn. */
+					to_reap_born_dead[n_reap] =
+					    (!voluntary && bt == 0 && uc == 0);
 					n_reap++;
 					memmove(&p->workers[i],
 					    &p->workers[i + 1],
@@ -1831,6 +2059,7 @@ reporter_thread(void *arg)
 				struct sftp_worker *w = to_reap[i];
 				if (!to_reap_voluntary[i])
 					n_to_respawn++;
+				(void)to_reap_born_dead[i];   /* unused now */
 				pthread_join(w->tid, NULL);
 				if (w->conn) sftp_free(w->conn);
 				if (w->fd_in >= 0) close(w->fd_in);
@@ -3103,12 +3332,25 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (file_size < RANGE_SPLIT_MIN_SIZE)
 		goto whole_file;
 
-	int ceil = __atomic_load_n(&p->scale_ceiling, __ATOMIC_RELAXED);
-	if (ceil < 1) ceil = 1;
-	if (ceil > SFTP_PARALLEL_MAX_WORKERS)
-		ceil = SFTP_PARALLEL_MAX_WORKERS;
+	/* Base the chunk count on the user's -j N (cfg.num_streams), not
+	 * scale_ceiling.  scale_ceiling defaults to SFTP_PARALLEL_MAX_WORKERS
+	 * (24) regardless of -j, which would over-split: a -j 4 run would
+	 * produce 96 chunks per file instead of the intended 16, paying
+	 * per-chunk open/close overhead ~6× more often than necessary.
+	 * When adaptive_scaling is on, the worker pool may grow up to
+	 * scale_ceiling, so use the higher of (num_streams, scale_ceiling)
+	 * to ensure we have enough chunks if the pool scales up. */
+	int base = p->cfg.num_streams;
+	if (p->cfg.adaptive_scaling) {
+		int ceil = __atomic_load_n(&p->scale_ceiling, __ATOMIC_RELAXED);
+		if (ceil > base) base = ceil;
+	}
+	if (base < 1) base = 1;
+	if (base > SFTP_PARALLEL_MAX_WORKERS)
+		base = SFTP_PARALLEL_MAX_WORKERS;
 	int by_size = (int)(file_size / RANGE_SPLIT_MIN_SIZE);
-	max_ranges = (by_size < ceil) ? by_size : ceil;
+	int want = base * RANGE_CHUNK_MULTIPLIER;
+	max_ranges = (by_size < want) ? by_size : want;
 	if (max_ranges < 2)
 		goto whole_file;
 
@@ -3124,13 +3366,9 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (!stripe_info_viable(&info, remote_path))
 		goto whole_file;
 
-	/* Same rationale as maybe_submit_upload: pick num_ranges first
-	 * (one per OST up to stripe_count, capped by max_ranges), then
-	 * size each range to file_size/num_ranges rounded up to a stripe
-	 * boundary so workers don't share a stripe. */
-	num_ranges = (int)info.stripe_count;
-	if (num_ranges > max_ranges)
-		num_ranges = max_ranges;
+	/* Same rationale as maybe_submit_upload: use max_ranges chunks,
+	 * each aligned to a stripe_size boundary. */
+	num_ranges = max_ranges;
 	if (num_ranges < 2)
 		goto whole_file;
 
@@ -3176,15 +3414,20 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (file_size < RANGE_SPLIT_MIN_SIZE)
 		goto whole_file;
 
-	/* Cap by scaler ceiling so we don't generate units the scaler has
-	 * decided not to use.  Also cap by file size so ranges stay above
-	 * RANGE_SPLIT_MIN_SIZE (open/close RTT cost would dominate). */
-	int ceil = __atomic_load_n(&p->scale_ceiling, __ATOMIC_RELAXED);
-	if (ceil < 1) ceil = 1;
-	if (ceil > SFTP_PARALLEL_MAX_WORKERS)
-		ceil = SFTP_PARALLEL_MAX_WORKERS;
+	/* Same rationale as maybe_submit_upload: base chunk count on the
+	 * user's -j N rather than scale_ceiling (which is the absolute cap,
+	 * not the current pool size).  See the upload comment for details. */
+	int base = p->cfg.num_streams;
+	if (p->cfg.adaptive_scaling) {
+		int ceil = __atomic_load_n(&p->scale_ceiling, __ATOMIC_RELAXED);
+		if (ceil > base) base = ceil;
+	}
+	if (base < 1) base = 1;
+	if (base > SFTP_PARALLEL_MAX_WORKERS)
+		base = SFTP_PARALLEL_MAX_WORKERS;
 	int by_size = (int)(file_size / RANGE_SPLIT_MIN_SIZE);
-	max_ranges = (by_size < ceil) ? by_size : ceil;
+	int want = base * RANGE_CHUNK_MULTIPLIER;
+	max_ranges = (by_size < want) ? by_size : want;
 	if (max_ranges < 2)
 		goto whole_file;
 
@@ -3206,16 +3449,14 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (!stripe_info_viable(&info, remote_path))
 		goto whole_file;
 
-	/* Stripe-aware: pick one range per OST up to stripe_count, capped
-	 * by max_ranges (scaler ceiling).  Each range then gets
-	 * file_size/num_ranges bytes, rounded up to a stripe_size boundary
-	 * so neighbouring workers don't share a stripe and contend on OST
-	 * locks.  (The previous version used stripe_size itself as the
-	 * range unit, which gave one worker ~all of a large file and left
-	 * the rest with a single stripe each.) */
-	num_ranges = (int)info.stripe_count;
-	if (num_ranges > max_ranges)
-		num_ranges = max_ranges;
+	/* Use max_ranges chunks directly.  Ranges still align to stripe_size
+	 * boundaries so each range starts at an OST boundary; with more ranges
+	 * than stripe_count, adjacent ranges share an OST but access it at
+	 * non-overlapping offsets and never write simultaneously — no lock
+	 * contention.  The original stripe_count cap (one range per OST) was
+	 * correct for avoiding simultaneous contention but unnecessarily limits
+	 * load balancing: fast workers go idle waiting for the one slow OST. */
+	num_ranges = max_ranges;
 	if (num_ranges < 2)
 		goto whole_file;
 
