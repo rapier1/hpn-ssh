@@ -70,19 +70,6 @@ struct sftp_parallel_config {
 	int          max_auth_concurrent;
 
 	/*
-	 * Adaptive worker scaling toggle.  When 0 (default), the reporter
-	 * thread keeps the worker pool fixed at num_streams for the entire
-	 * transfer — no scale-up, no scale-down.  When 1, the reporter
-	 * dynamically grows the pool up to SFTP_PARALLEL_MAX_WORKERS based
-	 * on queue depth, and shrinks it back based on idle/saturation
-	 * signals.  Default is off because the scale-down path has shown
-	 * pathological behaviour at high RTT (idle metric is lifetime
-	 * cumulative, max-of-workers triggers on a single idle worker,
-	 * queue empty between producer bursts is misread as over-provision).
-	 */
-	int          adaptive_scaling;
-
-	/*
 	 * Adaptive throughput-based stall detection (FIRST PASS, opt-in).
 	 *
 	 * The existing watchdog detects STALLED/DEAD via TIME since last

@@ -68,17 +68,9 @@ static struct sftp_parallel *parallel_orch = NULL;
 static int parallel_num_streams = 1;
 /* 1 if the user explicitly passed -j N; 0 otherwise.  When 0, hpnsftp
  * runs as a plain single-stream client (no orchestrator, no autotuning) so
- * default behaviour matches upstream sftp.  -j N opts into the adaptive
- * scaler, which treats N as the starting point. */
+ * default behaviour matches upstream sftp.  -j N opts into the parallel
+ * worker pool, which stays fixed at N for the lifetime of the transfer. */
 static int parallel_user_opt_in = 0;
-/*
- * Adaptive worker scaling: off by default.  Set to 1 by
- * "-o AdaptiveScaling=yes".  When off, the worker pool stays fixed at
- * parallel_num_streams for the lifetime of the transfer.  Default is off
- * because the current scale-down path has shown pathological behaviour at
- * high RTT.
- */
-static int parallel_adaptive_scaling = 0;
 
 /*
  * When non-zero, process_put / process_get do NOT call sftp_parallel_wait
@@ -2724,32 +2716,6 @@ main(int argc, char **argv)
 			parallel_identity = optarg;
 			break;
 		case 'o':
-			/*
-			 * Intercept hpnsftp-local -o keys before forwarding the
-			 * rest to the worker SSH connections.  Case-insensitive
-			 * match on the key, value parsed as a boolean.
-			 */
-			if (strncasecmp(optarg, "AdaptiveScaling=",
-			    sizeof("AdaptiveScaling=") - 1) == 0) {
-				const char *val = optarg +
-				    sizeof("AdaptiveScaling=") - 1;
-				if (strcasecmp(val, "yes") == 0 ||
-				    strcasecmp(val, "true") == 0 ||
-				    strcasecmp(val, "on") == 0 ||
-				    strcmp(val, "1") == 0) {
-					parallel_adaptive_scaling = 1;
-				} else if (strcasecmp(val, "no") == 0 ||
-				    strcasecmp(val, "false") == 0 ||
-				    strcasecmp(val, "off") == 0 ||
-				    strcmp(val, "0") == 0) {
-					parallel_adaptive_scaling = 0;
-				} else {
-					fatal("Invalid value for "
-					    "AdaptiveScaling: \"%s\" "
-					    "(use yes/no)", val);
-				}
-				break;
-			}
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
 			if (parallel_extra_o_count + 2 > parallel_extra_o_cap) {
@@ -3010,7 +2976,6 @@ main(int argc, char **argv)
 		pcfg.preserve_flag    = global_pflag;
 		pcfg.fsync_flag       = global_fflag;
 		pcfg.print_flag       = quiet ? 0 : 1;
-		pcfg.adaptive_scaling = parallel_adaptive_scaling;
 
 		/*
 		 * Adaptive throughput-outlier stall detection.  On by default
@@ -3043,20 +3008,12 @@ main(int argc, char **argv)
 			    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
 		}
 
-		if (!quiet) {
-			logit("Parallel streams: -j %d, adaptive scaling %s",
-			    parallel_num_streams,
-			    parallel_adaptive_scaling ? "on" : "off");
-		}
-		/* Mirror to debug so batch-mode runs (quiet=1) can still
-		 * verify what state the orchestrator was started in.
-		 * Visible at -v.  This costs nothing and saves diagnosing
-		 * "did I really pass AdaptiveScaling=no?" later. */
-		debug_f("parallel mode: -j %d adaptive_scaling=%s "
-		    "defer_parallel_wait=%d",
-		    parallel_num_streams,
-		    parallel_adaptive_scaling ? "yes" : "no",
-		    defer_parallel_wait);
+		if (!quiet)
+			logit("Parallel streams: -j %d",
+			    parallel_num_streams);
+		/* Mirror to debug for batch-mode runs (quiet=1). */
+		debug_f("parallel mode: -j %d defer_parallel_wait=%d",
+		    parallel_num_streams, defer_parallel_wait);
 		if (pcfg.tput_path_healthy_kbps > 0) {
 			double eff_alpha = pcfg.tput_ema_alpha > 0.0
 			    ? pcfg.tput_ema_alpha : 0.2;
