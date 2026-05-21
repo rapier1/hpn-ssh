@@ -98,12 +98,19 @@ extern int showprogress;
 #define UPLOAD_BATCH_BYTE_CAP   ((uint64_t)256 * 1024 * 1024)
 
 /* Watchdog thresholds. STALL: warn if a worker has had work available but
- * completed nothing for this long. DEAD: escalate to SIGTERM. Values
- * tuned for high-RTT shared-filesystem environments where a stuck worker
- * holds back the whole transfer (its in-flight unit keeps pending > 0).
- * STALL classification is also escalated to DEAD via the
- * "queue empty + this worker is the only thing holding pending up"
- * isolation check in watchdog_check_workers — see there for details. */
+ * made no bytes-level progress (bytes_total + live_bytes flat) for this
+ * long. DEAD: escalate to SIGTERM. The progress signal is bytes-based
+ * (live_bytes climbs continuously during a healthy transfer regardless of
+ * unit size), so these thresholds reflect "no client-side bytes pushed
+ * in N seconds" rather than "no unit completed in N seconds". Real fatal
+ * stalls (born-dead workers, frozen channel windows) still get caught by
+ * the 5 s born-dead fast-kill before this threshold fires.
+ *
+ * 2026-05-21 note: tried 300/600 to tolerate ext4 writeback-stall pauses
+ * in whole-file mode and the data showed whole-file parallelism is a
+ * net loss on disk-bound paths anyway (worse than single-stream), so we
+ * reverted to 60/120 — fine for the configurations we recommend
+ * (Lustre/GPFS range-split, or non-stripe range-split at low -j). */
 #define STALL_THRESHOLD_SEC     60
 #define DEAD_THRESHOLD_SEC      120
 
@@ -288,6 +295,20 @@ struct sftp_worker {
 	/* Adaptive throughput-based stall detection state.  See
 	 * cfg.tput_path_healthy_kbps in sftp-parallel.h for the algorithm.
 	 * Updated at each watchdog tick. */
+	/*
+	 * Bytes-based progress signal for the watchdog.  last_progress_ns is
+	 * updated by the watchdog every tick that (bytes_total + live_bytes)
+	 * increases; the silence threshold (STALL/DEAD) is measured against
+	 * this timestamp rather than against last_completion_ns.  Lets us
+	 * detect actually-stalled workers without misfiring on long-running
+	 * units (a whole-file upload of a multi-GiB file may run for minutes
+	 * without a completion event, but live_bytes climbs throughout).
+	 *
+	 * Only touched by the reporter/watchdog thread — no locking needed.
+	 */
+	uint64_t           last_progress_ns;
+	uint64_t           last_progress_bytes;
+
 	uint64_t           tput_check_bytes;     /* bytes_total at last check */
 	uint64_t           tput_check_ns;        /* monotime of last check */
 	uint64_t           tput_current_kbps;    /* most recent raw estimate */
@@ -1509,32 +1530,43 @@ watchdog_check_workers(struct sftp_parallel *p)
 
 		pthread_mutex_lock(&w->mu);
 		prev = w->health;
-		uint64_t since_completion_ns = w->last_completion_ns ?
-		    (now - w->last_completion_ns) : 0;
 		uint64_t in_flight = w->units_started - w->units_completed -
 		    w->units_failed;
 		uint64_t w_bytes_total = w->bytes_total;
 		uint64_t w_units_completed = w->units_completed;
+		uint64_t since_completion_ns = w->last_completion_ns ?
+		    (now - w->last_completion_ns) : 0;  /* for log messages */
 		pthread_mutex_unlock(&w->mu);
 		uint64_t w_live_bytes = __atomic_load_n(&w->live_bytes,
 		    __ATOMIC_RELAXED);
 
-		/*
-		 * Effective silence: how long has this worker been "not
-		 * making forward progress on a completion".  Prefer
-		 * since_completion_ns (it measures time since the worker
-		 * last finished any unit, the cleanest signal); fall back
-		 * to time since the current unit was popped when the worker
-		 * has never completed anything (the wedged-on-first-unit
-		 * case).  Either way, only meaningful when in_flight > 0.
-		 */
 		uint64_t unit_start = __atomic_load_n(&w->unit_start_ns,
 		    __ATOMIC_ACQUIRE);
 		uint64_t since_unit_start_ns = (unit_start > 0 &&
 		    now > unit_start) ? (now - unit_start) : 0;
-		uint64_t effective_silence_ns = since_completion_ns > 0
-		    ? since_completion_ns
-		    : since_unit_start_ns;
+
+		/*
+		 * Effective silence: time since we last observed forward
+		 * progress in bytes.  Tracks (bytes_total + live_bytes), which
+		 * climbs continuously during an active transfer regardless of
+		 * unit size.  Replaces the older completion-based timer that
+		 * misfired on whole-file uploads of large files (a 10 GiB
+		 * file at 2 Gbps takes ~50 s — close to STALL_THRESHOLD_SEC,
+		 * any writeback dip would trip a false DEAD).
+		 *
+		 * Updated only by this thread; no atomics needed.  On first
+		 * tick last_progress_ns is 0, so we seed it from now without
+		 * touching last_progress_bytes (which is also 0).
+		 */
+		uint64_t cur_progress_bytes = w_bytes_total + w_live_bytes;
+		if (w->last_progress_ns == 0 ||
+		    cur_progress_bytes > w->last_progress_bytes) {
+			w->last_progress_ns = now;
+			w->last_progress_bytes = cur_progress_bytes;
+		}
+		uint64_t effective_silence_ns =
+		    (w->last_progress_ns > 0 && now > w->last_progress_ns)
+		    ? (now - w->last_progress_ns) : 0;
 
 		next = WORKER_HEALTHY;
 
@@ -2864,6 +2896,16 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (file_size < RANGE_SPLIT_MIN_SIZE)
 		goto whole_file;
 
+	/* Diagnostic / testing escape hatch: HPN_NO_RANGE_SPLIT=1 in the
+	 * environment forces the whole-file path so we can compare pure
+	 * multi-file parallelism (one worker per file) against the
+	 * range-split path on the same workload. */
+	{
+		const char *no_split = getenv("HPN_NO_RANGE_SPLIT");
+		if (no_split && *no_split && *no_split != '0')
+			goto whole_file;
+	}
+
 	/* Each file is split into RANGE_CHUNK_MULTIPLIER × num_streams chunks.
 	 * Bounded by file_size / RANGE_SPLIT_MIN_SIZE so chunks stay above
 	 * the splitting floor.  Fast workers absorbing additional chunks
@@ -2887,19 +2929,21 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 		p->fs_info_cached = 1;
 	}
 
-	if (!stripe_info_viable(&info, remote_path))
-		goto whole_file;
-
-	/* Same rationale as maybe_submit_upload: use max_ranges chunks,
-	 * each aligned to a stripe_size boundary. */
+	/* Same rationale as maybe_submit_upload: stripe-aligned when geometry
+	 * is available, plain file_size/num_ranges otherwise. */
+	int have_stripe = stripe_info_viable(&info, remote_path);
 	num_ranges = max_ranges;
 	if (num_ranges < 2)
 		goto whole_file;
 
 	{
 		off_t per_range = (file_size + num_ranges - 1) / num_ranges;
-		off_t stripe   = (off_t)info.stripe_size;
-		range_size = ((per_range + stripe - 1) / stripe) * stripe;
+		if (have_stripe && info.stripe_size > 0) {
+			off_t stripe = (off_t)info.stripe_size;
+			range_size = ((per_range + stripe - 1) / stripe) * stripe;
+		} else {
+			range_size = per_range;
+		}
 	}
 
 	if (submit_download_ranges(p, remote_path, local_path,
@@ -2938,6 +2982,13 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (file_size < RANGE_SPLIT_MIN_SIZE)
 		goto whole_file;
 
+	/* HPN_NO_RANGE_SPLIT=1 escape hatch, mirroring maybe_submit_upload. */
+	{
+		const char *no_split = getenv("HPN_NO_RANGE_SPLIT");
+		if (no_split && *no_split && *no_split != '0')
+			goto whole_file;
+	}
+
 	/* Same rationale as maybe_submit_upload: RANGE_CHUNK_MULTIPLIER ×
 	 * num_streams chunks, bounded by file_size / RANGE_SPLIT_MIN_SIZE. */
 	int base = p->cfg.num_streams;
@@ -2965,24 +3016,28 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 		p->fs_info_cached = 1;
 	}
 
-	if (!stripe_info_viable(&info, remote_path))
-		goto whole_file;
-
-	/* Use max_ranges chunks directly.  Ranges still align to stripe_size
-	 * boundaries so each range starts at an OST boundary; with more ranges
-	 * than stripe_count, adjacent ranges share an OST but access it at
-	 * non-overlapping offsets and never write simultaneously — no lock
-	 * contention.  The original stripe_count cap (one range per OST) was
-	 * correct for avoiding simultaneous contention but unnecessarily limits
-	 * load balancing: fast workers go idle waiting for the one slow OST. */
+	/* When stripe geometry is available (Lustre/GPFS), align each range
+	 * to a stripe boundary so adjacent ranges target different OSTs.
+	 * Otherwise (ext4/xfs/NFS/etc., where sftp_fs_info returned no stripe
+	 * data), fall back to plain file_size/num_ranges chunks.  The server
+	 * pwrite()s into a pre-allocated file; whether the underlying FS
+	 * actually parallelises those writes is filesystem-dependent.  This
+	 * is the speculative "let's see what happens" non-stripe fallback —
+	 * the win may come from network/cipher parallelism even if disk
+	 * writes serialise. */
+	int have_stripe = stripe_info_viable(&info, remote_path);
 	num_ranges = max_ranges;
 	if (num_ranges < 2)
 		goto whole_file;
 
 	{
 		off_t per_range = (file_size + num_ranges - 1) / num_ranges;
-		off_t stripe   = (off_t)info.stripe_size;
-		range_size = ((per_range + stripe - 1) / stripe) * stripe;
+		if (have_stripe && info.stripe_size > 0) {
+			off_t stripe = (off_t)info.stripe_size;
+			range_size = ((per_range + stripe - 1) / stripe) * stripe;
+		} else {
+			range_size = per_range;
+		}
 	}
 
 	if (submit_upload_ranges(p, conn, local_path, remote_path,

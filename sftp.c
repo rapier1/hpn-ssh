@@ -155,6 +155,7 @@ enum sftp_command {
 	I_CHMOD,
 	I_CHOWN,
 	I_COPY,
+	I_DEFER,
 	I_DF,
 	I_GET,
 	I_HELP,
@@ -178,6 +179,7 @@ enum sftp_command {
 	I_SYMLINK,
 	I_VERSION,
 	I_PROGRESS,
+	I_WAIT,
 };
 
 struct CMD {
@@ -201,6 +203,7 @@ static const struct CMD cmds[] = {
 	{ "chown",	I_CHOWN,	REMOTE,		NOARGS	},
 	{ "copy",	I_COPY,		REMOTE,		LOCAL	},
 	{ "cp",		I_COPY,		REMOTE,		LOCAL	},
+	{ "defer",	I_DEFER,	NOARGS,		NOARGS	},
 	{ "df",		I_DF,		REMOTE,		NOARGS	},
 	{ "dir",	I_LS,		REMOTE,		NOARGS	},
 	{ "exit",	I_QUIT,		NOARGS,		NOARGS	},
@@ -228,6 +231,7 @@ static const struct CMD cmds[] = {
 	{ "rmdir",	I_RMDIR,	REMOTE,		NOARGS	},
 	{ "symlink",	I_SYMLINK,	REMOTE,		REMOTE	},
 	{ "version",	I_VERSION,	NOARGS,		NOARGS	},
+	{ "wait",	I_WAIT,		NOARGS,		NOARGS	},
 	{ "!",		I_SHELL,	NOARGS,		NOARGS	},
 	{ "?",		I_HELP,		NOARGS,		NOARGS	},
 	{ NULL,		-1,		-1,		-1	}
@@ -307,6 +311,8 @@ help(void)
 	    "chown [-h] own path                Change owner of file 'path' to 'own'\n"
 	    "copy oldpath newpath               Copy remote file\n"
 	    "cp oldpath newpath                 Copy remote file\n"
+	    "defer [on|off]                     Toggle deferred put/get (parallel mode);\n"
+	    "                                   no arg prints current state\n"
 	    "df [-hi] [path]                    Display statistics for current directory or\n"
 	    "                                   filesystem containing 'path'\n"
 	    "exit                               Quit sftp\n"
@@ -331,6 +337,7 @@ help(void)
 	    "rmdir path                         Remove remote directory\n"
 	    "symlink oldpath newpath            Symlink remote file\n"
 	    "version                            Show SFTP version\n"
+	    "wait                               Block until all deferred put/get are done\n"
 	    "!command                           Execute 'command' in local shell\n"
 	    "!                                  Escape to local shell\n"
 	    "?                                  Synonym for help\n");
@@ -1673,8 +1680,21 @@ parse_args(const char **cpp, int *ignore_errors, int *disable_echo, int *aflag,
 	case I_HELP:
 	case I_VERSION:
 	case I_PROGRESS:
+	case I_WAIT:
 		if ((optidx = parse_no_flags(cmd, argv, argc)) == -1)
 			return -1;
+		break;
+	case I_DEFER:
+		/* "defer" alone reports state; "defer on" / "defer off"
+		 * toggles.  No other args accepted. */
+		if ((optidx = parse_no_flags(cmd, argv, argc)) == -1)
+			return -1;
+		if (argc - optidx > 1) {
+			error("Too many arguments to defer (use on/off)");
+			return -1;
+		}
+		if (argc - optidx == 1)
+			*path1 = xstrdup(argv[optidx]);
 		break;
 	default:
 		fatal("Command not implemented");
@@ -1938,6 +1958,61 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 			printf("Progress meter enabled\n");
 		else
 			printf("Progress meter disabled\n");
+		break;
+	case I_DEFER:
+		/*
+		 * Toggle the deferred-wait flag.  When ON, `put` and `get`
+		 * return as soon as their submissions hit the queue rather
+		 * than blocking until completion, so successive commands
+		 * pipeline through the worker pool.
+		 *
+		 * Transitioning from ON to OFF drains any pending work
+		 * first (parallel_flush) — `defer off` is a synchronisation
+		 * barrier as well as a state change.  Going ON to ON or OFF
+		 * to OFF is a no-op.  With no argument, the current state
+		 * is printed.
+		 *
+		 * Useful in interactive mode where the user wants to queue
+		 * several uploads back-to-back without waiting for each to
+		 * finish, then synchronise at a chosen point.  In batch mode
+		 * the flag starts ON automatically; this command can disable
+		 * it mid-batch when the next operations depend on prior ones
+		 * having completed.
+		 */
+		if (path1 == NULL) {
+			printf("defer is %s\n",
+			    defer_parallel_wait ? "on" : "off");
+		} else if (strcasecmp(path1, "on") == 0 ||
+		    strcasecmp(path1, "yes") == 0 ||
+		    strcmp(path1, "1") == 0) {
+			defer_parallel_wait = 1;
+			if (!quiet)
+				printf("defer on\n");
+		} else if (strcasecmp(path1, "off") == 0 ||
+		    strcasecmp(path1, "no") == 0 ||
+		    strcmp(path1, "0") == 0) {
+			if (defer_parallel_wait && parallel_orch != NULL) {
+				parallel_flush();
+			}
+			defer_parallel_wait = 0;
+			if (!quiet)
+				printf("defer off\n");
+		} else {
+			error("defer: argument must be on or off "
+			    "(got \"%s\")", path1);
+			err = -1;
+		}
+		break;
+	case I_WAIT:
+		/* Synchronisation barrier: drain any submissions queued by
+		 * deferred put/get commands.  No-op when nothing is in
+		 * flight or when the orchestrator isn't running.  Always
+		 * safe — independent of the defer flag. */
+		if (parallel_orch != NULL) {
+			parallel_flush();
+		}
+		if (!quiet)
+			printf("wait: drained\n");
 		break;
 	default:
 		fatal("%d is not implemented", cmdnum);
