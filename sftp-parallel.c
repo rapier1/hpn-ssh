@@ -97,6 +97,25 @@ extern int showprogress;
  */
 #define UPLOAD_BATCH_BYTE_CAP   ((uint64_t)256 * 1024 * 1024)
 
+/*
+ * ── Phase 5: bundle-mode (hpn-bundle@hpnssh.org) tunables ────────────────
+ *
+ * When a worker has the bundle path enabled (HPN_USE_BUNDLE=1 in the
+ * environment AND the server advertised hpn-bundle support), the worker
+ * collects upload batches up to BUNDLE_TARGET_BYTES instead of
+ * UPLOAD_BATCH_BYTE_CAP, then dispatches them as a single tar stream via
+ * sftp_upload_bundle.  The smaller target produces many small bundles
+ * that compose well with parallel streams — each worker can have a
+ * different bundle in flight, the way each worker has a different batch
+ * in flight in the non-bundle path.
+ *
+ * 4 MiB is a starting point; a server-side fsync after each extract on
+ * the bundle close makes very large bundles bad (longer flush before the
+ * next OPEN), and very small bundles add tar header overhead.  Override
+ * with HPN_BUNDLE_TARGET_BYTES=<bytes>.
+ */
+#define BUNDLE_TARGET_BYTES     ((uint64_t)4 * 1024 * 1024)
+
 /* Watchdog thresholds. STALL: warn if a worker has had work available but
  * made no bytes-level progress (bytes_total + live_bytes flat) for this
  * long. DEAD: escalate to SIGTERM. The progress signal is bytes-based
@@ -177,6 +196,29 @@ extern int showprogress;
  * workers whose first chunk happens to span a slow OST.
  */
 #define BORN_DEAD_KILL_SEC        5
+
+/*
+ * Born-slow fast-kill threshold.  A worker that has completed at least one
+ * unit (so NOT born-dead) but whose EMA throughput is persistently below
+ * BORN_SLOW_FLOOR_FRAC × cfg.tput_path_healthy_kbps for BORN_SLOW_TICKS
+ * consecutive throughput samples is killed, in the hope that the respawn
+ * lands a TCP connection in a better state.
+ *
+ * Capped globally at BORN_SLOW_MAX_KILLS per orchestrator lifetime: if
+ * we've already burned this many respawns chasing slow connections and
+ * the path is still slow, additional respawns would just churn — accept
+ * the slow path and let remaining workers keep going.
+ *
+ * Tuning:
+ *   BORN_SLOW_TICKS=6        × ~5 s/sample = ~30 s window
+ *   BORN_SLOW_FLOOR_FRAC=0.25 below 25% of the configured healthy floor
+ *                            (e.g. < 500 kbps when healthy=2000) is "born
+ *                            slow" — much lower than legitimate slow paths
+ *   BORN_SLOW_MAX_KILLS=5    total respawn budget for born-slow workers
+ */
+#define BORN_SLOW_TICKS           6
+#define BORN_SLOW_FLOOR_FRAC      0.25
+#define BORN_SLOW_MAX_KILLS       5
 
 /*
  * Range-split chunk multiplier.  Each large file is split into
@@ -315,6 +357,10 @@ struct sftp_worker {
 	uint64_t           tput_ema_kbps;        /* EMA-smoothed estimate */
 	int                tput_ema_warmup_ticks; /* ticks since EMA cold-start */
 	int                tput_outlier_ticks;   /* consecutive outlier ticks */
+	int                tput_below_floor_ticks; /* consecutive ticks where
+	                                          * EMA < BORN_SLOW_FLOOR_FRAC ×
+	                                          * cfg.tput_path_healthy_kbps;
+	                                          * drives born-slow fast-kill */
 	uint64_t           tput_last_unit_start_ns; /* unit_start_ns at last tick;
 	                                         * used to detect new-unit starts
 	                                         * and reset EMA so stale frozen
@@ -357,6 +403,31 @@ struct sftp_worker {
 						* clean-shutdown path (worker
 						* thread otherwise blocks on
 						* unresponsive pipes forever) */
+
+	/* ── Phase 4 gap 1: pipelined-batch state ────────────────────
+	 * The previous batch's phase-5 (CLOSE-collection) is deferred
+	 * across the call to sftp_upload_batch_send for the NEXT batch.
+	 * These fields hold the carry-over state.  Set during a
+	 * pipelined send call, cleared by worker_drain_pipeline().
+	 * All NULL/0 means "no deferred batch in flight." */
+	struct sftp_upload_batch_pending *batch_prev_pending;
+	struct sftp_work_unit           **batch_prev_units;
+	struct sftp_upload_batch_entry   *batch_prev_entries;
+	int                               batch_prev_n;
+	int                               batch_pipe_disabled; /* per-worker
+	                                                        * HPN_NO_BATCH_PIPELINE */
+
+	/* ── Phase 5: bundle-mode state (hpn-bundle@hpnssh.org) ─────
+	 * bundle_enabled is set once at worker startup when
+	 *   HPN_USE_BUNDLE=1 in the environment AND
+	 *   sftp_conn_has_hpn_bundle(w->conn) is true.
+	 * When set, the worker collects upload batches to bundle_target_bytes
+	 * and dispatches them via sftp_upload_bundle instead of
+	 * sftp_upload_batch / sftp_upload_batch_send.  No interaction with
+	 * the pipelined-batch state above — bundle and pipelined paths are
+	 * mutually exclusive per worker. */
+	int      bundle_enabled;
+	uint64_t bundle_target_bytes;
 };
 
 struct sftp_parallel {
@@ -489,6 +560,12 @@ struct sftp_parallel {
 	uint32_t sync_stall_ticks;      /* stall slow-ticks in current window */
 	uint32_t sync_stall_window_pos; /* slow-ticks elapsed in current window */
 	uint64_t sync_stall_prev_bytes; /* aggregate bytes at previous slow-tick */
+
+	/* Born-slow respawn budget.  Total count of workers killed because
+	 * their EMA throughput stayed below the floor for the configured
+	 * window.  Capped at BORN_SLOW_MAX_KILLS to prevent runaway respawn
+	 * churn on a path that's genuinely slow.  Set in the watchdog. */
+	int      born_slow_kills;
 };
 
 /* ---------- Worker SSH connection setup ---------- */
@@ -827,6 +904,221 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 	}
 }
 
+/* ── BEGIN Phase 4 gap 1: pipelined-batch helpers ─────────────────────────
+ *
+ * Three helpers manage the deferred phase-5 state across worker_thread
+ * iterations:
+ *
+ *   worker_finalize_one_entry
+ *     Records the result of a single batch entry: success → completion;
+ *     failure → retry (re-queue) or maximum-retries-give-up.  Mirrors the
+ *     existing inline result loop in worker_thread.
+ *
+ *   worker_drain_pipeline
+ *     Calls sftp_upload_batch_finish on the carry-over prev batch (if
+ *     any), processes per-entry results, frees the heap arrays.  Called
+ *     before handling any non-batch work and at worker_thread exit.
+ *
+ *   worker_run_batch_pipelined
+ *     Replaces the synchronous sftp_upload_batch() call.  Allocates heap
+ *     entry/unit arrays so they survive across the next iteration, calls
+ *     sftp_upload_batch_send (which drains prev as part of its phase 1),
+ *     finalises prev (if there was one), then saves THIS batch as the
+ *     new prev.  On send failure, finalises this batch inline (no carry).
+ *
+ * HPN_NO_BATCH_PIPELINE=1 in the environment disables the pipelining at
+ * worker startup; the worker falls back to the legacy sftp_upload_batch
+ * call.  Useful for A/B testing and for bisecting regressions without a
+ * rebuild.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static void
+worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
+    struct sftp_work_unit *u, int rc)
+{
+	if (rc == 0) {
+		worker_record_completion(w, u->size, 1);
+		pending_dec_traced(p, u, w->id, "batch/success");
+		free_unit(u);
+		return;
+	}
+	if (++u->attempt < MAX_RETRIES) {
+		__atomic_store_n(&w->live_bytes, 0, __ATOMIC_RELAXED);
+		if (u->size > 0)
+			__atomic_fetch_add(&p->queued_bytes,
+			    (uint64_t)u->size, __ATOMIC_RELAXED);
+		if (pending_trace_on())
+			pending_trace("REQUEUE", p, u, w->id, "batch/retry");
+		if (sftp_workqueue_push(p->q, u) != 0) {
+			if (u->size > 0)
+				__atomic_fetch_sub(&p->queued_bytes,
+				    (uint64_t)u->size, __ATOMIC_RELAXED);
+			worker_record_completion(w, 0, 0);
+			pending_dec_traced(p, u, w->id, "batch/pushfail");
+			free_unit(u);
+		}
+		return;
+	}
+	error_f("worker %d: batch unit failed after %d attempts: %s",
+	    w->id, u->attempt,
+	    u->src_path ? u->src_path : "(null)");
+	worker_record_completion(w, 0, 0);
+	pending_dec_traced(p, u, w->id, "batch/maxretries");
+	free_unit(u);
+}
+
+static void
+worker_drain_pipeline(struct sftp_worker *w)
+{
+	struct sftp_parallel *p = w->parent;
+	if (w->batch_prev_pending == NULL)
+		return;
+	(void)sftp_upload_batch_finish(w->conn, w->batch_prev_pending);
+	for (int i = 0; i < w->batch_prev_n; i++)
+		worker_finalize_one_entry(p, w,
+		    w->batch_prev_units[i],
+		    w->batch_prev_entries[i].result);
+	free(w->batch_prev_units);
+	free(w->batch_prev_entries);
+	w->batch_prev_pending = NULL;
+	w->batch_prev_units   = NULL;
+	w->batch_prev_entries = NULL;
+	w->batch_prev_n       = 0;
+}
+
+static void
+worker_run_batch_pipelined(struct sftp_worker *w,
+    struct sftp_work_unit **batch, int bn)
+{
+	struct sftp_parallel *p = w->parent;
+	struct sftp_upload_batch_entry *entries;
+	struct sftp_work_unit **units;
+	struct sftp_upload_batch_pending *new_pending;
+
+	if (w->batch_pipe_disabled) {
+		/* Legacy un-pipelined path — kept verbatim from the
+		 * pre-Phase-4 implementation for A/B comparison. */
+		struct sftp_upload_batch_entry stack_entries[UPLOAD_BATCH_SIZE];
+		for (int i = 0; i < bn; i++) {
+			stack_entries[i].local_path  = batch[i]->src_path;
+			stack_entries[i].remote_path = batch[i]->dst_path;
+			stack_entries[i].result      = 0;
+			worker_record_start(w);
+		}
+		sftp_upload_batch(w->conn, stack_entries, bn,
+		    p->cfg.preserve_flag, p->cfg.fsync_flag,
+		    p->cfg.inplace_flag);
+		for (int i = 0; i < bn; i++)
+			worker_finalize_one_entry(p, w, batch[i],
+			    stack_entries[i].result);
+		return;
+	}
+
+	/* Pipelined path: heap-allocate the entry and unit arrays so they
+	 * survive across the next worker_thread iteration. */
+	entries = xcalloc(bn, sizeof(*entries));
+	units   = xcalloc(bn, sizeof(*units));
+	for (int i = 0; i < bn; i++) {
+		entries[i].local_path  = batch[i]->src_path;
+		entries[i].remote_path = batch[i]->dst_path;
+		entries[i].result      = 0;
+		units[i]               = batch[i];
+		worker_record_start(w);
+	}
+
+	/* send() drains batch_prev_pending (if any) AFTER its phase 1
+	 * OPENs are on the wire — that overlap is the win. */
+	new_pending = sftp_upload_batch_send(w->conn, entries, bn,
+	    p->cfg.preserve_flag, p->cfg.fsync_flag,
+	    p->cfg.inplace_flag,
+	    w->batch_prev_pending);
+	/* batch_prev_pending has been freed inside send. */
+	w->batch_prev_pending = NULL;
+
+	/* Now finalise the prev batch's results (entries already populated
+	 * by the drain that just ran inside send). */
+	if (w->batch_prev_units != NULL) {
+		for (int i = 0; i < w->batch_prev_n; i++)
+			worker_finalize_one_entry(p, w,
+			    w->batch_prev_units[i],
+			    w->batch_prev_entries[i].result);
+		free(w->batch_prev_units);
+		free(w->batch_prev_entries);
+		w->batch_prev_units   = NULL;
+		w->batch_prev_entries = NULL;
+		w->batch_prev_n       = 0;
+	}
+
+	if (new_pending == NULL) {
+		/* THIS batch's send failed.  Every entry has result == -1;
+		 * finalise inline and don't carry over. */
+		for (int i = 0; i < bn; i++)
+			worker_finalize_one_entry(p, w, units[i],
+			    entries[i].result);
+		free(units);
+		free(entries);
+	} else {
+		/* Save this batch as the new prev for the next iteration. */
+		w->batch_prev_pending = new_pending;
+		w->batch_prev_units   = units;
+		w->batch_prev_entries = entries;
+		w->batch_prev_n       = bn;
+	}
+}
+/* ── END Phase 4 gap 1 ────────────────────────────────────────────────── */
+
+/* ── BEGIN Phase 5: bundle-mode batch dispatch ────────────────────────────
+ *
+ * worker_run_bundle is the bundle-mode analogue of
+ * worker_run_batch_pipelined.  When w->bundle_enabled the worker calls
+ * this instead — the batch of small files is packed into a single tar
+ * stream and shipped through one OPEN/WRITE×N/CLOSE on a fresh bundle
+ * handle.  This eliminates the per-file open/close round-trip that limits
+ * Phase 4's pipelined batch path on high-RTT links.
+ *
+ * Per-entry success is signalled via the result field (set by
+ * sftp_upload_bundle): on bundle failure every entry is marked -1, the
+ * units retry through the normal worker_finalize_one_entry path, and the
+ * batch is requeued unit-by-unit (no batch-wide retry needed since the
+ * units are still individual work-queue entries).
+ *
+ * Synchronous in this first cut: no overlap with the next batch.  Could
+ * be relaxed later by splitting send/finish like Phase 4 gap 1; not worth
+ * the complexity until benchmarks show bundle close latency is a problem.
+ * ────────────────────────────────────────────────────────────────────── */
+
+static void
+worker_run_bundle(struct sftp_worker *w,
+    struct sftp_work_unit **batch, int bn)
+{
+	struct sftp_parallel *p = w->parent;
+	struct sftp_upload_bundle_entry *entries;
+	int i;
+
+	entries = xcalloc(bn, sizeof(*entries));
+	for (i = 0; i < bn; i++) {
+		entries[i].local_path  = batch[i]->src_path;
+		entries[i].remote_path = batch[i]->dst_path;
+		entries[i].result      = 0;
+		worker_record_start(w);
+	}
+
+	/* dest_dir = "" — each remote_path is treated as an absolute path
+	 * by the server-side bundle handler.  This avoids needing to
+	 * compute a common prefix across the batch; the server's bundle
+	 * extractor calls mkdir_p on each containing directory anyway.
+	 * Slight wire-size cost (full path repeated in every tar header)
+	 * but trivial compared to the small-file payloads. */
+	(void)sftp_upload_bundle(w->conn, "", entries, bn,
+	    p->cfg.preserve_flag, p->cfg.fsync_flag);
+
+	for (i = 0; i < bn; i++)
+		worker_finalize_one_entry(p, w, batch[i], entries[i].result);
+
+	free(entries);
+}
+/* ── END Phase 5 ──────────────────────────────────────────────────────── */
+
 static void *
 worker_thread(void *arg)
 {
@@ -846,6 +1138,40 @@ worker_thread(void *arg)
 	 * worker_thread itself never got scheduled / never started. */
 	debug_ft("dispatch-diag: worker %d entered main loop", w->id);
 
+	/* Phase 4 gap 1: read the HPN_NO_BATCH_PIPELINE env once per worker.
+	 * Disables the pipelined batch path; falls back to legacy
+	 * sftp_upload_batch.  Useful for A/B testing and bisecting. */
+	{
+		const char *e = getenv("HPN_NO_BATCH_PIPELINE");
+		if (e != NULL && *e != '\0' && *e != '0')
+			w->batch_pipe_disabled = 1;
+	}
+
+	/* Phase 5: bundle-mode opt-in.  Enabled iff HPN_USE_BUNDLE=1 AND the
+	 * server advertises the hpn-bundle@hpnssh.org extension.  Both
+	 * conditions are sampled once per worker at startup. */
+	w->bundle_target_bytes = BUNDLE_TARGET_BYTES;
+	{
+		const char *e = getenv("HPN_USE_BUNDLE");
+		if (e != NULL && *e != '\0' && *e != '0' &&
+		    sftp_conn_has_hpn_bundle(w->conn)) {
+			w->bundle_enabled = 1;
+			e = getenv("HPN_BUNDLE_TARGET_BYTES");
+			if (e != NULL && *e != '\0') {
+				unsigned long long v = strtoull(e, NULL, 10);
+				if (v >= 65536ULL)   /* sanity lower bound */
+					w->bundle_target_bytes = (uint64_t)v;
+			}
+			debug_ft("worker %d: hpn-bundle enabled "
+			    "(target_bytes=%llu)",
+			    w->id,
+			    (unsigned long long)w->bundle_target_bytes);
+		} else if (e != NULL && *e != '\0' && *e != '0') {
+			debug_ft("worker %d: HPN_USE_BUNDLE set but server "
+			    "lacks hpn-bundle extension", w->id);
+		}
+	}
+
 	while (1) {
 		if (p->abort_flag)
 			break;
@@ -853,7 +1179,22 @@ worker_thread(void *arg)
 		uint64_t t_idle_start = monotonic_ns();
 		__atomic_store_n(&w->pop_start_ns, t_idle_start,
 		    __ATOMIC_RELEASE);
-		if (sftp_workqueue_pop(p->q, &item) != 0) {
+		/* Phase 4 gap 1 deadlock guard: if we have a deferred
+		 * pipelined batch with pending CLOSE-STATUSes in the
+		 * SSH socket buffer, we cannot block on the workqueue
+		 * without first reading those replies — TCP back-pressure
+		 * would otherwise stall the server.  Try a non-blocking
+		 * pop first; if the queue is empty, drain the deferred
+		 * batch (which reads the pending STATUSes and frees them)
+		 * before falling back to a blocking pop. */
+		if (w->batch_prev_pending != NULL) {
+			if (sftp_workqueue_trypop(p->q, &item) != 0) {
+				/* queue empty — drain before blocking */
+				worker_drain_pipeline(w);
+				item = NULL;
+			}
+		}
+		if (item == NULL && sftp_workqueue_pop(p->q, &item) != 0) {
 			__atomic_store_n(&w->pop_start_ns, 0,
 			    __ATOMIC_RELEASE);
 			break;	/* shutdown && empty */
@@ -895,8 +1236,11 @@ worker_thread(void *arg)
 		/* Self-exit sentinel from sftp_parallel_remove_worker. The
 		 * first worker to pop this exits its loop; the reporter
 		 * thread reaps it. Mark voluntary so the reap loop does
-		 * not spawn a replacement. */
+		 * not spawn a replacement.  Drain the deferred pipelined
+		 * batch (if any) so its CLOSE STATUSes are collected on
+		 * a live connection before we exit. */
 		if (u0->op == SFTP_OP_EXIT_WORKER) {
+			worker_drain_pipeline(w);
 			free_unit(u0);
 			pthread_mutex_lock(&w->mu);
 			w->exited_voluntary = 1;
@@ -920,13 +1264,20 @@ worker_thread(void *arg)
 			/* Soft byte cap: keep adding while batch_bytes is at or
 			 * below the cap.  The first unit is always added even if
 			 * its size alone exceeds the cap (so a single huge file
-			 * is never orphaned).  See UPLOAD_BATCH_BYTE_CAP. */
+			 * is never orphaned).  See UPLOAD_BATCH_BYTE_CAP.
+			 *
+			 * Phase 5: in bundle mode use the smaller
+			 * w->bundle_target_bytes cap so each tar stream stays
+			 * small enough to compose well with parallel streams. */
 			uint64_t batch_bytes = (u0->size > 0) ?
 			    (uint64_t)u0->size : 0;
+			const uint64_t batch_byte_cap = w->bundle_enabled
+			    ? w->bundle_target_bytes
+			    : UPLOAD_BATCH_BYTE_CAP;
 
 			batch[bn++] = u0;
 			while (bn < UPLOAD_BATCH_SIZE && !p->abort_flag &&
-			    batch_bytes <= UPLOAD_BATCH_BYTE_CAP) {
+			    batch_bytes <= batch_byte_cap) {
 				void *nxt = NULL;
 				if (sftp_workqueue_trypop(p->q, &nxt) != 0)
 					break; /* queue empty or shutdown */
@@ -952,7 +1303,13 @@ worker_thread(void *arg)
 			    sftp_workqueue_depth(p->q)); */
 
 			if (bn == 1) {
-				/* Single file — skip batch overhead. */
+				/* Single file — skip batch overhead.  Drain any
+				 * deferred pipelined batch first: execute_unit on
+				 * a single unit uses sftp_upload/sftp_download
+				 * which reads from the connection and would
+				 * corrupt the message stream if a previous
+				 * batch's CLOSE STATUSes were still pending. */
+				worker_drain_pipeline(w);
 				worker_record_start(w);
 				int rc = execute_unit(w, batch[0]);
 				/* DISPATCH-DIAG: log per-unit completion so we
@@ -967,77 +1324,38 @@ worker_thread(void *arg)
 				    (long long)batch[0]->range_offset,
 				    (long long)batch[0]->range_length);
 				worker_process_result(w, batch[0], rc);
+			} else if (w->bundle_enabled) {
+				/*
+				 * Phase 5: bundle this batch as a tar stream
+				 * and ship through one OPEN/WRITE×N/CLOSE.
+				 * Synchronous; the pipelined-batch carry-over
+				 * state (batch_prev_pending et al) is unused
+				 * on the bundle path and stays NULL.
+				 */
+				worker_run_bundle(w, batch, bn);
 			} else {
 				/*
-				 * True batch: build entry array, run pipelined
-				 * open/write/close, then record per-file results.
+				 * True batch.  Phase 4 gap 1:
+				 * worker_run_batch_pipelined handles the entries
+				 * array, send/finish, and per-entry finalisation.
+				 * In pipelined mode (default) the THIS batch's
+				 * phase 5 is deferred; the PREVIOUS batch's
+				 * results are finalised inside the helper.  In
+				 * the kill-switch path (HPN_NO_BATCH_PIPELINE=1)
+				 * it falls back to a synchronous sftp_upload_batch
+				 * call with the same finalisation logic inline.
 				 */
-				struct sftp_upload_batch_entry entries[UPLOAD_BATCH_SIZE];
-				for (int i = 0; i < bn; i++) {
-					entries[i].local_path  = batch[i]->src_path;
-					entries[i].remote_path = batch[i]->dst_path;
-					entries[i].result      = 0;
-					worker_record_start(w);
-				}
-
-				sftp_upload_batch(w->conn, entries, bn,
-				    p->cfg.preserve_flag,
-				    p->cfg.fsync_flag,
-				    p->cfg.inplace_flag);
-
-				for (int i = 0; i < bn; i++) {
-					int rc = entries[i].result;
-					if (rc == 0) {
-						worker_record_completion(w,
-						    batch[i]->size, 1);
-						pending_dec_traced(p, batch[i],
-						    w->id, "batch/success");
-						free_unit(batch[i]);
-					} else if (++batch[i]->attempt < MAX_RETRIES) {
-						/*
-						 * Re-queue without recording completion:
-						 * pending stays up, live_bytes reset inline.
-						 */
-						__atomic_store_n(&w->live_bytes, 0,
-						    __ATOMIC_RELAXED);
-						if (batch[i]->size > 0)
-							__atomic_fetch_add(
-							    &p->queued_bytes,
-							    (uint64_t)batch[i]->size,
-							    __ATOMIC_RELAXED);
-						if (pending_trace_on())
-							pending_trace("REQUEUE",
-							    p, batch[i], w->id,
-							    "batch/retry");
-						if (sftp_workqueue_push(p->q,
-						    batch[i]) != 0) {
-							if (batch[i]->size > 0)
-								__atomic_fetch_sub(
-								    &p->queued_bytes,
-								    (uint64_t)batch[i]->size,
-								    __ATOMIC_RELAXED);
-							worker_record_completion(w, 0, 0);
-							pending_dec_traced(p,
-							    batch[i], w->id,
-							    "batch/pushfail");
-							free_unit(batch[i]);
-						}
-					} else {
-						error_f("worker %d: batch unit failed "
-						    "after %d attempts: %s",
-						    w->id, batch[i]->attempt,
-						    batch[i]->src_path ?
-						    batch[i]->src_path : "(null)");
-						worker_record_completion(w, 0, 0);
-						pending_dec_traced(p, batch[i],
-						    w->id, "batch/maxretries");
-						free_unit(batch[i]);
-					}
-				}
+				worker_run_batch_pipelined(w, batch, bn);
 			}
 
 			/* Process the leftover non-upload unit (if any). */
 			if (leftover != NULL) {
+				/* A non-batch op must drain the pipelined-batch
+				 * state first: the previous batch's CLOSEs are
+				 * still in flight, and execute_unit on the
+				 * leftover would corrupt the message stream by
+				 * reading their STATUS replies as something else. */
+				worker_drain_pipeline(w);
 				if (leftover->op == SFTP_OP_EXIT_WORKER) {
 					free_unit(leftover);
 					pthread_mutex_lock(&w->mu);
@@ -1051,7 +1369,11 @@ worker_thread(void *arg)
 			}
 		} else {
 			/* Download, mkdir, or any range op (UPLOAD_RANGE /
-			 * DOWNLOAD_RANGE) — all bypass the upload-batch path. */
+			 * DOWNLOAD_RANGE) — all bypass the upload-batch path.
+			 * Drain any deferred pipelined batch first so its
+			 * pending STATUSes don't get mistaken for the new op's
+			 * responses on the shared connection. */
+			worker_drain_pipeline(w);
 			worker_record_start(w);
 			int rc = execute_unit(w, u0);
 			/* DISPATCH-DIAG: per-unit completion for range and
@@ -1152,6 +1474,12 @@ worker_thread(void *arg)
 			break;
 		}
 	}
+	/* Phase 4 gap 1: drain any deferred pipelined batch state before
+	 * exiting.  If the connection died, this is a best-effort drain
+	 * (sftp_upload_batch_finish handles a dead conn by marking entries
+	 * failed and freeing). */
+	worker_drain_pipeline(w);
+
 	/* Mark exited so the reporter thread can reap us (join + free). */
 	pthread_mutex_lock(&w->mu);
 	w->exited = 1;
@@ -1443,6 +1771,27 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		} else {
 			w->tput_outlier_ticks = 0;
 		}
+
+		/* Born-slow tracking: per-worker counter of consecutive ticks
+		 * the EMA stayed below an ABSOLUTE floor (a fraction of the
+		 * configured tput_path_healthy_kbps).  Unlike the peer-based
+		 * outlier above, this fires even when all peers are slow —
+		 * the case where a connection comes up in a bad state from
+		 * the start and pipelining can't lift it.  The kill itself
+		 * happens in watchdog_check_workers; we just track the
+		 * streak here. */
+		{
+			uint64_t born_slow_floor =
+			    (uint64_t)(p->cfg.tput_path_healthy_kbps *
+			        BORN_SLOW_FLOOR_FRAC);
+			if (born_slow_floor > 0
+			    && w->tput_ema_kbps < born_slow_floor
+			    && w->tput_ema_warmup_ticks
+			        >= TPUT_EMA_WARMUP_TICKS)
+				w->tput_below_floor_ticks++;
+			else
+				w->tput_below_floor_ticks = 0;
+		}
 	}
 }
 
@@ -1714,6 +2063,38 @@ watchdog_check_workers(struct sftp_parallel *p)
 			} else if (consec >= req && next == WORKER_HEALTHY) {
 				next = WORKER_STALLED;
 			}
+		}
+
+		/*
+		 * Born-slow fast-kill.  A connection that came up in a low-
+		 * cwnd / small-recv-window state and never recovers presents
+		 * as a worker whose EMA throughput stays persistently below
+		 * a small fraction of the healthy floor.  Unlike the peer-
+		 * based outlier above, this fires even when EVERY worker is
+		 * slow (e.g. -j 2 with both connections stuck) — the case
+		 * Phase 4 pipelining cannot help.  Killing triggers the
+		 * normal respawn machinery; a fresh SSH session may land in
+		 * a healthier TCP state.  Capped globally at BORN_SLOW_MAX_KILLS
+		 * to avoid runaway respawn churn on paths that are genuinely
+		 * slow rather than just unlucky.
+		 */
+		if (next != WORKER_DEAD
+		    && p->cfg.tput_path_healthy_kbps > 0
+		    && w->tput_below_floor_ticks >= BORN_SLOW_TICKS
+		    && p->born_slow_kills < BORN_SLOW_MAX_KILLS) {
+			uint64_t floor =
+			    (uint64_t)(p->cfg.tput_path_healthy_kbps *
+			        BORN_SLOW_FLOOR_FRAC);
+			debug_ft("worker %d: born-slow kill "
+			    "(ema=%llukbps < %llukbps for %d ticks, "
+			    "global kills=%d/%d)",
+			    w->id,
+			    (unsigned long long)w->tput_ema_kbps,
+			    (unsigned long long)floor,
+			    w->tput_below_floor_ticks,
+			    p->born_slow_kills + 1, BORN_SLOW_MAX_KILLS);
+			p->born_slow_kills++;
+			next = WORKER_DEAD;
 		}
 
 		if (next != prev) {

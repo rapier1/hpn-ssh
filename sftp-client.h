@@ -217,6 +217,96 @@ struct sftp_upload_batch_entry {
 int sftp_upload_batch(struct sftp_conn *, struct sftp_upload_batch_entry *,
     int n, int preserve_flag, int fsync_flag, int inplace_flag);
 
+/* ── BEGIN Phase 4 gap 1: pipelined batch send/finish ──────────────────────
+ *
+ * Split-call form of sftp_upload_batch.  Lets the caller pipeline
+ * back-to-back batches: send the next batch's OPENs (phase 1) while the
+ * previous batch's CLOSE STATUSes are still being collected (phase 5).
+ *
+ *   pending = sftp_upload_batch_send(conn, entries, n, ..., prev_pending);
+ *     // does phases 1, 2, 3a-d, 4 for the new batch.
+ *     // if prev_pending != NULL: drains it (phase 5 of previous batch)
+ *     // AFTER the new batch's phase 1, so the server-side processing of
+ *     // prev's CLOSEs overlaps with this batch's OPENs on the wire.
+ *     // prev_pending is freed during the drain.
+ *
+ *   sftp_upload_batch_finish(conn, pending);
+ *     // drains the new batch's phase 5.  Free's pending.
+ *
+ * On error during send (connection dies, protocol violation), all entries
+ * in BOTH the current batch and prev (if drain failed) are marked failed
+ * and the function returns NULL.  Caller must NOT call finish on a
+ * NULL pending.
+ *
+ * The legacy sftp_upload_batch() is now a wrapper: send(NULL) + finish().
+ * Identical end-to-end behaviour and identical error semantics when called
+ * with prev=NULL — existing call sites need no changes. */
+struct sftp_upload_batch_pending;
+
+struct sftp_upload_batch_pending *sftp_upload_batch_send(
+    struct sftp_conn *conn,
+    struct sftp_upload_batch_entry *entries, int n,
+    int preserve_flag, int fsync_flag, int inplace_flag,
+    struct sftp_upload_batch_pending *prev);
+
+int sftp_upload_batch_finish(struct sftp_conn *conn,
+    struct sftp_upload_batch_pending *pending);
+
+/* ── END Phase 4 gap 1 ───────────────────────────────────────────────────── */
+
+/* ── BEGIN Phase 5: hpn-bundle small-file streaming ──────────────────────
+ *
+ * Bundle upload via the `hpn-bundle-open@hpnssh.org` SFTP extension.
+ * Many small files are packed into a single tar-format byte stream and
+ * delivered through one OPEN / WRITE×N / CLOSE sequence — amortising the
+ * per-file OPEN/CLOSE round-trip cost that limits small-file throughput
+ * even after Phase 4 pipelining.
+ *
+ * Composes with parallel streams: each worker handles its own bundles
+ * over its own SSH connection; many concurrent bundles in flight.
+ *
+ * Server support detected via the `hpn-bundle@hpnssh.org` extension
+ * advertised in SSH_FXP_VERSION (see SFTP_EXT_HPN_BUNDLE in sftp-client.c).
+ * When unsupported, caller must fall back to per-file uploads.
+ *
+ * See project_phase5_bundling_design.md in the memory store for the full
+ * protocol and architectural notes.
+ */
+
+struct sftp_upload_bundle_entry {
+	const char *local_path;
+	const char *remote_path;   /* relative path inside the bundle dest */
+	int         result;        /* 0 = ok; -1 = failed (set by function) */
+};
+
+/*
+ * Upload N small files as a single tar stream to remote_dest_dir.  The
+ * server's hpn-bundle handler extracts each file into remote_dest_dir/
+ * preserving the relative path supplied in entries[i].remote_path.
+ *
+ * preserve_flag: when non-zero, file mode + mtime are carried in the tar
+ *   header and applied on extract.  Otherwise extracted files use 0644
+ *   mode and current mtime.
+ * fsync_flag: when non-zero, request the server fsync each extracted
+ *   file before the bundle is closed.
+ *
+ * Returns 0 on success (all entries[].result == 0).  Returns -1 if the
+ * bundle failed; all entries[].result are set to -1 in that case (the
+ * protocol does not return per-record status — whole-bundle re-queue).
+ *
+ * Returns -1 immediately if conn does not advertise hpn-bundle support.
+ * Caller must detect this and fall back to per-file mode.
+ */
+int sftp_upload_bundle(struct sftp_conn *conn,
+    const char *remote_dest_dir,
+    struct sftp_upload_bundle_entry *entries, int n,
+    int preserve_flag, int fsync_flag);
+
+/* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
+int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
+
+/* ── END Phase 5 ─────────────────────────────────────────────────────────*/
+
 /*
  * Recursively upload 'local_directory' to 'remote_directory'. Preserve
  * times if 'pflag' is set

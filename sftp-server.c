@@ -311,12 +311,16 @@ struct Handle {
 	char *name;
 	uint64_t bytes_read, bytes_write;
 	int next_unused;
+	/* Phase 5: opaque ptr to struct hpn_bundle_state when use==HANDLE_BUNDLE.
+	 * NULL for HANDLE_FILE / HANDLE_DIR.  Owned by sftp-server-hpn.c. */
+	void *bundle_opaque;
 };
 
 enum {
 	HANDLE_UNUSED,
 	HANDLE_DIR,
-	HANDLE_FILE
+	HANDLE_FILE,
+	HANDLE_BUNDLE   /* Phase 5: hpn-bundle-open accumulator */
 };
 
 static Handle *handles = NULL;
@@ -352,9 +356,49 @@ handle_new(int use, const char *name, int fd, int flags, DIR *dirp)
 	handles[i].flags = flags;
 	handles[i].name = xstrdup(name);
 	handles[i].bytes_read = handles[i].bytes_write = 0;
+	handles[i].bundle_opaque = NULL;
 
 	return i;
 }
+
+/* ── BEGIN Phase 5: bundle handle helpers (called from sftp-server-hpn.c) */
+int
+handle_new_bundle(void *opaque)
+{
+	int i = handle_new(HANDLE_BUNDLE, "(bundle)", -1, 0, NULL);
+	if (i < 0)
+		return -1;
+	handles[i].bundle_opaque = opaque;
+	return i;
+}
+
+void *
+handle_get_bundle(int handle)
+{
+	if (handle < 0 || (u_int)handle >= num_handles ||
+	    handles[handle].use != HANDLE_BUNDLE)
+		return NULL;
+	return handles[handle].bundle_opaque;
+}
+
+int
+handle_is_bundle(int handle)
+{
+	return handle >= 0 && (u_int)handle < num_handles &&
+	    handles[handle].use == HANDLE_BUNDLE;
+}
+
+void
+handle_free_bundle(int handle)
+{
+	if (!handle_is_bundle(handle))
+		return;
+	handles[handle].bundle_opaque = NULL;
+	free(handles[handle].name);
+	handles[handle].name = NULL;
+	handle_unused(handle);
+}
+/* ── END Phase 5 ─────────────────────────────────────────────────────── */
 
 static int
 handle_is_ok(int i, int type)
@@ -730,6 +774,11 @@ process_init(void)
 	compose_extension(msg, "home-directory", "1");
 	compose_extension(msg, "users-groups-by-id@openssh.com", "1");
 	compose_extension(msg, HPN_EXT_FS_INFO, "1");
+#ifdef WITH_LIBARCHIVE
+	/* Phase 5: only advertise hpn-bundle when libarchive is linked,
+	 * since the server cannot extract the tar stream without it. */
+	compose_extension(msg, HPN_EXT_BUNDLE, "1");
+#endif
 
 	send_msg(msg);
 	sshbuf_free(msg);
@@ -786,6 +835,12 @@ process_close(uint32_t id)
 		fatal_fr(r, "parse");
 
 	debug3("request %u: close handle %u", id, handle);
+	/* Phase 5: bundle handles run libarchive extraction at close. */
+	if (sftp_server_hpn_is_bundle_handle(handle)) {
+		status = sftp_server_hpn_bundle_close(handle);
+		send_status(id, status);
+		return;
+	}
 	handle_log_close(handle, NULL);
 	ret = handle_close(handle);
 	status = (ret == -1) ? errno_to_portable(errno) : SSH2_FX_OK;
@@ -862,6 +917,16 @@ process_write(uint32_t id)
 
 	debug("request %u: write \"%s\" (handle %d) off %llu len %zu",
 	    id, handle_to_name(handle), handle, (unsigned long long)off, len);
+
+	/* Phase 5: bundle handles accumulate the WRITE data for later
+	 * libarchive extraction at close time. */
+	if (sftp_server_hpn_is_bundle_handle(handle)) {
+		status = sftp_server_hpn_bundle_write(handle, off, data, len);
+		send_status(id, status);
+		free(data);
+		return;
+	}
+
 	fd = handle_to_fd(handle);
 
 	if (fd < 0)

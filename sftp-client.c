@@ -131,6 +131,7 @@ struct sftp_conn {
 #define SFTP_EXT_COPY_DATA		0x00000100
 #define SFTP_EXT_GETUSERSGROUPS_BY_ID	0x00000200
 #define SFTP_EXT_HPN_FS_INFO		0x00000400
+#define SFTP_EXT_HPN_BUNDLE		0x00000800
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
@@ -652,6 +653,12 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		} else if (strcmp(name, "hpn-fs-info@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_HPN_FS_INFO;
+			known = 1;
+		} else if (strcmp(name, "hpn-bundle@hpnssh.org") == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			/* Phase 5: server can accept tar-format bundles via
+			 * the hpn-bundle-open@hpnssh.org extension. */
+			ret->exts |= SFTP_EXT_HPN_BUNDLE;
 			known = 1;
 		}
 		if (known) {
@@ -2913,18 +2920,148 @@ batch_fail_all_remaining(struct batch_file *bs,
 	}
 }
 
-int
-sftp_upload_batch(struct sftp_conn *conn,
-    struct sftp_upload_batch_entry *entries, int n,
-    int preserve_flag, int fsync_flag, int inplace_flag)
+/* ── BEGIN Phase 4 gap 1: sliding-window batch send/finish ────────────────
+ *
+ * Implementation note: the original sftp_upload_batch did all 5 phases
+ * back-to-back.  Splitting into send (phases 1-4) and finish (phase 5)
+ * lets the caller pipeline: the next batch's OPENs (phase 1) can be on
+ * the wire while the previous batch's CLOSE STATUSes (phase 5) are still
+ * coming back.  Saves ~1 RTT per batch boundary.
+ *
+ * Wire ordering when send is called with prev != NULL:
+ *   1. Send THIS batch's OPENs (phase 1)
+ *   2. Drain PREV's CLOSE STATUSes (the prev_finish step) — they should be
+ *      arriving / arrived since prev's CLOSEs were sent before this call
+ *   3. Collect THIS batch's HANDLEs (phase 2)
+ *   4. The rest of phases 3-4 for this batch
+ *
+ * The overlap: between step 1 (we send opens) and step 2 (we read close
+ * statuses), the server is processing both — sending close statuses for
+ * prev AND opening files for the current batch — concurrently.
+ *
+ * To disable at runtime: HPN_NO_BATCH_PIPELINE=1.  Forces the worker to
+ * fall back to the un-pipelined sftp_upload_batch() entry point.  Useful
+ * for A/B testing or for bisecting regressions.
+ */
+
+struct sftp_upload_batch_pending {
+	struct sftp_upload_batch_entry *entries;
+	struct batch_file              *bs;
+	int                             n;
+	int                             any_fail;
+};
+
+/* Phase 5 + cleanup, factored out for use by both finish and error paths. */
+static int
+batch_phase5_and_cleanup(struct sftp_conn *conn,
+    struct sftp_upload_batch_entry *entries, struct batch_file *bs,
+    int n, int any_fail_in)
 {
+	struct sshbuf *msg;
+	int i, r, any_fail = any_fail_in;
+
+	debug_f("batch upload phase 5: collecting %d close replies", n);
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	for (i = 0; i < n; i++) {
+		u_char type;
+		u_int status, rid;
+
+		if (bs[i].handle == NULL)
+			continue;
+		if (get_msg(conn, msg) != 0) {
+			error_f("batch close: connection closed while "
+			    "collecting responses (entry %d/%d)", i, n);
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+			error_fr(r, "parse batch close response");
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
+		if (type != SSH2_FXP_STATUS) {
+			error_f("batch close: expected SSH2_FXP_STATUS(%d), "
+			    "got %d — connection may be corrupt",
+			    SSH2_FXP_STATUS, type);
+			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
+		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+			error_fr(r, "parse batch close status");
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
+		if (rid != bs[i].close_id) {
+			error_f("batch close ID mismatch: got %u expected %u "
+			    "— possible MITM or server corruption",
+			    rid, bs[i].close_id);
+			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+			batch_fail_all_remaining(bs, entries, n, &any_fail);
+			sshbuf_free(msg);
+			goto cleanup;
+		}
+		if (status != SSH2_FX_OK) {
+			error("batch close \"%s\": %s",
+			    entries[i].remote_path, fx2txt(status));
+			if (!bs[i].failed) {
+				bs[i].failed = 1;
+				entries[i].result = -1;
+				any_fail = 1;
+			}
+		}
+		free(bs[i].handle);
+		bs[i].handle = NULL;
+	}
+	sshbuf_free(msg);
+
+ cleanup:
+	for (i = 0; i < n; i++) {
+		if (bs[i].local_fd >= 0)
+			close(bs[i].local_fd);
+		free(bs[i].handle);
+	}
+	free(bs);
+
+	return any_fail ? -1 : 0;
+}
+
+int
+sftp_upload_batch_finish(struct sftp_conn *conn,
+    struct sftp_upload_batch_pending *pending)
+{
+	int rc;
+	if (pending == NULL)
+		return 0;
+	rc = batch_phase5_and_cleanup(conn, pending->entries, pending->bs,
+	    pending->n, pending->any_fail);
+	free(pending);
+	return rc;
+}
+
+struct sftp_upload_batch_pending *
+sftp_upload_batch_send(struct sftp_conn *conn,
+    struct sftp_upload_batch_entry *entries, int n,
+    int preserve_flag, int fsync_flag, int inplace_flag,
+    struct sftp_upload_batch_pending *prev)
+{
+	struct sftp_upload_batch_pending *new_p;
 	struct batch_file *bs;
 	struct sshbuf *msg;
 	u_int openmode = SSH2_FXF_WRITE | SSH2_FXF_CREAT | SSH2_FXF_TRUNC;
 	int i, r, any_fail = 0;
 
-	if (n <= 0)
-		return 0;
+	if (n <= 0) {
+		if (prev != NULL)
+			(void)sftp_upload_batch_finish(conn, prev);
+		return NULL;
+	}
 
 	debug_f("batch upload: n=%d preserve=%d fsync=%d inplace=%d",
 	    n, preserve_flag, fsync_flag, inplace_flag);
@@ -2993,6 +3130,25 @@ sftp_upload_batch(struct sftp_conn *conn,
 			fatal_fr(r, "compose batch open");
 		send_msg(conn, msg);
 		sshbuf_free(msg);
+	}
+
+	/*
+	 * Drain the previous batch's deferred close STATUSes here, between
+	 * phase 1 (this batch's OPENs sent) and phase 2 (collect this batch's
+	 * HANDLEs).  The OPENs we just sent are now in flight to the server,
+	 * which will also send back the close STATUSes for the prev batch
+	 * (whose CLOSEs were sent before this call).  By draining now we
+	 * overlap server processing of THIS batch's opens with collection of
+	 * PREV batch's close statuses — saving ~1 RTT per batch boundary.
+	 *
+	 * If the drain fails (connection died, protocol violation), prev's
+	 * remaining entries are marked failed inside finish; we still proceed
+	 * with this batch.  If this batch's connection is dead too, phase 2
+	 * below will fail naturally.
+	 */
+	if (prev != NULL) {
+		(void)sftp_upload_batch_finish(conn, prev);
+		prev = NULL;
 	}
 
 	/*
@@ -3096,14 +3252,14 @@ sftp_upload_batch(struct sftp_conn *conn,
 				    "collecting responses (entry %d/%d)", i, n);
 				batch_fail_all_remaining(bs, entries, n, &any_fail);
 				sshbuf_free(msg);
-				goto cleanup;
+				goto send_failed;
 			}
 			if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 			    (r = sshbuf_get_u32(msg, &rid)) != 0) {
 				error_fr(r, "parse batch write response");
 				batch_fail_all_remaining(bs, entries, n, &any_fail);
 				sshbuf_free(msg);
-				goto cleanup;
+				goto send_failed;
 			}
 			if (type != SSH2_FXP_STATUS) {
 				error_f("batch write: expected SSH2_FXP_STATUS(%d), "
@@ -3112,13 +3268,13 @@ sftp_upload_batch(struct sftp_conn *conn,
 				sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 				batch_fail_all_remaining(bs, entries, n, &any_fail);
 				sshbuf_free(msg);
-				goto cleanup;
+				goto send_failed;
 			}
 			if ((r = sshbuf_get_u32(msg, &status)) != 0) {
 				error_fr(r, "parse batch write status");
 				batch_fail_all_remaining(bs, entries, n, &any_fail);
 				sshbuf_free(msg);
-				goto cleanup;
+				goto send_failed;
 			}
 			if (rid != bs[i].write_id) {
 				error_f("batch write ID mismatch: got %u expected "
@@ -3127,7 +3283,7 @@ sftp_upload_batch(struct sftp_conn *conn,
 				sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 				batch_fail_all_remaining(bs, entries, n, &any_fail);
 				sshbuf_free(msg);
-				goto cleanup;
+				goto send_failed;
 			}
 			if (conn->hpn->live_counter != NULL) /* HPN */
 				__atomic_fetch_add(conn->hpn->live_counter,
@@ -3207,86 +3363,392 @@ sftp_upload_batch(struct sftp_conn *conn,
 		sshbuf_free(msg);
 	}
 
-	/*
-	 * Phase 5: collect close STATUS replies in the same order.
-	 * One RTT covers all N replies.
-	 *
-	 * Same dead-connection / protocol-violation handling as Phase 3b:
-	 * mark all unfailed entries failed and goto cleanup rather than
-	 * calling fatal_fr, which would terminate the whole process.
-	 */
-	debug_f("batch upload phase 5: collecting %d close replies", n);
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	for (i = 0; i < n; i++) {
-		u_char type;
-		u_int status, rid;
+	/* Phase 5 is deferred to sftp_upload_batch_finish — packaged into
+	 * a pending struct and returned to the caller, who calls finish
+	 * either inline (legacy sftp_upload_batch wrapper) or later, after
+	 * sending the next batch's phase 1 OPENs (sliding-window pipelining). */
+	new_p = xcalloc(1, sizeof(*new_p));
+	new_p->entries  = entries;
+	new_p->bs       = bs;
+	new_p->n        = n;
+	new_p->any_fail = any_fail;
+	return new_p;
 
-		if (bs[i].handle == NULL)
-			continue;
-		if (get_msg(conn, msg) != 0) {
-			error_f("batch close: connection closed while "
-			    "collecting responses (entry %d/%d)", i, n);
-			batch_fail_all_remaining(bs, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
-		}
-		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
-			error_fr(r, "parse batch close response");
-			batch_fail_all_remaining(bs, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
-		}
-		if (type != SSH2_FXP_STATUS) {
-			error_f("batch close: expected SSH2_FXP_STATUS(%d), "
-			    "got %d — connection may be corrupt",
-			    SSH2_FXP_STATUS, type);
-			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
-			batch_fail_all_remaining(bs, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
-		}
-		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
-			error_fr(r, "parse batch close status");
-			batch_fail_all_remaining(bs, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
-		}
-		if (rid != bs[i].close_id) {
-			error_f("batch close ID mismatch: got %u expected %u "
-			    "— possible MITM or server corruption",
-			    rid, bs[i].close_id);
-			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
-			batch_fail_all_remaining(bs, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
-		}
-		if (status != SSH2_FX_OK) {
-			error("batch close \"%s\": %s",
-			    entries[i].remote_path, fx2txt(status));
-			if (!bs[i].failed) {
-				bs[i].failed = 1;
-				entries[i].result = -1;
-				any_fail = 1;
-			}
-		}
-		free(bs[i].handle);
-		bs[i].handle = NULL;
-	}
-	sshbuf_free(msg);
-
- cleanup:
-	/* Ensure any remaining local fds or handles are cleaned up. */
+ send_failed:
+	/* Phase 3b error path: connection dead or protocol violation BEFORE
+	 * we sent phase 4 CLOSEs.  Mark every entry failed, clean up the
+	 * batch state, and return NULL.  Phase 4 CLOSEs are NOT sent, so
+	 * there is nothing for finish to collect — return NULL signals this
+	 * to the caller. */
 	for (i = 0; i < n; i++) {
 		if (bs[i].local_fd >= 0)
 			close(bs[i].local_fd);
 		free(bs[i].handle);
 	}
 	free(bs);
-
-	return any_fail ? -1 : 0;
+	return NULL;
 }
+
+int
+sftp_upload_batch(struct sftp_conn *conn,
+    struct sftp_upload_batch_entry *entries, int n,
+    int preserve_flag, int fsync_flag, int inplace_flag)
+{
+	struct sftp_upload_batch_pending *p;
+
+	p = sftp_upload_batch_send(conn, entries, n,
+	    preserve_flag, fsync_flag, inplace_flag, NULL);
+	if (p == NULL) {
+		/* send_failed marked entries; if n was 0, also -1 with no work */
+		return n > 0 ? -1 : 0;
+	}
+	return sftp_upload_batch_finish(conn, p);
+}
+/* ── END Phase 4 gap 1 ──────────────────────────────────────────────────── */
+
+/* ── BEGIN Phase 5: hpn-bundle upload ──────────────────────────────────────
+ *
+ * Implements the client side of `hpn-bundle-open@hpnssh.org`.  Many small
+ * files are packed into a tar (ustar) byte stream by libarchive and
+ * delivered to the server through a single OPEN, multiple WRITEs, and a
+ * CLOSE on the SFTP connection.  Server-side handler (see sftp-server.c
+ * process_extended_hpn_bundle_open) feeds the bytes back through
+ * libarchive to recreate the file tree.
+ *
+ * Wire format:
+ *   client -> server:
+ *     SSH_FXP_EXTENDED { id, "hpn-bundle-open@hpnssh.org",
+ *                       string dest_dir, uint32 flags }
+ *       flags bit 0 = preserve metadata, bit 1 = fsync each file
+ *   server -> client:
+ *     SSH_FXP_HANDLE { id, opaque handle }   on success
+ *     SSH_FXP_STATUS { id, status }          on failure
+ *   client -> server: SSH_FXP_WRITE x N with handle, carrying tar bytes
+ *   server -> client: SSH_FXP_STATUS x N (one per WRITE)
+ *   client -> server: SSH_FXP_CLOSE with handle
+ *   server -> client: SSH_FXP_STATUS { id, overall result }
+ *
+ * Caller must check sftp_conn_has_hpn_bundle() before calling
+ * sftp_upload_bundle.  This function does not transparently fall back.
+ *
+ * libarchive integration: compile-time optional via WITH_LIBARCHIVE.
+ * When unavailable, sftp_upload_bundle is a stub that returns -1.
+ */
+
+#ifdef WITH_LIBARCHIVE
+# include <archive.h>
+# include <archive_entry.h>
+#endif
+
+int
+sftp_conn_has_hpn_bundle(struct sftp_conn *conn)
+{
+	return conn && (conn->exts & SFTP_EXT_HPN_BUNDLE) != 0;
+}
+
+#ifndef WITH_LIBARCHIVE
+/* Stub when libarchive is not compiled in.  Caller will fall back to
+ * per-file uploads. */
+int
+sftp_upload_bundle(struct sftp_conn *conn,
+    const char *remote_dest_dir,
+    struct sftp_upload_bundle_entry *entries, int n,
+    int preserve_flag, int fsync_flag)
+{
+	int i;
+	(void)conn; (void)remote_dest_dir;
+	(void)preserve_flag; (void)fsync_flag;
+	for (i = 0; i < n; i++)
+		entries[i].result = -1;
+	debug_f("hpn-bundle: not compiled in (missing libarchive)");
+	return -1;
+}
+#else  /* WITH_LIBARCHIVE */
+
+/* Bundle flags carried in the SSH_FXP_EXTENDED open request. */
+#define HPN_BUNDLE_FLAG_PRESERVE   0x00000001U
+#define HPN_BUNDLE_FLAG_FSYNC      0x00000002U
+
+/* Context for libarchive's write callback — we redirect tar bytes into
+ * SSH_FXP_WRITE messages on the bundle handle. */
+struct bundle_write_ctx {
+	struct sftp_conn *conn;
+	const u_char *handle;
+	size_t        handle_len;
+	off_t         offset;       /* monotonically increasing */
+	int           any_fail;     /* sticky: any WRITE failed */
+};
+
+static la_ssize_t
+bundle_archive_write_cb(struct archive *a, void *client_data,
+    const void *buffer, size_t length)
+{
+	struct bundle_write_ctx *ctx = client_data;
+	struct sshbuf *msg;
+	u_int rid;
+	int r;
+	u_char type;
+	u_int status, reply_rid;
+
+	if (ctx->any_fail)
+		return -1;
+
+	if ((msg = sshbuf_new()) == NULL) {
+		archive_set_error(a, ENOMEM, "sshbuf_new failed");
+		ctx->any_fail = 1;
+		return -1;
+	}
+
+	rid = ctx->conn->msg_id++;
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_WRITE)) != 0 ||
+	    (r = sshbuf_put_u32(msg, rid)) != 0 ||
+	    (r = sshbuf_put_string(msg, ctx->handle, ctx->handle_len)) != 0 ||
+	    (r = sshbuf_put_u64(msg, (uint64_t)ctx->offset)) != 0 ||
+	    (r = sshbuf_put_string(msg, buffer, length)) != 0) {
+		archive_set_error(a, EIO, "compose bundle WRITE: %s",
+		    ssh_err(r));
+		sshbuf_free(msg);
+		ctx->any_fail = 1;
+		return -1;
+	}
+	send_msg(ctx->conn, msg);
+	sshbuf_reset(msg);
+
+	/* Wait for the STATUS reply for this WRITE.  Synchronous (no
+	 * pipelining) for simplicity in this first cut; can be relaxed
+	 * later to overlap multiple WRITE replies. */
+	if (get_msg(ctx->conn, msg) != 0) {
+		archive_set_error(a, EIO,
+		    "bundle WRITE: connection closed before reply");
+		sshbuf_free(msg);
+		ctx->any_fail = 1;
+		return -1;
+	}
+	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+	    (r = sshbuf_get_u32(msg, &reply_rid)) != 0 ||
+	    type != SSH2_FXP_STATUS ||
+	    (r = sshbuf_get_u32(msg, &status)) != 0) {
+		archive_set_error(a, EIO,
+		    "bundle WRITE: malformed reply (type=%u r=%d)", type, r);
+		sshbuf_free(msg);
+		ctx->any_fail = 1;
+		return -1;
+	}
+	if (reply_rid != rid || status != SSH2_FX_OK) {
+		archive_set_error(a, EIO,
+		    "bundle WRITE: id mismatch or status %u (rid=%u expected %u)",
+		    status, reply_rid, rid);
+		sshbuf_free(msg);
+		ctx->any_fail = 1;
+		return -1;
+	}
+	sshbuf_free(msg);
+
+	ctx->offset += (off_t)length;
+	return (la_ssize_t)length;
+}
+
+int
+sftp_upload_bundle(struct sftp_conn *conn,
+    const char *remote_dest_dir,
+    struct sftp_upload_bundle_entry *entries, int n,
+    int preserve_flag, int fsync_flag)
+{
+	struct sshbuf *msg = NULL;
+	u_char *handle = NULL;
+	size_t handle_len = 0;
+	u_int open_id;
+	u_int flags;
+	struct archive *a = NULL;
+	struct bundle_write_ctx ctx;
+	int i, r;
+	int rc = -1;
+
+	for (i = 0; i < n; i++)
+		entries[i].result = -1;   /* pessimistic; flip to 0 on success */
+
+	if (n <= 0)
+		return 0;
+	if (!sftp_conn_has_hpn_bundle(conn)) {
+		debug_f("hpn-bundle: server does not advertise extension");
+		return -1;
+	}
+
+	debug_f("hpn-bundle upload: n=%d dest=\"%s\" preserve=%d fsync=%d",
+	    n, remote_dest_dir, preserve_flag, fsync_flag);
+
+	/* ── Send hpn-bundle-open@hpnssh.org and collect HANDLE ─────────── */
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	open_id = conn->msg_id++;
+	flags = (preserve_flag ? HPN_BUNDLE_FLAG_PRESERVE : 0)
+	      | (fsync_flag    ? HPN_BUNDLE_FLAG_FSYNC    : 0);
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+	    (r = sshbuf_put_u32(msg, open_id)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "hpn-bundle-open@hpnssh.org")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, remote_dest_dir)) != 0 ||
+	    (r = sshbuf_put_u32(msg, flags)) != 0)
+		fatal_fr(r, "compose hpn-bundle-open");
+	send_msg(conn, msg);
+	sshbuf_reset(msg);
+
+	handle = get_handle(conn, open_id, &handle_len,
+	    "hpn-bundle-open \"%s\"", remote_dest_dir);
+	if (handle == NULL) {
+		debug_f("hpn-bundle: server refused open");
+		goto cleanup;
+	}
+
+	/* ── Stream tar bytes through libarchive ────────────────────────── */
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.conn       = conn;
+	ctx.handle     = handle;
+	ctx.handle_len = handle_len;
+	ctx.offset     = 0;
+	ctx.any_fail   = 0;
+
+	a = archive_write_new();
+	if (a == NULL)
+		fatal_f("archive_write_new failed");
+	/* ustar is the universal "tar" format.  Could be pax for larger
+	 * filenames / timestamps, but ustar is the lowest common denominator. */
+	if (archive_write_set_format_ustar(a) != ARCHIVE_OK ||
+	    archive_write_set_bytes_per_block(a, 32 * 1024) != ARCHIVE_OK ||
+	    archive_write_open(a, &ctx, NULL,
+	        bundle_archive_write_cb, NULL) != ARCHIVE_OK) {
+		error_f("libarchive setup: %s", archive_error_string(a));
+		goto cleanup;
+	}
+
+	for (i = 0; i < n; i++) {
+		struct archive_entry *ae;
+		int fd;
+		struct stat sb;
+		off_t bytes_remaining;
+		u_char buf[65536];
+
+		fd = open(entries[i].local_path, O_RDONLY);
+		if (fd < 0) {
+			error("hpn-bundle: open local \"%s\": %s",
+			    entries[i].local_path, strerror(errno));
+			/* Skip this entry; remaining files still uploaded. */
+			continue;
+		}
+		if (fstat(fd, &sb) < 0) {
+			error("hpn-bundle: fstat \"%s\": %s",
+			    entries[i].local_path, strerror(errno));
+			close(fd);
+			continue;
+		}
+
+		ae = archive_entry_new();
+		archive_entry_set_pathname(ae, entries[i].remote_path);
+		archive_entry_set_size(ae, (la_int64_t)sb.st_size);
+		archive_entry_set_filetype(ae, AE_IFREG);
+		if (preserve_flag) {
+			archive_entry_set_perm(ae, sb.st_mode & 07777);
+			archive_entry_set_mtime(ae, sb.st_mtime, 0);
+		} else {
+			archive_entry_set_perm(ae, 0644);
+			archive_entry_set_mtime(ae, time(NULL), 0);
+		}
+		if (archive_write_header(a, ae) != ARCHIVE_OK) {
+			error_f("libarchive write_header for \"%s\": %s",
+			    entries[i].remote_path, archive_error_string(a));
+			archive_entry_free(ae);
+			close(fd);
+			goto cleanup;
+		}
+
+		bytes_remaining = sb.st_size;
+		while (bytes_remaining > 0) {
+			ssize_t got = read(fd, buf,
+			    (size_t)(bytes_remaining < (off_t)sizeof(buf)
+			        ? bytes_remaining : (off_t)sizeof(buf)));
+			if (got <= 0) {
+				error("hpn-bundle: read \"%s\": %s",
+				    entries[i].local_path,
+				    got < 0 ? strerror(errno) : "EOF");
+				archive_entry_free(ae);
+				close(fd);
+				goto cleanup;
+			}
+			if (archive_write_data(a, buf, (size_t)got) < 0) {
+				error_f("libarchive write_data \"%s\": %s",
+				    entries[i].remote_path,
+				    archive_error_string(a));
+				archive_entry_free(ae);
+				close(fd);
+				goto cleanup;
+			}
+			bytes_remaining -= got;
+		}
+
+		archive_entry_free(ae);
+		close(fd);
+		entries[i].result = 0;
+	}
+
+	if (archive_write_close(a) != ARCHIVE_OK) {
+		error_f("libarchive write_close: %s", archive_error_string(a));
+		goto cleanup;
+	}
+	if (ctx.any_fail) {
+		debug_f("hpn-bundle: WRITE phase reported failure");
+		goto cleanup;
+	}
+
+	/* ── Close the bundle handle, collect overall STATUS ────────────── */
+	{
+		u_int close_id = conn->msg_id++;
+		u_char type;
+		u_int status, reply_rid;
+
+		sshbuf_reset(msg);
+		if ((r = sshbuf_put_u8(msg, SSH2_FXP_CLOSE)) != 0 ||
+		    (r = sshbuf_put_u32(msg, close_id)) != 0 ||
+		    (r = sshbuf_put_string(msg, handle, handle_len)) != 0)
+			fatal_fr(r, "compose bundle CLOSE");
+		send_msg(conn, msg);
+		sshbuf_reset(msg);
+
+		if (get_msg(conn, msg) != 0) {
+			error_f("hpn-bundle: connection closed before "
+			    "CLOSE reply");
+			goto cleanup;
+		}
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &reply_rid)) != 0 ||
+		    type != SSH2_FXP_STATUS ||
+		    (r = sshbuf_get_u32(msg, &status)) != 0) {
+			error_f("hpn-bundle: malformed CLOSE reply");
+			goto cleanup;
+		}
+		if (reply_rid != close_id || status != SSH2_FX_OK) {
+			error_f("hpn-bundle: CLOSE failed status=%u "
+			    "(rid=%u expected %u)",
+			    status, reply_rid, close_id);
+			goto cleanup;
+		}
+	}
+
+	rc = 0;   /* success — entries[].result already set to 0 above */
+
+ cleanup:
+	if (rc != 0) {
+		for (i = 0; i < n; i++)
+			entries[i].result = -1;
+	}
+	if (a != NULL)
+		archive_write_free(a);
+	free(handle);
+	if (msg != NULL)
+		sshbuf_free(msg);
+	return rc;
+}
+
+#endif /* WITH_LIBARCHIVE */
+/* ── END Phase 5 ────────────────────────────────────────────────────────── */
 
 static int
 upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
