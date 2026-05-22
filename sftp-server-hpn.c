@@ -713,34 +713,80 @@ sftp_server_hpn_dispatch(u_int id, const char *name,
 	}
 	debug3("request %u: hpn-fs-info \"%s\"", id, path);
 
+	/*
+	 * The client typically asks about the destination file BEFORE it
+	 * exists (path is the upload target, not yet created).  statfs /
+	 * statvfs / lfs getstripe all need an existing path, so walk up
+	 * the path's ancestors until we find one that exists.  Lustre /
+	 * GPFS stripe geometry inherits per-directory, so the first
+	 * existing ancestor gives the same answer.
+	 *
+	 * effective_path is a writable copy we whittle down with dirname()
+	 * style component stripping; freed before return.
+	 */
+	char *effective_path = strdup(path);
+	if (effective_path == NULL)
+		fatal_f("strdup failed");
+	{
+		struct stat st;
+		while (stat(effective_path, &st) != 0) {
+			char *slash = strrchr(effective_path, '/');
+			if (slash == NULL) {
+				/* Ran out of slashes — bail.  Server returns
+				 * "unknown" / zeros; client falls back. */
+				debug3("hpn-fs-info: no existing ancestor "
+				    "for \"%s\"", path);
+				break;
+			}
+			if (slash == effective_path) {
+				/* Reached "/" itself. */
+				effective_path[1] = '\0';
+				if (stat(effective_path, &st) != 0) {
+					debug3("hpn-fs-info: even / does "
+					    "not stat for \"%s\"", path);
+				}
+				break;
+			}
+			*slash = '\0';
+		}
+		if (strcmp(effective_path, path) != 0)
+			debug3("hpn-fs-info: walked \"%s\" -> existing "
+			    "ancestor \"%s\"", path, effective_path);
+	}
+
 #ifdef HAVE_STATFS
 	{
 		struct statfs sfs;
-		if (statfs(path, &sfs) == 0)
+		if (statfs(effective_path, &sfs) == 0)
 			fs_type = fstype_from_magic(
 			    (unsigned long)sfs.f_type);
 		else
 			debug3("hpn-fs-info: statfs \"%s\": %s",
-			    path, strerror(errno));
+			    effective_path, strerror(errno));
 	}
 #endif
 
 	{
 		struct statvfs svfs;
-		if (statvfs(path, &svfs) == 0 && svfs.f_bsize > 0)
+		if (statvfs(effective_path, &svfs) == 0 && svfs.f_bsize > 0)
 			block_size = (uint64_t)svfs.f_bsize;
 	}
 
 	if (strcmp(fs_type, "lustre") == 0) {
-		if (lustre_get_stripe(path, &stripe_size, &stripe_count)) {
+		if (lustre_get_stripe(effective_path, &stripe_size,
+		    &stripe_count)) {
 			debug3("hpn-fs-info: lustre stripe_size=%llu "
-			    "stripe_count=%u",
-			    (unsigned long long)stripe_size, stripe_count);
+			    "stripe_count=%u (path \"%s\")",
+			    (unsigned long long)stripe_size, stripe_count,
+			    effective_path);
 		} else {
 			debug3("hpn-fs-info: lfs getstripe unavailable "
-			    "for \"%s\", using block_size only", path);
+			    "for \"%s\", using block_size only",
+			    effective_path);
 		}
 	}
+
+	free(effective_path);
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");

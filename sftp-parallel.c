@@ -231,6 +231,45 @@ extern int showprogress;
 #define RANGE_CHUNK_MULTIPLIER    4
 
 /*
+ * Per-chunk minimum size, expressed in stripe extents (one stripe extent =
+ * stripe_size × stripe_count).  These constants set the threshold for
+ * range-splitting a file: a file is only split when its size ≥
+ *   stripe_extent × <fs-specific multiplier> × num_workers
+ *
+ * Rationale: each chunk needs to be big enough that its server-side
+ * close()/commit cost amortises against the chunk's transfer time.  How
+ * many stripe rotations is "big enough" depends on the filesystem's
+ * per-object commit cost, which differs across Lustre / GPFS / other.
+ *
+ * LUSTRE — empirically determined on bridges-2 ocean
+ *   (stripe_size=1 MiB × stripe_count=8 = 8 MiB extent) with j=8 workers:
+ *   threshold of 2048 MiB gave both the lowest wall time AND the lowest
+ *   run-to-run variance (CV 4.9% vs 12–22% at neighbouring thresholds).
+ *   2048 = 8 × 32 × 8, so 32 is the measured multiplier for Lustre.
+ *
+ * GPFS — UNTESTED on real GPFS hardware.  The fs_info GPFS path
+ *   substitutes block_size for stripe_size and SFTP_PARALLEL_MAX_WORKERS
+ *   (=24) for stripe_count, so the effective "stripe extent" GPFS reports
+ *   to us is much larger per OST than Lustre's.  Using the same 32×
+ *   multiplier here would produce thresholds in the multi-GiB range
+ *   (e.g. block_size=4 MiB × 24 × 32 × 8 = 24 GiB), which is almost
+ *   certainly too aggressive.  Starting at 4× until we have measurements.
+ *
+ * DEFAULT — for any other filesystem that reports usable stripe info via
+ *   the fs-info catch-all (rare; ext4/NFS typically report nothing).
+ *   Conservative 4× — the formula is unlikely to be right for an unknown
+ *   fs, but we'd rather under-split than block uploads on a wrong
+ *   threshold.
+ *
+ * Operator override: HPN_RANGE_SPLIT_MIN_MB bypasses the formula entirely.
+ */
+#define LUSTRE_STRIPE_MULTIPLIER  32
+#define GPFS_STRIPE_MULTIPLIER     4
+#define DEFAULT_STRIPE_MULTIPLIER  4
+/* Function is defined below struct sftp_parallel and stripe_info_viable;
+ * see comments at the implementation site. */
+
+/*
  * Isolation progress-rate gate.  When a worker is alone with an in-flight
  * unit (queue empty, no peers transferring) the peer-EMA-based outlier path
  * has no signal to compare against — max_kbps decays to zero as peers go
@@ -3175,8 +3214,9 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 		return -1;
 	}
 
-	debug3("range-split \"%s\": %d ranges of %lld bytes",
-	    remote_path, num_ranges, (long long)range_size);
+	debug("range-split upload \"%s\": %d ranges of %lld bytes "
+	    "(%.1f MiB each)", remote_path, num_ranges,
+	    (long long)range_size, (double)range_size / (1024.0*1024.0));
 
 	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
 	for (i = 0; i < num_ranges; i++) {
@@ -3258,6 +3298,136 @@ stripe_info_viable(struct sftp_fs_info *info, const char *path)
 }
 
 /*
+ * Compute the minimum file size at which range-splitting is allowed,
+ * in bytes.  Precedence:
+ *   1. HPN_RANGE_SPLIT_MIN_MB env var (operator escape hatch, in MiB)
+ *   2. fs-info-derived: stripe_size × stripe_count × <fs-specific multiplier> × num_workers
+ *      (requires hpn-fs-info to have returned usable stripe geometry)
+ *   3. RANGE_SPLIT_MIN_SIZE static floor (64 MiB) — for non-striped destinations
+ *
+ * Multiplier dispatch:
+ *   - "lustre"  -> LUSTRE_STRIPE_MULTIPLIER (32, empirical)
+ *   - "gpfs"    -> GPFS_STRIPE_MULTIPLIER  (4, conservative, untested)
+ *   - other     -> DEFAULT_STRIPE_MULTIPLIER (4, conservative)
+ *
+ * fs_info is queried lazily and cached on `p` (one RTT once per orchestrator).
+ * Callers should fast-path tiny files (< RANGE_SPLIT_MIN_SIZE) before calling
+ * this so the lazy query never fires for clearly-too-small uploads.
+ */
+static uint64_t
+range_split_min_size_for(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *remote_path)
+{
+	/* Env override always wins. */
+	const char *e = getenv("HPN_RANGE_SPLIT_MIN_MB");
+	if (e != NULL && *e != '\0') {
+		uint64_t mb = strtoull(e, NULL, 10);
+		if (mb > 0) {
+			static struct sftp_parallel *logged_for_env;
+			if (logged_for_env != p) {
+				logit("range-split threshold = %llu MiB "
+				    "(HPN_RANGE_SPLIT_MIN_MB override)",
+				    (unsigned long long)mb);
+				logged_for_env = p;
+			}
+			return mb * 1024ULL * 1024ULL;
+		}
+	}
+
+	/* Query fs-info on first call; subsequent calls hit the cache. */
+	if (!p->fs_info_cached) {
+		struct sftp_fs_info info;
+		memset(&info, 0, sizeof(info));
+		sftp_fs_info(conn, remote_path, &info);
+		p->fs_info_cache = info;
+		p->fs_info_cached = 1;
+	}
+
+	if (stripe_info_viable(&p->fs_info_cache, remote_path)) {
+		uint64_t stripe_extent =
+		    (uint64_t)p->fs_info_cache.stripe_size *
+		    p->fs_info_cache.stripe_count;
+		int workers = p->cfg.num_streams;
+		if (workers < 1) workers = 1;
+
+		/* Pick the multiplier from the reported fs_type.  Unknown
+		 * types get the conservative default.  This is the hook
+		 * point for adding measurements / new filesystems later
+		 * (e.g. WekaFS, BeeGFS, Ceph). */
+		int multiplier;
+		const char *fs_type = p->fs_info_cache.fs_type;
+		const char *mult_source;
+		if (fs_type != NULL && strcmp(fs_type, "lustre") == 0) {
+			multiplier  = LUSTRE_STRIPE_MULTIPLIER;
+			mult_source = "lustre";
+		} else if (fs_type != NULL && strcmp(fs_type, "gpfs") == 0) {
+			multiplier  = GPFS_STRIPE_MULTIPLIER;
+			mult_source = "gpfs";
+		} else {
+			multiplier  = DEFAULT_STRIPE_MULTIPLIER;
+			mult_source = "default";
+		}
+		/* HPN_STRIPE_MULTIPLIER=N env override.  Takes precedence over
+		 * the per-fs constant but is itself overridden by
+		 * HPN_RANGE_SPLIT_MIN_MB (which bypasses the formula
+		 * entirely).  Useful for tuning the multiplier on a new fs
+		 * without rebuilding. */
+		{
+			const char *em = getenv("HPN_STRIPE_MULTIPLIER");
+			if (em != NULL && *em != '\0') {
+				int v = atoi(em);
+				if (v > 0) {
+					multiplier  = v;
+					mult_source = "env";
+				}
+			}
+		}
+
+		uint64_t derived = stripe_extent *
+		    (uint64_t)multiplier *
+		    (uint64_t)workers;
+		/* Never go below the static floor — protects against
+		 * filesystems with pathologically small stripe extents. */
+		int hit_floor = 0;
+		if (derived < (uint64_t)RANGE_SPLIT_MIN_SIZE) {
+			derived = (uint64_t)RANGE_SPLIT_MIN_SIZE;
+			hit_floor = 1;
+		}
+
+		/* Print once per orchestrator at default verbosity so the
+		 * operator can see what threshold the formula picked. */
+		static struct sftp_parallel *logged_for;
+		if (logged_for != p) {
+			logit("range-split threshold = %llu MiB "
+			    "(fs=%s stripe_size=%llu B × stripe_count=%u"
+			    " × mult=%d (%s) × workers=%d%s)",
+			    (unsigned long long)(derived / (1024ULL*1024ULL)),
+			    fs_type ? fs_type : "(null)",
+			    (unsigned long long)p->fs_info_cache.stripe_size,
+			    p->fs_info_cache.stripe_count,
+			    multiplier, mult_source, workers,
+			    hit_floor ? "; clamped to floor" : "");
+			logged_for = p;
+		}
+		return derived;
+	}
+
+	/* No usable stripe info — destination doesn't advertise stripe
+	 * geometry, or hpn-fs-info isn't supported.  Use the static floor. */
+	{
+		static struct sftp_parallel *logged_for_floor;
+		if (logged_for_floor != p) {
+			logit("range-split threshold = %llu MiB "
+			    "(no usable stripe info; static floor)",
+			    (unsigned long long)((uint64_t)RANGE_SPLIT_MIN_SIZE
+			        / (1024ULL*1024ULL)));
+			logged_for_floor = p;
+		}
+	}
+	return (uint64_t)RANGE_SPLIT_MIN_SIZE;
+}
+
+/*
  * Pre-create a local file at exactly size bytes so that parallel range-download
  * workers can open it O_WRONLY and write their ranges concurrently without
  * racing on creation.
@@ -3320,8 +3490,9 @@ submit_download_ranges(struct sftp_parallel *p,
 		return -1;
 	}
 
-	debug3("range-split download \"%s\": %d ranges of %lld bytes",
-	    remote_path, num_ranges, (long long)range_size);
+	debug("range-split download \"%s\": %d ranges of %lld bytes "
+	    "(%.1f MiB each)", remote_path, num_ranges,
+	    (long long)range_size, (double)range_size / (1024.0*1024.0));
 
 	for (i = 0; i < num_ranges; i++) {
 		off_t offset = (off_t)i * range_size;
@@ -3360,8 +3531,17 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (file_size <= 0)
 		goto whole_file;
 
-	if (file_size < RANGE_SPLIT_MIN_SIZE)
+	/* Static-floor fast path: files clearly below any plausible
+	 * threshold can short-circuit without paying for the fs-info RTT. */
+	if ((uint64_t)file_size < (uint64_t)RANGE_SPLIT_MIN_SIZE)
 		goto whole_file;
+
+	{
+		uint64_t min_split =
+		    range_split_min_size_for(p, conn, remote_path);
+		if ((uint64_t)file_size < min_split)
+			goto whole_file;
+	}
 
 	/* Diagnostic / testing escape hatch: HPN_NO_RANGE_SPLIT=1 in the
 	 * environment forces the whole-file path so we can compare pure
@@ -3374,14 +3554,15 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 
 	/* Each file is split into RANGE_CHUNK_MULTIPLIER × num_streams chunks.
-	 * Bounded by file_size / RANGE_SPLIT_MIN_SIZE so chunks stay above
+	 * Bounded by file_size / effective_min so chunks stay above
 	 * the splitting floor.  Fast workers absorbing additional chunks
 	 * naturally limits the tail-straggler impact of a slow OST. */
 	int base = p->cfg.num_streams;
 	if (base < 1) base = 1;
 	if (base > SFTP_PARALLEL_MAX_WORKERS)
 		base = SFTP_PARALLEL_MAX_WORKERS;
-	int by_size = (int)(file_size / RANGE_SPLIT_MIN_SIZE);
+	int by_size = (int)(file_size /
+	    range_split_min_size_for(p, conn, remote_path));
 	int want = base * RANGE_CHUNK_MULTIPLIER;
 	max_ranges = (by_size < want) ? by_size : want;
 	if (max_ranges < 2)
@@ -3446,8 +3627,17 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	off_t range_size;
 	int num_ranges, max_ranges;
 
-	if (file_size < RANGE_SPLIT_MIN_SIZE)
+	/* Static-floor fast path: avoid the fs-info RTT for clearly
+	 * too-small files. */
+	if ((uint64_t)file_size < (uint64_t)RANGE_SPLIT_MIN_SIZE)
 		goto whole_file;
+
+	{
+		uint64_t min_split =
+		    range_split_min_size_for(p, conn, remote_path);
+		if ((uint64_t)file_size < min_split)
+			goto whole_file;
+	}
 
 	/* HPN_NO_RANGE_SPLIT=1 escape hatch, mirroring maybe_submit_upload. */
 	{
@@ -3457,12 +3647,13 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 
 	/* Same rationale as maybe_submit_upload: RANGE_CHUNK_MULTIPLIER ×
-	 * num_streams chunks, bounded by file_size / RANGE_SPLIT_MIN_SIZE. */
+	 * num_streams chunks, bounded by file_size / effective_min. */
 	int base = p->cfg.num_streams;
 	if (base < 1) base = 1;
 	if (base > SFTP_PARALLEL_MAX_WORKERS)
 		base = SFTP_PARALLEL_MAX_WORKERS;
-	int by_size = (int)(file_size / RANGE_SPLIT_MIN_SIZE);
+	int by_size = (int)(file_size /
+	    range_split_min_size_for(p, conn, remote_path));
 	int want = base * RANGE_CHUNK_MULTIPLIER;
 	max_ranges = (by_size < want) ? by_size : want;
 	if (max_ranges < 2)

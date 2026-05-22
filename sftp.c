@@ -3030,6 +3030,25 @@ main(int argc, char **argv)
 	 * The master and workers honor the same -i / -F / -o options the
 	 * user gave the main connection (captured during getopt above).
 	 */
+	/*
+	 * Phase 5: bundle support lives on top of the parallel-streams
+	 * orchestrator's batch accumulator (worker_run_bundle in
+	 * sftp-parallel.c).  If the user asks for bundles via the
+	 * HPN_USE_BUNDLE env var but didn't pass -j, the env var would be
+	 * silently ignored — warn so they can re-run with -j and actually
+	 * get the path they wanted.
+	 */
+	if (!parallel_user_opt_in) {
+		const char *e = getenv("HPN_USE_BUNDLE");
+		if (e != NULL && *e != '\0' && *e != '0') {
+			fprintf(stderr,
+			    "hpnsftp: HPN_USE_BUNDLE=%s set but bundling "
+			    "requires -j N (parallel streams); ignoring.\n"
+			    "         Re-run with `-j 1` (or higher) to "
+			    "enable the bundle path.\n", e);
+		}
+	}
+
 	if (parallel_user_opt_in && sftp_direct == NULL) {
 		struct sftp_parallel_config pcfg;
 		char portbuf[16] = "";
@@ -3081,6 +3100,18 @@ main(int argc, char **argv)
 			    (e_c && *e_c) ? atoi(e_c) : 5;
 			pcfg.tput_ema_alpha =
 			    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
+		}
+
+		/* HPN_MAX_AUTH_CONCURRENT=N caps the number of worker SSH
+		 * children allowed to be in the authentication phase at the
+		 * same time.  0 (or unset) uses the built-in default (8). */
+		{
+			const char *e = getenv("HPN_MAX_AUTH_CONCURRENT");
+			if (e != NULL && *e != '\0') {
+				int v = atoi(e);
+				if (v > 0)
+					pcfg.max_auth_concurrent = v;
+			}
 		}
 
 		if (!quiet)
