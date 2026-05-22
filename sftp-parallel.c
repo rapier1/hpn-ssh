@@ -566,6 +566,12 @@ struct sftp_parallel {
 	 * window.  Capped at BORN_SLOW_MAX_KILLS to prevent runaway respawn
 	 * churn on a path that's genuinely slow.  Set in the watchdog. */
 	int      born_slow_kills;
+
+	/* Optional per-worker stats CSV (enabled via HPN_WORKER_STATS_CSV env).
+	 * Opened lazily by the reporter on first tick; closed at orchestrator
+	 * stop.  Touched only by the reporter thread. */
+	FILE    *stats_csv;
+	uint64_t stats_csv_start_ns;
 };
 
 /* ---------- Worker SSH connection setup ---------- */
@@ -1093,15 +1099,24 @@ worker_run_bundle(struct sftp_worker *w,
 {
 	struct sftp_parallel *p = w->parent;
 	struct sftp_upload_bundle_entry *entries;
-	int i;
+	uint64_t total_bytes = 0;
+	int i, ok_count = 0;
+	uint64_t t_start_ns, t_end_ns, elapsed_us;
 
 	entries = xcalloc(bn, sizeof(*entries));
 	for (i = 0; i < bn; i++) {
 		entries[i].local_path  = batch[i]->src_path;
 		entries[i].remote_path = batch[i]->dst_path;
 		entries[i].result      = 0;
+		if (batch[i]->size > 0)
+			total_bytes += (uint64_t)batch[i]->size;
 		worker_record_start(w);
 	}
+
+	/* Phase-5 instrumentation: per-bundle wall time.  Always-on; one
+	 * stderr line per bundle.  Format chosen so the harness can grep
+	 * "BUNDLE worker=" and parse the key=value fields. */
+	t_start_ns = monotonic_ns();
 
 	/* dest_dir = "" — each remote_path is treated as an absolute path
 	 * by the server-side bundle handler.  This avoids needing to
@@ -1111,6 +1126,24 @@ worker_run_bundle(struct sftp_worker *w,
 	 * but trivial compared to the small-file payloads. */
 	(void)sftp_upload_bundle(w->conn, "", entries, bn,
 	    p->cfg.preserve_flag, p->cfg.fsync_flag);
+
+	t_end_ns = monotonic_ns();
+	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
+	for (i = 0; i < bn; i++)
+		if (entries[i].result == 0)
+			ok_count++;
+	{
+		double mibps = 0.0;
+		if (elapsed_us > 0)
+			mibps = ((double)total_bytes /
+			    (1024.0 * 1024.0)) /
+			    ((double)elapsed_us / 1e6);
+		logit("BUNDLE worker=%d files=%d ok=%d bytes=%llu "
+		    "elapsed_us=%llu MiBps=%.2f",
+		    w->id, bn, ok_count,
+		    (unsigned long long)total_bytes,
+		    (unsigned long long)elapsed_us, mibps);
+	}
 
 	for (i = 0; i < bn; i++)
 		worker_finalize_one_entry(p, w, batch[i], entries[i].result);
@@ -2260,6 +2293,54 @@ reporter_thread(void *arg)
 		if (++slow_tick_counter >= 5) {
 			slow_tick_counter = 0;
 
+			/* Phase-5 instrumentation: per-worker stats CSV.
+			 * Enabled by HPN_WORKER_STATS_CSV=/path env var.  One
+			 * row per worker per slow tick.  Columns:
+			 *   t_ms,worker_id,bytes_total,units_completed,
+			 *   units_failed,health,live_bytes,reconnect_count */
+			if (p->stats_csv == NULL) {
+				const char *path =
+				    getenv("HPN_WORKER_STATS_CSV");
+				if (path != NULL && *path != '\0') {
+					p->stats_csv = fopen(path, "w");
+					if (p->stats_csv != NULL) {
+						setvbuf(p->stats_csv, NULL,
+						    _IOLBF, 0);
+						fprintf(p->stats_csv,
+						    "t_ms,worker_id,bytes_total"
+						    ",live_bytes,units_started"
+						    ",units_completed,units_failed"
+						    ",health,reconnect_count\n");
+						p->stats_csv_start_ns =
+						    monotonic_ns();
+					}
+				}
+			}
+			if (p->stats_csv != NULL) {
+				uint64_t t_ms =
+				    (monotonic_ns() - p->stats_csv_start_ns)
+				    / 1000000ULL;
+				pthread_mutex_lock(&p->workers_mu);
+				for (int i = 0; i < p->num_workers; i++) {
+					struct sftp_worker *w = p->workers[i];
+					pthread_mutex_lock(&w->mu);
+					fprintf(p->stats_csv,
+					    "%llu,%d,%llu,%llu,%llu,%llu,%llu"
+					    ",%d,%llu\n",
+					    (unsigned long long)t_ms,
+					    w->id,
+					    (unsigned long long)w->bytes_total,
+					    (unsigned long long)w->live_bytes,
+					    (unsigned long long)w->units_started,
+					    (unsigned long long)w->units_completed,
+					    (unsigned long long)w->units_failed,
+					    (int)w->health,
+					    (unsigned long long)w->reconnect_count);
+					pthread_mutex_unlock(&w->mu);
+				}
+				pthread_mutex_unlock(&p->workers_mu);
+			}
+
 			/* Stability timer: if no new cooldown was needed for
 			 * RESPAWN_STABILITY_SEC, the cluster has been running
 			 * cleanly — reset the cooldown count so a very long
@@ -2912,6 +2993,11 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	}
 	if (p->reporter_started)
 		pthread_join(p->reporter_tid, NULL);
+
+	if (p->stats_csv != NULL) {
+		fclose(p->stats_csv);
+		p->stats_csv = NULL;
+	}
 
 	if (p->workers) {
 		/* Reporter is now joined — no more concurrent reaping. We

@@ -3469,15 +3469,117 @@ sftp_upload_bundle(struct sftp_conn *conn,
 #define HPN_BUNDLE_FLAG_PRESERVE   0x00000001U
 #define HPN_BUNDLE_FLAG_FSYNC      0x00000002U
 
-/* Context for libarchive's write callback — we redirect tar bytes into
- * SSH_FXP_WRITE messages on the bundle handle. */
+/*
+ * Defensive cap on outstanding (unread) STATUS replies.  Each queued
+ * STATUS is ~13 bytes on the wire, so 4096 is well under any plausible
+ * socket / channel buffer.  In practice the default 4 MiB bundle at the
+ * 128 KiB libarchive block size below queues only ~32 STATUSes per
+ * bundle — the cap exists only so a user cranking HPN_BUNDLE_TARGET_BYTES
+ * very high doesn't fill kernel buffers and deadlock.
+ */
+#define BUNDLE_MAX_INFLIGHT     4096
+
+/*
+ * libarchive output block size.  Each block becomes one SSH_FXP_WRITE
+ * message; with SFTP_MAX_MSG_LENGTH = 256 KiB the practical ceiling is
+ * just under that.  128 KiB matches DEFAULT_TRANSFER_BUFLEN and the size
+ * the rest of the client uses for file uploads.
+ */
+#define BUNDLE_BLOCK_BYTES      (128 * 1024)
+
+/*
+ * Context for libarchive's write callback.  WRITEs are pipelined: each
+ * callback invocation sends one SSH_FXP_WRITE without blocking on the
+ * server's STATUS reply.  STATUSes accumulate in the SSH channel; they
+ * are drained in bulk before SSH_FXP_CLOSE.
+ *
+ * Because rids come from conn->msg_id++ and SFTP replies are returned in
+ * request order, we don't need to track each pending rid individually —
+ * the rid of drain #k is simply first_rid + k.
+ */
 struct bundle_write_ctx {
 	struct sftp_conn *conn;
 	const u_char *handle;
 	size_t        handle_len;
-	off_t         offset;       /* monotonically increasing */
-	int           any_fail;     /* sticky: any WRITE failed */
+	off_t         offset;        /* monotonically increasing */
+	int           any_fail;      /* sticky: any WRITE/STATUS failed */
+
+	uint64_t      n_sent;        /* WRITEs sent */
+	uint64_t      n_drained;     /* STATUS replies successfully drained */
+	u_int         first_rid;     /* rid of WRITE #0; valid when n_sent > 0 */
 };
+
+/*
+ * Drain up to `n` outstanding WRITE STATUS replies.  Pass SIZE_MAX to
+ * drain all of them.  Sets ctx->any_fail on any read error or unexpected
+ * reply; the caller is responsible for not issuing the SSH_FXP_CLOSE
+ * before all WRITEs have been drained (otherwise the CLOSE STATUS would
+ * be confused with a WRITE STATUS).
+ */
+static int
+bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
+{
+	struct sshbuf *msg = NULL;
+	uint64_t outstanding;
+	int r, rc = 0;
+
+	if (ctx->any_fail)
+		return -1;
+	outstanding = ctx->n_sent - ctx->n_drained;
+	if (n > outstanding)
+		n = (size_t)outstanding;
+	if (n == 0)
+		return 0;
+
+	if ((msg = sshbuf_new()) == NULL) {
+		ctx->any_fail = 1;
+		return -1;
+	}
+	while (n-- > 0) {
+		u_char type;
+		u_int status, reply_rid;
+		u_int expected_rid =
+		    ctx->first_rid + (u_int)ctx->n_drained;
+
+		sshbuf_reset(msg);
+		if (get_msg(ctx->conn, msg) != 0) {
+			error_f("bundle drain: connection closed waiting "
+			    "for WRITE STATUS (drained %llu/%llu)",
+			    (unsigned long long)ctx->n_drained,
+			    (unsigned long long)ctx->n_sent);
+			ctx->any_fail = 1;
+			rc = -1;
+			break;
+		}
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &reply_rid)) != 0 ||
+		    type != SSH2_FXP_STATUS ||
+		    (r = sshbuf_get_u32(msg, &status)) != 0) {
+			error_f("bundle drain: malformed STATUS reply "
+			    "(type=%u r=%d)", type, r);
+			ctx->any_fail = 1;
+			rc = -1;
+			break;
+		}
+		if (reply_rid != expected_rid) {
+			error_f("bundle drain: rid mismatch "
+			    "(got %u expected %u)", reply_rid, expected_rid);
+			ctx->any_fail = 1;
+			rc = -1;
+			break;
+		}
+		if (status != SSH2_FX_OK) {
+			error_f("bundle drain: WRITE STATUS %u "
+			    "(rid=%u)", status, reply_rid);
+			ctx->any_fail = 1;
+			rc = -1;
+			break;
+		}
+		ctx->n_drained++;
+	}
+	sshbuf_free(msg);
+	return rc;
+}
 
 static la_ssize_t
 bundle_archive_write_cb(struct archive *a, void *client_data,
@@ -3487,11 +3589,20 @@ bundle_archive_write_cb(struct archive *a, void *client_data,
 	struct sshbuf *msg;
 	u_int rid;
 	int r;
-	u_char type;
-	u_int status, reply_rid;
 
 	if (ctx->any_fail)
 		return -1;
+
+	/* Defensive drain: keep outstanding WRITEs bounded so kernel
+	 * channel buffers don't fill on pathologically large bundles.
+	 * For the default 4 MiB bundle / 128 KiB block this never trips. */
+	if ((ctx->n_sent - ctx->n_drained) >= BUNDLE_MAX_INFLIGHT) {
+		if (bundle_drain_n(ctx, BUNDLE_MAX_INFLIGHT / 2) < 0) {
+			archive_set_error(a, EIO,
+			    "bundle drain: server status failure");
+			return -1;
+		}
+	}
 
 	if ((msg = sshbuf_new()) == NULL) {
 		archive_set_error(a, ENOMEM, "sshbuf_new failed");
@@ -3500,6 +3611,8 @@ bundle_archive_write_cb(struct archive *a, void *client_data,
 	}
 
 	rid = ctx->conn->msg_id++;
+	if (ctx->n_sent == 0)
+		ctx->first_rid = rid;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_WRITE)) != 0 ||
 	    (r = sshbuf_put_u32(msg, rid)) != 0 ||
 	    (r = sshbuf_put_string(msg, ctx->handle, ctx->handle_len)) != 0 ||
@@ -3512,39 +3625,12 @@ bundle_archive_write_cb(struct archive *a, void *client_data,
 		return -1;
 	}
 	send_msg(ctx->conn, msg);
-	sshbuf_reset(msg);
-
-	/* Wait for the STATUS reply for this WRITE.  Synchronous (no
-	 * pipelining) for simplicity in this first cut; can be relaxed
-	 * later to overlap multiple WRITE replies. */
-	if (get_msg(ctx->conn, msg) != 0) {
-		archive_set_error(a, EIO,
-		    "bundle WRITE: connection closed before reply");
-		sshbuf_free(msg);
-		ctx->any_fail = 1;
-		return -1;
-	}
-	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &reply_rid)) != 0 ||
-	    type != SSH2_FXP_STATUS ||
-	    (r = sshbuf_get_u32(msg, &status)) != 0) {
-		archive_set_error(a, EIO,
-		    "bundle WRITE: malformed reply (type=%u r=%d)", type, r);
-		sshbuf_free(msg);
-		ctx->any_fail = 1;
-		return -1;
-	}
-	if (reply_rid != rid || status != SSH2_FX_OK) {
-		archive_set_error(a, EIO,
-		    "bundle WRITE: id mismatch or status %u (rid=%u expected %u)",
-		    status, reply_rid, rid);
-		sshbuf_free(msg);
-		ctx->any_fail = 1;
-		return -1;
-	}
 	sshbuf_free(msg);
 
+	ctx->n_sent++;
 	ctx->offset += (off_t)length;
+	/* STATUS reply for this WRITE is left in the channel buffer; the
+	 * close-time drain (in sftp_upload_bundle) reads it later. */
 	return (la_ssize_t)length;
 }
 
@@ -3560,7 +3646,7 @@ sftp_upload_bundle(struct sftp_conn *conn,
 	u_int open_id;
 	u_int flags;
 	struct archive *a = NULL;
-	struct bundle_write_ctx ctx;
+	struct bundle_write_ctx ctx = { 0 };
 	int i, r;
 	int rc = -1;
 
@@ -3600,12 +3686,9 @@ sftp_upload_bundle(struct sftp_conn *conn,
 	}
 
 	/* ── Stream tar bytes through libarchive ────────────────────────── */
-	memset(&ctx, 0, sizeof(ctx));
 	ctx.conn       = conn;
 	ctx.handle     = handle;
 	ctx.handle_len = handle_len;
-	ctx.offset     = 0;
-	ctx.any_fail   = 0;
 
 	a = archive_write_new();
 	if (a == NULL)
@@ -3613,7 +3696,8 @@ sftp_upload_bundle(struct sftp_conn *conn,
 	/* ustar is the universal "tar" format.  Could be pax for larger
 	 * filenames / timestamps, but ustar is the lowest common denominator. */
 	if (archive_write_set_format_ustar(a) != ARCHIVE_OK ||
-	    archive_write_set_bytes_per_block(a, 32 * 1024) != ARCHIVE_OK ||
+	    archive_write_set_bytes_per_block(a, BUNDLE_BLOCK_BYTES)
+	        != ARCHIVE_OK ||
 	    archive_write_open(a, &ctx, NULL,
 	        bundle_archive_write_cb, NULL) != ARCHIVE_OK) {
 		error_f("libarchive setup: %s", archive_error_string(a));
@@ -3693,6 +3777,14 @@ sftp_upload_bundle(struct sftp_conn *conn,
 		error_f("libarchive write_close: %s", archive_error_string(a));
 		goto cleanup;
 	}
+
+	/* Drain the deferred WRITE STATUSes before we send SSH_FXP_CLOSE —
+	 * otherwise the CLOSE reply would interleave with leftover WRITE
+	 * replies in the channel and the rid match would fail. */
+	if (bundle_drain_n(&ctx, SIZE_MAX) < 0) {
+		debug_f("hpn-bundle: WRITE drain reported failure");
+		goto cleanup;
+	}
 	if (ctx.any_fail) {
 		debug_f("hpn-bundle: WRITE phase reported failure");
 		goto cleanup;
@@ -3735,6 +3827,19 @@ sftp_upload_bundle(struct sftp_conn *conn,
 	rc = 0;   /* success — entries[].result already set to 0 above */
 
  cleanup:
+	/* If we sent WRITEs but bailed before draining, the channel still
+	 * has the matching STATUSes queued.  Try to consume them so the
+	 * next operation on this conn doesn't read them as its own reply.
+	 * If the drain itself fails (e.g. connection died), mark the conn
+	 * dead so the orchestrator tears down this worker — leaving the
+	 * channel in an undefined state would corrupt later transfers. */
+	if (rc != 0 && ctx.n_sent > ctx.n_drained) {
+		int saved_fail = ctx.any_fail;
+		ctx.any_fail = 0;
+		if (bundle_drain_n(&ctx, SIZE_MAX) < 0)
+			conn->hpn->dead = 1;
+		ctx.any_fail = saved_fail;
+	}
 	if (rc != 0) {
 		for (i = 0; i < n; i++)
 			entries[i].result = -1;
