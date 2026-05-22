@@ -118,6 +118,10 @@ static void process_extended_copy_data(uint32_t id);
 static void process_extended_home_directory(uint32_t id);
 static void process_extended_get_users_groups_by_id(uint32_t id);
 static void process_extended_hpn_fs_info(uint32_t id);
+#ifdef WITH_LIBARCHIVE
+static void process_extended_hpn_bundle_open(uint32_t id);
+static void process_extended_hpn_bundle_cap(uint32_t id);
+#endif
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -170,6 +174,12 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_get_users_groups_by_id, 0 },
 	{ "hpn-fs-info", HPN_EXT_FS_INFO, 0,
 	    process_extended_hpn_fs_info, 0 },
+#ifdef WITH_LIBARCHIVE
+	{ "hpn-bundle", HPN_EXT_BUNDLE, 0,
+	    process_extended_hpn_bundle_cap, 1 },
+	{ "hpn-bundle-open", HPN_EXT_BUNDLE_OPEN, 0,
+	    process_extended_hpn_bundle_open, 1 },
+#endif
 	{ NULL, NULL, 0, NULL, 0 }
 };
 
@@ -1843,6 +1853,28 @@ process_extended_hpn_fs_info(uint32_t id)
 {
 	sftp_server_hpn_dispatch(id, HPN_EXT_FS_INFO, iqueue, oqueue);
 }
+
+#ifdef WITH_LIBARCHIVE
+/* Phase 5: hpn-bundle-open@hpnssh.org dispatch wrapper.  The real
+ * implementation lives in sftp-server-hpn.c. */
+static void
+process_extended_hpn_bundle_open(uint32_t id)
+{
+	sftp_server_hpn_dispatch(id, HPN_EXT_BUNDLE_OPEN, iqueue, oqueue);
+}
+
+/* Phase 5: capability-only advertisement.  Clients never send a request
+ * named hpn-bundle@hpnssh.org — they send hpn-bundle-open instead.  This
+ * stub exists so compose_extension's handler-lookup-or-fatal can find a
+ * registration when advertising the capability in process_init(). */
+static void
+process_extended_hpn_bundle_cap(uint32_t id)
+{
+	error("hpn-bundle@hpnssh.org received as a request; clients should "
+	    "send hpn-bundle-open@hpnssh.org");
+	send_status(id, SSH2_FX_OP_UNSUPPORTED);
+}
+#endif /* WITH_LIBARCHIVE */
 
 static void
 process_extended(uint32_t id)
