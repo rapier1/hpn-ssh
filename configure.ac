@@ -3598,12 +3598,12 @@ fi
 # Optional dependency.  When present, the client's sftp_upload_bundle and the
 # server's hpn-bundle handler are compiled in.  When absent, both ends fall
 # back gracefully — the bundle extension simply isn't advertised/used.
-LIBARCHIVE_LIBS=""
+LIBARCHIVE=""
 have_libarchive="no"
 AC_CHECK_LIB([archive], [archive_write_new],
 	[AC_CHECK_HEADER([archive.h],
 		[have_libarchive="yes"
-		 LIBARCHIVE_LIBS="-larchive"
+		 LIBARCHIVE="-larchive"
 		 AC_DEFINE([WITH_LIBARCHIVE], [1],
 		   [Define if libarchive is available for hpn-bundle tar streaming])
 		],
@@ -3612,7 +3612,7 @@ AC_CHECK_LIB([archive], [archive_write_new],
 	[have_libarchive="no"])
 AC_MSG_CHECKING([whether to enable hpn-bundle (libarchive)])
 AC_MSG_RESULT([$have_libarchive])
-AC_SUBST([LIBARCHIVE_LIBS])
+AC_SUBST([LIBARCHIVE])
 # ── END Phase 5 ──────────────────────────────────────────────────────────
 
 # Check for standalone SecurityKeyProvider
