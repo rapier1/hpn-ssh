@@ -432,15 +432,29 @@ sftp_server_hpn_bundle_close(int handle)
 			status = SSH2_FX_FAILURE;
 			break;
 		}
-		/* Compose full destination path: dest_dir/path */
-		size_t full_len = strlen(s->dest_dir) + 1 + strlen(path) + 1;
-		char *full = malloc(full_len);
+		/* Compose full destination path.  Empty dest_dir means the
+		 * client supplied per-record paths that should be interpreted
+		 * verbatim against the server's current working directory
+		 * (the user's home, as set by the standard SFTP entry point).
+		 * Prepending "/" in that case would silently root the path at
+		 * filesystem root — which is both wrong and a privilege issue.
+		 * Non-empty dest_dir uses the natural "dir/path" composition. */
+		char *full;
+		if (*s->dest_dir == '\0') {
+			full = strdup(path);
+		} else {
+			size_t full_len = strlen(s->dest_dir) + 1 +
+			    strlen(path) + 1;
+			full = malloc(full_len);
+			if (full != NULL)
+				snprintf(full, full_len, "%s/%s",
+				    s->dest_dir, path);
+		}
 		if (full == NULL) {
 			error_f("hpn-bundle: out of memory");
 			status = SSH2_FX_FAILURE;
 			break;
 		}
-		snprintf(full, full_len, "%s/%s", s->dest_dir, path);
 
 		/* Create parent directories on demand.  NOTE: libarchive's
 		 * archive_write_disk + archive_read_extract would handle
@@ -565,8 +579,12 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	    id, dest_dir, flags);
 
 	/* Make sure the destination directory exists (mkdir -p semantics).
-	 * Don't fail if it already exists. */
-	if (mkdir_p(dest_dir, 0755) != 0 && errno != EEXIST) {
+	 * Don't fail if it already exists.  Empty dest_dir means the client
+	 * is supplying absolute (or otherwise pre-rooted) per-record paths;
+	 * the per-entry extract loop handles parent-directory creation on
+	 * each record, so the up-front mkdir is unnecessary in that case. */
+	if (*dest_dir != '\0' &&
+	    mkdir_p(dest_dir, 0755) != 0 && errno != EEXIST) {
 		error_f("hpn-bundle-open: mkdir_p \"%s\": %s",
 		    dest_dir, strerror(errno));
 		status = errno == ENOENT ? SSH2_FX_NO_SUCH_FILE
