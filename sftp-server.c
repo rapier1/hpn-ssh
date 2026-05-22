@@ -436,7 +436,8 @@ handle_from_string(const u_char *handle, u_int hlen)
 		return -1;
 	val = get_u32(handle);
 	if (handle_is_ok(val, HANDLE_FILE) ||
-	    handle_is_ok(val, HANDLE_DIR))
+	    handle_is_ok(val, HANDLE_DIR) ||
+	    handle_is_ok(val, HANDLE_BUNDLE))
 		return val;
 	return -1;
 }
@@ -445,7 +446,8 @@ static char *
 handle_to_name(int handle)
 {
 	if (handle_is_ok(handle, HANDLE_DIR)||
-	    handle_is_ok(handle, HANDLE_FILE))
+	    handle_is_ok(handle, HANDLE_FILE) ||
+	    handle_is_ok(handle, HANDLE_BUNDLE))
 		return handles[handle].name;
 	return NULL;
 }
