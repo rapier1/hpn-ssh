@@ -231,18 +231,11 @@ extern int showprogress;
 #define RANGE_CHUNK_MULTIPLIER    4
 
 /*
- * The range-split minimum is a static default (RANGE_SPLIT_MIN_SIZE_DEFAULT
- * in sftp-parallel.h, 2 GiB) overridable via -M on the command line.
- * Resolved per-orchestrator in range_split_min_size_for() below.
- *
- * Earlier code derived this from filesystem stripe geometry (Lustre stripe
- * count × stripe size × empirical multiplier × num_workers).  The full sweep
- * matrix in benchmark/range-split-tuning-analysis.md showed the formula was
- * over-engineered: a single static value was within noise on every Lustre
- * config and either tied or won by ~10 % on ext4 vs the formula.  The
- * complexity cost (per-fs dispatch, dependency on hpn-fs-info, a real bug
- * in the server-side path-walk) wasn't earning its keep.  The formula was
- * removed; this comment is the headstone.
+ * Range-split minimum: static default (RANGE_SPLIT_MIN_SIZE_DEFAULT,
+ * 2 GiB) overridable via -M on the command line.  Resolved per
+ * orchestrator in range_split_min_size_for() below.  See
+ * benchmark/range-split-tuning-analysis.md for the empirical sweep that
+ * picked 2 GiB and for the formula-driven scheme that preceded it.
  */
 
 /*
@@ -500,23 +493,24 @@ struct sftp_parallel {
 	/*
 	 * Sum of u->size across units currently in the workqueue (waiting to
 	 * be popped — does NOT include in-flight work being processed by a
-	 * worker).  Updated atomically by submit/pop sites.  Read by the
-	 * adaptive scaler on each scale check tick to drive the byte-based
-	 * scale-up trigger.  Brief overcounts are possible during the gap
-	 * between increment and queue push (or decrement and queue pop), but
-	 * never undercounts — the order of operations ensures the counter
-	 * leads the queue state.
+	 * worker).  Updated atomically by submit/pop sites.  Brief overcounts
+	 * are possible during the gap between increment and queue push (or
+	 * decrement and queue pop), but never undercounts — the order of
+	 * operations ensures the counter leads the queue state.
+	 *
+	 * Originally driven by the adaptive scaler (removed 2026-05-20); kept
+	 * because the watchdog still uses it to distinguish "worker stalled
+	 * with work pending" from "worker idle, queue empty."
 	 */
 	volatile uint64_t           queued_bytes;
 
 	/*
-	 * Bytes carried by workers that have exited (scale-down or fault).
-	 * snapshot_workers iterates only the live workers[] array, so a
-	 * voluntary scale-down would otherwise erase the exited worker's
-	 * bytes_total from the aggregate.  Captured under workers_mu just
-	 * before the worker is removed from the array; read by
-	 * snapshot_workers under the same lock.  Keeps aggregate_bytes_for_meter
-	 * monotonic so the bps calculation in the scaler doesn't underflow.
+	 * Bytes carried by workers that have exited (fault / shutdown).
+	 * snapshot_workers iterates only the live workers[] array, so an
+	 * exiting worker would otherwise erase its bytes_total from the
+	 * aggregate.  Captured under workers_mu just before the worker is
+	 * removed from the array; read by snapshot_workers under the same
+	 * lock.  Keeps aggregate_bytes_for_meter monotonic.
 	 */
 	uint64_t                    retired_bytes;
 
@@ -3236,65 +3230,62 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 }
 
 /*
- * Validate and normalise stripe geometry from an sftp_fs_info reply.
- * Mutates *info in place for the GPFS block-size heuristic.
- * Returns 1 if range splitting is viable (values within known-valid bounds),
- * 0 if the geometry is absent or suspect (caller should fall back to
- * whole-file and log accordingly).
+ * Validate / normalise stripe_size for use as a chunk-boundary alignment
+ * unit.  Returns 1 if we have a usable stripe_size and the caller may
+ * align byte-ranges to it; 0 means fall back to plain even division.
+ *
+ * Mutates *info in place for the GPFS heuristic only: GPFS exposes no
+ * per-OST stripe via SFTP fs-info, so we substitute its statvfs
+ * block_size as the alignment unit.  Other filesystems are taken at
+ * face value — only stripe_size matters downstream, and overly-large
+ * values simply collapse range-splitting back toward whole-file
+ * uploads (the alignment-up-to-stripe rounding pushes per_range past
+ * file_size), which is harmless.
  */
 static int
 stripe_info_viable(struct sftp_fs_info *info, const char *path)
 {
-	if (strcmp(info->fs_type, "lustre") == 0) {
-		/* Lustre: only range-split when lfs getstripe returned values
-		 * within the known-valid range (64 KiB–1 GiB, 1–4096).  Any
-		 * other result — including stripe_size=0 (lfs unavailable) —
-		 * is unexpected; warn and fall back to whole-file.
-		 * NOTE: the 1 GiB upper bound on stripe_size is conservative
-		 * and may need to be raised — Lustre installations with very
-		 * large OSTs can be configured with stripe sizes well above
-		 * 1 GiB.  Needs further investigation before widening the
-		 * gate. */
-		if (info->stripe_size < 64 * 1024 ||
-		    info->stripe_size > (uint64_t)1024 * 1024 * 1024 ||
-		    info->stripe_count == 0 ||
-		    info->stripe_count > 4096) {
-			logit("hpn-fs-info: Lustre detected but"
-			    " stripe_size=%llu stripe_count=%u"
-			    " is outside expected range"
-			    " (64 KiB–1 GiB, 1–4096);"
-			    " skipping range split for \"%s\"",
-			    (unsigned long long)info->stripe_size,
-			    info->stripe_count, path);
-			return 0;
-		}
-		return 1;
-	}
 	if (strcmp(info->fs_type, "gpfs") == 0 && info->stripe_size == 0) {
-		/* GPFS: block_size from statvfs() is the GPFS I/O block size.
-		 * Valid GPFS block sizes are 256K–16M (IBM Spectrum Scale docs);
-		 * 1 MiB is the common HPC default.  If block_size is below the
-		 * minimum valid GPFS value it means statvfs returned a bogus
-		 * result or the GPFS magic number matched a false positive —
-		 * warn and skip range splitting rather than guessing.  GPFS has
-		 * no fixed stripe_count equivalent so set it high and let
-		 * max_ranges govern. */
+		/* Valid GPFS block sizes are 256 KiB–16 MiB per IBM
+		 * Spectrum Scale docs; anything else is a bogus statvfs
+		 * return or a fs_type false positive.  Bail rather than
+		 * guessing. */
 		if (info->block_size < 256 * 1024 ||
 		    info->block_size > 16 * 1024 * 1024) {
-			logit("hpn-fs-info: GPFS detected but block_size=%llu "
-			    "is outside the valid GPFS range (256 KiB–16 MiB);"
-			    " skipping range split for \"%s\"",
+			logit("hpn-fs-info: GPFS detected but block_size=%llu"
+			    " is outside the valid range (256 KiB–16 MiB);"
+			    " skipping stripe alignment for \"%s\"",
 			    (unsigned long long)info->block_size, path);
 			return 0;
 		}
-		info->stripe_size  = info->block_size;
-		info->stripe_count = SFTP_PARALLEL_MAX_WORKERS;
-		debug3("hpn-fs-info: gpfs, using block_size=%llu as stripe unit",
+		info->stripe_size = info->block_size;
+		debug3("hpn-fs-info: gpfs, using block_size=%llu as alignment unit",
 		    (unsigned long long)info->stripe_size);
-		return 1;
 	}
-	/* Not a filesystem we know how to stripe-split. */
-	return (info->stripe_size > 0 && info->stripe_count > 0);
+	return info->stripe_size > 0;
+}
+
+/*
+ * One-shot lazy fs-info accessor.  Both maybe_submit_upload and
+ * maybe_submit_download need the destination filesystem's stripe geometry
+ * for chunk alignment; we query it once and cache it on the orchestrator.
+ * Returns 1 if we got usable stripe info, 0 if alignment should fall back
+ * to plain file_size/num_ranges.  Output goes in *info_out (caller may
+ * inspect info->stripe_size etc).
+ */
+static int
+get_cached_fs_info(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *remote_path, struct sftp_fs_info *info_out)
+{
+	if (p->fs_info_cached) {
+		*info_out = p->fs_info_cache;
+	} else {
+		memset(info_out, 0, sizeof(*info_out));
+		sftp_fs_info(conn, remote_path, info_out);
+		p->fs_info_cache = *info_out;
+		p->fs_info_cached = 1;
+	}
+	return stripe_info_viable(info_out, remote_path);
 }
 
 /*
@@ -3478,18 +3469,9 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (max_ranges < 2)
 		goto whole_file;
 
-	if (p->fs_info_cached) {
-		info = p->fs_info_cache;
-	} else {
-		memset(&info, 0, sizeof(info));
-		sftp_fs_info(conn, remote_path, &info);
-		p->fs_info_cache = info;
-		p->fs_info_cached = 1;
-	}
-
 	/* Same rationale as maybe_submit_upload: stripe-aligned when geometry
 	 * is available, plain file_size/num_ranges otherwise. */
-	int have_stripe = stripe_info_viable(&info, remote_path);
+	int have_stripe = get_cached_fs_info(p, conn, remote_path, &info);
 	num_ranges = max_ranges;
 	if (num_ranges < 2)
 		goto whole_file;
@@ -3572,30 +3554,16 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 		goto whole_file;
 
 	/* fs-info costs one RTT on the control connection.  Cache the
-	 * answer per orchestrator: the destination filesystem does not
-	 * change within a transfer, and querying every file at high RTT
-	 * starves the workers (the walker can't keep the queue deep
-	 * enough to drive scale-up).  Single cache slot is enough for the
-	 * common "recursive put into one tree" case. */
-	if (p->fs_info_cached) {
-		info = p->fs_info_cache;
-	} else {
-		memset(&info, 0, sizeof(info));
-		sftp_fs_info(conn, remote_path, &info);
-		p->fs_info_cache = info;
-		p->fs_info_cached = 1;
-	}
-
+	 * answer per orchestrator (cached on p): the destination filesystem
+	 * does not change within a transfer, and querying every file at high
+	 * RTT starves the workers. */
 	/* When stripe geometry is available (Lustre/GPFS), align each range
 	 * to a stripe boundary so adjacent ranges target different OSTs.
 	 * Otherwise (ext4/xfs/NFS/etc., where sftp_fs_info returned no stripe
 	 * data), fall back to plain file_size/num_ranges chunks.  The server
 	 * pwrite()s into a pre-allocated file; whether the underlying FS
-	 * actually parallelises those writes is filesystem-dependent.  This
-	 * is the speculative "let's see what happens" non-stripe fallback —
-	 * the win may come from network/cipher parallelism even if disk
-	 * writes serialise. */
-	int have_stripe = stripe_info_viable(&info, remote_path);
+	 * actually parallelises those writes is filesystem-dependent. */
+	int have_stripe = get_cached_fs_info(p, conn, remote_path, &info);
 	num_ranges = max_ranges;
 	if (num_ranges < 2)
 		goto whole_file;
