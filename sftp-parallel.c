@@ -3304,19 +3304,12 @@ stripe_info_viable(struct sftp_fs_info *info, const char *path)
  *
  * Values are clamped to [FLOOR, CEILING] = [64 MiB, 10 GiB].  Logs the
  * chosen value once per orchestrator at default verbosity.
- *
- * NOTE: takes `p` but no longer touches `conn` or the fs-info cache.
- * The conn parameter is kept in the signature for compatibility with
- * existing call sites; range-split alignment elsewhere still uses
- * fs-info, which is queried lazily on the alignment path itself.
  */
 static uint64_t
-range_split_min_size_for(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *remote_path)
+range_split_min_size_for(struct sftp_parallel *p)
 {
 	uint64_t bytes;
 	const char *source;
-	(void)conn; (void)remote_path;
 
 	if (p->cfg.range_split_min_mb > 0) {
 		bytes = (uint64_t)p->cfg.range_split_min_mb * 1024ULL * 1024ULL;
@@ -3452,7 +3445,7 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 
 	{
 		uint64_t min_split =
-		    range_split_min_size_for(p, conn, remote_path);
+		    range_split_min_size_for(p);
 		if ((uint64_t)file_size < min_split)
 			goto whole_file;
 	}
@@ -3479,7 +3472,7 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (base > SFTP_PARALLEL_MAX_WORKERS)
 		base = SFTP_PARALLEL_MAX_WORKERS;
 	int by_size = (int)(file_size /
-	    range_split_min_size_for(p, conn, remote_path));
+	    range_split_min_size_for(p));
 	int want = base * RANGE_CHUNK_MULTIPLIER;
 	max_ranges = (by_size < want) ? by_size : want;
 	if (max_ranges < 2)
@@ -3551,7 +3544,7 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 
 	{
 		uint64_t min_split =
-		    range_split_min_size_for(p, conn, remote_path);
+		    range_split_min_size_for(p);
 		if ((uint64_t)file_size < min_split)
 			goto whole_file;
 	}
@@ -3572,7 +3565,7 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (base > SFTP_PARALLEL_MAX_WORKERS)
 		base = SFTP_PARALLEL_MAX_WORKERS;
 	int by_size = (int)(file_size /
-	    range_split_min_size_for(p, conn, remote_path));
+	    range_split_min_size_for(p));
 	int want = base * RANGE_CHUNK_MULTIPLIER;
 	max_ranges = (by_size < want) ? by_size : want;
 	if (max_ranges < 2)
@@ -3899,31 +3892,6 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	}
 }
 
-int
-sftp_parallel_get_worker_stats(struct sftp_parallel *p,
-    struct sftp_parallel_worker_stats *out, int max)
-{
-	if (p == NULL || out == NULL || max <= 0)
-		return 0;
-	int copied = 0;
-	pthread_mutex_lock(&p->workers_mu);
-	for (int i = 0; i < p->num_workers && copied < max; i++) {
-		struct sftp_worker *w = p->workers[i];
-		pthread_mutex_lock(&w->mu);
-		out[copied].id                  = w->id;
-		out[copied].health              = (int)w->health;
-		out[copied].bytes_total         = w->bytes_total;
-		out[copied].units_started       = w->units_started;
-		out[copied].units_completed     = w->units_completed;
-		out[copied].units_failed        = w->units_failed;
-		out[copied].reconnect_count     = w->reconnect_count;
-		out[copied].last_completion_ns  = w->last_completion_ns;
-		pthread_mutex_unlock(&w->mu);
-		copied++;
-	}
-	pthread_mutex_unlock(&p->workers_mu);
-	return copied;
-}
 
 /* ---------- Dynamic worker scaling ---------- */
 

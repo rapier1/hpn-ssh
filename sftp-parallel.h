@@ -259,22 +259,13 @@ uint64_t sftp_parallel_units_completed(struct sftp_parallel *p);
 uint64_t sftp_parallel_units_failed(struct sftp_parallel *p);
 
 /*
- * Programmatic stats surface for adaptive control.
+ * Aggregate orchestrator state snapshot.  Cheap (one mutex per worker
+ * briefly held).  Safe to call from any thread.
  *
- * sftp_parallel_get_stats() returns aggregate orchestrator state cheaply
- * (one mutex per worker briefly held). sftp_parallel_get_worker_stats()
- * fills a caller-provided array with per-worker snapshots; returns the
- * number of workers actually copied (<= max). Both are safe to call from
- * any thread including a control loop running on its own cadence.
- *
- * Worker IDs are stable across the lifetime of the orchestrator — when
- * a worker is removed, its slot compacts but its id is not reused.
+ * The companion per-worker snapshot API was removed when adaptive scaling
+ * was removed (2026-05-20); aggregate stats are the only consumer-facing
+ * observability today.
  */
-
-/* Worker health classification — mirrors the internal enum. */
-#define SFTP_PARALLEL_HEALTHY  0
-#define SFTP_PARALLEL_STALLED  1
-#define SFTP_PARALLEL_DEAD     2
 
 struct sftp_parallel_stats {
 	int      num_workers;
@@ -289,21 +280,8 @@ struct sftp_parallel_stats {
 				       * due to possible MITM or corruption */
 };
 
-struct sftp_parallel_worker_stats {
-	int      id;
-	int      health;          /* SFTP_PARALLEL_{HEALTHY,STALLED,DEAD} */
-	uint64_t bytes_total;
-	uint64_t units_started;
-	uint64_t units_completed;
-	uint64_t units_failed;
-	uint64_t reconnect_count;
-	uint64_t last_completion_ns; /* monotonic, 0 if no completion yet */
-};
-
 void sftp_parallel_get_stats(struct sftp_parallel *p,
     struct sftp_parallel_stats *out);
-int sftp_parallel_get_worker_stats(struct sftp_parallel *p,
-    struct sftp_parallel_worker_stats *out, int max);
 
 /*
  * Dynamic worker scaling for long-running transfers.
