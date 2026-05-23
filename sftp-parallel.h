@@ -51,6 +51,11 @@ struct sftp_parallel_config {
 	unsigned int num_requests;      /* 0 = default */
 	uint64_t     limit_kbps;        /* 0 = no bandwidth limit */
 
+	/* CLI-set range-split minimum, in MiB.  0 = unset (env or default
+	 * applies).  Set by -M flag in sftp.c; bounded [64, 10240] at parse
+	 * time. */
+	int          range_split_min_mb;
+
 	/* Transfer flags applied to every submitted unit */
 	int          preserve_flag;
 	int          resume_flag;
@@ -152,12 +157,25 @@ int sftp_parallel_submit_mkdir(struct sftp_parallel *p,
     const char *remote_path, mode_t mode);
 
 /*
- * Minimum file size (bytes) at which a single file is split across workers
+ * Default minimum file size at which a single file is split across workers
  * by byte range.  Below this threshold the file is treated as a whole-file
- * work unit.  Splitting very small files would add more overhead (extra open
- * round-trips, pre-creation) than it saves.
+ * work unit.
+ *
+ * 2 GiB empirically minimises both wall time and run-to-run variance on
+ * the Lustre and ext4 sweeps documented in
+ *   benchmark/range-split-tuning-analysis.md
+ * On Lustre this avoids the per-chunk close()/OST-commit serialization that
+ * dominated the early formula-driven approach; on ext4 it is roughly
+ * equivalent to or slightly worse than aggressive chunking at j=4 but
+ * dramatically better at j=16.  A single static value that the operator
+ * can override is far simpler than the per-fs formula it replaces.
+ *
+ * Override via -M MiB on the hpnsftp command line.  Range [64, 10240] MiB
+ * is enforced both at parse time and again in the resolver below.
  */
-#define RANGE_SPLIT_MIN_SIZE  (64 * 1024 * 1024)   /* 64 MiB */
+#define RANGE_SPLIT_MIN_SIZE_DEFAULT   ((uint64_t)2048 * 1024 * 1024)
+#define RANGE_SPLIT_MIN_SIZE_FLOOR     ((uint64_t)64 * 1024 * 1024)
+#define RANGE_SPLIT_MIN_SIZE_CEILING   ((uint64_t)10240 * 1024 * 1024)
 
 /*
  * Recursive walkers (Approach B): traverse the source tree on the control

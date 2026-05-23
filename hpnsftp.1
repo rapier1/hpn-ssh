@@ -39,6 +39,7 @@
 .Op Fl i Ar identity_file
 .Op Fl J Ar destination
 .Op Fl l Ar limit
+.Op Fl M Ar range_split_min_mb
 .Op Fl o Ar ssh_option
 .Op Fl P Ar port
 .Op Fl R Ar num_requests
@@ -208,6 +209,26 @@ This option is directly passed to
 .Xr hpnssh 1 .
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
+.It Fl M Ar range_split_min_mb
+Set the minimum file size (in MiB) at which an individual file will be
+split into byte ranges across parallel workers.
+Files at or below this size are uploaded as a single whole-file work unit
+by one worker; files larger than this are split into byte ranges so that
+multiple workers cooperate on the same file.
+Must be in the range
+.Bq 64, 10240
+MiB.
+The default is 2048 MiB (2 GiB), empirically chosen to minimise both wall
+time and run-to-run variance across the tested Lustre and ext4 destinations.
+Lowering this value increases per-file parallelism at the cost of additional
+open/close round-trips per chunk; raising it favours whole-file uploads,
+which trade per-file parallelism for fewer round-trips and lower
+filesystem-side commit serialization.
+This flag only takes effect together with
+.Fl j .
+Without
+.Fl j
+the parallel-streams orchestrator is not engaged and the option is a no-op.
 .It Fl N
 Disables quiet mode, e.g. to override the implicit quiet mode set by the
 .Fl b

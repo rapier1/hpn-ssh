@@ -72,6 +72,11 @@ static int parallel_num_streams = 1;
  * worker pool, which stays fixed at N for the lifetime of the transfer. */
 static int parallel_user_opt_in = 0;
 
+/* User-facing range-split minimum size, in MiB.  0 = unset (orchestrator
+ * uses RANGE_SPLIT_MIN_SIZE_DEFAULT).  Set by -M flag.  Bounded to
+ * [64, 10240] MiB at parse time. */
+static int range_split_min_mb_user = 0;
+
 /*
  * When non-zero, process_put / process_get do NOT call sftp_parallel_wait
  * after submitting their files.  Submissions pile up in the queue and the
@@ -2704,7 +2709,8 @@ usage(void)
 	    "usage: %s [-46AaCfNpqrv] [-B buffer_size] [-b batchfile] [-c cipher]\n"
 	    "          [-D sftp_server_command] [-F ssh_config] [-i identity_file]\n"
 	    "          [-J destination] [-j parallel_streams] [-l limit]\n"
-	    "          [-o ssh_option] [-P port] [-R num_requests] [-S program]\n"
+	    "          [-M range_split_min_mb] [-o ssh_option] [-P port]\n"
+	    "          [-R num_requests] [-S program]\n"
 	    "          [-s subsystem | sftp_server] [-X sftp_option] destination\n",
 	    __progname);
 	exit(1);
@@ -2765,7 +2771,7 @@ main(int argc, char **argv)
 	infile = stdin;
 
 	while ((ch = getopt(argc, argv,
-	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:P:R:X:")) != -1) {
+	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:X:")) != -1) {
 		switch (ch) {
 		/* Passed through to ssh(1) */
 		case 'A':
@@ -2877,6 +2883,20 @@ main(int argc, char **argv)
 				fatal("Number of parallel streams must be between 1 and %d: \"%s\": %s",
 				    SFTP_PARALLEL_MAX_WORKERS,optarg, errstr);
 			parallel_user_opt_in = 1;
+			break;
+		case 'M':
+			/* Range-split minimum size (in MiB).  Files at or below
+			 * this size are uploaded as whole-file work units; larger
+			 * files are split into byte ranges across workers.  Hard
+			 * bounded to [64, 10240] MiB so neither degenerate value
+			 * can produce pathological behavior (very small => over-
+			 * chunking, very large => no parallelism for huge files). */
+			range_split_min_mb_user = (int)strtonum(optarg, 64,
+			    10240, &errstr);
+			if (errstr != NULL)
+				fatal("Range-split minimum (-M) must be between "
+				    "64 and 10240 MiB: \"%s\": %s",
+				    optarg, errstr);
 			break;
 		case 'l':
 			limit_kbps = strtonum(optarg, 1, 100 * 1024 * 1024,
@@ -3039,6 +3059,9 @@ main(int argc, char **argv)
 	 * get the path they wanted.
 	 */
 	if (!parallel_user_opt_in) {
+		/* ENV-VAR HPN_USE_BUNDLE — config-candidate: primary on/off toggle
+		 * for Phase 5 small-file bundling.  Promote to ssh_config
+		 * BundleEnabled and/or hpnsftp -X bundle=yes before 18.10. */
 		const char *e = getenv("HPN_USE_BUNDLE");
 		if (e != NULL && *e != '\0' && *e != '0') {
 			fprintf(stderr,
@@ -3067,6 +3090,7 @@ main(int argc, char **argv)
 		pcfg.transfer_buflen  = (unsigned int)copy_buffer_len;
 		pcfg.num_requests     = (unsigned int)num_requests;
 		pcfg.limit_kbps       = limit_kbps;
+		pcfg.range_split_min_mb = range_split_min_mb_user;
 		pcfg.preserve_flag    = global_pflag;
 		pcfg.fsync_flag       = global_fflag;
 		pcfg.print_flag       = quiet ? 0 : 1;
@@ -3088,9 +3112,19 @@ main(int argc, char **argv)
 		 *   SFTP_TPUT_EMA_ALPHA=F     EMA smoothing factor (default 0.2)
 		 */
 		{
+			/* ENV-VAR SFTP_TPUT_HEALTHY_KBPS — developer-only:
+			 * adaptive stall detector path-health floor (kbps).
+			 * Tuning knob for the throughput-outlier detector; not
+			 * meaningful to end users. */
 			const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
+			/* ENV-VAR SFTP_TPUT_FRACTION — developer-only:
+			 * adaptive stall detector outlier fraction (0–1). */
 			const char *e_f = getenv("SFTP_TPUT_FRACTION");
+			/* ENV-VAR SFTP_TPUT_CONSEC — developer-only:
+			 * adaptive stall detector consecutive-tick count. */
 			const char *e_c = getenv("SFTP_TPUT_CONSEC");
+			/* ENV-VAR SFTP_TPUT_EMA_ALPHA — developer-only:
+			 * adaptive stall detector EMA smoothing factor. */
 			const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
 			pcfg.tput_path_healthy_kbps =
 			    (e_h && *e_h) ? strtoull(e_h, NULL, 10) : 2000;
@@ -3102,9 +3136,10 @@ main(int argc, char **argv)
 			    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
 		}
 
-		/* HPN_MAX_AUTH_CONCURRENT=N caps the number of worker SSH
-		 * children allowed to be in the authentication phase at the
-		 * same time.  0 (or unset) uses the built-in default (8). */
+		/* ENV-VAR HPN_MAX_AUTH_CONCURRENT — config-candidate: caps
+		 * concurrent worker SSH auth-phase connections (default 8).
+		 * Operator-facing, needed by sites with restrictive MaxStartups.
+		 * Promote to ssh_config and/or hpnsftp CLI before 18.10. */
 		{
 			const char *e = getenv("HPN_MAX_AUTH_CONCURRENT");
 			if (e != NULL && *e != '\0') {
