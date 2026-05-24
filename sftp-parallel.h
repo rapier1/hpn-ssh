@@ -300,6 +300,11 @@ struct sftp_parallel_stats {
 	uint64_t bytes_total_aggregate;
 	uint64_t units_completed_aggregate;
 	uint64_t units_failed_aggregate;
+	/* Files the recursive walker dropped before submission
+	 * (lstat / readdir / symlink-stat failures, etc.).  Counted
+	 * separately from units_failed_aggregate because they happen on
+	 * the main thread inside the walkers, not inside a worker. */
+	uint64_t walker_failures_aggregate;
 	int      protocol_violations; /* ID mismatches / bad packet types;
 				       * non-zero means the transfer was aborted
 				       * due to possible MITM or corruption */

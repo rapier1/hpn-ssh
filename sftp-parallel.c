@@ -306,33 +306,37 @@ enum sftp_op {
 
 /*
  * Per-file completion tracker shared across the N range work units that
- * make up a single SFTP_OP_DOWNLOAD_RANGE transfer.  Used to detect
- * partial-range failure: if even one range gives up permanently after
- * retries, the local pre-allocated file is silently corrupt (some range
- * offsets contain the just-written bytes, others contain zeros from
- * ftruncate).  Without this tracker the user has no way to know — the
- * file exists at the expected size with no error indicator.
+ * make up a single SFTP_OP_DOWNLOAD_RANGE or SFTP_OP_UPLOAD_RANGE
+ * transfer.  Detects partial-range failure: if even one range gives up
+ * permanently after retries, the pre-allocated file is silently corrupt
+ * (some range offsets contain the just-written bytes, others contain
+ * zeros from the pre-allocation).  Without this tracker the user has no
+ * way to know — the file exists at the expected size with no error
+ * indicator.
  *
  * Each range unit holds a pointer to the same tracker.  On every range's
  * final completion (success OR give-up, NOT retry), the tracker is
  * decremented under its mutex.  The thread that drops `remaining` to 0
  * is the LAST completer; if `any_failed` is set at that point it
- * unlinks the corrupt local file and logs the corruption event.
+ * removes the corrupt file (unlink() for local, sftp_unlink() for
+ * remote) and logs the corruption event.
  *
  * Ownership: the LAST completer frees the tracker.  The shared pointer
  * in each work_unit is read-only after submit; only the mutex-protected
  * counters change.
- *
- * Upload-range counterpart (SFTP_OP_UPLOAD_RANGE) has the same
- * corruption shape on the REMOTE file; see project_range_partial_failure.md
- * for the upload-side follow-up.
  */
+enum sftp_range_target {
+	SFTP_RANGE_TARGET_LOCAL,   /* unlink() at finalize */
+	SFTP_RANGE_TARGET_REMOTE,  /* sftp_unlink() via worker conn */
+};
+
 struct sftp_range_tracker {
-	pthread_mutex_t mu;
-	int             total;
-	int             remaining;
-	int             any_failed;
-	char           *local_path; /* unlink target on partial failure */
+	pthread_mutex_t        mu;
+	int                    total;
+	int                    remaining;
+	int                    any_failed;
+	enum sftp_range_target target;
+	char                  *path;  /* local OR remote path of corrupt file */
 };
 
 struct sftp_work_unit {
@@ -522,6 +526,16 @@ struct sftp_parallel {
 						       * abort if any non-zero;
 						       * exposed via stats for
 						       * post-mortem inspection */
+
+	/* Files the walker dropped before they could become work units
+	 * (stat() failed, symlink resolution failed, etc.).  These are NOT
+	 * worker failures — they happen on the main thread inside
+	 * parallel_upload_walk / parallel_download_walk — so they aren't
+	 * captured by per-worker units_failed.  parallel_flush surfaces
+	 * this so the user can't mistake a non-zero walker-loss for a
+	 * clean transfer.  Bumped via __atomic_fetch_add from any thread.
+	 */
+	uint64_t                    walker_failures;
 
 	pthread_t                   reporter_tid;
 	int                         reporter_started;
@@ -781,15 +795,17 @@ make_unit(enum sftp_op op, const char *src, const char *dst,
 
 static struct sftp_work_unit *
 make_range_unit(const char *src, const char *dst,
-    off_t range_offset, off_t range_length)
+    off_t range_offset, off_t range_length,
+    struct sftp_range_tracker *tracker)
 {
 	struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
-	u->op           = SFTP_OP_UPLOAD_RANGE;
-	u->src_path     = xstrdup(src);
-	u->dst_path     = xstrdup(dst);
-	u->size         = range_length;
-	u->range_offset = range_offset;
-	u->range_length = range_length;
+	u->op            = SFTP_OP_UPLOAD_RANGE;
+	u->src_path      = xstrdup(src);
+	u->dst_path      = xstrdup(dst);
+	u->size          = range_length;
+	u->range_offset  = range_offset;
+	u->range_length  = range_length;
+	u->range_tracker = tracker;
 	return u;
 }
 
@@ -805,21 +821,22 @@ free_unit(struct sftp_work_unit *u)
 }
 
 /*
- * Range-completion tracker (download side).
- *
- * Allocated once per range-split download by submit_download_ranges and
- * attached to each of the N range work units it creates.  Lives until
- * the last range completes; that completer frees the tracker.
+ * Range-completion tracker constructor.  Allocated once per range-split
+ * transfer (download by submit_download_ranges, upload by
+ * submit_upload_ranges) and attached to each of the N range work units
+ * it creates.  Lives until the last range completes; that completer
+ * frees the tracker.
  */
 static struct sftp_range_tracker *
-range_tracker_new(int total, const char *local_path)
+range_tracker_new(int total, enum sftp_range_target target, const char *path)
 {
 	struct sftp_range_tracker *t = xcalloc(1, sizeof(*t));
 	pthread_mutex_init(&t->mu, NULL);
 	t->total      = total;
 	t->remaining  = total;
 	t->any_failed = 0;
-	t->local_path = xstrdup(local_path);
+	t->target     = target;
+	t->path       = xstrdup(path);
 	return t;
 }
 
@@ -828,18 +845,22 @@ range_tracker_new(int total, const char *local_path)
  * permanent give-up — NOT on a retry).  `failed` is 1 if this range
  * gave up after MAX_RETRIES, 0 if it succeeded.
  *
+ * `w` is the worker reporting completion.  Used only when target is
+ * REMOTE and the file needs to be unlinked on the server (we need
+ * w->conn for the SFTP_FXP_REMOVE).  May be NULL for LOCAL targets.
+ *
  * Returns 1 if this completion was the last range for the file AND any
- * range failed (caller knows the local file was unlinked); returns 0
- * otherwise.  The return value is informational — the unlink happens
+ * range failed (caller knows the corrupt file was removed); returns 0
+ * otherwise.  The return value is informational — removal happens
  * inside this function regardless.
  *
- * Frees the tracker when remaining hits 0.  No external user has a
- * pointer to it after the last range completes.
+ * Frees the tracker when remaining hits 0.
  */
 static int
-range_tracker_finalize(struct sftp_range_tracker *t, int failed)
+range_tracker_finalize(struct sftp_range_tracker *t, int failed,
+    struct sftp_worker *w)
 {
-	int was_last, should_unlink;
+	int was_last, should_remove;
 
 	if (t == NULL)
 		return 0;
@@ -849,27 +870,46 @@ range_tracker_finalize(struct sftp_range_tracker *t, int failed)
 		t->any_failed = 1;
 	t->remaining--;
 	was_last      = (t->remaining == 0);
-	should_unlink = was_last && t->any_failed;
+	should_remove = was_last && t->any_failed;
 	pthread_mutex_unlock(&t->mu);
 
 	if (!was_last)
 		return 0;
 
-	if (should_unlink) {
-		if (unlink(t->local_path) == 0) {
-			error("range-split: unlinked corrupt local file "
-			    "\"%s\" — at least one range failed permanently "
-			    "after retries", t->local_path);
+	if (should_remove) {
+		if (t->target == SFTP_RANGE_TARGET_LOCAL) {
+			if (unlink(t->path) == 0) {
+				error("range-split: unlinked corrupt local "
+				    "file \"%s\" — at least one range failed "
+				    "permanently after retries", t->path);
+			} else {
+				error("range-split: local file \"%s\" is "
+				    "corrupt (partial range failure) but "
+				    "unlink failed: %s",
+				    t->path, strerror(errno));
+			}
 		} else {
-			error("range-split: local file \"%s\" is corrupt "
-			    "(partial range failure) but unlink failed: %s",
-			    t->local_path, strerror(errno));
+			/* REMOTE: need an SFTP connection to remove.  If the
+			 * caller didn't supply a worker (shouldn't happen for
+			 * upload-range), the corrupt remote file stays — log
+			 * loudly so the user knows. */
+			if (w != NULL && w->conn != NULL &&
+			    sftp_rm(w->conn, t->path) == 0) {
+				error("range-split: removed corrupt remote "
+				    "file \"%s\" — at least one range failed "
+				    "permanently after retries", t->path);
+			} else {
+				error("range-split: remote file \"%s\" is "
+				    "corrupt (partial range failure); remove "
+				    "FAILED — user must clean up manually",
+				    t->path);
+			}
 		}
 	}
 	pthread_mutex_destroy(&t->mu);
-	free(t->local_path);
+	free(t->path);
 	free(t);
-	return should_unlink;
+	return should_remove;
 }
 
 /* ---------- Worker thread ---------- */
@@ -1012,7 +1052,7 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		pending_dec_traced(p, u, w->id, "wpr/success");
 		/* Range tracker: this range finished cleanly.  Last
 		 * completer for the file frees the tracker. */
-		(void)range_tracker_finalize(u->range_tracker, 0);
+		(void)range_tracker_finalize(u->range_tracker, 0, w);
 		free_unit(u);
 	} else if (++u->attempt < MAX_RETRIES) {
 		/* Re-queue without freeing. Keeps pending counter consistent. */
@@ -1029,7 +1069,7 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 			pending_dec_traced(p, u, w->id, "wpr/pushfail");
 			/* Push-fail means the queue is shutting down: this
 			 * range will never run, so finalize as failure. */
-			(void)range_tracker_finalize(u->range_tracker, 1);
+			(void)range_tracker_finalize(u->range_tracker, 1, w);
 			free_unit(u);
 		}
 	} else {
@@ -1039,9 +1079,9 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		worker_record_completion(w, 0, 0);
 		pending_dec_traced(p, u, w->id, "wpr/maxretries");
 		/* Range tracker: this range permanently failed.  Last
-		 * completer for the file will unlink the (now-corrupt)
-		 * local file. */
-		(void)range_tracker_finalize(u->range_tracker, 1);
+		 * completer for the file removes the (now-corrupt) target
+		 * file (local unlink or remote sftp_rm via w->conn). */
+		(void)range_tracker_finalize(u->range_tracker, 1, w);
 		free_unit(u);
 	}
 }
@@ -3228,6 +3268,41 @@ sftp_parallel_abort(struct sftp_parallel *p)
 	p->abort_flag = 1;
 	if (p->q)
 		sftp_workqueue_shutdown(p->q);
+
+	/*
+	 * Close every worker's SSH FDs.  Without this, a worker blocked in
+	 * get_msg / send_msg on the SSH socket won't notice abort_flag
+	 * until the server eventually drops the connection (seconds to
+	 * minutes).  Closing the FD here makes the blocked read return
+	 * EBADF / 0 immediately; the worker propagates the I/O failure,
+	 * exits execute_unit, sees abort_flag at the top of its loop, and
+	 * thread-exits within milliseconds.  pthread_join in
+	 * sftp_parallel_free can then return promptly.
+	 *
+	 * Set the FD to -1 after closing so teardown_worker_ssh (called
+	 * later from sftp_parallel_free) is a no-op for these slots and
+	 * doesn't double-close a (potentially reused) FD number.
+	 *
+	 * Policy: abort means abort.  We do not gracefully drain in-flight
+	 * RPCs — the user (or the orchestrator detecting an
+	 * unrecoverable condition) has asked us to stop.
+	 */
+	pthread_mutex_lock(&p->workers_mu);
+	for (int i = 0; i < p->num_workers; i++) {
+		struct sftp_worker *w = p->workers[i];
+		if (w == NULL)
+			continue;
+		if (w->fd_in >= 0) {
+			(void)close(w->fd_in);
+			w->fd_in = -1;
+		}
+		if (w->fd_out >= 0) {
+			(void)close(w->fd_out);
+			w->fd_out = -1;
+		}
+	}
+	pthread_mutex_unlock(&p->workers_mu);
+
 	pthread_mutex_lock(&p->pending_mu);
 	pthread_cond_broadcast(&p->pending_cv);
 	pthread_mutex_unlock(&p->pending_mu);
@@ -3460,7 +3535,8 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
     off_t file_size, mode_t mode,
     off_t range_size, int num_ranges)
 {
-	int i;
+	int i, effective_ranges = 0;
+	struct sftp_range_tracker *tracker = NULL;
 
 	/* Pre-create remote file with O_CREAT|O_TRUNC at the correct size. */
 	if (sftp_precreate(conn, remote_path, file_size) != 0) {
@@ -3472,17 +3548,39 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 	    "(%.1f MiB each)", remote_path, num_ranges,
 	    (long long)range_size, (double)range_size / (1024.0*1024.0));
 
-	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
+	/* Count effective (positive-length) ranges first so the tracker
+	 * knows the exact number of completions to wait for.  Mirrors the
+	 * download path; see submit_download_ranges for rationale. */
 	for (i = 0; i < num_ranges; i++) {
 		off_t offset = (off_t)i * range_size;
 		off_t length = (i == num_ranges - 1) ?
 		    (file_size - offset) : range_size;
-
 		if (length <= 0)
 			break;
+		effective_ranges++;
+	}
+	if (effective_ranges == 0)
+		return -1;
+
+	tracker = range_tracker_new(effective_ranges,
+	    SFTP_RANGE_TARGET_REMOTE, remote_path);
+
+	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
+	for (i = 0; i < effective_ranges; i++) {
+		off_t offset = (off_t)i * range_size;
+		off_t length = (i == effective_ranges - 1) ?
+		    (file_size - offset) : range_size;
 		if (submit(p, make_range_unit(local_path, remote_path,
-		    offset, length)) != 0) {
-			error("submit range %d of \"%s\" failed", i, local_path);
+		    offset, length, tracker)) != 0) {
+			error("submit range %d of \"%s\" failed",
+			    i, local_path);
+			/* Synthesise failures for ranges we never submitted
+			 * so the tracker reaches remaining=0 and removes the
+			 * (now-corrupt) remote file.  NULL worker is fine —
+			 * the REMOTE branch logs loudly if it can't remove. */
+			int unsent;
+			for (unsent = i; unsent < effective_ranges; unsent++)
+				(void)range_tracker_finalize(tracker, 1, NULL);
 			return -1;
 		}
 	}
@@ -3670,7 +3768,8 @@ submit_download_ranges(struct sftp_parallel *p,
 	if (effective_ranges == 0)
 		return -1;
 
-	tracker = range_tracker_new(effective_ranges, local_path);
+	tracker = range_tracker_new(effective_ranges,
+	    SFTP_RANGE_TARGET_LOCAL, local_path);
 
 	for (i = 0; i < effective_ranges; i++) {
 		off_t offset = (off_t)i * range_size;
@@ -3683,10 +3782,12 @@ submit_download_ranges(struct sftp_parallel *p,
 			/* Synthesise failures for ranges we never submitted
 			 * so the tracker reaches remaining=0 and unlinks the
 			 * corrupt local file.  Without this the tracker
-			 * leaks and the file is silently left behind. */
+			 * leaks and the file is silently left behind.  No
+			 * worker context here, so pass NULL — local target
+			 * uses unlink() and doesn't need it. */
 			int unsent;
 			for (unsent = i; unsent < effective_ranges; unsent++)
-				(void)range_tracker_finalize(tracker, 1);
+				(void)range_tracker_finalize(tracker, 1, NULL);
 			return -1;
 		}
 	}
@@ -3888,14 +3989,17 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 
 	if (depth >= PARALLEL_MAX_DIR_DEPTH) {
 		error("Maximum directory depth exceeded: %d levels", depth);
+		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
 		return -1;
 	}
 	if (stat(src, &sb) == -1) {
 		error("stat local \"%s\": %s", src, strerror(errno));
+		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
 		return -1;
 	}
 	if (!S_ISDIR(sb.st_mode)) {
 		error("\"%s\" is not a directory", src);
+		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
 		return -1;
 	}
 
@@ -3921,12 +4025,18 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 
 	if ((dirp = opendir(src)) == NULL) {
 		error("local opendir \"%s\": %s", src, strerror(errno));
+		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
 		return -1;
 	}
 	while (((dp = readdir(dirp)) != NULL) && !p->abort_flag) {
 		const char *filename = dp->d_name;
-		if (dp->d_ino == 0)
+		if (dp->d_ino == 0) {
+			/* Filesystem race / oddity (entry marked in-use but
+			 * has no inode).  Skip; not user data. */
+			debug_f("skipping \"%s/%s\" with d_ino == 0",
+			    src, filename);
 			continue;
+		}
 		if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0)
 			continue;
 		free(new_dst); free(new_src);
@@ -3934,19 +4044,25 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		new_src = sftp_path_append(src, filename);
 
 		if (lstat(new_src, &sb) == -1) {
-			logit("local lstat \"%s\": %s", filename,
+			error("local lstat \"%s\": %s", new_src,
 			    strerror(errno));
+			__atomic_fetch_add(&p->walker_failures, 1,
+			    __ATOMIC_RELAXED);
 			ret = -1;
 			continue;
 		}
 		if (S_ISLNK(sb.st_mode)) {
 			if (!follow_link_flag) {
+				/* Skipping symlink is the user's explicit
+				 * choice (no -L); not a loss. */
 				logit("%s: not a regular file", filename);
 				continue;
 			}
 			if (stat(new_src, &sb) == -1) {
-				logit("local stat \"%s\": %s", filename,
+				error("local stat \"%s\": %s", new_src,
 				    strerror(errno));
+				__atomic_fetch_add(&p->walker_failures, 1,
+				    __ATOMIC_RELAXED);
 				ret = -1;
 				continue;
 			}
@@ -3960,9 +4076,14 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			    sb.st_size, sb.st_mode) != 0) {
 				error("submit \"%s\" -> \"%s\" failed",
 				    new_src, new_dst);
+				__atomic_fetch_add(&p->walker_failures, 1,
+				    __ATOMIC_RELAXED);
 				ret = -1;
 			}
 		} else {
+			/* Non-regular file (socket / fifo / device): SFTP
+			 * cannot transfer these.  By-design skip; not a
+			 * loss of user data. */
 			logit("%s: not a regular file", filename);
 		}
 	}
@@ -4003,17 +4124,21 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 
 	if (depth >= PARALLEL_MAX_DIR_DEPTH) {
 		error("Maximum directory depth exceeded: %d levels", depth);
+		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
 		return -1;
 	}
 	if (dirattrib == NULL) {
 		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
 			error("stat remote \"%s\" directory failed", src);
+			__atomic_fetch_add(&p->walker_failures, 1,
+			    __ATOMIC_RELAXED);
 			return -1;
 		}
 		dirattrib = &ldirattrib;
 	}
 	if (!S_ISDIR(dirattrib->perm)) {
 		error("\"%s\" is not a directory", src);
+		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
 		return -1;
 	}
 	if (dirattrib->flags & SSH2_FILEXFER_ATTR_PERMISSIONS) {
@@ -4022,10 +4147,12 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (mkdir(dst, tmpmode) == -1 && errno != EEXIST) {
 		error("mkdir %s: %s", dst, strerror(errno));
+		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
 		return -1;
 	}
 	if (sftp_readdir(conn, src, &dir_entries) == -1) {
 		error("remote readdir \"%s\" failed", src);
+		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
 		return -1;
 	}
 
@@ -4038,12 +4165,16 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 
 		if (S_ISLNK(a->perm)) {
 			if (!follow_link_flag) {
+				/* Skipping symlink is the user's explicit
+				 * choice (no -L); not a loss. */
 				logit("download \"%s\": not a regular file",
 				    new_src);
 				continue;
 			}
 			if (sftp_stat(conn, new_src, 1, &lsym) != 0) {
-				logit("remote stat \"%s\" failed", new_src);
+				error("remote stat \"%s\" failed", new_src);
+				__atomic_fetch_add(&p->walker_failures, 1,
+				    __ATOMIC_RELAXED);
 				ret = -1;
 				continue;
 			}
@@ -4067,9 +4198,13 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			    new_src, new_dst, fsize, fmode) != 0) {
 				error("submit download \"%s\" -> \"%s\" failed",
 				    new_src, new_dst);
+				__atomic_fetch_add(&p->walker_failures, 1,
+				    __ATOMIC_RELAXED);
 				ret = -1;
 			}
 		} else {
+			/* Non-regular remote entry: SFTP cannot transfer
+			 * these.  By-design skip; not a loss of user data. */
 			logit("download \"%s\": not a regular file", new_src);
 		}
 	}
@@ -4134,6 +4269,8 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	out->bytes_total_aggregate = b;
 	out->units_completed_aggregate = c;
 	out->units_failed_aggregate = f;
+	out->walker_failures_aggregate =
+	    __atomic_load_n(&p->walker_failures, __ATOMIC_RELAXED);
 	if (p->q) {
 		out->queue_depth = sftp_workqueue_depth(p->q);
 		out->queue_high_watermark = sftp_workqueue_high_watermark(p->q);

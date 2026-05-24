@@ -93,6 +93,23 @@ static int range_split_min_mb_user = 0;
  */
 static int defer_parallel_wait = 0;
 
+/*
+ * Sticky session-wide failure flag.  parallel_flush sets this to 1
+ * whenever it detects undelivered files (units_failed_aggregate or
+ * walker_failures_aggregate > 0).  Consulted by interactive_loop's
+ * final return so the process exits non-zero whenever ANY transfer
+ * during the session lost data — even if a later command succeeded
+ * and reset the local err counter.
+ *
+ * Why this exists: in interactive (non-batch) mode,
+ * parse_dispatch_command intentionally returns 0 for failed individual
+ * commands so the session continues to the next prompt.  That
+ * swallows the per-command failure signal.  Batch mode propagates it
+ * directly (err_abort = 1).  This flag is the bridge so the user
+ * always gets a non-zero exit when data was lost, regardless of mode.
+ */
+static int session_had_failure = 0;
+
 /* Are we in batchfile mode? */
 int batchmode = 0;
 
@@ -716,6 +733,16 @@ parallel_flush(void)
 		    (unsigned long long)pstats.units_failed_aggregate);
 		rc = -1;
 	}
+	if (pstats.walker_failures_aggregate > 0) {
+		error("TRANSFER INCOMPLETE: %llu file(s) or director(y/ies) "
+		    "were skipped during the directory walk "
+		    "(stat/readdir/symlink errors); check stderr above for "
+		    "per-path diagnostics",
+		    (unsigned long long)pstats.walker_failures_aggregate);
+		rc = -1;
+	}
+	if (rc != 0)
+		session_had_failure = 1;
 	return rc;
 }
 
@@ -2653,7 +2680,16 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 		el_end(el);
 #endif /* USE_LIBEDIT */
 
-	/* err == 1 signifies normal "quit" exit */
+	/*
+	 * err == 1 signifies normal "quit" exit; err == -1 is a failed
+	 * command in batch mode.  Additionally, session_had_failure
+	 * captures any parallel_flush failure that interactive mode
+	 * intentionally swallowed at the parse_dispatch_command layer.
+	 * Either signal forces non-zero exit so the user always knows
+	 * when data was lost.
+	 */
+	if (session_had_failure)
+		return (-1);
 	return (err >= 0 ? 0 : -1);
 }
 
