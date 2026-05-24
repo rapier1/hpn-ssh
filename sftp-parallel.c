@@ -562,8 +562,8 @@ struct sftp_parallel {
 
 	/* Files the walker dropped before they could become work units
 	 * (stat() failed, symlink resolution failed, etc.).  These are NOT
-	 * worker failures — they happen on the main thread inside
-	 * parallel_upload_walk / parallel_download_walk — so they aren't
+	 * worker failures — they happen on the main thread inside the
+	 * recursive walkers (sftp-parallel-walk.c) — so they aren't
 	 * captured by per-worker units_failed.  parallel_flush surfaces
 	 * this so the user can't mistake a non-zero walker-loss for a
 	 * clean transfer.  Bumped via __atomic_fetch_add from any thread.

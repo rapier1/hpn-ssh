@@ -3449,8 +3449,8 @@ sftp_conn_alloc_msg_id(struct sftp_conn *conn)
 
 /* Mark `conn` as dead due to a non-recoverable I/O failure.  Public
  * accessor for HPN bundle code in sftp-hpn-client.c — same effect as
- * the direct `conn->hpn->dead = 1` assignment that used to live in
- * sftp_hpn_bundle_upload when it was in this file. */
+ * the direct `conn->hpn->dead = 1` assignment that internal code in
+ * this file can do.  Declared in sftp-client-internal.h. */
 void
 sftp_conn_set_dead(struct sftp_conn *conn)
 {

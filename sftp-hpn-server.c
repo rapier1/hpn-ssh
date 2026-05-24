@@ -49,6 +49,7 @@
 #include "misc.h"
 #include "sftp.h"
 #include "sftp-common.h"
+#include "sftp-hpn-bundle.h"
 #include "sftp-hpn-server.h"
 
 /* Linux filesystem type magic numbers. */
@@ -218,10 +219,6 @@ sftp_hpn_server_handles(const char *name)
 # include <archive_entry.h>
 # include <libgen.h>     /* dirname() for mkdir-on-extract */
 
-/* libarchive write block size: matches sftp-client.c, picked to amortise
- * tar header overhead over a reasonable payload chunk. */
-# define BUNDLE_BLOCK_BYTES (128 * 1024)
-
 /* Bundle handle mode: upload (open + write + close => extract) vs.
  * download (fetch packs the tar buffer up-front, client drains via
  * SSH_FXP_READ, close releases). */
@@ -242,9 +239,8 @@ struct hpn_bundle_state {
 	size_t   accum_cap;
 };
 
-/* Flags — must match the client side in sftp-client.c. */
-#define HPN_BUNDLE_FLAG_PRESERVE   0x00000001U
-#define HPN_BUNDLE_FLAG_FSYNC      0x00000002U
+/* Flag constants and HPN_BUNDLE_BLOCK_BYTES live in sftp-hpn-bundle.h, the
+ * shared HPN-only header.  Single source of truth for client + server. */
 
 /* ── Server-side bundle accumulator caps ─────────────────────────────────
  *
@@ -1014,7 +1010,7 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 	if (archive_write_set_format_ustar(a) != ARCHIVE_OK ||
-	    archive_write_set_bytes_per_block(a, BUNDLE_BLOCK_BYTES)
+	    archive_write_set_bytes_per_block(a, HPN_BUNDLE_BLOCK_BYTES)
 	        != ARCHIVE_OK ||
 	    archive_write_open(a, s, NULL,
 	        bundle_fetch_archive_write_cb, NULL) != ARCHIVE_OK) {

@@ -250,9 +250,9 @@ sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
 /* ── BEGIN Phase 5: hpn-bundle-fetch download ─────────────────────────────
  *
  * Implements the client side of `hpn-bundle-fetch@hpnssh.org`.  Symmetric
- * twin of sftp_hpn_bundle_upload (which lives in sftp-client.c next to the
- * other extension wire helpers).  Kept here in the HPN-only module so
- * future additions don't grow the upstream diff against sftp-client.c.
+ * twin of sftp_hpn_bundle_upload (defined later in this file).  Both
+ * live in this HPN-only module so the bundle wire protocol stays out
+ * of the upstream-aligned sftp-client.c.
  *
  * Wire protocol:
  *
@@ -265,7 +265,7 @@ sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
  *
  *   client drains tar bytes via repeated SSH_FXP_READ on `handle` until
  *   SSH2_FX_EOF, then SSH_FXP_CLOSE.  Server's process_read routes
- *   bundle-handle reads to sftp_server_hpn_bundle_read (returns bytes
+ *   bundle-handle reads to sftp_hpn_server_bundle_read (returns bytes
  *   from a pre-packed accumulator).
  *
  * Per-entry result accounting: server packs every requested path it can
@@ -291,11 +291,7 @@ sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
 #include "sftp.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"
-
-/* Mirror of HPN_BUNDLE_FLAG_* in sftp-client.c / sftp-hpn-server.c.
- * Only PRESERVE has meaning on the fetch path today (mtime/perm in tar
- * headers are honoured at extract time when set). */
-#define HPN_BUNDLE_FETCH_FLAG_PRESERVE   0x00000001U
+#include "sftp-hpn-bundle.h"
 
 #ifdef WITH_LIBARCHIVE
 
@@ -599,7 +595,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	open_id = sftp_conn_alloc_msg_id(conn);
-	flags = preserve_flag ? HPN_BUNDLE_FETCH_FLAG_PRESERVE : 0;
+	flags = preserve_flag ? HPN_BUNDLE_FLAG_PRESERVE : 0;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, open_id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg,
@@ -633,7 +629,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	ctx.handle     = handle;
 	ctx.handle_len = handle_len;
 	ctx.off        = 0;
-	/* 128 KiB matches the upload-side BUNDLE_BLOCK_BYTES; aligns with
+	/* 128 KiB matches the upload-side HPN_BUNDLE_BLOCK_BYTES; aligns with
 	 * the server's libarchive write-block boundary for cache friendliness. */
 	ctx.chunk      = 128 * 1024;
 
@@ -728,9 +724,9 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
  * Implements the client side of `hpn-bundle-open@hpnssh.org`.  Many small
  * files are packed into a tar (ustar) byte stream by libarchive and
  * delivered to the server through a single OPEN, multiple WRITEs, and a
- * CLOSE on the SFTP connection.  Server-side handler (see sftp-server.c
- * process_extended_hpn_bundle_open) feeds the bytes back through
- * libarchive to recreate the file tree.
+ * CLOSE on the SFTP connection.  Server-side handler (in sftp-hpn-server.c
+ * process_hpn_bundle_open) feeds the bytes back through libarchive to
+ * recreate the file tree.
  *
  * Wire format:
  *   client -> server:
@@ -750,10 +746,6 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
  *
  * libarchive integration: compile-time optional via WITH_LIBARCHIVE.
  * When unavailable, sftp_hpn_bundle_upload is a stub that returns -1.
- *
- * Moved here from sftp-client.c during cleanup to symmetrise with
- * sftp_hpn_bundle_download above and cut the upstream-OpenSSH diff in
- * sftp-client.c.
  */
 
 #ifndef WITH_LIBARCHIVE
@@ -775,10 +767,9 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 }
 #else  /* WITH_LIBARCHIVE */
 
-/* Bundle flags carried in the SSH_FXP_EXTENDED open request.  Mirror
- * the constants in sftp-hpn-server.c — must match the server side. */
-#define HPN_BUNDLE_FLAG_PRESERVE   0x00000001U
-#define HPN_BUNDLE_FLAG_FSYNC      0x00000002U
+/* Bundle flag constants (HPN_BUNDLE_FLAG_*) and HPN_BUNDLE_BLOCK_BYTES
+ * live in sftp-hpn-bundle.h (included above) — single source of truth
+ * shared with the server side. */
 
 /*
  * Defensive cap on outstanding (unread) STATUS replies.  Each queued
@@ -789,14 +780,6 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
  * very high doesn't fill kernel buffers and deadlock.
  */
 #define BUNDLE_MAX_INFLIGHT     4096
-
-/*
- * libarchive output block size.  Each block becomes one SSH_FXP_WRITE
- * message; with SFTP_MAX_MSG_LENGTH = 256 KiB the practical ceiling is
- * just under that.  128 KiB matches DEFAULT_TRANSFER_BUFLEN and the size
- * the rest of the client uses for file uploads.
- */
-#define BUNDLE_BLOCK_BYTES      (128 * 1024)
 
 /*
  * Context for libarchive's write callback.  WRITEs are pipelined: each
@@ -1007,7 +990,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	/* ustar is the universal "tar" format.  Could be pax for larger
 	 * filenames / timestamps, but ustar is the lowest common denominator. */
 	if (archive_write_set_format_ustar(a) != ARCHIVE_OK ||
-	    archive_write_set_bytes_per_block(a, BUNDLE_BLOCK_BYTES)
+	    archive_write_set_bytes_per_block(a, HPN_BUNDLE_BLOCK_BYTES)
 	        != ARCHIVE_OK ||
 	    archive_write_open(a, &ctx, NULL,
 	        bundle_archive_write_cb, NULL) != ARCHIVE_OK) {
