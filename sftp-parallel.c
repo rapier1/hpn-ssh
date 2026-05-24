@@ -451,22 +451,72 @@ struct sftp_worker {
 	 * since_completion_ns gate misses this case).  Atomic ACQUIRE/
 	 * RELEASE so the reporter sees a coherent value. */
 	uint64_t           unit_start_ns;
-	enum worker_health health;             /* set by reporter, read for log */
+	/* ── Worker state lattice ────────────────────────────────────────
+	 *
+	 * Three orthogonal state machines.  Each flag below tracks ONE of
+	 * them; the combinations encode the full worker lifecycle.
+	 *
+	 * (A) Liveness classification (watchdog-owned, watchdog-written):
+	 *       HEALTHY ─→ STALLED ─→ DEAD
+	 *     De-escalation (DEAD → HEALTHY) never happens; once the
+	 *     watchdog declares DEAD, that worker is doomed and reaped.
+	 *     Set by reporter under workers_mu; mostly diagnostic.
+	 *
+	 * (B) Doom progression (watchdog-owned):
+	 *       not_doomed ─→ doomed (SIGTERM sent) ─→ [SIGKILL escalation
+	 *                                                if not yet exited]
+	 *     The `doomed` flag prevents double-SIGTERM across ticks.
+	 *     `doom_ns` is the SIGTERM timestamp, consulted by the
+	 *     SIGKILL-escalation deadline.
+	 *
+	 * (C) Exit lifecycle (worker-owned):
+	 *       alive ─→ exited
+	 *     Set by the worker thread itself just before pthread_exit;
+	 *     read by reporter for pthread_join + reap.  `exited_voluntary`
+	 *     distinguishes "removed via EXIT_WORKER sentinel" (no
+	 *     replacement spawn) from "died involuntarily — respawn".
+	 *
+	 * Valid combinations:
+	 *   (HEALTHY,  ¬doomed, ¬exited)            — normal running
+	 *   (STALLED,  ¬doomed, ¬exited)            — silent but not killed
+	 *   (DEAD,      doomed, ¬exited)            — SIGTERMed, awaiting
+	 *                                             thread exit
+	 *   (DEAD,      doomed,  exited involuntary) — ready to reap +
+	 *                                             respawn
+	 *   (any,      ¬doomed,  exited voluntary)  — user removed worker;
+	 *                                             reap, no respawn
+	 *   (DEAD,      doomed,  exited voluntary)  — exited via sentinel
+	 *                                             AFTER watchdog
+	 *                                             already doomed it
+	 *                                             (race; reap, no
+	 *                                             respawn — voluntary
+	 *                                             wins)
+	 *
+	 * Brief race window after the watchdog's transition: (DEAD,
+	 * ¬doomed, ¬exited) holds for a few lines until SIGTERM is sent;
+	 * no other thread observes it (the transition + SIGTERM happen in
+	 * the same workers_mu critical section).
+	 */
+	enum worker_health health;             /* (A) HEALTHY/STALLED/DEAD;
+						* set by reporter, read for
+						* logging + transition gating */
 
 	int                started;
-	int                exited;             /* set by worker on self-exit;
-						* read by reporter for reaping */
-	int                exited_voluntary;   /* set when exiting via EXIT_WORKER
-						* sentinel; suppresses replacement
-						* spawn in the reap loop */
-	int                doomed;            /* set by watchdog before SIGTERM;
-						* prevents double-kill */
-	uint64_t           doom_ns;           /* monotonic ns when SIGTERM was
-						* sent; used to escalate to
-						* SIGKILL when SSH hangs in its
-						* clean-shutdown path (worker
-						* thread otherwise blocks on
-						* unresponsive pipes forever) */
+	int                exited;             /* (C) set by worker on
+						* self-exit; read by reporter
+						* for reaping */
+	int                exited_voluntary;   /* (C) modifier on exited;
+						* EXIT_WORKER sentinel only.
+						* Suppresses respawn. */
+	int                doomed;             /* (B) set by watchdog before
+						* SIGTERM; prevents double-kill */
+	uint64_t           doom_ns;            /* (B) monotonic ns when
+						* SIGTERM was sent; consulted by
+						* SIGKILL-escalation deadline when
+						* SSH hangs in its clean-shutdown
+						* path (worker thread otherwise
+						* blocks on unresponsive pipes
+						* forever) */
 
 	/* ── Phase 4 gap 1: pipelined-batch state ────────────────────
 	 * The previous batch's phase-5 (CLOSE-collection) is deferred
