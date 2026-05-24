@@ -1628,12 +1628,41 @@ worker_run_bundle_download(struct sftp_worker *w,
 }
 /* ── END Phase 5 ──────────────────────────────────────────────────────── */
 
-static void *
-worker_thread(void *arg)
+/*
+ * Execute a single work unit through the non-batch path: drain any
+ * deferred pipelined batch (its STATUSes would corrupt the next RPC),
+ * mark the worker as actively working, run execute_unit, log the
+ * dispatch-diag line, hand the result to worker_process_result.
+ *
+ * Used in three places by worker_thread:
+ *   - the `bn == 1` branch (batch loop collected only one unit)
+ *   - the leftover-after-batch dispatch
+ *   - the outer else branch (DOWNLOAD without bundle, RANGE ops,
+ *     mkdir, etc.)
+ */
+static void
+worker_execute_single(struct sftp_worker *w, struct sftp_work_unit *u)
 {
-	struct sftp_worker *w = arg;
-	struct sftp_parallel *p = w->parent;
+	worker_drain_pipeline(w);
+	worker_record_start(w);
+	int rc = execute_unit(w, u);
+	debug_ft("dispatch-diag: worker %d executed op=%d rc=%d "
+	    "offset=%lld length=%lld",
+	    w->id, (int)u->op, rc,
+	    (long long)u->range_offset,
+	    (long long)u->range_length);
+	worker_process_result(w, u, rc);
+}
 
+/*
+ * One-time worker setup: signal mask, env-var parsing for the bundle
+ * and batch-pipeline kill switches, and per-worker bundle target.
+ * Sampled once at startup; survives the worker's lifetime.  Factored
+ * out of worker_thread to keep the main loop body readable.
+ */
+static void
+worker_thread_init(struct sftp_worker *w)
+{
 	/* Mask SIGALRM so progressmeter timer ticks deliver only to the
 	 * main thread / reporter (which holds it unmasked). */
 	sigset_t mask;
@@ -1665,10 +1694,7 @@ worker_thread(void *arg)
 	 *   2. HPNUseBundle no   in ssh_config (resolved by sftp.c via
 	 *                        `hpnssh -G host`; stored in p->cfg.use_bundle)
 	 *   3. server doesn't advertise hpn-bundle extension
-	 * Any of these forces the Phase-4 pipelined batch fallback.
-	 *
-	 * Sampled once per worker at startup; survives the lifetime of
-	 * the worker. */
+	 * Any of these forces the Phase-4 pipelined batch fallback. */
 	w->bundle_target_bytes = BUNDLE_TARGET_BYTES;
 	{
 		/* ENV-VAR HPN_USE_BUNDLE — developer-only: kill switch for
@@ -1711,6 +1737,79 @@ worker_thread(void *arg)
 			    w->id);
 		}
 	}
+}
+
+/*
+ * Post-iteration termination check: returns 1 if the worker should
+ * break out of the main loop (protocol-violation strike 1, or
+ * connection died), 0 otherwise.  Strike 2 fatal()s the process and
+ * never returns.
+ *
+ * Protocol-violation two-strikes policy:
+ *   Strike 1 — log loudly, bump p->protocol_violations.  The conn is
+ *     already dead (set by sftp_hpn_set_protocol_violation in
+ *     sftp-client.c) so we fall through to the conn_is_dead branch
+ *     immediately below and break out.  Reporter's respawn machinery
+ *     replaces us with a fresh SSH child; transfer continues.
+ *   Strike 2 (lifetime per hpnsftp process) — sustained pattern,
+ *     not bad luck.  fatal().  The OS reaps remaining SSH children
+ *     when the parent dies.  Current unit cleanup was already done by
+ *     worker_process_result / batch result loop.
+ *
+ * Threshold is a fixed count (2), not a rate: a correctly-functioning
+ * server produces zero violations regardless of worker count or
+ * transfer length — SSH MAC catches all in-channel tampering below
+ * this layer.  Anything reaching here is, by definition, abnormal.
+ *
+ * Possible causes: random bit-flip on a long transfer (historical NIC
+ * silicon bug — common, benign-but-noisy, want to tolerate one) or
+ * buggy/compromised server / persistent hardware fault (rare but
+ * serious — must not paper over).
+ */
+static int
+worker_should_terminate(struct sftp_worker *w)
+{
+	struct sftp_parallel *p = w->parent;
+
+	if (sftp_conn_is_protocol_violation(w->conn)) {
+		int total;
+
+		pthread_mutex_lock(&p->workers_mu);
+		p->protocol_violations++;
+		total = p->protocol_violations;
+		pthread_mutex_unlock(&p->workers_mu);
+
+		if (total >= 2) {
+			fatal("worker %d: protocol violation #%d in "
+			    "this session - sustained pattern, "
+			    "aborting hpnsftp (possible server "
+			    "corruption, MITM, or persistent "
+			    "hardware fault)", w->id, total);
+		}
+		error_f("worker %d: protocol violation #%d - killing "
+		    "worker and respawning; one more this session "
+		    "will exit hpnsftp", w->id, total);
+		/* fall through to the conn_is_dead branch below: the
+		 * conn is already marked dead by the protocol-violation
+		 * handler in sftp-client.c. */
+	}
+
+	if (sftp_conn_is_dead(w->conn)) {
+		if (!p->abort_flag && !p->stopped)
+			debug_ft("worker %d: connection lost - "
+			    "will attempt to respawn", w->id);
+		return 1;
+	}
+	return 0;
+}
+
+static void *
+worker_thread(void *arg)
+{
+	struct sftp_worker *w = arg;
+	struct sftp_parallel *p = w->parent;
+
+	worker_thread_init(w);
 
 	while (1) {
 		if (p->abort_flag)
@@ -1874,27 +1973,8 @@ worker_thread(void *arg)
 			    sftp_workqueue_depth(p->q)); */
 
 			if (bn == 1) {
-				/* Single file — skip batch overhead.  Drain any
-				 * deferred pipelined batch first: execute_unit on
-				 * a single unit uses sftp_upload/sftp_download
-				 * which reads from the connection and would
-				 * corrupt the message stream if a previous
-				 * batch's CLOSE STATUSes were still pending. */
-				worker_drain_pipeline(w);
-				worker_record_start(w);
-				int rc = execute_unit(w, batch[0]);
-				/* DISPATCH-DIAG: log per-unit completion so we
-				 * can correlate transferred bytes back to the
-				 * specific worker.  Captured BEFORE
-				 * worker_process_result, which may re-queue or
-				 * free the unit. */
-				debug_ft("dispatch-diag: worker %d "
-				    "executed op=%d rc=%d offset=%lld "
-				    "length=%lld",
-				    w->id, (int)batch[0]->op, rc,
-				    (long long)batch[0]->range_offset,
-				    (long long)batch[0]->range_length);
-				worker_process_result(w, batch[0], rc);
+				/* Single file — skip batch overhead. */
+				worker_execute_single(w, batch[0]);
 			} else if ((int)batch_op == (int)SFTP_OP_DOWNLOAD) {
 				/*
 				 * Phase 5 (download side): the eligibility
@@ -1930,44 +2010,24 @@ worker_thread(void *arg)
 				worker_run_batch_pipelined(w, batch, bn);
 			}
 
-			/* Process the leftover non-upload unit (if any). */
+			/* Process the leftover non-batch unit (if any). */
 			if (leftover != NULL) {
-				/* A non-batch op must drain the pipelined-batch
-				 * state first: the previous batch's CLOSEs are
-				 * still in flight, and execute_unit on the
-				 * leftover would corrupt the message stream by
-				 * reading their STATUS replies as something else. */
-				worker_drain_pipeline(w);
 				if (leftover->op == SFTP_OP_EXIT_WORKER) {
+					/* Drain pending pipelined CLOSEs on a
+					 * live conn before voluntary exit. */
+					worker_drain_pipeline(w);
 					free_unit(leftover);
 					pthread_mutex_lock(&w->mu);
 					w->exited_voluntary = 1;
 					pthread_mutex_unlock(&w->mu);
 					break;
 				}
-				worker_record_start(w);
-				int rc = execute_unit(w, leftover);
-				worker_process_result(w, leftover, rc);
+				worker_execute_single(w, leftover);
 			}
 		} else {
-			/* Download, mkdir, or any range op (UPLOAD_RANGE /
-			 * DOWNLOAD_RANGE) — all bypass the upload-batch path.
-			 * Drain any deferred pipelined batch first so its
-			 * pending STATUSes don't get mistaken for the new op's
-			 * responses on the shared connection. */
-			worker_drain_pipeline(w);
-			worker_record_start(w);
-			int rc = execute_unit(w, u0);
-			/* DISPATCH-DIAG: per-unit completion for range and
-			 * non-batched ops.  This is the path SFTP_OP_UPLOAD_RANGE
-			 * (op=4) takes — the earlier diag in the bn==1 branch
-			 * only covers whole-file uploads. */
-			debug_ft("dispatch-diag: worker %d executed op=%d "
-			    "rc=%d offset=%lld length=%lld",
-			    w->id, (int)u0->op, rc,
-			    (long long)u0->range_offset,
-			    (long long)u0->range_length);
-			worker_process_result(w, u0, rc);
+			/* Download (no bundle), mkdir, or any range op —
+			 * all bypass the upload-batch path. */
+			worker_execute_single(w, u0);
 		}
 
 		/* Account for this iteration's idle and work time. */
@@ -1984,77 +2044,8 @@ worker_thread(void *arg)
 		 * actually holding work. */
 		__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
 
-		/*
-		 * Protocol violation handling: two-strikes policy.
-		 *
-		 * A protocol violation (ID mismatch or unexpected packet
-		 * type at sftp-client.c boundaries) means the wire data
-		 * does not match what we expect.  Possible causes:
-		 *
-		 *   (a) Random bit-flip on a long transfer.  Historically
-		 *       seen with a NIC silicon bug that occasionally
-		 *       corrupted a byte over multi-hour runs.  This is the
-		 *       common, benign-but-noisy case we want to tolerate.
-		 *   (b) Buggy / compromised server, in-channel tampering,
-		 *       persistent hardware fault.  Rare but serious — we
-		 *       must not paper over it.
-		 *
-		 * Strike 1: log loudly, increment p->protocol_violations,
-		 * fall through to the sftp_conn_is_dead() branch below.
-		 * The connection is already marked dead by
-		 * sftp_hpn_set_protocol_violation (in sftp-client.c) so the
-		 * worker exits involuntarily and the reporter's respawn
-		 * machinery (respawn_owed) replaces it with a fresh SSH
-		 * child.  Other workers and the control connection are
-		 * unaffected and the transfer continues.
-		 *
-		 * Strike 2 (lifetime per hpnsftp process): two independent
-		 * violations is a pattern, not bad luck.  fatal() out
-		 * immediately — the OS reaps the remaining SSH children
-		 * when the parent dies.  Unit cleanup for the current
-		 * work-unit was already handled above by
-		 * worker_process_result / the batch result loop.
-		 *
-		 * The threshold is intentionally a fixed count (2), not a
-		 * rate.  A correctly-functioning server should produce
-		 * zero violations even with many workers and long-running
-		 * transfers — SSH MAC integrity catches all in-channel
-		 * tampering at the cipher layer.  Anything that reaches
-		 * this code path is, by definition, abnormal.
-		 */
-		if (sftp_conn_is_protocol_violation(w->conn)) {
-			int total;
-
-			pthread_mutex_lock(&p->workers_mu);
-			p->protocol_violations++;
-			total = p->protocol_violations;
-			pthread_mutex_unlock(&p->workers_mu);
-
-			if (total >= 2) {
-				/* Strike 2: sustained pattern — abort process. */
-				fatal("worker %d: protocol violation #%d in "
-				    "this session - sustained pattern, "
-				    "aborting hpnsftp (possible server "
-				    "corruption, MITM, or persistent "
-				    "hardware fault)", w->id, total);
-			}
-			/* Strike 1: kill this worker, let orchestrator respawn.
-			 * The conn is already dead; falling through reaches
-			 * the sftp_conn_is_dead() check immediately below. */
-			error_f("worker %d: protocol violation #%d - killing "
-			    "worker and respawning; one more this session "
-			    "will exit hpnsftp", w->id, total);
-		}
-
-		/* Connection died during the transfer — this worker cannot
-		 * continue.  The unit was already re-queued or failed above;
-		 * exit cleanly so the orchestrator can detect us as dead. */
-		if (sftp_conn_is_dead(w->conn)) {
-			if (!p->abort_flag && !p->stopped)
-				debug_ft("worker %d: connection lost - "
-				    "will attempt to respawn", w->id);
+		if (worker_should_terminate(w))
 			break;
-		}
 	}
 	/* Phase 4 gap 1: drain any deferred pipelined batch state before
 	 * exiting.  If the connection died, this is a best-effort drain
@@ -2437,69 +2428,65 @@ watchdog_check_sync_stall(struct sftp_parallel *p)
  * worker has transitioned to DEAD, signaling the reporter to abort the
  * orchestrator.
  */
+/*
+ * Per-worker health classification and dooming action.  Returns 1 if
+ * the worker was DEAD (or just transitioned to DEAD this tick), 0
+ * otherwise — caller uses this to drive the workers_mu "any_dead"
+ * tally.
+ *
+ * Caller must hold workers_mu; this function acquires per-worker mu
+ * only for short critical sections (state read + transition).
+ *
+ * `tput_dead_this_tick` is the in/out throttle flag — at most one
+ * throughput-outlier DEAD promotion per tick across all workers.
+ */
 static int
-watchdog_check_workers(struct sftp_parallel *p)
+watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
+    uint64_t now, int queue_has_work, int *tput_dead_this_tick)
 {
-	int any_dead = 0;
-	uint64_t now = monotonic_ns();
-	int queue_has_work = (sftp_workqueue_depth(p->q) > 0);
+	enum worker_health prev, next;
 
-	pthread_mutex_lock(&p->workers_mu);
+	pthread_mutex_lock(&w->mu);
+	prev = w->health;
+	uint64_t in_flight = w->units_started - w->units_completed -
+	    w->units_failed;
+	uint64_t w_bytes_total = w->bytes_total;
+	uint64_t w_units_completed = w->units_completed;
+	uint64_t since_completion_ns = w->last_completion_ns ?
+	    (now - w->last_completion_ns) : 0;  /* for log messages */
+	pthread_mutex_unlock(&w->mu);
+	uint64_t w_live_bytes = __atomic_load_n(&w->live_bytes,
+	    __ATOMIC_RELAXED);
 
-	/* Adaptive throughput sample for outlier detection (no-op if
-	 * cfg.tput_path_healthy_kbps == 0). Sets w->tput_outlier_ticks. */
-	watchdog_sample_throughput(p, now);
+	uint64_t unit_start = __atomic_load_n(&w->unit_start_ns,
+	    __ATOMIC_ACQUIRE);
+	uint64_t since_unit_start_ns = (unit_start > 0 &&
+	    now > unit_start) ? (now - unit_start) : 0;
 
-	/* Throttle: at most one DEAD promotion per tick from the
-	 * throughput-outlier path.  See the comment by the outlier
-	 * escalation block below for rationale. */
-	int tput_dead_this_tick = 0;
+	/*
+	 * Effective silence: time since we last observed forward
+	 * progress in bytes.  Tracks (bytes_total + live_bytes), which
+	 * climbs continuously during an active transfer regardless of
+	 * unit size.  Replaces the older completion-based timer that
+	 * misfired on whole-file uploads of large files (a 10 GiB file
+	 * at 2 Gbps takes ~50 s — close to STALL_THRESHOLD_SEC, any
+	 * writeback dip would trip a false DEAD).
+	 *
+	 * Updated only by this thread; no atomics needed.  On first
+	 * tick last_progress_ns is 0, so we seed it from now without
+	 * touching last_progress_bytes (which is also 0).
+	 */
+	uint64_t cur_progress_bytes = w_bytes_total + w_live_bytes;
+	if (w->last_progress_ns == 0 ||
+	    cur_progress_bytes > w->last_progress_bytes) {
+		w->last_progress_ns = now;
+		w->last_progress_bytes = cur_progress_bytes;
+	}
+	uint64_t effective_silence_ns =
+	    (w->last_progress_ns > 0 && now > w->last_progress_ns)
+	    ? (now - w->last_progress_ns) : 0;
 
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = p->workers[i];
-		enum worker_health prev, next;
-
-		pthread_mutex_lock(&w->mu);
-		prev = w->health;
-		uint64_t in_flight = w->units_started - w->units_completed -
-		    w->units_failed;
-		uint64_t w_bytes_total = w->bytes_total;
-		uint64_t w_units_completed = w->units_completed;
-		uint64_t since_completion_ns = w->last_completion_ns ?
-		    (now - w->last_completion_ns) : 0;  /* for log messages */
-		pthread_mutex_unlock(&w->mu);
-		uint64_t w_live_bytes = __atomic_load_n(&w->live_bytes,
-		    __ATOMIC_RELAXED);
-
-		uint64_t unit_start = __atomic_load_n(&w->unit_start_ns,
-		    __ATOMIC_ACQUIRE);
-		uint64_t since_unit_start_ns = (unit_start > 0 &&
-		    now > unit_start) ? (now - unit_start) : 0;
-
-		/*
-		 * Effective silence: time since we last observed forward
-		 * progress in bytes.  Tracks (bytes_total + live_bytes), which
-		 * climbs continuously during an active transfer regardless of
-		 * unit size.  Replaces the older completion-based timer that
-		 * misfired on whole-file uploads of large files (a 10 GiB
-		 * file at 2 Gbps takes ~50 s — close to STALL_THRESHOLD_SEC,
-		 * any writeback dip would trip a false DEAD).
-		 *
-		 * Updated only by this thread; no atomics needed.  On first
-		 * tick last_progress_ns is 0, so we seed it from now without
-		 * touching last_progress_bytes (which is also 0).
-		 */
-		uint64_t cur_progress_bytes = w_bytes_total + w_live_bytes;
-		if (w->last_progress_ns == 0 ||
-		    cur_progress_bytes > w->last_progress_bytes) {
-			w->last_progress_ns = now;
-			w->last_progress_bytes = cur_progress_bytes;
-		}
-		uint64_t effective_silence_ns =
-		    (w->last_progress_ns > 0 && now > w->last_progress_ns)
-		    ? (now - w->last_progress_ns) : 0;
-
-		next = WORKER_HEALTHY;
+	next = WORKER_HEALTHY;
 
 		/* SSH child gone is the strongest signal — detectable
 		 * without waiting for the worker thread's next I/O.
@@ -2632,9 +2619,9 @@ watchdog_check_workers(struct sftp_parallel *p)
 			int req = p->cfg.tput_consec_required > 0
 			    ? p->cfg.tput_consec_required : 5;
 			if (consec >= 2 * req) {
-				if (!tput_dead_this_tick) {
+				if (!*tput_dead_this_tick) {
 					next = WORKER_DEAD;
-					tput_dead_this_tick = 1;
+					*tput_dead_this_tick = 1;
 				} else {
 					/* Throttle: another worker already
 					 * promoted to DEAD this tick.  Stay
@@ -2728,33 +2715,54 @@ watchdog_check_workers(struct sftp_parallel *p)
 				    "child (pid %ld)", w->id,
 				    (long)w->ssh_pid);
 			}
-			any_dead = 1;
 		}
 
-		/* SIGKILL escalation: if a doomed worker hasn't exited within
-		 * SIGKILL_ESCALATION_SEC, the SSH child is hung in its clean-
-		 * shutdown path (broken socket) and the worker thread is
-		 * blocked on its stdout pipe.  SIGKILL closes the pipes
-		 * immediately, the worker thread sees EOF/EPIPE on its next
-		 * I/O call, sets exited=1, and gets reaped.  Without this we
-		 * deadlock: the SIGKILL-on-reap path is gated on exited=1. */
-		if (w->doomed && !w->exited && w->doom_ns > 0 &&
-		    w->ssh_pid > 0 &&
-		    now - w->doom_ns >
-		    (uint64_t)SIGKILL_ESCALATION_SEC * 1000000000ULL) {
-			(void)kill(w->ssh_pid, SIGKILL);
-			debug_ft("worker %d: escalated to SIGKILL after "
-			    "%llus (SSH child unresponsive to SIGTERM, "
-			    "pid %ld)",
-			    w->id,
-			    (unsigned long long)
-			    ((now - w->doom_ns) / 1000000000ULL),
-			    (long)w->ssh_pid);
-			/* Clear doom_ns so we don't re-escalate every tick. */
-			pthread_mutex_lock(&w->mu);
-			w->doom_ns = 0;
-			pthread_mutex_unlock(&w->mu);
-		}
+	/* SIGKILL escalation: if a doomed worker hasn't exited within
+	 * SIGKILL_ESCALATION_SEC, the SSH child is hung in its clean-
+	 * shutdown path (broken socket) and the worker thread is blocked
+	 * on its stdout pipe.  SIGKILL closes the pipes immediately, the
+	 * worker thread sees EOF/EPIPE on its next I/O call, sets
+	 * exited=1, and gets reaped.  Without this we deadlock: the
+	 * SIGKILL-on-reap path is gated on exited=1. */
+	if (w->doomed && !w->exited && w->doom_ns > 0 && w->ssh_pid > 0 &&
+	    now - w->doom_ns >
+	    (uint64_t)SIGKILL_ESCALATION_SEC * 1000000000ULL) {
+		(void)kill(w->ssh_pid, SIGKILL);
+		debug_ft("worker %d: escalated to SIGKILL after %llus "
+		    "(SSH child unresponsive to SIGTERM, pid %ld)",
+		    w->id,
+		    (unsigned long long)
+		    ((now - w->doom_ns) / 1000000000ULL),
+		    (long)w->ssh_pid);
+		/* Clear doom_ns so we don't re-escalate every tick. */
+		pthread_mutex_lock(&w->mu);
+		w->doom_ns = 0;
+		pthread_mutex_unlock(&w->mu);
+	}
+	return (next == WORKER_DEAD) ? 1 : 0;
+}
+
+static int
+watchdog_check_workers(struct sftp_parallel *p)
+{
+	int any_dead = 0;
+	uint64_t now = monotonic_ns();
+	int queue_has_work = (sftp_workqueue_depth(p->q) > 0);
+
+	pthread_mutex_lock(&p->workers_mu);
+
+	/* Adaptive throughput sample for outlier detection (no-op if
+	 * cfg.tput_path_healthy_kbps == 0).  Sets w->tput_outlier_ticks. */
+	watchdog_sample_throughput(p, now);
+
+	/* Throttle: at most one DEAD promotion per tick from the
+	 * throughput-outlier path. */
+	int tput_dead_this_tick = 0;
+
+	for (int i = 0; i < p->num_workers; i++) {
+		if (watchdog_check_one_worker(p, p->workers[i], now,
+		    queue_has_work, &tput_dead_this_tick))
+			any_dead = 1;
 	}
 	pthread_mutex_unlock(&p->workers_mu);
 	return any_dead;
@@ -2812,6 +2820,294 @@ respawn_worker_thread(void *arg)
 	return NULL;
 }
 
+/*
+ * Phase-5 instrumentation: per-worker stats CSV.  Enabled by
+ * HPN_WORKER_STATS_CSV=/path in the environment.  Opens the file on
+ * first call (lazy), emits one row per worker per slow tick.
+ *
+ * Columns: t_ms, worker_id, bytes_total, live_bytes, units_started,
+ *          units_completed, units_failed, health, reconnect_count
+ *
+ * Factored out of reporter_thread to keep the slow-tick body readable.
+ * Holds workers_mu while iterating, plus per-worker mu for each row.
+ */
+static void
+reporter_emit_stats_csv(struct sftp_parallel *p)
+{
+	if (p->stats_csv == NULL) {
+		/* ENV-VAR HPN_WORKER_STATS_CSV — developer-only: path for
+		 * per-second per-worker stats CSV used by the benchmark
+		 * harness.  Not user-facing. */
+		const char *path = getenv("HPN_WORKER_STATS_CSV");
+		if (path == NULL || *path == '\0')
+			return;
+		p->stats_csv = fopen(path, "w");
+		if (p->stats_csv == NULL)
+			return;
+		setvbuf(p->stats_csv, NULL, _IOLBF, 0);
+		fprintf(p->stats_csv,
+		    "t_ms,worker_id,bytes_total,live_bytes,units_started"
+		    ",units_completed,units_failed,health,reconnect_count\n");
+		p->stats_csv_start_ns = monotonic_ns();
+	}
+	uint64_t t_ms =
+	    (monotonic_ns() - p->stats_csv_start_ns) / 1000000ULL;
+	pthread_mutex_lock(&p->workers_mu);
+	for (int i = 0; i < p->num_workers; i++) {
+		struct sftp_worker *w = p->workers[i];
+		pthread_mutex_lock(&w->mu);
+		fprintf(p->stats_csv,
+		    "%llu,%d,%llu,%llu,%llu,%llu,%llu,%d,%llu\n",
+		    (unsigned long long)t_ms,
+		    w->id,
+		    (unsigned long long)w->bytes_total,
+		    (unsigned long long)w->live_bytes,
+		    (unsigned long long)w->units_started,
+		    (unsigned long long)w->units_completed,
+		    (unsigned long long)w->units_failed,
+		    (int)w->health,
+		    (unsigned long long)w->reconnect_count);
+		pthread_mutex_unlock(&w->mu);
+	}
+	pthread_mutex_unlock(&p->workers_mu);
+}
+
+/*
+ * Reap workers that have marked themselves exited (either via
+ * SFTP_OP_EXIT_WORKER sentinel or because their connection died).
+ *
+ * Two phases for clean locking: collect-under-lock, then join-and-free
+ * outside the lock (pthread_join can take arbitrary time).
+ *
+ * Returns the count of NON-voluntary exits — the caller (reporter)
+ * uses this to drive respawn dispatch.  Voluntary exits (worker
+ * removed via sftp_parallel_remove_worker sending an EXIT_WORKER
+ * sentinel) are reaped but NOT respawned.
+ */
+static int
+reporter_reap_exited_workers(struct sftp_parallel *p)
+{
+	struct sftp_worker *to_reap[SFTP_PARALLEL_MAX_WORKERS];
+	int to_reap_voluntary[SFTP_PARALLEL_MAX_WORKERS];
+	int n_reap = 0;
+
+	pthread_mutex_lock(&p->workers_mu);
+	for (int i = p->num_workers - 1; i >= 0; i--) {
+		struct sftp_worker *w = p->workers[i];
+		int exited, voluntary;
+		uint64_t bt;
+		pthread_mutex_lock(&w->mu);
+		exited    = w->exited;
+		voluntary = w->exited_voluntary;
+		bt        = w->bytes_total;
+		/* Capture bytes_total before the worker leaves the array
+		 * so the aggregate stays monotonic.  live_bytes was reset
+		 * to 0 at the worker's last completion so it is not
+		 * double-counted. */
+		if (exited)
+			p->retired_bytes += bt;
+		pthread_mutex_unlock(&w->mu);
+		if (exited) {
+			to_reap[n_reap] = w;
+			to_reap_voluntary[n_reap] = voluntary;
+			n_reap++;
+			memmove(&p->workers[i],
+			    &p->workers[i + 1],
+			    (p->num_workers - i - 1) *
+			    sizeof(*p->workers));
+			p->num_workers--;
+		}
+	}
+	pthread_mutex_unlock(&p->workers_mu);
+
+	int n_to_respawn = 0;
+	for (int i = 0; i < n_reap; i++) {
+		struct sftp_worker *w = to_reap[i];
+		if (!to_reap_voluntary[i])
+			n_to_respawn++;
+		pthread_join(w->tid, NULL);
+		if (w->conn) sftp_free(w->conn);
+		if (w->fd_in >= 0) close(w->fd_in);
+		if (w->fd_out >= 0) close(w->fd_out);
+		if (w->ssh_pid > 0) {
+			int s;
+			/* Belt-and-suspenders: may already be dead from
+			 * SIGTERM above. */
+			(void)kill(w->ssh_pid, SIGKILL);
+			(void)waitpid(w->ssh_pid, &s, 0);
+		}
+		pthread_mutex_destroy(&w->mu);
+		free(w);
+	}
+	return n_to_respawn;
+}
+
+/*
+ * Drive worker respawn dispatch for the reporter's slow tick.  Takes
+ * the count of non-voluntary worker exits seen on this tick and:
+ *
+ *   - absorbs them into respawn_owed (the persistent backlog)
+ *   - updates the epoch ceiling / cooldown state machine
+ *   - launches detached respawn threads up to the available slots
+ *   - aborts the transfer if every worker is gone and recovery is
+ *     exhausted (cooldowns spent on an unhealthy path) or if the
+ *     workforce has gone to zero with units still pending
+ *
+ * Returns 1 if the reporter should break out of its main loop (an
+ * abort condition fired); 0 otherwise.
+ *
+ * Cooldown / ceiling policy:
+ *   Each epoch allows RESPAWN_MULTIPLIER × num_streams respawns.
+ *   On hitting the ceiling: enter a counted cooldown (pause for
+ *   RESPAWN_COOLDOWN_SEC, reset epoch).  After RESPAWN_MAX_COOLDOWNS
+ *   counted cooldowns, fall through to a throughput gate: if any
+ *   worker is still pushing the configured healthy-path floor, grant
+ *   an uncounted extension cooldown (warn but continue).  If the
+ *   path itself is unhealthy, abort.
+ */
+static int
+reporter_dispatch_respawns(struct sftp_parallel *p, int n_to_respawn)
+{
+	pthread_mutex_lock(&p->workers_mu);
+	int cur_workers  = p->num_workers;
+	int respawn_ceil = p->cfg.num_streams * RESPAWN_MULTIPLIER;
+	pthread_mutex_unlock(&p->workers_mu);
+
+	/* Absorb this tick's involuntary deaths into the backlog.
+	 * respawn_owed carries across cooldowns and pthread_create
+	 * failures, so the worker pool drains back up to num_streams
+	 * once spawning resumes. */
+	if (n_to_respawn > 0)
+		p->respawn_owed += n_to_respawn;
+
+	/* Check cooldown: suppress respawns until timer expires. */
+	int in_cooldown = 0;
+	if (p->respawn_resume_ns != 0) {
+		uint64_t now_ns = monotonic_ns();
+		if (now_ns < p->respawn_resume_ns) {
+			in_cooldown = 1;
+		} else {
+			debug_ft("respawn cooldown ended, resuming "
+			    "(epoch reset, owed=%d)", p->respawn_owed);
+			p->respawn_resume_ns = 0;
+			p->respawn_epoch_count = 0;
+		}
+	}
+
+	/* Ceiling check + cooldown entry (only when we owe a respawn
+	 * and are not already in cooldown). */
+	if (!in_cooldown && p->respawn_owed > 0 &&
+	    p->respawn_epoch_count >= respawn_ceil) {
+		uint64_t now_ns = monotonic_ns();
+		if (p->respawn_cooldown_count < RESPAWN_MAX_COOLDOWNS) {
+			/* Counted cooldown. */
+			p->respawn_cooldown_count++;
+			p->respawn_last_cooldown_ns = now_ns;
+			p->respawn_resume_ns = now_ns +
+			    (uint64_t)RESPAWN_COOLDOWN_SEC * 1000000000ULL;
+			p->respawn_epoch_count = 0;
+			in_cooldown = 1;
+			error_ft("respawn epoch ceiling reached "
+			    "(%d/%d) — entering cooldown %d/%d for %ds; "
+			    "healthy workers continue",
+			    p->total_respawns, respawn_ceil,
+			    p->respawn_cooldown_count,
+			    RESPAWN_MAX_COOLDOWNS,
+			    RESPAWN_COOLDOWN_SEC);
+		} else {
+			/* Cooldowns exhausted — throughput gate. */
+			int path_ok =
+			    (p->cfg.tput_path_healthy_kbps > 0) &&
+			    (p->tput_last_raw_max_kbps >=
+			     p->cfg.tput_path_healthy_kbps);
+			if (path_ok) {
+				/* Productive workers remain — extend rather
+				 * than killing a partially-complete transfer. */
+				p->respawn_resume_ns = now_ns +
+				    (uint64_t)RESPAWN_COOLDOWN_SEC *
+				    1000000000ULL;
+				p->respawn_last_cooldown_ns = now_ns;
+				p->respawn_epoch_count = 0;
+				in_cooldown = 1;
+				error_ft("WARNING: respawn cooldowns "
+				    "exhausted but path still healthy "
+				    "(max=%llukbps) — extending rather than "
+				    "aborting; investigate connection churn",
+				    (unsigned long long)
+				    p->tput_last_raw_max_kbps);
+			} else {
+				error_ft("respawn cooldowns exhausted and "
+				    "path unhealthy (max=%llukbps) — "
+				    "persistent connection failure, "
+				    "aborting transfer",
+				    (unsigned long long)
+				    p->tput_last_raw_max_kbps);
+				sftp_parallel_abort(p);
+				return 1;
+			}
+		}
+	}
+
+	int target   = p->cfg.num_streams;
+	int slots    = target - cur_workers;
+	int to_spawn = (!in_cooldown && p->respawn_owed > 0 && slots > 0)
+	    ? ((p->respawn_owed < slots) ? p->respawn_owed : slots)
+	    : 0;
+	if (to_spawn > 0) {
+		debug_ft("initiating respawn for %d worker(s) "
+		    "(current=%d target=%d owed=%d "
+		    "epoch=%d/%d cooldowns=%d/%d)",
+		    to_spawn, cur_workers, target,
+		    p->respawn_owed,
+		    p->respawn_epoch_count + to_spawn, respawn_ceil,
+		    p->respawn_cooldown_count, RESPAWN_MAX_COOLDOWNS);
+	}
+	for (int i = 0; i < to_spawn; i++) {
+		if (p->abort_flag || p->stopped)
+			break;
+		pthread_mutex_lock(&p->workers_mu);
+		p->pending_respawns++;
+		p->total_respawns++;
+		p->respawn_epoch_count++;
+		pthread_mutex_unlock(&p->workers_mu);
+		pthread_t rtid;
+		if (pthread_create(&rtid, NULL,
+		    respawn_worker_thread, p) == 0) {
+			(void)pthread_detach(rtid);
+			/* Drain backlog only on success; a failed create
+			 * leaves owed in place so we retry next tick. */
+			p->respawn_owed--;
+		} else {
+			error_ft("respawn thread create failed");
+			pthread_mutex_lock(&p->workers_mu);
+			p->pending_respawns--;
+			p->total_respawns--;
+			p->respawn_epoch_count--;
+			pthread_mutex_unlock(&p->workers_mu);
+		}
+	}
+
+	/* If every worker is gone and no respawn is in flight, all
+	 * recovery attempts have failed; abort rather than letting
+	 * sftp_parallel_wait hang. */
+	pthread_mutex_lock(&p->workers_mu);
+	int all_gone = (p->num_workers == 0 && p->pending_respawns == 0);
+	pthread_mutex_unlock(&p->workers_mu);
+	if (all_gone && !p->abort_flag) {
+		pthread_mutex_lock(&p->pending_mu);
+		int stuck = (p->pending > 0);
+		pthread_mutex_unlock(&p->pending_mu);
+		if (stuck) {
+			error_ft("all workers gone with %llu unit(s) "
+			    "pending -- aborting transfer",
+			    (unsigned long long)p->pending);
+			sftp_parallel_abort(p);
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static void *
 reporter_thread(void *arg)
 {
@@ -2846,56 +3142,7 @@ reporter_thread(void *arg)
 		if (++slow_tick_counter >= 5) {
 			slow_tick_counter = 0;
 
-			/* Phase-5 instrumentation: per-worker stats CSV.
-			 * Enabled by HPN_WORKER_STATS_CSV=/path env var.  One
-			 * row per worker per slow tick.  Columns:
-			 *   t_ms,worker_id,bytes_total,units_completed,
-			 *   units_failed,health,live_bytes,reconnect_count */
-			if (p->stats_csv == NULL) {
-				/* ENV-VAR HPN_WORKER_STATS_CSV — developer-only:
-				 * path for per-second per-worker stats CSV used
-				 * by the benchmark harness.  Not user-facing. */
-				const char *path =
-				    getenv("HPN_WORKER_STATS_CSV");
-				if (path != NULL && *path != '\0') {
-					p->stats_csv = fopen(path, "w");
-					if (p->stats_csv != NULL) {
-						setvbuf(p->stats_csv, NULL,
-						    _IOLBF, 0);
-						fprintf(p->stats_csv,
-						    "t_ms,worker_id,bytes_total"
-						    ",live_bytes,units_started"
-						    ",units_completed,units_failed"
-						    ",health,reconnect_count\n");
-						p->stats_csv_start_ns =
-						    monotonic_ns();
-					}
-				}
-			}
-			if (p->stats_csv != NULL) {
-				uint64_t t_ms =
-				    (monotonic_ns() - p->stats_csv_start_ns)
-				    / 1000000ULL;
-				pthread_mutex_lock(&p->workers_mu);
-				for (int i = 0; i < p->num_workers; i++) {
-					struct sftp_worker *w = p->workers[i];
-					pthread_mutex_lock(&w->mu);
-					fprintf(p->stats_csv,
-					    "%llu,%d,%llu,%llu,%llu,%llu,%llu"
-					    ",%d,%llu\n",
-					    (unsigned long long)t_ms,
-					    w->id,
-					    (unsigned long long)w->bytes_total,
-					    (unsigned long long)w->live_bytes,
-					    (unsigned long long)w->units_started,
-					    (unsigned long long)w->units_completed,
-					    (unsigned long long)w->units_failed,
-					    (int)w->health,
-					    (unsigned long long)w->reconnect_count);
-					pthread_mutex_unlock(&w->mu);
-				}
-				pthread_mutex_unlock(&p->workers_mu);
-			}
+			reporter_emit_stats_csv(p);
 
 			/* Stability timer: if no new cooldown was needed for
 			 * RESPAWN_STABILITY_SEC, the cluster has been running
@@ -2932,232 +3179,10 @@ reporter_thread(void *arg)
 			 * signal. */
 			watchdog_check_sync_stall(p);
 
-			/* Reap workers that have exited (either via
-			 * SFTP_OP_EXIT_WORKER sentinel or because their
-			 * connection died). Collect under workers_mu, then
-			 * join and free outside the lock. */
-			struct sftp_worker *to_reap[SFTP_PARALLEL_MAX_WORKERS];
-			int to_reap_voluntary[SFTP_PARALLEL_MAX_WORKERS];
-			int n_reap = 0;
-			pthread_mutex_lock(&p->workers_mu);
-			for (int i = p->num_workers - 1; i >= 0; i--) {
-				struct sftp_worker *w = p->workers[i];
-				int exited, voluntary;
-				uint64_t bt;
-				pthread_mutex_lock(&w->mu);
-				exited    = w->exited;
-				voluntary = w->exited_voluntary;
-				bt        = w->bytes_total;
-				/* Capture bytes_total before the worker leaves
-				 * the array so the aggregate stays monotonic.
-				 * live_bytes was reset to 0 at the worker's
-				 * last completion so it is not double-counted. */
-				if (exited)
-					p->retired_bytes += bt;
-				pthread_mutex_unlock(&w->mu);
-				if (exited) {
-					to_reap[n_reap] = w;
-					to_reap_voluntary[n_reap] = voluntary;
-					n_reap++;
-					memmove(&p->workers[i],
-					    &p->workers[i + 1],
-					    (p->num_workers - i - 1) *
-					    sizeof(*p->workers));
-					p->num_workers--;
-				}
-			}
-			pthread_mutex_unlock(&p->workers_mu);
+			int n_to_respawn = reporter_reap_exited_workers(p);
 
-			int n_to_respawn = 0;
-			for (int i = 0; i < n_reap; i++) {
-				struct sftp_worker *w = to_reap[i];
-				if (!to_reap_voluntary[i])
-					n_to_respawn++;
-				pthread_join(w->tid, NULL);
-				if (w->conn) sftp_free(w->conn);
-				if (w->fd_in >= 0) close(w->fd_in);
-				if (w->fd_out >= 0) close(w->fd_out);
-				if (w->ssh_pid > 0) {
-					int s;
-					/* Belt-and-suspenders: may already
-					 * be dead from SIGTERM above. */
-					(void)kill(w->ssh_pid, SIGKILL);
-					(void)waitpid(w->ssh_pid, &s, 0);
-				}
-				pthread_mutex_destroy(&w->mu);
-				free(w);
-			}
-
-			/* Spawn replacements for non-voluntary exits
-			 * (connection died or watchdog-SIGTERMed). Run each
-			 * in a detached thread so the SSH handshake doesn't
-			 * block the reporter's progress ticks.
-			 *
-			 * Epoch ceiling: each epoch allows RESPAWN_MULTIPLIER
-			 * * num_streams respawns.  On ceiling:
-			 *  - If cooldowns remain: pause for RESPAWN_COOLDOWN_SEC,
-			 *    reset the epoch counter, let healthy workers continue.
-			 *  - After RESPAWN_MAX_COOLDOWNS: throughput gate — if any
-			 *    worker is still healthy (raw max_kbps >= healthy
-			 *    threshold), grant an uncounted extension cooldown
-			 *    rather than killing a transfer 85% through petabytes.
-			 *    Only abort when the path itself is unhealthy. */
-			pthread_mutex_lock(&p->workers_mu);
-			int cur_workers  = p->num_workers;
-			int respawn_ceil = p->cfg.num_streams * RESPAWN_MULTIPLIER;
-			pthread_mutex_unlock(&p->workers_mu);
-
-			/* Absorb this tick's involuntary deaths into the
-			 * backlog.  respawn_owed carries across cooldowns and
-			 * pthread_create failures, so the worker pool drains
-			 * back up to num_streams once spawning resumes. */
-			if (n_to_respawn > 0)
-				p->respawn_owed += n_to_respawn;
-
-			/* Check cooldown: suppress respawns until timer expires. */
-			int in_cooldown = 0;
-			if (p->respawn_resume_ns != 0) {
-				uint64_t now_ns = monotonic_ns();
-				if (now_ns < p->respawn_resume_ns) {
-					in_cooldown = 1;
-				} else {
-					/* Cooldown expired — resume respawning. */
-					debug_ft("respawn cooldown ended, "
-					    "resuming (epoch reset, owed=%d)",
-					    p->respawn_owed);
-					p->respawn_resume_ns = 0;
-					p->respawn_epoch_count = 0;
-				}
-			}
-
-			/* Ceiling check and cooldown entry (only when we owe
-			 * a respawn and are not already in cooldown). */
-			if (!in_cooldown && p->respawn_owed > 0 &&
-			    p->respawn_epoch_count >= respawn_ceil) {
-				uint64_t now_ns = monotonic_ns();
-				if (p->respawn_cooldown_count <
-				    RESPAWN_MAX_COOLDOWNS) {
-					/* Enter a counted cooldown. */
-					p->respawn_cooldown_count++;
-					p->respawn_last_cooldown_ns = now_ns;
-					p->respawn_resume_ns = now_ns +
-					    (uint64_t)RESPAWN_COOLDOWN_SEC *
-					    1000000000ULL;
-					p->respawn_epoch_count = 0;
-					in_cooldown = 1;
-					error_ft("respawn epoch ceiling reached "
-					    "(%d/%d) — entering cooldown %d/%d "
-					    "for %ds; healthy workers continue",
-					    p->total_respawns, respawn_ceil,
-					    p->respawn_cooldown_count,
-					    RESPAWN_MAX_COOLDOWNS,
-					    RESPAWN_COOLDOWN_SEC);
-				} else {
-					/* Cooldowns exhausted — check whether
-					 * any healthy throughput remains. */
-					int path_ok =
-					    (p->cfg.tput_path_healthy_kbps > 0)
-					    && (p->tput_last_raw_max_kbps >=
-					        p->cfg.tput_path_healthy_kbps);
-					if (path_ok) {
-						/* Some workers are still
-						 * productive — grant an
-						 * uncounted extension and warn
-						 * loudly rather than killing a
-						 * partially-complete transfer. */
-						p->respawn_resume_ns = now_ns +
-						    (uint64_t)RESPAWN_COOLDOWN_SEC
-						    * 1000000000ULL;
-						p->respawn_last_cooldown_ns =
-						    now_ns;
-						p->respawn_epoch_count = 0;
-						in_cooldown = 1;
-						error_ft("WARNING: respawn "
-						    "cooldowns exhausted but "
-						    "path still healthy "
-						    "(max=%llukbps) — extending "
-						    "rather than aborting; "
-						    "investigate connection "
-						    "churn",
-						    (unsigned long long)
-						    p->tput_last_raw_max_kbps);
-					} else {
-						error_ft("respawn cooldowns "
-						    "exhausted and path "
-						    "unhealthy (max=%llukbps) "
-						    "— persistent connection "
-						    "failure, aborting transfer",
-						    (unsigned long long)
-						    p->tput_last_raw_max_kbps);
-						sftp_parallel_abort(p);
-						break;
-					}
-				}
-			}
-
-			int target   = p->cfg.num_streams;
-			int slots    = target - cur_workers;
-			int to_spawn = (!in_cooldown && p->respawn_owed > 0 &&
-			    slots > 0)
-			    ? ((p->respawn_owed < slots) ? p->respawn_owed : slots)
-			    : 0;
-			if (to_spawn > 0) {
-				debug_ft("initiating respawn for %d worker(s) "
-				    "(current=%d target=%d owed=%d "
-				    "epoch=%d/%d cooldowns=%d/%d)",
-				    to_spawn, cur_workers, target,
-				    p->respawn_owed,
-				    p->respawn_epoch_count + to_spawn,
-				    respawn_ceil,
-				    p->respawn_cooldown_count,
-				    RESPAWN_MAX_COOLDOWNS);
-			}
-			for (int i = 0; i < to_spawn; i++) {
-				if (p->abort_flag || p->stopped)
-					break;
-				pthread_mutex_lock(&p->workers_mu);
-				p->pending_respawns++;
-				p->total_respawns++;
-				p->respawn_epoch_count++;
-				pthread_mutex_unlock(&p->workers_mu);
-				pthread_t rtid;
-				if (pthread_create(&rtid, NULL,
-				    respawn_worker_thread, p) == 0) {
-					(void)pthread_detach(rtid);
-					/* Drain the backlog only on success;
-					 * a failed create leaves owed in place
-					 * so we retry on the next tick. */
-					p->respawn_owed--;
-				} else {
-					error_ft("respawn thread create failed");
-					pthread_mutex_lock(&p->workers_mu);
-					p->pending_respawns--;
-					p->total_respawns--;
-					p->respawn_epoch_count--;
-					pthread_mutex_unlock(&p->workers_mu);
-				}
-			}
-
-			/* If every worker is gone and no respawn is in
-			 * flight, all recovery attempts have failed; abort
-			 * rather than letting sftp_parallel_wait hang. */
-			pthread_mutex_lock(&p->workers_mu);
-			int all_gone = (p->num_workers == 0 &&
-			    p->pending_respawns == 0);
-			pthread_mutex_unlock(&p->workers_mu);
-			if (all_gone && !p->abort_flag) {
-				pthread_mutex_lock(&p->pending_mu);
-				int stuck = (p->pending > 0);
-				pthread_mutex_unlock(&p->pending_mu);
-				if (stuck) {
-					error_ft("all workers gone with %llu "
-					    "unit(s) pending -- aborting "
-					    "transfer",
-					    (unsigned long long)p->pending);
-					sftp_parallel_abort(p);
-					break;
-				}
-			}
+			if (reporter_dispatch_respawns(p, n_to_respawn))
+				break;
 		}
 	}
 	return NULL;
