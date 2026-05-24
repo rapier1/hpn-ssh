@@ -1,11 +1,11 @@
-/* sftp-client-hpn.h — HPN-SSH extensions to the SFTP client connection.
+/* sftp-hpn-client.h — HPN-SSH extensions to the SFTP client connection.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * All HPN-specific per-connection state is isolated here so that
  * sftp-client.c carries a minimal diff against upstream.
  *
  * Upstream merge note: sftp-client.c gains only:
- *   #include "sftp-client-hpn.h"
+ *   #include "sftp-hpn-client.h"
  *   struct sftp_hpn_conn *hpn;   (one field in struct sftp_conn)
  *   sftp_hpn_conn_init/free calls in sftp_init/sftp_free
  *   conn->hpn->dead  replacements for conn->dead
@@ -63,7 +63,7 @@ void sftp_hpn_conn_free(struct sftp_hpn_conn *);
 
 /*
  * Internal helpers called by the thin public-API wrappers in sftp-client.c.
- * These operate on struct sftp_hpn_conn directly so sftp-client-hpn.c has
+ * These operate on struct sftp_hpn_conn directly so sftp-hpn-client.c has
  * no dependency on the opaque struct sftp_conn.
  */
 int  sftp_hpn_is_dead(struct sftp_hpn_conn *);

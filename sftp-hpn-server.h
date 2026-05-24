@@ -1,4 +1,4 @@
-/* sftp-server-hpn.h — HPN-SSH server-side SFTP extensions.
+/* sftp-hpn-server.h — HPN-SSH server-side SFTP extensions.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Server-side HPN extension handlers are isolated here so that
@@ -10,8 +10,8 @@
  *     transfers to Lustre/GPFS stripe boundaries.
  *
  * Upstream merge note: sftp-server.c gains only:
- *   #include "sftp-server-hpn.h"
- *   sftp_server_hpn_handles() / sftp_server_hpn_dispatch() calls in the
+ *   #include "sftp-hpn-server.h"
+ *   sftp_hpn_server_handles() / sftp_hpn_server_dispatch() calls in the
  *   SSH2_FXP_EXTENDED dispatch block.
  */
 
@@ -31,18 +31,18 @@ struct sshbuf;
  * Called from sftp-server.c's SSH2_FXP_EXTENDED dispatch to route
  * HPN-specific extension requests without modifying the upstream table.
  */
-int sftp_server_hpn_handles(const char *name);
+int sftp_hpn_server_handles(const char *name);
 
 /*
  * Dispatch an HPN extension request.  Called only when
- * sftp_server_hpn_handles() returned non-zero.
+ * sftp_hpn_server_handles() returned non-zero.
  *
  *   id      — SFTP request ID from the client
  *   name    — extension name string
  *   iqueue  — input buffer (positioned after the extension name)
  *   oqueue  — output buffer for the reply
  */
-void sftp_server_hpn_dispatch(u_int id, const char *name,
+void sftp_hpn_server_dispatch(u_int id, const char *name,
     struct sshbuf *iqueue, struct sshbuf *oqueue);
 
 /* ── BEGIN Phase 5: bundle handle support ─────────────────────────────────
@@ -55,7 +55,7 @@ void sftp_server_hpn_dispatch(u_int id, const char *name,
  *
  * The sftp-server.c WRITE/CLOSE dispatchers detect bundle handles via
  * the use type and call the functions below.  All bundle state lives
- * inside sftp-server-hpn.c so sftp-server.c carries a minimal diff.
+ * inside sftp-hpn-server.c so sftp-server.c carries a minimal diff.
  *
  * Compiled in only when WITH_LIBARCHIVE is defined; otherwise the handler
  * returns SSH2_FX_OP_UNSUPPORTED on open and the bundle code path is
@@ -67,13 +67,13 @@ void sftp_server_hpn_dispatch(u_int id, const char *name,
  * by this module.  sftp-server.c calls this in process_write and
  * process_close before its standard fd-based dispatch.
  */
-int sftp_server_hpn_is_bundle_handle(int handle);
+int sftp_hpn_server_is_bundle_handle(int handle);
 
 /*
  * Append WRITE data to a bundle handle's accumulation buffer.
  * Returns SSH2_FX_OK on success or an SSH2_FX_* error.
  */
-int sftp_server_hpn_bundle_write(int handle, uint64_t off,
+int sftp_hpn_server_bundle_write(int handle, uint64_t off,
     const u_char *data, size_t len);
 
 /*
@@ -86,7 +86,7 @@ int sftp_server_hpn_bundle_write(int handle, uint64_t off,
  * process_hpn_bundle_fetch), close simply releases the accumulator and
  * always returns SSH2_FX_OK.
  */
-int sftp_server_hpn_bundle_close(int handle);
+int sftp_hpn_server_bundle_close(int handle);
 
 /*
  * Read up to len bytes from a fetch-mode bundle handle's accumulator
@@ -101,9 +101,9 @@ int sftp_server_hpn_bundle_close(int handle);
  * (e.g. an upload-side bundle being WRITten into) or other failure.
  *
  * Used by sftp-server.c's process_read for handles where
- * sftp_server_hpn_is_bundle_handle() returns true.
+ * sftp_hpn_server_is_bundle_handle() returns true.
  */
-int sftp_server_hpn_bundle_read(int handle, uint64_t off,
+int sftp_hpn_server_bundle_read(int handle, uint64_t off,
     u_char *out_buf, size_t len, size_t *out_len);
 
 /* ── END Phase 5 ─────────────────────────────────────────────────────── */

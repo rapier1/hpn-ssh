@@ -182,6 +182,26 @@ int sftp_parallel_submit_mkdir(struct sftp_parallel *p,
     const char *remote_path, mode_t mode);
 
 /*
+ * Walker-helper accessors.  Exposed for sftp-parallel-walk.c (the
+ * recursive-directory walkers, split out of sftp-parallel.c) so it
+ * doesn't need to see struct sftp_parallel's internals.  All read-only
+ * (or write-only-via-helper) — no callers should grow direct field
+ * access to bypass these.
+ */
+int sftp_parallel_preserve_flag(const struct sftp_parallel *p);
+int sftp_parallel_follow_link_flag(const struct sftp_parallel *p);
+int sftp_parallel_is_aborting(const struct sftp_parallel *p);
+
+/*
+ * Walker-side failure recorder.  Bumps the orchestrator's
+ * walker_failures counter and appends "path: err" (or just "path"
+ * when err is NULL) to the failed-paths list.  Used by every walker
+ * skip-on-error site.
+ */
+void sftp_parallel_walker_record_failure(struct sftp_parallel *p,
+    const char *path, const char *err);
+
+/*
  * Default minimum file size at which a single file is split across workers
  * by byte range.  Below this threshold the file is treated as a whole-file
  * work unit.

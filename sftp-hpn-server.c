@@ -1,5 +1,5 @@
 /*
- * sftp-server-hpn.c — HPN-SSH server-side SFTP extensions.
+ * sftp-hpn-server.c — HPN-SSH server-side SFTP extensions.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Isolating HPN-specific extension handlers here keeps sftp-server.c's
@@ -49,7 +49,7 @@
 #include "misc.h"
 #include "sftp.h"
 #include "sftp-common.h"
-#include "sftp-server-hpn.h"
+#include "sftp-hpn-server.h"
 
 /* Linux filesystem type magic numbers. */
 #ifndef EXT4_SUPER_MAGIC
@@ -182,7 +182,7 @@ static void process_hpn_bundle_open(u_int id, struct sshbuf *iqueue,
     struct sshbuf *oqueue);
 
 int
-sftp_server_hpn_handles(const char *name)
+sftp_hpn_server_handles(const char *name)
 {
 	return strcmp(name, HPN_EXT_FS_INFO) == 0
 	    || strcmp(name, HPN_EXT_BUNDLE_OPEN) == 0
@@ -231,7 +231,7 @@ enum hpn_bundle_mode {
 };
 
 /* Bundle state allocated for each open handle.  Lifetime spans from
- * hpn-bundle-open/fetch through close.  Owned by sftp-server-hpn.c; stored on
+ * hpn-bundle-open/fetch through close.  Owned by sftp-hpn-server.c; stored on
  * the handle table via handle_new_bundle's opaque field. */
 struct hpn_bundle_state {
 	enum hpn_bundle_mode mode;
@@ -334,7 +334,7 @@ bundle_caps_init(void)
 	    bundle_total_cap / (1024*1024));
 }
 
-/* These callbacks live in sftp-server.c so sftp-server-hpn.c doesn't
+/* These callbacks live in sftp-server.c so sftp-hpn-server.c doesn't
  * need to know about the handle table internals. */
 extern int    handle_new_bundle(void *opaque);
 extern void  *handle_get_bundle(int handle);
@@ -454,13 +454,13 @@ bundle_state_reserve(struct hpn_bundle_state *s, size_t need)
 }
 
 int
-sftp_server_hpn_is_bundle_handle(int handle)
+sftp_hpn_server_is_bundle_handle(int handle)
 {
 	return handle_is_bundle(handle);
 }
 
 int
-sftp_server_hpn_bundle_write(int handle, uint64_t off,
+sftp_hpn_server_bundle_write(int handle, uint64_t off,
     const u_char *data, size_t len)
 {
 	struct hpn_bundle_state *s = handle_get_bundle(handle);
@@ -489,7 +489,7 @@ sftp_server_hpn_bundle_write(int handle, uint64_t off,
 }
 
 int
-sftp_server_hpn_bundle_read(int handle, uint64_t off, u_char *out_buf,
+sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
     size_t len, size_t *out_len)
 {
 	struct hpn_bundle_state *s = handle_get_bundle(handle);
@@ -519,7 +519,7 @@ sftp_server_hpn_bundle_read(int handle, uint64_t off, u_char *out_buf,
  * archive_read_extract / archive_write_disk which would do this and
  * more (xattrs, owners, etc.) automatically.  Worth migrating to that
  * path if subdirectory creation becomes a hotspot or correctness
- * concern; see comment in sftp_server_hpn_bundle_close.
+ * concern; see comment in sftp_hpn_server_bundle_close.
  */
 static int
 mkdir_p(const char *dirpath, mode_t mode)
@@ -553,7 +553,7 @@ mkdir_p(const char *dirpath, mode_t mode)
 
 /*
  * libarchive read callback that pulls bytes from the accumulator buffer.
- * Used by archive_read_open under sftp_server_hpn_bundle_close.
+ * Used by archive_read_open under sftp_hpn_server_bundle_close.
  */
 struct bundle_read_ctx {
 	const u_char *p;
@@ -575,7 +575,7 @@ bundle_archive_read_cb(struct archive *a, void *cd, const void **buffer)
 }
 
 int
-sftp_server_hpn_bundle_close(int handle)
+sftp_hpn_server_bundle_close(int handle)
 {
 	struct hpn_bundle_state *s = handle_get_bundle(handle);
 	if (s == NULL)
@@ -1096,14 +1096,14 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
  * in sftp-server.c, which check WITH_LIBARCHIVE). */
 
 int
-sftp_server_hpn_is_bundle_handle(int handle)
+sftp_hpn_server_is_bundle_handle(int handle)
 {
 	(void)handle;
 	return 0;
 }
 
 int
-sftp_server_hpn_bundle_write(int handle, uint64_t off,
+sftp_hpn_server_bundle_write(int handle, uint64_t off,
     const u_char *data, size_t len)
 {
 	(void)handle; (void)off; (void)data; (void)len;
@@ -1111,14 +1111,14 @@ sftp_server_hpn_bundle_write(int handle, uint64_t off,
 }
 
 int
-sftp_server_hpn_bundle_close(int handle)
+sftp_hpn_server_bundle_close(int handle)
 {
 	(void)handle;
 	return SSH2_FX_OP_UNSUPPORTED;
 }
 
 int
-sftp_server_hpn_bundle_read(int handle, uint64_t off, u_char *out_buf,
+sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
     size_t len, size_t *out_len)
 {
 	(void)handle; (void)off; (void)out_buf; (void)len;
@@ -1169,7 +1169,7 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 /* ── END Phase 5 ───────────────────────────────────────────────────────── */
 
 void
-sftp_server_hpn_dispatch(u_int id, const char *name,
+sftp_hpn_server_dispatch(u_int id, const char *name,
     struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
 	char *path = NULL;

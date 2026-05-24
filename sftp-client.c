@@ -53,7 +53,7 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
-#include "sftp-client-hpn.h" /* HPN */
+#include "sftp-hpn-client.h" /* HPN */
 
 extern volatile sig_atomic_t interrupted;
 extern int showprogress;
@@ -189,7 +189,7 @@ sftpio(void *_bwlimit, size_t amount)
 }
 
 /* HPN: send_msg / get_msg / get_handle dropped `static` qualifier so
- * HPN-only client code (sftp-client-hpn.c) can implement extension
+ * HPN-only client code (sftp-hpn-client.c) can implement extension
  * helpers like sftp_hpn_bundle_download without redefining the SFTP
  * transport layer.  Declarations live in sftp-client-internal.h. */
 int
@@ -738,7 +738,7 @@ sftp_proto_version(struct sftp_conn *conn)
 	return conn->version;
 }
 
-/* HPN: thin wrappers — logic lives in sftp-client-hpn.c */
+/* HPN: thin wrappers — logic lives in sftp-hpn-client.c */
 int
 sftp_conn_is_dead(struct sftp_conn *conn)
 {
@@ -3420,7 +3420,7 @@ sftp_upload_batch(struct sftp_conn *conn,
 /* ── BEGIN Phase 5: hpn-bundle accessors ─────────────────────────────────
  *
  * The bundle wire protocol implementations (sftp_hpn_bundle_upload,
- * sftp_hpn_bundle_download) live in sftp-client-hpn.c.  Only the small
+ * sftp_hpn_bundle_download) live in sftp-hpn-client.c.  Only the small
  * accessors that need to peek inside struct sftp_conn stay here — they
  * cross the upstream-aligned / HPN boundary minimally.
  */
@@ -3438,7 +3438,7 @@ sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn)
 }
 
 /* Allocate the next outbound SFTP message id for `conn`.  Internal-only
- * accessor used by HPN extension code in sftp-client-hpn.c so it doesn't
+ * accessor used by HPN extension code in sftp-hpn-client.c so it doesn't
  * have to know struct sftp_conn's layout (which lives in sftp-client.c).
  * Declared in sftp-client-internal.h. */
 u_int
@@ -3448,7 +3448,7 @@ sftp_conn_alloc_msg_id(struct sftp_conn *conn)
 }
 
 /* Mark `conn` as dead due to a non-recoverable I/O failure.  Public
- * accessor for HPN bundle code in sftp-client-hpn.c — same effect as
+ * accessor for HPN bundle code in sftp-hpn-client.c — same effect as
  * the direct `conn->hpn->dead = 1` assignment that used to live in
  * sftp_hpn_bundle_upload when it was in this file. */
 void

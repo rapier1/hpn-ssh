@@ -319,7 +319,7 @@ int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
  * transaction failed at the wire level (in which case every entry is
  * marked -1 and the caller should fall back to per-file downloads).
  *
- * Implementation lives in sftp-client-hpn.c.
+ * Implementation lives in sftp-hpn-client.c.
  */
 struct sftp_hpn_bundle_download_entry {
 	const char *remote_path;

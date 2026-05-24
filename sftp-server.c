@@ -48,7 +48,7 @@
 
 #include "sftp.h"
 #include "sftp-common.h"
-#include "sftp-server-hpn.h"
+#include "sftp-hpn-server.h"
 
 char *sftp_realpath(const char *, char *); /* sftp-realpath.c */
 
@@ -325,7 +325,7 @@ struct Handle {
 	uint64_t bytes_read, bytes_write;
 	int next_unused;
 	/* Phase 5: opaque ptr to struct hpn_bundle_state when use==HANDLE_BUNDLE.
-	 * NULL for HANDLE_FILE / HANDLE_DIR.  Owned by sftp-server-hpn.c. */
+	 * NULL for HANDLE_FILE / HANDLE_DIR.  Owned by sftp-hpn-server.c. */
 	void *bundle_opaque;
 };
 
@@ -374,7 +374,7 @@ handle_new(int use, const char *name, int fd, int flags, DIR *dirp)
 	return i;
 }
 
-/* ── BEGIN Phase 5: bundle handle helpers (called from sftp-server-hpn.c) */
+/* ── BEGIN Phase 5: bundle handle helpers (called from sftp-hpn-server.c) */
 int
 handle_new_bundle(void *opaque)
 {
@@ -854,8 +854,8 @@ process_close(uint32_t id)
 
 	debug3("request %u: close handle %u", id, handle);
 	/* Phase 5: bundle handles run libarchive extraction at close. */
-	if (sftp_server_hpn_is_bundle_handle(handle)) {
-		status = sftp_server_hpn_bundle_close(handle);
+	if (sftp_hpn_server_is_bundle_handle(handle)) {
+		status = sftp_hpn_server_bundle_close(handle);
 		send_status(id, status);
 		return;
 	}
@@ -885,7 +885,7 @@ process_read(uint32_t id)
 	/* Phase 5 (download bundling): READs on a fetch-mode bundle handle
 	 * return bytes from the pre-packed tar accumulator rather than
 	 * reading from an OS file descriptor. */
-	if (sftp_server_hpn_is_bundle_handle(handle)) {
+	if (sftp_hpn_server_is_bundle_handle(handle)) {
 		size_t got = 0;
 		if (len > SFTP_MAX_READ_LENGTH)
 			len = SFTP_MAX_READ_LENGTH;
@@ -894,7 +894,7 @@ process_read(uint32_t id)
 				fatal_f("realloc failed");
 			buflen = len;
 		}
-		status = sftp_server_hpn_bundle_read(handle, off, buf, len,
+		status = sftp_hpn_server_bundle_read(handle, off, buf, len,
 		    &got);
 		if (status == SSH2_FX_OK && got > 0)
 			send_data(id, buf, got);
@@ -960,8 +960,8 @@ process_write(uint32_t id)
 
 	/* Phase 5: bundle handles accumulate the WRITE data for later
 	 * libarchive extraction at close time. */
-	if (sftp_server_hpn_is_bundle_handle(handle)) {
-		status = sftp_server_hpn_bundle_write(handle, off, data, len);
+	if (sftp_hpn_server_is_bundle_handle(handle)) {
+		status = sftp_hpn_server_bundle_write(handle, off, data, len);
 		send_status(id, status);
 		free(data);
 		return;
@@ -1881,16 +1881,16 @@ process_extended_get_users_groups_by_id(uint32_t id)
 static void
 process_extended_hpn_fs_info(uint32_t id)
 {
-	sftp_server_hpn_dispatch(id, HPN_EXT_FS_INFO, iqueue, oqueue);
+	sftp_hpn_server_dispatch(id, HPN_EXT_FS_INFO, iqueue, oqueue);
 }
 
 #ifdef WITH_LIBARCHIVE
 /* Phase 5: hpn-bundle-open@hpnssh.org dispatch wrapper.  The real
- * implementation lives in sftp-server-hpn.c. */
+ * implementation lives in sftp-hpn-server.c. */
 static void
 process_extended_hpn_bundle_open(uint32_t id)
 {
-	sftp_server_hpn_dispatch(id, HPN_EXT_BUNDLE_OPEN, iqueue, oqueue);
+	sftp_hpn_server_dispatch(id, HPN_EXT_BUNDLE_OPEN, iqueue, oqueue);
 }
 
 /* Phase 5: capability-only advertisement.  Clients never send a request
@@ -1910,11 +1910,11 @@ process_extended_hpn_bundle_cap(uint32_t id)
  * packs into a tar buffer via libarchive write, allocates a bundle handle
  * holding the buffer, replies with SSH_FXP_HANDLE.  Client then drains via
  * SSH_FXP_READ (process_read routes bundle-handle reads to
- * sftp_server_hpn_bundle_read) and closes the handle when done. */
+ * sftp_hpn_server_bundle_read) and closes the handle when done. */
 static void
 process_extended_hpn_bundle_fetch(uint32_t id)
 {
-	sftp_server_hpn_dispatch(id, HPN_EXT_BUNDLE_FETCH, iqueue, oqueue);
+	sftp_hpn_server_dispatch(id, HPN_EXT_BUNDLE_FETCH, iqueue, oqueue);
 }
 #endif /* WITH_LIBARCHIVE */
 

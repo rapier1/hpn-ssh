@@ -136,7 +136,7 @@ SSHD_SESSION_OBJS=sshd-session.o auth-rhosts.o auth-passwd.o \
 	monitor.o monitor_wrap.o auth-krb5.o \
 	auth2-gss.o gss-serv.o gss-serv-krb5.o \
 	loginrec.o auth-pam.o auth-shadow.o auth-sia.o \
-	sftp-server.o sftp-server-hpn.o sftp-common.o \
+	sftp-server.o sftp-hpn-server.o sftp-common.o \
 	uidswap.o platform-listen.o cipher-switch.o $(P11OBJS) $(SKOBJS)
 
 SSHD_AUTH_OBJS=sshd-auth.o \
@@ -151,10 +151,10 @@ SSHD_AUTH_OBJS=sshd-auth.o \
 	loginrec.o auth-pam.o auth-shadow.o auth-sia.o \
 	sandbox-null.o sandbox-rlimit.o sandbox-darwin.o \
 	sandbox-seccomp-filter.o sandbox-capsicum.o  sandbox-solaris.o \
-	sftp-server.o sftp-server-hpn.o sftp-common.o \
+	sftp-server.o sftp-hpn-server.o sftp-common.o \
 	uidswap.o cipher-switch.o $(P11OBJS) $(SKOBJS)
 
-SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-client-hpn.o sftp-glob.o ssherr-nolibcrypto.o
+SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-glob.o ssherr-nolibcrypto.o
 
 SCP_OBJS=	scp.o progressmeter.o $(SFTP_CLIENT_OBJS)
 
@@ -172,11 +172,11 @@ SKHELPER_OBJS=	ssh-sk-helper.o ssh-sk.o sk-usbhid.o ssherr-nolibcrypto.o
 
 SSHKEYSCAN_OBJS=ssh-keyscan.o $(P11OBJS) $(SKOBJS)
 
-SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-server-hpn.o sftp-server-main.o ssherr-nolibcrypto.o
+SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-hpn-server.o sftp-server-main.o ssherr-nolibcrypto.o
 
 SFTP_OBJS=	sftp.o sftp-usergroup.o progressmeter.o $(SFTP_CLIENT_OBJS) \
-		sftp-workqueue.o sftp-parallel.o sftp-parallel-config.o \
-		readconf.o $(P11OBJS) $(SKOBJS)
+		sftp-workqueue.o sftp-parallel.o sftp-parallel-walk.o \
+		sftp-parallel-config.o readconf.o $(P11OBJS) $(SKOBJS)
 
 MANPAGES	= hpnmoduli.5.out hpnscp.1.out hpnssh-add.1.out hpnssh-agent.1.out hpnssh-keygen.1.out hpnssh-keyscan.1.out hpnssh.1.out hpnsshd.8.out hpnsftp-server.8.out hpnsftp.1.out hpnssh-keysign.8.out hpnssh-pkcs11-helper.8.out hpnssh-sk-helper.8.out hpnsshd_config.5.out hpnssh_config.5.out
 MANPAGES_IN	= hpnmoduli.5 hpnscp.1 hpnssh-add.1 hpnssh-agent.1 hpnssh-keygen.1 hpnssh-keyscan.1 hpnssh.1 hpnsshd.8 hpnsftp-server.8 hpnsftp.1 hpnssh-keysign.8 hpnssh-pkcs11-helper.8 hpnssh-sk-helper.8 hpnsshd_config.5 hpnssh_config.5

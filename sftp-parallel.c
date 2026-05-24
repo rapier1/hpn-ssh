@@ -863,7 +863,7 @@ free_unit(struct sftp_work_unit *u)
 }
 
 /* Forward decl — hpn_strlist_append is defined below this point but
- * walker_record_failure (defined here) needs it.  Avoids reordering
+ * sftp_parallel_walker_record_failure (defined here) needs it.  Avoids reordering
  * the file. */
 static void hpn_strlist_append(struct hpn_strlist *l, const char *s);
 
@@ -913,9 +913,13 @@ worker_record_failed_path(struct sftp_parallel *p,
  * NULL when no errno-style message is available (e.g. depth limit,
  * "not a directory").  Single-call helper because every walker
  * skip-on-error site does both — bump + list.
+ *
+ * Public (declared in sftp-parallel.h) so the walkers in
+ * sftp-parallel-walk.c can call it without seeing struct
+ * sftp_parallel's internals.
  */
-static void
-walker_record_failure(struct sftp_parallel *p, const char *path,
+void
+sftp_parallel_walker_record_failure(struct sftp_parallel *p, const char *path,
     const char *err)
 {
 	char buf[PATH_MAX + 256];
@@ -4199,271 +4203,29 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	    file_size, mode));
 }
 
-static int
-parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int depth)
+
+/* ----------------------------------------------------------------
+ * Read-only accessors for walker-helper fields.  Exposed so the
+ * recursive walkers in sftp-parallel-walk.c can read config and
+ * abort state without seeing struct sftp_parallel's internals.
+ * ---------------------------------------------------------------- */
+
+int
+sftp_parallel_preserve_flag(const struct sftp_parallel *p)
 {
-	int created = 0, ret = 0;
-	DIR *dirp;
-	struct dirent *dp;
-	char *new_src = NULL, *new_dst = NULL;
-	struct stat sb;
-	Attrib a, dirattrib;
-	uint32_t saved_perm;
-	int preserve_flag = p->cfg.preserve_flag;
-	int follow_link_flag = p->cfg.follow_link_flag;
-
-	if (depth >= PARALLEL_MAX_DIR_DEPTH) {
-		error("Maximum directory depth exceeded: %d levels", depth);
-		walker_record_failure(p, src, "max directory depth exceeded");
-		return -1;
-	}
-	if (stat(src, &sb) == -1) {
-		error("stat local \"%s\": %s", src, strerror(errno));
-		walker_record_failure(p, src, strerror(errno));
-		return -1;
-	}
-	if (!S_ISDIR(sb.st_mode)) {
-		error("\"%s\" is not a directory", src);
-		walker_record_failure(p, src, "not a directory");
-		return -1;
-	}
-
-	stat_to_attrib(&sb, &a);
-	a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
-	a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
-	a.perm &= 01777;
-	if (!preserve_flag)
-		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-	saved_perm = a.perm;
-	a.perm |= (S_IWUSR|S_IXUSR);
-	if (sftp_mkdir(conn, dst, &a, 0) == 0) {
-		created = 1;
-	} else {
-		if (sftp_stat(conn, dst, 0, &dirattrib) != 0)
-			return -1;
-		if (!S_ISDIR(dirattrib.perm)) {
-			error("\"%s\" exists but is not a directory", dst);
-			return -1;
-		}
-	}
-	a.perm = saved_perm;
-
-	if ((dirp = opendir(src)) == NULL) {
-		error("local opendir \"%s\": %s", src, strerror(errno));
-		walker_record_failure(p, src, strerror(errno));
-		return -1;
-	}
-	while (((dp = readdir(dirp)) != NULL) && !p->abort_flag) {
-		const char *filename = dp->d_name;
-		if (dp->d_ino == 0) {
-			/* Filesystem race / oddity (entry marked in-use but
-			 * has no inode).  Skip; not user data. */
-			debug_f("skipping \"%s/%s\" with d_ino == 0",
-			    src, filename);
-			continue;
-		}
-		if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0)
-			continue;
-		free(new_dst); free(new_src);
-		new_dst = sftp_path_append(dst, filename);
-		new_src = sftp_path_append(src, filename);
-
-		if (lstat(new_src, &sb) == -1) {
-			error("local lstat \"%s\": %s", new_src,
-			    strerror(errno));
-			walker_record_failure(p, new_src, strerror(errno));
-			ret = -1;
-			continue;
-		}
-		if (S_ISLNK(sb.st_mode)) {
-			if (!follow_link_flag) {
-				/* Skipping symlink is the user's explicit
-				 * choice (no -L); not a loss. */
-				logit("%s: not a regular file", filename);
-				continue;
-			}
-			if (stat(new_src, &sb) == -1) {
-				error("local stat \"%s\": %s", new_src,
-				    strerror(errno));
-				walker_record_failure(p, new_src,
-				    strerror(errno));
-				ret = -1;
-				continue;
-			}
-		}
-		if (S_ISDIR(sb.st_mode)) {
-			if (parallel_upload_walk(p, conn, new_src, new_dst,
-			    depth + 1) == -1)
-				ret = -1;
-		} else if (S_ISREG(sb.st_mode)) {
-			if (maybe_submit_upload(p, conn, new_src, new_dst,
-			    sb.st_size, sb.st_mode) != 0) {
-				error("submit \"%s\" -> \"%s\" failed",
-				    new_src, new_dst);
-				walker_record_failure(p, new_src,
-				    "submit failed");
-				ret = -1;
-			}
-		} else {
-			/* Non-regular file (socket / fifo / device): SFTP
-			 * cannot transfer these.  By-design skip; not a
-			 * loss of user data. */
-			logit("%s: not a regular file", filename);
-		}
-	}
-	free(new_dst);
-	free(new_src);
-
-	if (created || preserve_flag)
-		sftp_setstat(conn, dst, &a);
-
-	(void)closedir(dirp);
-	return ret;
+	return (p != NULL) ? p->cfg.preserve_flag : 0;
 }
 
 int
-sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int print_flag)
+sftp_parallel_follow_link_flag(const struct sftp_parallel *p)
 {
-	if (p == NULL || conn == NULL || src == NULL || dst == NULL) {
-		errno = EINVAL;
-		return -1;
-	}
-	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Entering %s\n", src);
-	return parallel_upload_walk(p, conn, src, dst, 0);
-}
-
-static int
-parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int depth, Attrib *dirattrib)
-{
-	int i, ret = 0;
-	SFTP_DIRENT **dir_entries;
-	char *new_src = NULL, *new_dst = NULL;
-	mode_t mode = 0777, tmpmode = mode;
-	Attrib *a, ldirattrib, lsym;
-	int preserve_flag = p->cfg.preserve_flag;
-	int follow_link_flag = p->cfg.follow_link_flag;
-
-	if (depth >= PARALLEL_MAX_DIR_DEPTH) {
-		error("Maximum directory depth exceeded: %d levels", depth);
-		walker_record_failure(p, src, "max directory depth exceeded");
-		return -1;
-	}
-	if (dirattrib == NULL) {
-		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
-			error("stat remote \"%s\" directory failed", src);
-			walker_record_failure(p, src, "remote stat failed");
-			return -1;
-		}
-		dirattrib = &ldirattrib;
-	}
-	if (!S_ISDIR(dirattrib->perm)) {
-		error("\"%s\" is not a directory", src);
-		walker_record_failure(p, src, "not a directory");
-		return -1;
-	}
-	if (dirattrib->flags & SSH2_FILEXFER_ATTR_PERMISSIONS) {
-		mode = dirattrib->perm & 01777;
-		tmpmode = mode | (S_IWUSR|S_IXUSR);
-	}
-	if (mkdir(dst, tmpmode) == -1 && errno != EEXIST) {
-		error("mkdir %s: %s", dst, strerror(errno));
-		walker_record_failure(p, dst, strerror(errno));
-		return -1;
-	}
-	if (sftp_readdir(conn, src, &dir_entries) == -1) {
-		error("remote readdir \"%s\" failed", src);
-		walker_record_failure(p, src, "remote readdir failed");
-		return -1;
-	}
-
-	for (i = 0; dir_entries[i] != NULL && !p->abort_flag; i++) {
-		const char *filename = dir_entries[i]->filename;
-		free(new_dst); free(new_src);
-		new_dst = sftp_path_append(dst, filename);
-		new_src = sftp_path_append(src, filename);
-		a = &dir_entries[i]->a;
-
-		if (S_ISLNK(a->perm)) {
-			if (!follow_link_flag) {
-				/* Skipping symlink is the user's explicit
-				 * choice (no -L); not a loss. */
-				logit("download \"%s\": not a regular file",
-				    new_src);
-				continue;
-			}
-			if (sftp_stat(conn, new_src, 1, &lsym) != 0) {
-				error("remote stat \"%s\" failed", new_src);
-				walker_record_failure(p, new_src,
-				    "remote stat failed");
-				ret = -1;
-				continue;
-			}
-			a = &lsym;
-		}
-
-		if (S_ISDIR(a->perm)) {
-			if (strcmp(filename, ".") == 0 ||
-			    strcmp(filename, "..") == 0)
-				continue;
-			if (parallel_download_walk(p, conn, new_src, new_dst,
-			    depth + 1, a) == -1)
-				ret = -1;
-		} else if (S_ISREG(a->perm)) {
-			off_t fsize = (a->flags & SSH2_FILEXFER_ATTR_SIZE) ?
-			    (off_t)a->size : 0;
-			mode_t fmode = (a->flags &
-			    SSH2_FILEXFER_ATTR_PERMISSIONS) ?
-			    (a->perm & 07777) : 0644;
-			if (sftp_parallel_submit_download(p, conn,
-			    new_src, new_dst, fsize, fmode) != 0) {
-				error("submit download \"%s\" -> \"%s\" failed",
-				    new_src, new_dst);
-				walker_record_failure(p, new_src,
-				    "submit failed");
-				ret = -1;
-			}
-		} else {
-			/* Non-regular remote entry: SFTP cannot transfer
-			 * these.  By-design skip; not a loss of user data. */
-			logit("download \"%s\": not a regular file", new_src);
-		}
-	}
-	free(new_dst);
-	free(new_src);
-
-	if (preserve_flag &&
-	    (dirattrib->flags & SSH2_FILEXFER_ATTR_ACMODTIME)) {
-		struct timeval tv[2];
-		tv[0].tv_sec = dirattrib->atime;
-		tv[1].tv_sec = dirattrib->mtime;
-		tv[0].tv_usec = tv[1].tv_usec = 0;
-		if (utimes(dst, tv) == -1)
-			error("local set times on \"%s\": %s",
-			    dst, strerror(errno));
-	}
-	if (mode != tmpmode && chmod(dst, mode) == -1)
-		error("local chmod directory \"%s\": %s",
-		    dst, strerror(errno));
-
-	sftp_free_dirents(dir_entries);
-	return ret;
+	return (p != NULL) ? p->cfg.follow_link_flag : 0;
 }
 
 int
-sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int print_flag)
+sftp_parallel_is_aborting(const struct sftp_parallel *p)
 {
-	if (p == NULL || conn == NULL || src == NULL || dst == NULL) {
-		errno = EINVAL;
-		return -1;
-	}
-	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Retrieving %s\n", src);
-	return parallel_download_walk(p, conn, src, dst, 0, NULL);
+	return (p != NULL) ? p->abort_flag : 0;
 }
 
 /* ---------- Stats accessor (programmatic observability) ---------- */

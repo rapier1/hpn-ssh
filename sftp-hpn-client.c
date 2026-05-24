@@ -1,5 +1,5 @@
 /*
- * sftp-client-hpn.c — HPN-SSH extensions to the SFTP client connection.
+ * sftp-hpn-client.c — HPN-SSH extensions to the SFTP client connection.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Isolating HPN-specific logic here keeps sftp-client.c's diff against
@@ -29,7 +29,7 @@
 
 #include "xmalloc.h"
 #include "log.h"
-#include "sftp-client-hpn.h"
+#include "sftp-hpn-client.h"
 
 #ifdef HPN_FAULT_INJECTION
 static struct {
@@ -292,7 +292,7 @@ sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
 #include "sftp-client.h"
 #include "sftp-client-internal.h"
 
-/* Mirror of HPN_BUNDLE_FLAG_* in sftp-client.c / sftp-server-hpn.c.
+/* Mirror of HPN_BUNDLE_FLAG_* in sftp-client.c / sftp-hpn-server.c.
  * Only PRESERVE has meaning on the fetch path today (mtime/perm in tar
  * headers are honoured at extract time when set). */
 #define HPN_BUNDLE_FETCH_FLAG_PRESERVE   0x00000001U
@@ -776,7 +776,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 #else  /* WITH_LIBARCHIVE */
 
 /* Bundle flags carried in the SSH_FXP_EXTENDED open request.  Mirror
- * the constants in sftp-server-hpn.c — must match the server side. */
+ * the constants in sftp-hpn-server.c — must match the server side. */
 #define HPN_BUNDLE_FLAG_PRESERVE   0x00000001U
 #define HPN_BUNDLE_FLAG_FSYNC      0x00000002U
 

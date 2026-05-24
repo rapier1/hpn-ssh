@@ -1,5 +1,5 @@
 /* sftp-client-internal.h — narrow internal API exposed by sftp-client.c
- * to HPN-only client files (sftp-client-hpn.c).
+ * to HPN-only client files (sftp-hpn-client.c).
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * It exists so HPN extension code can implement new SFTP wire
