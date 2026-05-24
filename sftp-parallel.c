@@ -315,39 +315,84 @@ enum sftp_op {
 	SFTP_OP_DOWNLOAD_RANGE,	/* download a byte range of a large file */
 };
 
-/*
- * Per-file completion tracker shared across the N range work units that
- * make up a single SFTP_OP_DOWNLOAD_RANGE or SFTP_OP_UPLOAD_RANGE
- * transfer.  Detects partial-range failure: if even one range gives up
- * permanently after retries, the pre-allocated file is silently corrupt
- * (some range offsets contain the just-written bytes, others contain
- * zeros from the pre-allocation).  Without this tracker the user has no
- * way to know — the file exists at the expected size with no error
+/* ── Per-file range-completion tracker ────────────────────────────────
+ *
+ * Shared across the N range work units that make up a single
+ * SFTP_OP_DOWNLOAD_RANGE or SFTP_OP_UPLOAD_RANGE transfer.  Detects
+ * partial-range failure: if even one range gives up permanently after
+ * retries, the pre-allocated file is silently corrupt (some range
+ * offsets contain the just-written bytes, others contain zeros from
+ * the pre-allocation).  Without this tracker the user has no way to
+ * know — the file exists at the expected size with no error
  * indicator.
  *
- * Each range unit holds a pointer to the same tracker.  On every range's
- * final completion (success OR give-up, NOT retry), the tracker is
- * decremented under its mutex.  The thread that drops `remaining` to 0
- * is the LAST completer; if `any_failed` is set at that point it
- * removes the corrupt file (unlink() for local, sftp_unlink() for
- * remote) and logs the corruption event.
+ * Protocol (last-completer-frees):
+ *   range_tracker_new returns a heap-allocated tracker with
+ *   remaining=total and any_failed=0.  Caller stores its pointer on
+ *   each of the N range work units' u->range_tracker field at submit
+ *   time.
  *
- * Ownership: the LAST completer frees the tracker.  The shared pointer
- * in each work_unit is read-only after submit; only the mutex-protected
- * counters change.
+ *   range_tracker_finalize is called EXACTLY ONCE per range unit on
+ *   the unit's FINAL completion — success OR permanent give-up.
+ *   NEVER on a retry (the unit isn't done yet).  The function takes
+ *   the mutex, sets any_failed on give-up, decrements remaining.
+ *   Exactly one caller sees remaining transition to 0; that caller
+ *   does the post-mortem cleanup (unlink corrupt file if any_failed,
+ *   destroy the mutex, free the tracker) and is the LAST owner.
+ *
+ *   Other callers see remaining > 0 after their decrement and return
+ *   without touching the struct further — by design, they cannot
+ *   race with the last completer's cleanup because the mutex was
+ *   released before any of them returned.
+ *
+ * Invariants the caller MUST uphold:
+ *
+ *   (I1) Exactly `total` finalize calls per tracker, no more, no less.
+ *        Over-calling drives remaining negative (undefined: free-after-
+ *        free, double-unlink).  Under-calling leaks the tracker AND
+ *        leaves the corrupt file in place.
+ *
+ *   (I2) Finalize fires on FINAL completion only.  On retry, the
+ *        unit goes back on the workqueue and finalize must NOT be
+ *        called yet — wait until the next attempt resolves.
+ *
+ *   (I3) After ANY thread's finalize returns 0, that thread must
+ *        treat its u->range_tracker pointer as dead — another caller
+ *        may have been the last completer in the meantime and freed
+ *        the struct.  Don't deref.  (In practice this is automatic:
+ *        the work unit itself is freed right after finalize in
+ *        worker_process_result / worker_give_up_unit, so the dead
+ *        pointer is unreachable.)
+ *
+ *   (I4) Worker context `w` is required only when target=REMOTE and
+ *        any_failed=1 (we need w->conn to sftp_rm the corrupt remote
+ *        file).  Pass NULL for LOCAL targets or when no worker
+ *        context exists (e.g., synthesised finalize during a submit
+ *        failure in submit_*_ranges).
+ *
+ *   (I5) range_tracker_finalize(NULL, ...) is a no-op.  Non-range
+ *        work units have u->range_tracker == NULL; that's the
+ *        intended representation.
+ *
+ * Memory:
+ *   - tracker struct itself: xcalloc'd in new, freed by last completer
+ *   - t->path: xstrdup'd in new, freed alongside the struct
+ *   - t->mu: pthread_mutex_init'd in new, destroyed by last completer
  */
 enum sftp_range_target {
 	SFTP_RANGE_TARGET_LOCAL,   /* unlink() at finalize */
-	SFTP_RANGE_TARGET_REMOTE,  /* sftp_unlink() via worker conn */
+	SFTP_RANGE_TARGET_REMOTE,  /* sftp_rm()  at finalize via worker conn */
 };
 
 struct sftp_range_tracker {
-	pthread_mutex_t        mu;
-	int                    total;
-	int                    remaining;
-	int                    any_failed;
+	pthread_mutex_t        mu;         /* serialises decrement + cleanup */
+	int                    total;      /* original range count (immutable
+					    * after new; for diagnostics) */
+	int                    remaining;  /* finalize calls still owed */
+	int                    any_failed; /* sticky: 1 if any range failed */
 	enum sftp_range_target target;
-	char                  *path;  /* local OR remote path of corrupt file */
+	char                  *path;       /* local OR remote path of corrupt
+					    * file (xstrdup'd in new) */
 };
 
 struct sftp_work_unit {
@@ -1082,20 +1127,23 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path)
 }
 
 /*
- * Called on the FINAL completion of a single range unit (success or
- * permanent give-up — NOT on a retry).  `failed` is 1 if this range
- * gave up after MAX_RETRIES, 0 if it succeeded.
+ * One range's final completion: `failed` = 1 on permanent give-up
+ * (after MAX_RETRIES) or 0 on success.  Must be called exactly once
+ * per range unit, on its final outcome only — see invariants (I1)
+ * and (I2) at struct sftp_range_tracker.
  *
- * `w` is the worker reporting completion.  Used only when target is
- * REMOTE and the file needs to be unlinked on the server (we need
- * w->conn for the SFTP_FXP_REMOVE).  May be NULL for LOCAL targets.
+ * `w` is the worker reporting completion; used only for sftp_rm on
+ * REMOTE-target trackers when the corrupt-file cleanup fires.  May
+ * be NULL otherwise (I4).
  *
- * Returns 1 if this completion was the last range for the file AND any
- * range failed (caller knows the corrupt file was removed); returns 0
- * otherwise.  The return value is informational — removal happens
- * inside this function regardless.
+ * Returns 1 if THIS call was the last-completer AND any range
+ * failed (informational — the cleanup happened inside this call
+ * regardless).  Returns 0 otherwise.
  *
- * Frees the tracker when remaining hits 0.
+ * Tracker is freed when remaining hits 0; callers that saw a 0
+ * return value have a dead pointer and must not deref it (I3).
+ *
+ * No-op on NULL t (I5).
  */
 static int
 range_tracker_finalize(struct sftp_range_tracker *t, int failed,
