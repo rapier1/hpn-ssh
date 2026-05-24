@@ -59,7 +59,34 @@
 extern int showprogress;
 
 #define WORK_QUEUE_DEPTH(N)     ((size_t)((N) * UPLOAD_BATCH_SIZE * 4 + UPLOAD_BATCH_SIZE))
-#define MAX_RETRIES             3
+
+/* Retry budget per work unit.  Default 3 attempts (initial + 2 retries).
+ *
+ * Configured via ssh_config HPNMaxRetries (parsed by readconf.c into
+ * options.hpn_max_retries, then copied to pcfg->max_retries by
+ * sftp-parallel-config.c).  Clamped to [1, 20] at the readconf layer:
+ *   - 1 = no retries (one attempt total).  Useful for diagnosing
+ *     transient-vs-permanent failures: every failure is final.
+ *   - 3 = default.  Covers ordinary network hiccups; doesn't punish
+ *     permanent failures (permission denied, disk full) with much
+ *     wasted retry time.
+ *   - 20 = upper bound.  For demonstrably flaky networks where the
+ *     transport layer hasn't yet self-recovered.  Above this the
+ *     retry storm itself becomes the load problem.
+ *
+ * HPN_MAX_RETRIES env var overrides the config option for ad-hoc
+ * testing without editing ssh_config.  Same [1, 20] clamp.
+ */
+#define HPN_MAX_RETRIES_DEFAULT 3
+#define HPN_MAX_RETRIES_MIN     1
+#define HPN_MAX_RETRIES_MAX     20
+
+/* hpn_max_retries() definition is later in this file — struct
+ * sftp_parallel is opaque here.  Forward declaration so callers
+ * earlier than the struct definition can still resolve the symbol. */
+struct sftp_parallel;
+static int hpn_max_retries(struct sftp_parallel *p);
+
 #define REPORTER_TICK_MS        200
 #define DEFAULT_TRANSFER_BUFLEN 131072	/* 128 KB; matches sftp-client.c */
 #define DEFAULT_NUM_REQUESTS    1024	/* 128 KB * 1024 = 128 MB in-flight per stream */
@@ -1219,6 +1246,34 @@ worker_record_start(struct sftp_worker *w)
 	pthread_mutex_unlock(&w->mu);
 }
 
+/*
+ * Resolve the effective per-unit retry budget.  See the comment at the
+ * HPN_MAX_RETRIES_* defines near the top of this file for the full
+ * policy.  Definition lives here because struct sftp_parallel is
+ * opaque earlier in the file; the forward decl appears alongside the
+ * defines.
+ */
+static int
+hpn_max_retries(struct sftp_parallel *p)
+{
+	/* ENV-VAR HPN_MAX_RETRIES — developer override that takes
+	 * precedence over the HPNMaxRetries config option.  Clamped to
+	 * [1, 20]; out-of-range or unparseable values are ignored and
+	 * the config / default is used instead. */
+	const char *e = getenv("HPN_MAX_RETRIES");
+	if (e != NULL && *e != '\0') {
+		int parsed = atoi(e);
+		if (parsed >= HPN_MAX_RETRIES_MIN &&
+		    parsed <= HPN_MAX_RETRIES_MAX)
+			return parsed;
+	}
+	if (p != NULL &&
+	    p->cfg.max_retries >= HPN_MAX_RETRIES_MIN &&
+	    p->cfg.max_retries <= HPN_MAX_RETRIES_MAX)
+		return p->cfg.max_retries;
+	return HPN_MAX_RETRIES_DEFAULT;
+}
+
 static void
 worker_record_completion(struct sftp_worker *w, off_t bytes, int success)
 {
@@ -1404,7 +1459,7 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		 * completer for the file frees the tracker. */
 		(void)range_tracker_finalize(u->range_tracker, 0, w);
 		free_unit(u);
-	} else if (++u->attempt < MAX_RETRIES) {
+	} else if (++u->attempt < hpn_max_retries(p)) {
 		/* Re-queue without freeing. Keeps pending counter consistent. */
 		if (u->size > 0)
 			__atomic_fetch_add(&p->queued_bytes,
@@ -1456,7 +1511,7 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 		free_unit(u);
 		return;
 	}
-	if (++u->attempt < MAX_RETRIES) {
+	if (++u->attempt < hpn_max_retries(p)) {
 		__atomic_store_n(&w->live_bytes, 0, __ATOMIC_RELAXED);
 		if (u->size > 0)
 			__atomic_fetch_add(&p->queued_bytes,

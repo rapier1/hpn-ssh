@@ -63,6 +63,13 @@ struct sftp_parallel_config {
 	 * in the worker also disables, taking precedence over this. */
 	int          use_bundle;
 
+	/* Retry budget per work unit, resolved from ssh_config
+	 * HPNMaxRetries.  Default 3, clamped to [1, 20] by readconf.c
+	 * fill_default_options.  Worker code calls hpn_max_retries(p)
+	 * which lets HPN_MAX_RETRIES env var override this for ad-hoc
+	 * testing without touching config. */
+	int          max_retries;
+
 	/* Transfer flags applied to every submitted unit */
 	int          preserve_flag;
 	int          resume_flag;

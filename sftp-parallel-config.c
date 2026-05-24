@@ -112,8 +112,9 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	if (pcfg == NULL || host == NULL || *host == '\0')
 		return -1;
 
-	/* Sensible default if anything below fails: bundle enabled. */
-	pcfg->use_bundle = 1;
+	/* Sensible defaults if anything below fails. */
+	pcfg->use_bundle  = 1;
+	pcfg->max_retries = 3;
 
 	initialize_options(&options);
 	options.host_arg = xstrdup(host);
@@ -147,10 +148,11 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 
 	/* Map the resolved Options into pcfg.  Future ssh_config-promoted
 	 * options append additional assignments here. */
-	pcfg->use_bundle = (options.hpn_use_bundle != 0);
+	pcfg->use_bundle  = (options.hpn_use_bundle != 0);
+	pcfg->max_retries = options.hpn_max_retries;
 
-	debug_f("ssh_config: host=\"%s\" HPNUseBundle=%s",
-	    host, pcfg->use_bundle ? "yes" : "no");
+	debug_f("ssh_config: host=\"%s\" HPNUseBundle=%s HPNMaxRetries=%d",
+	    host, pcfg->use_bundle ? "yes" : "no", pcfg->max_retries);
 
 	free_options(&options);
 	return 0;

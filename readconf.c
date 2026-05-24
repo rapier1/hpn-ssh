@@ -159,6 +159,7 @@ typedef enum {
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
 	oTcpRcvBufPoll, oTcpRcvBufRescue, oHPNDisabled,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch, oHPNUseBundle,
+	oHPNMaxRetries,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oVisualHostKey,
@@ -300,6 +301,7 @@ static struct {
 	{ "nonemacenabled", oNoneMacEnabled },
 	{ "noneswitch", oNoneSwitch },
 	{ "hpnusebundle", oHPNUseBundle },
+	{ "hpnmaxretries", oHPNMaxRetries },
 	{ "usemptcp", oUseMPTCP},
 	{ "happyeyes", oHappyEyes },
 	{ "happydelay", oHappyDelay },
@@ -1375,6 +1377,10 @@ parse_time:
 	case oHPNUseBundle:
 		intptr = &options->hpn_use_bundle;
 		goto parse_flag;
+
+	case oHPNMaxRetries:
+		intptr = &options->hpn_max_retries;
+		goto parse_int;
 
 	case oUseMPTCP:
 		intptr = &options->use_mptcp;
@@ -2900,6 +2906,7 @@ initialize_options(Options * options)
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
 	options->hpn_use_bundle = -1;
+	options->hpn_max_retries = -1;
 	options->use_mptcp = -1;
 	options->use_happyeyes = -1;
 	options->happy_delay = -1;
@@ -3102,6 +3109,17 @@ fill_default_options(Options * options)
 		options->nonemac_enabled = 0;
 	if (options->hpn_use_bundle == -1)
 		options->hpn_use_bundle = 1;	/* default: yes */
+	if (options->hpn_max_retries == -1) {
+		options->hpn_max_retries = 3;	/* default: 3 attempts */
+	} else if (options->hpn_max_retries < 1) {
+		fprintf(stderr, "HPNMaxRetries %d is below the minimum (1); "
+		    "clamping to 1.\n", options->hpn_max_retries);
+		options->hpn_max_retries = 1;
+	} else if (options->hpn_max_retries > 20) {
+		fprintf(stderr, "HPNMaxRetries %d is above the maximum (20); "
+		    "clamping to 20.\n", options->hpn_max_retries);
+		options->hpn_max_retries = 20;
+	}
 	if (options->nonemac_enabled > 0 && (options->none_enabled == 0 ||
 					     options->none_switch == 0)) {
 		fprintf(stderr, "None MAC can only be used with the None cipher. None MAC disabled.\n");
@@ -3964,6 +3982,7 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oNoneEnabled, o->none_enabled);
 	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
 	dump_cfg_fmtint(oHPNUseBundle, o->hpn_use_bundle);
+	dump_cfg_int(oHPNMaxRetries, o->hpn_max_retries);
 	dump_cfg_fmtint(oFallback, o->fallback);
 	dump_cfg_fmtint(oMetrics, o->metrics);
 	dump_cfg_fmtint(oUseMPTCP, o->use_mptcp);

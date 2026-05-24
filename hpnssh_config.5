@@ -1140,6 +1140,28 @@ In some situations, such as transfers on a local area network, the impact
 of the HPN code produces a net decrease in performance. In these cases it is
 helpful to disable the HPN functionality. By default HPNDisabled is set to
 .Cm no. HPNSSH only.
+.It Cm HPNMaxRetries
+Sets the per-file retry budget used by
+.Xr hpnsftp 1
+when running with
+.Cm -j
+parallel streams. A failed transfer (transient transport error, server
+hiccup, etc.) is re-queued and retried up to this many times before
+the orchestrator gives up on the file and reports it in the final
+.Cm TRANSFER INCOMPLETE
+summary. Larger values tolerate flakier networks at the cost of more
+wasted time on permanent failures (permission denied, disk full, etc.).
+The argument must be an integer in the range
+.Cm 1
+through
+.Cm 20
+inclusive; values outside this range are clamped and a warning is
+emitted on standard error. The default is
+.Cm 3
+(one initial attempt plus two retries). Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
 .It Cm HPNUseBundle
 Controls whether
 .Xr hpnsftp 1
