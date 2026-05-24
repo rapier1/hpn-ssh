@@ -54,4 +54,12 @@ u_char *get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
  */
 u_int sftp_conn_alloc_msg_id(struct sftp_conn *conn);
 
+/*
+ * Mark a connection as dead due to a non-recoverable I/O failure.
+ * Subsequent send_msg / get_msg short-circuit.  Equivalent to the
+ * direct `conn->hpn->dead = 1` assignment that internal sftp-client.c
+ * code can do; HPN extension code uses this accessor instead.
+ */
+void sftp_conn_set_dead(struct sftp_conn *conn);
+
 #endif /* _SFTP_CLIENT_INTERNAL_H */

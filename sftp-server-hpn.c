@@ -154,6 +154,11 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 		return 0;
 	}
 	while (fgets(line, sizeof(line), f) != NULL) {
+		/* Keep as `unsigned long long` to match the %llu format
+		 * specifier — sscanf is strict about the underlying type
+		 * (u_int64_t is `unsigned long int` on LP64 Linux, not
+		 * `unsigned long long`).  Same exception as the printf cast
+		 * idiom — format-spec matching wins over typedef preference. */
 		unsigned long long v = 0;
 		if (sscanf(line, " stripe_count: %llu", &v) == 1 ||
 		    sscanf(line, " lmm_stripe_count: %llu", &v) == 1) {
@@ -275,7 +280,10 @@ static size_t bundle_total_cap = 0;
 static size_t bundle_total_bytes = 0; /* sum of accum_cap across open handles */
 
 /* Parse env_var as a byte count; honours K/M/G suffix.  Returns fallback
- * if unset, empty, or unparseable. */
+ * if unset, empty, unparseable, or if the value would overflow when
+ * multiplied by the suffix.  The overflow guard is intentional: the
+ * env var is operator-controlled, so a typo like 9999999999G should
+ * fall back to the default rather than wrap to a bogus small value. */
 static size_t
 parse_bytes_env(const char *env_var, size_t fallback)
 {
@@ -283,16 +291,22 @@ parse_bytes_env(const char *env_var, size_t fallback)
 	if (v == NULL || *v == '\0')
 		return fallback;
 	char *end = NULL;
-	unsigned long long n = strtoull(v, &end, 10);
+	u_int64_t n = strtoull(v, &end, 10);
+	u_int64_t mult = 1;
 	if (end == v)
 		return fallback;
 	switch (*end) {
-	case 'G': case 'g': n *= 1024ULL * 1024 * 1024; break;
-	case 'M': case 'm': n *= 1024ULL * 1024;        break;
-	case 'K': case 'k': n *= 1024ULL;               break;
-	case '\0':                                       break;
+	case 'G': case 'g': mult = 1024ULL * 1024 * 1024; break;
+	case 'M': case 'm': mult = 1024ULL * 1024;        break;
+	case 'K': case 'k': mult = 1024ULL;               break;
+	case '\0':                                         break;
 	default: return fallback;
 	}
+	/* Overflow check BEFORE multiplying.  If n > SIZE_MAX / mult, the
+	 * multiplication would wrap. */
+	if (mult > 1 && n > (u_int64_t)SIZE_MAX / mult)
+		return fallback;
+	n *= mult;
 	if (n == 0 || n > SIZE_MAX)
 		return fallback;
 	return (size_t)n;

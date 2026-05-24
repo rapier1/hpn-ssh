@@ -47,9 +47,9 @@ struct sftp_parallel_config {
 	char *const *extra_argv;        /* additional -o KEY=VALUE; may be NULL */
 
 	/* Per-worker sftp_init parameters */
-	unsigned int transfer_buflen;   /* 0 = default */
-	unsigned int num_requests;      /* 0 = default */
-	uint64_t     limit_kbps;        /* 0 = no bandwidth limit */
+	u_int    transfer_buflen;       /* 0 = default */
+	u_int    num_requests;          /* 0 = default */
+	uint64_t limit_kbps;            /* 0 = no bandwidth limit */
 
 	/* CLI-set range-split minimum, in MiB.  0 = unset (env or default
 	 * applies).  Set by -M flag in sftp.c; bounded [64, 10240] at parse

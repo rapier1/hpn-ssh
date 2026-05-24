@@ -273,7 +273,7 @@ int sftp_upload_batch_finish(struct sftp_conn *conn,
  * protocol and architectural notes.
  */
 
-struct sftp_upload_bundle_entry {
+struct sftp_hpn_bundle_upload_entry {
 	const char *local_path;
 	const char *remote_path;   /* relative path inside the bundle dest */
 	int         result;        /* 0 = ok; -1 = failed (set by function) */
@@ -297,9 +297,9 @@ struct sftp_upload_bundle_entry {
  * Returns -1 immediately if conn does not advertise hpn-bundle support.
  * Caller must detect this and fall back to per-file mode.
  */
-int sftp_upload_bundle(struct sftp_conn *conn,
+int sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
-    struct sftp_upload_bundle_entry *entries, int n,
+    struct sftp_hpn_bundle_upload_entry *entries, int n,
     int preserve_flag, int fsync_flag);
 
 /* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
@@ -309,7 +309,7 @@ int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
 int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
 
 /*
- * Download-side counterpart of sftp_upload_bundle.  Asks the server to
+ * Download-side counterpart of sftp_hpn_bundle_upload.  Asks the server to
  * pack the listed `entries[].remote_path` files into a single tar stream,
  * then untars locally into each `entries[].local_path`.  Per-entry result
  * codes are written into entries[i].result (0 = ok, -1 = skipped/failed).
@@ -321,14 +321,14 @@ int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
  *
  * Implementation lives in sftp-client-hpn.c.
  */
-struct sftp_download_bundle_entry {
+struct sftp_hpn_bundle_download_entry {
 	const char *remote_path;
 	const char *local_path;
 	int         result;
 };
 
-int sftp_bundle_download(struct sftp_conn *conn,
-    struct sftp_download_bundle_entry *entries, int n,
+int sftp_hpn_bundle_download(struct sftp_conn *conn,
+    struct sftp_hpn_bundle_download_entry *entries, int n,
     int preserve_flag);
 
 /* ── END Phase 5 ─────────────────────────────────────────────────────────*/

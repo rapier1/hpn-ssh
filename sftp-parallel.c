@@ -104,7 +104,7 @@ extern int showprogress;
  * environment AND the server advertised hpn-bundle support), the worker
  * collects upload batches up to BUNDLE_TARGET_BYTES instead of
  * UPLOAD_BATCH_BYTE_CAP, then dispatches them as a single tar stream via
- * sftp_upload_bundle.  The smaller target produces many small bundles
+ * sftp_hpn_bundle_upload.  The smaller target produces many small bundles
  * that compose well with parallel streams — each worker can have a
  * different bundle in flight, the way each worker has a different batch
  * in flight in the non-bundle path.
@@ -486,7 +486,7 @@ struct sftp_worker {
 	 *   HPN_USE_BUNDLE=1 in the environment AND
 	 *   sftp_conn_has_hpn_bundle(w->conn) is true.
 	 * When set, the worker collects upload batches to bundle_target_bytes
-	 * and dispatches them via sftp_upload_bundle instead of
+	 * and dispatches them via sftp_hpn_bundle_upload instead of
 	 * sftp_upload_batch / sftp_upload_batch_send.  No interaction with
 	 * the pipelined-batch state above — bundle and pipelined paths are
 	 * mutually exclusive per worker. */
@@ -1228,6 +1228,67 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	return rc;
 }
 
+/*
+ * Permanent give-up of a work unit after MAX_RETRIES.  Snapshots the
+ * cause from the TLS-captured most-recent ERROR log BEFORE the give-up
+ * log clobbers it, then does all the bookkeeping in one place:
+ *   - log give-up at error level
+ *   - record per-worker completion as failure
+ *   - decrement orchestrator pending counter
+ *   - finalize range tracker (NULL-safe; only meaningful for range units)
+ *   - append path + cause to failed-paths list
+ *   - free the unit
+ *
+ * `log_prefix` distinguishes the caller in the give-up log ("unit" for
+ * single-unit dispatch, "batch unit" for pipelined-batch).  `trace_tag`
+ * is the pending-trace tag string.
+ */
+static void
+worker_give_up_unit(struct sftp_parallel *p, struct sftp_worker *w,
+    struct sftp_work_unit *u, const char *log_prefix,
+    const char *trace_tag)
+{
+	char        cause[256];
+	const char *captured = hpn_get_last_error();
+
+	strlcpy(cause,
+	    (captured && *captured) ? captured : "(no error captured)",
+	    sizeof(cause));
+
+	error_f("worker %d: %s failed after %d attempts: %s",
+	    w->id, log_prefix, u->attempt,
+	    u->src_path ? u->src_path : "(null)");
+	worker_record_completion(w, 0, 0);
+	pending_dec_traced(p, u, w->id, trace_tag);
+	(void)range_tracker_finalize(u->range_tracker, 1, w);
+	worker_record_failed_path(p, u, cause);
+	free_unit(u);
+}
+
+/*
+ * Push-fail give-up: the workqueue refused our retry submission
+ * (shutdown in progress), so this unit can never run.  Same bookkeeping
+ * as worker_give_up_unit but with an explicit cause string ("queue
+ * shutdown") and no give-up log line — the push-fail itself is the
+ * diagnostic.
+ *
+ * Caller must have already failed sftp_workqueue_push BEFORE calling
+ * this; we just clean up.
+ */
+static void
+worker_give_up_pushfail(struct sftp_parallel *p, struct sftp_worker *w,
+    struct sftp_work_unit *u, const char *trace_tag)
+{
+	if (u->size > 0)
+		__atomic_fetch_sub(&p->queued_bytes,
+		    (uint64_t)u->size, __ATOMIC_RELAXED);
+	worker_record_completion(w, 0, 0);
+	pending_dec_traced(p, u, w->id, trace_tag);
+	(void)range_tracker_finalize(u->range_tracker, 1, w);
+	worker_record_failed_path(p, u, "queue shutdown");
+	free_unit(u);
+}
+
 /* Handle the result of executing a single work unit (retry or completion). */
 static void
 worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
@@ -1248,40 +1309,10 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 			    (uint64_t)u->size, __ATOMIC_RELAXED);
 		if (pending_trace_on())
 			pending_trace("REQUEUE", p, u, w->id, "wpr/retry");
-		if (sftp_workqueue_push(p->q, u) != 0) {
-			if (u->size > 0)
-				__atomic_fetch_sub(&p->queued_bytes,
-				    (uint64_t)u->size, __ATOMIC_RELAXED);
-			worker_record_completion(w, 0, 0);
-			pending_dec_traced(p, u, w->id, "wpr/pushfail");
-			/* Push-fail means the queue is shutting down: this
-			 * range will never run, so finalize as failure. */
-			(void)range_tracker_finalize(u->range_tracker, 1, w);
-			worker_record_failed_path(p, u, "queue shutdown");
-			free_unit(u);
-		}
+		if (sftp_workqueue_push(p->q, u) != 0)
+			worker_give_up_pushfail(p, w, u, "wpr/pushfail");
 	} else {
-		/* Snapshot the actual cause BEFORE logging our own
-		 * give-up message, which would otherwise overwrite the
-		 * TLS capture with the give-up text itself. */
-		char        cause[256];
-		const char *captured = hpn_get_last_error();
-		strlcpy(cause,
-		    (captured && *captured)
-		        ? captured : "(no error captured)",
-		    sizeof(cause));
-
-		error_f("worker %d: unit failed after %d attempts: %s",
-		    w->id, u->attempt,
-		    u->src_path ? u->src_path : "(null)");
-		worker_record_completion(w, 0, 0);
-		pending_dec_traced(p, u, w->id, "wpr/maxretries");
-		/* Range tracker: this range permanently failed.  Last
-		 * completer for the file removes the (now-corrupt) target
-		 * file (local unlink or remote sftp_rm via w->conn). */
-		(void)range_tracker_finalize(u->range_tracker, 1, w);
-		worker_record_failed_path(p, u, cause);
-		free_unit(u);
+		worker_give_up_unit(p, w, u, "unit", "wpr/maxretries");
 	}
 }
 
@@ -1330,35 +1361,11 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 			    (uint64_t)u->size, __ATOMIC_RELAXED);
 		if (pending_trace_on())
 			pending_trace("REQUEUE", p, u, w->id, "batch/retry");
-		if (sftp_workqueue_push(p->q, u) != 0) {
-			if (u->size > 0)
-				__atomic_fetch_sub(&p->queued_bytes,
-				    (uint64_t)u->size, __ATOMIC_RELAXED);
-			worker_record_completion(w, 0, 0);
-			pending_dec_traced(p, u, w->id, "batch/pushfail");
-			worker_record_failed_path(p, u, "queue shutdown");
-			free_unit(u);
-		}
+		if (sftp_workqueue_push(p->q, u) != 0)
+			worker_give_up_pushfail(p, w, u, "batch/pushfail");
 		return;
 	}
-	/* Same cause-snapshot pattern as worker_process_result: grab
-	 * the real error BEFORE our give-up log clobbers the TLS. */
-	{
-		char        cause[256];
-		const char *captured = hpn_get_last_error();
-		strlcpy(cause,
-		    (captured && *captured)
-		        ? captured : "(no error captured)",
-		    sizeof(cause));
-
-		error_f("worker %d: batch unit failed after %d attempts: %s",
-		    w->id, u->attempt,
-		    u->src_path ? u->src_path : "(null)");
-		worker_record_completion(w, 0, 0);
-		pending_dec_traced(p, u, w->id, "batch/maxretries");
-		worker_record_failed_path(p, u, cause);
-		free_unit(u);
-	}
+	worker_give_up_unit(p, w, u, "batch unit", "batch/maxretries");
 }
 
 static void
@@ -1471,7 +1478,7 @@ worker_run_batch_pipelined(struct sftp_worker *w,
  * Phase 4's pipelined batch path on high-RTT links.
  *
  * Per-entry success is signalled via the result field (set by
- * sftp_upload_bundle): on bundle failure every entry is marked -1, the
+ * sftp_hpn_bundle_upload): on bundle failure every entry is marked -1, the
  * units retry through the normal worker_finalize_one_entry path, and the
  * batch is requeued unit-by-unit (no batch-wide retry needed since the
  * units are still individual work-queue entries).
@@ -1486,7 +1493,7 @@ worker_run_bundle(struct sftp_worker *w,
     struct sftp_work_unit **batch, int bn)
 {
 	struct sftp_parallel *p = w->parent;
-	struct sftp_upload_bundle_entry *entries;
+	struct sftp_hpn_bundle_upload_entry *entries;
 	uint64_t total_bytes = 0;
 	int i, ok_count = 0;
 	uint64_t t_start_ns, t_end_ns, elapsed_us;
@@ -1512,7 +1519,7 @@ worker_run_bundle(struct sftp_worker *w,
 	 * extractor calls mkdir_p on each containing directory anyway.
 	 * Slight wire-size cost (full path repeated in every tar header)
 	 * but trivial compared to the small-file payloads. */
-	int bundle_rc = sftp_upload_bundle(w->conn, "", entries, bn,
+	int bundle_rc = sftp_hpn_bundle_upload(w->conn, "", entries, bn,
 	    p->cfg.preserve_flag, p->cfg.fsync_flag);
 
 	t_end_ns = monotonic_ns();
@@ -1554,7 +1561,7 @@ worker_run_bundle(struct sftp_worker *w,
  * Download-side counterpart of worker_run_bundle.  Builds the entries
  * array from a batch of SFTP_OP_DOWNLOAD units (src_path = remote,
  * dst_path = local), asks the server to pack the listed paths via
- * sftp_bundle_download, then finalises each work unit with its
+ * sftp_hpn_bundle_download, then finalises each work unit with its
  * per-entry result.
  *
  * Mirrors worker_run_bundle's failure handling: per-entry result is
@@ -1568,7 +1575,7 @@ worker_run_bundle_download(struct sftp_worker *w,
     struct sftp_work_unit **batch, int bn)
 {
 	struct sftp_parallel *p = w->parent;
-	struct sftp_download_bundle_entry *entries;
+	struct sftp_hpn_bundle_download_entry *entries;
 	uint64_t total_bytes = 0;
 	int i, ok_count = 0;
 	uint64_t t_start_ns, t_end_ns, elapsed_us;
@@ -1584,7 +1591,7 @@ worker_run_bundle_download(struct sftp_worker *w,
 	}
 
 	t_start_ns = monotonic_ns();
-	int bundle_rc = sftp_bundle_download(w->conn, entries, bn,
+	int bundle_rc = sftp_hpn_bundle_download(w->conn, entries, bn,
 	    p->cfg.preserve_flag);
 	t_end_ns = monotonic_ns();
 	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
@@ -1686,9 +1693,9 @@ worker_thread(void *arg)
 			 * -X bundle_size=N before 18.10. */
 			e = getenv("HPN_BUNDLE_TARGET_BYTES");
 			if (e != NULL && *e != '\0') {
-				unsigned long long v = strtoull(e, NULL, 10);
+				u_int64_t v = strtoull(e, NULL, 10);
 				if (v >= 65536ULL)   /* sanity lower bound */
-					w->bundle_target_bytes = (uint64_t)v;
+					w->bundle_target_bytes = v;
 			}
 			debug_ft("worker %d: hpn-bundle enabled "
 			    "(target_bytes=%llu)",
@@ -3170,9 +3177,9 @@ spawn_one_worker(struct sftp_parallel *p)
 	w->ssh_pid = -1;
 	pthread_mutex_init(&w->mu, NULL);
 
-	unsigned int buflen = p->cfg.transfer_buflen ?
+	u_int buflen = p->cfg.transfer_buflen ?
 	    p->cfg.transfer_buflen : DEFAULT_TRANSFER_BUFLEN;
-	unsigned int nreq = p->cfg.num_requests ?
+	u_int nreq = p->cfg.num_requests ?
 	    p->cfg.num_requests : DEFAULT_NUM_REQUESTS;
 
 	if (spawn_worker_ssh(&p->cfg,
