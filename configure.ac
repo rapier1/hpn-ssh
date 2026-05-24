@@ -3595,23 +3595,16 @@ if test "x$enable_sk" = "xyes" -a "x$enable_sk_internal" != "xno" ; then
 fi
 
 # ── Phase 5: libarchive for hpn-bundle SFTP extension ──────────────────────
-# Optional dependency.  When present, the client's sftp_upload_bundle and the
-# server's hpn-bundle handler are compiled in.  When absent, both ends fall
-# back gracefully — the bundle extension simply isn't advertised/used.
-LIBARCHIVE=""
-have_libarchive="no"
-AC_CHECK_LIB([archive], [archive_write_new],
-	[AC_CHECK_HEADER([archive.h],
-		[have_libarchive="yes"
-		 LIBARCHIVE="-larchive"
-		 AC_DEFINE([WITH_LIBARCHIVE], [1],
-		   [Define if libarchive is available for hpn-bundle tar streaming])
-		],
-		[have_libarchive="no"])
-	],
-	[have_libarchive="no"])
-AC_MSG_CHECKING([whether to enable hpn-bundle (libarchive)])
-AC_MSG_RESULT([$have_libarchive])
+# Required dependency.  HPN-SSH's bundle path (small-file aggregation in
+# put -r / get -r over the hpn-bundle@hpnssh.org extension) tar-streams via
+# libarchive and is part of the parallel-streams critical path.  No stub
+# fallback is shipped; configure aborts here if the library or header is
+# missing.
+AC_CHECK_LIB([archive], [archive_write_new], [],
+	[AC_MSG_ERROR([libarchive (-larchive) is required.  Install the libarchive development package (libarchive-dev / libarchive-devel) and re-run configure.])])
+AC_CHECK_HEADER([archive.h], [],
+	[AC_MSG_ERROR([archive.h is required.  Install the libarchive development headers (libarchive-dev / libarchive-devel) and re-run configure.])])
+LIBARCHIVE="-larchive"
 AC_SUBST([LIBARCHIVE])
 # ── END Phase 5 ──────────────────────────────────────────────────────────
 

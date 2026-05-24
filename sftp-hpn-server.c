@@ -177,8 +177,7 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 	return got_size && got_count && *stripe_size > 0 && *stripe_count > 0;
 }
 
-/* Forward decl: definition lives at the bottom of the file inside the
- * WITH_LIBARCHIVE block (and as a stub when libarchive is absent). */
+/* Forward decl: definition lives at the bottom of the file. */
 static void process_hpn_bundle_open(u_int id, struct sshbuf *iqueue,
     struct sshbuf *oqueue);
 
@@ -212,11 +211,10 @@ sftp_hpn_server_handles(const char *name)
  * synchronous keeps per-bundle results clean.
  */
 
-#ifdef WITH_LIBARCHIVE
-# include <fcntl.h>      /* O_RDONLY for bundle_fetch_pack_one */
-# include <sys/stat.h>
-# include <archive.h>
-# include <archive_entry.h>
+#include <fcntl.h>      /* O_RDONLY for bundle_fetch_pack_one */
+#include <sys/stat.h>
+#include <archive.h>
+#include <archive_entry.h>
 # include <libgen.h>     /* dirname() for mkdir-on-extract */
 
 /* Bundle handle mode: upload (client streams WRITE-by-WRITE, server
@@ -325,70 +323,113 @@ struct hpn_bundle_state {
  * Default total cap is SFTP_PARALLEL_MAX_WORKERS (24) × per-bundle —
  * matches the maximum concurrent worker count on the client side.
  *
- * Both are tunable via env vars (HPN_BUNDLE_MAX_BYTES,
- * HPN_BUNDLE_MAX_TOTAL_BYTES) read once on first use.  An operator can
- * set these in the sshd unit's environment.  Promotion to a real
- * sshd_config option (HPNBundleMaxSize) is a future cleanup; the env
- * vars exist so the cap is reachable today without plumbing through
- * servconf.c.
+ * Both are tunable via the sftp-server -B (per-bundle) and -T (total)
+ * CLI flags, which the operator sets on the sshd_config Subsystem line:
+ *
+ *   Subsystem  sftp  /usr/libexec/hpnsftp-server -B 64M -T 1500M
+ *
+ * sftp-server.c parses the flags and calls sftp_hpn_server_set_bundle_caps
+ * before the SFTP main loop runs.  Unset flags leave the compiled
+ * defaults in place.
  */
-#define HPN_BUNDLE_PER_CAP_DEFAULT   ((size_t)64  * 1024 * 1024)  /* 64 MiB */
-#define HPN_BUNDLE_TOTAL_CAP_DEFAULT ((size_t)1536* 1024 * 1024)  /* 1.5 GiB */
+#define HPN_BUNDLE_PER_CAP_DEFAULT   ((size_t)64   * 1024 * 1024)        /* 64 MiB */
+#define HPN_BUNDLE_PER_CAP_MIN       ((size_t)1    * 1024 * 1024)        /* 1 MiB */
+#define HPN_BUNDLE_PER_CAP_MAX       ((size_t)1024 * 1024 * 1024)        /* 1 GiB */
+#define HPN_BUNDLE_TOTAL_CAP_DEFAULT ((size_t)1536 * 1024 * 1024)        /* 1.5 GiB */
+#define HPN_BUNDLE_TOTAL_CAP_MIN     ((size_t)16   * 1024 * 1024)        /* 16 MiB */
+#define HPN_BUNDLE_TOTAL_CAP_MAX     ((size_t)16ULL * 1024 * 1024 * 1024) /* 16 GiB */
 
 static size_t bundle_per_cap   = 0;   /* 0 = uninitialised */
 static size_t bundle_total_cap = 0;
 static size_t bundle_total_bytes = 0; /* sum of accum_cap across open handles */
 
-/* Parse env_var as a byte count; honours K/M/G suffix.  Returns fallback
- * if unset, empty, unparseable, or if the value would overflow when
- * multiplied by the suffix.  The overflow guard is intentional: the
- * env var is operator-controlled, so a typo like 9999999999G should
- * fall back to the default rather than wrap to a bogus small value. */
+/*
+ * Parse a K/M/G-suffixed byte count.  Returns the parsed value on
+ * success, or 0 if spec is NULL/empty/unparseable or would overflow
+ * size_t when the suffix is applied.  Callers must check for 0
+ * separately from a legitimately-parsed value, since 0 itself is never
+ * a valid cap.
+ */
 static size_t
-parse_bytes_env(const char *env_var, size_t fallback)
+parse_bytes_arg(const char *spec)
 {
-	const char *v = getenv(env_var);
-	if (v == NULL || *v == '\0')
-		return fallback;
 	char *end = NULL;
-	u_int64_t n = strtoull(v, &end, 10);
-	u_int64_t mult = 1;
-	if (end == v)
-		return fallback;
+	u_int64_t n, mult = 1;
+
+	if (spec == NULL || *spec == '\0')
+		return 0;
+	n = strtoull(spec, &end, 10);
+	if (end == spec)
+		return 0;
 	switch (*end) {
 	case 'G': case 'g': mult = 1024ULL * 1024 * 1024; break;
 	case 'M': case 'm': mult = 1024ULL * 1024;        break;
 	case 'K': case 'k': mult = 1024ULL;               break;
 	case '\0':                                         break;
-	default: return fallback;
+	default: return 0;
 	}
-	/* Overflow check BEFORE multiplying.  If n > SIZE_MAX / mult, the
-	 * multiplication would wrap. */
+	/* Overflow check BEFORE multiplying. */
 	if (mult > 1 && n > (u_int64_t)SIZE_MAX / mult)
-		return fallback;
+		return 0;
 	n *= mult;
 	if (n == 0 || n > SIZE_MAX)
-		return fallback;
+		return 0;
 	return (size_t)n;
+}
+
+/*
+ * Clamp value into [lo, hi], warning to stderr on either boundary so
+ * the operator notices that their request was adjusted.
+ */
+static size_t
+clamp_cap(const char *flag, size_t v, size_t lo, size_t hi)
+{
+	if (v < lo) {
+		fprintf(stderr,
+		    "%s %zu bytes is below minimum %zu MiB; clamping.\n",
+		    flag, v, lo / (1024 * 1024));
+		return lo;
+	}
+	if (v > hi) {
+		fprintf(stderr,
+		    "%s %zu bytes is above maximum %zu MiB; clamping.\n",
+		    flag, v, hi / (1024 * 1024));
+		return hi;
+	}
+	return v;
+}
+
+void
+sftp_hpn_server_set_bundle_caps(const char *per_arg, const char *total_arg)
+{
+	if (per_arg != NULL && *per_arg != '\0') {
+		size_t v = parse_bytes_arg(per_arg);
+		if (v == 0)
+			fatal("Invalid -B value \"%s\"", per_arg);
+		bundle_per_cap = clamp_cap("-B", v,
+		    HPN_BUNDLE_PER_CAP_MIN, HPN_BUNDLE_PER_CAP_MAX);
+	}
+	if (total_arg != NULL && *total_arg != '\0') {
+		size_t v = parse_bytes_arg(total_arg);
+		if (v == 0)
+			fatal("Invalid -T value \"%s\"", total_arg);
+		bundle_total_cap = clamp_cap("-T", v,
+		    HPN_BUNDLE_TOTAL_CAP_MIN, HPN_BUNDLE_TOTAL_CAP_MAX);
+	}
 }
 
 static void
 bundle_caps_init(void)
 {
-	if (bundle_per_cap != 0)
+	static int initialised = 0;
+
+	if (initialised)
 		return;
-	/* ENV-VAR HPN_BUNDLE_MAX_BYTES — server-side: per-bundle accumulator
-	 * cap.  Reject WRITE / pack expansion past this point.  Defaults
-	 * 64 MiB.  Operator-tunable; raise carefully on high-concurrency
-	 * sites since memory cost scales with concurrent bundle handles. */
-	bundle_per_cap   = parse_bytes_env("HPN_BUNDLE_MAX_BYTES",
-	    HPN_BUNDLE_PER_CAP_DEFAULT);
-	/* ENV-VAR HPN_BUNDLE_MAX_TOTAL_BYTES — server-side: aggregate
-	 * accumulator cap across all open bundle handles in this
-	 * sftp-server process.  Reject new bundle opens / growth past this
-	 * point.  Defaults 1.5 GiB. */
-	bundle_total_cap = parse_bytes_env("HPN_BUNDLE_MAX_TOTAL_BYTES",
-	    HPN_BUNDLE_TOTAL_CAP_DEFAULT);
+	if (bundle_per_cap == 0)
+		bundle_per_cap = HPN_BUNDLE_PER_CAP_DEFAULT;
+	if (bundle_total_cap == 0)
+		bundle_total_cap = HPN_BUNDLE_TOTAL_CAP_DEFAULT;
+	initialised = 1;
 	debug_f("hpn-bundle caps: per=%zu MiB total=%zu MiB",
 	    bundle_per_cap   / (1024*1024),
 	    bundle_total_cap / (1024*1024));
@@ -1149,83 +1190,6 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	sshbuf_free(msg);
 }
 
-#else  /* !WITH_LIBARCHIVE */
-
-/* Stubs when libarchive is not available — bundle support is compiled out.
- * The extension is NOT advertised in this case (see compose_extension calls
- * in sftp-server.c, which check WITH_LIBARCHIVE). */
-
-int
-sftp_hpn_server_is_bundle_handle(int handle)
-{
-	(void)handle;
-	return 0;
-}
-
-int
-sftp_hpn_server_bundle_write(int handle, uint64_t off,
-    const u_char *data, size_t len)
-{
-	(void)handle; (void)off; (void)data; (void)len;
-	return SSH2_FX_OP_UNSUPPORTED;
-}
-
-int
-sftp_hpn_server_bundle_close(int handle)
-{
-	(void)handle;
-	return SSH2_FX_OP_UNSUPPORTED;
-}
-
-int
-sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
-    size_t len, size_t *out_len)
-{
-	(void)handle; (void)off; (void)out_buf; (void)len;
-	if (out_len)
-		*out_len = 0;
-	return SSH2_FX_OP_UNSUPPORTED;
-}
-
-static void
-process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
-{
-	struct sshbuf *msg;
-	int r;
-	(void)iqueue;
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u32(msg, SSH2_FX_OP_UNSUPPORTED)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0)
-		fatal_fr(r, "compose unsupported reply");
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue unsupported reply");
-	sshbuf_free(msg);
-}
-
-static void
-process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
-{
-	struct sshbuf *msg;
-	int r;
-	(void)iqueue;
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u32(msg, SSH2_FX_OP_UNSUPPORTED)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0)
-		fatal_fr(r, "compose unsupported reply");
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue unsupported reply");
-	sshbuf_free(msg);
-}
-
-#endif /* WITH_LIBARCHIVE */
 /* ── END Phase 5 ───────────────────────────────────────────────────────── */
 
 void

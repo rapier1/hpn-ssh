@@ -118,11 +118,9 @@ static void process_extended_copy_data(uint32_t id);
 static void process_extended_home_directory(uint32_t id);
 static void process_extended_get_users_groups_by_id(uint32_t id);
 static void process_extended_hpn_fs_info(uint32_t id);
-#ifdef WITH_LIBARCHIVE
 static void process_extended_hpn_bundle_open(uint32_t id);
 static void process_extended_hpn_bundle_cap(uint32_t id);
 static void process_extended_hpn_bundle_fetch(uint32_t id);
-#endif
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -175,14 +173,12 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_get_users_groups_by_id, 0 },
 	{ "hpn-fs-info", HPN_EXT_FS_INFO, 0,
 	    process_extended_hpn_fs_info, 0 },
-#ifdef WITH_LIBARCHIVE
 	{ "hpn-bundle", HPN_EXT_BUNDLE, 0,
 	    process_extended_hpn_bundle_cap, 1 },
 	{ "hpn-bundle-open", HPN_EXT_BUNDLE_OPEN, 0,
 	    process_extended_hpn_bundle_open, 1 },
 	{ "hpn-bundle-fetch", HPN_EXT_BUNDLE_FETCH, 0,
 	    process_extended_hpn_bundle_fetch, 0 },
-#endif
 	{ NULL, NULL, 0, NULL, 0 }
 };
 
@@ -789,14 +785,8 @@ process_init(void)
 	compose_extension(msg, "home-directory", "1");
 	compose_extension(msg, "users-groups-by-id@openssh.com", "1");
 	compose_extension(msg, HPN_EXT_FS_INFO, "1");
-#ifdef WITH_LIBARCHIVE
-	/* Phase 5: only advertise hpn-bundle{,-fetch} when libarchive is
-	 * linked, since the server cannot pack/unpack the tar stream without
-	 * it.  Upload-side (hpn-bundle-open) and download-side
-	 * (hpn-bundle-fetch) ship together — both require libarchive. */
 	compose_extension(msg, HPN_EXT_BUNDLE, "1");
 	compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
-#endif
 
 	send_msg(msg);
 	sshbuf_free(msg);
@@ -1884,7 +1874,6 @@ process_extended_hpn_fs_info(uint32_t id)
 	sftp_hpn_server_dispatch(id, HPN_EXT_FS_INFO, iqueue, oqueue);
 }
 
-#ifdef WITH_LIBARCHIVE
 /* Phase 5: hpn-bundle-open@hpnssh.org dispatch wrapper.  The real
  * implementation lives in sftp-hpn-server.c. */
 static void
@@ -1916,7 +1905,6 @@ process_extended_hpn_bundle_fetch(uint32_t id)
 {
 	sftp_hpn_server_dispatch(id, HPN_EXT_BUNDLE_FETCH, iqueue, oqueue);
 }
-#endif /* WITH_LIBARCHIVE */
 
 static void
 process_extended(uint32_t id)
@@ -2034,7 +2022,8 @@ sftp_server_usage(void)
 	extern char *__progname;
 
 	fprintf(stderr,
-	    "usage: %s [-ehR] [-d start_directory] [-f log_facility] "
+	    "usage: %s [-ehR] [-B per_bundle_cap] [-T total_bundle_cap]\n"
+	    "\t[-d start_directory] [-f log_facility] "
 	    "[-l log_level]\n\t[-P denied_requests] "
 	    "[-p allowed_requests] [-u umask]\n"
 	    "       %s -Q protocol_feature\n",
@@ -2050,6 +2039,8 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 	SyslogFacility log_facility = SYSLOG_FACILITY_AUTH;
 	char *cp, *homedir = NULL, uidstr[32], buf[4*4096];
 	long mask;
+	const char *bundle_per_arg = NULL;
+	const char *bundle_total_arg = NULL;
 
 	extern char *optarg;
 	extern char *__progname;
@@ -2060,7 +2051,7 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 	pw = pwcopy(user_pw);
 
 	while (!skipargs && (ch = getopt(argc, argv,
-	    "d:f:l:P:p:Q:u:cehR")) != -1) {
+	    "B:T:d:f:l:P:p:Q:u:cehR")) != -1) {
 		switch (ch) {
 		case 'Q':
 			if (strcasecmp(optarg, "requests") != 0) {
@@ -2122,11 +2113,23 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 				fatal("Invalid umask \"%s\"", optarg);
 			(void)umask((mode_t)mask);
 			break;
+		case 'B':
+			/* hpn-bundle per-bundle accumulator cap; parsed
+			 * + clamped below by sftp_hpn_server_set_bundle_caps. */
+			bundle_per_arg = optarg;
+			break;
+		case 'T':
+			/* hpn-bundle total accumulator cap across all
+			 * concurrent bundle handles in this server process. */
+			bundle_total_arg = optarg;
+			break;
 		case 'h':
 		default:
 			sftp_server_usage();
 		}
 	}
+
+	sftp_hpn_server_set_bundle_caps(bundle_per_arg, bundle_total_arg);
 
 	log_init(__progname, log_level, log_facility, log_stderr);
 

@@ -275,14 +275,12 @@ sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
  * pathname, which the server sets to the original remote_path.
  */
 
-#ifdef WITH_LIBARCHIVE
-# include <archive.h>
-# include <archive_entry.h>
-# include <fcntl.h>
-# include <libgen.h>
-# include <sys/stat.h>
-# include <unistd.h>
-#endif
+#include <archive.h>
+#include <archive_entry.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "sftp-common.h"
 #include "sshbuf.h"
@@ -292,8 +290,6 @@ sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
 #include "sftp-client.h"
 #include "sftp-client-internal.h"
 #include "sftp-hpn-bundle.h"
-
-#ifdef WITH_LIBARCHIVE
 
 /*
  * Match a tar record pathname back to an entries[] slot.  Server-side
@@ -702,23 +698,6 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	return rc;
 }
 
-#else /* !WITH_LIBARCHIVE */
-
-int
-sftp_hpn_bundle_download(struct sftp_conn *conn,
-    struct sftp_hpn_bundle_download_entry *entries, int n,
-    int preserve_flag)
-{
-	int i;
-	(void)conn; (void)preserve_flag;
-	for (i = 0; i < n; i++)
-		entries[i].result = -1;
-	debug_f("hpn-bundle-fetch: client built without libarchive");
-	return -1;
-}
-
-#endif /* WITH_LIBARCHIVE */
-
 /* ── BEGIN Phase 5: hpn-bundle upload ──────────────────────────────────────
  *
  * Implements the client side of `hpn-bundle-open@hpnssh.org`.  Many small
@@ -743,29 +722,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
  *
  * Caller must check sftp_conn_has_hpn_bundle() before calling
  * sftp_hpn_bundle_upload.  This function does not transparently fall back.
- *
- * libarchive integration: compile-time optional via WITH_LIBARCHIVE.
- * When unavailable, sftp_hpn_bundle_upload is a stub that returns -1.
  */
-
-#ifndef WITH_LIBARCHIVE
-/* Stub when libarchive is not compiled in.  Caller will fall back to
- * per-file uploads. */
-int
-sftp_hpn_bundle_upload(struct sftp_conn *conn,
-    const char *remote_dest_dir,
-    struct sftp_hpn_bundle_upload_entry *entries, int n,
-    int preserve_flag, int fsync_flag)
-{
-	int i;
-	(void)conn; (void)remote_dest_dir;
-	(void)preserve_flag; (void)fsync_flag;
-	for (i = 0; i < n; i++)
-		entries[i].result = -1;
-	debug_f("hpn-bundle: not compiled in (missing libarchive)");
-	return -1;
-}
-#else  /* WITH_LIBARCHIVE */
 
 /* Bundle flag constants (HPN_BUNDLE_FLAG_*) and HPN_BUNDLE_BLOCK_BYTES
  * live in sftp-hpn-bundle.h (included above) — single source of truth
@@ -1145,7 +1102,5 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		sshbuf_free(msg);
 	return rc;
 }
-
-#endif /* WITH_LIBARCHIVE */
 
 /* ── END Phase 5 ───────────────────────────────────────────────────────── */

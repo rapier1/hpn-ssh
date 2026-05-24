@@ -57,9 +57,8 @@ void sftp_hpn_server_dispatch(u_int id, const char *name,
  * the use type and call the functions below.  All bundle state lives
  * inside sftp-hpn-server.c so sftp-server.c carries a minimal diff.
  *
- * Compiled in only when WITH_LIBARCHIVE is defined; otherwise the handler
- * returns SSH2_FX_OP_UNSUPPORTED on open and the bundle code path is
- * unreachable.
+ * Requires libarchive (-larchive); enforced as a hard configure
+ * requirement.
  */
 
 /*
@@ -105,6 +104,23 @@ int sftp_hpn_server_bundle_close(int handle);
  */
 int sftp_hpn_server_bundle_read(int handle, uint64_t off,
     u_char *out_buf, size_t len, size_t *out_len);
+
+/*
+ * Apply operator-supplied per-bundle and total bundle-accumulator caps
+ * from K/M/G-suffixed byte strings (e.g. "64M", "1500M", "2G").  Either
+ * argument may be NULL or "" to leave that cap at its compiled default.
+ * Values outside the supported range are clamped to the nearest bound
+ * with a warning to stderr; unparseable values cause exit via fatal().
+ *
+ * Bounds:
+ *   per-bundle: [1 MiB, 1 GiB]   default 64 MiB
+ *   total:      [16 MiB, 16 GiB] default 1.5 GiB
+ *
+ * Called by sftp-server.c after parsing -B / -T CLI flags, before the
+ * SFTP main loop starts.  Safe to call with both NULLs (no-op).
+ */
+void sftp_hpn_server_set_bundle_caps(const char *per_arg,
+    const char *total_arg);
 
 /* ── END Phase 5 ─────────────────────────────────────────────────────── */
 
