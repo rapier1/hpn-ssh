@@ -159,7 +159,7 @@ typedef enum {
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
 	oTcpRcvBufPoll, oTcpRcvBufRescue, oHPNDisabled,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch, oHPNUseBundle,
-	oHPNMaxRetries,
+	oHPNMaxRetries, oHPNBundleSize, oHPNMaxAuthConcurrent,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oVisualHostKey,
@@ -302,6 +302,8 @@ static struct {
 	{ "noneswitch", oNoneSwitch },
 	{ "hpnusebundle", oHPNUseBundle },
 	{ "hpnmaxretries", oHPNMaxRetries },
+	{ "hpnbundlesize", oHPNBundleSize },
+	{ "hpnmaxauthconcurrent", oHPNMaxAuthConcurrent },
 	{ "usemptcp", oUseMPTCP},
 	{ "happyeyes", oHappyEyes },
 	{ "happydelay", oHappyDelay },
@@ -1380,6 +1382,42 @@ parse_time:
 
 	case oHPNMaxRetries:
 		intptr = &options->hpn_max_retries;
+		goto parse_int;
+
+	case oHPNBundleSize:
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0') {
+			error("%.200s line %d: Missing argument.", filename,
+			    linenum);
+			goto out;
+		}
+		if (scan_scaled(arg, &val64) == -1) {
+			error("%.200s line %d: HPNBundleSize bad value '%s': "
+			    "%s", filename, linenum, arg, strerror(errno));
+			goto out;
+		}
+		/* Clamp to [64 KiB, 64 MiB] with warning when out of range.
+		 * 64 KiB lower bound is the existing sanity floor in the
+		 * worker startup code; 64 MiB upper bound matches the
+		 * server-side per-bundle cap default — values above that
+		 * would just be rejected by the server. */
+		if (val64 < 65536LL) {
+			fprintf(stderr, "HPNBundleSize %lld is below the "
+			    "minimum (65536 bytes); clamping to 65536.\n",
+			    (long long)val64);
+			val64 = 65536LL;
+		} else if (val64 > (int64_t)(64 * 1024 * 1024)) {
+			fprintf(stderr, "HPNBundleSize %lld is above the "
+			    "maximum (67108864 bytes / 64 MiB); clamping to "
+			    "64 MiB.\n", (long long)val64);
+			val64 = 64 * 1024 * 1024;
+		}
+		if (*activep && options->hpn_bundle_size == -1)
+			options->hpn_bundle_size = val64;
+		break;
+
+	case oHPNMaxAuthConcurrent:
+		intptr = &options->hpn_max_auth_concurrent;
 		goto parse_int;
 
 	case oUseMPTCP:
@@ -2907,6 +2945,8 @@ initialize_options(Options * options)
 	options->nonemac_enabled = -1;
 	options->hpn_use_bundle = -1;
 	options->hpn_max_retries = -1;
+	options->hpn_bundle_size = -1;
+	options->hpn_max_auth_concurrent = -1;
 	options->use_mptcp = -1;
 	options->use_happyeyes = -1;
 	options->happy_delay = -1;
@@ -3119,6 +3159,21 @@ fill_default_options(Options * options)
 		fprintf(stderr, "HPNMaxRetries %d is above the maximum (20); "
 		    "clamping to 20.\n", options->hpn_max_retries);
 		options->hpn_max_retries = 20;
+	}
+	if (options->hpn_bundle_size == -1)
+		options->hpn_bundle_size = 4 * 1024 * 1024;	/* default 4 MiB */
+	if (options->hpn_max_auth_concurrent == -1) {
+		options->hpn_max_auth_concurrent = 8;		/* default 8 */
+	} else if (options->hpn_max_auth_concurrent < 1) {
+		fprintf(stderr, "HPNMaxAuthConcurrent %d is below the "
+		    "minimum (1); clamping to 1.\n",
+		    options->hpn_max_auth_concurrent);
+		options->hpn_max_auth_concurrent = 1;
+	} else if (options->hpn_max_auth_concurrent > 64) {
+		fprintf(stderr, "HPNMaxAuthConcurrent %d is above the "
+		    "maximum (64); clamping to 64.\n",
+		    options->hpn_max_auth_concurrent);
+		options->hpn_max_auth_concurrent = 64;
 	}
 	if (options->nonemac_enabled > 0 && (options->none_enabled == 0 ||
 					     options->none_switch == 0)) {
@@ -3983,6 +4038,10 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
 	dump_cfg_fmtint(oHPNUseBundle, o->hpn_use_bundle);
 	dump_cfg_int(oHPNMaxRetries, o->hpn_max_retries);
+	dump_cfg_int(oHPNMaxAuthConcurrent, o->hpn_max_auth_concurrent);
+	/* oHPNBundleSize — int64 byte count; printed plain (operator can
+	 * compare against the K/M/G suffix they configured). */
+	printf("hpnbundlesize %lld\n", (long long)o->hpn_bundle_size);
 	dump_cfg_fmtint(oFallback, o->fallback);
 	dump_cfg_fmtint(oMetrics, o->metrics);
 	dump_cfg_fmtint(oUseMPTCP, o->use_mptcp);

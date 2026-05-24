@@ -3203,19 +3203,6 @@ main(int argc, char **argv)
 			    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
 		}
 
-		/* ENV-VAR HPN_MAX_AUTH_CONCURRENT — config-candidate: caps
-		 * concurrent worker SSH auth-phase connections (default 8).
-		 * Operator-facing, needed by sites with restrictive MaxStartups.
-		 * Promote to ssh_config and/or hpnsftp CLI before 18.10. */
-		{
-			const char *e = getenv("HPN_MAX_AUTH_CONCURRENT");
-			if (e != NULL && *e != '\0') {
-				int v = atoi(e);
-				if (v > 0)
-					pcfg.max_auth_concurrent = v;
-			}
-		}
-
 		if (!quiet)
 			logit("Parallel streams: -j %d",
 			    parallel_num_streams);

@@ -59,16 +59,18 @@ struct sftp_parallel_config {
 	/* Bundle-mode enable, resolved from ssh_config HPNUseBundle by
 	 * sftp.c (which queries `hpnssh -G host`).  0 = disabled (force
 	 * Phase-4 fallback), 1 = enabled (default; subject to server
-	 * advertising the hpn-bundle extension).  HPN_USE_BUNDLE=0 env var
-	 * in the worker also disables, taking precedence over this. */
+	 * advertising the hpn-bundle extension). */
 	int          use_bundle;
 
 	/* Retry budget per work unit, resolved from ssh_config
 	 * HPNMaxRetries.  Default 3, clamped to [1, 20] by readconf.c
-	 * fill_default_options.  Worker code calls hpn_max_retries(p)
-	 * which lets HPN_MAX_RETRIES env var override this for ad-hoc
-	 * testing without touching config. */
+	 * fill_default_options. */
 	int          max_retries;
+
+	/* Bundle-mode accumulator target size in bytes, resolved from
+	 * ssh_config HPNBundleSize.  Default 4 MiB.  0 = unset / use
+	 * default. */
+	uint64_t     bundle_size;
 
 	/* Transfer flags applied to every submitted unit */
 	int          preserve_flag;

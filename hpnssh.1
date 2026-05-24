@@ -565,7 +565,11 @@ For full details of the options listed below, and their possible values, see
 .It HostbasedAcceptedAlgorithms
 .It HostbasedAuthentication
 .It Hostname
+.It HPNBundleSize**
 .It HPNDisabled*
+.It HPNMaxAuthConcurrent**
+.It HPNMaxRetries**
+.It HPNUseBundle**
 .It IPQoS
 .It IdentitiesOnly
 .It IdentityAgent
@@ -632,6 +636,11 @@ For full details of the options listed below, and their possible values, see
 .It XAuthLocation
 .Pp
 .It * Hpnssh specific configuration option.
+.It ** Hpnsftp specific configuration option (accepted by the
+ssh_config parser but consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores these).
 .El
 .Pp
 .It Fl P Ar tag

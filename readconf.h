@@ -136,6 +136,13 @@ typedef struct {
 				    * parallel orchestrator.  Default 3,
 				    * clamped to [1, 20].  Only consulted by
 				    * hpnsftp; hpnssh ignores. */
+	int64_t hpn_bundle_size;   /* Bundle-mode target accumulator size in
+				    * bytes, hpnsftp client side.  Default
+				    * 4 MiB, clamped to [64 KiB, 64 MiB].
+				    * -1 = unset (use compile-time default). */
+	int     hpn_max_auth_concurrent; /* Max concurrent worker SSH children
+					  * in the auth phase, hpnsftp client.
+					  * Default 8, clamped to [1, 64]. */
 	int     disable_multithreaded; /* Disable multithreaded aes-ctr */
         int     metrics; /* enable metrics */
         int     metrics_interval; /* time in seconds between polls */

@@ -73,9 +73,6 @@ extern int showprogress;
  *   - 20 = upper bound.  For demonstrably flaky networks where the
  *     transport layer hasn't yet self-recovered.  Above this the
  *     retry storm itself becomes the load problem.
- *
- * HPN_MAX_RETRIES env var overrides the config option for ad-hoc
- * testing without editing ssh_config.  Same [1, 20] clamp.
  */
 #define HPN_MAX_RETRIES_DEFAULT 3
 #define HPN_MAX_RETRIES_MIN     1
@@ -127,8 +124,8 @@ static int hpn_max_retries(struct sftp_parallel *p);
 /*
  * ── Phase 5: bundle-mode (hpn-bundle@hpnssh.org) tunables ────────────────
  *
- * When a worker has the bundle path enabled (HPN_USE_BUNDLE=1 in the
- * environment AND the server advertised hpn-bundle support), the worker
+ * When a worker has the bundle path enabled (HPNUseBundle yes in
+ * ssh_config AND the server advertised hpn-bundle support), the worker
  * collects upload batches up to BUNDLE_TARGET_BYTES instead of
  * UPLOAD_BATCH_BYTE_CAP, then dispatches them as a single tar stream via
  * sftp_hpn_bundle_upload.  The smaller target produces many small bundles
@@ -139,7 +136,7 @@ static int hpn_max_retries(struct sftp_parallel *p);
  * 4 MiB is a starting point; a server-side fsync after each extract on
  * the bundle close makes very large bundles bad (longer flush before the
  * next OPEN), and very small bundles add tar header overhead.  Override
- * with HPN_BUNDLE_TARGET_BYTES=<bytes>.
+ * with HPNBundleSize in ssh_config.
  */
 #define BUNDLE_TARGET_BYTES     ((uint64_t)4 * 1024 * 1024)
 
@@ -605,7 +602,7 @@ struct sftp_worker {
 
 	/* ── Phase 5: bundle-mode state (hpn-bundle@hpnssh.org) ─────
 	 * bundle_enabled is set once at worker startup when
-	 *   HPN_USE_BUNDLE=1 in the environment AND
+	 *   ssh_config HPNUseBundle yes (the default) AND
 	 *   sftp_conn_has_hpn_bundle(w->conn) is true.
 	 * When set, the worker collects upload batches to bundle_target_bytes
 	 * and dispatches them via sftp_hpn_bundle_upload instead of
@@ -1256,17 +1253,6 @@ worker_record_start(struct sftp_worker *w)
 static int
 hpn_max_retries(struct sftp_parallel *p)
 {
-	/* ENV-VAR HPN_MAX_RETRIES — developer override that takes
-	 * precedence over the HPNMaxRetries config option.  Clamped to
-	 * [1, 20]; out-of-range or unparseable values are ignored and
-	 * the config / default is used instead. */
-	const char *e = getenv("HPN_MAX_RETRIES");
-	if (e != NULL && *e != '\0') {
-		int parsed = atoi(e);
-		if (parsed >= HPN_MAX_RETRIES_MIN &&
-		    parsed <= HPN_MAX_RETRIES_MAX)
-			return parsed;
-	}
 	if (p != NULL &&
 	    p->cfg.max_retries >= HPN_MAX_RETRIES_MIN &&
 	    p->cfg.max_retries <= HPN_MAX_RETRIES_MAX)
@@ -1842,53 +1828,24 @@ worker_thread_init(struct sftp_worker *w)
 	}
 
 	/* Phase 5 bundle-mode: ON by default when the server advertises
-	 * hpn-bundle@hpnssh.org.  Precedence for disabling:
-	 *   1. HPN_USE_BUNDLE=0 env var (dev-side kill switch)
-	 *   2. HPNUseBundle no   in ssh_config (resolved by sftp.c via
-	 *                        `hpnssh -G host`; stored in p->cfg.use_bundle)
-	 *   3. server doesn't advertise hpn-bundle extension
-	 * Any of these forces the Phase-4 pipelined batch fallback. */
-	w->bundle_target_bytes = BUNDLE_TARGET_BYTES;
-	{
-		/* ENV-VAR HPN_USE_BUNDLE — developer-only: kill switch for
-		 * bundle-mode.  Promoted to the HPNUseBundle ssh_config
-		 * option (parsed in readconf.c); env var stays as a dev
-		 * override that bypasses config.  Set =0 to force the
-		 * Phase-4 fallback regardless of config.  Any other value
-		 * (or unset) defers to ssh_config HPNUseBundle and the
-		 * server's extension advertisement. */
-		const char *e = getenv("HPN_USE_BUNDLE");
-		int env_disabled = (e != NULL && *e == '0' && e[1] == '\0');
-		int cfg_disabled = (w->parent->cfg.use_bundle == 0);
-
-		if (env_disabled) {
-			debug_ft("worker %d: bundle disabled by "
-			    "HPN_USE_BUNDLE=0", w->id);
-		} else if (cfg_disabled) {
-			debug_ft("worker %d: bundle disabled by "
-			    "ssh_config HPNUseBundle no", w->id);
-		} else if (sftp_conn_has_hpn_bundle(w->conn)) {
-			w->bundle_enabled = 1;
-			/* ENV-VAR HPN_BUNDLE_TARGET_BYTES — config-candidate:
-			 * size tuning knob for the bundle accumulator
-			 * (default 4 MiB).  Useful for sites with high RTT.
-			 * Promote to ssh_config BundleSize /
-			 * -X bundle_size=N before 18.10. */
-			e = getenv("HPN_BUNDLE_TARGET_BYTES");
-			if (e != NULL && *e != '\0') {
-				u_int64_t v = strtoull(e, NULL, 10);
-				if (v >= 65536ULL)   /* sanity lower bound */
-					w->bundle_target_bytes = v;
-			}
-			debug_ft("worker %d: hpn-bundle enabled "
-			    "(target_bytes=%llu)",
-			    w->id,
-			    (unsigned long long)w->bundle_target_bytes);
-		} else {
-			debug_ft("worker %d: server lacks hpn-bundle "
-			    "extension, using Phase-4 batch fallback",
-			    w->id);
-		}
+	 * hpn-bundle@hpnssh.org.  Disabled when:
+	 *   - HPNUseBundle no   in ssh_config (resolved by sftp.c via
+	 *                       `hpnssh -G host`; stored in p->cfg.use_bundle)
+	 *   - server doesn't advertise the hpn-bundle extension
+	 * Either forces the Phase-4 pipelined batch fallback. */
+	w->bundle_target_bytes = (w->parent->cfg.bundle_size > 0)
+	    ? w->parent->cfg.bundle_size
+	    : BUNDLE_TARGET_BYTES;
+	if (w->parent->cfg.use_bundle == 0) {
+		debug_ft("worker %d: bundle disabled by "
+		    "ssh_config HPNUseBundle no", w->id);
+	} else if (sftp_conn_has_hpn_bundle(w->conn)) {
+		w->bundle_enabled = 1;
+		debug_ft("worker %d: hpn-bundle enabled (target_bytes=%llu)",
+		    w->id, (unsigned long long)w->bundle_target_bytes);
+	} else {
+		debug_ft("worker %d: server lacks hpn-bundle extension, "
+		    "using Phase-4 batch fallback", w->id);
 	}
 }
 

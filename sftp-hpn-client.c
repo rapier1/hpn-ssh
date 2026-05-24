@@ -776,8 +776,8 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
  * STATUS is ~13 bytes on the wire, so 4096 is well under any plausible
  * socket / channel buffer.  In practice the default 4 MiB bundle at the
  * 128 KiB libarchive block size below queues only ~32 STATUSes per
- * bundle — the cap exists only so a user cranking HPN_BUNDLE_TARGET_BYTES
- * very high doesn't fill kernel buffers and deadlock.
+ * bundle — the cap exists only so a user cranking HPNBundleSize very
+ * high doesn't fill kernel buffers and deadlock.
  */
 #define BUNDLE_MAX_INFLIGHT     4096
 

@@ -115,6 +115,8 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	/* Sensible defaults if anything below fails. */
 	pcfg->use_bundle  = 1;
 	pcfg->max_retries = 3;
+	pcfg->bundle_size = 0;  /* 0 = let worker use compile-time default */
+	pcfg->max_auth_concurrent = 0;  /* 0 = auto */
 
 	initialize_options(&options);
 	options.host_arg = xstrdup(host);
@@ -150,9 +152,15 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	 * options append additional assignments here. */
 	pcfg->use_bundle  = (options.hpn_use_bundle != 0);
 	pcfg->max_retries = options.hpn_max_retries;
+	pcfg->bundle_size = (options.hpn_bundle_size > 0)
+	    ? (uint64_t)options.hpn_bundle_size : 0;
+	pcfg->max_auth_concurrent = options.hpn_max_auth_concurrent;
 
-	debug_f("ssh_config: host=\"%s\" HPNUseBundle=%s HPNMaxRetries=%d",
-	    host, pcfg->use_bundle ? "yes" : "no", pcfg->max_retries);
+	debug_f("ssh_config: host=\"%s\" HPNUseBundle=%s HPNMaxRetries=%d "
+	    "HPNBundleSize=%llu HPNMaxAuthConcurrent=%d",
+	    host, pcfg->use_bundle ? "yes" : "no", pcfg->max_retries,
+	    (unsigned long long)pcfg->bundle_size,
+	    pcfg->max_auth_concurrent);
 
 	free_options(&options);
 	return 0;
