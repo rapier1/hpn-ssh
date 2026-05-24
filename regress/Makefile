@@ -72,6 +72,10 @@ LTESTS= 	connect \
 		sftp-resume \
 		sftp-uri \
 		sftp-parallel \
+		sftp-bundle \
+		sftp-bundle-caps \
+		sftp-range-split \
+		sftp-hpn-config \
 		reconfigure \
 		dynamic-forward \
 		forwarding \
