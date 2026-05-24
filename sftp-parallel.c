@@ -712,7 +712,7 @@ struct sftp_parallel {
 	 * control connection for every large file — at high RTT this stalls
 	 * the walker and prevents queued_bytes from rising fast enough for
 	 * the scale-up trigger to fire while there is still work to do.
-	 * Updated by maybe_submit_upload on the first invocation; read by
+	 * Updated by submit_upload_maybe_split on the first invocation; read by
 	 * subsequent invocations.  Single-threaded access (the walker is the
 	 * only caller path that uses this).
 	 */
@@ -3561,10 +3561,10 @@ submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 }
 
 /* Defined later in this file. */
-static int maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
+static int submit_upload_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
     off_t file_size, mode_t mode);
-static int maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
+static int submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *remote_path, const char *local_path,
     off_t file_size, mode_t mode);
 
@@ -3577,7 +3577,7 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	 * multiple range work units (feeds the byte-based scale-up
 	 * trigger).  Otherwise, fall back to a whole-file unit. */
 	if (conn != NULL)
-		return maybe_submit_upload(p, conn, local_path, remote_path,
+		return submit_upload_maybe_split(p, conn, local_path, remote_path,
 		    size, mode);
 	return submit(p,
 	    make_unit(SFTP_OP_UPLOAD, local_path, remote_path, size, mode));
@@ -3589,7 +3589,7 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
     const char *remote_path, const char *local_path, off_t size, mode_t mode)
 {
 	if (conn != NULL)
-		return maybe_submit_download(p, conn, remote_path, local_path,
+		return submit_download_maybe_split(p, conn, remote_path, local_path,
 		    size, mode);
 	return submit(p,
 	    make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path, size, mode));
@@ -3977,8 +3977,8 @@ stripe_info_viable(struct sftp_fs_info *info, const char *path)
 }
 
 /*
- * One-shot lazy fs-info accessor.  Both maybe_submit_upload and
- * maybe_submit_download need the destination filesystem's stripe geometry
+ * One-shot lazy fs-info accessor.  Both submit_upload_maybe_split and
+ * submit_download_maybe_split need the destination filesystem's stripe geometry
  * for chunk alignment; we query it once and cache it on the orchestrator.
  * Returns 1 if we got usable stripe info, 0 if alignment should fall back
  * to plain file_size/num_ranges.  Output goes in *info_out (caller may
@@ -4148,7 +4148,7 @@ submit_download_ranges(struct sftp_parallel *p,
 }
 
 static int
-maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
+submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *remote_path, const char *local_path,
     off_t file_size, mode_t mode)
 {
@@ -4207,7 +4207,7 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (max_ranges < 2)
 		goto whole_file;
 
-	/* Same rationale as maybe_submit_upload: stripe-aligned when geometry
+	/* Same rationale as submit_upload_maybe_split: stripe-aligned when geometry
 	 * is available, plain file_size/num_ranges otherwise. */
 	int have_stripe = get_cached_fs_info(p, conn, remote_path, &info);
 	num_ranges = max_ranges;
@@ -4249,7 +4249,7 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
  *     ext4 (juliet) without measurable regression vs. whole-file.
  */
 static int
-maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
+submit_upload_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
     off_t file_size, mode_t mode)
 {
@@ -4269,7 +4269,7 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 			goto whole_file;
 	}
 
-	/* HPN_NO_RANGE_SPLIT=1 escape hatch, mirroring maybe_submit_upload. */
+	/* HPN_NO_RANGE_SPLIT=1 escape hatch, mirroring submit_upload_maybe_split. */
 	{
 		/* ENV-VAR HPN_NO_RANGE_SPLIT — developer-only: kill switch for
 		 * range-splitting (same as upload-side use, download path). */
@@ -4278,7 +4278,7 @@ maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 			goto whole_file;
 	}
 
-	/* Same rationale as maybe_submit_upload: RANGE_CHUNK_MULTIPLIER ×
+	/* Same rationale as submit_upload_maybe_split: RANGE_CHUNK_MULTIPLIER ×
 	 * num_streams chunks, bounded by file_size / effective_min. */
 	int base = p->cfg.num_streams;
 	if (base < 1) base = 1;
