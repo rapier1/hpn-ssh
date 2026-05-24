@@ -180,7 +180,8 @@ int
 sftp_server_hpn_handles(const char *name)
 {
 	return strcmp(name, HPN_EXT_FS_INFO) == 0
-	    || strcmp(name, HPN_EXT_BUNDLE_OPEN) == 0;
+	    || strcmp(name, HPN_EXT_BUNDLE_OPEN) == 0
+	    || strcmp(name, HPN_EXT_BUNDLE_FETCH) == 0;
 }
 
 /* ── BEGIN Phase 5: bundle handle implementation ──────────────────────────
@@ -206,18 +207,32 @@ sftp_server_hpn_handles(const char *name)
  */
 
 #ifdef WITH_LIBARCHIVE
+# include <fcntl.h>      /* O_RDONLY for bundle_fetch_pack_one */
 # include <sys/stat.h>
 # include <archive.h>
 # include <archive_entry.h>
 # include <libgen.h>     /* dirname() for mkdir-on-extract */
 
+/* libarchive write block size: matches sftp-client.c, picked to amortise
+ * tar header overhead over a reasonable payload chunk. */
+# define BUNDLE_BLOCK_BYTES (128 * 1024)
+
+/* Bundle handle mode: upload (open + write + close => extract) vs.
+ * download (fetch packs the tar buffer up-front, client drains via
+ * SSH_FXP_READ, close releases). */
+enum hpn_bundle_mode {
+	HPN_BUNDLE_MODE_UPLOAD = 0,   /* hpn-bundle-open */
+	HPN_BUNDLE_MODE_FETCH  = 1,   /* hpn-bundle-fetch */
+};
+
 /* Bundle state allocated for each open handle.  Lifetime spans from
- * hpn-bundle-open through close.  Owned by sftp-server-hpn.c; stored on
+ * hpn-bundle-open/fetch through close.  Owned by sftp-server-hpn.c; stored on
  * the handle table via handle_new_bundle's opaque field. */
 struct hpn_bundle_state {
-	char    *dest_dir;       /* absolute or relative dir to extract into */
+	enum hpn_bundle_mode mode;
+	char    *dest_dir;       /* upload mode: dir to extract into; unused for fetch */
 	uint32_t flags;          /* HPN_BUNDLE_FLAG_* */
-	u_char  *accum;          /* growing tar-stream buffer */
+	u_char  *accum;          /* upload: growing receive buffer; fetch: packed tar */
 	size_t   accum_len;
 	size_t   accum_cap;
 };
@@ -239,11 +254,30 @@ bundle_state_new(const char *dest_dir, uint32_t flags)
 	struct hpn_bundle_state *s = calloc(1, sizeof(*s));
 	if (s == NULL)
 		return NULL;
+	s->mode = HPN_BUNDLE_MODE_UPLOAD;
 	s->dest_dir = strdup(dest_dir);
 	if (s->dest_dir == NULL) {
 		free(s);
 		return NULL;
 	}
+	s->flags     = flags;
+	s->accum     = NULL;
+	s->accum_len = 0;
+	s->accum_cap = 0;
+	return s;
+}
+
+/* Fetch-mode counterpart: no dest_dir (server-side reads, doesn't extract),
+ * accum starts unallocated and is filled by the fetch handler's
+ * libarchive write pass before the handle is returned to the client. */
+static struct hpn_bundle_state *
+bundle_state_new_fetch(uint32_t flags)
+{
+	struct hpn_bundle_state *s = calloc(1, sizeof(*s));
+	if (s == NULL)
+		return NULL;
+	s->mode      = HPN_BUNDLE_MODE_FETCH;
+	s->dest_dir  = NULL;
 	s->flags     = flags;
 	s->accum     = NULL;
 	s->accum_len = 0;
@@ -294,6 +328,11 @@ sftp_server_hpn_bundle_write(int handle, uint64_t off,
 	struct hpn_bundle_state *s = handle_get_bundle(handle);
 	if (s == NULL)
 		return SSH2_FX_FAILURE;
+	if (s->mode != HPN_BUNDLE_MODE_UPLOAD) {
+		error_f("hpn-bundle: WRITE on non-upload bundle handle %d",
+		    handle);
+		return SSH2_FX_FAILURE;
+	}
 	/* Client writes monotonically — `off` should equal accum_len.
 	 * Tolerate skew by reseting to off when smaller (idempotent
 	 * retry case) but reject gaps. */
@@ -308,6 +347,29 @@ sftp_server_hpn_bundle_write(int handle, uint64_t off,
 	}
 	memcpy(s->accum + s->accum_len, data, len);
 	s->accum_len += len;
+	return SSH2_FX_OK;
+}
+
+int
+sftp_server_hpn_bundle_read(int handle, uint64_t off, u_char *out_buf,
+    size_t len, size_t *out_len)
+{
+	struct hpn_bundle_state *s = handle_get_bundle(handle);
+	if (s == NULL || out_buf == NULL || out_len == NULL)
+		return SSH2_FX_FAILURE;
+	if (s->mode != HPN_BUNDLE_MODE_FETCH) {
+		error_f("hpn-bundle: READ on non-fetch bundle handle %d",
+		    handle);
+		return SSH2_FX_FAILURE;
+	}
+	if (off >= s->accum_len) {
+		*out_len = 0;
+		return SSH2_FX_EOF;
+	}
+	size_t avail = s->accum_len - (size_t)off;
+	size_t n = len < avail ? len : avail;
+	memcpy(out_buf, s->accum + off, n);
+	*out_len = n;
 	return SSH2_FX_OK;
 }
 
@@ -380,6 +442,17 @@ sftp_server_hpn_bundle_close(int handle)
 	struct hpn_bundle_state *s = handle_get_bundle(handle);
 	if (s == NULL)
 		return SSH2_FX_FAILURE;
+
+	/* Fetch-mode handles already finished their server-side work in the
+	 * hpn-bundle-fetch handler (packed tar into accum).  Close is just a
+	 * resource release — no libarchive extraction. */
+	if (s->mode == HPN_BUNDLE_MODE_FETCH) {
+		debug_f("hpn-bundle close (fetch): handle=%d accum=%zu bytes",
+		    handle, s->accum_len);
+		bundle_state_free(s);
+		handle_free_bundle(handle);
+		return SSH2_FX_OK;
+	}
 
 	int status = SSH2_FX_OK;
 	struct archive *a = NULL;
@@ -637,6 +710,247 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	free(dest_dir);
 }
 
+/*
+ * libarchive_write callback writing into the bundle_state accumulator
+ * via bundle_state_reserve / memcpy.  Mirror of bundle_write_cb on the
+ * client upload side, but here the destination is in-process memory
+ * rather than the SFTP wire.
+ */
+static la_ssize_t
+bundle_fetch_archive_write_cb(struct archive *a, void *client_data,
+    const void *buf, size_t len)
+{
+	struct hpn_bundle_state *s = client_data;
+	(void)a;
+	if (bundle_state_reserve(s, len) != 0)
+		return -1;
+	memcpy(s->accum + s->accum_len, buf, len);
+	s->accum_len += len;
+	return (la_ssize_t)len;
+}
+
+/*
+ * Pack one path into the libarchive writer.  Returns 0 on success.
+ * On read/header errors the entry is skipped (logged) and the bundle
+ * continues — symmetric to upload-side per-entry skip behaviour.
+ */
+static int
+bundle_fetch_pack_one(struct archive *a, const char *path)
+{
+	struct archive_entry *ae = NULL;
+	struct stat sb;
+	int fd = -1;
+	int rc = -1;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		error_f("hpn-bundle-fetch: open \"%s\": %s",
+		    path, strerror(errno));
+		goto out;
+	}
+	if (fstat(fd, &sb) < 0) {
+		error_f("hpn-bundle-fetch: fstat \"%s\": %s",
+		    path, strerror(errno));
+		goto out;
+	}
+	if (!S_ISREG(sb.st_mode)) {
+		debug_f("hpn-bundle-fetch: \"%s\" not a regular file, skipping",
+		    path);
+		goto out;
+	}
+
+	ae = archive_entry_new();
+	if (ae == NULL) {
+		error_f("hpn-bundle-fetch: archive_entry_new failed");
+		goto out;
+	}
+	archive_entry_set_pathname(ae, path);
+	archive_entry_set_size(ae, (la_int64_t)sb.st_size);
+	archive_entry_set_filetype(ae, AE_IFREG);
+	archive_entry_set_perm(ae, sb.st_mode & 07777);
+	archive_entry_set_mtime(ae, sb.st_mtime, 0);
+
+	if (archive_write_header(a, ae) != ARCHIVE_OK) {
+		error_f("hpn-bundle-fetch: header \"%s\": %s",
+		    path, archive_error_string(a));
+		goto out;
+	}
+
+	{
+		off_t remaining = sb.st_size;
+		u_char buf[65536];
+		while (remaining > 0) {
+			ssize_t n = read(fd, buf,
+			    remaining < (off_t)sizeof(buf)
+			    ? (size_t)remaining : sizeof(buf));
+			if (n < 0) {
+				if (errno == EINTR)
+					continue;
+				error_f("hpn-bundle-fetch: read \"%s\": %s",
+				    path, strerror(errno));
+				goto out;
+			}
+			if (n == 0)
+				break;
+			if (archive_write_data(a, buf, (size_t)n) != n) {
+				error_f("hpn-bundle-fetch: write_data "
+				    "\"%s\": %s", path,
+				    archive_error_string(a));
+				goto out;
+			}
+			remaining -= n;
+		}
+	}
+	rc = 0;
+
+ out:
+	if (ae != NULL)
+		archive_entry_free(ae);
+	if (fd >= 0)
+		(void)close(fd);
+	return rc;
+}
+
+/*
+ * Process the hpn-bundle-fetch@hpnssh.org extended request.
+ *
+ * Wire format (after extension name):
+ *   u32 flags
+ *   u32 n_paths
+ *   for i in [0, n_paths): cstring path
+ *
+ * Server reads each file, packs into a libarchive ustar buffer held on
+ * a new fetch-mode bundle handle, replies with SSH_FXP_HANDLE.  Client
+ * drains the buffer via SSH_FXP_READ and closes the handle when done.
+ *
+ * On error replies SSH_FXP_STATUS with the appropriate SSH2_FX_* code.
+ */
+static void
+process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
+{
+	uint32_t flags = 0, n_paths = 0;
+	char **paths = NULL;
+	uint32_t n_collected = 0;
+	struct hpn_bundle_state *s = NULL;
+	struct archive *a = NULL;
+	struct sshbuf *msg = NULL;
+	int handle = -1;
+	int r, status = SSH2_FX_FAILURE;
+	uint32_t i;
+
+	if ((r = sshbuf_get_u32(iqueue, &flags)) != 0 ||
+	    (r = sshbuf_get_u32(iqueue, &n_paths)) != 0) {
+		error_f("parse hpn-bundle-fetch header: %s", ssh_err(r));
+		goto fail;
+	}
+	if (n_paths == 0 || n_paths > 65535) {
+		error_f("hpn-bundle-fetch: implausible n_paths=%u", n_paths);
+		goto fail;
+	}
+	paths = calloc(n_paths, sizeof(*paths));
+	if (paths == NULL) {
+		error_f("hpn-bundle-fetch: out of memory");
+		goto fail;
+	}
+	for (i = 0; i < n_paths; i++) {
+		if ((r = sshbuf_get_cstring(iqueue, &paths[i], NULL)) != 0) {
+			error_f("parse hpn-bundle-fetch path[%u]: %s",
+			    i, ssh_err(r));
+			goto fail;
+		}
+		n_collected++;
+	}
+
+	debug3("request %u: hpn-bundle-fetch n=%u flags=0x%x",
+	    id, n_paths, flags);
+
+	s = bundle_state_new_fetch(flags);
+	if (s == NULL) {
+		error_f("hpn-bundle-fetch: out of memory");
+		goto fail;
+	}
+
+	a = archive_write_new();
+	if (a == NULL) {
+		error_f("hpn-bundle-fetch: archive_write_new failed");
+		goto fail;
+	}
+	if (archive_write_set_format_ustar(a) != ARCHIVE_OK ||
+	    archive_write_set_bytes_per_block(a, BUNDLE_BLOCK_BYTES)
+	        != ARCHIVE_OK ||
+	    archive_write_open(a, s, NULL,
+	        bundle_fetch_archive_write_cb, NULL) != ARCHIVE_OK) {
+		error_f("hpn-bundle-fetch: libarchive setup: %s",
+		    archive_error_string(a));
+		goto fail;
+	}
+
+	/* Pack each path.  Per-entry failures are logged and skipped so a
+	 * single bad file (race-deleted, permission flap) doesn't kill the
+	 * whole bundle — symmetric to upload-side per-entry skip. */
+	for (i = 0; i < n_paths; i++)
+		(void)bundle_fetch_pack_one(a, paths[i]);
+
+	if (archive_write_close(a) != ARCHIVE_OK) {
+		error_f("hpn-bundle-fetch: archive_write_close: %s",
+		    archive_error_string(a));
+		goto fail;
+	}
+	archive_write_free(a);
+	a = NULL;
+
+	handle = handle_new_bundle(s);
+	if (handle < 0) {
+		error_f("hpn-bundle-fetch: handle table full");
+		goto fail;
+	}
+
+	debug_f("hpn-bundle-fetch: handle=%d n_paths=%u accum=%zu bytes",
+	    handle, n_paths, s->accum_len);
+
+	/* Hand ownership of `s` over to the handle table. */
+	s = NULL;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	{
+		u_char hbuf[sizeof(int32_t)];
+		put_u32(hbuf, (uint32_t)handle);
+		if ((r = sshbuf_put_u8(msg, SSH2_FXP_HANDLE)) != 0 ||
+		    (r = sshbuf_put_u32(msg, id)) != 0 ||
+		    (r = sshbuf_put_string(msg, hbuf, sizeof(hbuf))) != 0)
+			fatal_fr(r, "compose bundle-fetch handle reply");
+	}
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue bundle-fetch handle reply");
+	sshbuf_free(msg);
+
+	for (i = 0; i < n_collected; i++)
+		free(paths[i]);
+	free(paths);
+	return;
+
+ fail:
+	if (a != NULL)
+		archive_write_free(a);
+	if (s != NULL)
+		bundle_state_free(s);
+	for (i = 0; i < n_collected; i++)
+		free(paths[i]);
+	free(paths);
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u32(msg, status)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "")) != 0)
+		fatal_fr(r, "compose bundle-fetch failure");
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue bundle-fetch failure");
+	sshbuf_free(msg);
+}
+
 #else  /* !WITH_LIBARCHIVE */
 
 /* Stubs when libarchive is not available — bundle support is compiled out.
@@ -665,8 +979,37 @@ sftp_server_hpn_bundle_close(int handle)
 	return SSH2_FX_OP_UNSUPPORTED;
 }
 
+int
+sftp_server_hpn_bundle_read(int handle, uint64_t off, u_char *out_buf,
+    size_t len, size_t *out_len)
+{
+	(void)handle; (void)off; (void)out_buf; (void)len;
+	if (out_len)
+		*out_len = 0;
+	return SSH2_FX_OP_UNSUPPORTED;
+}
+
 static void
 process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
+{
+	struct sshbuf *msg;
+	int r;
+	(void)iqueue;
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u32(msg, SSH2_FX_OP_UNSUPPORTED)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "")) != 0)
+		fatal_fr(r, "compose unsupported reply");
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue unsupported reply");
+	sshbuf_free(msg);
+}
+
+static void
+process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
 	struct sshbuf *msg;
 	int r;
@@ -698,9 +1041,13 @@ sftp_server_hpn_dispatch(u_int id, const char *name,
 	struct sshbuf *msg;
 	int r;
 
-	/* Phase 5: bundle-open dispatches to its own handler. */
+	/* Phase 5: bundle-open / bundle-fetch dispatch to their own handlers. */
 	if (strcmp(name, HPN_EXT_BUNDLE_OPEN) == 0) {
 		process_hpn_bundle_open(id, iqueue, oqueue);
+		return;
+	}
+	if (strcmp(name, HPN_EXT_BUNDLE_FETCH) == 0) {
+		process_hpn_bundle_fetch(id, iqueue, oqueue);
 		return;
 	}
 

@@ -129,6 +129,9 @@ typedef struct {
 	int     none_switch;    /* Use none cipher */
 	int     none_enabled;   /* Allow none to be used */
 	int     nonemac_enabled;   /* Allow none to be used */
+	int     hpn_use_bundle;    /* Use hpn-bundle SFTP extension for small-file
+				    * aggregation in hpnsftp (default: yes).
+				    * Only consulted by hpnsftp; hpnssh ignores. */
 	int     disable_multithreaded; /* Disable multithreaded aes-ctr */
         int     metrics; /* enable metrics */
         int     metrics_interval; /* time in seconds between polls */

@@ -305,6 +305,32 @@ int sftp_upload_bundle(struct sftp_conn *conn,
 /* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
 int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
 
+/* True iff the server advertised hpn-bundle-fetch@hpnssh.org (download). */
+int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
+
+/*
+ * Download-side counterpart of sftp_upload_bundle.  Asks the server to
+ * pack the listed `entries[].remote_path` files into a single tar stream,
+ * then untars locally into each `entries[].local_path`.  Per-entry result
+ * codes are written into entries[i].result (0 = ok, -1 = skipped/failed).
+ *
+ * Returns 0 if the bundle transaction succeeded (even if some per-entry
+ * results are -1), -1 if the server refused the extension or the
+ * transaction failed at the wire level (in which case every entry is
+ * marked -1 and the caller should fall back to per-file downloads).
+ *
+ * Implementation lives in sftp-client-hpn.c.
+ */
+struct sftp_download_bundle_entry {
+	const char *remote_path;
+	const char *local_path;
+	int         result;
+};
+
+int sftp_bundle_download(struct sftp_conn *conn,
+    struct sftp_download_bundle_entry *entries, int n,
+    int preserve_flag);
+
 /* ── END Phase 5 ─────────────────────────────────────────────────────────*/
 
 /*

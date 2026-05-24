@@ -1140,6 +1140,30 @@ In some situations, such as transfers on a local area network, the impact
 of the HPN code produces a net decrease in performance. In these cases it is
 helpful to disable the HPN functionality. By default HPNDisabled is set to
 .Cm no. HPNSSH only.
+.It Cm HPNUseBundle
+Controls whether
+.Xr hpnsftp 1
+aggregates small files into bundled tar streams (the
+.Cm hpn-bundle@hpnssh.org
+SFTP extension) when running with
+.Cm -j
+parallel streams. Bundling amortizes per-file open/close round-trip
+costs that dominate small-file throughput on high-RTT paths.
+The argument must be
+.Cm yes
+or
+.Cm no .
+The default is
+.Cm yes .
+When set to
+.Cm no ,
+or when the remote
+.Xr hpnsftp-server 8
+does not advertise the bundle extension, hpnsftp falls back to the
+per-file pipelined batch upload path. Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
 .It Cm IdentitiesOnly
 Specifies that
 .Xr ssh 1

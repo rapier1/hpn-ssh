@@ -56,6 +56,13 @@ struct sftp_parallel_config {
 	 * time. */
 	int          range_split_min_mb;
 
+	/* Bundle-mode enable, resolved from ssh_config HPNUseBundle by
+	 * sftp.c (which queries `hpnssh -G host`).  0 = disabled (force
+	 * Phase-4 fallback), 1 = enabled (default; subject to server
+	 * advertising the hpn-bundle extension).  HPN_USE_BUNDLE=0 env var
+	 * in the worker also disables, taking precedence over this. */
+	int          use_bundle;
+
 	/* Transfer flags applied to every submitted unit */
 	int          preserve_flag;
 	int          resume_flag;
@@ -136,6 +143,24 @@ struct sftp_parallel_config {
  * should warn and fall back to single-stream mode).
  */
 struct sftp_parallel *sftp_parallel_start(const struct sftp_parallel_config *cfg);
+
+/*
+ * Populate pcfg fields from ssh_config resolution for `host`.  Uses the
+ * same two-pass parser as hpnssh (resolves Match blocks against the
+ * canonicalised hostname).  Today maps only:
+ *   HPNUseBundle yes|no  ->  pcfg->use_bundle
+ * Future ssh_config promotions (BundleSize, etc.) extend the mapping
+ * in sftp-parallel-config.c.
+ *
+ * host            : destination host argument (may include user@)
+ * user_config_file: explicit -F path, or NULL to use the standard
+ *                   ~/.ssh/config + /etc/ssh/ssh_config search.
+ *
+ * Returns 0 on success, -1 on parse failure.  On failure pcfg keeps
+ * compile-time defaults (use_bundle = 1).
+ */
+int sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
+    const char *host, const char *user_config_file);
 
 /*
  * Submit a work unit. These calls copy the path strings; the caller retains

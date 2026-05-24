@@ -121,6 +121,7 @@ static void process_extended_hpn_fs_info(uint32_t id);
 #ifdef WITH_LIBARCHIVE
 static void process_extended_hpn_bundle_open(uint32_t id);
 static void process_extended_hpn_bundle_cap(uint32_t id);
+static void process_extended_hpn_bundle_fetch(uint32_t id);
 #endif
 static void process_extended(uint32_t id);
 
@@ -179,6 +180,8 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_hpn_bundle_cap, 1 },
 	{ "hpn-bundle-open", HPN_EXT_BUNDLE_OPEN, 0,
 	    process_extended_hpn_bundle_open, 1 },
+	{ "hpn-bundle-fetch", HPN_EXT_BUNDLE_FETCH, 0,
+	    process_extended_hpn_bundle_fetch, 0 },
 #endif
 	{ NULL, NULL, 0, NULL, 0 }
 };
@@ -787,9 +790,12 @@ process_init(void)
 	compose_extension(msg, "users-groups-by-id@openssh.com", "1");
 	compose_extension(msg, HPN_EXT_FS_INFO, "1");
 #ifdef WITH_LIBARCHIVE
-	/* Phase 5: only advertise hpn-bundle when libarchive is linked,
-	 * since the server cannot extract the tar stream without it. */
+	/* Phase 5: only advertise hpn-bundle{,-fetch} when libarchive is
+	 * linked, since the server cannot pack/unpack the tar stream without
+	 * it.  Upload-side (hpn-bundle-open) and download-side
+	 * (hpn-bundle-fetch) ship together — both require libarchive. */
 	compose_extension(msg, HPN_EXT_BUNDLE, "1");
+	compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
 #endif
 
 	send_msg(msg);
@@ -875,6 +881,28 @@ process_read(uint32_t id)
 
 	debug("request %u: read \"%s\" (handle %d) off %llu len %u",
 	    id, handle_to_name(handle), handle, (unsigned long long)off, len);
+
+	/* Phase 5 (download bundling): READs on a fetch-mode bundle handle
+	 * return bytes from the pre-packed tar accumulator rather than
+	 * reading from an OS file descriptor. */
+	if (sftp_server_hpn_is_bundle_handle(handle)) {
+		size_t got = 0;
+		if (len > SFTP_MAX_READ_LENGTH)
+			len = SFTP_MAX_READ_LENGTH;
+		if (len > buflen) {
+			if ((buf = realloc(buf, len)) == NULL)
+				fatal_f("realloc failed");
+			buflen = len;
+		}
+		status = sftp_server_hpn_bundle_read(handle, off, buf, len,
+		    &got);
+		if (status == SSH2_FX_OK && got > 0)
+			send_data(id, buf, got);
+		else
+			send_status(id, status);
+		return;
+	}
+
 	if ((fd = handle_to_fd(handle)) == -1)
 		goto out;
 	if (len > SFTP_MAX_READ_LENGTH) {
@@ -1875,6 +1903,18 @@ process_extended_hpn_bundle_cap(uint32_t id)
 	error("hpn-bundle@hpnssh.org received as a request; clients should "
 	    "send hpn-bundle-open@hpnssh.org");
 	send_status(id, SSH2_FX_OP_UNSUPPORTED);
+}
+
+/* Phase 5 (download side): hpn-bundle-fetch@hpnssh.org dispatch wrapper.
+ * Client supplies a list of remote paths + base_dir; server reads them,
+ * packs into a tar buffer via libarchive write, allocates a bundle handle
+ * holding the buffer, replies with SSH_FXP_HANDLE.  Client then drains via
+ * SSH_FXP_READ (process_read routes bundle-handle reads to
+ * sftp_server_hpn_bundle_read) and closes the handle when done. */
+static void
+process_extended_hpn_bundle_fetch(uint32_t id)
+{
+	sftp_server_hpn_dispatch(id, HPN_EXT_BUNDLE_FETCH, iqueue, oqueue);
 }
 #endif /* WITH_LIBARCHIVE */
 

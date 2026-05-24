@@ -19,9 +19,10 @@
 #define _SFTP_SERVER_HPN_H
 
 /* Extension names advertised in SSH_FXP_VERSION and dispatched by sftp-server.c. */
-#define HPN_EXT_FS_INFO     "hpn-fs-info@hpnssh.org"
-#define HPN_EXT_BUNDLE      "hpn-bundle@hpnssh.org"        /* capability advert */
-#define HPN_EXT_BUNDLE_OPEN "hpn-bundle-open@hpnssh.org"   /* extended open request */
+#define HPN_EXT_FS_INFO      "hpn-fs-info@hpnssh.org"
+#define HPN_EXT_BUNDLE       "hpn-bundle@hpnssh.org"        /* capability advert */
+#define HPN_EXT_BUNDLE_OPEN  "hpn-bundle-open@hpnssh.org"   /* upload  bundle open  */
+#define HPN_EXT_BUNDLE_FETCH "hpn-bundle-fetch@hpnssh.org"  /* download bundle open */
 
 struct sshbuf;
 
@@ -80,8 +81,30 @@ int sftp_server_hpn_bundle_write(int handle, uint64_t off,
  * tar bytes, then release all bundle state and the handle itself.
  * Returns SSH2_FX_OK if every file in the bundle was extracted
  * successfully, otherwise an SSH2_FX_* error.
+ *
+ * For fetch-mode handles (download-side bundles populated up front by
+ * process_hpn_bundle_fetch), close simply releases the accumulator and
+ * always returns SSH2_FX_OK.
  */
 int sftp_server_hpn_bundle_close(int handle);
+
+/*
+ * Read up to len bytes from a fetch-mode bundle handle's accumulator
+ * into out_buf, starting at offset off.
+ *
+ * On success returns SSH2_FX_OK and sets *out_len to the number of bytes
+ * actually returned (0 < *out_len <= len for in-range reads).
+ *
+ * Returns SSH2_FX_EOF if off >= accumulator length (end of bundle).
+ *
+ * Returns an SSH2_FX_* error if the handle is not a fetch-mode bundle
+ * (e.g. an upload-side bundle being WRITten into) or other failure.
+ *
+ * Used by sftp-server.c's process_read for handles where
+ * sftp_server_hpn_is_bundle_handle() returns true.
+ */
+int sftp_server_hpn_bundle_read(int handle, uint64_t off,
+    u_char *out_buf, size_t len, size_t *out_len);
 
 /* ── END Phase 5 ─────────────────────────────────────────────────────── */
 

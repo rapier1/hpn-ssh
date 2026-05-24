@@ -132,6 +132,7 @@ struct sftp_conn {
 #define SFTP_EXT_GETUSERSGROUPS_BY_ID	0x00000200
 #define SFTP_EXT_HPN_FS_INFO		0x00000400
 #define SFTP_EXT_HPN_BUNDLE		0x00000800
+#define SFTP_EXT_HPN_BUNDLE_FETCH	0x00001000
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
@@ -146,7 +147,7 @@ struct request {
 };
 TAILQ_HEAD(requests, request);
 
-static u_char *
+u_char *
 get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
     const char *errfmt, ...) __attribute__((format(printf, 4, 5)));
 
@@ -187,7 +188,11 @@ sftpio(void *_bwlimit, size_t amount)
 	return 0;
 }
 
-static int
+/* HPN: send_msg / get_msg / get_handle dropped `static` qualifier so
+ * HPN-only client code (sftp-client-hpn.c) can implement extension
+ * helpers like sftp_bundle_download without redefining the SFTP
+ * transport layer.  Declarations live in sftp-client-internal.h. */
+int
 send_msg(struct sftp_conn *conn, struct sshbuf *m)
 {
 	u_char mlen[4];
@@ -277,7 +282,7 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 	return 0;
 }
 
-static int
+int
 get_msg(struct sftp_conn *conn, struct sshbuf *m)
 {
 	return get_msg_extended(conn, m, 0);
@@ -364,7 +369,7 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 	return status;
 }
 
-static u_char *
+u_char *
 get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
     const char *errfmt, ...)
 {
@@ -659,6 +664,12 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 			/* Phase 5: server can accept tar-format bundles via
 			 * the hpn-bundle-open@hpnssh.org extension. */
 			ret->exts |= SFTP_EXT_HPN_BUNDLE;
+			known = 1;
+		} else if (strcmp(name, "hpn-bundle-fetch@hpnssh.org") == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			/* Phase 5: server can produce tar-format bundles from
+			 * a list of paths via hpn-bundle-fetch@hpnssh.org. */
+			ret->exts |= SFTP_EXT_HPN_BUNDLE_FETCH;
 			known = 1;
 		}
 		if (known) {
@@ -3444,6 +3455,22 @@ int
 sftp_conn_has_hpn_bundle(struct sftp_conn *conn)
 {
 	return conn && (conn->exts & SFTP_EXT_HPN_BUNDLE) != 0;
+}
+
+int
+sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn)
+{
+	return conn && (conn->exts & SFTP_EXT_HPN_BUNDLE_FETCH) != 0;
+}
+
+/* Allocate the next outbound SFTP message id for `conn`.  Internal-only
+ * accessor used by HPN extension code in sftp-client-hpn.c so it doesn't
+ * have to know struct sftp_conn's layout (which lives in sftp-client.c).
+ * Declared in sftp-client-internal.h. */
+u_int
+sftp_conn_alloc_msg_id(struct sftp_conn *conn)
+{
+	return conn->msg_id++;
 }
 
 #ifndef WITH_LIBARCHIVE

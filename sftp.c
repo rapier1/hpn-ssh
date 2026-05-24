@@ -3050,28 +3050,6 @@ main(int argc, char **argv)
 	 * The master and workers honor the same -i / -F / -o options the
 	 * user gave the main connection (captured during getopt above).
 	 */
-	/*
-	 * Phase 5: bundle support lives on top of the parallel-streams
-	 * orchestrator's batch accumulator (worker_run_bundle in
-	 * sftp-parallel.c).  If the user asks for bundles via the
-	 * HPN_USE_BUNDLE env var but didn't pass -j, the env var would be
-	 * silently ignored — warn so they can re-run with -j and actually
-	 * get the path they wanted.
-	 */
-	if (!parallel_user_opt_in) {
-		/* ENV-VAR HPN_USE_BUNDLE — config-candidate: primary on/off toggle
-		 * for Phase 5 small-file bundling.  Promote to ssh_config
-		 * BundleEnabled and/or hpnsftp -X bundle=yes before 18.10. */
-		const char *e = getenv("HPN_USE_BUNDLE");
-		if (e != NULL && *e != '\0' && *e != '0') {
-			fprintf(stderr,
-			    "hpnsftp: HPN_USE_BUNDLE=%s set but bundling "
-			    "requires -j N (parallel streams); ignoring.\n"
-			    "         Re-run with `-j 1` (or higher) to "
-			    "enable the bundle path.\n", e);
-		}
-	}
-
 	if (parallel_user_opt_in && sftp_direct == NULL) {
 		struct sftp_parallel_config pcfg;
 		char portbuf[16] = "";
@@ -3091,6 +3069,11 @@ main(int argc, char **argv)
 		pcfg.num_requests     = (unsigned int)num_requests;
 		pcfg.limit_kbps       = limit_kbps;
 		pcfg.range_split_min_mb = range_split_min_mb_user;
+		/* Resolve HPNUseBundle and any other ssh_config-derived
+		 * pcfg fields.  Sets pcfg.use_bundle; defaults to 1 (yes)
+		 * if parsing fails or the option isn't set. */
+		(void)sftp_parallel_apply_ssh_config(&pcfg, host,
+		    parallel_config_file);
 		pcfg.preserve_flag    = global_pflag;
 		pcfg.fsync_flag       = global_fflag;
 		pcfg.print_flag       = quiet ? 0 : 1;

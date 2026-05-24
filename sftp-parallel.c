@@ -1165,6 +1165,65 @@ worker_run_bundle(struct sftp_worker *w,
 
 	free(entries);
 }
+
+/*
+ * Download-side counterpart of worker_run_bundle.  Builds the entries
+ * array from a batch of SFTP_OP_DOWNLOAD units (src_path = remote,
+ * dst_path = local), asks the server to pack the listed paths via
+ * sftp_bundle_download, then finalises each work unit with its
+ * per-entry result.
+ *
+ * Mirrors worker_run_bundle's failure handling: per-entry result is
+ * propagated through worker_finalize_one_entry, which re-queues on
+ * failure via the normal retry path.  If the whole transaction fails
+ * (server refused extension, mid-stream wire error), every entry is
+ * marked -1 and each gets retried individually.
+ */
+static void
+worker_run_bundle_download(struct sftp_worker *w,
+    struct sftp_work_unit **batch, int bn)
+{
+	struct sftp_parallel *p = w->parent;
+	struct sftp_download_bundle_entry *entries;
+	uint64_t total_bytes = 0;
+	int i, ok_count = 0;
+	uint64_t t_start_ns, t_end_ns, elapsed_us;
+
+	entries = xcalloc(bn, sizeof(*entries));
+	for (i = 0; i < bn; i++) {
+		entries[i].remote_path = batch[i]->src_path;
+		entries[i].local_path  = batch[i]->dst_path;
+		entries[i].result      = 0;
+		if (batch[i]->size > 0)
+			total_bytes += (uint64_t)batch[i]->size;
+		worker_record_start(w);
+	}
+
+	t_start_ns = monotonic_ns();
+	(void)sftp_bundle_download(w->conn, entries, bn,
+	    p->cfg.preserve_flag);
+	t_end_ns = monotonic_ns();
+	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
+	for (i = 0; i < bn; i++)
+		if (entries[i].result == 0)
+			ok_count++;
+	{
+		double mibps = 0.0;
+		if (elapsed_us > 0)
+			mibps = ((double)total_bytes / (1024.0 * 1024.0)) /
+			    ((double)elapsed_us / 1e6);
+		logit("BUNDLE-DL worker=%d files=%d ok=%d bytes=%llu "
+		    "elapsed_us=%llu MiBps=%.2f",
+		    w->id, bn, ok_count,
+		    (unsigned long long)total_bytes,
+		    (unsigned long long)elapsed_us, mibps);
+	}
+
+	for (i = 0; i < bn; i++)
+		worker_finalize_one_entry(p, w, batch[i], entries[i].result);
+
+	free(entries);
+}
 /* ── END Phase 5 ──────────────────────────────────────────────────────── */
 
 static void *
@@ -1198,23 +1257,42 @@ worker_thread(void *arg)
 			w->batch_pipe_disabled = 1;
 	}
 
-	/* Phase 5: bundle-mode opt-in.  Enabled iff HPN_USE_BUNDLE=1 AND the
-	 * server advertises the hpn-bundle@hpnssh.org extension.  Both
-	 * conditions are sampled once per worker at startup. */
+	/* Phase 5 bundle-mode: ON by default when the server advertises
+	 * hpn-bundle@hpnssh.org.  Precedence for disabling:
+	 *   1. HPN_USE_BUNDLE=0 env var (dev-side kill switch)
+	 *   2. HPNUseBundle no   in ssh_config (resolved by sftp.c via
+	 *                        `hpnssh -G host`; stored in p->cfg.use_bundle)
+	 *   3. server doesn't advertise hpn-bundle extension
+	 * Any of these forces the Phase-4 pipelined batch fallback.
+	 *
+	 * Sampled once per worker at startup; survives the lifetime of
+	 * the worker. */
 	w->bundle_target_bytes = BUNDLE_TARGET_BYTES;
 	{
-		/* ENV-VAR HPN_USE_BUNDLE — config-candidate: primary on/off
-		 * toggle for Phase 5 small-file bundling.  Also read at the
-		 * front of sftp.c (warning path).  Promote to ssh_config
-		 * BundleEnabled / hpnsftp -X bundle=yes before 18.10. */
+		/* ENV-VAR HPN_USE_BUNDLE — developer-only: kill switch for
+		 * bundle-mode.  Promoted to the HPNUseBundle ssh_config
+		 * option (parsed in readconf.c); env var stays as a dev
+		 * override that bypasses config.  Set =0 to force the
+		 * Phase-4 fallback regardless of config.  Any other value
+		 * (or unset) defers to ssh_config HPNUseBundle and the
+		 * server's extension advertisement. */
 		const char *e = getenv("HPN_USE_BUNDLE");
-		if (e != NULL && *e != '\0' && *e != '0' &&
-		    sftp_conn_has_hpn_bundle(w->conn)) {
+		int env_disabled = (e != NULL && *e == '0' && e[1] == '\0');
+		int cfg_disabled = (w->parent->cfg.use_bundle == 0);
+
+		if (env_disabled) {
+			debug_ft("worker %d: bundle disabled by "
+			    "HPN_USE_BUNDLE=0", w->id);
+		} else if (cfg_disabled) {
+			debug_ft("worker %d: bundle disabled by "
+			    "ssh_config HPNUseBundle no", w->id);
+		} else if (sftp_conn_has_hpn_bundle(w->conn)) {
 			w->bundle_enabled = 1;
 			/* ENV-VAR HPN_BUNDLE_TARGET_BYTES — config-candidate:
-			 * size tuning knob for the bundle accumulator (default
-			 * 4 MiB).  Useful for sites with high RTT.  Promote to
-			 * ssh_config BundleSize / -X bundle_size=N before 18.10. */
+			 * size tuning knob for the bundle accumulator
+			 * (default 4 MiB).  Useful for sites with high RTT.
+			 * Promote to ssh_config BundleSize /
+			 * -X bundle_size=N before 18.10. */
 			e = getenv("HPN_BUNDLE_TARGET_BYTES");
 			if (e != NULL && *e != '\0') {
 				unsigned long long v = strtoull(e, NULL, 10);
@@ -1225,9 +1303,10 @@ worker_thread(void *arg)
 			    "(target_bytes=%llu)",
 			    w->id,
 			    (unsigned long long)w->bundle_target_bytes);
-		} else if (e != NULL && *e != '\0' && *e != '0') {
-			debug_ft("worker %d: HPN_USE_BUNDLE set but server "
-			    "lacks hpn-bundle extension", w->id);
+		} else {
+			debug_ft("worker %d: server lacks hpn-bundle "
+			    "extension, using Phase-4 batch fallback",
+			    w->id);
 		}
 	}
 
@@ -1316,7 +1395,18 @@ worker_thread(void *arg)
 		 * Falls back to single-unit execution if the first unit is
 		 * not an upload or if the batch stays at size 1.
 		 */
-		if (u0->op == SFTP_OP_UPLOAD) {
+		/* Phase 5 (download side): only batch DOWNLOAD units when
+		 * the server advertises hpn-bundle-fetch and the worker has
+		 * bundle mode on; otherwise downloads continue down the
+		 * single-unit branch (Phase 4 pipelining for downloads is
+		 * still future work). */
+		int batch_eligible_download =
+		    (u0->op == SFTP_OP_DOWNLOAD &&
+		     w->bundle_enabled &&
+		     sftp_conn_has_hpn_bundle_fetch(w->conn));
+		enum sftp_op batch_op = u0->op;
+
+		if (u0->op == SFTP_OP_UPLOAD || batch_eligible_download) {
 			struct sftp_work_unit *batch[UPLOAD_BATCH_SIZE];
 			struct sftp_work_unit *leftover = NULL;
 			int bn = 0;
@@ -1345,13 +1435,13 @@ worker_thread(void *arg)
 					__atomic_fetch_sub(&p->queued_bytes,
 					    (uint64_t)nu->size,
 					    __ATOMIC_RELAXED);
-				if (nu->op == SFTP_OP_UPLOAD) {
+				if (nu->op == batch_op) {
 					batch[bn++] = nu;
 					if (nu->size > 0)
 						batch_bytes +=
 						    (uint64_t)nu->size;
 				} else {
-					/* Non-upload: stop collecting, handle after batch. */
+					/* Off-op: stop collecting, handle after batch. */
 					leftover = nu;
 					break;
 				}
@@ -1383,13 +1473,24 @@ worker_thread(void *arg)
 				    (long long)batch[0]->range_offset,
 				    (long long)batch[0]->range_length);
 				worker_process_result(w, batch[0], rc);
+			} else if ((int)batch_op == (int)SFTP_OP_DOWNLOAD) {
+				/*
+				 * Phase 5 (download side): the eligibility
+				 * gate above guarantees w->bundle_enabled and
+				 * the server has hpn-bundle-fetch, so the only
+				 * dispatch for a multi-unit DOWNLOAD batch is
+				 * bundle-fetch.  Synchronous; no pipelined
+				 * carry-over state on the download bundle path.
+				 */
+				worker_run_bundle_download(w, batch, bn);
 			} else if (w->bundle_enabled) {
 				/*
-				 * Phase 5: bundle this batch as a tar stream
-				 * and ship through one OPEN/WRITE×N/CLOSE.
-				 * Synchronous; the pipelined-batch carry-over
-				 * state (batch_prev_pending et al) is unused
-				 * on the bundle path and stays NULL.
+				 * Phase 5 (upload side): bundle this batch as
+				 * a tar stream and ship through one
+				 * OPEN/WRITE×N/CLOSE.  Synchronous; the
+				 * pipelined-batch carry-over state
+				 * (batch_prev_pending et al) is unused on the
+				 * bundle path and stays NULL.
 				 */
 				worker_run_bundle(w, batch, bn);
 			} else {
@@ -3500,15 +3601,15 @@ maybe_submit_download(struct sftp_parallel *p, struct sftp_conn *conn,
  * Decide whether and how to range-split a large file, then either submit
  * range units (via submit_upload_ranges) or fall back to a whole-file unit.
  *
- * Range splitting is only safe on parallel filesystems (Lustre/GPFS) where
- * different stripes live on different OSTs and concurrent writes to one
- * file at different offsets do not contend.  On a regular POSIX filesystem
- * (ext4/xfs/etc.) concurrent writes to the same inode contend on page
- * cache, writeback, and inode locks — empirically this widens throughput
- * variance dramatically without lifting the mean.  So we range-split
- * exclusively when sftp_fs_info reports valid stripe geometry; otherwise
- * the file is submitted as a single whole-file unit and the scaler relies
- * on multi-file parallelism (one worker per file) to scale up.
+ * Two range-split modes:
+ *   - Stripe-aligned: when hpn-fs-info reports valid Lustre/GPFS stripe
+ *     geometry, each range is rounded up to a stripe boundary so adjacent
+ *     ranges target different OSTs.
+ *   - Plain: when no stripe info is available (ext4/xfs/NFS/etc.), ranges
+ *     are simply file_size / num_ranges.  The server pwrite()s into a
+ *     pre-allocated file; whether the underlying FS actually parallelises
+ *     those writes is filesystem-dependent, but exercised in practice on
+ *     ext4 (juliet) without measurable regression vs. whole-file.
  */
 static int
 maybe_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,

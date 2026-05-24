@@ -158,7 +158,7 @@ typedef enum {
 	oTunnel, oTunnelDevice,
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
 	oTcpRcvBufPoll, oTcpRcvBufRescue, oHPNDisabled,
-	oNoneEnabled, oNoneMacEnabled, oNoneSwitch,
+	oNoneEnabled, oNoneMacEnabled, oNoneSwitch, oHPNUseBundle,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oVisualHostKey,
@@ -299,6 +299,7 @@ static struct {
 	{ "noneenabled", oNoneEnabled },
 	{ "nonemacenabled", oNoneMacEnabled },
 	{ "noneswitch", oNoneSwitch },
+	{ "hpnusebundle", oHPNUseBundle },
 	{ "usemptcp", oUseMPTCP},
 	{ "happyeyes", oHappyEyes },
 	{ "happydelay", oHappyDelay },
@@ -1369,6 +1370,10 @@ parse_time:
 
 	case oNoneMacEnabled:
 		intptr = &options->nonemac_enabled;
+		goto parse_flag;
+
+	case oHPNUseBundle:
+		intptr = &options->hpn_use_bundle;
 		goto parse_flag;
 
 	case oUseMPTCP:
@@ -2894,6 +2899,7 @@ initialize_options(Options * options)
 	options->none_switch = -1;
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
+	options->hpn_use_bundle = -1;
 	options->use_mptcp = -1;
 	options->use_happyeyes = -1;
 	options->happy_delay = -1;
@@ -3094,6 +3100,8 @@ fill_default_options(Options * options)
 	}
 	if (options->nonemac_enabled == -1)
 		options->nonemac_enabled = 0;
+	if (options->hpn_use_bundle == -1)
+		options->hpn_use_bundle = 1;	/* default: yes */
 	if (options->nonemac_enabled > 0 && (options->none_enabled == 0 ||
 					     options->none_switch == 0)) {
 		fprintf(stderr, "None MAC can only be used with the None cipher. None MAC disabled.\n");
@@ -3955,6 +3963,7 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oNoneSwitch, o->none_switch);
 	dump_cfg_fmtint(oNoneEnabled, o->none_enabled);
 	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
+	dump_cfg_fmtint(oHPNUseBundle, o->hpn_use_bundle);
 	dump_cfg_fmtint(oFallback, o->fallback);
 	dump_cfg_fmtint(oMetrics, o->metrics);
 	dump_cfg_fmtint(oUseMPTCP, o->use_mptcp);
