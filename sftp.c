@@ -684,13 +684,21 @@ local_is_dir(const char *path)
  * Safe to call when parallel_orch is NULL (no-op) or when no submissions are
  * outstanding (sftp_parallel_wait returns immediately).
  */
-static void
+/*
+ * Drains the parallel orchestrator and returns 0 if every submitted
+ * unit completed successfully, -1 if any unit was permanently lost
+ * (units_failed_aggregate > 0).  Callers MUST propagate -1 up to the
+ * sftp exit code: silent data loss is unacceptable.  When parallel_orch
+ * is NULL (parallel mode off) the function is a no-op returning 0.
+ */
+static int
 parallel_flush(void)
 {
 	struct sftp_parallel_stats pstats;
+	int rc = 0;
 
 	if (parallel_orch == NULL)
-		return;
+		return 0;
 
 	sftp_parallel_wait(parallel_orch);
 	sftp_parallel_progress_stop(parallel_orch);
@@ -701,6 +709,14 @@ parallel_flush(void)
 		    "this recurs across transfers",
 		    pstats.protocol_violations);
 	}
+	if (pstats.units_failed_aggregate > 0) {
+		error("TRANSFER INCOMPLETE: %llu file(s) could not be "
+		    "delivered after retries; check stderr above for "
+		    "per-file diagnostics",
+		    (unsigned long long)pstats.units_failed_aggregate);
+		rc = -1;
+	}
+	return rc;
 }
 
 static int
@@ -836,8 +852,10 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 	 * each get on a slow chunk from the previous one.  Err reporting and
 	 * the protocol-violation summary then happen at flush time.
 	 */
-	if (parallel_orch != NULL && !defer_parallel_wait)
-		parallel_flush();
+	if (parallel_orch != NULL && !defer_parallel_wait) {
+		if (parallel_flush() != 0)
+			err = -1;
+	}
 
 out:
 	free(abs_src);
@@ -965,8 +983,10 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 	/* See process_get — deferred mode skips the per-command drain so
 	 * successive put commands pipeline their files instead of each one
 	 * stalling on a slow tail chunk from the previous file. */
-	if (parallel_orch != NULL && !defer_parallel_wait)
-		parallel_flush();
+	if (parallel_orch != NULL && !defer_parallel_wait) {
+		if (parallel_flush() != 0)
+			err = -1;
+	}
 
 out:
 	free(abs_dst);
@@ -1997,7 +2017,8 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		    strcasecmp(path1, "no") == 0 ||
 		    strcmp(path1, "0") == 0) {
 			if (defer_parallel_wait && parallel_orch != NULL) {
-				parallel_flush();
+				if (parallel_flush() != 0)
+					err = -1;
 			}
 			defer_parallel_wait = 0;
 			if (!quiet)
@@ -2014,7 +2035,8 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		 * flight or when the orchestrator isn't running.  Always
 		 * safe — independent of the defer flag. */
 		if (parallel_orch != NULL) {
-			parallel_flush();
+			if (parallel_flush() != 0)
+				err = -1;
 		}
 		if (!quiet)
 			printf("wait: drained\n");
@@ -2616,7 +2638,8 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	 * already drained itself, so the queue is empty and the wait returns
 	 * immediately.
 	 */
-	parallel_flush();
+	if (parallel_flush() != 0)
+		err = -1;
 
 	ssh_signal(SIGCHLD, SIG_DFL);
 	free(remote_path);

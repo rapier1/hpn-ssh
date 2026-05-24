@@ -241,6 +241,85 @@ struct hpn_bundle_state {
 #define HPN_BUNDLE_FLAG_PRESERVE   0x00000001U
 #define HPN_BUNDLE_FLAG_FSYNC      0x00000002U
 
+/* ── Server-side bundle accumulator caps ─────────────────────────────────
+ *
+ * SFTP is normally bounded by SFTP_MAX_MSG_LENGTH (256 KiB per message).
+ * Bundle handles break that invariant: an upload bundle accepts a long
+ * sequence of WRITEs into a malloc'd accumulator, and a download bundle
+ * pre-allocates a tar buffer sized by the client's path list.  Without a
+ * server-side cap a malicious or misconfigured client can drive the
+ * server to OOM.
+ *
+ * Caps are process-local — sftp-server is forked per user connection by
+ * sshd, so the "total across handles" cap is per-connection.  Per-system
+ * memory protection (RLIMIT_AS, sshd's MaxStartups) is the OS's
+ * responsibility.
+ *
+ * Default per-bundle cap is 16× the empirical 4 MiB bundle target,
+ * giving operators headroom while still capping abuse at a small number.
+ * Default total cap is SFTP_PARALLEL_MAX_WORKERS (24) × per-bundle —
+ * matches the maximum concurrent worker count on the client side.
+ *
+ * Both are tunable via env vars (HPN_BUNDLE_MAX_BYTES,
+ * HPN_BUNDLE_MAX_TOTAL_BYTES) read once on first use.  An operator can
+ * set these in the sshd unit's environment.  Promotion to a real
+ * sshd_config option (HPNBundleMaxSize) is a future cleanup; the env
+ * vars exist so the cap is reachable today without plumbing through
+ * servconf.c.
+ */
+#define HPN_BUNDLE_PER_CAP_DEFAULT   ((size_t)64  * 1024 * 1024)  /* 64 MiB */
+#define HPN_BUNDLE_TOTAL_CAP_DEFAULT ((size_t)1536* 1024 * 1024)  /* 1.5 GiB */
+
+static size_t bundle_per_cap   = 0;   /* 0 = uninitialised */
+static size_t bundle_total_cap = 0;
+static size_t bundle_total_bytes = 0; /* sum of accum_cap across open handles */
+
+/* Parse env_var as a byte count; honours K/M/G suffix.  Returns fallback
+ * if unset, empty, or unparseable. */
+static size_t
+parse_bytes_env(const char *env_var, size_t fallback)
+{
+	const char *v = getenv(env_var);
+	if (v == NULL || *v == '\0')
+		return fallback;
+	char *end = NULL;
+	unsigned long long n = strtoull(v, &end, 10);
+	if (end == v)
+		return fallback;
+	switch (*end) {
+	case 'G': case 'g': n *= 1024ULL * 1024 * 1024; break;
+	case 'M': case 'm': n *= 1024ULL * 1024;        break;
+	case 'K': case 'k': n *= 1024ULL;               break;
+	case '\0':                                       break;
+	default: return fallback;
+	}
+	if (n == 0 || n > SIZE_MAX)
+		return fallback;
+	return (size_t)n;
+}
+
+static void
+bundle_caps_init(void)
+{
+	if (bundle_per_cap != 0)
+		return;
+	/* ENV-VAR HPN_BUNDLE_MAX_BYTES — server-side: per-bundle accumulator
+	 * cap.  Reject WRITE / pack expansion past this point.  Defaults
+	 * 64 MiB.  Operator-tunable; raise carefully on high-concurrency
+	 * sites since memory cost scales with concurrent bundle handles. */
+	bundle_per_cap   = parse_bytes_env("HPN_BUNDLE_MAX_BYTES",
+	    HPN_BUNDLE_PER_CAP_DEFAULT);
+	/* ENV-VAR HPN_BUNDLE_MAX_TOTAL_BYTES — server-side: aggregate
+	 * accumulator cap across all open bundle handles in this
+	 * sftp-server process.  Reject new bundle opens / growth past this
+	 * point.  Defaults 1.5 GiB. */
+	bundle_total_cap = parse_bytes_env("HPN_BUNDLE_MAX_TOTAL_BYTES",
+	    HPN_BUNDLE_TOTAL_CAP_DEFAULT);
+	debug_f("hpn-bundle caps: per=%zu MiB total=%zu MiB",
+	    bundle_per_cap   / (1024*1024),
+	    bundle_total_cap / (1024*1024));
+}
+
 /* These callbacks live in sftp-server.c so sftp-server-hpn.c doesn't
  * need to know about the handle table internals. */
 extern int    handle_new_bundle(void *opaque);
@@ -290,28 +369,73 @@ bundle_state_free(struct hpn_bundle_state *s)
 {
 	if (s == NULL)
 		return;
+	/* Release this handle's contribution to the process-wide total
+	 * before freeing the buffer. */
+	if (s->accum_cap > 0) {
+		if (bundle_total_bytes >= s->accum_cap)
+			bundle_total_bytes -= s->accum_cap;
+		else
+			bundle_total_bytes = 0;
+	}
 	free(s->dest_dir);
 	free(s->accum);
 	free(s);
 }
 
-/* Ensure accum has room for `need` additional bytes. */
+/*
+ * Ensure accum has room for `need` additional bytes.
+ *
+ * Enforces two caps:
+ *   - per-bundle: accum_len + need must not exceed bundle_per_cap
+ *   - total: the new accum_cap minus the old accum_cap (i.e. the bytes
+ *     this growth would add to bundle_total_bytes) must keep
+ *     bundle_total_bytes <= bundle_total_cap
+ *
+ * Returns 0 on success, -1 on allocation failure OR cap exceeded.
+ * Callers translate -1 into SSH2_FX_FAILURE on the wire.
+ */
 static int
 bundle_state_reserve(struct hpn_bundle_state *s, size_t need)
 {
+	bundle_caps_init();
+
+	if (s->accum_len > SIZE_MAX - need ||
+	    s->accum_len + need > bundle_per_cap) {
+		error_f("hpn-bundle: per-bundle cap exceeded "
+		    "(would be %zu, cap %zu)",
+		    s->accum_len + need, bundle_per_cap);
+		return -1;
+	}
 	if (s->accum_len + need <= s->accum_cap)
 		return 0;
+
 	size_t new_cap = s->accum_cap ? s->accum_cap : 65536;
 	while (new_cap < s->accum_len + need) {
 		if (new_cap > SIZE_MAX / 2)
 			return -1;
 		new_cap *= 2;
 	}
+	/* Clamp the geometric growth to the per-bundle cap so we don't
+	 * over-allocate beyond what the bundle could ever legitimately
+	 * hold. */
+	if (new_cap > bundle_per_cap)
+		new_cap = bundle_per_cap;
+
+	size_t added = new_cap - s->accum_cap;
+	if (bundle_total_bytes > SIZE_MAX - added ||
+	    bundle_total_bytes + added > bundle_total_cap) {
+		error_f("hpn-bundle: total-across-handles cap exceeded "
+		    "(would be %zu, cap %zu)",
+		    bundle_total_bytes + added, bundle_total_cap);
+		return -1;
+	}
+
 	u_char *p = realloc(s->accum, new_cap);
 	if (p == NULL)
 		return -1;
 	s->accum     = p;
 	s->accum_cap = new_cap;
+	bundle_total_bytes += added;
 	return 0;
 }
 

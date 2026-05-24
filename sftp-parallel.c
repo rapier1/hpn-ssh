@@ -304,6 +304,37 @@ enum sftp_op {
 	SFTP_OP_DOWNLOAD_RANGE,	/* download a byte range of a large file */
 };
 
+/*
+ * Per-file completion tracker shared across the N range work units that
+ * make up a single SFTP_OP_DOWNLOAD_RANGE transfer.  Used to detect
+ * partial-range failure: if even one range gives up permanently after
+ * retries, the local pre-allocated file is silently corrupt (some range
+ * offsets contain the just-written bytes, others contain zeros from
+ * ftruncate).  Without this tracker the user has no way to know — the
+ * file exists at the expected size with no error indicator.
+ *
+ * Each range unit holds a pointer to the same tracker.  On every range's
+ * final completion (success OR give-up, NOT retry), the tracker is
+ * decremented under its mutex.  The thread that drops `remaining` to 0
+ * is the LAST completer; if `any_failed` is set at that point it
+ * unlinks the corrupt local file and logs the corruption event.
+ *
+ * Ownership: the LAST completer frees the tracker.  The shared pointer
+ * in each work_unit is read-only after submit; only the mutex-protected
+ * counters change.
+ *
+ * Upload-range counterpart (SFTP_OP_UPLOAD_RANGE) has the same
+ * corruption shape on the REMOTE file; see project_range_partial_failure.md
+ * for the upload-side follow-up.
+ */
+struct sftp_range_tracker {
+	pthread_mutex_t mu;
+	int             total;
+	int             remaining;
+	int             any_failed;
+	char           *local_path; /* unlink target on partial failure */
+};
+
 struct sftp_work_unit {
 	enum sftp_op op;
 	char    *src_path;
@@ -311,9 +342,19 @@ struct sftp_work_unit {
 	off_t    size;
 	mode_t   mode;
 	int      attempt;
-	/* Range fields: used only for SFTP_OP_UPLOAD_RANGE. */
+	/* Phase 5: set to 1 after a bundle wire failure (server refused open,
+	 * mid-stream error).  The worker batch loop refuses to bundle units
+	 * with this flag set and dispatches them through the per-file path
+	 * instead — so a server-side cap rejection (or any other bundle
+	 * wire failure) does not strand the user's files.  Reset only by
+	 * re-creation via make_unit on a fresh submit. */
+	int      bundle_ineligible;
+	/* Range fields: used only for SFTP_OP_UPLOAD_RANGE / DOWNLOAD_RANGE. */
 	off_t    range_offset;
 	off_t    range_length;
+	/* Shared across all range units of one file.  NULL for non-range
+	 * units.  See struct sftp_range_tracker above. */
+	struct sftp_range_tracker *range_tracker;
 };
 
 struct sftp_worker {
@@ -758,7 +799,77 @@ free_unit(struct sftp_work_unit *u)
 	if (u == NULL) return;
 	free(u->src_path);
 	free(u->dst_path);
+	/* range_tracker is shared across sibling range units; never freed
+	 * by free_unit.  See range_tracker_finalize for ownership rules. */
 	free(u);
+}
+
+/*
+ * Range-completion tracker (download side).
+ *
+ * Allocated once per range-split download by submit_download_ranges and
+ * attached to each of the N range work units it creates.  Lives until
+ * the last range completes; that completer frees the tracker.
+ */
+static struct sftp_range_tracker *
+range_tracker_new(int total, const char *local_path)
+{
+	struct sftp_range_tracker *t = xcalloc(1, sizeof(*t));
+	pthread_mutex_init(&t->mu, NULL);
+	t->total      = total;
+	t->remaining  = total;
+	t->any_failed = 0;
+	t->local_path = xstrdup(local_path);
+	return t;
+}
+
+/*
+ * Called on the FINAL completion of a single range unit (success or
+ * permanent give-up — NOT on a retry).  `failed` is 1 if this range
+ * gave up after MAX_RETRIES, 0 if it succeeded.
+ *
+ * Returns 1 if this completion was the last range for the file AND any
+ * range failed (caller knows the local file was unlinked); returns 0
+ * otherwise.  The return value is informational — the unlink happens
+ * inside this function regardless.
+ *
+ * Frees the tracker when remaining hits 0.  No external user has a
+ * pointer to it after the last range completes.
+ */
+static int
+range_tracker_finalize(struct sftp_range_tracker *t, int failed)
+{
+	int was_last, should_unlink;
+
+	if (t == NULL)
+		return 0;
+
+	pthread_mutex_lock(&t->mu);
+	if (failed)
+		t->any_failed = 1;
+	t->remaining--;
+	was_last      = (t->remaining == 0);
+	should_unlink = was_last && t->any_failed;
+	pthread_mutex_unlock(&t->mu);
+
+	if (!was_last)
+		return 0;
+
+	if (should_unlink) {
+		if (unlink(t->local_path) == 0) {
+			error("range-split: unlinked corrupt local file "
+			    "\"%s\" — at least one range failed permanently "
+			    "after retries", t->local_path);
+		} else {
+			error("range-split: local file \"%s\" is corrupt "
+			    "(partial range failure) but unlink failed: %s",
+			    t->local_path, strerror(errno));
+		}
+	}
+	pthread_mutex_destroy(&t->mu);
+	free(t->local_path);
+	free(t);
+	return should_unlink;
 }
 
 /* ---------- Worker thread ---------- */
@@ -899,6 +1010,9 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 	if (rc == 0) {
 		worker_record_completion(w, u->size, 1);
 		pending_dec_traced(p, u, w->id, "wpr/success");
+		/* Range tracker: this range finished cleanly.  Last
+		 * completer for the file frees the tracker. */
+		(void)range_tracker_finalize(u->range_tracker, 0);
 		free_unit(u);
 	} else if (++u->attempt < MAX_RETRIES) {
 		/* Re-queue without freeing. Keeps pending counter consistent. */
@@ -913,6 +1027,9 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 				    (uint64_t)u->size, __ATOMIC_RELAXED);
 			worker_record_completion(w, 0, 0);
 			pending_dec_traced(p, u, w->id, "wpr/pushfail");
+			/* Push-fail means the queue is shutting down: this
+			 * range will never run, so finalize as failure. */
+			(void)range_tracker_finalize(u->range_tracker, 1);
 			free_unit(u);
 		}
 	} else {
@@ -921,6 +1038,10 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		    u->src_path ? u->src_path : "(null)");
 		worker_record_completion(w, 0, 0);
 		pending_dec_traced(p, u, w->id, "wpr/maxretries");
+		/* Range tracker: this range permanently failed.  Last
+		 * completer for the file will unlink the (now-corrupt)
+		 * local file. */
+		(void)range_tracker_finalize(u->range_tracker, 1);
 		free_unit(u);
 	}
 }
@@ -1139,7 +1260,7 @@ worker_run_bundle(struct sftp_worker *w,
 	 * extractor calls mkdir_p on each containing directory anyway.
 	 * Slight wire-size cost (full path repeated in every tar header)
 	 * but trivial compared to the small-file payloads. */
-	(void)sftp_upload_bundle(w->conn, "", entries, bn,
+	int bundle_rc = sftp_upload_bundle(w->conn, "", entries, bn,
 	    p->cfg.preserve_flag, p->cfg.fsync_flag);
 
 	t_end_ns = monotonic_ns();
@@ -1158,6 +1279,17 @@ worker_run_bundle(struct sftp_worker *w,
 		    w->id, bn, ok_count,
 		    (unsigned long long)total_bytes,
 		    (unsigned long long)elapsed_us, mibps);
+	}
+
+	/* Bundle wire failed (server refused open, transport error): the
+	 * per-entry results above all say -1, but retrying the same bundle
+	 * path would hit the same failure.  Mark each unit ineligible for
+	 * future bundling so the next worker_thread iteration dispatches
+	 * them via the per-file SFTP path instead.  Files MUST be delivered
+	 * one way or another — bundle is an optimisation, not a contract. */
+	if (bundle_rc != 0) {
+		for (i = 0; i < bn; i++)
+			batch[i]->bundle_ineligible = 1;
 	}
 
 	for (i = 0; i < bn; i++)
@@ -1200,7 +1332,7 @@ worker_run_bundle_download(struct sftp_worker *w,
 	}
 
 	t_start_ns = monotonic_ns();
-	(void)sftp_bundle_download(w->conn, entries, bn,
+	int bundle_rc = sftp_bundle_download(w->conn, entries, bn,
 	    p->cfg.preserve_flag);
 	t_end_ns = monotonic_ns();
 	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
@@ -1217,6 +1349,13 @@ worker_run_bundle_download(struct sftp_worker *w,
 		    w->id, bn, ok_count,
 		    (unsigned long long)total_bytes,
 		    (unsigned long long)elapsed_us, mibps);
+	}
+
+	/* Bundle wire failed: mark each unit ineligible so retries go down
+	 * the per-file SFTP_OP_DOWNLOAD path.  See worker_run_bundle. */
+	if (bundle_rc != 0) {
+		for (i = 0; i < bn; i++)
+			batch[i]->bundle_ineligible = 1;
 	}
 
 	for (i = 0; i < bn; i++)
@@ -1406,7 +1545,22 @@ worker_thread(void *arg)
 		     sftp_conn_has_hpn_bundle_fetch(w->conn));
 		enum sftp_op batch_op = u0->op;
 
-		if (u0->op == SFTP_OP_UPLOAD || batch_eligible_download) {
+		/* Phase 5: a previous bundle attempt failed at the wire for
+		 * this unit (server refused, cap exceeded, transport error).
+		 * Skip the batch path entirely so this retry goes through
+		 * sftp_download / sftp_upload directly.  Without this gate,
+		 * the unit would loop bundle-fail → retry → bundle-fail until
+		 * MAX_RETRIES, then be permanently lost. */
+		if (u0->bundle_ineligible) {
+			batch_eligible_download = 0;
+			/* For uploads the check happens inside the block; the
+			 * `bn == 1` branch below handles per-file dispatch.
+			 * For downloads, dropping the eligibility gate sends
+			 * the unit straight to the outer single-unit path. */
+		}
+
+		if ((u0->op == SFTP_OP_UPLOAD && !u0->bundle_ineligible) ||
+		    batch_eligible_download) {
 			struct sftp_work_unit *batch[UPLOAD_BATCH_SIZE];
 			struct sftp_work_unit *leftover = NULL;
 			int bn = 0;
@@ -1435,13 +1589,18 @@ worker_thread(void *arg)
 					__atomic_fetch_sub(&p->queued_bytes,
 					    (uint64_t)nu->size,
 					    __ATOMIC_RELAXED);
-				if (nu->op == batch_op) {
+				if (nu->op == batch_op &&
+				    !nu->bundle_ineligible) {
 					batch[bn++] = nu;
 					if (nu->size > 0)
 						batch_bytes +=
 						    (uint64_t)nu->size;
 				} else {
-					/* Off-op: stop collecting, handle after batch. */
+					/* Off-op OR bundle-ineligible: stop
+					 * collecting, handle after batch.
+					 * Ineligible units must not be bundled;
+					 * leftover dispatch sends them through
+					 * the per-file path. */
 					leftover = nu;
 					break;
 				}
@@ -3456,15 +3615,17 @@ precreate_local(const char *local_path, off_t size, mode_t mode)
 
 static struct sftp_work_unit *
 make_download_range_unit(const char *remote_path, const char *local_path,
-    off_t range_offset, off_t range_length)
+    off_t range_offset, off_t range_length,
+    struct sftp_range_tracker *tracker)
 {
 	struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
-	u->op           = SFTP_OP_DOWNLOAD_RANGE;
-	u->src_path     = xstrdup(remote_path);
-	u->dst_path     = xstrdup(local_path);
-	u->size         = range_length;
-	u->range_offset = range_offset;
-	u->range_length = range_length;
+	u->op            = SFTP_OP_DOWNLOAD_RANGE;
+	u->src_path      = xstrdup(remote_path);
+	u->dst_path      = xstrdup(local_path);
+	u->size          = range_length;
+	u->range_offset  = range_offset;
+	u->range_length  = range_length;
+	u->range_tracker = tracker;
 	return u;
 }
 
@@ -3482,7 +3643,8 @@ submit_download_ranges(struct sftp_parallel *p,
     off_t file_size, mode_t mode,
     off_t range_size, int num_ranges)
 {
-	int i;
+	int i, effective_ranges = 0;
+	struct sftp_range_tracker *tracker = NULL;
 
 	if (precreate_local(local_path, file_size, mode) != 0) {
 		error("local pre-create \"%s\" failed", local_path);
@@ -3493,17 +3655,38 @@ submit_download_ranges(struct sftp_parallel *p,
 	    "(%.1f MiB each)", remote_path, num_ranges,
 	    (long long)range_size, (double)range_size / (1024.0*1024.0));
 
+	/* Count ranges with positive length first so the tracker knows the
+	 * exact number of completions to wait for.  A trailing range may be
+	 * vacuous if the caller's range_size × num_ranges rounded past
+	 * file_size. */
 	for (i = 0; i < num_ranges; i++) {
 		off_t offset = (off_t)i * range_size;
 		off_t length = (i == num_ranges - 1) ?
 		    (file_size - offset) : range_size;
-
 		if (length <= 0)
 			break;
+		effective_ranges++;
+	}
+	if (effective_ranges == 0)
+		return -1;
+
+	tracker = range_tracker_new(effective_ranges, local_path);
+
+	for (i = 0; i < effective_ranges; i++) {
+		off_t offset = (off_t)i * range_size;
+		off_t length = (i == effective_ranges - 1) ?
+		    (file_size - offset) : range_size;
 		if (submit(p, make_download_range_unit(remote_path, local_path,
-		    offset, length)) != 0) {
+		    offset, length, tracker)) != 0) {
 			error("submit download range %d of \"%s\" failed",
 			    i, remote_path);
+			/* Synthesise failures for ranges we never submitted
+			 * so the tracker reaches remaining=0 and unlinks the
+			 * corrupt local file.  Without this the tracker
+			 * leaks and the file is silently left behind. */
+			int unsent;
+			for (unsent = i; unsent < effective_ranges; unsent++)
+				(void)range_tracker_finalize(tracker, 1);
 			return -1;
 		}
 	}
