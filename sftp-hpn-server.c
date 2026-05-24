@@ -219,24 +219,88 @@ sftp_hpn_server_handles(const char *name)
 # include <archive_entry.h>
 # include <libgen.h>     /* dirname() for mkdir-on-extract */
 
-/* Bundle handle mode: upload (open + write + close => extract) vs.
- * download (fetch packs the tar buffer up-front, client drains via
- * SSH_FXP_READ, close releases). */
+/* Bundle handle mode: upload (client streams WRITE-by-WRITE, server
+ * extracts at close) vs. fetch (server packs tar up-front, client
+ * drains via READ, close just releases). */
 enum hpn_bundle_mode {
 	HPN_BUNDLE_MODE_UPLOAD = 0,   /* hpn-bundle-open */
 	HPN_BUNDLE_MODE_FETCH  = 1,   /* hpn-bundle-fetch */
 };
 
-/* Bundle state allocated for each open handle.  Lifetime spans from
- * hpn-bundle-open/fetch through close.  Owned by sftp-hpn-server.c; stored on
- * the handle table via handle_new_bundle's opaque field. */
+/* ── Bundle handle state and lifecycle ────────────────────────────────
+ *
+ * One struct hpn_bundle_state per open bundle handle.  Stored on the
+ * handle table via handle_new_bundle's opaque slot.  Two distinct
+ * lifecycles based on `mode`:
+ *
+ * UPLOAD (hpn-bundle-open@hpnssh.org):
+ *   process_hpn_bundle_open
+ *     ↓ bundle_state_new (mode=UPLOAD, dest_dir set, accum=NULL)
+ *     ↓ handle_new_bundle (transfers ownership to handle table)
+ *     ↓ replies SSH_FXP_HANDLE
+ *   ...client sends one or more SSH_FXP_WRITE on the handle...
+ *     each WRITE → sftp_hpn_server_bundle_write
+ *       → bundle_state_reserve  (grows accum, updates bundle_total_bytes)
+ *       → memcpy into accum
+ *   ...client sends SSH_FXP_CLOSE...
+ *     → sftp_hpn_server_bundle_close (UPLOAD branch)
+ *       → libarchive read on accum, extract files to dest_dir
+ *       → bundle_state_free + handle_free_bundle
+ *
+ * FETCH (hpn-bundle-fetch@hpnssh.org):
+ *   process_hpn_bundle_fetch
+ *     ↓ bundle_state_new_fetch (mode=FETCH, dest_dir=NULL, accum=NULL)
+ *     ↓ libarchive write_open with bundle_fetch_archive_write_cb
+ *     ↓ per requested path: read file → archive_write_data
+ *         (callback calls bundle_state_reserve + memcpy — accum grows
+ *          and bundle_total_bytes is updated)
+ *     ↓ archive_write_close (flushes trailing block into accum)
+ *     ↓ handle_new_bundle (transfers ownership)
+ *     ↓ replies SSH_FXP_HANDLE
+ *   ...client sends one or more SSH_FXP_READ on the handle...
+ *     each READ → sftp_hpn_server_bundle_read (memcpy out of accum)
+ *   ...client sends SSH_FXP_CLOSE...
+ *     → sftp_hpn_server_bundle_close (FETCH branch — short-circuits)
+ *       → bundle_state_free + handle_free_bundle (no extraction)
+ *
+ * Death paths (all converge on bundle_state_free):
+ *   1. Normal close — extracted (UPLOAD) or released (FETCH)
+ *   2. process_hpn_bundle_fetch fail label — packing failed before
+ *      the handle was registered; the local `s` is freed via the
+ *      fail-label cleanup
+ *   3. process_hpn_bundle_open fail label — bundle_state_new succeeded
+ *      but handle_new_bundle failed (handle table full); local `s`
+ *      freed via the fail label
+ *   4. sftp-server process exit — handle table cleanup eventually
+ *      reaches bundle_close paths (handled by sftp-server.c)
+ *
+ * Ownership invariants:
+ *   - After bundle_state_new[_fetch], the local pointer `s` owns
+ *     the struct.
+ *   - After handle_new_bundle succeeds, ownership transfers to the
+ *     handle table; the local pointer MUST be set to NULL so the
+ *     fail-label cleanup doesn't double-free.
+ *   - bundle_state_free is idempotent against NULL; safe to call
+ *     from any fail label.
+ *
+ * Memory accounting invariants (see bundle_state_reserve /
+ * bundle_state_free for enforcement):
+ *   - accum_len ≤ accum_cap always.
+ *   - accum is NULL iff accum_cap == 0 (fresh state, not yet grown).
+ *   - The process-wide static `bundle_total_bytes` is the sum of
+ *     accum_cap across all currently-allocated bundle states.  Only
+ *     bundle_state_reserve increments it; only bundle_state_free
+ *     decrements it.  Any other code path that touches accum/accum_cap
+ *     would violate the cap enforcement — don't do that.
+ */
 struct hpn_bundle_state {
 	enum hpn_bundle_mode mode;
-	char    *dest_dir;       /* upload mode: dir to extract into; unused for fetch */
-	uint32_t flags;          /* HPN_BUNDLE_FLAG_* */
-	u_char  *accum;          /* upload: growing receive buffer; fetch: packed tar */
-	size_t   accum_len;
-	size_t   accum_cap;
+	char    *dest_dir;       /* UPLOAD: dir to extract into; FETCH: NULL */
+	uint32_t flags;          /* HPN_BUNDLE_FLAG_*, see sftp-hpn-bundle.h */
+	u_char  *accum;          /* UPLOAD: incoming WRITE buffer;
+				  * FETCH:  pre-packed tar stream */
+	size_t   accum_len;      /* bytes valid in accum */
+	size_t   accum_cap;      /* bytes allocated for accum */
 };
 
 /* Flag constants and HPN_BUNDLE_BLOCK_BYTES live in sftp-hpn-bundle.h, the
