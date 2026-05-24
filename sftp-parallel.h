@@ -314,6 +314,23 @@ void sftp_parallel_get_stats(struct sftp_parallel *p,
     struct sftp_parallel_stats *out);
 
 /*
+ * Drain the orchestrator's bounded list of paths that could not be
+ * delivered (permanent give-up after MAX_RETRIES, workqueue push-fail,
+ * walker skip-on-error).  Returns the TOTAL number of failures seen
+ * (which may exceed the number of held entries — the held list is
+ * bounded at orchestrator init time).
+ *
+ * If `out_paths` and `out_used` are non-NULL, on return *out_paths is
+ * a malloc'd array of *out_used strdup'd path strings; caller frees
+ * each entry and the array.  Returns 0 with *out_used == 0 and
+ * *out_paths == NULL when no failures have occurred.
+ *
+ * The list is reset by this call so subsequent failures start fresh.
+ */
+uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
+    char ***out_paths, size_t *out_used);
+
+/*
  * Dynamic worker scaling for long-running transfers.
  *
  * sftp_parallel_add_worker() spawns a new independent SSH child, runs

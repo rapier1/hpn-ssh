@@ -116,6 +116,17 @@ extern int showprogress;
  */
 #define BUNDLE_TARGET_BYTES     ((uint64_t)4 * 1024 * 1024)
 
+/*
+ * Maximum number of failed-path entries the orchestrator retains for
+ * the end-of-transfer summary.  Beyond this, the count keeps growing
+ * (so the user knows N files failed) but the per-path strings are
+ * dropped to bound memory on pathological cases (e.g. permission-
+ * denied across a 100k-file tree).  ~25 KiB at the default with
+ * typical path lengths.  Touched by hpn_strlist_init in orchestrator
+ * init; surfaced by parallel_flush's "Failed paths:" block.
+ */
+#define HPN_FAILED_PATHS_MAX    100
+
 /* Watchdog thresholds. STALL: warn if a worker has had work available but
  * made no bytes-level progress (bytes_total + live_bytes flat) for this
  * long. DEAD: escalate to SIGTERM. The progress signal is bytes-based
@@ -483,6 +494,28 @@ struct sftp_worker {
 	uint64_t bundle_target_bytes;
 };
 
+/*
+ * Bounded thread-safe string list.  Append-only with a hard cap; the
+ * `total` counter keeps growing past the cap so callers can report
+ * "showing first N of TOTAL".  Drain transfers ownership of the held
+ * strings to the caller.
+ *
+ * Failures (and other rare events we accumulate) are infrequent enough
+ * that the per-append mutex acquire is uncontended in practice.  The
+ * cap bounds memory on pathological inputs (e.g. a permission-denied
+ * walk over a 100k-file tree) without losing the overall count.
+ *
+ * Generic shape so future "things-the-user-needs-to-see" accumulators
+ * can reuse it without inventing a parallel struct.
+ */
+struct hpn_strlist {
+	pthread_mutex_t  mu;
+	char           **items;     /* xstrdup'd entries; NULL until init */
+	size_t           used;      /* entries actually held */
+	size_t           cap;       /* array capacity */
+	uint64_t         total;     /* total appends seen (may exceed cap) */
+};
+
 struct sftp_parallel {
 	struct sftp_parallel_config cfg;
 	char                        cfg_port_buf[16]; /* owns cfg.port string */
@@ -536,6 +569,15 @@ struct sftp_parallel {
 	 * clean transfer.  Bumped via __atomic_fetch_add from any thread.
 	 */
 	uint64_t                    walker_failures;
+
+	/* Bounded list of paths that could not be delivered, populated at
+	 * every give-up site (worker MAX_RETRIES, workqueue push-fail,
+	 * walker skip-on-error).  Surfaced inline in parallel_flush's
+	 * TRANSFER INCOMPLETE message so users don't have to grep a
+	 * potentially huge log for per-file errors.  Uses the reusable
+	 * hpn_strlist below — same shape for any future "things-the-user-
+	 * needs-to-see" accumulation across threads. */
+	struct hpn_strlist          failed_paths;
 
 	pthread_t                   reporter_tid;
 	int                         reporter_started;
@@ -820,6 +862,151 @@ free_unit(struct sftp_work_unit *u)
 	free(u);
 }
 
+/* Forward decl — hpn_strlist_append is defined below this point but
+ * walker_record_failure (defined here) needs it.  Avoids reordering
+ * the file. */
+static void hpn_strlist_append(struct hpn_strlist *l, const char *s);
+
+/*
+ * Worker-side failed-path recorder.  Formats "path: cause" and appends
+ * to the orchestrator's failed-paths list.  If `explicit_cause` is
+ * NULL we pull from hpn_get_last_error() — the TLS-captured most-
+ * recent ERROR-level log message on this thread, set automatically
+ * inside do_log().  This is how a failed sftp_upload / sftp_download
+ * gets its error text into the summary without any plumbing through
+ * the RPC API.
+ *
+ * Falls back to "(no error captured)" when neither source has a
+ * message — shouldn't happen in practice for a real give-up.
+ *
+ * Called only at give-up sites in worker_process_result and
+ * worker_finalize_one_entry (NOT on retry).
+ */
+static void
+worker_record_failed_path(struct sftp_parallel *p,
+    struct sftp_work_unit *u, const char *explicit_cause)
+{
+	char        buf[PATH_MAX + 256];
+	const char *path = (u && u->src_path) ? u->src_path : "(unknown)";
+	const char *cause;
+
+	if (explicit_cause != NULL && *explicit_cause != '\0') {
+		cause = explicit_cause;
+	} else {
+		const char *captured = hpn_get_last_error();
+		cause = (captured && *captured)
+		    ? captured : "(no error captured)";
+	}
+
+	snprintf(buf, sizeof(buf), "%s: %s", path, cause);
+	hpn_strlist_append(&p->failed_paths, buf);
+
+	/* Reset so the next failure on this thread starts clean instead
+	 * of stale.  Captured-error contract: it reflects the most recent
+	 * error AT THE TIME we record the failure. */
+	hpn_clear_last_error();
+}
+
+/*
+ * Walker-side failure recorder: bumps the aggregate counter and adds
+ * "path: error" to the failed-paths list in one shot.  `err` may be
+ * NULL when no errno-style message is available (e.g. depth limit,
+ * "not a directory").  Single-call helper because every walker
+ * skip-on-error site does both — bump + list.
+ */
+static void
+walker_record_failure(struct sftp_parallel *p, const char *path,
+    const char *err)
+{
+	char buf[PATH_MAX + 256];
+
+	__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+	if (path == NULL)
+		path = "(unknown)";
+	if (err != NULL && *err != '\0')
+		snprintf(buf, sizeof(buf), "%s: %s", path, err);
+	else
+		snprintf(buf, sizeof(buf), "%s", path);
+	hpn_strlist_append(&p->failed_paths, buf);
+}
+
+/*
+ * Bounded thread-safe string list — see comment on struct hpn_strlist.
+ */
+static void
+hpn_strlist_init(struct hpn_strlist *l, size_t cap)
+{
+	pthread_mutex_init(&l->mu, NULL);
+	l->cap   = cap;
+	l->used  = 0;
+	l->total = 0;
+	l->items = (cap > 0) ? xcalloc(cap, sizeof(*l->items)) : NULL;
+}
+
+static void
+hpn_strlist_free(struct hpn_strlist *l)
+{
+	if (l->items != NULL) {
+		for (size_t i = 0; i < l->used; i++)
+			free(l->items[i]);
+		free(l->items);
+		l->items = NULL;
+	}
+	pthread_mutex_destroy(&l->mu);
+	l->used = 0;
+	l->cap  = 0;
+}
+
+/*
+ * Append `s` to the list.  Always bumps `total`; only allocates a
+ * new entry if `used < cap`.  Silently drops the string contents when
+ * over cap so memory stays bounded; the count is preserved so the
+ * user knows how many were dropped.
+ */
+static void
+hpn_strlist_append(struct hpn_strlist *l, const char *s)
+{
+	if (l == NULL || s == NULL)
+		return;
+	pthread_mutex_lock(&l->mu);
+	l->total++;
+	if (l->used < l->cap)
+		l->items[l->used++] = xstrdup(s);
+	pthread_mutex_unlock(&l->mu);
+}
+
+/*
+ * Drain the list.  Returns the total append count seen, and (when
+ * `out` is non-NULL) transfers ownership of the held strings to the
+ * caller via *out / *out_used.  The list itself is reset to empty
+ * but remains usable for further appends.  Caller frees each string
+ * and the array.
+ */
+static uint64_t
+hpn_strlist_drain(struct hpn_strlist *l, char ***out, size_t *out_used)
+{
+	uint64_t total;
+	pthread_mutex_lock(&l->mu);
+	total = l->total;
+	if (out != NULL && out_used != NULL) {
+		*out_used = l->used;
+		if (l->used > 0) {
+			*out = xcalloc(l->used, sizeof(**out));
+			for (size_t i = 0; i < l->used; i++)
+				(*out)[i] = l->items[i];   /* transfer ownership */
+		} else {
+			*out = NULL;
+		}
+	}
+	/* Reset the list so subsequent appends start fresh. */
+	if (l->items != NULL)
+		memset(l->items, 0, l->cap * sizeof(*l->items));
+	l->used  = 0;
+	l->total = 0;
+	pthread_mutex_unlock(&l->mu);
+	return total;
+}
+
 /*
  * Range-completion tracker constructor.  Allocated once per range-split
  * transfer (download by submit_download_ranges, upload by
@@ -1070,9 +1257,20 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 			/* Push-fail means the queue is shutting down: this
 			 * range will never run, so finalize as failure. */
 			(void)range_tracker_finalize(u->range_tracker, 1, w);
+			worker_record_failed_path(p, u, "queue shutdown");
 			free_unit(u);
 		}
 	} else {
+		/* Snapshot the actual cause BEFORE logging our own
+		 * give-up message, which would otherwise overwrite the
+		 * TLS capture with the give-up text itself. */
+		char        cause[256];
+		const char *captured = hpn_get_last_error();
+		strlcpy(cause,
+		    (captured && *captured)
+		        ? captured : "(no error captured)",
+		    sizeof(cause));
+
 		error_f("worker %d: unit failed after %d attempts: %s",
 		    w->id, u->attempt,
 		    u->src_path ? u->src_path : "(null)");
@@ -1082,6 +1280,7 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		 * completer for the file removes the (now-corrupt) target
 		 * file (local unlink or remote sftp_rm via w->conn). */
 		(void)range_tracker_finalize(u->range_tracker, 1, w);
+		worker_record_failed_path(p, u, cause);
 		free_unit(u);
 	}
 }
@@ -1137,16 +1336,29 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 				    (uint64_t)u->size, __ATOMIC_RELAXED);
 			worker_record_completion(w, 0, 0);
 			pending_dec_traced(p, u, w->id, "batch/pushfail");
+			worker_record_failed_path(p, u, "queue shutdown");
 			free_unit(u);
 		}
 		return;
 	}
-	error_f("worker %d: batch unit failed after %d attempts: %s",
-	    w->id, u->attempt,
-	    u->src_path ? u->src_path : "(null)");
-	worker_record_completion(w, 0, 0);
-	pending_dec_traced(p, u, w->id, "batch/maxretries");
-	free_unit(u);
+	/* Same cause-snapshot pattern as worker_process_result: grab
+	 * the real error BEFORE our give-up log clobbers the TLS. */
+	{
+		char        cause[256];
+		const char *captured = hpn_get_last_error();
+		strlcpy(cause,
+		    (captured && *captured)
+		        ? captured : "(no error captured)",
+		    sizeof(cause));
+
+		error_f("worker %d: batch unit failed after %d attempts: %s",
+		    w->id, u->attempt,
+		    u->src_path ? u->src_path : "(null)");
+		worker_record_completion(w, 0, 0);
+		pending_dec_traced(p, u, w->id, "batch/maxretries");
+		worker_record_failed_path(p, u, cause);
+		free_unit(u);
+	}
 }
 
 static void
@@ -3099,6 +3311,12 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_cond_init(&p->pending_cv, NULL);
 	pthread_mutex_init(&p->workers_mu, NULL);
 
+	/* Cap chosen so the worst-case allocation is bounded but the
+	 * "show me what failed" list is still useful for moderately
+	 * broken transfers.  HPN_FAILED_PATHS_MAX × ~256 bytes typical
+	 * = ~25 KiB at the default cap. */
+	hpn_strlist_init(&p->failed_paths, HPN_FAILED_PATHS_MAX);
+
 	/* 1. Workqueue. Sized for cfg->num_streams; if workers are added
 	 * later via sftp_parallel_add_worker, capacity stays the same.
 	 * That's fine — capacity is just backpressure, not a hard cap. */
@@ -3398,6 +3616,7 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	pthread_mutex_destroy(&p->pending_mu);
 	pthread_cond_destroy(&p->pending_cv);
 	pthread_mutex_destroy(&p->workers_mu);
+	hpn_strlist_free(&p->failed_paths);
 	free(p);
 }
 
@@ -3989,17 +4208,17 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 
 	if (depth >= PARALLEL_MAX_DIR_DEPTH) {
 		error("Maximum directory depth exceeded: %d levels", depth);
-		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+		walker_record_failure(p, src, "max directory depth exceeded");
 		return -1;
 	}
 	if (stat(src, &sb) == -1) {
 		error("stat local \"%s\": %s", src, strerror(errno));
-		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+		walker_record_failure(p, src, strerror(errno));
 		return -1;
 	}
 	if (!S_ISDIR(sb.st_mode)) {
 		error("\"%s\" is not a directory", src);
-		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+		walker_record_failure(p, src, "not a directory");
 		return -1;
 	}
 
@@ -4025,7 +4244,7 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 
 	if ((dirp = opendir(src)) == NULL) {
 		error("local opendir \"%s\": %s", src, strerror(errno));
-		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+		walker_record_failure(p, src, strerror(errno));
 		return -1;
 	}
 	while (((dp = readdir(dirp)) != NULL) && !p->abort_flag) {
@@ -4046,8 +4265,7 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		if (lstat(new_src, &sb) == -1) {
 			error("local lstat \"%s\": %s", new_src,
 			    strerror(errno));
-			__atomic_fetch_add(&p->walker_failures, 1,
-			    __ATOMIC_RELAXED);
+			walker_record_failure(p, new_src, strerror(errno));
 			ret = -1;
 			continue;
 		}
@@ -4061,8 +4279,8 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			if (stat(new_src, &sb) == -1) {
 				error("local stat \"%s\": %s", new_src,
 				    strerror(errno));
-				__atomic_fetch_add(&p->walker_failures, 1,
-				    __ATOMIC_RELAXED);
+				walker_record_failure(p, new_src,
+				    strerror(errno));
 				ret = -1;
 				continue;
 			}
@@ -4076,8 +4294,8 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			    sb.st_size, sb.st_mode) != 0) {
 				error("submit \"%s\" -> \"%s\" failed",
 				    new_src, new_dst);
-				__atomic_fetch_add(&p->walker_failures, 1,
-				    __ATOMIC_RELAXED);
+				walker_record_failure(p, new_src,
+				    "submit failed");
 				ret = -1;
 			}
 		} else {
@@ -4124,21 +4342,20 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 
 	if (depth >= PARALLEL_MAX_DIR_DEPTH) {
 		error("Maximum directory depth exceeded: %d levels", depth);
-		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+		walker_record_failure(p, src, "max directory depth exceeded");
 		return -1;
 	}
 	if (dirattrib == NULL) {
 		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
 			error("stat remote \"%s\" directory failed", src);
-			__atomic_fetch_add(&p->walker_failures, 1,
-			    __ATOMIC_RELAXED);
+			walker_record_failure(p, src, "remote stat failed");
 			return -1;
 		}
 		dirattrib = &ldirattrib;
 	}
 	if (!S_ISDIR(dirattrib->perm)) {
 		error("\"%s\" is not a directory", src);
-		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+		walker_record_failure(p, src, "not a directory");
 		return -1;
 	}
 	if (dirattrib->flags & SSH2_FILEXFER_ATTR_PERMISSIONS) {
@@ -4147,12 +4364,12 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (mkdir(dst, tmpmode) == -1 && errno != EEXIST) {
 		error("mkdir %s: %s", dst, strerror(errno));
-		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+		walker_record_failure(p, dst, strerror(errno));
 		return -1;
 	}
 	if (sftp_readdir(conn, src, &dir_entries) == -1) {
 		error("remote readdir \"%s\" failed", src);
-		__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+		walker_record_failure(p, src, "remote readdir failed");
 		return -1;
 	}
 
@@ -4173,8 +4390,8 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			}
 			if (sftp_stat(conn, new_src, 1, &lsym) != 0) {
 				error("remote stat \"%s\" failed", new_src);
-				__atomic_fetch_add(&p->walker_failures, 1,
-				    __ATOMIC_RELAXED);
+				walker_record_failure(p, new_src,
+				    "remote stat failed");
 				ret = -1;
 				continue;
 			}
@@ -4198,8 +4415,8 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			    new_src, new_dst, fsize, fmode) != 0) {
 				error("submit download \"%s\" -> \"%s\" failed",
 				    new_src, new_dst);
-				__atomic_fetch_add(&p->walker_failures, 1,
-				    __ATOMIC_RELAXED);
+				walker_record_failure(p, new_src,
+				    "submit failed");
 				ret = -1;
 			}
 		} else {
@@ -4279,6 +4496,18 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 		 * stable. */
 		out->queue_capacity = WORK_QUEUE_DEPTH(p->cfg.num_streams);
 	}
+}
+
+uint64_t
+sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
+    char ***out_paths, size_t *out_used)
+{
+	if (p == NULL) {
+		if (out_paths != NULL) *out_paths = NULL;
+		if (out_used  != NULL) *out_used  = 0;
+		return 0;
+	}
+	return hpn_strlist_drain(&p->failed_paths, out_paths, out_used);
 }
 
 

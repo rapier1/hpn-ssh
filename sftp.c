@@ -728,19 +728,44 @@ parallel_flush(void)
 	}
 	if (pstats.units_failed_aggregate > 0) {
 		error("TRANSFER INCOMPLETE: %llu file(s) could not be "
-		    "delivered after retries; check stderr above for "
-		    "per-file diagnostics",
+		    "delivered after retries",
 		    (unsigned long long)pstats.units_failed_aggregate);
 		rc = -1;
 	}
 	if (pstats.walker_failures_aggregate > 0) {
 		error("TRANSFER INCOMPLETE: %llu file(s) or director(y/ies) "
 		    "were skipped during the directory walk "
-		    "(stat/readdir/symlink errors); check stderr above for "
-		    "per-path diagnostics",
+		    "(stat/readdir/symlink errors)",
 		    (unsigned long long)pstats.walker_failures_aggregate);
 		rc = -1;
 	}
+
+	/* Drain the failed-paths list and print it.  This is the
+	 * user-facing inventory of what didn't make it — separate from
+	 * the per-aggregate counts above because a path can show up via
+	 * the worker-failure or walker-failure code path. */
+	{
+		char  **paths     = NULL;
+		size_t  paths_used = 0;
+		uint64_t total = sftp_parallel_drain_failed_paths(
+		    parallel_orch, &paths, &paths_used);
+		if (total > 0) {
+			if (paths_used >= total) {
+				error("  Failed paths (%llu total):",
+				    (unsigned long long)total);
+			} else {
+				error("  Failed paths (showing first %zu; "
+				    "list exceeds current limit of %zu files):",
+				    paths_used, paths_used);
+			}
+			for (size_t i = 0; i < paths_used; i++) {
+				error("    %s", paths[i]);
+				free(paths[i]);
+			}
+			free(paths);
+		}
+	}
+
 	if (rc != 0)
 		session_had_failure = 1;
 	return rc;

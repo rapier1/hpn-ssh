@@ -159,4 +159,21 @@ int log_ratelimit(struct log_ratelimit_ctx *rl, time_t now, int *active,
 #define fatal_fr(r, ...)	sshfatal(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_FATAL, ssh_err(r), __VA_ARGS__)
 #define logdie_fr(r, ...)	sshlogdie(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_ERROR, ssh_err(r), __VA_ARGS__)
 
+/*
+ * HPN: per-thread snapshot of the most recent ERROR-level log message.
+ * Populated automatically inside do_log().  Returns "" when nothing has
+ * been logged on this thread (or after hpn_clear_last_error).
+ *
+ * Lets structured callers (e.g. the parallel-streams failed-paths
+ * summary in sftp-parallel.c) attach the cause string to a higher-
+ * level event without plumbing error returns through every API in
+ * sftp-client.c.
+ *
+ * hpn_log_capture_error is the do_log hook; not intended for direct
+ * use by callers.
+ */
+void        hpn_log_capture_error(const char *msg);
+const char *hpn_get_last_error(void);
+void        hpn_clear_last_error(void);
+
 #endif
