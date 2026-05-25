@@ -38,6 +38,7 @@
 .Op Fl F Ar ssh_config
 .Op Fl i Ar identity_file
 .Op Fl J Ar destination
+.Op Fl j Ar parallel_streams
 .Op Fl l Ar limit
 .Op Fl M Ar range_split_min_mb
 .Op Fl o Ar ssh_option
@@ -207,6 +208,37 @@ This is a shortcut to specify a
 configuration directive.
 This option is directly passed to
 .Xr hpnssh 1 .
+.It Fl j Ar parallel_streams
+Enables the parallel-streams orchestrator and sets the number of
+concurrent worker SSH sessions used to transfer files.
+Each worker establishes its own SSH connection to the destination and
+operates a private SFTP session; the orchestrator distributes work
+units (whole files, small-file bundles, or byte-range chunks of large
+files) across them.
+Must be between 1 and 24; values outside this range are clamped at
+parse time.
+.Pp
+There is no universally-correct setting.
+More streams is not always faster:
+once the path or server reaches saturation, additional workers compete
+for the same bottleneck, individual workers fall below the
+fastest-peer throughput threshold, and the orchestrator's
+outlier-detection machinery reaps and respawns them.
+The end-of-transfer summary line includes the worker-respawn count;
+when that count climbs above roughly 25 % of
+.Fl j ,
+the transfer has crossed the knee of the throughput curve and a
+lower
+.Fl j
+will usually give equivalent or better aggregate throughput with less
+churn.
+.Pp
+Typical starting points are
+.Fl j Ar 4
+on commodity LAN paths and
+.Fl j Ar 8
+on high-bandwidth/high-RTT WAN paths to striped parallel filesystems
+(Lustre, GPFS); tune from there using the respawn-count signal.
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
 .It Fl M Ar range_split_min_mb

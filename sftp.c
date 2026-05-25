@@ -720,6 +720,49 @@ parallel_flush(void)
 	sftp_parallel_wait(parallel_orch);
 	sftp_parallel_progress_stop(parallel_orch);
 	sftp_parallel_get_stats(parallel_orch, &pstats);
+
+	/* End-of-transfer summary.  Leads with bytes/throughput so the
+	 * operator gets a one-line health check; appends the respawn
+	 * count when non-zero (so a clean transfer stays terse), and a
+	 * tuning hint when respawn churn crosses ~25 % of -j — the same
+	 * threshold the outlier detector uses, and the empirically
+	 * observed knee-of-the-curve for too many parallel streams on a
+	 * saturated path.  Emitted BEFORE any TRANSFER INCOMPLETE block
+	 * so the signal isn't buried under a long failed-paths list. */
+	if (pstats.elapsed_ms > 0 && pstats.bytes_total_aggregate > 0) {
+		double secs   = pstats.elapsed_ms / 1000.0;
+		double mibps  = (double)pstats.bytes_total_aggregate
+		    / (1024.0 * 1024.0) / secs;
+		double bytes  = (double)pstats.bytes_total_aggregate;
+		const char *size_unit;
+		double size_val;
+		if (bytes >= 1024.0 * 1024.0 * 1024.0) {
+			size_val  = bytes / (1024.0 * 1024.0 * 1024.0);
+			size_unit = "GiB";
+		} else {
+			size_val  = bytes / (1024.0 * 1024.0);
+			size_unit = "MiB";
+		}
+		int j         = pstats.num_workers > 0
+		    ? pstats.num_workers : parallel_num_streams;
+		int respawn_hint_threshold = (j + 3) / 4; /* ceil(j / 4) */
+		const char *churn_hint =
+		    (pstats.total_respawns >= respawn_hint_threshold &&
+		     respawn_hint_threshold > 0)
+		    ? " \xe2\x80\x94 consider lowering -j" : "";
+		if (pstats.total_respawns > 0) {
+			logit("Parallel streams: %.2f %s in %.1fs (%.0f MiB/s); "
+			    "%d worker respawn%s%s",
+			    size_val, size_unit, secs, mibps,
+			    pstats.total_respawns,
+			    pstats.total_respawns == 1 ? "" : "s",
+			    churn_hint);
+		} else {
+			logit("Parallel streams: %.2f %s in %.1fs (%.0f MiB/s)",
+			    size_val, size_unit, secs, mibps);
+		}
+	}
+
 	if (pstats.protocol_violations > 0) {
 		logit("warning: %d worker protocol violation detected "
 		    "(recovered via worker respawn) - investigate if "

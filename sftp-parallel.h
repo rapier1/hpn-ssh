@@ -337,6 +337,18 @@ struct sftp_parallel_stats {
 	int      protocol_violations; /* ID mismatches / bad packet types;
 				       * non-zero means the transfer was aborted
 				       * due to possible MITM or corruption */
+	/* Lifetime worker respawn count for this orchestrator session.
+	 * Incremented atomically at respawn dispatch.  Surfaced in the
+	 * end-of-transfer summary as the operator-visible signal for
+	 * "you may have set -j too high" — once respawn churn climbs to
+	 * ~25 % of -j, additional workers stop adding throughput because
+	 * they're flapping in and out of the outlier-detector reap path. */
+	int      total_respawns;
+	/* Wall-clock duration of the parallel-streams session in
+	 * milliseconds.  start_ns is captured in sftp_parallel_start();
+	 * elapsed_ms is computed against the monotonic clock at
+	 * sftp_parallel_get_stats() call time. */
+	uint64_t elapsed_ms;
 };
 
 void sftp_parallel_get_stats(struct sftp_parallel *p,

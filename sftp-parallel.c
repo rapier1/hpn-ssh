@@ -654,6 +654,12 @@ struct sftp_parallel {
 						       * not yet in workers[];
 						       * guards premature abort */
 	int                         total_respawns;  /* lifetime respawn count */
+	uint64_t                    session_start_ns;  /* monotonic_ns() at
+						       * sftp_parallel_start;
+						       * elapsed surfaced in
+						       * stats for the
+						       * end-of-transfer
+						       * summary */
 	int                         respawn_epoch_count;   /* respawns in current
 							    * epoch; reset when a
 							    * cooldown ends */
@@ -3457,6 +3463,8 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_cond_init(&p->pending_cv, NULL);
 	pthread_mutex_init(&p->workers_mu, NULL);
 
+	p->session_start_ns = monotonic_ns();
+
 	/* Cap chosen so the worst-case allocation is bounded but the
 	 * "show me what failed" list is still useful for moderately
 	 * broken transfers.  HPN_FAILED_PATHS_MAX × ~256 bytes typical
@@ -4377,6 +4385,7 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	pthread_mutex_lock(&p->workers_mu);
 	out->num_workers        = p->num_workers;
 	out->protocol_violations = p->protocol_violations;
+	out->total_respawns      = p->total_respawns;
 	for (int i = 0; i < p->num_workers; i++) {
 		struct sftp_worker *w = p->workers[i];
 		pthread_mutex_lock(&w->mu);
@@ -4392,6 +4401,10 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	out->units_failed_aggregate = f;
 	out->walker_failures_aggregate =
 	    __atomic_load_n(&p->walker_failures, __ATOMIC_RELAXED);
+
+	if (p->session_start_ns != 0)
+		out->elapsed_ms =
+		    (monotonic_ns() - p->session_start_ns) / 1000000ULL;
 	if (p->q) {
 		out->queue_depth = sftp_workqueue_depth(p->q);
 		out->queue_high_watermark = sftp_workqueue_high_watermark(p->q);
