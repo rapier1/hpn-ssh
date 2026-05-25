@@ -646,44 +646,12 @@ bundle_path_is_safe(const char *p, const char *dest_dir)
 }
 
 /*
- * Recursively create `dirpath`.  Used so tar paths like "a/b/c.dat" get
- * extracted correctly when "a" or "a/b" don't yet exist.
- *
- * NOTE: this is hand-rolled mkdir-p.  libarchive offers
- * archive_read_extract / archive_write_disk which would do this and
- * more (xattrs, owners, etc.) automatically.  Worth migrating to that
- * path if subdirectory creation becomes a hotspot or correctness
- * concern; see comment in sftp_hpn_server_bundle_close.
+ * Tar paths like "a/b/c.dat" need their parent directories created
+ * before we can open() the file.  The on-the-fly mkdir-p is in
+ * misc.c so both client (-W setup) and server (this file) can share
+ * it.  See the libarchive archive_write_disk path comment in
+ * sftp_hpn_server_bundle_close for a future cleanup direction.
  */
-static int
-mkdir_p(const char *dirpath, mode_t mode)
-{
-	char *p, *q;
-	int rc = 0;
-
-	if (dirpath == NULL || *dirpath == '\0')
-		return -1;
-	p = strdup(dirpath);
-	if (p == NULL)
-		return -1;
-	/* Walk path components, mkdir each. */
-	for (q = p + 1; *q != '\0'; q++) {
-		if (*q == '/') {
-			*q = '\0';
-			if (mkdir(p, mode) != 0 && errno != EEXIST) {
-				rc = -1;
-				break;
-			}
-			*q = '/';
-		}
-	}
-	if (rc == 0) {
-		if (mkdir(p, mode) != 0 && errno != EEXIST)
-			rc = -1;
-	}
-	free(p);
-	return rc;
-}
 
 /*
  * libarchive read callback that pulls bytes from the accumulator buffer.

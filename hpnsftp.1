@@ -46,6 +46,7 @@
 .Op Fl R Ar num_requests
 .Op Fl S Ar program
 .Op Fl s Ar subsystem | sftp_server
+.Op Fl W Ar worker_log_dir
 .Op Fl X Ar sftp_option
 .Ar destination
 .Sh DESCRIPTION
@@ -418,6 +419,38 @@ does not have an sftp subsystem configured.
 .It Fl v
 Raise logging level.
 This option is also passed to hpnssh.
+.It Fl W Ar worker_log_dir
+Diagnostic aid for parallel mode
+.Pq Fl j .
+When supplied, each parallel worker writes its underlying
+.Xr hpnssh 1
+child's standard error stream to
+.Pa <worker_log_dir>/hpnssh-worker-<pid>.stderr
+so a clear per-worker log is available when reporting failures
+or when developers ask the user to capture worker output.
+.Pp
+.Ar worker_log_dir
+must already exist and be writable;
+.Nm
+exits with a fatal error otherwise.
+A common choice is
+.Pa /tmp ,
+but any directory the user can write to (for example
+.Pa $HOME/hpnssh-logs )
+is acceptable.
+.Pp
+When
+.Fl W
+is not supplied, worker
+.Xr hpnssh 1
+stderr is inherited from
+.Nm ,
+so connection errors, host-key warnings, and server banners
+appear directly on the user's terminal.
+This is the default and intended behaviour in normal operation; the
+.Fl W
+log directory is only useful when capturing logs for a developer to
+inspect.
 .It Fl X Ar sftp_option
 Specify an option that controls aspects of SFTP protocol behaviour.
 The valid options are:

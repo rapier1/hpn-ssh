@@ -56,6 +56,21 @@ struct sftp_parallel_config {
 	 * time. */
 	int          range_split_min_mb;
 
+	/* Per-worker SSH stderr capture directory, set by -W flag in sftp.c.
+	 * NULL = off (production default — worker stderr is inherited so
+	 * connection errors reach the user's terminal).  When non-NULL, each
+	 * spawned worker writes its SSH child's stderr to
+	 * <worker_log_dir>/hpnssh-worker-<pid>.stderr.  sftp.c validates the
+	 * directory exists and is writable at parse time. */
+	const char  *worker_log_dir;
+
+	/* User-supplied -v count on the hpnsftp command line.  Passed through
+	 * to each parallel worker SSH child so worker-side verbosity matches
+	 * what the user asked for at the hpnsftp layer.  When worker_log_dir
+	 * is also set, the effective worker level is max(verbose_level, 1)
+	 * so the captured stderr files actually contain something useful. */
+	int          verbose_level;
+
 	/* Bundle-mode enable, resolved from ssh_config HPNUseBundle by
 	 * sftp.c (which queries `hpnssh -G host`).  0 = disabled (force
 	 * Phase-4 fallback), 1 = enabled (default; subject to server

@@ -827,31 +827,33 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 		dup2(c2p[1], STDOUT_FILENO);
 
 		/*
-		 * Redirect this SSH child's stderr to a per-child log file
-		 * so we can post-mortem failed handshakes that would
-		 * otherwise vanish into the orchestrator's interleaved
-		 * stderr stream.  Path is /tmp/hpnssh-worker-PID.stderr;
-		 * the child's PID becomes part of the SSH child's command
-		 * line so it's easy to correlate.
+		 * Optional diagnostic aid: when -W <dir> was supplied to
+		 * hpnsftp (cfg->worker_log_dir non-NULL), redirect each
+		 * worker's SSH child stderr to
+		 * <dir>/hpnssh-worker-<pid>.stderr so the user can send us
+		 * a clear per-worker log when reporting failures.
 		 *
-		 * Open with O_EXCL | O_NOFOLLOW to defeat the classic
-		 * world-writable-/tmp symlink-race / preexisting-file
-		 * attack: a co-tenant on the same host who predicts our
-		 * child's PID could otherwise pre-create
-		 * `/tmp/hpnssh-worker-N.stderr` as either a symlink to
-		 * (e.g.) ~/.ssh/authorized_keys (→ DoS via O_TRUNC) or as
-		 * a regular file they own (→ info leak via redirected
-		 * stderr).  O_EXCL fails on either; we fall through to
-		 * inherited stderr which is the safe default.
+		 * In normal operation (-W not set) we INHERIT stderr — so
+		 * SSH connection errors, host-key warnings, server banners
+		 * and the like reach the user's terminal where they're
+		 * actually useful, instead of vanishing into a file the
+		 * user never reads.
 		 *
-		 * Best-effort: if open fails for any reason, fall through
-		 * to inherited stderr.
+		 * Hardening: O_EXCL | O_NOFOLLOW defeats the classic
+		 * world-writable-directory symlink-race / preexisting-file
+		 * attack — a co-tenant who predicts our child PID can't
+		 * pre-create the path as either a symlink to a sensitive
+		 * file (→ DoS via O_TRUNC equivalent) or as a file they own
+		 * (→ info leak via redirected stderr).  On any failure
+		 * (including O_EXCL collision) we fall through to inherited
+		 * stderr, which is the safe default.
 		 */
-		{
-			char path[64];
+		if (cfg->worker_log_dir != NULL) {
+			char path[PATH_MAX];
 			int fd;
 			snprintf(path, sizeof(path),
-			    "/tmp/hpnssh-worker-%d.stderr", (int)getpid());
+			    "%s/hpnssh-worker-%d.stderr",
+			    cfg->worker_log_dir, (int)getpid());
 			fd = open(path,
 			    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
 			    0644);
@@ -872,23 +874,30 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 		argv[argc++] = "-oControlMaster=no";
 		argv[argc++] = "-oControlPath=none";
 		argv[argc++] = "-oStrictHostKeyChecking=accept-new";
-		/*
-		 * Per-child verbose output for respawn diagnostics. Routed
-		 * to /tmp/hpnssh-worker-PID.stderr by the dup2() above, so
-		 * it does not pollute the orchestrator's stdout/stderr.
-		 * HPNSSH_WORKER_VERBOSE controls level: 1=-v, 2=-vv, 3=-vvv.
-		 * Default 0 (off); set to 1 or higher to capture worker SSH
-		 * debug output when diagnosing connection or respawn failures.
-		 */
+		/* Worker verbosity = max(user's hpnsftp -v count,
+		 *                        worker_log_dir ? 1 : 0).
+		 *
+		 * Passing through the user's own -v count keeps worker
+		 * verbosity consistent with what they asked for at the
+		 * hpnsftp layer (previously hpnsftp -v added -v to the
+		 * control-master SSH but not to the workers — asymmetric).
+		 *
+		 * When -W is set, force at least -v so the captured stderr
+		 * files actually contain something useful: ssh is silent on
+		 * a successful handshake, and an empty log file is a
+		 * usability footgun.  We take the MAX of the two so a user
+		 * who explicitly asked for -vv (or higher) gets that level
+		 * — we never decrease their requested verbosity.
+		 *
+		 * SSH itself accepts at most -vvv (three -v's).  Cap there
+		 * to avoid wasted argv slots. */
 		{
-			/* ENV-VAR HPNSSH_WORKER_VERBOSE — developer-only:
-			 * inject -v / -vv / -vvv into worker hpnssh invocations
-			 * for debugging.  Not user-facing. */
-			const char *e = getenv("HPNSSH_WORKER_VERBOSE");
-			int lvl = (e && *e) ? atoi(e) : 0;
-			if (lvl >= 1) argv[argc++] = "-v";
-			if (lvl >= 2) argv[argc++] = "-vv";
-			if (lvl >= 3) argv[argc++] = "-vvv";
+			int v = cfg->verbose_level;
+			if (cfg->worker_log_dir != NULL && v < 1)
+				v = 1;
+			if (v > 3) v = 3;
+			for (int i = 0; i < v; i++)
+				argv[argc++] = "-v";
 		}
 		if (cfg->port && cfg->port[0]) {
 			argv[argc++] = "-p";

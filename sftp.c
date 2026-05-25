@@ -77,6 +77,13 @@ static int parallel_user_opt_in = 0;
  * [64, 10240] MiB at parse time. */
 static int range_split_min_mb_user = 0;
 
+/* Directory for per-worker SSH stderr capture, set by -W flag.  NULL = off
+ * (production default — worker stderr is inherited so connection errors
+ * reach the user's terminal).  When set, each parallel worker writes its
+ * SSH child's stderr to <dir>/hpnssh-worker-<pid>.stderr.  Validated to be
+ * an existing writable directory at parse time. */
+static const char *worker_log_dir = NULL;
+
 /*
  * When non-zero, process_put / process_get do NOT call sftp_parallel_wait
  * after submitting their files.  Submissions pile up in the queue and the
@@ -2898,7 +2905,7 @@ main(int argc, char **argv)
 	infile = stdin;
 
 	while ((ch = getopt(argc, argv,
-	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:X:")) != -1) {
+	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:X:")) != -1) {
 		switch (ch) {
 		/* Passed through to ssh(1) */
 		case 'A':
@@ -3048,6 +3055,51 @@ main(int argc, char **argv)
 			ssh_program = optarg;
 			replacearg(&args, 0, "%s", ssh_program);
 			break;
+		case 'W':
+			/* Per-worker SSH stderr capture directory.  Diagnostic
+			 * aid: when set, each parallel worker writes its SSH
+			 * child's stderr to <dir>/hpnssh-worker-<pid>.stderr,
+			 * giving users a clear per-worker log to send when
+			 * reporting failures.  Off by default — production
+			 * inherits stderr so connection errors / banners /
+			 * warnings reach the user's terminal directly.
+			 *
+			 * Validates: must be a non-empty path that names a
+			 * writable directory.  If the path doesn't exist we
+			 * create it (mkdir-p semantics, mode 0755).  Anything
+			 * else (missing arg, dash-prefixed token, mkdir
+			 * failure, existing path that isn't a directory, no
+			 * write access) is fatal — the user typed something
+			 * they probably didn't mean. */
+			if (optarg == NULL || *optarg == '\0' ||
+			    *optarg == '-')
+				fatal("-W requires a directory path argument "
+				    "(got \"%s\")",
+				    optarg ? optarg : "(none)");
+			{
+				struct stat st;
+				if (stat(optarg, &st) != 0) {
+					if (errno != ENOENT)
+						fatal("-W \"%s\": %s",
+						    optarg, strerror(errno));
+					if (mkdir_p(optarg, 0755) != 0)
+						fatal("-W could not create "
+						    "\"%s\": %s",
+						    optarg, strerror(errno));
+					if (stat(optarg, &st) != 0)
+						fatal("-W \"%s\" missing "
+						    "after mkdir: %s",
+						    optarg, strerror(errno));
+				}
+				if (!S_ISDIR(st.st_mode))
+					fatal("-W \"%s\" is not a directory",
+					    optarg);
+				if (access(optarg, W_OK | X_OK) != 0)
+					fatal("-W \"%s\" not writable: %s",
+					    optarg, strerror(errno));
+			}
+			worker_log_dir = optarg;
+			break;
 		case 'X':
 			/* Please keep in sync with scp.c -X */
 			if (strncmp(optarg, "buffer=", 7) == 0) {
@@ -3196,6 +3248,8 @@ main(int argc, char **argv)
 		pcfg.num_requests     = (unsigned int)num_requests;
 		pcfg.limit_kbps       = limit_kbps;
 		pcfg.range_split_min_mb = range_split_min_mb_user;
+		pcfg.worker_log_dir     = worker_log_dir;
+		pcfg.verbose_level      = debug_level;
 		/* Resolve HPNUseBundle and any other ssh_config-derived
 		 * pcfg fields.  Sets pcfg.use_bundle; defaults to 1 (yes)
 		 * if parsing fails or the option isn't set. */

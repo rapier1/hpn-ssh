@@ -76,6 +76,7 @@ LTESTS= 	connect \
 		sftp-bundle-caps \
 		sftp-range-split \
 		sftp-hpn-config \
+		sftp-worker-log-dir \
 		reconfigure \
 		dynamic-forward \
 		forwarding \
