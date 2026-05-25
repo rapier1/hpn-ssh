@@ -187,8 +187,6 @@ int sftp_parallel_submit_upload(struct sftp_parallel *p,
 int sftp_parallel_submit_download(struct sftp_parallel *p,
     struct sftp_conn *conn,
     const char *remote_path, const char *local_path, off_t size, mode_t mode);
-int sftp_parallel_submit_mkdir(struct sftp_parallel *p,
-    const char *remote_path, mode_t mode);
 
 /*
  * Walker-helper accessors.  Exposed for sftp-parallel-walk.c (the
@@ -307,18 +305,9 @@ off_t sftp_parallel_scan_upload_total(const char *src, long *file_count_out);
  */
 void sftp_parallel_stop(struct sftp_parallel *p);
 
-/* Observability — safe to call any time after start(). */
-uint64_t sftp_parallel_bytes_total(struct sftp_parallel *p);
-uint64_t sftp_parallel_units_completed(struct sftp_parallel *p);
-uint64_t sftp_parallel_units_failed(struct sftp_parallel *p);
-
 /*
  * Aggregate orchestrator state snapshot.  Cheap (one mutex per worker
  * briefly held).  Safe to call from any thread.
- *
- * The companion per-worker snapshot API was removed when adaptive scaling
- * was removed (2026-05-20); aggregate stats are the only consumer-facing
- * observability today.
  */
 
 struct sftp_parallel_stats {
@@ -372,22 +361,6 @@ uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
     char ***out_paths, size_t *out_used);
 
 /*
- * Dynamic worker scaling for long-running transfers.
- *
- * sftp_parallel_add_worker() spawns a new independent SSH child, runs
- * sftp_init, and starts a worker thread. Synchronous — returns 0 on
- * success or -1 on failure (capped at SFTP_PARALLEL_MAX_WORKERS,
- * spawn failure, or sftp_init failure).
- *
- * sftp_parallel_remove_worker() submits an exit sentinel; whichever
- * worker pops it next finishes its current unit, sets its exited flag,
- * and terminates. The reporter thread reaps exited workers. Asynchronous
- * — returns 0 if the sentinel was queued (-1 if num_workers <= 1, queue
- * is shut down, etc.). Removal is "any available worker", not targeted
- * — targeted removal requires the in-flight cancel work that's deferred
- * past Phase 1.
- */
-/*
  * Hard cap on the number of parallel worker SSH connections per process.
  *
  * This is intentionally a compile-time constant, not a runtime parameter.
@@ -400,8 +373,5 @@ uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
  * rate limiting, and fail2ban-style tools.
  */
 #define SFTP_PARALLEL_MAX_WORKERS 24
-
-int sftp_parallel_add_worker(struct sftp_parallel *p);
-int sftp_parallel_remove_worker(struct sftp_parallel *p);
 
 #endif /* _SFTP_PARALLEL_H */

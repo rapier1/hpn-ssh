@@ -11,8 +11,9 @@
  *
  * Upstream merge note: sftp-server.c gains only:
  *   #include "sftp-hpn-server.h"
- *   sftp_hpn_server_handles() / sftp_hpn_server_dispatch() calls in the
- *   SSH2_FXP_EXTENDED dispatch block.
+ *   sftp_hpn_server_dispatch() calls in the SSH2_FXP_EXTENDED dispatch
+ *   block (extensions are registered in the extended_handlers[] table
+ *   at the top of sftp-server.c, which routes by name to dispatch).
  */
 
 #ifndef _SFTP_SERVER_HPN_H
@@ -27,18 +28,14 @@
 struct sshbuf;
 
 /*
- * Returns non-zero if the named extension is handled by this module.
- * Called from sftp-server.c's SSH2_FXP_EXTENDED dispatch to route
- * HPN-specific extension requests without modifying the upstream table.
- */
-int sftp_hpn_server_handles(const char *name);
-
-/*
- * Dispatch an HPN extension request.  Called only when
- * sftp_hpn_server_handles() returned non-zero.
+ * Dispatch an HPN extension request from sftp-server.c's
+ * SSH2_FXP_EXTENDED handler.  The caller has already routed by
+ * extension name (via the extended_handlers[] table in sftp-server.c),
+ * so this entry point switches on `name` to call the right HPN-side
+ * handler.
  *
  *   id      — SFTP request ID from the client
- *   name    — extension name string
+ *   name    — extension name string (one of HPN_EXT_*)
  *   iqueue  — input buffer (positioned after the extension name)
  *   oqueue  — output buffer for the reply
  */

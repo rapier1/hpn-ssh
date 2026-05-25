@@ -181,14 +181,6 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 static void process_hpn_bundle_open(u_int id, struct sshbuf *iqueue,
     struct sshbuf *oqueue);
 
-int
-sftp_hpn_server_handles(const char *name)
-{
-	return strcmp(name, HPN_EXT_FS_INFO) == 0
-	    || strcmp(name, HPN_EXT_BUNDLE_OPEN) == 0
-	    || strcmp(name, HPN_EXT_BUNDLE_FETCH) == 0;
-}
-
 /* ── BEGIN Phase 5: bundle handle implementation ──────────────────────────
  *
  * Bundle handles are allocated when the client sends an

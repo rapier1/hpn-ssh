@@ -333,8 +333,6 @@ enum worker_health {
 enum sftp_op {
 	SFTP_OP_UPLOAD,
 	SFTP_OP_DOWNLOAD,
-	SFTP_OP_MKDIR,
-	SFTP_OP_EXIT_WORKER,	/* sentinel for sftp_parallel_remove_worker */
 	SFTP_OP_UPLOAD_RANGE,	/* upload a byte range of a large file */
 	SFTP_OP_DOWNLOAD_RANGE,	/* download a byte range of a large file */
 };
@@ -541,25 +539,16 @@ struct sftp_worker {
 	 * (C) Exit lifecycle (worker-owned):
 	 *       alive ─→ exited
 	 *     Set by the worker thread itself just before pthread_exit;
-	 *     read by reporter for pthread_join + reap.  `exited_voluntary`
-	 *     distinguishes "removed via EXIT_WORKER sentinel" (no
-	 *     replacement spawn) from "died involuntarily — respawn".
+	 *     read by reporter for pthread_join + reap.  Every reap is
+	 *     followed by a respawn — there is no "voluntary exit" path
+	 *     in the current codebase.
 	 *
 	 * Valid combinations:
 	 *   (HEALTHY,  ¬doomed, ¬exited)            — normal running
 	 *   (STALLED,  ¬doomed, ¬exited)            — silent but not killed
 	 *   (DEAD,      doomed, ¬exited)            — SIGTERMed, awaiting
 	 *                                             thread exit
-	 *   (DEAD,      doomed,  exited involuntary) — ready to reap +
-	 *                                             respawn
-	 *   (any,      ¬doomed,  exited voluntary)  — user removed worker;
-	 *                                             reap, no respawn
-	 *   (DEAD,      doomed,  exited voluntary)  — exited via sentinel
-	 *                                             AFTER watchdog
-	 *                                             already doomed it
-	 *                                             (race; reap, no
-	 *                                             respawn — voluntary
-	 *                                             wins)
+	 *   (DEAD,      doomed,  exited)            — ready to reap + respawn
 	 *
 	 * Brief race window after the watchdog's transition: (DEAD,
 	 * ¬doomed, ¬exited) holds for a few lines until SIGTERM is sent;
@@ -574,9 +563,6 @@ struct sftp_worker {
 	int                exited;             /* (C) set by worker on
 						* self-exit; read by reporter
 						* for reaping */
-	int                exited_voluntary;   /* (C) modifier on exited;
-						* EXIT_WORKER sentinel only.
-						* Suppresses respawn. */
 	int                doomed;             /* (B) set by watchdog before
 						* SIGTERM; prevents double-kill */
 	uint64_t           doom_ns;            /* (B) monotonic ns when
@@ -720,9 +706,8 @@ struct sftp_parallel {
 	 * decrement and queue pop), but never undercounts — the order of
 	 * operations ensures the counter leads the queue state.
 	 *
-	 * Originally driven by the adaptive scaler (removed 2026-05-20); kept
-	 * because the watchdog still uses it to distinguish "worker stalled
-	 * with work pending" from "worker idle, queue empty."
+	 * The watchdog uses this to distinguish "worker stalled with work
+	 * pending" from "worker idle, queue empty."
 	 */
 	volatile uint64_t           queued_bytes;
 
@@ -1366,13 +1351,6 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		    p->cfg.resume_flag, p->cfg.fsync_flag,
 		    p->cfg.inplace_flag);
 		break;
-	case SFTP_OP_MKDIR:
-		rc = sftp_mkdir(w->conn, u->dst_path, NULL, /*print_flag=*/0);
-		break;
-	case SFTP_OP_EXIT_WORKER:
-		/* Intercepted in worker_thread before reaching here. */
-		rc = 0;
-		break;
 	}
 	return rc;
 }
@@ -1988,21 +1966,6 @@ worker_thread(void *arg)
 			__atomic_fetch_sub(&p->queued_bytes,
 			    (uint64_t)u0->size, __ATOMIC_RELAXED);
 
-		/* Self-exit sentinel from sftp_parallel_remove_worker. The
-		 * first worker to pop this exits its loop; the reporter
-		 * thread reaps it. Mark voluntary so the reap loop does
-		 * not spawn a replacement.  Drain the deferred pipelined
-		 * batch (if any) so its CLOSE STATUSes are collected on
-		 * a live connection before we exit. */
-		if (u0->op == SFTP_OP_EXIT_WORKER) {
-			worker_drain_pipeline(w);
-			free_unit(u0);
-			pthread_mutex_lock(&w->mu);
-			w->exited_voluntary = 1;
-			pthread_mutex_unlock(&w->mu);
-			break;
-		}
-
 		/*
 		 * Batch-open optimisation for uploads: accumulate up to
 		 * UPLOAD_BATCH_SIZE upload units using non-blocking trypop,
@@ -2127,22 +2090,11 @@ worker_thread(void *arg)
 			}
 
 			/* Process the leftover non-batch unit (if any). */
-			if (leftover != NULL) {
-				if (leftover->op == SFTP_OP_EXIT_WORKER) {
-					/* Drain pending pipelined CLOSEs on a
-					 * live conn before voluntary exit. */
-					worker_drain_pipeline(w);
-					free_unit(leftover);
-					pthread_mutex_lock(&w->mu);
-					w->exited_voluntary = 1;
-					pthread_mutex_unlock(&w->mu);
-					break;
-				}
+			if (leftover != NULL)
 				worker_execute_single(w, leftover);
-			}
 		} else {
-			/* Download (no bundle), mkdir, or any range op —
-			 * all bypass the upload-batch path. */
+			/* Download (no bundle) or any range op — all bypass
+			 * the upload-batch path. */
 			worker_execute_single(w, u0);
 		}
 
@@ -2989,33 +2941,30 @@ reporter_emit_stats_csv(struct sftp_parallel *p)
 }
 
 /*
- * Reap workers that have marked themselves exited (either via
- * SFTP_OP_EXIT_WORKER sentinel or because their connection died).
+ * Reap workers that have marked themselves exited (connection died,
+ * fault-injected exit, or fatal protocol violation).  Every exit is
+ * involuntary — the orchestrator always respawns.
  *
  * Two phases for clean locking: collect-under-lock, then join-and-free
  * outside the lock (pthread_join can take arbitrary time).
  *
- * Returns the count of NON-voluntary exits — the caller (reporter)
- * uses this to drive respawn dispatch.  Voluntary exits (worker
- * removed via sftp_parallel_remove_worker sending an EXIT_WORKER
- * sentinel) are reaped but NOT respawned.
+ * Returns the count of reaped workers, which equals the number of
+ * respawn slots the caller (reporter) needs to dispatch.
  */
 static int
 reporter_reap_exited_workers(struct sftp_parallel *p)
 {
 	struct sftp_worker *to_reap[SFTP_PARALLEL_MAX_WORKERS];
-	int to_reap_voluntary[SFTP_PARALLEL_MAX_WORKERS];
 	int n_reap = 0;
 
 	pthread_mutex_lock(&p->workers_mu);
 	for (int i = p->num_workers - 1; i >= 0; i--) {
 		struct sftp_worker *w = p->workers[i];
-		int exited, voluntary;
+		int exited;
 		uint64_t bt;
 		pthread_mutex_lock(&w->mu);
-		exited    = w->exited;
-		voluntary = w->exited_voluntary;
-		bt        = w->bytes_total;
+		exited = w->exited;
+		bt     = w->bytes_total;
 		/* Capture bytes_total before the worker leaves the array
 		 * so the aggregate stays monotonic.  live_bytes was reset
 		 * to 0 at the worker's last completion so it is not
@@ -3024,9 +2973,7 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 			p->retired_bytes += bt;
 		pthread_mutex_unlock(&w->mu);
 		if (exited) {
-			to_reap[n_reap] = w;
-			to_reap_voluntary[n_reap] = voluntary;
-			n_reap++;
+			to_reap[n_reap++] = w;
 			memmove(&p->workers[i],
 			    &p->workers[i + 1],
 			    (p->num_workers - i - 1) *
@@ -3036,11 +2983,8 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 	}
 	pthread_mutex_unlock(&p->workers_mu);
 
-	int n_to_respawn = 0;
 	for (int i = 0; i < n_reap; i++) {
 		struct sftp_worker *w = to_reap[i];
-		if (!to_reap_voluntary[i])
-			n_to_respawn++;
 		pthread_join(w->tid, NULL);
 		if (w->conn) sftp_free(w->conn);
 		if (w->fd_in >= 0) close(w->fd_in);
@@ -3055,7 +2999,7 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 		pthread_mutex_destroy(&w->mu);
 		free(w);
 	}
-	return n_to_respawn;
+	return n_reap;
 }
 
 /*
@@ -3308,10 +3252,10 @@ reporter_thread(void *arg)
 
 /*
  * Spawn one worker: SSH child via the master's socket, sftp_init, attach
- * to p->workers[] under workers_mu, then start the thread. Returns the
+ * to p->workers[] under workers_mu, then start the thread.  Returns the
  * worker on success, NULL on failure (with all resources cleaned up).
- * Used by sftp_parallel_start (during initial bring-up) and
- * sftp_parallel_add_worker (for dynamic scaling).
+ * Used by sftp_parallel_start (during initial bring-up) and by the
+ * reporter's respawn dispatch when a worker has died.
  */
 static struct sftp_worker *
 spawn_one_worker(struct sftp_parallel *p)
@@ -3471,9 +3415,8 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	 * = ~25 KiB at the default cap. */
 	hpn_strlist_init(&p->failed_paths, HPN_FAILED_PATHS_MAX);
 
-	/* 1. Workqueue. Sized for cfg->num_streams; if workers are added
-	 * later via sftp_parallel_add_worker, capacity stays the same.
-	 * That's fine — capacity is just backpressure, not a hard cap. */
+	/* 1. Workqueue. Sized for cfg->num_streams.  Respawned workers
+	 * reuse the same queue, so capacity is set once at startup. */
 	p->q = sftp_workqueue_new(WORK_QUEUE_DEPTH(cfg->num_streams));
 	if (p->q == NULL) {
 		error_f("workqueue allocation failed");
@@ -3613,14 +3556,6 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
 		    size, mode);
 	return submit(p,
 	    make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path, size, mode));
-}
-
-int
-sftp_parallel_submit_mkdir(struct sftp_parallel *p,
-    const char *remote_path, mode_t mode)
-{
-	return submit(p,
-	    make_unit(SFTP_OP_MKDIR, NULL, remote_path, 0, mode));
 }
 
 void
@@ -3844,33 +3779,6 @@ sftp_parallel_progress_stop(struct sftp_parallel *p)
 		return;
 	p->progress_meter_started = 0;
 	stop_progress_meter();
-}
-
-uint64_t
-sftp_parallel_bytes_total(struct sftp_parallel *p)
-{
-	if (p == NULL) return 0;
-	uint64_t b;
-	snapshot_workers(p, &b, NULL, NULL);
-	return b;
-}
-
-uint64_t
-sftp_parallel_units_completed(struct sftp_parallel *p)
-{
-	if (p == NULL) return 0;
-	uint64_t c;
-	snapshot_workers(p, NULL, &c, NULL);
-	return c;
-}
-
-uint64_t
-sftp_parallel_units_failed(struct sftp_parallel *p)
-{
-	if (p == NULL) return 0;
-	uint64_t f;
-	snapshot_workers(p, NULL, NULL, &f);
-	return f;
 }
 
 /* ---------- Recursive walkers (Approach B) ----------
@@ -4428,41 +4336,3 @@ sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
 }
 
 
-/* ---------- Dynamic worker scaling ---------- */
-
-int
-sftp_parallel_add_worker(struct sftp_parallel *p)
-{
-	if (p == NULL || p->stopped || p->abort_flag) {
-		errno = EINVAL;
-		return -1;
-	}
-	struct sftp_worker *w = spawn_one_worker(p);
-	return (w == NULL) ? -1 : 0;
-}
-
-int
-sftp_parallel_remove_worker(struct sftp_parallel *p)
-{
-	if (p == NULL || p->stopped || p->abort_flag) {
-		errno = EINVAL;
-		return -1;
-	}
-	pthread_mutex_lock(&p->workers_mu);
-	if (p->num_workers <= 1) {
-		pthread_mutex_unlock(&p->workers_mu);
-		return -1;
-	}
-	pthread_mutex_unlock(&p->workers_mu);
-
-	/* Submit an exit sentinel; whichever worker pops it next will
-	 * exit at the next iteration of its loop. The reporter thread
-	 * reaps the exited worker. */
-	struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
-	u->op = SFTP_OP_EXIT_WORKER;
-	if (sftp_workqueue_push(p->q, u) != 0) {
-		free(u);
-		return -1;
-	}
-	return 0;
-}
