@@ -605,6 +605,47 @@ sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
 }
 
 /*
+ * Validate a tar entry pathname before composing it into a destination
+ * path.  Rejects:
+ *   - NULL or empty
+ *   - any "/"-separated component equal to ".." (traversal — always
+ *     anomalous for a bundle producer; plain SFTP OPEN never has
+ *     reason to encode a "../" climb in a single pathname)
+ *   - leading "/" ONLY when dest_dir is non-empty.  When dest_dir is
+ *     empty the protocol explicitly delegates path interpretation to
+ *     the server's standard SFTP path-resolution (mirroring plain
+ *     SFTP OPEN semantics, including absolute paths the user has
+ *     permission to write); when dest_dir is non-empty an absolute
+ *     pathname composed as "dest_dir/" + "/abs/path" produces weird
+ *     semantics that the protocol never intends.
+ *
+ * Returns 1 if the pathname is safe to extract under the given
+ * dest_dir, 0 if it must be rejected.
+ */
+static int
+bundle_path_is_safe(const char *p, const char *dest_dir)
+{
+	const char *start, *q;
+
+	if (p == NULL || *p == '\0')
+		return 0;
+	if (*p == '/' && dest_dir != NULL && *dest_dir != '\0')
+		return 0;
+	start = p;
+	for (q = p; ; q++) {
+		if (*q == '/' || *q == '\0') {
+			size_t len = (size_t)(q - start);
+			if (len == 2 && start[0] == '.' && start[1] == '.')
+				return 0;
+			if (*q == '\0')
+				break;
+			start = q + 1;
+		}
+	}
+	return 1;
+}
+
+/*
  * Recursively create `dirpath`.  Used so tar paths like "a/b/c.dat" get
  * extracted correctly when "a" or "a/b" don't yet exist.
  *
@@ -733,6 +774,18 @@ sftp_hpn_server_bundle_close(int handle)
 		const char *path = archive_entry_pathname(ae);
 		if (path == NULL || *path == '\0') {
 			error_f("hpn-bundle: empty pathname in tar record");
+			status = SSH2_FX_FAILURE;
+			break;
+		}
+		if (!bundle_path_is_safe(path, s->dest_dir)) {
+			/* Loud rejection — anyone seeing this in the sftp
+			 * server log should investigate the originating
+			 * client.  Mark the whole bundle as failed so the
+			 * client gets a clear signal too. */
+			error("hpn-bundle: REJECTED unsafe tar pathname "
+			    "\"%s\" (\"..\" component, or absolute path with "
+			    "non-empty dest_dir); possible path-traversal "
+			    "attempt", path);
 			status = SSH2_FX_FAILURE;
 			break;
 		}

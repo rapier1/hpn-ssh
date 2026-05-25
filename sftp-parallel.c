@@ -3858,7 +3858,13 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 			/* Synthesise failures for ranges we never submitted
 			 * so the tracker reaches remaining=0 and removes the
 			 * (now-corrupt) remote file.  NULL worker is fine —
-			 * the REMOTE branch logs loudly if it can't remove. */
+			 * the REMOTE branch logs loudly if it can't remove.
+			 *
+			 * Safety: see the matching download-side comment in
+			 * submit_download_range_split — total finalize count
+			 * across workers + this loop is bounded by
+			 * effective_ranges, so if our final call frees the
+			 * tracker, the loop bound prevents re-dereference. */
 			int unsent;
 			for (unsent = i; unsent < effective_ranges; unsent++)
 				(void)range_tracker_finalize(tracker, 1, NULL);
@@ -4065,7 +4071,18 @@ submit_download_ranges(struct sftp_parallel *p,
 			 * corrupt local file.  Without this the tracker
 			 * leaks and the file is silently left behind.  No
 			 * worker context here, so pass NULL — local target
-			 * uses unlink() and doesn't need it. */
+			 * uses unlink() and doesn't need it.
+			 *
+			 * Safety: workers finalize at most `i` times (they
+			 * only received ranges 0..i-1); this loop adds
+			 * exactly (effective_ranges - i) more.  Total ≤
+			 * effective_ranges, so if our final iteration is the
+			 * one that drops remaining to 0 and frees the
+			 * tracker, the loop condition `unsent <
+			 * effective_ranges` fails immediately after — we
+			 * never re-dereference `tracker`.  Scan-build flags
+			 * this as a potential UAF because it can't see the
+			 * X ≤ i worker-finalize invariant. */
 			int unsent;
 			for (unsent = i; unsent < effective_ranges; unsent++)
 				(void)range_tracker_finalize(tracker, 1, NULL);
