@@ -832,16 +832,29 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 		 * otherwise vanish into the orchestrator's interleaved
 		 * stderr stream.  Path is /tmp/hpnssh-worker-PID.stderr;
 		 * the child's PID becomes part of the SSH child's command
-		 * line so it's easy to correlate.  Best-effort: if open
-		 * fails for any reason, fall through to inherited stderr
-		 * (current behaviour).
+		 * line so it's easy to correlate.
+		 *
+		 * Open with O_EXCL | O_NOFOLLOW to defeat the classic
+		 * world-writable-/tmp symlink-race / preexisting-file
+		 * attack: a co-tenant on the same host who predicts our
+		 * child's PID could otherwise pre-create
+		 * `/tmp/hpnssh-worker-N.stderr` as either a symlink to
+		 * (e.g.) ~/.ssh/authorized_keys (→ DoS via O_TRUNC) or as
+		 * a regular file they own (→ info leak via redirected
+		 * stderr).  O_EXCL fails on either; we fall through to
+		 * inherited stderr which is the safe default.
+		 *
+		 * Best-effort: if open fails for any reason, fall through
+		 * to inherited stderr.
 		 */
 		{
 			char path[64];
 			int fd;
 			snprintf(path, sizeof(path),
 			    "/tmp/hpnssh-worker-%d.stderr", (int)getpid());
-			fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			fd = open(path,
+			    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
+			    0644);
 			if (fd >= 0) {
 				dup2(fd, STDERR_FILENO);
 				close(fd);
