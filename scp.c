@@ -1881,11 +1881,13 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 		debug("Fetching %s to %s\n", g.gl_pathv[i], abs_dst);
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) && iamrecursive) {
 			if (sftp_download_dir(conn, g.gl_pathv[i], abs_dst,
-			    NULL, pflag, SFTP_PROGRESS_ONLY, 0, 0, 1, 1) == -1)
+			    NULL, pflag, SFTP_PROGRESS_ONLY, resume_flag,
+			    resume_flag /* verify */, 0, 1, 1) == -1)
 				err = -1;
 		} else {
 			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
-			    NULL, pflag, 0, 0, 1, 0);
+			    NULL, pflag, resume_flag, 0, 1,
+			    resume_flag /* verify */);
 			if (dr == -1)
 				err = -1;
 			else if (dr == 1)

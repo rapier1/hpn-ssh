@@ -424,6 +424,13 @@ struct sftp_work_unit {
 	off_t    size;
 	mode_t   mode;
 	int      attempt;
+	/* Per-unit resume/verify (whole-file units only — set by the public
+	 * submit entry points).  Carries the originating command's intent
+	 * (reget vs regetv, scp -Z) into the worker, replacing the dormant
+	 * session-global cfg.resume_flag.  Range units never resume; see
+	 * the resume⇒whole-file rule in sftp_parallel_submit_upload. */
+	int      resume;
+	int      verify;
 	/* Phase 5: set to 1 after a bundle wire failure (server refused open,
 	 * mid-stream error).  The worker batch loop refuses to bundle units
 	 * with this flag set and dispatches them through the per-file path
@@ -689,6 +696,13 @@ struct sftp_parallel {
 	 * hpn_strlist below — same shape for any future "things-the-user-
 	 * needs-to-see" accumulation across threads. */
 	struct hpn_strlist          failed_paths;
+
+	/* HPNVerifyTransfer: files whose post-transfer XXH3 hash did NOT
+	 * match the source.  The transfer is NOT aborted on a mismatch; the
+	 * path is recorded here (thread-safe append from workers) and the
+	 * end-of-transfer summary prints them.  A non-empty list makes
+	 * hpnsftp exit SFTP_EX_VERIFY_FAILED. */
+	struct hpn_strlist          verify_failed_paths;
 
 	pthread_t                   reporter_tid;
 	int                         reporter_started;
@@ -1347,6 +1361,33 @@ pending_dec_traced(struct sftp_parallel *p, const struct sftp_work_unit *u,
 	pending_dec(p);
 }
 
+/*
+ * HPNVerifyTransfer (parallel): verify one just-transferred whole file
+ * end-to-end on the worker's connection and record a mismatch in the
+ * orchestrator's thread-safe verify_failed_paths list.  Never fails the
+ * unit — a mismatch is surfaced in the summary + exit code, not retried.
+ */
+static void
+parallel_verify_one(struct sftp_worker *w, const char *local_path,
+    const char *remote_path)
+{
+	struct sftp_parallel *p = w->parent;
+	int r = sftp_verify_transfer(w->conn, local_path, remote_path);
+
+	if (r == 0)
+		return;	/* verified good */
+	if (r < 0) {
+		logit("worker %d VERIFY SKIPPED: \"%s\": server lacks "
+		    "hpn-check-file@hpnssh.org or read error",
+		    w->id, remote_path);
+		return;
+	}
+	error_f("worker %d VERIFY FAILED: \"%s\" post-transfer hash "
+	    "mismatch — transferred file does NOT match source",
+	    w->id, remote_path);
+	hpn_strlist_append(&p->verify_failed_paths, remote_path);
+}
+
 static int
 execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 {
@@ -1355,14 +1396,27 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 
 	switch (u->op) {
 	case SFTP_OP_UPLOAD:
-		/* verify=0: parallel whole-file uploads don't do verified
-		 * resume yet — deferred to the holistic parallel+resume work
-		 * (project_parallel_upload_dir_verify_integration). */
+		/*
+		 * Resume gate (Option A): u->verify makes sftp_upload hash even
+		 * on a size match (closes the sparse-hole gap).  resume/verify
+		 * are per-unit (the originating command's intent); the
+		 * unsupported-remote fatal already fired up front in the main
+		 * thread (see sftp_parallel_submit_upload), so the worker never
+		 * fatals here.  Return 1/2 are "already complete" skip codes —
+		 * map to success below so the unit isn't retried.
+		 */
 		rc = sftp_upload(w->conn, u->src_path, u->dst_path,
-		    p->cfg.preserve_flag, /*resume=*/0, /*verify=*/0,
+		    p->cfg.preserve_flag, u->resume, /*verify=*/u->verify,
 		    p->cfg.fsync_flag, p->cfg.inplace_flag);
+		if (rc == 0 && p->cfg.verify_transfer)
+			parallel_verify_one(w, u->src_path, u->dst_path);
+		if (rc == 1 || rc == 2)
+			rc = 0;	/* identical / target-larger: complete */
 		break;
 	case SFTP_OP_UPLOAD_RANGE:
+		/* Range-split resume gate + post-transfer verify happen at
+		 * the orchestrator/finalize level, not per-range; see
+		 * project_parallel_resume_verify_design (Phase 1 follow-up). */
 		rc = sftp_upload_range(w->conn, u->src_path, u->dst_path,
 		    u->range_offset, u->range_length);
 		break;
@@ -1371,13 +1425,14 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		    u->range_offset, u->range_length);
 		break;
 	case SFTP_OP_DOWNLOAD:
-		/* verify=0: parallel whole-file downloads don't do verified
-		 * resume yet — deferred to the holistic parallel+resume work
-		 * (project_parallel_upload_dir_verify_integration). */
 		rc = sftp_download(w->conn, u->src_path, u->dst_path,
 		    /*Attrib*/NULL, p->cfg.preserve_flag,
-		    p->cfg.resume_flag, p->cfg.fsync_flag,
-		    p->cfg.inplace_flag, /*verify=*/0);
+		    u->resume, p->cfg.fsync_flag,
+		    p->cfg.inplace_flag, /*verify=*/u->verify);
+		if (rc == 0 && p->cfg.verify_transfer)
+			parallel_verify_one(w, u->dst_path, u->src_path);
+		if (rc == 1 || rc == 2)
+			rc = 0;	/* identical / target-larger: complete */
 		break;
 	}
 	return rc;
@@ -3442,6 +3497,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	 * broken transfers.  HPN_FAILED_PATHS_MAX × ~256 bytes typical
 	 * = ~25 KiB at the default cap. */
 	hpn_strlist_init(&p->failed_paths, HPN_FAILED_PATHS_MAX);
+	hpn_strlist_init(&p->verify_failed_paths, HPN_FAILED_PATHS_MAX);
 
 	/* 1. Workqueue. Sized for cfg->num_streams.  Respawned workers
 	 * reuse the same queue, so capacity is set once at startup. */
@@ -3559,10 +3615,41 @@ static int submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn
     const char *remote_path, const char *local_path,
     off_t file_size, mode_t mode);
 
+/*
+ * Whole-file submit for a resumed and/or verified transfer.  resume/verify
+ * disable speculative range-splitting: range-split resume is the deferred
+ * sparse-hole case, so the file goes as one unit where sftp_upload/
+ * sftp_download's hash gate applies.  The unsupported-remote check fires
+ * HERE, in the main (submit) thread — a fatal() inside a worker would fight
+ * fault isolation, and hpn-check-file support is identical across workers,
+ * so one up-front check on the control connection suffices.  'remote' is the
+ * path named in the failure message; 'src'/'dst' follow make_unit's
+ * per-op convention (upload: local→remote; download: remote→local).
+ */
+static int
+submit_resume_whole_file(struct sftp_parallel *p, struct sftp_conn *conn,
+    enum sftp_op op, const char *src, const char *dst, const char *remote,
+    off_t size, mode_t mode, int resume, int verify)
+{
+	struct sftp_work_unit *u;
+
+	if (verify && conn != NULL && !sftp_conn_has_hpn_check_file(conn))
+		fatal("\"%s\": %s", remote, RESUME_INCOMPAT_MSG);
+	u = make_unit(op, src, dst, size, mode);
+	u->resume = resume;
+	u->verify = verify;
+	return submit(p, u);
+}
+
 int
 sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *local_path, const char *remote_path, off_t size, mode_t mode)
+    const char *local_path, const char *remote_path, off_t size, mode_t mode,
+    int resume, int verify)
 {
+	if (resume || verify)
+		return submit_resume_whole_file(p, conn, SFTP_OP_UPLOAD,
+		    local_path, remote_path, remote_path, size, mode,
+		    resume, verify);
 	/* When a control connection is supplied, route through the
 	 * speculative-split decision so a single large file produces
 	 * multiple range work units (feeds the byte-based scale-up
@@ -3577,8 +3664,13 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 int
 sftp_parallel_submit_download(struct sftp_parallel *p,
     struct sftp_conn *conn,
-    const char *remote_path, const char *local_path, off_t size, mode_t mode)
+    const char *remote_path, const char *local_path, off_t size, mode_t mode,
+    int resume, int verify)
 {
+	if (resume || verify)
+		return submit_resume_whole_file(p, conn, SFTP_OP_DOWNLOAD,
+		    remote_path, local_path, remote_path, size, mode,
+		    resume, verify);
 	if (conn != NULL)
 		return submit_download_maybe_split(p, conn, remote_path, local_path,
 		    size, mode);
@@ -3734,6 +3826,7 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	pthread_cond_destroy(&p->pending_cv);
 	pthread_mutex_destroy(&p->workers_mu);
 	hpn_strlist_free(&p->failed_paths);
+	hpn_strlist_free(&p->verify_failed_paths);
 	free(p);
 }
 
@@ -4378,6 +4471,25 @@ sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
 		return 0;
 	}
 	return hpn_strlist_drain(&p->failed_paths, out_paths, out_used);
+}
+
+/*
+ * Drain the HPNVerifyTransfer post-transfer mismatch list.  Same contract
+ * as sftp_parallel_drain_failed_paths: returns the total mismatch count and
+ * (when out_paths is non-NULL) transfers ownership of the path strings to
+ * the caller.  A non-zero return means hpnsftp should exit
+ * SFTP_EX_VERIFY_FAILED.
+ */
+uint64_t
+sftp_parallel_drain_verify_failures(struct sftp_parallel *p,
+    char ***out_paths, size_t *out_used)
+{
+	if (p == NULL) {
+		if (out_paths != NULL) *out_paths = NULL;
+		if (out_used  != NULL) *out_used  = 0;
+		return 0;
+	}
+	return hpn_strlist_drain(&p->verify_failed_paths, out_paths, out_used);
 }
 
 

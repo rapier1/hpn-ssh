@@ -56,8 +56,8 @@ for mode in legacy sftp; do
 				    >/dev/null 2>&1
 				;;
 			larger)
-				# Dest is larger than source; should overwrite fully
-				# and ftruncate to source size.
+				# Dest is larger than source; verified resume skips
+				# it (a larger file can't be a partial of the source).
 				cp ${COPY}.1 ${COPY}.2
 				dd if=/dev/urandom bs=512 count=1 >>${COPY}.2 \
 				    2>/dev/null
@@ -102,6 +102,18 @@ for mode in legacy sftp; do
 				cmp ${COPY}.1 ${COPY}.2 \
 				    || fail "$tag corrupted after put -Z size=${size}"
 			else
+				if test $mode = sftp; then
+					case "${size}" in
+					larger)
+						# SFTP get skips when dest is larger (exit 0);
+						# dest is intentionally left untouched (a larger
+						# file can't be a partial of the source).
+						$SCP -Z $scpopts somehost:${COPY}.1 ${COPY}.2 \
+						    || fail "$tag get -Z failed size=${size}"
+						continue
+						;;
+					esac
+				fi
 				$SCP -Z $scpopts somehost:${COPY}.1 ${COPY}.2 \
 				    || fail "$tag get -Z failed size=${size}"
 				cmp ${COPY}.1 ${COPY}.2 \

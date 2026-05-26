@@ -1241,6 +1241,39 @@ per-file pipelined batch upload path. Consulted only by
 .Xr hpnsftp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
+.It Cm HPNVerifyTransfer
+Controls whether
+.Xr hpnsftp 1
+and
+.Xr hpnscp 1
+perform an end-to-end integrity check after each file transfer. When
+enabled, the full local and remote file are hashed with XXH3 and compared;
+the SSH transport MAC only protects bytes in flight, whereas this catches
+client- or server-side disk corruption, byte-range placement bugs, and
+crash-resume sparse-zero holes. The argument must be
+.Cm yes
+or
+.Cm no .
+The default is
+.Cm no .
+A mismatch does
+.Em not
+abort the transfer: the offending file is logged loudly, recorded, and a
+summary is printed when the session ends, after which the process exits
+with code 57
+.Pq Dv SFTP_EX_VERIFY_FAILED
+so that automation can detect the integrity failure. Verification requires
+the remote
+.Xr hpnsftp-server 8
+to advertise the
+.Cm hpn-check-file@hpnssh.org
+extension; if it does not, a per-file warning is emitted and the file is
+not counted as a failure. Consulted only by
+.Xr hpnsftp 1
+and
+.Xr hpnscp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
 .It Cm IdentitiesOnly
 Specifies that
 .Xr ssh 1

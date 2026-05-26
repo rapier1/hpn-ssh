@@ -63,7 +63,7 @@
 
 static int
 parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int depth)
+    const char *src, const char *dst, int depth, int resume, int verify)
 {
 	int created = 0, ret = 0;
 	DIR *dirp;
@@ -159,11 +159,12 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		}
 		if (S_ISDIR(sb.st_mode)) {
 			if (parallel_upload_walk(p, conn, new_src, new_dst,
-			    depth + 1) == -1)
+			    depth + 1, resume, verify) == -1)
 				ret = -1;
 		} else if (S_ISREG(sb.st_mode)) {
 			if (sftp_parallel_submit_upload(p, conn, new_src,
-			    new_dst, sb.st_size, sb.st_mode) != 0) {
+			    new_dst, sb.st_size, sb.st_mode, resume,
+			    verify) != 0) {
 				error("submit \"%s\" -> \"%s\" failed",
 				    new_src, new_dst);
 				sftp_parallel_walker_record_failure(p, new_src,
@@ -189,7 +190,7 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 
 int
 sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int print_flag)
+    const char *src, const char *dst, int print_flag, int resume, int verify)
 {
 	if (p == NULL || conn == NULL || src == NULL || dst == NULL) {
 		errno = EINVAL;
@@ -197,12 +198,13 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Entering %s\n", src);
-	return parallel_upload_walk(p, conn, src, dst, 0);
+	return parallel_upload_walk(p, conn, src, dst, 0, resume, verify);
 }
 
 static int
 parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int depth, Attrib *dirattrib)
+    const char *src, const char *dst, int depth, Attrib *dirattrib,
+    int resume, int verify)
 {
 	int i, ret = 0;
 	SFTP_DIRENT **dir_entries;
@@ -279,7 +281,7 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			    strcmp(filename, "..") == 0)
 				continue;
 			if (parallel_download_walk(p, conn, new_src, new_dst,
-			    depth + 1, a) == -1)
+			    depth + 1, a, resume, verify) == -1)
 				ret = -1;
 		} else if (S_ISREG(a->perm)) {
 			off_t fsize = (a->flags & SSH2_FILEXFER_ATTR_SIZE) ?
@@ -288,7 +290,8 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			    SSH2_FILEXFER_ATTR_PERMISSIONS) ?
 			    (a->perm & 07777) : 0644;
 			if (sftp_parallel_submit_download(p, conn,
-			    new_src, new_dst, fsize, fmode) != 0) {
+			    new_src, new_dst, fsize, fmode, resume,
+			    verify) != 0) {
 				error("submit download \"%s\" -> \"%s\" failed",
 				    new_src, new_dst);
 				sftp_parallel_walker_record_failure(p, new_src,
@@ -324,7 +327,7 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 
 int
 sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int print_flag)
+    const char *src, const char *dst, int print_flag, int resume, int verify)
 {
 	if (p == NULL || conn == NULL || src == NULL || dst == NULL) {
 		errno = EINVAL;
@@ -332,5 +335,5 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Retrieving %s\n", src);
-	return parallel_download_walk(p, conn, src, dst, 0, NULL);
+	return parallel_download_walk(p, conn, src, dst, 0, NULL, resume, verify);
 }

@@ -913,6 +913,22 @@ Escape to local shell.
 .It Ic \&?
 Synonym for help.
 .El
+.Sh EXIT STATUS
+.Nm
+exits 0 on success and >0 if an error occurs.
+.Pp
+As an HPNSSH extension, when
+.Cm HPNVerifyTransfer
+is enabled
+.Pq see Xr hpnssh_config 5
+and one or more files fail the post-transfer XXH3 integrity check, the
+transfer is completed but
+.Nm
+exits with code 57
+.Pq Dv SFTP_EX_VERIFY_FAILED
+and prints a summary of the files that did not match their source. This
+distinct code lets automation detect a silent-corruption event separately
+from an ordinary transfer error.
 .Sh SEE ALSO
 .Xr ftp 1 ,
 .Xr ls 1 ,

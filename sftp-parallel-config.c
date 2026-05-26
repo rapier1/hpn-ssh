@@ -100,14 +100,54 @@ process_config_files(const char *user_config_file, struct passwd *pw,
 	return 0;
 }
 
+/*
+ * Read ssh_config for `host` into *options (two-pass Match resolution).
+ * initialize_options() is done here; the caller must always free_options()
+ * afterward, including on a -1 return.  Returns 0 on success, -1 on failure.
+ */
+static int
+resolve_ssh_config(const char *host, const char *user_config_file,
+    Options *options)
+{
+	struct passwd *pw;
+	int want_final_pass = 0;
+	const char *host_name;
+
+	initialize_options(options);
+	options->host_arg = xstrdup(host);
+
+	pw = getpwuid(getuid());
+	if (pw == NULL) {
+		debug_f("getpwuid failed; skipping ssh_config parse");
+		return -1;
+	}
+
+	/* Pass 1: read config without Match-resolution, find out whether
+	 * a second pass is needed. */
+	if (process_config_files(user_config_file, pw, host, host,
+	    /* final_pass */ 0, &want_final_pass, options) < 0) {
+		error_f("could not read user ssh_config \"%s\"",
+		    user_config_file ? user_config_file : "(default)");
+		return -1;
+	}
+
+	/* Pass 2: if any Match block referenced final-pass data, re-read
+	 * with the resolved hostname. */
+	if (want_final_pass) {
+		host_name = options->hostname ? options->hostname : host;
+		(void)process_config_files(user_config_file, pw, host,
+		    host_name, /* final_pass */ 1, NULL, options);
+	}
+
+	fill_default_options(options);
+	return 0;
+}
+
 int
 sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
     const char *host, const char *user_config_file)
 {
 	Options options;
-	struct passwd *pw;
-	int want_final_pass = 0;
-	const char *host_name;
 
 	if (pcfg == NULL || host == NULL || *host == '\0')
 		return -1;
@@ -117,36 +157,12 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	pcfg->max_retries = 3;
 	pcfg->bundle_size = 0;  /* 0 = let worker use compile-time default */
 	pcfg->max_auth_concurrent = 0;  /* 0 = auto */
+	pcfg->verify_transfer = 0;  /* default off */
 
-	initialize_options(&options);
-	options.host_arg = xstrdup(host);
-
-	pw = getpwuid(getuid());
-	if (pw == NULL) {
-		debug_f("getpwuid failed; skipping ssh_config parse");
+	if (resolve_ssh_config(host, user_config_file, &options) < 0) {
 		free_options(&options);
 		return -1;
 	}
-
-	/* Pass 1: read config without Match-resolution, find out whether
-	 * a second pass is needed. */
-	if (process_config_files(user_config_file, pw, host, host,
-	    /* final_pass */ 0, &want_final_pass, &options) < 0) {
-		error_f("could not read user ssh_config \"%s\"",
-		    user_config_file ? user_config_file : "(default)");
-		free_options(&options);
-		return -1;
-	}
-
-	/* Pass 2: if any Match block referenced final-pass data, re-read
-	 * with the resolved hostname. */
-	if (want_final_pass) {
-		host_name = options.hostname ? options.hostname : host;
-		(void)process_config_files(user_config_file, pw, host,
-		    host_name, /* final_pass */ 1, NULL, &options);
-	}
-
-	fill_default_options(&options);
 
 	/* Map the resolved Options into pcfg.  Future ssh_config-promoted
 	 * options append additional assignments here. */
@@ -155,13 +171,30 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	pcfg->bundle_size = (options.hpn_bundle_size > 0)
 	    ? (uint64_t)options.hpn_bundle_size : 0;
 	pcfg->max_auth_concurrent = options.hpn_max_auth_concurrent;
+	pcfg->verify_transfer = (options.hpn_verify_transfer != 0);
 
 	debug_f("ssh_config: host=\"%s\" HPNUseBundle=%s HPNMaxRetries=%d "
-	    "HPNBundleSize=%llu HPNMaxAuthConcurrent=%d",
+	    "HPNBundleSize=%llu HPNMaxAuthConcurrent=%d HPNVerifyTransfer=%s",
 	    host, pcfg->use_bundle ? "yes" : "no", pcfg->max_retries,
 	    (unsigned long long)pcfg->bundle_size,
-	    pcfg->max_auth_concurrent);
+	    pcfg->max_auth_concurrent,
+	    pcfg->verify_transfer ? "yes" : "no");
 
 	free_options(&options);
 	return 0;
+}
+
+int
+sftp_resolve_hpn_verify_transfer(const char *host,
+    const char *user_config_file)
+{
+	Options options;
+	int r = 0;
+
+	if (host == NULL || *host == '\0')
+		return 0;
+	if (resolve_ssh_config(host, user_config_file, &options) == 0)
+		r = (options.hpn_verify_transfer != 0);
+	free_options(&options);
+	return r;
 }

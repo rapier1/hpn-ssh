@@ -93,6 +93,9 @@ struct sftp_parallel_config {
 	int          fsync_flag;
 	int          inplace_flag;
 	int          follow_link_flag;
+	int          verify_transfer;	/* HPNVerifyTransfer: post-transfer
+					 * XXH3 verify; warn+collect on
+					 * mismatch, never abort */
 
 	/* Reporting: SFTP_QUIET / SFTP_PROGRESS_ONLY / SFTP_PRINT */
 	int          print_flag;
@@ -187,6 +190,14 @@ int sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
     const char *host, const char *user_config_file);
 
 /*
+ * Resolve just the HPNVerifyTransfer ssh_config option for a host.  Used by
+ * the single-stream sftp/scp paths, which otherwise don't read ssh_config.
+ * Returns 1 if HPNVerifyTransfer is enabled, 0 otherwise (default/off/error).
+ */
+int sftp_resolve_hpn_verify_transfer(const char *host,
+    const char *user_config_file);
+
+/*
  * Submit a work unit. These calls copy the path strings; the caller retains
  * ownership of its own buffers. Returns 0 on success, -1 if the orchestrator
  * is in shutdown / abort state.
@@ -195,13 +206,21 @@ int sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
  * used to query filesystem stripe geometry and pre-create the remote file
  * when speculative range-splitting applies.  Pass NULL to skip the split
  * decision (the upload is submitted as a single whole-file work unit).
+ *
+ * resume/verify carry the originating command's intent (reget vs regetv,
+ * scp -Z).  When either is set the file is submitted whole-file (range-split
+ * resume is deferred) and, if verify is set, the remote MUST advertise
+ * hpn-check-file@hpnssh.org — otherwise this is fatal (RESUME_INCOMPAT_MSG),
+ * checked once up front on conn in the calling thread.
  */
 int sftp_parallel_submit_upload(struct sftp_parallel *p,
     struct sftp_conn *conn,
-    const char *local_path, const char *remote_path, off_t size, mode_t mode);
+    const char *local_path, const char *remote_path, off_t size, mode_t mode,
+    int resume, int verify);
 int sftp_parallel_submit_download(struct sftp_parallel *p,
     struct sftp_conn *conn,
-    const char *remote_path, const char *local_path, off_t size, mode_t mode);
+    const char *remote_path, const char *local_path, off_t size, mode_t mode,
+    int resume, int verify);
 
 /*
  * Walker-helper accessors.  Exposed for sftp-parallel-walk.c (the
@@ -255,10 +274,10 @@ void sftp_parallel_walker_record_failure(struct sftp_parallel *p,
  * stored config.
  */
 int sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int print_flag);
+    const char *src, const char *dst, int print_flag, int resume, int verify);
 
 int sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int print_flag);
+    const char *src, const char *dst, int print_flag, int resume, int verify);
 
 /*
  * Block until all submitted units have been completed (or failed past
@@ -373,6 +392,14 @@ void sftp_parallel_get_stats(struct sftp_parallel *p,
  * The list is reset by this call so subsequent failures start fresh.
  */
 uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
+    char ***out_paths, size_t *out_used);
+
+/*
+ * Drain the HPNVerifyTransfer post-transfer hash-mismatch list (transfers
+ * ownership of the path strings to the caller).  Non-zero return => some
+ * file failed end-to-end verification => exit SFTP_EX_VERIFY_FAILED.
+ */
+uint64_t sftp_parallel_drain_verify_failures(struct sftp_parallel *p,
     char ***out_paths, size_t *out_used);
 
 /*

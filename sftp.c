@@ -141,6 +141,17 @@ int global_pflag = 0;
 /* When this option is set, transfers will have fsync() called on each file */
 int global_fflag = 0;
 
+/*
+ * HPNVerifyTransfer: when enabled (ssh_config HPNVerifyTransfer yes,
+ * resolved at startup), every successfully transferred single-stream file
+ * is XXH3-verified end-to-end after transfer.  A mismatch does NOT abort —
+ * it is logged loudly and recorded; at exit a summary is printed and the
+ * process returns SFTP_EX_VERIFY_FAILED (57).
+ */
+static int hpn_verify_transfer = 0;
+static char **verify_fail_list = NULL;
+static u_int verify_fail_count = 0;
+
 /* SIGINT received during command processing */
 volatile sig_atomic_t interrupted = 0;
 
@@ -831,6 +842,52 @@ parallel_flush(void)
 	return rc;
 }
 
+/*
+ * HPNVerifyTransfer: verify one just-transferred file end-to-end and record
+ * a mismatch for the end-of-run summary.  Never fails the transfer.
+ */
+static void
+verify_one(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path)
+{
+	int r = sftp_verify_transfer(conn, local_path, remote_path);
+
+	if (r == 0) {
+		debug("verify: \"%s\" OK", remote_path);
+		return;
+	}
+	if (r < 0) {
+		logit("VERIFY SKIPPED: \"%s\": could not verify (server "
+		    "lacks hpn-check-file@hpnssh.org or read error)",
+		    remote_path);
+		return;
+	}
+	/* r == 1: content mismatch — loud, recorded, but don't abort. */
+	error("VERIFY FAILED: \"%s\" (post-transfer hash mismatch — the "
+	    "transferred file does NOT match the source)", remote_path);
+	verify_fail_list = xreallocarray(verify_fail_list,
+	    verify_fail_count + 1, sizeof(*verify_fail_list));
+	verify_fail_list[verify_fail_count++] = xstrdup(remote_path);
+}
+
+/*
+ * Print the verify-failure summary at exit.  Returns the number of files
+ * that failed verification (0 = all clean / verify off).
+ */
+static u_int
+verify_print_summary(void)
+{
+	u_int i;
+
+	if (verify_fail_count == 0)
+		return 0;
+	mprintf("\nHPNVerifyTransfer: %u file(s) FAILED post-transfer "
+	    "verification:\n", verify_fail_count);
+	for (i = 0; i < verify_fail_count; i++)
+		mprintf("    %s\n", verify_fail_list[i]);
+	return verify_fail_count;
+}
+
 static int
 process_get(struct sftp_conn *conn, const char *src, const char *dst,
     const char *pwd, int pflag, int rflag, int resume, int fflag, int verify)
@@ -913,11 +970,12 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		    (rflag || global_rflag)) {
 			if (parallel_orch != NULL) {
 				if (sftp_parallel_download_dir(parallel_orch,
-				    conn, g.gl_pathv[i], abs_dst, 1) == -1)
+				    conn, g.gl_pathv[i], abs_dst, 1,
+				    resume, verify) == -1)
 					err = -1;
 			} else if (sftp_download_dir(conn, g.gl_pathv[i],
 			    abs_dst, NULL, pflag || global_pflag, 1, resume,
-			    fflag || global_fflag, 0, 0) == -1)
+			    verify, fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
 			/*
@@ -947,7 +1005,8 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 					fmode = ga.perm & 07777;
 			}
 			if (sftp_parallel_submit_download(parallel_orch, conn,
-			    g.gl_pathv[i], abs_dst, fsize, fmode) != 0)
+			    g.gl_pathv[i], abs_dst, fsize, fmode,
+			    resume, verify) != 0)
 				err = -1;
 		} else {
 			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
@@ -961,6 +1020,8 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			else if (dr == 2)
 				mprintf("File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
+			else if (hpn_verify_transfer)	/* dr==0: downloaded */
+				verify_one(conn, abs_dst, g.gl_pathv[i]);
 		}
 		free(abs_dst);
 		abs_dst = NULL;
@@ -1086,7 +1147,8 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		    (rflag || global_rflag)) {
 			if (parallel_orch != NULL) {
 				if (sftp_parallel_upload_dir(parallel_orch,
-				    conn, g.gl_pathv[i], abs_dst, 1) == -1)
+				    conn, g.gl_pathv[i], abs_dst, 1,
+				    resume, verify) == -1)
 					err = -1;
 			} else if (sftp_upload_dir(conn, g.gl_pathv[i],
 			    abs_dst, pflag || global_pflag, 1, resume, verify,
@@ -1095,7 +1157,7 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		} else if (parallel_orch != NULL) {
 			if (sftp_parallel_submit_upload(parallel_orch, conn,
 			    g.gl_pathv[i], abs_dst,
-			    sb.st_size, sb.st_mode) != 0)
+			    sb.st_size, sb.st_mode, resume, verify) != 0)
 				err = -1;
 		} else {
 			int ur = sftp_upload(conn, g.gl_pathv[i], abs_dst,
@@ -1109,6 +1171,8 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			else if (ur == 2)
 				mprintf("File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
+			else if (hpn_verify_transfer)	/* ur==0: uploaded */
+				verify_one(conn, g.gl_pathv[i], abs_dst);
 		}
 	}
 
@@ -3414,7 +3478,36 @@ main(int argc, char **argv)
 		}
 	}
 
+	/*
+	 * Resolve HPNVerifyTransfer from ssh_config for the single-stream
+	 * transfer paths (the parallel orchestrator resolves it into pcfg
+	 * separately).  Safe with a NULL/empty host (returns 0 = off).
+	 */
+	hpn_verify_transfer = sftp_resolve_hpn_verify_transfer(host,
+	    parallel_config_file);
+
 	err = interactive_loop(conn, file1, file2);
+
+	/*
+	 * Fold any parallel post-transfer verify mismatches into the global
+	 * verify-failure list (drain transfers ownership of the strings), so
+	 * the single end-of-run summary + SFTP_EX_VERIFY_FAILED exit path
+	 * covers both single-stream and parallel transfers.  Must run before
+	 * sftp_parallel_stop frees the orchestrator.
+	 */
+	if (parallel_orch != NULL) {
+		char  **vpaths = NULL;
+		size_t  vused = 0, i;
+
+		(void)sftp_parallel_drain_verify_failures(parallel_orch,
+		    &vpaths, &vused);
+		for (i = 0; i < vused; i++) {
+			verify_fail_list = xreallocarray(verify_fail_list,
+			    verify_fail_count + 1, sizeof(*verify_fail_list));
+			verify_fail_list[verify_fail_count++] = vpaths[i];
+		}
+		free(vpaths);
+	}
 
 	if (parallel_orch != NULL) {
 		sftp_parallel_stop(parallel_orch);
@@ -3441,6 +3534,16 @@ main(int argc, char **argv)
 		if (errno != EINTR)
 			fatal("Couldn't wait for ssh process: %s",
 			    strerror(errno));
+
+	/*
+	 * HPNVerifyTransfer: if any file failed post-transfer verification,
+	 * print the summary and exit with the distinct SFTP_EX_VERIFY_FAILED
+	 * code so automation can detect silent-corruption even though the
+	 * transfer itself was not aborted.  This takes precedence over the
+	 * generic error code since it flags data integrity specifically.
+	 */
+	if (verify_print_summary() > 0)
+		exit(SFTP_EX_VERIFY_FAILED);
 
 	exit(err == 0 ? 0 : 1);
 }

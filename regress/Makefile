@@ -84,6 +84,7 @@ LTESTS= 	connect \
 		sftp-range-split \
 		sftp-hpn-config \
 		sftp-worker-log-dir \
+		sftp-verify \
 		reconfigure \
 		dynamic-forward \
 		forwarding \

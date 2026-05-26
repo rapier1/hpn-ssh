@@ -74,6 +74,29 @@ struct sftp_limits {
 #define SFTP_PROGRESS_ONLY	2	/* progress bar only */
 
 /*
+ * Exit code returned by hpnsftp/hpnscp when one or more files fail
+ * post-transfer XXH3 verification (HPNVerifyTransfer) or the verified
+ * resume gate.  The transfer is NOT aborted on a mismatch — the file is
+ * re-transferred (resume) or flagged (verify) and a summary is printed —
+ * but the process exits non-zero so automation can detect it.  57 = a
+ * Pittsburgh/PSC nod (Heinz 57); chosen to avoid the existing 0/1/255
+ * exit codes and the BSD sysexits block (64-78).
+ */
+#define SFTP_EX_VERIFY_FAILED	57
+
+/*
+ * Single canonical message for "the remote can't do verified resume".
+ * Referenced by sftp_upload, sftp_download, and the parallel submit path
+ * so every verified-resume fatal reads identically regardless of mode or
+ * direction.  Verified resume requires the server's hpn-check-file@hpnssh.org
+ * extension; when it is absent we fail loudly rather than silently degrade
+ * to an unverified resume or a full re-transfer behind the user's back.
+ */
+#define RESUME_INCOMPAT_MSG \
+	"The remote is not compatible with verified resume. " \
+	"Please upgrade the remote to at least HPN-SSH 19.0.0"
+
+/*
  * Initialise a SSH filexfer connection. Returns NULL on error or
  * a pointer to a initialized sftp_conn struct on success.
  */
@@ -180,20 +203,32 @@ int sftp_download(struct sftp_conn *, const char *, const char *, Attrib *,
 
 /*
  * Recursively download 'remote_directory' to 'local_directory'. Preserve
- * times if 'pflag' is set
+ * times if 'pflag' is set.  The 'verify' arg (after resume) mirrors
+ * sftp_upload_dir: when set, each file is resumed with hash verification
+ * (fatal if the server lacks hpn-check-file@hpnssh.org).
  */
 int sftp_download_dir(struct sftp_conn *, const char *, const char *, Attrib *,
-    int, int, int, int, int, int);
+    int, int, int, int, int, int, int);
 
 /*
  * Upload 'local_path' to 'remote_path'. Preserve permissions and times
- * if 'pflag' is set. If 'verify' is set and the server supports the
- * hpn-check-file@hpnssh.org extension, hash-compare the overlapping prefix
- * before deciding whether to resume or restart. Falls back to size-only
- * resume if the extension is unavailable.
+ * if 'pflag' is set. If 'verify' is set, the server MUST support the
+ * hpn-check-file@hpnssh.org extension: the overlapping prefix is
+ * hash-compared before deciding whether to resume or restart. If the
+ * extension is unavailable this is fatal (RESUME_INCOMPAT_MSG) — there is
+ * no silent fallback to size-only resume. Plain (verify=0) resume is
+ * size-only and works against any server.
  */
 int sftp_upload(struct sftp_conn *, const char *, const char *,
     int, int, int, int, int);
+
+/*
+ * HPNVerifyTransfer post-transfer integrity check: XXH3 the full local and
+ * remote file and compare.  Returns 0 = match, 1 = mismatch (corruption),
+ * -1 = could not verify (server lacks hpn-check-file or I/O error).
+ */
+int sftp_verify_transfer(struct sftp_conn *, const char *local_path,
+    const char *remote_path);
 
 /*
  * Per-file descriptor for sftp_upload_batch.  Caller fills local_path and
@@ -310,6 +345,14 @@ int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
 
 /* True iff the server advertised hpn-bundle-fetch@hpnssh.org (download). */
 int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
+
+/*
+ * True iff the server advertised hpn-check-file@hpnssh.org, i.e. it can
+ * answer the XXH3 hash queries that verified resume depends on.  Lets the
+ * parallel submit path (which sees struct sftp_conn only as opaque) make
+ * the up-front "can this remote verify?" decision in the main thread.
+ */
+int sftp_conn_has_hpn_check_file(struct sftp_conn *conn);
 
 /*
  * Download-side counterpart of sftp_hpn_bundle_upload.  Asks the server to

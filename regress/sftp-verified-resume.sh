@@ -31,8 +31,8 @@ for size in 0 1k size-1 larger corrupt same; do
         dd if=${COPY}.1 of=${COPY}.2 bs=1023 count=1 >/dev/null 2>&1
         ;;
     larger)
-        # Dest is larger than source; should overwrite fully and
-        # ftruncate to source size.
+        # Dest is larger than source; verified resume skips it
+        # (a larger file can't be a partial of the source).
         cp ${COPY}.1 ${COPY}.2
         dd if=/dev/urandom bs=512 count=1 >>${COPY}.2 2>/dev/null
         ;;
