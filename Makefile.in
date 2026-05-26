@@ -61,6 +61,7 @@ SSHDLIBS=@SSHDLIBS@
 LIBEDIT=@LIBEDIT@
 LIBFIDO2=@LIBFIDO2@
 LIBWTMPDB=@LIBWTMPDB@
+LIBARCHIVE=@LIBARCHIVE@
 AR=@AR@
 AWK=@AWK@
 RANLIB=@RANLIB@
@@ -135,7 +136,7 @@ SSHD_SESSION_OBJS=sshd-session.o auth-rhosts.o auth-passwd.o \
 	monitor.o monitor_wrap.o auth-krb5.o \
 	auth2-gss.o gss-serv.o gss-serv-krb5.o \
 	loginrec.o auth-pam.o auth-shadow.o auth-sia.o \
-	sftp-server.o sftp-common.o \
+	sftp-server.o sftp-hpn-server.o sftp-common.o \
 	uidswap.o platform-listen.o cipher-switch.o $(P11OBJS) $(SKOBJS)
 
 SSHD_AUTH_OBJS=sshd-auth.o \
@@ -150,10 +151,10 @@ SSHD_AUTH_OBJS=sshd-auth.o \
 	loginrec.o auth-pam.o auth-shadow.o auth-sia.o \
 	sandbox-null.o sandbox-rlimit.o sandbox-darwin.o \
 	sandbox-seccomp-filter.o sandbox-capsicum.o  sandbox-solaris.o \
-	sftp-server.o sftp-common.o \
+	sftp-server.o sftp-hpn-server.o sftp-common.o \
 	uidswap.o cipher-switch.o $(P11OBJS) $(SKOBJS)
 
-SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-glob.o ssherr-nolibcrypto.o
+SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-glob.o ssherr-nolibcrypto.o
 
 SCP_OBJS=	scp.o progressmeter.o $(SFTP_CLIENT_OBJS)
 
@@ -171,9 +172,11 @@ SKHELPER_OBJS=	ssh-sk-helper.o ssh-sk.o sk-usbhid.o ssherr-nolibcrypto.o
 
 SSHKEYSCAN_OBJS=ssh-keyscan.o $(P11OBJS) $(SKOBJS)
 
-SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-server-main.o ssherr-nolibcrypto.o
+SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-hpn-server.o sftp-server-main.o ssherr-nolibcrypto.o
 
-SFTP_OBJS=	sftp.o sftp-usergroup.o progressmeter.o $(SFTP_CLIENT_OBJS)
+SFTP_OBJS=	sftp.o sftp-usergroup.o progressmeter.o $(SFTP_CLIENT_OBJS) \
+		sftp-workqueue.o sftp-parallel.o sftp-parallel-walk.o \
+		sftp-parallel-config.o readconf.o $(P11OBJS) $(SKOBJS)
 
 MANPAGES	= hpnmoduli.5.out hpnscp.1.out hpnssh-add.1.out hpnssh-agent.1.out hpnssh-keygen.1.out hpnssh-keyscan.1.out hpnssh.1.out hpnsshd.8.out hpnsftp-server.8.out hpnsftp.1.out hpnssh-keysign.8.out hpnssh-pkcs11-helper.8.out hpnssh-sk-helper.8.out hpnsshd_config.5.out hpnssh_config.5.out
 MANPAGES_IN	= hpnmoduli.5 hpnscp.1 hpnssh-add.1 hpnssh-agent.1 hpnssh-keygen.1 hpnssh-keyscan.1 hpnssh.1 hpnsshd.8 hpnsftp-server.8 hpnsftp.1 hpnssh-keysign.8 hpnssh-pkcs11-helper.8 hpnssh-sk-helper.8 hpnsshd_config.5 hpnssh_config.5
@@ -229,13 +232,13 @@ hpnsshd$(EXEEXT): libssh.a $(LIBCOMPAT) $(SSHDOBJS)
 	$(LD) -o $@ $(SSHDOBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(SSHDLIBS) $(LIBS) $(CHANNELLIBS)
 
 hpnsshd-session$(EXEEXT): libssh.a $(LIBCOMPAT) $(SSHD_SESSION_OBJS)
-	$(LD) -o $@ $(SSHD_SESSION_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(SSHDLIBS) $(LIBS) $(GSSLIBS) $(K5LIBS) $(CHANNELLIBS) $(LIBWTMPDB)
+	$(LD) -o $@ $(SSHD_SESSION_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(SSHDLIBS) $(LIBS) $(GSSLIBS) $(K5LIBS) $(CHANNELLIBS) $(LIBWTMPDB) $(LIBARCHIVE)
 
 hpnsshd-auth$(EXEEXT): libssh.a $(LIBCOMPAT) $(SSHD_AUTH_OBJS)
-	$(LD) -o $@ $(SSHD_AUTH_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(SSHDLIBS) $(LIBS) $(GSSLIBS) $(K5LIBS) $(CHANNELLIBS) $(LIBWTMPDB)
+	$(LD) -o $@ $(SSHD_AUTH_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(SSHDLIBS) $(LIBS) $(GSSLIBS) $(K5LIBS) $(CHANNELLIBS) $(LIBWTMPDB) $(LIBARCHIVE)
 
 hpnscp$(EXEEXT): $(LIBCOMPAT) libssh.a $(SCP_OBJS)
-	$(LD) -o $@ $(SCP_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(CHANNELLIBS)
+	$(LD) -o $@ $(SCP_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(CHANNELLIBS) $(LIBARCHIVE)
 
 hpnssh-add$(EXEEXT): $(LIBCOMPAT) libssh.a $(SSHADD_OBJS)
 	$(LD) -o $@ $(SSHADD_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(CHANNELLIBS)
@@ -259,10 +262,10 @@ hpnssh-keyscan$(EXEEXT): $(LIBCOMPAT) libssh.a $(SSHKEYSCAN_OBJS)
 	$(LD) -o $@ $(SSHKEYSCAN_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat -lssh $(LIBS) $(CHANNELLIBS)
 
 hpnsftp-server$(EXEEXT): $(LIBCOMPAT) libssh.a $(SFTPSERVER_OBJS)
-	$(LD) -o $@ $(SFTPSERVER_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat -lssh $(LIBS)
+	$(LD) -o $@ $(SFTPSERVER_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat -lssh $(LIBS) $(LIBARCHIVE)
 
 hpnsftp$(EXEEXT): $(LIBCOMPAT) libssh.a $(SFTP_OBJS)
-	$(LD) -o $@ $(SFTP_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(LIBEDIT)
+	$(LD) -o $@ $(SFTP_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(LIBEDIT) $(LIBARCHIVE) $(CHANNELLIBS)
 
 # test driver for the loginrec code - not built by default
 logintest: logintest.o $(LIBCOMPAT) libssh.a loginrec.o
@@ -324,6 +327,8 @@ clean:	regressclean
 	rm -f regress/unittests/sshbuf/test_sshbuf$(EXEEXT)
 	rm -f regress/unittests/sshkey/*.o
 	rm -f regress/unittests/sshkey/test_sshkey$(EXEEXT)
+	rm -f regress/unittests/sftp_workqueue/*.o
+	rm -f regress/unittests/sftp_workqueue/test_sftp_workqueue$(EXEEXT)
 	rm -f regress/unittests/sshsig/*.o
 	rm -f regress/unittests/sshsig/test_sshsig$(EXEEXT)
 	rm -f regress/unittests/utf8/*.o
@@ -407,6 +412,8 @@ distclean:	regressclean
 	rm -f regress/unittests/misc/test_misc
 	rm -f regress/unittests/sshbuf/*.o
 	rm -f regress/unittests/sshbuf/test_sshbuf
+	rm -f regress/unittests/sftp_workqueue/*.o
+	rm -f regress/unittests/sftp_workqueue/test_sftp_workqueue
 	rm -f regress/unittests/sshkey/*.o
 	rm -f regress/unittests/sshkey/test_sshkey
 	rm -f regress/unittests/sshsig/*.o
@@ -588,6 +595,7 @@ regress-prep:
 	$(MKDIR_P) `pwd`/regress/unittests/kex
 	$(MKDIR_P) `pwd`/regress/unittests/match
 	$(MKDIR_P) `pwd`/regress/unittests/misc
+	$(MKDIR_P) `pwd`/regress/unittests/sftp_workqueue
 	$(MKDIR_P) `pwd`/regress/unittests/sshbuf
 	$(MKDIR_P) `pwd`/regress/unittests/sshkey
 	$(MKDIR_P) `pwd`/regress/unittests/sshsig
@@ -767,6 +775,17 @@ regress/unittests/utf8/test_utf8$(EXEEXT): \
 	    regress/unittests/test_helper/libtest_helper.a \
 	    -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(TESTLIBS)
 
+# sftp-workqueue is a self-contained MPMC queue used by the parallel-streams
+# orchestrator. The test does not use test_helper — it has its own main().
+UNITTESTS_TEST_SFTP_WORKQUEUE_OBJS=\
+	regress/unittests/sftp_workqueue/tests.o \
+	sftp-workqueue.o
+
+regress/unittests/sftp_workqueue/test_sftp_workqueue$(EXEEXT): \
+    ${UNITTESTS_TEST_SFTP_WORKQUEUE_OBJS}
+	$(LD) -o $@ $(LDFLAGS) $(UNITTESTS_TEST_SFTP_WORKQUEUE_OBJS) \
+	    -lpthread $(TESTLIBS)
+
 # These all need to be compiled -fPIC, so they are treated differently.
 SK_DUMMY_OBJS=\
 	regress/misc/sk-dummy/sk-dummy.lo \
@@ -809,6 +828,7 @@ regress-unit-binaries: regress-prep $(REGRESSLIBS) \
 	regress/unittests/kex/test_kex$(EXEEXT) \
 	regress/unittests/match/test_match$(EXEEXT) \
 	regress/unittests/misc/test_misc$(EXEEXT) \
+	regress/unittests/sftp_workqueue/test_sftp_workqueue$(EXEEXT) \
 	regress/unittests/sshbuf/test_sshbuf$(EXEEXT) \
 	regress/unittests/sshkey/test_sshkey$(EXEEXT) \
 	regress/unittests/sshsig/test_sshsig$(EXEEXT) \

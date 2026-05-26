@@ -402,6 +402,14 @@ do_log(LogLevel level, int force, const char *suffix, const char *fmt,
 		snprintf(fmtbuf, sizeof(fmtbuf), "%s: %s", msgbuf, suffix);
 		strlcpy(msgbuf, fmtbuf, sizeof(msgbuf));
 	}
+	/* HPN: snapshot the most recent ERROR-level message into per-thread
+	 * storage so structured callers (e.g. the parallel-streams
+	 * failed-paths summary) can attach the cause to a higher-level
+	 * event without having to plumb error strings through every API.
+	 * Captured BEFORE strnvis so the user sees the raw cause string.
+	 * See hpn_get_last_error / hpn_clear_last_error below. */
+	if (level == SYSLOG_LEVEL_ERROR)
+		hpn_log_capture_error(msgbuf);
 	strnvis(fmtbuf, msgbuf, sizeof(fmtbuf),
 	    log_on_stderr ? LOG_STDERR_VIS : LOG_SYSLOG_VIS);
 	if (log_handler != NULL) {
@@ -486,6 +494,37 @@ sshlogv(const char *file, const char *func, int line, int showfunc,
 		strlcpy(fmt2, fmt, sizeof(fmt2));
 
 	do_log(level, forced, suffix, fmt2, args);
+}
+
+void
+sshlogv_ts(const char *file, const char *func, int line, int showfunc,
+    LogLevel level, const char *suffix, const char *fmt, va_list args)
+{
+	char ts[20], tsfmt[MSGBUFSIZ + 32];
+	struct timeval tv;
+	struct tm tm;
+
+	gettimeofday(&tv, NULL);
+	if (localtime_r(&tv.tv_sec, &tm) != NULL)
+		snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03d",
+		    tm.tm_hour, tm.tm_min, tm.tm_sec,
+		    (int)(tv.tv_usec / 1000));
+	else
+		strlcpy(ts, "??:??:??.???", sizeof(ts));
+
+	snprintf(tsfmt, sizeof(tsfmt), "[%s] %s", ts, fmt);
+	sshlogv(file, func, line, showfunc, level, suffix, tsfmt, args);
+}
+
+void
+sshlog_ts(const char *file, const char *func, int line, int showfunc,
+    LogLevel level, const char *suffix, const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	sshlogv_ts(file, func, line, showfunc, level, suffix, fmt, args);
+	va_end(args);
 }
 
 void
@@ -660,4 +699,41 @@ log_ratelimit(struct log_ratelimit_ctx *rl, time_t now, int *active,
 	rl->ratelimited_events++;
 	RLDBG(("drop: ratelimited_events=%u", rl->ratelimited_events));
 	return 1;
+}
+
+/* ── HPN: per-thread last-error capture ──────────────────────────────────
+ *
+ * Holds the most recent ERROR-level log message produced on the calling
+ * thread.  Populated automatically by do_log() above.  HPN-aware
+ * callers read it via hpn_get_last_error() to attach the cause string
+ * to higher-level structured events (e.g. the parallel-streams
+ * failed-paths summary).
+ *
+ * Per-thread storage means the worker thread that hit the error is the
+ * same one that reads it back — no cross-thread races.
+ *
+ * ~260 bytes per thread.  Used by the parallel-streams failed-paths
+ * summary; size of that bounded path list is set by
+ * HPN_FAILED_PATHS_MAX in sftp-parallel.c.
+ */
+static __thread char hpn_last_error_msg[256];
+
+void
+hpn_log_capture_error(const char *msg)
+{
+	if (msg == NULL)
+		return;
+	strlcpy(hpn_last_error_msg, msg, sizeof(hpn_last_error_msg));
+}
+
+const char *
+hpn_get_last_error(void)
+{
+	return hpn_last_error_msg;
+}
+
+void
+hpn_clear_last_error(void)
+{
+	hpn_last_error_msg[0] = '\0';
 }

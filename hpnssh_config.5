@@ -1140,6 +1140,107 @@ In some situations, such as transfers on a local area network, the impact
 of the HPN code produces a net decrease in performance. In these cases it is
 helpful to disable the HPN functionality. By default HPNDisabled is set to
 .Cm no. HPNSSH only.
+.It Cm HPNBundleSize
+Sets the bundle-mode target accumulator size for
+.Xr hpnsftp 1
+when running with
+.Cm -j
+parallel streams and the server advertises the
+.Cm hpn-bundle@hpnssh.org
+SFTP extension.  Each worker collects small files into a tar stream
+up to this many bytes before closing the bundle and starting a new one.
+Larger values amortize per-bundle open/close cost across more files;
+smaller values keep server-side memory footprint lower.
+The argument is a byte count that accepts the standard
+.Cm K
+.Pq KiB ,
+.Cm M
+.Pq MiB ,
+and
+.Cm G
+.Pq GiB
+suffixes.
+Values outside the range
+.Cm 64K
+through
+.Cm 64M
+inclusive are clamped and a warning is emitted on standard error.
+The default is
+.Cm 4M
+which empirical tuning has shown to perform well on typical paths.
+Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
+.It Cm HPNMaxAuthConcurrent
+Caps the number of worker SSH children
+.Xr hpnsftp 1
+allows in the authentication phase simultaneously when running with
+.Cm -j
+parallel streams.  Workers are spawned in parallel up to this limit;
+additional workers wait for an authentication slot before starting.
+Used to stay under the remote server's
+.Cm MaxStartups
+threshold (default 10:30:100) on sites with many workers.
+The argument must be an integer in the range
+.Cm 1
+through
+.Cm 64
+inclusive; values outside this range are clamped and a warning is
+emitted on standard error. The default is
+.Cm 8
+(safely below the typical
+.Cm MaxStartups
+start-throttling threshold).  Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
+.It Cm HPNMaxRetries
+Sets the per-file retry budget used by
+.Xr hpnsftp 1
+when running with
+.Cm -j
+parallel streams. A failed transfer (transient transport error, server
+hiccup, etc.) is re-queued and retried up to this many times before
+the orchestrator gives up on the file and reports it in the final
+.Cm TRANSFER INCOMPLETE
+summary. Larger values tolerate flakier networks at the cost of more
+wasted time on permanent failures (permission denied, disk full, etc.).
+The argument must be an integer in the range
+.Cm 1
+through
+.Cm 20
+inclusive; values outside this range are clamped and a warning is
+emitted on standard error. The default is
+.Cm 3
+(one initial attempt plus two retries). Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
+.It Cm HPNUseBundle
+Controls whether
+.Xr hpnsftp 1
+aggregates small files into bundled tar streams (the
+.Cm hpn-bundle@hpnssh.org
+SFTP extension) when running with
+.Cm -j
+parallel streams. Bundling amortizes per-file open/close round-trip
+costs that dominate small-file throughput on high-RTT paths.
+The argument must be
+.Cm yes
+or
+.Cm no .
+The default is
+.Cm yes .
+When set to
+.Cm no ,
+or when the remote
+.Xr hpnsftp-server 8
+does not advertise the bundle extension, hpnsftp falls back to the
+per-file pipelined batch upload path. Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
 .It Cm IdentitiesOnly
 Specifies that
 .Xr ssh 1

@@ -47,6 +47,19 @@ struct sftp_statvfs {
 	uint64_t f_namemax;
 };
 
+/*
+ * Filesystem information returned by the hpn-fs-info@hpnssh.org extension.
+ * Used by the parallel orchestrator to align byte-range splits to Lustre/GPFS
+ * stripe boundaries.  All fields zero/empty if the server does not support
+ * the extension.
+ */
+struct sftp_fs_info {
+	char     fs_type[32];   /* "lustre", "gpfs", "ext4", "xfs", etc. */
+	uint64_t stripe_size;   /* bytes per stripe; 0 if not applicable */
+	uint32_t stripe_count;  /* number of OSTs/stripes; 0 if not applicable */
+	uint64_t block_size;    /* optimal I/O block size (always present) */
+};
+
 /* Used for limits response on the wire from the server */
 struct sftp_limits {
 	uint64_t packet_length;
@@ -66,6 +79,32 @@ struct sftp_limits {
  */
 struct sftp_conn *sftp_init(int, int, u_int, u_int, uint64_t);
 void sftp_free(struct sftp_conn *);
+void sftp_set_live_counter(struct sftp_conn *, volatile uint64_t *);
+
+/* Returns non-zero if the connection suffered an unrecoverable I/O error.
+ * Workers should check this after a failed transfer and exit their loop. */
+int sftp_conn_is_dead(struct sftp_conn *);
+
+/*
+ * Mark a connection as dead with prominent diagnostic logging, without
+ * terminating the process. Used to replace fatal() in code paths that
+ * may run inside a parallel-streams worker, where fatal() would crash
+ * the entire orchestrator.
+ *
+ * After this call, sftp_conn_is_dead() returns true and subsequent RPC
+ * calls on this connection short-circuit to error returns. Callers must
+ * still propagate the failure via their own return value (or rely on
+ * the worker thread's per-unit conn->dead post-check to abandon the
+ * unit and exit so the watchdog can respawn).
+ */
+void sftp_conn_die(struct sftp_conn *, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+/* Returns non-zero if a protocol-level violation was detected (ID mismatch,
+ * unexpected packet type). Distinct from sftp_conn_is_dead: indicates possible
+ * MITM attack or serious server corruption. The parallel orchestrator aborts
+ * the entire transfer on violation rather than retrying the affected worker. */
+int sftp_conn_is_protocol_violation(struct sftp_conn *);
 
 u_int sftp_proto_version(struct sftp_conn *);
 
@@ -157,6 +196,147 @@ int sftp_upload(struct sftp_conn *, const char *, const char *,
     int, int, int, int, int);
 
 /*
+ * Per-file descriptor for sftp_upload_batch.  Caller fills local_path and
+ * remote_path; result is written by the function (0 = success, -1 = failure).
+ */
+struct sftp_upload_batch_entry {
+	const char *local_path;
+	const char *remote_path;
+	int         result;
+};
+
+/*
+ * Upload N files with pipelined SSH_FXP_OPEN and SSH_FXP_CLOSE: all N
+ * opens are sent in a single burst (1 RTT for all handles), files are
+ * transferred sequentially, then all N closes are sent in a single burst
+ * (1 RTT for all status replies). Amortises per-file open/close RTT from
+ * 2*N RTTs down to 2 RTTs for the batch, which matters greatly for
+ * many-small-file workloads at high latency.
+ *
+ * resume is not supported; all other flags apply to every entry.
+ * Returns 0 if every file succeeded, -1 if any failed (check entry->result
+ * for per-file status).
+ */
+int sftp_upload_batch(struct sftp_conn *, struct sftp_upload_batch_entry *,
+    int n, int preserve_flag, int fsync_flag, int inplace_flag);
+
+/* ── BEGIN Phase 4 gap 1: pipelined batch send/finish ──────────────────────
+ *
+ * Split-call form of sftp_upload_batch.  Lets the caller pipeline
+ * back-to-back batches: send the next batch's OPENs (phase 1) while the
+ * previous batch's CLOSE STATUSes are still being collected (phase 5).
+ *
+ *   pending = sftp_upload_batch_send(conn, entries, n, ..., prev_pending);
+ *     // does phases 1, 2, 3a-d, 4 for the new batch.
+ *     // if prev_pending != NULL: drains it (phase 5 of previous batch)
+ *     // AFTER the new batch's phase 1, so the server-side processing of
+ *     // prev's CLOSEs overlaps with this batch's OPENs on the wire.
+ *     // prev_pending is freed during the drain.
+ *
+ *   sftp_upload_batch_finish(conn, pending);
+ *     // drains the new batch's phase 5.  Free's pending.
+ *
+ * On error during send (connection dies, protocol violation), all entries
+ * in BOTH the current batch and prev (if drain failed) are marked failed
+ * and the function returns NULL.  Caller must NOT call finish on a
+ * NULL pending.
+ *
+ * The legacy sftp_upload_batch() is now a wrapper: send(NULL) + finish().
+ * Identical end-to-end behaviour and identical error semantics when called
+ * with prev=NULL — existing call sites need no changes. */
+struct sftp_upload_batch_pending;
+
+struct sftp_upload_batch_pending *sftp_upload_batch_send(
+    struct sftp_conn *conn,
+    struct sftp_upload_batch_entry *entries, int n,
+    int preserve_flag, int fsync_flag, int inplace_flag,
+    struct sftp_upload_batch_pending *prev);
+
+int sftp_upload_batch_finish(struct sftp_conn *conn,
+    struct sftp_upload_batch_pending *pending);
+
+/* ── END Phase 4 gap 1 ───────────────────────────────────────────────────── */
+
+/* ── BEGIN Phase 5: hpn-bundle small-file streaming ──────────────────────
+ *
+ * Bundle upload via the `hpn-bundle-open@hpnssh.org` SFTP extension.
+ * Many small files are packed into a single tar-format byte stream and
+ * delivered through one OPEN / WRITE×N / CLOSE sequence — amortising the
+ * per-file OPEN/CLOSE round-trip cost that limits small-file throughput
+ * even after Phase 4 pipelining.
+ *
+ * Composes with parallel streams: each worker handles its own bundles
+ * over its own SSH connection; many concurrent bundles in flight.
+ *
+ * Server support detected via the `hpn-bundle@hpnssh.org` extension
+ * advertised in SSH_FXP_VERSION (see SFTP_EXT_HPN_BUNDLE in sftp-client.c).
+ * When unsupported, caller must fall back to per-file uploads.
+ *
+ * See project_phase5_bundling_design.md in the memory store for the full
+ * protocol and architectural notes.
+ */
+
+struct sftp_hpn_bundle_upload_entry {
+	const char *local_path;
+	const char *remote_path;   /* relative path inside the bundle dest */
+	int         result;        /* 0 = ok; -1 = failed (set by function) */
+};
+
+/*
+ * Upload N small files as a single tar stream to remote_dest_dir.  The
+ * server's hpn-bundle handler extracts each file into remote_dest_dir/
+ * preserving the relative path supplied in entries[i].remote_path.
+ *
+ * preserve_flag: when non-zero, file mode + mtime are carried in the tar
+ *   header and applied on extract.  Otherwise extracted files use 0644
+ *   mode and current mtime.
+ * fsync_flag: when non-zero, request the server fsync each extracted
+ *   file before the bundle is closed.
+ *
+ * Returns 0 on success (all entries[].result == 0).  Returns -1 if the
+ * bundle failed; all entries[].result are set to -1 in that case (the
+ * protocol does not return per-record status — whole-bundle re-queue).
+ *
+ * Returns -1 immediately if conn does not advertise hpn-bundle support.
+ * Caller must detect this and fall back to per-file mode.
+ */
+int sftp_hpn_bundle_upload(struct sftp_conn *conn,
+    const char *remote_dest_dir,
+    struct sftp_hpn_bundle_upload_entry *entries, int n,
+    int preserve_flag, int fsync_flag);
+
+/* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
+int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
+
+/* True iff the server advertised hpn-bundle-fetch@hpnssh.org (download). */
+int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
+
+/*
+ * Download-side counterpart of sftp_hpn_bundle_upload.  Asks the server to
+ * pack the listed `entries[].remote_path` files into a single tar stream,
+ * then untars locally into each `entries[].local_path`.  Per-entry result
+ * codes are written into entries[i].result (0 = ok, -1 = skipped/failed).
+ *
+ * Returns 0 if the bundle transaction succeeded (even if some per-entry
+ * results are -1), -1 if the server refused the extension or the
+ * transaction failed at the wire level (in which case every entry is
+ * marked -1 and the caller should fall back to per-file downloads).
+ *
+ * Implementation lives in sftp-hpn-client.c.
+ */
+struct sftp_hpn_bundle_download_entry {
+	const char *remote_path;
+	const char *local_path;
+	int         result;
+};
+
+int sftp_hpn_bundle_download(struct sftp_conn *conn,
+    struct sftp_hpn_bundle_download_entry *entries, int n,
+    int preserve_flag);
+
+/* ── END Phase 5 ─────────────────────────────────────────────────────────*/
+
+/*
  * Recursively upload 'local_directory' to 'remote_directory'. Preserve
  * times if 'pflag' is set. 'verify' is propagated to each file upload.
  */
@@ -188,6 +368,55 @@ int sftp_get_users_groups_by_id(struct sftp_conn *conn,
     const u_int *uids, u_int nuids,
     const u_int *gids, u_int ngids,
     char ***usernamesp, char ***groupnamesp);
+
+/*
+ * Query the server for filesystem type and stripe geometry of the given path.
+ * Fills *info on success; on error or if the extension is unsupported, *info
+ * is zeroed (all-zeros is a safe "unknown" sentinel for callers).
+ * Returns 0 on success, -1 if the extension is unsupported or the query failed.
+ */
+int sftp_fs_info(struct sftp_conn *, const char *path, struct sftp_fs_info *info);
+
+/*
+ * Pre-create a remote file at exactly `size` bytes (O_CREAT|O_TRUNC + setstat
+ * size) so that parallel range-upload workers can subsequently open it with
+ * O_WRONLY and write their byte ranges concurrently without racing on creation.
+ * Returns 0 on success, -1 on error.
+ */
+int sftp_precreate(struct sftp_conn *, const char *remote_path, off_t size);
+
+/*
+ * Upload a byte range of a local file to the corresponding byte range of a
+ * remote file.  The remote file must already exist at the correct size (i.e.
+ * pre-created by the orchestrator).  Opens the remote file with O_WRONLY only
+ * (no O_CREAT, no O_TRUNC) so concurrent range workers don't clobber each other.
+ *
+ * local_path    — source file on the local filesystem
+ * remote_path   — destination file on the remote server
+ * range_offset  — byte offset in both files where this range starts
+ * range_length  — number of bytes to transfer
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int sftp_upload_range(struct sftp_conn *, const char *local_path,
+    const char *remote_path, off_t range_offset, off_t range_length);
+
+/*
+ * Download a byte range of a remote file into the corresponding byte range
+ * of a local file.  The local file must already exist at the correct size
+ * (pre-created by the orchestrator).  Opens the local file with O_WRONLY
+ * only (no O_CREAT, no O_TRUNC) so concurrent range workers don't clobber
+ * each other.
+ *
+ * remote_path   — source file on the remote server
+ * local_path    — destination file on the local filesystem
+ * range_offset  — byte offset in both files where this range starts
+ * range_length  — number of bytes to transfer
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int sftp_download_range(struct sftp_conn *, const char *remote_path,
+    const char *local_path, off_t range_offset, off_t range_length);
 
 /* Concatenate paths, taking care of slashes. Caller must free result. */
 char *sftp_path_append(const char *, const char *);

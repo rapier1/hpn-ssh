@@ -48,6 +48,7 @@
 
 #include "sftp.h"
 #include "sftp-common.h"
+#include "sftp-hpn-server.h"
 
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -120,6 +121,10 @@ static void process_extended_copy_data(uint32_t id);
 static void process_extended_home_directory(uint32_t id);
 static void process_extended_get_users_groups_by_id(uint32_t id);
 static void process_extended_hpn_check_file(uint32_t id);
+static void process_extended_hpn_fs_info(uint32_t id);
+static void process_extended_hpn_bundle_open(uint32_t id);
+static void process_extended_hpn_bundle_cap(uint32_t id);
+static void process_extended_hpn_bundle_fetch(uint32_t id);
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -172,6 +177,14 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_get_users_groups_by_id, 0 },
 	{ "hpn-check-file", "hpn-check-file@hpnssh.org", 0,
 	    process_extended_hpn_check_file, 0 },
+	{ "hpn-fs-info", HPN_EXT_FS_INFO, 0,
+	    process_extended_hpn_fs_info, 0 },
+	{ "hpn-bundle", HPN_EXT_BUNDLE, 0,
+	    process_extended_hpn_bundle_cap, 1 },
+	{ "hpn-bundle-open", HPN_EXT_BUNDLE_OPEN, 0,
+	    process_extended_hpn_bundle_open, 1 },
+	{ "hpn-bundle-fetch", HPN_EXT_BUNDLE_FETCH, 0,
+	    process_extended_hpn_bundle_fetch, 0 },
 	{ NULL, NULL, 0, NULL, 0 }
 };
 
@@ -313,12 +326,16 @@ struct Handle {
 	char *name;
 	uint64_t bytes_read, bytes_write;
 	int next_unused;
+	/* Phase 5: opaque ptr to struct hpn_bundle_state when use==HANDLE_BUNDLE.
+	 * NULL for HANDLE_FILE / HANDLE_DIR.  Owned by sftp-hpn-server.c. */
+	void *bundle_opaque;
 };
 
 enum {
 	HANDLE_UNUSED,
 	HANDLE_DIR,
-	HANDLE_FILE
+	HANDLE_FILE,
+	HANDLE_BUNDLE   /* Phase 5: hpn-bundle-open accumulator */
 };
 
 static Handle *handles = NULL;
@@ -354,9 +371,49 @@ handle_new(int use, const char *name, int fd, int flags, DIR *dirp)
 	handles[i].flags = flags;
 	handles[i].name = xstrdup(name);
 	handles[i].bytes_read = handles[i].bytes_write = 0;
+	handles[i].bundle_opaque = NULL;
 
 	return i;
 }
+
+/* ── BEGIN Phase 5: bundle handle helpers (called from sftp-hpn-server.c) */
+int
+handle_new_bundle(void *opaque)
+{
+	int i = handle_new(HANDLE_BUNDLE, "(bundle)", -1, 0, NULL);
+	if (i < 0)
+		return -1;
+	handles[i].bundle_opaque = opaque;
+	return i;
+}
+
+void *
+handle_get_bundle(int handle)
+{
+	if (handle < 0 || (u_int)handle >= num_handles ||
+	    handles[handle].use != HANDLE_BUNDLE)
+		return NULL;
+	return handles[handle].bundle_opaque;
+}
+
+int
+handle_is_bundle(int handle)
+{
+	return handle >= 0 && (u_int)handle < num_handles &&
+	    handles[handle].use == HANDLE_BUNDLE;
+}
+
+void
+handle_free_bundle(int handle)
+{
+	if (!handle_is_bundle(handle))
+		return;
+	handles[handle].bundle_opaque = NULL;
+	free(handles[handle].name);
+	handles[handle].name = NULL;
+	handle_unused(handle);
+}
+/* ── END Phase 5 ─────────────────────────────────────────────────────── */
 
 static int
 handle_is_ok(int i, int type)
@@ -384,7 +441,8 @@ handle_from_string(const u_char *handle, u_int hlen)
 		return -1;
 	val = get_u32(handle);
 	if (handle_is_ok(val, HANDLE_FILE) ||
-	    handle_is_ok(val, HANDLE_DIR))
+	    handle_is_ok(val, HANDLE_DIR) ||
+	    handle_is_ok(val, HANDLE_BUNDLE))
 		return val;
 	return -1;
 }
@@ -393,7 +451,8 @@ static char *
 handle_to_name(int handle)
 {
 	if (handle_is_ok(handle, HANDLE_DIR)||
-	    handle_is_ok(handle, HANDLE_FILE))
+	    handle_is_ok(handle, HANDLE_FILE) ||
+	    handle_is_ok(handle, HANDLE_BUNDLE))
 		return handles[handle].name;
 	return NULL;
 }
@@ -732,6 +791,9 @@ process_init(void)
 	compose_extension(msg, "home-directory", "1");
 	compose_extension(msg, "users-groups-by-id@openssh.com", "1");
 	compose_extension(msg, "hpn-check-file@hpnssh.org", "1");
+	compose_extension(msg, HPN_EXT_FS_INFO, "1");
+	compose_extension(msg, HPN_EXT_BUNDLE, "1");
+	compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
 
 	send_msg(msg);
 	sshbuf_free(msg);
@@ -788,6 +850,12 @@ process_close(uint32_t id)
 		fatal_fr(r, "parse");
 
 	debug3("request %u: close handle %u", id, handle);
+	/* Phase 5: bundle handles run libarchive extraction at close. */
+	if (sftp_hpn_server_is_bundle_handle(handle)) {
+		status = sftp_hpn_server_bundle_close(handle);
+		send_status(id, status);
+		return;
+	}
 	handle_log_close(handle, NULL);
 	ret = handle_close(handle);
 	status = (ret == -1) ? errno_to_portable(errno) : SSH2_FX_OK;
@@ -810,6 +878,28 @@ process_read(uint32_t id)
 
 	debug("request %u: read \"%s\" (handle %d) off %llu len %u",
 	    id, handle_to_name(handle), handle, (unsigned long long)off, len);
+
+	/* Phase 5 (download bundling): READs on a fetch-mode bundle handle
+	 * return bytes from the pre-packed tar accumulator rather than
+	 * reading from an OS file descriptor. */
+	if (sftp_hpn_server_is_bundle_handle(handle)) {
+		size_t got = 0;
+		if (len > SFTP_MAX_READ_LENGTH)
+			len = SFTP_MAX_READ_LENGTH;
+		if (len > buflen) {
+			if ((buf = realloc(buf, len)) == NULL)
+				fatal_f("realloc failed");
+			buflen = len;
+		}
+		status = sftp_hpn_server_bundle_read(handle, off, buf, len,
+		    &got);
+		if (status == SSH2_FX_OK && got > 0)
+			send_data(id, buf, got);
+		else
+			send_status(id, status);
+		return;
+	}
+
 	if ((fd = handle_to_fd(handle)) == -1)
 		goto out;
 	if (len > SFTP_MAX_READ_LENGTH) {
@@ -864,6 +954,16 @@ process_write(uint32_t id)
 
 	debug("request %u: write \"%s\" (handle %d) off %llu len %zu",
 	    id, handle_to_name(handle), handle, (unsigned long long)off, len);
+
+	/* Phase 5: bundle handles accumulate the WRITE data for later
+	 * libarchive extraction at close time. */
+	if (sftp_hpn_server_is_bundle_handle(handle)) {
+		status = sftp_hpn_server_bundle_write(handle, off, data, len);
+		send_status(id, status);
+		free(data);
+		return;
+	}
+
 	fd = handle_to_fd(handle);
 
 	if (fd < 0)
@@ -1865,6 +1965,44 @@ out:
 }
 
 static void
+process_extended_hpn_fs_info(uint32_t id)
+{
+	sftp_hpn_server_dispatch(id, HPN_EXT_FS_INFO, iqueue, oqueue);
+}
+
+/* Phase 5: hpn-bundle-open@hpnssh.org dispatch wrapper.  The real
+ * implementation lives in sftp-hpn-server.c. */
+static void
+process_extended_hpn_bundle_open(uint32_t id)
+{
+	sftp_hpn_server_dispatch(id, HPN_EXT_BUNDLE_OPEN, iqueue, oqueue);
+}
+
+/* Phase 5: capability-only advertisement.  Clients never send a request
+ * named hpn-bundle@hpnssh.org — they send hpn-bundle-open instead.  This
+ * stub exists so compose_extension's handler-lookup-or-fatal can find a
+ * registration when advertising the capability in process_init(). */
+static void
+process_extended_hpn_bundle_cap(uint32_t id)
+{
+	error("hpn-bundle@hpnssh.org received as a request; clients should "
+	    "send hpn-bundle-open@hpnssh.org");
+	send_status(id, SSH2_FX_OP_UNSUPPORTED);
+}
+
+/* Phase 5 (download side): hpn-bundle-fetch@hpnssh.org dispatch wrapper.
+ * Client supplies a list of remote paths + base_dir; server reads them,
+ * packs into a tar buffer via libarchive write, allocates a bundle handle
+ * holding the buffer, replies with SSH_FXP_HANDLE.  Client then drains via
+ * SSH_FXP_READ (process_read routes bundle-handle reads to
+ * sftp_hpn_server_bundle_read) and closes the handle when done. */
+static void
+process_extended_hpn_bundle_fetch(uint32_t id)
+{
+	sftp_hpn_server_dispatch(id, HPN_EXT_BUNDLE_FETCH, iqueue, oqueue);
+}
+
+static void
 process_extended(uint32_t id)
 {
 	char *request;
@@ -1980,7 +2118,8 @@ sftp_server_usage(void)
 	extern char *__progname;
 
 	fprintf(stderr,
-	    "usage: %s [-ehR] [-d start_directory] [-f log_facility] "
+	    "usage: %s [-ehR] [-B per_bundle_cap] [-T total_bundle_cap]\n"
+	    "\t[-d start_directory] [-f log_facility] "
 	    "[-l log_level]\n\t[-P denied_requests] "
 	    "[-p allowed_requests] [-u umask]\n"
 	    "       %s -Q protocol_feature\n",
@@ -1996,6 +2135,8 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 	SyslogFacility log_facility = SYSLOG_FACILITY_AUTH;
 	char *cp, *homedir = NULL, uidstr[32], buf[4*4096];
 	long mask;
+	const char *bundle_per_arg = NULL;
+	const char *bundle_total_arg = NULL;
 
 	extern char *optarg;
 	extern char *__progname;
@@ -2006,7 +2147,7 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 	pw = pwcopy(user_pw);
 
 	while (!skipargs && (ch = getopt(argc, argv,
-	    "d:f:l:P:p:Q:u:cehR")) != -1) {
+	    "B:T:d:f:l:P:p:Q:u:cehR")) != -1) {
 		switch (ch) {
 		case 'Q':
 			if (strcasecmp(optarg, "requests") != 0) {
@@ -2068,11 +2209,23 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 				fatal("Invalid umask \"%s\"", optarg);
 			(void)umask((mode_t)mask);
 			break;
+		case 'B':
+			/* hpn-bundle per-bundle accumulator cap; parsed
+			 * + clamped below by sftp_hpn_server_set_bundle_caps. */
+			bundle_per_arg = optarg;
+			break;
+		case 'T':
+			/* hpn-bundle total accumulator cap across all
+			 * concurrent bundle handles in this server process. */
+			bundle_total_arg = optarg;
+			break;
 		case 'h':
 		default:
 			sftp_server_usage();
 		}
 	}
+
+	sftp_hpn_server_set_bundle_caps(bundle_per_arg, bundle_total_arg);
 
 	log_init(__progname, log_level, log_facility, log_stderr);
 

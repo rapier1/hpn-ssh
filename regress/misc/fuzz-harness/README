@@ -1,1 +1,10 @@
 This directory contains fuzzing harnesses for use with clang's libfuzzer.
+
+HPN-SSH-specific harnesses (not present upstream):
+  sftp_bundle_extract_fuzz   — server-side tar reader for the
+                               hpn-bundle-open@hpnssh.org extension
+                               (exercises bundle_path_is_safe + libarchive
+                               tar parsing).
+  sftp_fs_info_fuzz          — client-side reply parser for the
+                               hpn-fs-info@hpnssh.org extension
+                               (sshbuf cstring + u64 + u32 + u64 sequence).

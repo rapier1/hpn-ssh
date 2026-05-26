@@ -2478,6 +2478,48 @@ safe_path_fd(int fd, const char *file, struct passwd *pw,
 }
 
 /*
+ * Create dirpath and any missing parent directories with mode.
+ *
+ * Like `mkdir -p`: walks the path components left-to-right, mkdir'ing
+ * each segment in turn and ignoring EEXIST so a partially-existing
+ * tree is fine.  Returns 0 on success or -1 (errno set) on the first
+ * mkdir failure that isn't EEXIST.
+ *
+ * An existing path that isn't a directory is treated as success here —
+ * we only care that the path is reachable.  Callers that need the
+ * leaf to be a directory should stat afterward.
+ */
+int
+mkdir_p(const char *dirpath, mode_t mode)
+{
+	char *p, *q;
+	int rc = 0;
+
+	if (dirpath == NULL || *dirpath == '\0')
+		return -1;
+	p = strdup(dirpath);
+	if (p == NULL)
+		return -1;
+	/* Walk path components, mkdir each. */
+	for (q = p + 1; *q != '\0'; q++) {
+		if (*q == '/') {
+			*q = '\0';
+			if (mkdir(p, mode) != 0 && errno != EEXIST) {
+				rc = -1;
+				break;
+			}
+			*q = '/';
+		}
+	}
+	if (rc == 0) {
+		if (mkdir(p, mode) != 0 && errno != EEXIST)
+			rc = -1;
+	}
+	free(p);
+	return rc;
+}
+
+/*
  * Sets the value of the given variable in the environment.  If the variable
  * already exists, its value is overridden.
  */

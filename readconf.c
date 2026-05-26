@@ -157,8 +157,9 @@ typedef enum {
 	oHashKnownHosts,
 	oTunnel, oTunnelDevice,
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
-	oTcpRcvBufPoll, oHPNDisabled, oHPNMemoryLimit,
-	oNoneEnabled, oNoneMacEnabled, oNoneSwitch,
+	oTcpRcvBufPoll, oTcpRcvBufRescue, oHPNDisabled, oHPNMemoryLimit,
+	oNoneEnabled, oNoneMacEnabled, oNoneSwitch, oHPNUseBundle,
+	oHPNMaxRetries, oHPNBundleSize, oHPNMaxAuthConcurrent,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oVisualHostKey,
@@ -299,6 +300,10 @@ static struct {
 	{ "noneenabled", oNoneEnabled },
 	{ "nonemacenabled", oNoneMacEnabled },
 	{ "noneswitch", oNoneSwitch },
+	{ "hpnusebundle", oHPNUseBundle },
+	{ "hpnmaxretries", oHPNMaxRetries },
+	{ "hpnbundlesize", oHPNBundleSize },
+	{ "hpnmaxauthconcurrent", oHPNMaxAuthConcurrent },
 	{ "usemptcp", oUseMPTCP},
 	{ "happyeyes", oHappyEyes },
 	{ "happydelay", oHappyDelay },
@@ -331,6 +336,7 @@ static struct {
 	{ "securitykeyprovider", oSecurityKeyProvider },
 	{ "knownhostscommand", oKnownHostsCommand },
 	{ "tcprcvbufpoll", oTcpRcvBufPoll },
+	{ "tcprcvbufrescue", oTcpRcvBufRescue },
 	{ "hpndisabled", oHPNDisabled },
 	{ "hpnmemorylimit", oHPNMemoryLimit },
 	{ "requiredrsasize", oRequiredRSASize },
@@ -1371,6 +1377,10 @@ parse_time:
 		intptr = &options->tcp_rcv_buf_poll;
 		goto parse_flag;
 
+	case oTcpRcvBufRescue:
+		intptr = &options->tcp_rcv_buf_rescue;
+		goto parse_flag;
+
 	case oNoneEnabled:
 		intptr = &options->none_enabled;
 		goto parse_flag;
@@ -1378,6 +1388,50 @@ parse_time:
 	case oNoneMacEnabled:
 		intptr = &options->nonemac_enabled;
 		goto parse_flag;
+
+	case oHPNUseBundle:
+		intptr = &options->hpn_use_bundle;
+		goto parse_flag;
+
+	case oHPNMaxRetries:
+		intptr = &options->hpn_max_retries;
+		goto parse_int;
+
+	case oHPNBundleSize:
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0') {
+			error("%.200s line %d: Missing argument.", filename,
+			    linenum);
+			goto out;
+		}
+		if (scan_scaled(arg, &val64) == -1) {
+			error("%.200s line %d: HPNBundleSize bad value '%s': "
+			    "%s", filename, linenum, arg, strerror(errno));
+			goto out;
+		}
+		/* Clamp to [64 KiB, 64 MiB] with warning when out of range.
+		 * 64 KiB lower bound is the existing sanity floor in the
+		 * worker startup code; 64 MiB upper bound matches the
+		 * server-side per-bundle cap default — values above that
+		 * would just be rejected by the server. */
+		if (val64 < 65536LL) {
+			fprintf(stderr, "HPNBundleSize %lld is below the "
+			    "minimum (65536 bytes); clamping to 65536.\n",
+			    (long long)val64);
+			val64 = 65536LL;
+		} else if (val64 > (int64_t)(64 * 1024 * 1024)) {
+			fprintf(stderr, "HPNBundleSize %lld is above the "
+			    "maximum (67108864 bytes / 64 MiB); clamping to "
+			    "64 MiB.\n", (long long)val64);
+			val64 = 64 * 1024 * 1024;
+		}
+		if (*activep && options->hpn_bundle_size == -1)
+			options->hpn_bundle_size = val64;
+		break;
+
+	case oHPNMaxAuthConcurrent:
+		intptr = &options->hpn_max_auth_concurrent;
+		goto parse_int;
 
 	case oUseMPTCP:
 		intptr = &options->use_mptcp;
@@ -2902,6 +2956,10 @@ initialize_options(Options * options)
 	options->none_switch = -1;
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
+	options->hpn_use_bundle = -1;
+	options->hpn_max_retries = -1;
+	options->hpn_bundle_size = -1;
+	options->hpn_max_auth_concurrent = -1;
 	options->use_mptcp = -1;
 	options->use_happyeyes = -1;
 	options->happy_delay = -1;
@@ -2914,6 +2972,7 @@ initialize_options(Options * options)
 	options->fallback = -1;
 	options->fallback_port = -1;
 	options->tcp_rcv_buf_poll = -1;
+	options->tcp_rcv_buf_rescue = -1;
 	options->session_type = -1;
 	options->stdin_null = -1;
 	options->fork_after_authentication = -1;
@@ -3092,6 +3151,8 @@ fill_default_options(Options * options)
 		options->hpn_memory_limit = 0;
 	if (options->tcp_rcv_buf_poll == -1)
 		options->tcp_rcv_buf_poll = 1;
+	if (options->tcp_rcv_buf_rescue == -1)
+		options->tcp_rcv_buf_rescue = 0; /* opt-in until validated */
 	if (options->none_switch == -1)
 		options->none_switch = 0;
 	if (options->none_enabled == -1)
@@ -3102,6 +3163,34 @@ fill_default_options(Options * options)
 	}
 	if (options->nonemac_enabled == -1)
 		options->nonemac_enabled = 0;
+	if (options->hpn_use_bundle == -1)
+		options->hpn_use_bundle = 1;	/* default: yes */
+	if (options->hpn_max_retries == -1) {
+		options->hpn_max_retries = 3;	/* default: 3 attempts */
+	} else if (options->hpn_max_retries < 1) {
+		fprintf(stderr, "HPNMaxRetries %d is below the minimum (1); "
+		    "clamping to 1.\n", options->hpn_max_retries);
+		options->hpn_max_retries = 1;
+	} else if (options->hpn_max_retries > 20) {
+		fprintf(stderr, "HPNMaxRetries %d is above the maximum (20); "
+		    "clamping to 20.\n", options->hpn_max_retries);
+		options->hpn_max_retries = 20;
+	}
+	if (options->hpn_bundle_size == -1)
+		options->hpn_bundle_size = 4 * 1024 * 1024;	/* default 4 MiB */
+	if (options->hpn_max_auth_concurrent == -1) {
+		options->hpn_max_auth_concurrent = 8;		/* default 8 */
+	} else if (options->hpn_max_auth_concurrent < 1) {
+		fprintf(stderr, "HPNMaxAuthConcurrent %d is below the "
+		    "minimum (1); clamping to 1.\n",
+		    options->hpn_max_auth_concurrent);
+		options->hpn_max_auth_concurrent = 1;
+	} else if (options->hpn_max_auth_concurrent > 64) {
+		fprintf(stderr, "HPNMaxAuthConcurrent %d is above the "
+		    "maximum (64); clamping to 64.\n",
+		    options->hpn_max_auth_concurrent);
+		options->hpn_max_auth_concurrent = 64;
+	}
 	if (options->nonemac_enabled > 0 && (options->none_enabled == 0 ||
 					     options->none_switch == 0)) {
 		fprintf(stderr, "None MAC can only be used with the None cipher. None MAC disabled.\n");
@@ -3960,11 +4049,18 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oUpdateHostkeys, o->update_hostkeys);
 	dump_cfg_fmtint(oEnableEscapeCommandline, o->enable_escape_commandline);
 	dump_cfg_fmtint(oTcpRcvBufPoll, o->tcp_rcv_buf_poll);
+	dump_cfg_fmtint(oTcpRcvBufRescue, o->tcp_rcv_buf_rescue);
 	dump_cfg_fmtint(oHPNDisabled, o->hpn_disabled);
 	dump_cfg_fmtint(oHPNMemoryLimit, o->hpn_memory_limit);
 	/* NoneSwitch is command-line only; omit from -G dump to allow reparse */
 	dump_cfg_fmtint(oNoneEnabled, o->none_enabled);
 	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
+	dump_cfg_fmtint(oHPNUseBundle, o->hpn_use_bundle);
+	dump_cfg_int(oHPNMaxRetries, o->hpn_max_retries);
+	dump_cfg_int(oHPNMaxAuthConcurrent, o->hpn_max_auth_concurrent);
+	/* oHPNBundleSize — int64 byte count; printed plain (operator can
+	 * compare against the K/M/G suffix they configured). */
+	printf("hpnbundlesize %lld\n", (long long)o->hpn_bundle_size);
 	dump_cfg_fmtint(oFallback, o->fallback);
 	dump_cfg_fmtint(oMetrics, o->metrics);
 	dump_cfg_fmtint(oUseMPTCP, o->use_mptcp);

@@ -58,9 +58,64 @@ typedef void EditLine;
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-usergroup.h"
+#include "sftp-parallel.h"
 
 /* File to read commands from */
 FILE* infile;
+
+/* Parallel-streams orchestrator: NULL = single-stream (default) */
+static struct sftp_parallel *parallel_orch = NULL;
+static int parallel_num_streams = 1;
+/* 1 if the user explicitly passed -j N; 0 otherwise.  When 0, hpnsftp
+ * runs as a plain single-stream client (no orchestrator, no autotuning) so
+ * default behaviour matches upstream sftp.  -j N opts into the parallel
+ * worker pool, which stays fixed at N for the lifetime of the transfer. */
+static int parallel_user_opt_in = 0;
+
+/* User-facing range-split minimum size, in MiB.  0 = unset (orchestrator
+ * uses RANGE_SPLIT_MIN_SIZE_DEFAULT).  Set by -M flag.  Bounded to
+ * [64, 10240] MiB at parse time. */
+static int range_split_min_mb_user = 0;
+
+/* Directory for per-worker SSH stderr capture, set by -W flag.  NULL = off
+ * (production default — worker stderr is inherited so connection errors
+ * reach the user's terminal).  When set, each parallel worker writes its
+ * SSH child's stderr to <dir>/hpnssh-worker-<pid>.stderr.  Validated to be
+ * an existing writable directory at parse time. */
+static const char *worker_log_dir = NULL;
+
+/*
+ * When non-zero, process_put / process_get do NOT call sftp_parallel_wait
+ * after submitting their files.  Submissions pile up in the queue and the
+ * caller is responsible for calling parallel_flush() at the appropriate time
+ * (typically end-of-batch).  Enabled automatically in batch mode so that
+ *     put file1
+ *     put file2
+ *     put file3
+ * pipelines all three files instead of serialising on each command's wait.
+ *
+ * Interactive mode leaves this at 0 by default — users expect their prompt
+ * to come back when an upload completes.  A future "job submission mode" in
+ * the interactive shell can flip this on per-session via the same hook.
+ */
+static int defer_parallel_wait = 0;
+
+/*
+ * Sticky session-wide failure flag.  parallel_flush sets this to 1
+ * whenever it detects undelivered files (units_failed_aggregate or
+ * walker_failures_aggregate > 0).  Consulted by interactive_loop's
+ * final return so the process exits non-zero whenever ANY transfer
+ * during the session lost data — even if a later command succeeded
+ * and reset the local err counter.
+ *
+ * Why this exists: in interactive (non-batch) mode,
+ * parse_dispatch_command intentionally returns 0 for failed individual
+ * commands so the session continues to the next prompt.  That
+ * swallows the per-command failure signal.  Batch mode propagates it
+ * directly (err_abort = 1).  This flag is the bridge so the user
+ * always gets a non-zero exit when data was lost, regardless of mode.
+ */
+static int session_had_failure = 0;
 
 /* Are we in batchfile mode? */
 int batchmode = 0;
@@ -101,6 +156,7 @@ struct complete_ctx {
 
 int sftp_glob(struct sftp_conn *, const char *, int,
     int (*)(const char *, int), glob_t *); /* proto for sftp-glob.c */
+int sftp_glob_get_attrib(const char *, Attrib *);  /* proto for sftp-glob.c */
 
 extern char *__progname;
 
@@ -128,6 +184,7 @@ enum sftp_command {
 	I_CHMOD,
 	I_CHOWN,
 	I_COPY,
+	I_DEFER,
 	I_DF,
 	I_GET,
 	I_HELP,
@@ -153,6 +210,7 @@ enum sftp_command {
 	I_SYMLINK,
 	I_VERSION,
 	I_PROGRESS,
+	I_WAIT,
 };
 
 struct CMD {
@@ -176,6 +234,7 @@ static const struct CMD cmds[] = {
 	{ "chown",	I_CHOWN,	REMOTE,		NOARGS	},
 	{ "copy",	I_COPY,		REMOTE,		LOCAL	},
 	{ "cp",		I_COPY,		REMOTE,		LOCAL	},
+	{ "defer",	I_DEFER,	NOARGS,		NOARGS	},
 	{ "df",		I_DF,		REMOTE,		NOARGS	},
 	{ "dir",	I_LS,		REMOTE,		NOARGS	},
 	{ "exit",	I_QUIT,		NOARGS,		NOARGS	},
@@ -205,6 +264,7 @@ static const struct CMD cmds[] = {
 	{ "rmdir",	I_RMDIR,	REMOTE,		NOARGS	},
 	{ "symlink",	I_SYMLINK,	REMOTE,		REMOTE	},
 	{ "version",	I_VERSION,	NOARGS,		NOARGS	},
+	{ "wait",	I_WAIT,		NOARGS,		NOARGS	},
 	{ "!",		I_SHELL,	NOARGS,		NOARGS	},
 	{ "?",		I_HELP,		NOARGS,		NOARGS	},
 	{ NULL,		-1,		-1,		-1	}
@@ -284,6 +344,8 @@ help(void)
 	    "chown [-h] own path                Change owner of file 'path' to 'own'\n"
 	    "copy oldpath newpath               Copy remote file\n"
 	    "cp oldpath newpath                 Copy remote file\n"
+	    "defer [on|off]                     Toggle deferred put/get (parallel mode);\n"
+	    "                                   no arg prints current state\n"
 	    "df [-hi] [path]                    Display statistics for current directory or\n"
 	    "                                   filesystem containing 'path'\n"
 	    "exit                               Quit sftp\n"
@@ -310,6 +372,7 @@ help(void)
 	    "rmdir path                         Remove remote directory\n"
 	    "symlink oldpath newpath            Symlink remote file\n"
 	    "version                            Show SFTP version\n"
+	    "wait                               Block until all deferred put/get are done\n"
 	    "!command                           Execute 'command' in local shell\n"
 	    "!                                  Escape to local shell\n"
 	    "?                                  Synonym for help\n");
@@ -644,6 +707,130 @@ local_is_dir(const char *path)
 	return S_ISDIR(sb.st_mode);
 }
 
+/*
+ * Drain all submissions sitting in the parallel orchestrator's queue.
+ *
+ * Centralises the wait + progress_stop + protocol-violation summary that
+ * process_get / process_put used to do at the end of each command.  Called
+ * directly by those functions in interactive mode, or once at end-of-batch
+ * by the caller (interactive_loop) when defer_parallel_wait is set.
+ *
+ * Safe to call when parallel_orch is NULL (no-op) or when no submissions are
+ * outstanding (sftp_parallel_wait returns immediately).
+ */
+/*
+ * Drains the parallel orchestrator and returns 0 if every submitted
+ * unit completed successfully, -1 if any unit was permanently lost
+ * (units_failed_aggregate > 0).  Callers MUST propagate -1 up to the
+ * sftp exit code: silent data loss is unacceptable.  When parallel_orch
+ * is NULL (parallel mode off) the function is a no-op returning 0.
+ */
+static int
+parallel_flush(void)
+{
+	struct sftp_parallel_stats pstats;
+	int rc = 0;
+
+	if (parallel_orch == NULL)
+		return 0;
+
+	sftp_parallel_wait(parallel_orch);
+	sftp_parallel_progress_stop(parallel_orch);
+	sftp_parallel_get_stats(parallel_orch, &pstats);
+
+	/* End-of-transfer summary.  Leads with bytes/throughput so the
+	 * operator gets a one-line health check; appends the respawn
+	 * count when non-zero (so a clean transfer stays terse), and a
+	 * tuning hint when respawn churn crosses ~25 % of -j — the same
+	 * threshold the outlier detector uses, and the empirically
+	 * observed knee-of-the-curve for too many parallel streams on a
+	 * saturated path.  Emitted BEFORE any TRANSFER INCOMPLETE block
+	 * so the signal isn't buried under a long failed-paths list. */
+	if (pstats.elapsed_ms > 0 && pstats.bytes_total_aggregate > 0) {
+		double secs   = pstats.elapsed_ms / 1000.0;
+		double mibps  = (double)pstats.bytes_total_aggregate
+		    / (1024.0 * 1024.0) / secs;
+		double bytes  = (double)pstats.bytes_total_aggregate;
+		const char *size_unit;
+		double size_val;
+		if (bytes >= 1024.0 * 1024.0 * 1024.0) {
+			size_val  = bytes / (1024.0 * 1024.0 * 1024.0);
+			size_unit = "GiB";
+		} else {
+			size_val  = bytes / (1024.0 * 1024.0);
+			size_unit = "MiB";
+		}
+		int j         = pstats.num_workers > 0
+		    ? pstats.num_workers : parallel_num_streams;
+		int respawn_hint_threshold = (j + 3) / 4; /* ceil(j / 4) */
+		const char *churn_hint =
+		    (pstats.total_respawns >= respawn_hint_threshold &&
+		     respawn_hint_threshold > 0)
+		    ? " \xe2\x80\x94 consider lowering -j" : "";
+		if (pstats.total_respawns > 0) {
+			logit("Parallel streams: %.2f %s in %.1fs (%.0f MiB/s); "
+			    "%d worker respawn%s%s",
+			    size_val, size_unit, secs, mibps,
+			    pstats.total_respawns,
+			    pstats.total_respawns == 1 ? "" : "s",
+			    churn_hint);
+		} else {
+			logit("Parallel streams: %.2f %s in %.1fs (%.0f MiB/s)",
+			    size_val, size_unit, secs, mibps);
+		}
+	}
+
+	if (pstats.protocol_violations > 0) {
+		logit("warning: %d worker protocol violation detected "
+		    "(recovered via worker respawn) - investigate if "
+		    "this recurs across transfers",
+		    pstats.protocol_violations);
+	}
+	if (pstats.units_failed_aggregate > 0) {
+		error("TRANSFER INCOMPLETE: %llu file(s) could not be "
+		    "delivered after retries",
+		    (unsigned long long)pstats.units_failed_aggregate);
+		rc = -1;
+	}
+	if (pstats.walker_failures_aggregate > 0) {
+		error("TRANSFER INCOMPLETE: %llu file(s) or director(y/ies) "
+		    "were skipped during the directory walk "
+		    "(stat/readdir/symlink errors)",
+		    (unsigned long long)pstats.walker_failures_aggregate);
+		rc = -1;
+	}
+
+	/* Drain the failed-paths list and print it.  This is the
+	 * user-facing inventory of what didn't make it — separate from
+	 * the per-aggregate counts above because a path can show up via
+	 * the worker-failure or walker-failure code path. */
+	{
+		char  **paths     = NULL;
+		size_t  paths_used = 0;
+		uint64_t total = sftp_parallel_drain_failed_paths(
+		    parallel_orch, &paths, &paths_used);
+		if (total > 0) {
+			if (paths_used >= total) {
+				error("  Failed paths (%llu total):",
+				    (unsigned long long)total);
+			} else {
+				error("  Failed paths (showing first %zu; "
+				    "list exceeds current limit of %zu files):",
+				    paths_used, paths_used);
+			}
+			for (size_t i = 0; i < paths_used; i++) {
+				error("    %s", paths[i]);
+				free(paths[i]);
+			}
+			free(paths);
+		}
+	}
+
+	if (rc != 0)
+		session_had_failure = 1;
+	return rc;
+}
+
 static int
 process_get(struct sftp_conn *conn, const char *src, const char *dst,
     const char *pwd, int pflag, int rflag, int resume, int fflag, int verify)
@@ -675,6 +862,14 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		    "\"%s\" is not a directory", dst);
 		err = -1;
 		goto out;
+	}
+
+	if (parallel_orch != NULL && !quiet && g.gl_matchc > 0) {
+		char label[64];
+		snprintf(label, sizeof(label),
+		    "Fetching %d file%s in parallel", (int)g.gl_matchc,
+		    g.gl_matchc == 1 ? "" : "s");
+		sftp_parallel_progress_start(parallel_orch, label, 0);
 	}
 
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
@@ -716,9 +911,43 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		/* XXX follow link flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
 		    (rflag || global_rflag)) {
-			if (sftp_download_dir(conn, g.gl_pathv[i], abs_dst,
-			    NULL, pflag || global_pflag, 1, resume,
+			if (parallel_orch != NULL) {
+				if (sftp_parallel_download_dir(parallel_orch,
+				    conn, g.gl_pathv[i], abs_dst, 1) == -1)
+					err = -1;
+			} else if (sftp_download_dir(conn, g.gl_pathv[i],
+			    abs_dst, NULL, pflag || global_pflag, 1, resume,
 			    fflag || global_fflag, 0, 0) == -1)
+				err = -1;
+		} else if (parallel_orch != NULL) {
+			/*
+			 * Recover size and mode from the glob attrib cache so
+			 * maybe_submit_download can decide whether to range-
+			 * split this file.  sftp_glob already paid an RTT for
+			 * the stat via fudge_stat/fudge_lstat; we just reuse it.
+			 *
+			 * If the lookup misses (rare — typically only the
+			 * GLOB_NOCHECK fallback path), do an explicit stat so
+			 * that the single-file get case (the workload most
+			 * likely to benefit from range splitting) still gets
+			 * a known size.
+			 */
+			Attrib ga;
+			off_t fsize = 0;
+			mode_t fmode = 0;
+			int have = (sftp_glob_get_attrib(g.gl_pathv[i],
+			    &ga) == 0);
+			if (!have &&
+			    sftp_stat(conn, g.gl_pathv[i], 1, &ga) == 0)
+				have = 1;
+			if (have) {
+				if (ga.flags & SSH2_FILEXFER_ATTR_SIZE)
+					fsize = (off_t)ga.size;
+				if (ga.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
+					fmode = ga.perm & 07777;
+			}
+			if (sftp_parallel_submit_download(parallel_orch, conn,
+			    g.gl_pathv[i], abs_dst, fsize, fmode) != 0)
 				err = -1;
 		} else {
 			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
@@ -735,6 +964,19 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		}
 		free(abs_dst);
 		abs_dst = NULL;
+	}
+
+	/*
+	 * In deferred-wait mode (batch mode or future "job submission mode"),
+	 * skip the drain — the caller (interactive_loop end-of-batch) will
+	 * flush the queue once after all commands have been submitted, which
+	 * lets multiple get commands pipeline their files instead of stalling
+	 * each get on a slow chunk from the previous one.  Err reporting and
+	 * the protocol-violation summary then happen at flush time.
+	 */
+	if (parallel_orch != NULL && !defer_parallel_wait) {
+		if (parallel_flush() != 0)
+			err = -1;
 	}
 
 out:
@@ -778,6 +1020,22 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		    "\"%s\" is not a directory", tmp_dst);
 		err = -1;
 		goto out;
+	}
+
+	if (parallel_orch != NULL && !quiet && g.gl_matchc > 0) {
+		char label[64];
+		off_t total_bytes = 0;
+		long total_files = 0, fc = 0;
+		for (i = 0; g.gl_pathv[i]; i++) {
+			fc = 0;
+			total_bytes += sftp_parallel_scan_upload_total(
+			    g.gl_pathv[i], &fc);
+			total_files += fc;
+		}
+		snprintf(label, sizeof(label),
+		    "Uploading %ld file%s in parallel", total_files,
+		    total_files == 1 ? "" : "s");
+		sftp_parallel_progress_start(parallel_orch, label, total_bytes);
 	}
 
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
@@ -826,9 +1084,18 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		/* XXX follow_link_flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
 		    (rflag || global_rflag)) {
-			if (sftp_upload_dir(conn, g.gl_pathv[i], abs_dst,
-			    pflag || global_pflag, 1, resume, verify,
+			if (parallel_orch != NULL) {
+				if (sftp_parallel_upload_dir(parallel_orch,
+				    conn, g.gl_pathv[i], abs_dst, 1) == -1)
+					err = -1;
+			} else if (sftp_upload_dir(conn, g.gl_pathv[i],
+			    abs_dst, pflag || global_pflag, 1, resume, verify,
 			    fflag || global_fflag, 0, 0) == -1)
+				err = -1;
+		} else if (parallel_orch != NULL) {
+			if (sftp_parallel_submit_upload(parallel_orch, conn,
+			    g.gl_pathv[i], abs_dst,
+			    sb.st_size, sb.st_mode) != 0)
 				err = -1;
 		} else {
 			int ur = sftp_upload(conn, g.gl_pathv[i], abs_dst,
@@ -843,6 +1110,14 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 				mprintf("File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
 		}
+	}
+
+	/* See process_get — deferred mode skips the per-command drain so
+	 * successive put commands pipeline their files instead of each one
+	 * stalling on a slow tail chunk from the previous file. */
+	if (parallel_orch != NULL && !defer_parallel_wait) {
+		if (parallel_flush() != 0)
+			err = -1;
 	}
 
 out:
@@ -1564,8 +1839,21 @@ parse_args(const char **cpp, int *ignore_errors, int *disable_echo, int *aflag,
 	case I_HELP:
 	case I_VERSION:
 	case I_PROGRESS:
+	case I_WAIT:
 		if ((optidx = parse_no_flags(cmd, argv, argc)) == -1)
 			return -1;
+		break;
+	case I_DEFER:
+		/* "defer" alone reports state; "defer on" / "defer off"
+		 * toggles.  No other args accepted. */
+		if ((optidx = parse_no_flags(cmd, argv, argc)) == -1)
+			return -1;
+		if (argc - optidx > 1) {
+			error("Too many arguments to defer (use on/off)");
+			return -1;
+		}
+		if (argc - optidx == 1)
+			*path1 = xstrdup(argv[optidx]);
 		break;
 	default:
 		fatal("Command not implemented");
@@ -1839,6 +2127,63 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 			printf("Progress meter enabled\n");
 		else
 			printf("Progress meter disabled\n");
+		break;
+	case I_DEFER:
+		/*
+		 * Toggle the deferred-wait flag.  When ON, `put` and `get`
+		 * return as soon as their submissions hit the queue rather
+		 * than blocking until completion, so successive commands
+		 * pipeline through the worker pool.
+		 *
+		 * Transitioning from ON to OFF drains any pending work
+		 * first (parallel_flush) — `defer off` is a synchronisation
+		 * barrier as well as a state change.  Going ON to ON or OFF
+		 * to OFF is a no-op.  With no argument, the current state
+		 * is printed.
+		 *
+		 * Useful in interactive mode where the user wants to queue
+		 * several uploads back-to-back without waiting for each to
+		 * finish, then synchronise at a chosen point.  In batch mode
+		 * the flag starts ON automatically; this command can disable
+		 * it mid-batch when the next operations depend on prior ones
+		 * having completed.
+		 */
+		if (path1 == NULL) {
+			printf("defer is %s\n",
+			    defer_parallel_wait ? "on" : "off");
+		} else if (strcasecmp(path1, "on") == 0 ||
+		    strcasecmp(path1, "yes") == 0 ||
+		    strcmp(path1, "1") == 0) {
+			defer_parallel_wait = 1;
+			if (!quiet)
+				printf("defer on\n");
+		} else if (strcasecmp(path1, "off") == 0 ||
+		    strcasecmp(path1, "no") == 0 ||
+		    strcmp(path1, "0") == 0) {
+			if (defer_parallel_wait && parallel_orch != NULL) {
+				if (parallel_flush() != 0)
+					err = -1;
+			}
+			defer_parallel_wait = 0;
+			if (!quiet)
+				printf("defer off\n");
+		} else {
+			error("defer: argument must be on or off "
+			    "(got \"%s\")", path1);
+			err = -1;
+		}
+		break;
+	case I_WAIT:
+		/* Synchronisation barrier: drain any submissions queued by
+		 * deferred put/get commands.  No-op when nothing is in
+		 * flight or when the orchestrator isn't running.  Always
+		 * safe — independent of the defer flag. */
+		if (parallel_orch != NULL) {
+			if (parallel_flush() != 0)
+				err = -1;
+		}
+		if (!quiet)
+			printf("wait: drained\n");
 		break;
 	default:
 		fatal("%d is not implemented", cmdnum);
@@ -2308,8 +2653,14 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	}
 #endif /* USE_LIBEDIT */
 
-	if ((remote_path = sftp_realpath(conn, ".")) == NULL)
+	if ((remote_path = sftp_realpath(conn, ".")) == NULL) {
+		/* Distinguish protocol corruption from a generic "no cwd" so
+		 * the user knows whether to investigate the server. */
+		if (sftp_conn_is_protocol_violation(conn))
+			fatal("control connection protocol violation during "
+			    "init - possible MITM or server corruption");
 		fatal("Need cwd");
+	}
 	startdir = xstrdup(remote_path);
 
 	if (file1 != NULL) {
@@ -2322,6 +2673,13 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 			snprintf(cmd, sizeof cmd, "cd \"%s\"", dir);
 			if (parse_dispatch_command(conn, cmd,
 			    &remote_path, startdir, 1, 0) != 0) {
+				/* Early dispatch (pre-interactive_loop): same
+				 * fail-stop on protocol violation as the main
+				 * loop check at the bottom of interactive_loop. */
+				if (sftp_conn_is_protocol_violation(conn))
+					fatal("control connection protocol "
+					    "violation - possible MITM or "
+					    "server corruption");
 				free(dir);
 				free(startdir);
 				free(remote_path);
@@ -2336,6 +2694,11 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 			    file2 == NULL ? "" : file2);
 			err = parse_dispatch_command(conn, cmd,
 			    &remote_path, startdir, 1, 0);
+			/* Early dispatch (pre-interactive_loop): same
+			 * fail-stop on protocol violation as the main loop. */
+			if (sftp_conn_is_protocol_violation(conn))
+				fatal("control connection protocol violation "
+				    "- possible MITM or server corruption");
 			free(dir);
 			free(startdir);
 			free(remote_path);
@@ -2401,9 +2764,27 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 
 		err = parse_dispatch_command(conn, cmd, &remote_path,
 		    startdir, batchmode, !interactive && el == NULL);
+		if (sftp_conn_is_protocol_violation(conn))
+			fatal("control connection protocol violation - "
+			    "possible MITM or server corruption");
 		if (err != 0)
 			break;
 	}
+
+	/*
+	 * End-of-batch drain.  In deferred mode (batch mode, or a future
+	 * interactive "job submission mode") process_put / process_get only
+	 * submit to the queue and return; the actual wait happens here.  Safe
+	 * to call unconditionally — parallel_flush() is a no-op when no
+	 * orchestrator exists or no submissions are outstanding.
+	 *
+	 * In non-deferred interactive mode this is also safe: each command
+	 * already drained itself, so the queue is empty and the wait returns
+	 * immediately.
+	 */
+	if (parallel_flush() != 0)
+		err = -1;
+
 	ssh_signal(SIGCHLD, SIG_DFL);
 	free(remote_path);
 	free(startdir);
@@ -2416,7 +2797,16 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 		el_end(el);
 #endif /* USE_LIBEDIT */
 
-	/* err == 1 signifies normal "quit" exit */
+	/*
+	 * err == 1 signifies normal "quit" exit; err == -1 is a failed
+	 * command in batch mode.  Additionally, session_had_failure
+	 * captures any parallel_flush failure that interactive mode
+	 * intentionally swallowed at the parse_dispatch_command layer.
+	 * Either signal forces non-zero exit so the user always knows
+	 * when data was lost.
+	 */
+	if (session_had_failure)
+		return (-1);
 	return (err >= 0 ? 0 : -1);
 }
 
@@ -2478,6 +2868,12 @@ connect_to_server(char *path, char **args, int *in, int *out)
 	ssh_signal(SIGCHLD, sigchld_handler);
 	close(c_in);
 	close(c_out);
+
+	/* Announce the control ssh child PID so post-mortem diagnostics can
+	 * tell it apart from worker PIDs (worker PIDs are logged by the
+	 * parallel orchestrator's watchdog as "worker N: ... pid=...").
+	 * Useful when investigating control-connection deaths in -j mode. */
+	logit("hpnsftp control: ssh child pid=%ld", (long)sshpid);
 }
 
 static void
@@ -2488,9 +2884,10 @@ usage(void)
 	fprintf(stderr,
 	    "usage: %s [-46AaCfNpqrv] [-B buffer_size] [-b batchfile] [-c cipher]\n"
 	    "          [-D sftp_server_command] [-F ssh_config] [-i identity_file]\n"
-	    "          [-J destination] [-l limit] [-o ssh_option] [-P port]\n"
-	    "          [-R num_requests] [-S program] [-s subsystem | sftp_server]\n"
-	    "          [-X sftp_option] destination\n",
+	    "          [-J destination] [-j parallel_streams] [-l limit]\n"
+	    "          [-M range_split_min_mb] [-o ssh_option] [-P port]\n"
+	    "          [-R num_requests] [-S program]\n"
+	    "          [-s subsystem | sftp_server] [-X sftp_option] destination\n",
 	    __progname);
 	exit(1);
 }
@@ -2513,9 +2910,29 @@ main(int argc, char **argv)
 	size_t num_requests = 0;
 	long long llv, limit_kbps = 0;
 
+	/* Pass-through state for the parallel-streams ControlMaster.
+	 * Captured during getopt and forwarded into sftp_parallel_config so
+	 * the master and worker connections honor the same -i / -F / -o
+	 * options the user gave the main connection. */
+	const char *parallel_identity = NULL;
+	const char *parallel_config_file = NULL;
+	char **parallel_extra_o = NULL;
+	size_t parallel_extra_o_count = 0;
+	size_t parallel_extra_o_cap = 0;
+
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
 	msetlocale();
+
+	/*
+	 * Ignore SIGPIPE process-wide.  Without this, a write to a closed
+	 * pipe terminates the entire process — fatal in parallel mode
+	 * because a worker thread writing to its (now-dead) ssh child
+	 * delivers SIGPIPE to the whole sftp process, killing the control
+	 * connection and the orchestrator as collateral damage.  After this
+	 * call, those writes return EPIPE which our code already handles.
+	 */
+	ssh_signal(SIGPIPE, SIG_IGN);
 
 	__progname = ssh_get_progname(argv[0]);
 	memset(&args, '\0', sizeof(args));
@@ -2530,7 +2947,7 @@ main(int argc, char **argv)
 	infile = stdin;
 
 	while ((ch = getopt(argc, argv,
-	    "1246AafhNpqrvCc:D:i:l:o:s:S:b:B:F:J:P:R:X:")) != -1) {
+	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:X:")) != -1) {
 		switch (ch) {
 		/* Passed through to ssh(1) */
 		case 'A':
@@ -2540,13 +2957,35 @@ main(int argc, char **argv)
 			addargs(&args, "-%c", ch);
 			break;
 		/* Passed through to ssh(1) with argument */
-		case 'F':
 		case 'J':
 		case 'c':
+			addargs(&args, "-%c", ch);
+			addargs(&args, "%s", optarg);
+			break;
+		case 'F':
+			addargs(&args, "-%c", ch);
+			addargs(&args, "%s", optarg);
+			parallel_config_file = optarg;
+			break;
 		case 'i':
+			addargs(&args, "-%c", ch);
+			addargs(&args, "%s", optarg);
+			parallel_identity = optarg;
+			break;
 		case 'o':
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
+			if (parallel_extra_o_count + 2 > parallel_extra_o_cap) {
+				parallel_extra_o_cap =
+				    parallel_extra_o_cap ?
+				    parallel_extra_o_cap * 2 : 8;
+				parallel_extra_o = xreallocarray(
+				    parallel_extra_o, parallel_extra_o_cap,
+				    sizeof(*parallel_extra_o));
+			}
+			parallel_extra_o[parallel_extra_o_count++] =
+			    xstrdup(optarg);
+			parallel_extra_o[parallel_extra_o_count] = NULL;
 			break;
 		case 'q':
 			ll = SYSLOG_LEVEL_ERROR;
@@ -2590,6 +3029,15 @@ main(int argc, char **argv)
 				fatal("%s (%s).", strerror(errno), optarg);
 			showprogress = 0;
 			quiet = batchmode = 1;
+			/*
+			 * Batch mode submits commands sequentially from a file.
+			 * Deferring the per-command parallel_flush lets multiple
+			 * `put`/`get` commands pipeline their files through the
+			 * worker pool instead of each command stalling on the
+			 * slowest chunk of the previous one.  parallel_flush() is
+			 * called once after the command loop exits.
+			 */
+			defer_parallel_wait = 1;
 			addargs(&args, "-obatchmode yes");
 			break;
 		case 'f':
@@ -2603,6 +3051,28 @@ main(int argc, char **argv)
 			break;
 		case 'D':
 			sftp_direct = optarg;
+			break;
+		case 'j':
+			parallel_num_streams = (int)strtonum(optarg, 1,
+			    SFTP_PARALLEL_MAX_WORKERS, &errstr);
+			if (errstr != NULL)
+				fatal("Number of parallel streams must be between 1 and %d: \"%s\": %s",
+				    SFTP_PARALLEL_MAX_WORKERS,optarg, errstr);
+			parallel_user_opt_in = 1;
+			break;
+		case 'M':
+			/* Range-split minimum size (in MiB).  Files at or below
+			 * this size are uploaded as whole-file work units; larger
+			 * files are split into byte ranges across workers.  Hard
+			 * bounded to [64, 10240] MiB so neither degenerate value
+			 * can produce pathological behavior (very small => over-
+			 * chunking, very large => no parallelism for huge files). */
+			range_split_min_mb_user = (int)strtonum(optarg, 64,
+			    10240, &errstr);
+			if (errstr != NULL)
+				fatal("Range-split minimum (-M) must be between "
+				    "64 and 10240 MiB: \"%s\": %s",
+				    optarg, errstr);
 			break;
 		case 'l':
 			limit_kbps = strtonum(optarg, 1, 100 * 1024 * 1024,
@@ -2626,6 +3096,51 @@ main(int argc, char **argv)
 		case 'S':
 			ssh_program = optarg;
 			replacearg(&args, 0, "%s", ssh_program);
+			break;
+		case 'W':
+			/* Per-worker SSH stderr capture directory.  Diagnostic
+			 * aid: when set, each parallel worker writes its SSH
+			 * child's stderr to <dir>/hpnssh-worker-<pid>.stderr,
+			 * giving users a clear per-worker log to send when
+			 * reporting failures.  Off by default — production
+			 * inherits stderr so connection errors / banners /
+			 * warnings reach the user's terminal directly.
+			 *
+			 * Validates: must be a non-empty path that names a
+			 * writable directory.  If the path doesn't exist we
+			 * create it (mkdir-p semantics, mode 0755).  Anything
+			 * else (missing arg, dash-prefixed token, mkdir
+			 * failure, existing path that isn't a directory, no
+			 * write access) is fatal — the user typed something
+			 * they probably didn't mean. */
+			if (optarg == NULL || *optarg == '\0' ||
+			    *optarg == '-')
+				fatal("-W requires a directory path argument "
+				    "(got \"%s\")",
+				    optarg ? optarg : "(none)");
+			{
+				struct stat st;
+				if (stat(optarg, &st) != 0) {
+					if (errno != ENOENT)
+						fatal("-W \"%s\": %s",
+						    optarg, strerror(errno));
+					if (mkdir_p(optarg, 0755) != 0)
+						fatal("-W could not create "
+						    "\"%s\": %s",
+						    optarg, strerror(errno));
+					if (stat(optarg, &st) != 0)
+						fatal("-W \"%s\" missing "
+						    "after mkdir: %s",
+						    optarg, strerror(errno));
+				}
+				if (!S_ISDIR(st.st_mode))
+					fatal("-W \"%s\" is not a directory",
+					    optarg);
+				if (access(optarg, W_OK | X_OK) != 0)
+					fatal("-W \"%s\" not writable: %s",
+					    optarg, strerror(errno));
+			}
+			worker_log_dir = optarg;
 			break;
 		case 'X':
 			/* Please keep in sync with scp.c -X */
@@ -2746,7 +3261,171 @@ main(int argc, char **argv)
 			fprintf(stderr, "Attached to %s.\n", sftp_direct);
 	}
 
+	/*
+	 * Start the parallel-streams orchestrator only when the user
+	 * explicitly opted in via -j N.  Without -j, hpnsftp behaves as a
+	 * plain single-stream client (no orchestrator, no autotuning) so
+	 * default behaviour is identical to upstream sftp.  -j N opts into
+	 * the adaptive scaler, treating N as the starting point.
+	 *
+	 * The master and workers honor the same -i / -F / -o options the
+	 * user gave the main connection (captured during getopt above).
+	 */
+	if (parallel_user_opt_in && sftp_direct == NULL) {
+		struct sftp_parallel_config pcfg;
+		char portbuf[16] = "";
+		memset(&pcfg, 0, sizeof(pcfg));
+		pcfg.num_streams      = parallel_num_streams;
+		pcfg.host             = host;
+		pcfg.user             = user;
+		if (port > 0) {
+			snprintf(portbuf, sizeof(portbuf), "%d", port);
+			pcfg.port = portbuf;
+		}
+		pcfg.ssh_binary       = ssh_program;
+		pcfg.identity         = parallel_identity;
+		pcfg.config_file      = parallel_config_file;
+		pcfg.extra_argv       = parallel_extra_o;
+		pcfg.transfer_buflen  = (unsigned int)copy_buffer_len;
+		pcfg.num_requests     = (unsigned int)num_requests;
+		pcfg.limit_kbps       = limit_kbps;
+		pcfg.range_split_min_mb = range_split_min_mb_user;
+		pcfg.worker_log_dir     = worker_log_dir;
+		pcfg.verbose_level      = debug_level;
+		/* Resolve HPNUseBundle and any other ssh_config-derived
+		 * pcfg fields.  Sets pcfg.use_bundle; defaults to 1 (yes)
+		 * if parsing fails or the option isn't set. */
+		(void)sftp_parallel_apply_ssh_config(&pcfg, host,
+		    parallel_config_file);
+		pcfg.preserve_flag    = global_pflag;
+		pcfg.fsync_flag       = global_fflag;
+		pcfg.print_flag       = quiet ? 0 : 1;
+
+		/*
+		 * Adaptive throughput-outlier stall detection.  On by default
+		 * in parallel mode with conservative settings suited to WAN
+		 * bulk transfer.  Override or disable via env vars:
+		 *
+		 *   SFTP_TPUT_HEALTHY_KBPS=N  override minimum path rate (kbps)
+		 *                             that must be seen before outlier
+		 *                             classification fires; set to 0 to
+		 *                             disable the feature entirely
+		 *   SFTP_TPUT_FRACTION=F      worker is outlier if its kbps
+		 *                             is less than F * max_kbps
+		 *                             (default 0.25)
+		 *   SFTP_TPUT_CONSEC=N        consecutive outlier ticks before
+		 *                             STALLED (default 5); DEAD at 2N
+		 *   SFTP_TPUT_EMA_ALPHA=F     EMA smoothing factor (default 0.2)
+		 */
+		{
+			/* ENV-VAR SFTP_TPUT_HEALTHY_KBPS — developer-only:
+			 * adaptive stall detector path-health floor (kbps).
+			 * Tuning knob for the throughput-outlier detector; not
+			 * meaningful to end users. */
+			const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
+			/* ENV-VAR SFTP_TPUT_FRACTION — developer-only:
+			 * adaptive stall detector outlier fraction (0–1). */
+			const char *e_f = getenv("SFTP_TPUT_FRACTION");
+			/* ENV-VAR SFTP_TPUT_CONSEC — developer-only:
+			 * adaptive stall detector consecutive-tick count. */
+			const char *e_c = getenv("SFTP_TPUT_CONSEC");
+			/* ENV-VAR SFTP_TPUT_EMA_ALPHA — developer-only:
+			 * adaptive stall detector EMA smoothing factor. */
+			const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
+			pcfg.tput_path_healthy_kbps =
+			    (e_h && *e_h) ? strtoull(e_h, NULL, 10) : 2000;
+			pcfg.tput_outlier_fraction =
+			    (e_f && *e_f) ? strtod(e_f, NULL) : 0.25;
+			pcfg.tput_consec_required =
+			    (e_c && *e_c) ? atoi(e_c) : 5;
+			pcfg.tput_ema_alpha =
+			    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
+		}
+
+		if (!quiet)
+			logit("Parallel streams: -j %d",
+			    parallel_num_streams);
+		/* Mirror to debug for batch-mode runs (quiet=1). */
+		debug_f("parallel mode: -j %d defer_parallel_wait=%d",
+		    parallel_num_streams, defer_parallel_wait);
+		if (pcfg.tput_path_healthy_kbps > 0) {
+			double eff_alpha = pcfg.tput_ema_alpha > 0.0
+			    ? pcfg.tput_ema_alpha : 0.2;
+			debug_f("tput-outlier detection: healthy_kbps=%llu "
+			    "frac=%.2f consec=%d ema_alpha=%.2f",
+			    (unsigned long long)pcfg.tput_path_healthy_kbps,
+			    pcfg.tput_outlier_fraction,
+			    pcfg.tput_consec_required,
+			    eff_alpha);
+		}
+		parallel_orch = sftp_parallel_start(&pcfg);
+		if (parallel_orch == NULL) {
+			logit("Parallel-streams setup failed; "
+			    "falling back to single-stream mode.");
+			parallel_num_streams = 1;
+		} else {
+			sftp_parallel_set_interrupt_flag(parallel_orch,
+			    &interrupted);
+
+			/*
+			 * Sample app-layer path RTT on the control connection.
+			 * sftp_realpath does one SSH2_FXP_REALPATH round trip,
+			 * which is the cheapest small request available after
+			 * do_init has run.  Median of a few samples filters
+			 * jitter from a single noisy round-trip without paying
+			 * many extra RTTs at startup.  Passed to the orchestrator
+			 * so the reporter can size its outlier-warmup correctly
+			 * (see RAMP_RTTS in sftp-parallel.c).
+			 */
+			{
+				uint64_t samples[3] = {0, 0, 0};
+				int got = 0;
+				for (int i = 0; i < 3; i++) {
+					double t0 = monotime_double();
+					char *r = sftp_realpath(conn, ".");
+					double t1 = monotime_double();
+					if (r == NULL)
+						break;
+					free(r);
+					samples[got++] = (uint64_t)
+					    ((t1 - t0) * 1e6);
+				}
+				if (got > 0) {
+					/* Simple insertion sort + median. */
+					for (int i = 1; i < got; i++) {
+						uint64_t v = samples[i];
+						int j = i - 1;
+						while (j >= 0 &&
+						    samples[j] > v) {
+							samples[j+1] =
+							    samples[j];
+							j--;
+						}
+						samples[j+1] = v;
+					}
+					uint64_t rtt_us = samples[got / 2];
+					sftp_parallel_set_path_rtt(
+					    parallel_orch, rtt_us);
+					debug_f("control-path RTT: "
+					    "%llu us (median of %d samples)",
+					    (unsigned long long)rtt_us, got);
+				}
+			}
+		}
+	}
+
 	err = interactive_loop(conn, file1, file2);
+
+	if (parallel_orch != NULL) {
+		sftp_parallel_stop(parallel_orch);
+		parallel_orch = NULL;
+	}
+	if (parallel_extra_o != NULL) {
+		for (size_t pi = 0; pi < parallel_extra_o_count; pi++)
+			free(parallel_extra_o[pi]);
+		free(parallel_extra_o);
+		parallel_extra_o = NULL;
+	}
 
 #if !defined(USE_PIPES)
 	shutdown(in, SHUT_RDWR);

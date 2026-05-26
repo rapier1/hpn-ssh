@@ -1486,7 +1486,7 @@ process_lock_agent(SocketEntry *e, int lock)
 			delay = 100000 * fail_count;
 			debug("unlock failed, delaying %0.1lf seconds",
 			    (double)delay/1000000);
-			usleep(delay);
+			// // // // // // // // // // // usleep(delay);
 		}
 		explicit_bzero(passwdhash, sizeof(passwdhash));
 	} else if (!locked && lock) {

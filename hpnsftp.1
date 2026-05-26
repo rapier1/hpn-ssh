@@ -38,12 +38,15 @@
 .Op Fl F Ar ssh_config
 .Op Fl i Ar identity_file
 .Op Fl J Ar destination
+.Op Fl j Ar parallel_streams
 .Op Fl l Ar limit
+.Op Fl M Ar range_split_min_mb
 .Op Fl o Ar ssh_option
 .Op Fl P Ar port
 .Op Fl R Ar num_requests
 .Op Fl S Ar program
 .Op Fl s Ar subsystem | sftp_server
+.Op Fl W Ar worker_log_dir
 .Op Fl X Ar sftp_option
 .Ar destination
 .Sh DESCRIPTION
@@ -206,8 +209,59 @@ This is a shortcut to specify a
 configuration directive.
 This option is directly passed to
 .Xr hpnssh 1 .
+.It Fl j Ar parallel_streams
+Enables the parallel-streams orchestrator and sets the number of
+concurrent worker SSH sessions used to transfer files.
+Each worker establishes its own SSH connection to the destination and
+operates a private SFTP session; the orchestrator distributes work
+units (whole files, small-file bundles, or byte-range chunks of large
+files) across them.
+Must be between 1 and 24; values outside this range are clamped at
+parse time.
+.Pp
+There is no universally-correct setting.
+More streams is not always faster:
+once the path or server reaches saturation, additional workers compete
+for the same bottleneck, individual workers fall below the
+fastest-peer throughput threshold, and the orchestrator's
+outlier-detection machinery reaps and respawns them.
+The end-of-transfer summary line includes the worker-respawn count;
+when that count climbs above roughly 25 % of
+.Fl j ,
+the transfer has crossed the knee of the throughput curve and a
+lower
+.Fl j
+will usually give equivalent or better aggregate throughput with less
+churn.
+.Pp
+Typical starting points are
+.Fl j Ar 4
+on commodity LAN paths and
+.Fl j Ar 8
+on high-bandwidth/high-RTT WAN paths to striped parallel filesystems
+(Lustre, GPFS); tune from there using the respawn-count signal.
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
+.It Fl M Ar range_split_min_mb
+Set the minimum file size (in MiB) at which an individual file will be
+split into byte ranges across parallel workers.
+Files at or below this size are uploaded as a single whole-file work unit
+by one worker; files larger than this are split into byte ranges so that
+multiple workers cooperate on the same file.
+Must be in the range
+.Bq 64, 10240
+MiB.
+The default is 2048 MiB (2 GiB), empirically chosen to minimise both wall
+time and run-to-run variance across the tested Lustre and ext4 destinations.
+Lowering this value increases per-file parallelism at the cost of additional
+open/close round-trips per chunk; raising it favours whole-file uploads,
+which trade per-file parallelism for fewer round-trips and lower
+filesystem-side commit serialization.
+This flag only takes effect together with
+.Fl j .
+Without
+.Fl j
+the parallel-streams orchestrator is not engaged and the option is a no-op.
 .It Fl N
 Disables quiet mode, e.g. to override the implicit quiet mode set by the
 .Fl b
@@ -365,6 +419,38 @@ does not have an sftp subsystem configured.
 .It Fl v
 Raise logging level.
 This option is also passed to hpnssh.
+.It Fl W Ar worker_log_dir
+Diagnostic aid for parallel mode
+.Pq Fl j .
+When supplied, each parallel worker writes its underlying
+.Xr hpnssh 1
+child's standard error stream to
+.Pa <worker_log_dir>/hpnssh-worker-<pid>.stderr
+so a clear per-worker log is available when reporting failures
+or when developers ask the user to capture worker output.
+.Pp
+.Ar worker_log_dir
+must already exist and be writable;
+.Nm
+exits with a fatal error otherwise.
+A common choice is
+.Pa /tmp ,
+but any directory the user can write to (for example
+.Pa $HOME/hpnssh-logs )
+is acceptable.
+.Pp
+When
+.Fl W
+is not supplied, worker
+.Xr hpnssh 1
+stderr is inherited from
+.Nm ,
+so connection errors, host-key warnings, and server banners
+appear directly on the user's terminal.
+This is the default and intended behaviour in normal operation; the
+.Fl W
+log directory is only useful when capturing logs for a developer to
+inspect.
 .It Fl X Ar sftp_option
 Specify an option that controls aspects of SFTP protocol behaviour.
 The valid options are:

@@ -30,9 +30,11 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
+#include "uthash.h"
 
 int sftp_glob(struct sftp_conn *, const char *, int,
     int (*)(const char *, int), glob_t *);
+int sftp_glob_get_attrib(const char *path, Attrib *out);
 
 struct SFTP_OPENDIR {
 	SFTP_DIRENT **dir;
@@ -42,6 +44,70 @@ struct SFTP_OPENDIR {
 static struct {
 	struct sftp_conn *conn;
 } cur;
+
+/*
+ * Attribute cache populated as a side effect of fudge_stat/fudge_lstat during
+ * glob(3) expansion.  Lets callers (process_get in sftp.c) recover the file
+ * size and mode that glob already paid an RTT to fetch, instead of issuing a
+ * fresh stat per glob match.  Cleared at the start of every sftp_glob() call.
+ *
+ * Hard-capped at GLOB_ATTRIB_CACHE_MAX entries to bound memory under unusually
+ * large globs; lookups past the cap simply miss and the caller falls back to
+ * an explicit sftp_stat.  ~200 B/entry including string + uthash overhead, so
+ * 262144 = ~50 MB worst case — comfortably above any realistic HPC glob.
+ */
+struct glob_attrib_entry {
+	char *path;	/* hash key (xstrdup'd) */
+	Attrib attrib;
+	UT_hash_handle hh;
+};
+#define GLOB_ATTRIB_CACHE_MAX 262144
+static struct glob_attrib_entry *attrib_cache;
+static size_t attrib_cache_count;
+
+static void
+attrib_cache_clear(void)
+{
+	struct glob_attrib_entry *e, *tmp;
+
+	HASH_ITER(hh, attrib_cache, e, tmp) {
+		HASH_DEL(attrib_cache, e);
+		free(e->path);
+		free(e);
+	}
+	attrib_cache_count = 0;
+}
+
+static void
+attrib_cache_record(const char *path, const Attrib *a)
+{
+	struct glob_attrib_entry *e;
+
+	if (attrib_cache_count >= GLOB_ATTRIB_CACHE_MAX)
+		return;
+	HASH_FIND_STR(attrib_cache, path, e);
+	if (e != NULL) {
+		e->attrib = *a;
+		return;
+	}
+	e = xcalloc(1, sizeof(*e));
+	e->path = xstrdup(path);
+	e->attrib = *a;
+	HASH_ADD_KEYPTR(hh, attrib_cache, e->path, strlen(e->path), e);
+	attrib_cache_count++;
+}
+
+int
+sftp_glob_get_attrib(const char *path, Attrib *out)
+{
+	struct glob_attrib_entry *e;
+
+	HASH_FIND_STR(attrib_cache, path, e);
+	if (e == NULL)
+		return -1;
+	*out = e->attrib;
+	return 0;
+}
 
 static void *
 fudge_opendir(const char *path)
@@ -114,6 +180,7 @@ fudge_lstat(const char *path, struct stat *st)
 	if (sftp_lstat(cur.conn, path, 1, &a) != 0)
 		return -1;
 
+	attrib_cache_record(path, &a);
 	attrib_to_stat(&a, st);
 
 	return 0;
@@ -127,6 +194,7 @@ fudge_stat(const char *path, struct stat *st)
 	if (sftp_stat(cur.conn, path, 1, &a) != 0)
 		return -1;
 
+	attrib_cache_record(path, &a);
 	attrib_to_stat(&a, st);
 
 	return(0);
@@ -147,6 +215,7 @@ sftp_glob(struct sftp_conn *conn, const char *pattern, int flags,
 	pglob->gl_lstat = fudge_lstat;
 	pglob->gl_stat = fudge_stat;
 
+	attrib_cache_clear();
 	memset(&cur, 0, sizeof(cur));
 	cur.conn = conn;
 

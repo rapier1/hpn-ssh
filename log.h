@@ -72,6 +72,11 @@ void	 sshlog(const char *, const char *, int, int,
     __attribute__((format(printf, 7, 8)));
 void	 sshlogv(const char *, const char *, int, int,
     LogLevel, const char *, const char *, va_list);
+void	 sshlog_ts(const char *, const char *, int, int,
+    LogLevel, const char *, const char *, ...)
+    __attribute__((format(printf, 7, 8)));
+void	 sshlogv_ts(const char *, const char *, int, int,
+    LogLevel, const char *, const char *, va_list);
 void	 sshlogdie(const char *, const char *, int, int,
     LogLevel, const char *, const char *, ...) __attribute__((noreturn))
     __attribute__((format(printf, 7, 8)));
@@ -126,6 +131,14 @@ int log_ratelimit(struct log_ratelimit_ctx *rl, time_t now, int *active,
 #define fatal_f(...)		sshfatal(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_FATAL, NULL, __VA_ARGS__)
 #define logdie_f(...)		sshlogdie(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_ERROR, NULL, __VA_ARGS__)
 
+/* Variants that prepend the caller's function name and a wall-clock timestamp [HH:MM:SS.mmm] */
+#define debug3_ft(...)		sshlog_ts(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_DEBUG3, NULL, __VA_ARGS__)
+#define debug2_ft(...)		sshlog_ts(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_DEBUG2, NULL, __VA_ARGS__)
+#define debug_ft(...)		sshlog_ts(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_DEBUG1, NULL, __VA_ARGS__)
+#define verbose_ft(...)		sshlog_ts(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_VERBOSE, NULL, __VA_ARGS__)
+#define logit_ft(...)		sshlog_ts(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_INFO, NULL, __VA_ARGS__)
+#define error_ft(...)		sshlog_ts(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_ERROR, NULL, __VA_ARGS__)
+
 /* Variants that appends a ssh_err message */
 #define do_log2_r(r, level, ...) sshlog(__FILE__, __func__, __LINE__, 0, level, ssh_err(r), __VA_ARGS__)
 #define debug3_r(r, ...)	sshlog(__FILE__, __func__, __LINE__, 0, SYSLOG_LEVEL_DEBUG3, ssh_err(r), __VA_ARGS__)
@@ -145,5 +158,22 @@ int log_ratelimit(struct log_ratelimit_ctx *rl, time_t now, int *active,
 #define error_fr(r, ...)	sshlog(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_ERROR, ssh_err(r), __VA_ARGS__)
 #define fatal_fr(r, ...)	sshfatal(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_FATAL, ssh_err(r), __VA_ARGS__)
 #define logdie_fr(r, ...)	sshlogdie(__FILE__, __func__, __LINE__, 1, SYSLOG_LEVEL_ERROR, ssh_err(r), __VA_ARGS__)
+
+/*
+ * HPN: per-thread snapshot of the most recent ERROR-level log message.
+ * Populated automatically inside do_log().  Returns "" when nothing has
+ * been logged on this thread (or after hpn_clear_last_error).
+ *
+ * Lets structured callers (e.g. the parallel-streams failed-paths
+ * summary in sftp-parallel.c) attach the cause string to a higher-
+ * level event without plumbing error returns through every API in
+ * sftp-client.c.
+ *
+ * hpn_log_capture_error is the do_log hook; not intended for direct
+ * use by callers.
+ */
+void        hpn_log_capture_error(const char *msg);
+const char *hpn_get_last_error(void);
+void        hpn_clear_last_error(void);
 
 #endif
