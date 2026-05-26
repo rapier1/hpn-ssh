@@ -27,6 +27,11 @@ LTESTS= 	connect \
 		connect-mptcp \
 		connect-happy-eyeballs \
 		connect-memlimit \
+		connect-fallback \
+		connect-metrics \
+		connect-none-cipher \
+		connect-tcprcvbufpoll \
+		transfer-mt-ciphers \
 		proxy-connect \
 		sshfp-connect \
 		connect-privsep \
