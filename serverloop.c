@@ -612,6 +612,7 @@ server_request_session(struct ssh *ssh)
 		c->dynamic_window = 1;
 		if (options.tcp_rcv_buf_rescue > 0)
 			c->rcvbuf_rescue = 1;
+		ssh_packet_enable_hpn_bulk(ssh);
 	}
 	if (session_open(the_authctxt, c->self) != 1) {
 		debug("session open failed, free channel %d", c->self);

@@ -60,7 +60,7 @@
  * loop and multiple calls to EVP_EncryptUpdate. Doing so
  * dramatically reduced CPU load in the threads and indicated
  * that we could also eliminate most of the threads and queues
- * as it would take far less time for a queue to ebter KQ_FULL
+ * as it would take far less time for a queue to enter KQ_FULL
  * state. As such, we've reduced the default number of threads
  * and queues from 2 and 8 (respectively) to 1 and 2. We've also
  * elimnated the need to determine the physical number of cores on
@@ -112,7 +112,6 @@ int numkq = 2;
 #define HAVE_NONE       0
 #define HAVE_KEY        1
 #define HAVE_IV         2
-int X = 0;
 
 const EVP_CIPHER *evp_aes_ctr_mt(void);
 
@@ -239,29 +238,32 @@ stop_and_join_pregen_threads(struct ssh_aes_ctr_ctx_mt *c)
 
 	/* Cancel pregen threads */
 	for (i = 0; i < cipher_threads; i++) {
-		debug ("Canceled %lu (%lu,%d)", c->tid[i], c->struct_id, c->id[i]);
+		debug_f ("Canceled %lu (%lu,%d)", c->tid[i], c->struct_id, c->id[i]);
 		pthread_cancel(c->tid[i]);
 	}
         for (i = 0; i < numkq; i++) {
-                pthread_mutex_lock(&c->q[i].lock);
-                pthread_cond_broadcast(&c->q[i].cond);
-                pthread_mutex_unlock(&c->q[i].lock);
+		pthread_mutex_lock(&c->q[i].lock);
+		pthread_cond_broadcast(&c->q[i].cond);
+		pthread_mutex_unlock(&c->q[i].lock);
         }
 	for (i = 0; i < cipher_threads; i++) {
 		if (pthread_kill(c->tid[i], 0) != 0)
-			debug3("AES-CTR MT pthread_join failure: Invalid thread id %lu in %s",
-			       c->tid[i], __FUNCTION__);
+			debug3_f("AES-CTR MT pthread_join failure: Invalid thread id %lu",
+			    c->tid[i]);
 		else {
-			debug ("Joining %lu (%lu, %d)", c->tid[i], c->struct_id, c->id[i]);
+			debug_f ("Joining %lu (%lu, %d)", c->tid[i], c->struct_id, c->id[i]);
+			pthread_join(c->tid[i], NULL);
 			pthread_mutex_destroy(&c->q[i].lock);
-                        pthread_cond_destroy(&c->q[i].cond);
-                        pthread_join(c->tid[i], NULL);
+			pthread_cond_destroy(&c->q[i].cond);
 			/* this finds the entry in the hash that corresponding to the
 			 * thread id. That's used to find the pointer to the cipher struct
 			 * created in thread_loop. */
 			struct aes_mt_ctx_ptrs *ptr;
 			HASH_FIND_INT(evp_ptrs, &c->tid[i], ptr);
-			EVP_CIPHER_CTX_free(ptr->pointer);
+			if (ptr != NULL)
+				EVP_CIPHER_CTX_free(ptr->pointer);
+			else
+				fatal_f ("Cannot find entry in hash table for thread id");
 			HASH_DEL(evp_ptrs, ptr);
 			free(ptr);              }
         }
@@ -308,7 +310,7 @@ thread_loop(void *x)
 	 * thread id, which is available to us in the free function.
 	 * Note, the thread id isn't necessary unique across rekeys but
 	 * that's okay as they are unique during a key. */
-	ptr = malloc(sizeof *ptr); /*freed in stop & prejoin */
+	ptr = xmalloc(sizeof *ptr); /*freed in stop & prejoin */
 	ptr->tid = pthread_self(); /* index for hash */
 	ptr->pointer = aesni_ctx;
 	HASH_ADD_INT(evp_ptrs, tid, ptr);
@@ -322,8 +324,7 @@ thread_loop(void *x)
 	else if (c->keylen == 192)
 		EVP_EncryptInit_ex(aesni_ctx, EVP_aes_192_ctr(), NULL, c->orig_key, NULL);
 	else {
-		logit("Invalid key length of %d in AES CTR MT. Exiting", c->keylen);
-		exit(1);
+		fatal_f("Invalid key length of %d in AES CTR MT. Exiting", c->keylen);
 	}
 
 	/*
@@ -340,7 +341,7 @@ thread_loop(void *x)
 			/* set the initial counter */
 			EVP_EncryptInit_ex(aesni_ctx, NULL, NULL, NULL, q->ctr);
 
-			/* encypher a block sized null string (mynull) with the key. This
+			/* encipher a block sized null string (mynull) with the key. This
 			 * returns the keystream because xoring the keystream
 			 * against null returns the keystream. Store that in the appropriate queue */
 			EVP_EncryptUpdate(aesni_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
@@ -397,7 +398,7 @@ thread_loop(void *x)
 		/* set the initial counter */
 		EVP_EncryptInit_ex(aesni_ctx, NULL, NULL, NULL, q->ctr);
 
-		/* see coresponding block above for useful comments */
+		/* see corresponding block above for useful comments */
 		EVP_EncryptUpdate(aesni_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
 
 		/* Re-lock, mark full and signal consumer */
@@ -456,30 +457,30 @@ ssh_aes_ctr(EVP_CIPHER_CTX *ctx, u_char *dest, const u_char *src,
 		align = destp.u | srcp.u | bufp.u;
 #endif
 
-		/* xor the src against the key (buf)
-		 * different systems can do all 16 bytes at once or
-		 * may need to do it in 8 or 4 bytes chunks
-		 * worst case is doing it as a loop */
+		/* XOR src against keystream (buf). Use memcpy to
+		 * avoid strict aliasing UB when type-punning through
+		 * wider integer types. The compiler optimizes these
+		 * fixed-size memcpys into register loads. */
 #ifdef CIPHER_INT128_OK
-		/* with GCC 13 we have having consistent seg faults
-		 * in this section of code. Since this is a critical
-		 * code path we are removing this until we have a solution
-		 * in place -cjr 02/22/24
-		 * TODO: FIX THIS
-		 */
-		/* if ((align & 0xf) == 0) { */
-		/* 	destp.u128[0] = srcp.u128[0] ^ bufp.u128[0]; */
-		/* } else */
+		if ((align & 0xf) == 0) {
+			__uint128_t s128, k128, d128;
+			memcpy(&s128, srcp.u8, sizeof(s128));
+			memcpy(&k128, bufp.u8, sizeof(k128));
+			d128 = s128 ^ k128;
+			memcpy(destp.u8, &d128, sizeof(d128));
+		} else
 #endif
-		/* this is causing undefined behaviour in sanitizers
-		 * this is annoying because it's more efficient
-		 * but UB is not something I want to retain */
-		/* 64 bits */
-		/* if ((align & 0x7) == 0) { */
-		/* 	destp.u64[0] = srcp.u64[0] ^ bufp.u64[0]; */
-		/* 	destp.u64[1] = srcp.u64[1] ^ bufp.u64[1]; */
-		/* /\* 32 bits *\/ */
-		/* } else */
+		if ((align & 0x7) == 0) {
+			uint64_t src_a, key_a, dst_a;
+			memcpy(&src_a, srcp.u8, sizeof(uint64_t));
+			memcpy(&key_a, bufp.u8, sizeof(uint64_t));
+			dst_a = src_a ^ key_a;
+			memcpy(destp.u8, &dst_a, sizeof(uint64_t));
+			memcpy(&src_a, srcp.u8 + 8, sizeof(uint64_t));
+			memcpy(&key_a, bufp.u8 + 8, sizeof(uint64_t));
+			dst_a = src_a ^ key_a;
+			memcpy(destp.u8 + 8, &dst_a, sizeof(uint64_t));
+		} else
 		if ((align & 0x3) == 0) {
 			destp.u32[0] = srcp.u32[0] ^ bufp.u32[0];
 			destp.u32[1] = srcp.u32[1] ^ bufp.u32[1];
@@ -546,7 +547,7 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 	if (numkq > MAX_NUMKQ)
 		numkq = MAX_NUMKQ;
 
-	debug("Starting %d threads and %d queues\n", cipher_threads, numkq);
+	debug_f("Starting %d threads and %d queues\n", cipher_threads, numkq);
 
 	/* set up the initial state of c (our cipher stream struct) */
  	if ((c = EVP_CIPHER_CTX_get_app_data(ctx)) == NULL) {
@@ -627,17 +628,18 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 		for (i = 0; i < cipher_threads; i++) {
 			pthread_rwlock_wrlock(&c->tid_lock);
 			if (pthread_create(&c->tid[i], &attr, thread_loop, c) != 0)
-				fatal ("AES-CTR MT Could not create thread in %s", __FUNCTION__);
+				fatal_f ("AES-CTR MT Could not create thread");
                                 /*should die here */
 			else {
 				c->id[i] = i;
-				debug ("AES-CTR MT spawned a thread with id %lu in %s (%lu, %d)",
-				       c->tid[i], __FUNCTION__, c->struct_id, c->id[i]);
+				debug_f ("AES-CTR MT spawned a thread with id %lu (%lu, %d)",
+				       c->tid[i], c->struct_id, c->id[i]);
 			}
 			pthread_rwlock_unlock(&c->tid_lock);
 		}
+		pthread_attr_destroy(&attr);
 		pthread_mutex_lock(&c->q[0].lock);
-		// wait for all of the threads to be initialized
+		/* wait for all of the threads to be initialized */
 		while (c->q[0].qstate == KQINIT)
 			pthread_cond_wait(&c->q[0].cond, &c->q[0].lock);
 		pthread_mutex_unlock(&c->q[0].lock);
@@ -665,6 +667,8 @@ const EVP_CIPHER *
 evp_aes_ctr_mt(void)
 {
 	static EVP_CIPHER *aes_ctr;
+	if (aes_ctr != NULL)
+		return aes_ctr;
 	aes_ctr = EVP_CIPHER_meth_new(NID_undef, 16/*block*/, 16/*key*/);
 	EVP_CIPHER_meth_set_iv_length(aes_ctr, AES_BLOCK_SIZE);
 	EVP_CIPHER_meth_set_init(aes_ctr, ssh_aes_ctr_init);

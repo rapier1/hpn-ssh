@@ -3299,21 +3299,37 @@ channel_output_poll_input_open(struct ssh *ssh, Channel *c)
 		return 1;
 	}
 
-	/* Enqueue packet for buffered data. */
+	/* Enqueue packets for buffered data.  Loop to drain as much as
+	 * the remote window and output buffer backpressure allow. */
 	if (len > c->remote_window)
 		len = c->remote_window;
 	if (len > c->remote_maxpacket)
 		len = c->remote_maxpacket;
 	if (len == 0)
 		return 0;
-	if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_DATA)) != 0 ||
-	    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
-	    (r = sshpkt_put_string(ssh, sshbuf_ptr(c->input), len)) != 0 ||
-	    (r = sshpkt_send(ssh)) != 0)
-		fatal_fr(r, "channel %i: send data", c->self);
-	if ((r = sshbuf_consume(c->input, len)) != 0)
-		fatal_fr(r, "channel %i: consume", c->self);
-	c->remote_window -= len;
+
+	size_t limit = ssh_packet_bulk_write_limit(ssh);
+
+	do {
+		if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_DATA)) != 0 ||
+		    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
+		    (r = sshpkt_put_string(ssh,
+		    sshbuf_ptr(c->input), len)) != 0 ||
+		    (r = sshpkt_send(ssh)) != 0)
+			fatal_fr(r, "channel %i: send data", c->self);
+		if ((r = sshbuf_consume(c->input, len)) != 0)
+			fatal_fr(r, "channel %i: consume", c->self);
+		c->remote_window -= len;
+
+		len = sshbuf_len(c->input);
+		if (len == 0)
+			break;
+		if (len > c->remote_window)
+			len = c->remote_window;
+		if (len > c->remote_maxpacket)
+			len = c->remote_maxpacket;
+	} while (len > 0 && sshbuf_len(ssh_packet_get_output(ssh)) < limit);
+
 	return 1;
 }
 

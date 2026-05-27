@@ -495,9 +495,6 @@ main(int argc, char **argv)
 
 	msetlocale();
 
-	/* for use with rand function when resume option is used*/
-	srand(time(NULL));
-
 	/* Copy argv, because we modify it */
 	argv0 = argv[0];
 	newargv = xcalloc(MAXIMUM(argc + 1, 1), sizeof(*newargv));
@@ -2310,9 +2307,16 @@ sink(int argc, char **argv, const char *src)
 				resume_flag = 1;
 				np_tmp = xstrdup(np);
 				/* We should have a random component to avoid clobbering a
-				 * local file */
+				 * local file. Make sure it doesn't already exist and, if it does,
+				 * try again. Very unlikely for it to already exist though. */
 				rand_str(rand_string, 8);
 				strcat(np, rand_string);
+				while (stat(np, &stb) == 0) {
+					/* file exists, try a new suffix */
+					np[strlen(np) - 8] = '\0';  /* strip old suffix */
+					rand_str(rand_string, 8);
+					strcat(np, rand_string);
+				}
 #ifdef DEBUG
 				fprintf(stderr, "%s: Will concat %s to %s after xfer\n",
 					hostname, np, np_tmp);
@@ -2879,8 +2883,7 @@ void rand_str(char *dest, size_t length) {
 		"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 	while (length-- > 0) {
-		size_t index = (double) rand() / RAND_MAX * (sizeof charset - 1);
-		*dest++ = charset[index];
+		*dest++ = charset[arc4random_uniform(sizeof(charset) - 1)];
 	}
 	*dest = '\0';
 }

@@ -71,7 +71,6 @@ struct sshcipher_ctx {
 	int	plaintext;
 	int	encrypt;
 	EVP_CIPHER_CTX *evp;
-	const EVP_CIPHER *meth_ptr; /*used to free memory in aes_ctr_mt */
 	struct chachapoly_ctx *cp_ctx;
 #ifdef WITH_OPENSSL
 	struct chachapoly_ctx_mt *cp_ctx_mt;
@@ -324,7 +323,6 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 
 	cc->plaintext = (cipher->flags & CFLAG_NONE) != 0;
 	cc->encrypt = do_encrypt;
-	cc->meth_ptr = NULL;
 
 	if (keylen < cipher->key_len ||
 	    (iv != NULL && ivlen < cipher_ivlen(cipher))) {
@@ -375,44 +373,46 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 	 * _meth_new process found in cipher-ctr-mt.c */
 	if (strstr(cc->cipher->name, "ctr") && enable_threads) {
 #ifdef WITH_OPENSSL3
-		/* this version of openssl uses providers */
-		OSSL_LIB_CTX *aes_lib = NULL; /* probably not needed */
-		OSSL_PROVIDER *aes_mt_provider = NULL;
+		/* this version of openssl uses providers.
+		 * Cache the provider and cipher objects as singletons
+		 * so we don't leak on rekey. */
+		static OSSL_LIB_CTX *aes_lib = NULL;
+		static OSSL_PROVIDER *aes_mt_provider = NULL;
+		static EVP_CIPHER *aes_ctr_mt_128 = NULL;
+		static EVP_CIPHER *aes_ctr_mt_192 = NULL;
+		static EVP_CIPHER *aes_ctr_mt_256 = NULL;
 		type = NULL;
 
-		if (OSSL_PROVIDER_add_builtin(aes_lib, "hpnssh",
-					      OSSL_provider_init) != 1) {
-			fatal("Failed to add HPNSSH provider for AES-CTR");
-		}
-		aes_mt_provider = OSSL_PROVIDER_load(aes_lib, "hpnssh");
-
-		if (aes_mt_provider != NULL) {
-			/* use the previous key length to determine which cipher to load */
-			if (cipher->key_len == 32)
-				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_256", NULL);
-			if (cipher->key_len == 24)
-				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_192", NULL);
-			if (cipher->key_len == 16)
-				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_128", NULL);
-			if (type == NULL) {
-				ERR_print_errors_fp(stderr);
-				fatal("FAILED TO LOAD aes_ctr_mt");
-			} else {
-				debug("LOADED aes_ctr_mt");
+		if (aes_mt_provider == NULL) {
+			if (OSSL_PROVIDER_add_builtin(aes_lib, "hpnssh",
+						      OSSL_provider_init) != 1) {
+				fatal("Failed to add HPNSSH provider for AES-CTR");
 			}
+			aes_mt_provider = OSSL_PROVIDER_load(aes_lib, "hpnssh");
+			if (aes_mt_provider == NULL) {
+				ERR_print_errors_fp(stderr);
+				fatal("Failed to load HPN-SSH AES-CTR-MT provider.");
+			}
+			aes_ctr_mt_128 = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_128", NULL);
+			aes_ctr_mt_192 = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_192", NULL);
+			aes_ctr_mt_256 = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_256", NULL);
 		}
-		else {
+
+		if (cipher->key_len == 32)
+			type = aes_ctr_mt_256;
+		else if (cipher->key_len == 24)
+			type = aes_ctr_mt_192;
+		else if (cipher->key_len == 16)
+			type = aes_ctr_mt_128;
+
+		if (type == NULL) {
 			ERR_print_errors_fp(stderr);
-			fatal("Failed to load HPN-SSH AES-CTR-MT provider.");
+			fatal("FAILED TO LOAD aes_ctr_mt");
+		} else {
+			debug("LOADED aes_ctr_mt");
 		}
 #else
 		type = (*evp_aes_ctr_mt)(); /* see cipher-ctr-mt.c */
-		/* we need to free this later if using aes_ctr_mt
-		 * under OSSL 1.1. Honestly, we could avoid this by making
-		 * it a global in cipher-ctr_mt.c and exporting it here
-		 * then we'd only have to call EVP_CIPHER_meth once but this
-		 * works for now. TODO: This. cjr 02.22.2023 */
-		cc->meth_ptr = type;
 #endif /* WITH_OPENSSL3 */
 	} /* if (strstr()) */
 	if (EVP_CipherInit(cc->evp, type, NULL, (u_char *)iv,
@@ -576,18 +576,8 @@ cipher_free(struct sshcipher_ctx *cc)
 #ifdef WITH_OPENSSL
 	EVP_CIPHER_CTX_free(cc->evp);
 	cc->evp = NULL;
-	/* if meth_ptr isn't null then we are using the aes_ctr_mt
-	 * evp_cipher_meth_new() in cipher-ctr-mt.c under OSSL 1.1
-	 * if we don't explicitly free it then, even though we free
-	 * the ctx it is a part of it doesn't get freed. So...
-	 * cjr 2/7/2023
-	 */
-#if !defined(WITH_OPENSSL3)
-	if (cc->meth_ptr != NULL) {
-		EVP_CIPHER_meth_free((void *)(EVP_CIPHER *)cc->meth_ptr);
-		cc->meth_ptr = NULL;
-	}
-#endif
+	/* aes_ctr_mt EVP_CIPHER is a singleton in cipher-ctr-mt.c,
+	 * no per-connection free needed. */
 #endif
 	freezero(cc, sizeof(*cc));
 }

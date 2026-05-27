@@ -75,7 +75,6 @@ u_int	 cipher_seclen(const struct sshcipher *);
 u_int	 cipher_authlen(const struct sshcipher *);
 u_int	 cipher_ivlen(const struct sshcipher *);
 u_int	 cipher_is_cbc(const struct sshcipher *);
-void	 cipher_reset_multithreaded(void);
 const char *cipher_ctx_name(const struct sshcipher_ctx *);
 
 u_int	 cipher_ctx_is_plaintext(struct sshcipher_ctx *);
