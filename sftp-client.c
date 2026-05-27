@@ -3168,9 +3168,16 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	for (;;) {
 		int len = 0;
 		size_t outstanding = id - ackid + 1;
+		u_int rdcap;
+
+		/* HPN adaptive read-ahead: cap in-flight writes at the
+		 * controller's depth (num_requests when disabled). */
+		rdcap = sftp_hpn_rdahead_depth(conn->hpn);
+		if (rdcap == 0)
+			rdcap = conn->num_requests;
 
 		/* Send new requests while there is data and pipeline capacity. */
-		while (bytes_left > 0 && outstanding < conn->num_requests &&
+		while (bytes_left > 0 && outstanding < rdcap &&
 		    status == SSH2_FX_OK) {
 			size_t want = conn->upload_buflen;
 			if ((off_t)want > bytes_left)
@@ -3234,14 +3241,17 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			error("write remote \"%s\" at offset %llu: %s",
 			    remote_path, (unsigned long long)ack->offset,
 			    fx2txt(status));
-		} else if (conn->hpn->live_counter != NULL) {
-			/* Report incremental progress so the orchestrator's
-			 * bps measurement window sees a steady stream of
-			 * bytes rather than a step at range completion.
-			 * Without this the scaler reads bps=0 mid-range and
-			 * misfires the saturation signal. */
-			__atomic_fetch_add(conn->hpn->live_counter,
-			    (uint64_t)ack->len, __ATOMIC_RELAXED);
+		} else {
+			/* HPN adaptive read-ahead: feed acked bytes. */
+			sftp_hpn_rdahead_account(conn->hpn, ack->len);
+			if (conn->hpn->live_counter != NULL) {
+				/* Report incremental progress so the
+				 * orchestrator's bps window sees a steady
+				 * stream rather than a step at range
+				 * completion. */
+				__atomic_fetch_add(conn->hpn->live_counter,
+				    (uint64_t)ack->len, __ATOMIC_RELAXED);
+			}
 		}
 		TAILQ_REMOVE(&acks, ack, tq);
 		free(ack);
@@ -3272,7 +3282,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	struct request *req;
 	u_char *handle = NULL, type;
 	size_t handle_len;
-	u_int id, buflen, num_req, max_req, status = SSH2_FX_OK;
+	u_int id, buflen, num_req, max_req, adapt, status = SSH2_FX_OK;
 	uint64_t remote_offset;
 	off_t bytes_left;
 	int local_fd = -1, read_error = 0, write_error = 0, write_errno = 0;
@@ -3383,8 +3393,20 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				send_read_request(conn, req->id, req->offset,
 				    (u_int)req->len, handle, handle_len);
 			}
-			if (max_req > 0 && max_req < conn->num_requests)
-				max_req++;
+			if (max_req > 0) {
+				/*
+				 * HPN adaptive read-ahead: size the in-flight
+				 * window to the path BDP instead of ramping to
+				 * conn->num_requests.  0 => disabled, fall back
+				 * to the legacy +1 ramp.
+				 */
+				sftp_hpn_rdahead_account(conn->hpn, len);
+				adapt = sftp_hpn_rdahead_depth(conn->hpn);
+				if (adapt != 0)
+					max_req = adapt;
+				else if (max_req < conn->num_requests)
+					max_req++;
+			}
 			break;
 		}
 		default:
