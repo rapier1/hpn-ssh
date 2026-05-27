@@ -119,6 +119,12 @@ void sftp_hpn_set_live_counter(struct sftp_hpn_conn *, volatile uint64_t *);
 void     sftp_hpn_rdahead_init(struct sftp_hpn_conn *, uint32_t cap);
 void     sftp_hpn_rdahead_account(struct sftp_hpn_conn *, size_t nbytes);
 uint32_t sftp_hpn_rdahead_depth(struct sftp_hpn_conn *);
+/* Higher-level call-site helpers (collapse the repeated cap / ramp logic):
+ * _cap = depth-or-fallback for the upload outstanding-cap sites; _window =
+ * account + (adaptive depth or legacy +1 ramp) for the download ramp sites. */
+uint32_t sftp_hpn_rdahead_cap(struct sftp_hpn_conn *, uint32_t fallback);
+uint32_t sftp_hpn_rdahead_window(struct sftp_hpn_conn *, size_t nbytes,
+             uint32_t cur, uint32_t cap);
 
 /*
  * Mark a connection as dead due to a non-recoverable error, log the

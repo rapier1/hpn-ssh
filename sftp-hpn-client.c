@@ -275,6 +275,38 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
 	    rd->settled ? " (settled)" : "");
 }
 
+/*
+ * Effective in-flight request cap for the UPLOAD-style sites (do_upload_body,
+ * sftp_upload_range): the controller's current depth, or `fallback`
+ * (num_requests) when adaptation is disabled.
+ */
+uint32_t
+sftp_hpn_rdahead_cap(struct sftp_hpn_conn *hpn, uint32_t fallback)
+{
+	uint32_t d = sftp_hpn_rdahead_depth(hpn);
+
+	return d != 0 ? d : fallback;
+}
+
+/*
+ * Next read-ahead window for the DOWNLOAD-style ramp sites (sftp_download,
+ * sftp_download_range, sftp_crossload): feed `nbytes` to the controller, then
+ * return the new window — the adaptive depth, or the legacy +1 ramp
+ * (cur -> cur+1, capped at `cap`) when adaptation is disabled.
+ */
+uint32_t
+sftp_hpn_rdahead_window(struct sftp_hpn_conn *hpn, size_t nbytes,
+    uint32_t cur, uint32_t cap)
+{
+	uint32_t d;
+
+	sftp_hpn_rdahead_account(hpn, nbytes);
+	d = sftp_hpn_rdahead_depth(hpn);
+	if (d != 0)
+		return d;			/* adaptive depth */
+	return (cur < cap) ? cur + 1 : cur;	/* legacy +1 ramp (disabled) */
+}
+
 #ifdef HPN_FAULT_INJECTION
 /*
  * Called by send_msg after each successful write.  Accumulates bytes sent
