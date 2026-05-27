@@ -562,6 +562,8 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	    transfer_buflen ? transfer_buflen : DEFAULT_COPY_BUFLEN;
 	ret->num_requests =
 	    num_requests ? num_requests : DEFAULT_NUM_REQUESTS;
+	/* HPN: seed the adaptive read-ahead controller with -R as its ceiling. */
+	sftp_hpn_rdahead_init(ret->hpn, ret->num_requests);
 	ret->exts = 0;
 	ret->limit_kbps = 0;
 
@@ -1744,7 +1746,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	int local_fd = -1, write_error;
 	int read_error, write_errno, lmodified = 0, reordered = 0, r;
 	uint64_t offset = 0, size, highwater = 0, maxack = 0;
-	u_int mode, id, buflen, num_req, max_req, status = SSH2_FX_OK;
+	u_int mode, id, buflen, num_req, max_req, adapt, status = SSH2_FX_OK;
 	off_t progress_counter;
 	size_t handle_len;
 	struct stat st;
@@ -2045,8 +2047,21 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					    (unsigned long long)offset,
 					    num_req);
 					max_req = 1;
-				} else if (max_req < conn->num_requests) {
-					++max_req;
+				} else {
+					/*
+					 * HPN adaptive read-ahead: size the
+					 * in-flight window to the path BDP
+					 * instead of always ramping to
+					 * conn->num_requests.  Returns 0 when
+					 * disabled (HPN_RDAHEAD=fixed); fall
+					 * back to the legacy +1 ramp then.
+					 */
+					sftp_hpn_rdahead_account(conn->hpn, len);
+					adapt = sftp_hpn_rdahead_depth(conn->hpn);
+					if (adapt != 0)
+						max_req = adapt;
+					else if (max_req < conn->num_requests)
+						++max_req;
 				}
 			}
 			break;
@@ -2494,7 +2509,7 @@ do_upload_body(struct sftp_conn *conn,
     int preserve_flag, int fsync_flag, int inplace_flag,
     int resume, off_t resume_offset)
 {
-	u_int id, status = SSH2_FX_OK, status2, reordered = 0;
+	u_int id, status = SSH2_FX_OK, status2, reordered = 0, rdcap;
 	off_t offset, progress_counter;
 	u_char type, *data;
 	struct sshbuf *msg;
@@ -2566,8 +2581,12 @@ do_upload_body(struct sftp_conn *conn,
 			break;
 		}
 
-		if (id == startid || len == 0 ||
-		    id - ackid >= conn->num_requests) {
+		/* HPN adaptive read-ahead: cap outstanding writes at the
+		 * controller's current depth (num_requests when disabled). */
+		rdcap = sftp_hpn_rdahead_depth(conn->hpn);
+		if (rdcap == 0)
+			rdcap = conn->num_requests;
+		if (id == startid || len == 0 || id - ackid >= rdcap) {
 			u_int rid;
 
 			sshbuf_reset(msg);
@@ -2608,6 +2627,8 @@ do_upload_body(struct sftp_conn *conn,
 			if (conn->hpn->live_counter != NULL) /* HPN */
 				__atomic_fetch_add(conn->hpn->live_counter, ack->len,
 				    __ATOMIC_RELAXED);
+			/* HPN adaptive read-ahead: feed acked bytes. */
+			sftp_hpn_rdahead_account(conn->hpn, ack->len);
 			/*
 			 * Track both the highest offset acknowledged and the
 			 * highest *contiguous* offset acknowledged.

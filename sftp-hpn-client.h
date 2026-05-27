@@ -25,6 +25,39 @@
 /* #define HPN_FAULT_INJECTION */
 
 /*
+ * Adaptive SFTP read-ahead controller (HPN).
+ *
+ * The stock client keeps a fixed pipeline of num_requests (-R, default 1024)
+ * outstanding 128 KB requests — ~128 MB in flight per connection.  The
+ * receive side must buffer all of it, so on a fat pipe with N parallel
+ * workers process RSS and the kernel SO_RCVBUF balloon into the GB range,
+ * far past what throughput actually needs.
+ *
+ * This controller instead probes for the SMALLEST depth that saturates the
+ * path.  Over a sliding window of one depth's worth of completed requests it
+ * measures app-layer throughput, then multiplicatively grows the depth (x2)
+ * while throughput keeps rising (an RTT-bound ramp — growing by 1 would take
+ * thousands of RTTs to fill a fat pipe), and settles at the last depth that
+ * still gained once throughput plateaus (the BDP knee); a deeper pipe that
+ * reduces throughput (overshoot) likewise falls back to that last-good depth.
+ * -R stays a hard ceiling.  Per-connection, so each parallel worker tunes
+ * itself.  App-layer only — no TCP_INFO dependency, portable across every OS
+ * we support.
+ */
+struct sftp_rdahead {
+	uint32_t cur;         /* current target depth (requests in flight) */
+	uint32_t floor;       /* never probe below this */
+	uint32_t cap;         /* never exceed this (= num_requests / -R) */
+	uint32_t last_rising; /* largest depth that still improved throughput */
+	uint32_t win_reqs;    /* completed requests in the current window */
+	uint64_t win_bytes;   /* bytes accumulated in the current window */
+	double   win_start;   /* monotime_double() at window open */
+	double   last_rate;   /* smoothed throughput of previous window (bytes/s) */
+	int      settled;     /* 1 once the knee is found — stop probing */
+	int      enabled;     /* 0 => legacy fixed depth (HPN_RDAHEAD=fixed) */
+};
+
+/*
  * HPN per-connection state.  Embedded in struct sftp_conn as a single
  * pointer so the upstream struct definition gains exactly one line.
  */
@@ -44,6 +77,10 @@ struct sftp_hpn_conn {
 	 * Updated atomically per chunk during transfer; NULL in normal
 	 * (non-parallel) mode. */
 	volatile uint64_t *live_counter;
+
+	/* Adaptive read-ahead controller — sizes the in-flight request
+	 * window to the path BDP instead of a flat num_requests. */
+	struct sftp_rdahead rd;
 
 #ifdef HPN_FAULT_INJECTION
 	/* SFTP_FAULT_INJECT=bytes[:max_kills]   — simulates connection death.
@@ -70,6 +107,18 @@ int  sftp_hpn_is_dead(struct sftp_hpn_conn *);
 int  sftp_hpn_is_protocol_violation(struct sftp_hpn_conn *);
 void sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *);
 void sftp_hpn_set_live_counter(struct sftp_hpn_conn *, volatile uint64_t *);
+
+/*
+ * Adaptive read-ahead (HPN).  init() seeds the controller from the
+ * connection's num_requests (the -R cap); account() feeds it bytes as each
+ * request completes and re-sizes the window at window boundaries; depth()
+ * returns the current target in-flight depth, or 0 when adaptation is
+ * disabled (HPN_RDAHEAD=fixed) so the caller falls back to its fixed
+ * num_requests pipeline.
+ */
+void     sftp_hpn_rdahead_init(struct sftp_hpn_conn *, uint32_t cap);
+void     sftp_hpn_rdahead_account(struct sftp_hpn_conn *, size_t nbytes);
+uint32_t sftp_hpn_rdahead_depth(struct sftp_hpn_conn *);
 
 /*
  * Mark a connection as dead due to a non-recoverable error, log the

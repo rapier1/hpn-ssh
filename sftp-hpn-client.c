@@ -29,6 +29,7 @@
 
 #include "xmalloc.h"
 #include "log.h"
+#include "misc.h"		/* monotime_double, MINIMUM, MAXIMUM */
 #include "sftp-hpn-client.h"
 
 #ifdef HPN_FAULT_INJECTION
@@ -182,6 +183,96 @@ sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
 		    (unsigned long long)fi_pv_state.threshold);
 	}
 #endif /* HPN_FAULT_INJECTION */
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Adaptive read-ahead controller (HPN).  See sftp-hpn-client.h for rationale.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+#define RDAHEAD_FLOOR        64u    /* smallest depth we ever probe */
+#define RDAHEAD_GROW_PCT     0.15   /* >15% throughput gain => keep doubling */
+#define RDAHEAD_EWMA_ALPHA   0.6    /* weight of the newest window's rate */
+#define RDAHEAD_MIN_WIN_SEC  0.02   /* ignore windows shorter than this (noise) */
+
+void
+sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
+{
+	const char *e;
+
+	if (hpn == NULL)
+		return;
+	memset(&hpn->rd, 0, sizeof(hpn->rd));
+	hpn->rd.cap = cap ? cap : 1;
+	hpn->rd.floor = MINIMUM(RDAHEAD_FLOOR, hpn->rd.cap);
+	hpn->rd.cur = hpn->rd.floor;
+	hpn->rd.last_rising = hpn->rd.floor;
+	hpn->rd.win_start = monotime_double();
+	hpn->rd.enabled = 1;
+	/* HPN_RDAHEAD=fixed reverts to the legacy flat num_requests pipeline. */
+	if ((e = getenv("HPN_RDAHEAD")) != NULL && strcmp(e, "fixed") == 0)
+		hpn->rd.enabled = 0;
+}
+
+uint32_t
+sftp_hpn_rdahead_depth(struct sftp_hpn_conn *hpn)
+{
+	if (hpn == NULL || !hpn->rd.enabled)
+		return 0;	/* 0 => caller keeps its fixed num_requests depth */
+	return hpn->rd.cur;
+}
+
+void
+sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
+{
+	struct sftp_rdahead *rd;
+	double now, elapsed, rate, gain;
+
+	if (hpn == NULL || !hpn->rd.enabled || hpn->rd.settled)
+		return;
+	rd = &hpn->rd;
+	rd->win_bytes += nbytes;
+	if (++rd->win_reqs < rd->cur)
+		return;				/* window = one depth's worth */
+	now = monotime_double();
+	elapsed = now - rd->win_start;
+	if (elapsed < RDAHEAD_MIN_WIN_SEC)
+		return;				/* too short to measure; keep filling */
+
+	rate = (double)rd->win_bytes / elapsed;
+	if (rd->last_rate <= 0.0) {
+		/* First window: establish a baseline, then start climbing. */
+		rd->last_rate = rate;
+		rd->last_rising = rd->cur;
+		if (rd->cur < rd->cap)
+			rd->cur = MINIMUM(rd->cur * 2, rd->cap);
+		else
+			rd->settled = 1;
+	} else {
+		/* Smooth so one jittery window can't flip a decision. */
+		rate = RDAHEAD_EWMA_ALPHA * rate +
+		    (1.0 - RDAHEAD_EWMA_ALPHA) * rd->last_rate;
+		gain = (rate - rd->last_rate) / rd->last_rate;
+		if (gain > RDAHEAD_GROW_PCT) {
+			/* Still benefiting from a deeper pipe. */
+			rd->last_rising = rd->cur;
+			if (rd->cur < rd->cap)
+				rd->cur = MINIMUM(rd->cur * 2, rd->cap);
+			else
+				rd->settled = 1;	/* at the -R ceiling */
+		} else {
+			/* Plateau or overshoot: settle at the smallest depth
+			 * that reached the throughput knee. */
+			rd->cur = MAXIMUM(rd->last_rising, rd->floor);
+			rd->settled = 1;
+		}
+		rd->last_rate = rate;
+	}
+	rd->win_bytes = 0;
+	rd->win_reqs = 0;
+	rd->win_start = now;
+	debug2_f("rdahead: depth=%u cap=%u rate=%.1f MiB/s%s",
+	    rd->cur, rd->cap, rate / (1024.0 * 1024.0),
+	    rd->settled ? " (settled)" : "");
 }
 
 #ifdef HPN_FAULT_INJECTION
