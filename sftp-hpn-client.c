@@ -194,6 +194,11 @@ sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
 #define RDAHEAD_EWMA_ALPHA   0.6    /* weight of the newest window's rate */
 #define RDAHEAD_MIN_WIN_SEC  0.02   /* ignore windows shorter than this (noise) */
 
+/*
+ * Seed the controller for a new connection: cap = num_requests (the -R
+ * ceiling), floor = RDAHEAD_FLOOR clamped to cap, start probing at the floor.
+ * HPN_RDAHEAD=fixed disables adaptation (legacy flat num_requests pipeline).
+ */
 void
 sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
 {
@@ -213,6 +218,10 @@ sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
 		hpn->rd.enabled = 0;
 }
 
+/*
+ * Current target in-flight depth, or 0 when adaptation is disabled — callers
+ * treat 0 as "keep the fixed num_requests pipeline".
+ */
 uint32_t
 sftp_hpn_rdahead_depth(struct sftp_hpn_conn *hpn)
 {
@@ -221,6 +230,14 @@ sftp_hpn_rdahead_depth(struct sftp_hpn_conn *hpn)
 	return hpn->rd.cur;
 }
 
+/*
+ * Feed one completed request's bytes to the controller.  Once per window (one
+ * depth's worth of requests, and at least RDAHEAD_MIN_WIN_SEC) it measures
+ * app-layer throughput and resizes the depth: EWMA-smooth the rate, grow x2
+ * while the gain exceeds RDAHEAD_GROW_PCT, otherwise settle at the last depth
+ * that was still rising (the BDP knee) and stop probing.  No-op once settled
+ * or when disabled.
+ */
 void
 sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
 {
