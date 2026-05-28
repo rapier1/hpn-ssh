@@ -3762,32 +3762,31 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	if (p->q)
 		sftp_workqueue_shutdown(p->q);
 
-	if (p->workers) {
-		/* Iterate without holding workers_mu during pthread_join (it
-		 * would block). At this point p->stopped is set and the
-		 * queue is shut down, so no concurrent add/remove can happen
-		 * from the public API. The reporter may still be reaping
-		 * exited workers, which is why we join the reporter LATER —
-		 * after walking workers ourselves we accept that the reporter
-		 * may have removed some entries; we only join() those still
-		 * present. */
-		pthread_mutex_lock(&p->workers_mu);
-		int n = p->num_workers;
-		struct sftp_worker **snap = NULL;
-		if (n > 0) {
-			snap = xcalloc(n, sizeof(*snap));
-			memcpy(snap, p->workers, n * sizeof(*snap));
-		}
-		pthread_mutex_unlock(&p->workers_mu);
-
-		for (int i = 0; i < n; i++) {
-			if (snap[i]->started)
-				pthread_join(snap[i]->tid, NULL);
-		}
-		free(snap);
-	}
+	/*
+	 * Join the reporter BEFORE touching the workers.  Each reporter tick
+	 * reaps exited workers (pthread_join + sftp_free(w->conn) + free(w)) and
+	 * removes them from p->workers[].  If it keeps running while we walk the
+	 * workers below it can free a worker out from under us: the previous
+	 * snapshot-then-join approach copied the worker pointers, then the
+	 * reporter freed some of them concurrently, and we dereferenced
+	 * (snap[i]->started) and double-joined (pthread_join(snap[i]->tid)) the
+	 * freed structs — a use-after-free that crashes under worker death on a
+	 * lossy path.  reporter_thread breaks its loop on p->stopped (set above),
+	 * so this join returns within one tick; afterwards we own p->workers[]
+	 * exclusively and no concurrent reaping can occur.
+	 */
 	if (p->reporter_started)
 		pthread_join(p->reporter_tid, NULL);
+
+	if (p->workers) {
+		/* Reporter is gone — no concurrent reaping.  Join any worker
+		 * threads it had not already reaped. */
+		for (int i = 0; i < p->num_workers; i++) {
+			struct sftp_worker *w = p->workers[i];
+			if (w != NULL && w->started)
+				pthread_join(w->tid, NULL);
+		}
+	}
 
 	if (p->stats_csv != NULL) {
 		fclose(p->stats_csv);
