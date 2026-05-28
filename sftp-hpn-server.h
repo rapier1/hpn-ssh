@@ -24,6 +24,7 @@
 #define HPN_EXT_BUNDLE       "hpn-bundle@hpnssh.org"        /* capability advert */
 #define HPN_EXT_BUNDLE_OPEN  "hpn-bundle-open@hpnssh.org"   /* upload  bundle open  */
 #define HPN_EXT_BUNDLE_FETCH "hpn-bundle-fetch@hpnssh.org"  /* download bundle open */
+#define HPN_EXT_HASH_RANGE   "sftp-hash-range@hpnssh.org"   /* chunked-resume ranged hashing */
 
 struct sshbuf;
 

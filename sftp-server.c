@@ -121,6 +121,7 @@ static void process_extended_copy_data(uint32_t id);
 static void process_extended_home_directory(uint32_t id);
 static void process_extended_get_users_groups_by_id(uint32_t id);
 static void process_extended_hpn_check_file(uint32_t id);
+static void process_extended_sftp_hash_range(uint32_t id);
 static void process_extended_hpn_fs_info(uint32_t id);
 static void process_extended_hpn_bundle_open(uint32_t id);
 static void process_extended_hpn_bundle_cap(uint32_t id);
@@ -177,6 +178,8 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_get_users_groups_by_id, 0 },
 	{ "hpn-check-file", "hpn-check-file@hpnssh.org", 0,
 	    process_extended_hpn_check_file, 0 },
+	{ "sftp-hash-range", HPN_EXT_HASH_RANGE, 0,
+	    process_extended_sftp_hash_range, 0 },
 	{ "hpn-fs-info", HPN_EXT_FS_INFO, 0,
 	    process_extended_hpn_fs_info, 0 },
 	{ "hpn-bundle", HPN_EXT_BUNDLE, 0,
@@ -791,6 +794,7 @@ process_init(void)
 	compose_extension(msg, "home-directory", "1");
 	compose_extension(msg, "users-groups-by-id@openssh.com", "1");
 	compose_extension(msg, "hpn-check-file@hpnssh.org", "1");
+	compose_extension(msg, HPN_EXT_HASH_RANGE, "1");
 	compose_extension(msg, HPN_EXT_FS_INFO, "1");
 	compose_extension(msg, HPN_EXT_BUNDLE, "1");
 	compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
@@ -1962,6 +1966,17 @@ out:
 	if (fd != -1)
 		close(fd);
 	free(path);
+}
+
+/*
+ * sftp-hash-range@hpnssh.org dispatch wrapper.  The real implementation
+ * lives in sftp-hpn-server.c so sftp-server.c carries a minimal diff
+ * against upstream OpenSSH.
+ */
+static void
+process_extended_sftp_hash_range(uint32_t id)
+{
+	sftp_hpn_server_dispatch(id, HPN_EXT_HASH_RANGE, iqueue, oqueue);
 }
 
 static void

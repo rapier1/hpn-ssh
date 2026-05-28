@@ -137,6 +137,7 @@ struct sftp_conn {
 #define SFTP_EXT_HPN_FS_INFO		0x00000800
 #define SFTP_EXT_HPN_BUNDLE		0x00001000
 #define SFTP_EXT_HPN_BUNDLE_FETCH	0x00002000
+#define SFTP_EXT_HASH_RANGE		0x00004000
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
@@ -647,6 +648,14 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		} else if (strcmp(name, "hpn-check-file@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_HPN_CHECK_FILE;
+			known = 1;
+		} else if (strcmp(name, "sftp-hash-range@hpnssh.org") == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			/* Chunked resume: per-range XXH3 batching so a verified
+			 * resume re-transfers only mismatched chunks instead of
+			 * the whole file on size-match-hash-mismatch.  See
+			 * project-chunked-resume-plan memory. */
+			ret->exts |= SFTP_EXT_HASH_RANGE;
 			known = 1;
 		} else if (strcmp(name, "hpn-fs-info@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
@@ -1825,6 +1834,26 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				fatal("\"%s\": %s", remote_path,
 				    RESUME_INCOMPAT_MSG);
 			if ((uint64_t)st.st_size == size) {
+				/*
+				 * Chunked-resume fast path: when the server
+				 * supports sftp-hash-range@hpnssh.org, hash
+				 * per-chunk and re-fetch only mismatched chunks
+				 * instead of truncating + re-downloading the
+				 * whole file.  Declines (returns -1) on small
+				 * files, missing extension, or internal
+				 * failure; we fall through to the whole-file
+				 * gate below — same correctness, just costlier
+				 * on a size-match-hash-mismatch.
+				 */
+				int chunked =
+				    sftp_hpn_try_chunked_resume_download(
+				        conn, local_fd, local_path,
+				        remote_path, (off_t)size);
+				if (chunked >= 0) {
+					skip_ret = chunked == 1 ? 1 : 0;
+					goto resume_fail;
+				}
+
 				uint64_t local_hash, remote_hash;
 				int lret, rret;
 
@@ -2734,6 +2763,25 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			    (unsigned long long)sb.st_size);
 			if ((off_t)c.size == sb.st_size) {
 				/*
+				 * Chunked-resume fast path: when the server
+				 * supports sftp-hash-range@hpnssh.org, hash
+				 * per-chunk and re-transfer only mismatched
+				 * chunks instead of the whole file.  Declines
+				 * (returns -1) on small files, missing
+				 * extension, or any internal failure, in which
+				 * case we fall through to the whole-file gate
+				 * below — same correctness, just costlier on a
+				 * size-match-hash-mismatch.
+				 */
+				int chunked = sftp_hpn_try_chunked_resume_upload(
+				    conn, local_fd, local_path, remote_path,
+				    sb.st_size);
+				if (chunked >= 0) {
+					close(local_fd);
+					return chunked; /* 1=skip, 0=success */
+				}
+
+				/*
 				 * Option A: equal size does NOT imply equal
 				 * content.  A range-split destination is
 				 * pre-created at full size, so a crashed
@@ -3092,18 +3140,49 @@ int
 sftp_precreate(struct sftp_conn *conn, const char *remote_path, off_t size)
 {
 	u_char *handle = NULL;
-	size_t handle_len;
-	Attrib a;
-	int r;
+	u_int   handle_len_u;
+	size_t  handle_len;
+	Attrib  a;
+	int     r;
 
+	/*
+	 * Open the file empty.  We pass NULL attrs because the standard SFTP
+	 * server's process_open silently drops SSH2_FILEXFER_ATTR_SIZE on
+	 * open (it only honors permissions); relying on it there leaves the
+	 * file at logical size 0 even after this function returns.
+	 */
+	if (send_open(conn, remote_path, "precreate",
+	    SSH2_FXF_WRITE | SSH2_FXF_CREAT | SSH2_FXF_TRUNC,
+	    NULL, &handle, &handle_len) != 0)
+		return -1;
+
+	/*
+	 * Set the logical EOF to `size` via FSETSTAT.  The server's
+	 * process_fsetstat honors ATTR_SIZE via ftruncate(fd, size), which
+	 * extends the file's logical EOF to size and produces a true sparse
+	 * extent (no blocks allocated until pwrites land there).  Without
+	 * this, the file's stat-size grows only as workers extend it via
+	 * pwrite — and an interrupt before all workers finish their ranges
+	 * leaves the file at the highwater of pwrite offsets rather than at
+	 * size, which (a) breaks the documented contract of this function and
+	 * (b) prevents the size-match-content-different recovery path
+	 * (verified-resume chunked rehash) from engaging on an interrupted
+	 * range-split upload — the very state it was built to handle.
+	 *
+	 * The change is base-protocol SFTP; every compliant server supports it.
+	 * One extra round trip per precreate call; negligible vs. the parallel
+	 * range-split transfer that follows.
+	 */
+	handle_len_u = (u_int)handle_len;
 	attrib_clear(&a);
 	a.flags = SSH2_FILEXFER_ATTR_SIZE;
 	a.size  = (uint64_t)size;
+	if ((r = sftp_fsetstat(conn, handle, handle_len_u, &a)) != 0) {
+		(void)sftp_close(conn, handle, handle_len);
+		free(handle);
+		return r;
+	}
 
-	if (send_open(conn, remote_path, "precreate",
-	    SSH2_FXF_WRITE | SSH2_FXF_CREAT | SSH2_FXF_TRUNC,
-	    &a, &handle, &handle_len) != 0)
-		return -1;
 	r = sftp_close(conn, handle, handle_len);
 	free(handle);
 	return r;
@@ -3965,6 +4044,12 @@ int
 sftp_conn_has_hpn_check_file(struct sftp_conn *conn)
 {
 	return conn && (conn->exts & SFTP_EXT_HPN_CHECK_FILE) != 0;
+}
+
+int
+sftp_conn_has_hash_range(struct sftp_conn *conn)
+{
+	return conn && (conn->exts & SFTP_EXT_HASH_RANGE) != 0;
 }
 
 /* Allocate the next outbound SFTP message id for `conn`.  Internal-only

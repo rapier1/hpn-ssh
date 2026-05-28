@@ -355,6 +355,13 @@ int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
 int sftp_conn_has_hpn_check_file(struct sftp_conn *conn);
 
 /*
+ * True iff the server advertised sftp-hash-range@hpnssh.org, i.e. it can
+ * answer batched per-range XXH3 queries used by chunked resume to re-transfer
+ * only mismatched chunks instead of the whole file.
+ */
+int sftp_conn_has_hash_range(struct sftp_conn *conn);
+
+/*
  * Download-side counterpart of sftp_hpn_bundle_upload.  Asks the server to
  * pack the listed `entries[].remote_path` files into a single tar stream,
  * then untars locally into each `entries[].local_path`.  Per-entry result

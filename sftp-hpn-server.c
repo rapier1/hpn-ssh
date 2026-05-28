@@ -51,6 +51,8 @@
 #include "sftp-common.h"
 #include "sftp-hpn-bundle.h"
 #include "sftp-hpn-server.h"
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 
 /* Linux filesystem type magic numbers. */
 #ifndef EXT4_SUPER_MAGIC
@@ -180,6 +182,61 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 /* Forward decl: definition lives at the bottom of the file. */
 static void process_hpn_bundle_open(u_int id, struct sshbuf *iqueue,
     struct sshbuf *oqueue);
+
+/*
+ * Translate errno to an SFTP wire status code, mirroring the
+ * errno_to_portable() helper in sftp-server.c (which is file-local
+ * static and therefore not reachable from here).  Keep in sync if
+ * upstream extends the mapping.
+ */
+static u_int
+errno_to_sftp_status(int e)
+{
+	switch (e) {
+	case 0:
+		return SSH2_FX_OK;
+	case ENOENT:
+	case ENOTDIR:
+	case EBADF:
+	case ELOOP:
+		return SSH2_FX_NO_SUCH_FILE;
+	case EPERM:
+	case EACCES:
+	case EFAULT:
+		return SSH2_FX_PERMISSION_DENIED;
+	case ENAMETOOLONG:
+	case EINVAL:
+		return SSH2_FX_BAD_MESSAGE;
+	case ENOSYS:
+		return SSH2_FX_OP_UNSUPPORTED;
+	default:
+		return SSH2_FX_FAILURE;
+	}
+}
+
+/*
+ * Compose and enqueue an SSH2_FXP_STATUS reply with empty error message
+ * and language tag onto oqueue.  Mirrors the inline pattern used by the
+ * bundle handlers; factored out for handlers that need it more than once.
+ */
+static void
+send_status_oqueue(struct sshbuf *oqueue, u_int id, u_int status)
+{
+	struct sshbuf *msg;
+	int r;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u32(msg, status)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "")) != 0)
+		fatal_fr(r, "compose status");
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue status");
+	sshbuf_free(msg);
+}
 
 /* ── BEGIN Phase 5: bundle handle implementation ──────────────────────────
  *
@@ -1205,6 +1262,205 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 
 /* ── END Phase 5 ───────────────────────────────────────────────────────── */
 
+/* ── BEGIN sftp-hash-range: chunked-resume ranged XXH3 hashing ─────────────
+ *
+ * Multi-range variant of hpn-check-file: client supplies N (offset, length)
+ * tuples in one request, server returns N XXH3_64bits hashes in one reply.
+ * Used by chunked resume to identify exactly which chunks of a same-size
+ * destination differ from the source, so only those chunks get re-transferred
+ * instead of the whole file (closes the cost half of the sparse-hole gate).
+ *
+ * Wire format:
+ *   request:  string path | uint32 num_ranges
+ *             | num_ranges * (uint64 off, uint64 len)
+ *   reply:    uint32 num_hashes (== num_ranges)
+ *             | num_hashes * uint64 hash
+ *
+ * Error model: all-or-nothing.  Any range that fails to hash (I/O error,
+ * resource cap, file vanished mid-request) rejects the entire request with
+ * a single SSH2_FXP_STATUS reply -- no partial hashes.  The client falls
+ * back to hpn-check-file whole-file hash on this failure, then to full
+ * re-transfer if that also fails.
+ *
+ * EOF clamping: offset+length > file_size is clamped to [offset, file_size);
+ * offset >= file_size hashes zero bytes (well-defined XXH3 constant).  The
+ * client sees a mismatch against its local "full chunk" hash and correctly
+ * flags the chunk as incomplete.
+ */
+#define SFTP_HASH_RANGE_MAX_RANGES	65536U
+#define SFTP_HASH_RANGE_MAX_LEN		((u_int64_t)SSHBUF_SIZE_MAX)
+
+struct hash_range {
+	u_int64_t	off;
+	u_int64_t	len;
+};
+
+static void
+process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
+{
+	char			*path = NULL;
+	u_int32_t		 num_ranges = 0;
+	struct hash_range	*ranges = NULL;
+	u_int64_t		*hashes = NULL;
+	XXH3_state_t		*state = NULL;
+	struct sshbuf		*msg = NULL;
+	struct stat		 st;
+	u_char			 buf[65536];
+	u_int64_t		 fsize = 0;
+	u_int32_t		 i;
+	int			 fd = -1;
+	int			 r;
+
+	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0 ||
+	    (r = sshbuf_get_u32(iqueue, &num_ranges)) != 0) {
+		error_f("parse: %s", ssh_err(r));
+		goto fail_status;
+	}
+
+	debug3("request %u: sftp-hash-range \"%s\" num_ranges=%u",
+	    id, path, num_ranges);
+
+	if (num_ranges == 0) {
+		error_f("rejecting sftp-hash-range with num_ranges=0 "
+		    "for \"%s\"", path);
+		send_status_oqueue(oqueue, id, SSH2_FX_BAD_MESSAGE);
+		goto out;
+	}
+	if (num_ranges > SFTP_HASH_RANGE_MAX_RANGES) {
+		error_f("rejecting sftp-hash-range num_ranges=%u > cap %u "
+		    "for \"%s\"", num_ranges, SFTP_HASH_RANGE_MAX_RANGES,
+		    path);
+		goto fail_status;
+	}
+
+	if ((ranges = calloc(num_ranges, sizeof(*ranges))) == NULL ||
+	    (hashes = calloc(num_ranges, sizeof(*hashes))) == NULL) {
+		error_f("calloc for %u ranges failed", num_ranges);
+		goto fail_status;
+	}
+	for (i = 0; i < num_ranges; i++) {
+		if ((r = sshbuf_get_u64(iqueue, &ranges[i].off)) != 0 ||
+		    (r = sshbuf_get_u64(iqueue, &ranges[i].len)) != 0) {
+			error_f("parse range %u: %s", i, ssh_err(r));
+			goto fail_status;
+		}
+		if (ranges[i].len > SFTP_HASH_RANGE_MAX_LEN) {
+			error_f("range %u length %llu > cap %llu for \"%s\"",
+			    i, (unsigned long long)ranges[i].len,
+			    (unsigned long long)SFTP_HASH_RANGE_MAX_LEN, path);
+			goto fail_status;
+		}
+	}
+
+	logit("sftp-hash-range \"%s\" num_ranges=%u", path, num_ranges);
+
+	if ((fd = open(path, O_RDONLY|O_NOFOLLOW)) == -1) {
+		send_status_oqueue(oqueue, id,
+		    errno_to_sftp_status(errno));
+		goto out;
+	}
+	if (fstat(fd, &st) == -1) {
+		send_status_oqueue(oqueue, id,
+		    errno_to_sftp_status(errno));
+		goto out;
+	}
+	fsize = (u_int64_t)st.st_size;
+
+	if ((state = XXH3_createState()) == NULL) {
+		error_f("XXH3_createState failed");
+		goto fail_status;
+	}
+
+	/*
+	 * For each range, lseek to the offset and hash bytes
+	 * [offset, min(offset+length, file_size)).  EOF clamping handled by
+	 * starting `remaining` at the clamped length (zero if offset >= fsize).
+	 * All-or-nothing: any read or hash failure bails out with a single
+	 * SSH2_FXP_STATUS reply.
+	 */
+	for (i = 0; i < num_ranges; i++) {
+		u_int64_t	 off = ranges[i].off;
+		u_int64_t	 want = ranges[i].len;
+		u_int64_t	 remaining;
+		ssize_t		 nread;
+
+		if (XXH3_64bits_reset(state) == XXH_ERROR) {
+			error_f("XXH3_64bits_reset failed at range %u", i);
+			goto fail_status;
+		}
+
+		if (off >= fsize) {
+			remaining = 0;
+		} else {
+			u_int64_t avail = fsize - off;
+			remaining = want < avail ? want : avail;
+		}
+
+		if (remaining > 0) {
+			if (lseek(fd, (off_t)off, SEEK_SET) == (off_t)-1) {
+				send_status_oqueue(oqueue, id,
+				    errno_to_sftp_status(errno));
+				goto out;
+			}
+			while (remaining > 0) {
+				size_t toread = (size_t)MINIMUM(
+				    (u_int64_t)sizeof(buf), remaining);
+				nread = read(fd, buf, toread);
+				if (nread == 0)
+					break;	/* shouldn't happen given
+						 * clamp, but defensive */
+				if (nread < 0) {
+					send_status_oqueue(oqueue, id,
+					    errno_to_sftp_status(errno));
+					goto out;
+				}
+				if (XXH3_64bits_update(state, buf,
+				    (size_t)nread) == XXH_ERROR) {
+					error_f("XXH3_64bits_update failed "
+					    "at range %u", i);
+					goto fail_status;
+				}
+				remaining -= (u_int64_t)nread;
+			}
+		}
+		hashes[i] = (u_int64_t)XXH3_64bits_digest(state);
+	}
+
+	debug3("sftp-hash-range: computed %u hashes for \"%s\"",
+	    num_ranges, path);
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u32(msg, num_ranges)) != 0)
+		fatal_fr(r, "compose header");
+	for (i = 0; i < num_ranges; i++) {
+		if ((r = sshbuf_put_u64(msg, hashes[i])) != 0)
+			fatal_fr(r, "compose hash %u", i);
+	}
+	debug3("sftp-hash-range: sending EXTENDED_REPLY id=%u num_hashes=%u",
+	    id, num_ranges);
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue reply");
+	goto out;
+
+fail_status:
+	send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
+out:
+	if (msg != NULL)
+		sshbuf_free(msg);
+	if (state != NULL)
+		XXH3_freeState(state);
+	if (fd != -1)
+		close(fd);
+	free(ranges);
+	free(hashes);
+	free(path);
+}
+
+/* ── END sftp-hash-range ───────────────────────────────────────────────── */
+
 void
 sftp_hpn_server_dispatch(u_int id, const char *name,
     struct sshbuf *iqueue, struct sshbuf *oqueue)
@@ -1223,6 +1479,12 @@ sftp_hpn_server_dispatch(u_int id, const char *name,
 	}
 	if (strcmp(name, HPN_EXT_BUNDLE_FETCH) == 0) {
 		process_hpn_bundle_fetch(id, iqueue, oqueue);
+		return;
+	}
+
+	/* Chunked-resume ranged hashing — see process_hpn_hash_range above. */
+	if (strcmp(name, HPN_EXT_HASH_RANGE) == 0) {
+		process_hpn_hash_range(id, iqueue, oqueue);
 		return;
 	}
 
@@ -1327,15 +1589,5 @@ sftp_hpn_server_dispatch(u_int id, const char *name,
 
  unsupported:
 	free(path);
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u32(msg, SSH2_FX_OP_UNSUPPORTED)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0)
-		fatal_fr(r, "compose error");
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue");
-	sshbuf_free(msg);
+	send_status_oqueue(oqueue, id, SSH2_FX_OP_UNSUPPORTED);
 }

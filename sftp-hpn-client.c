@@ -1244,3 +1244,513 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 }
 
 /* ── END Phase 5 ───────────────────────────────────────────────────────── */
+
+/* ── BEGIN sftp-hash-range: client-side helpers ───────────────────────────
+ *
+ * Helpers for chunked resume.  See sftp-hpn-client.h for the public API
+ * and the design rationale at project_chunked_resume_plan.md in memory.
+ *
+ * sftp_hpn_xxhash_local_range — local XXH3 over an open fd's range
+ * sftp_hpn_hash_remote_ranges  — wire-level sftp-hash-range@hpnssh.org query
+ */
+
+#define HASH_RANGE_READ_BUF_LEN	65536U
+
+#include "sftp.h"
+#include "sftp-client-internal.h"
+#include "sftp-hpn-server.h"	/* HPN_EXT_HASH_RANGE wire-name macro */
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
+int
+sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
+    u_int64_t *hash_out)
+{
+	XXH3_state_t	*state;
+	u_char		 buf[HASH_RANGE_READ_BUF_LEN];
+	u_int64_t	 remaining;
+	ssize_t		 nread;
+
+	if (hash_out == NULL || fd < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if ((state = XXH3_createState()) == NULL) {
+		error_f("XXH3_createState failed");
+		return -1;
+	}
+	if (XXH3_64bits_reset(state) == XXH_ERROR) {
+		error_f("XXH3_64bits_reset failed");
+		XXH3_freeState(state);
+		return -1;
+	}
+
+	if (length > 0 && lseek(fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
+		error_f("lseek to %llu: %s",
+		    (unsigned long long)offset, strerror(errno));
+		XXH3_freeState(state);
+		return -1;
+	}
+
+	remaining = length;
+	while (remaining > 0) {
+		size_t toread = (size_t)MINIMUM(
+		    (u_int64_t)sizeof(buf), remaining);
+		nread = read(fd, buf, toread);
+		if (nread == 0)
+			break;	/* short read — caller may treat as
+				 * truncated; we hash what we got */
+		if (nread < 0) {
+			if (errno == EINTR)
+				continue;
+			error_f("read at offset %llu: %s",
+			    (unsigned long long)offset, strerror(errno));
+			XXH3_freeState(state);
+			return -1;
+		}
+		if (XXH3_64bits_update(state, buf, (size_t)nread)
+		    == XXH_ERROR) {
+			error_f("XXH3_64bits_update failed");
+			XXH3_freeState(state);
+			return -1;
+		}
+		remaining -= (u_int64_t)nread;
+	}
+
+	*hash_out = (u_int64_t)XXH3_64bits_digest(state);
+	XXH3_freeState(state);
+	return 0;
+}
+
+int
+sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
+    const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out)
+{
+	struct sshbuf	*msg = NULL;
+	u_int		 id, rid, num_hashes, i;
+	u_char		 type;
+	int		 r;
+	int		 rc = -1;
+
+	if (conn == NULL || path == NULL || ranges == NULL ||
+	    hashes_out == NULL || n == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (!sftp_conn_has_hash_range(conn)) {
+		/*
+		 * Expected condition when talking to a pre-19.0 server;
+		 * the caller will fall through to hpn-check-file whole-file
+		 * hashing.  Keep at debug level so it doesn't spam users.
+		 */
+		debug_f("server lacks sftp-hash-range; chunked path "
+		    "unavailable");
+		return -1;
+	}
+
+	if ((msg = sshbuf_new()) == NULL) {
+		error_f("sshbuf_new failed");
+		return -1;
+	}
+
+	id = sftp_conn_alloc_msg_id(conn);
+	debug3_f("sending sftp-hash-range \"%s\" num_ranges=%u id=%u",
+	    path, n, id);
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_HASH_RANGE)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
+	    (r = sshbuf_put_u32(msg, n)) != 0)
+		fatal_fr(r, "compose request header");
+	for (i = 0; i < n; i++) {
+		if ((r = sshbuf_put_u64(msg, ranges[i].off)) != 0 ||
+		    (r = sshbuf_put_u64(msg, ranges[i].len)) != 0)
+			fatal_fr(r, "compose range %u", i);
+	}
+	if (send_msg(conn, msg) != 0) {
+		logit_f("sftp-hash-range \"%s\": transport send failed; "
+		    "falling back to whole-file hash", path);
+		goto out;
+	}
+	sshbuf_reset(msg);
+
+	if (get_msg(conn, msg) != 0) {
+		logit_f("sftp-hash-range \"%s\": transport receive failed; "
+		    "falling back to whole-file hash", path);
+		goto out;
+	}
+	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+	    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+		logit_f("sftp-hash-range \"%s\": parse reply header: %s; "
+		    "falling back to whole-file hash", path, ssh_err(r));
+		goto out;
+	}
+	if (rid != id) {
+		logit_f("sftp-hash-range \"%s\": reply id mismatch "
+		    "(got %u expected %u); falling back to whole-file hash",
+		    path, rid, id);
+		goto out;
+	}
+
+	if (type == SSH2_FXP_STATUS) {
+		u_int	 status = SSH2_FX_FAILURE;
+		char	*errmsg = NULL;
+
+		(void)sshbuf_get_u32(msg, &status);
+		(void)sshbuf_get_cstring(msg, &errmsg, NULL);
+		/*
+		 * User-visible warning per the chunked-resume design:
+		 * server failure to hash a range indicates a problem on
+		 * the destination (FS corruption, concurrent modification,
+		 * permission change, etc.) and the user should know even
+		 * if the fallback transfer succeeds.
+		 */
+		logit_f("sftp-hash-range \"%s\": server reported error "
+		    "(%s); the destination may have storage / FS / "
+		    "permission issues — falling back to whole-file hash",
+		    path,
+		    (errmsg != NULL && *errmsg != '\0')
+		        ? errmsg : fx2txt(status));
+		free(errmsg);
+		goto out;
+	}
+	if (type != SSH2_FXP_EXTENDED_REPLY) {
+		logit_f("sftp-hash-range \"%s\": unexpected reply type %u; "
+		    "falling back to whole-file hash", path, type);
+		goto out;
+	}
+	if ((r = sshbuf_get_u32(msg, &num_hashes)) != 0) {
+		logit_f("sftp-hash-range \"%s\": parse num_hashes: %s; "
+		    "falling back to whole-file hash", path, ssh_err(r));
+		goto out;
+	}
+	if (num_hashes != n) {
+		logit_f("sftp-hash-range \"%s\": server returned %u hashes "
+		    "for %u ranges; falling back to whole-file hash",
+		    path, num_hashes, n);
+		goto out;
+	}
+	for (i = 0; i < n; i++) {
+		if ((r = sshbuf_get_u64(msg, &hashes_out[i])) != 0) {
+			logit_f("sftp-hash-range \"%s\": parse hash %u: %s; "
+			    "falling back to whole-file hash",
+			    path, i, ssh_err(r));
+			goto out;
+		}
+	}
+
+	debug3_f("sftp-hash-range \"%s\": received %u hashes", path, n);
+	rc = 0;
+out:
+	sshbuf_free(msg);
+	return rc;
+}
+
+/*
+ * Tunables for chunked resume.  Defaults chosen per the locked design
+ * (project_chunked_resume_plan.md memory):
+ *
+ *  CHUNK_HASH_CHUNK_SIZE       — granularity of re-transfer.  64 MiB makes
+ *                                per-chunk protocol overhead (16 B request,
+ *                                8 B response) negligible vs. typical
+ *                                missed-chunk transfer cost.
+ *  CHUNK_HASH_MIN_FILE_SIZE    — below this, skip the chunked path; the
+ *                                full-file hash gate is cheaper than the
+ *                                chunked-request round trip on small files.
+ *                                Chosen as 2 * CHUNK_SIZE so any engaged
+ *                                run has at least two chunks to map.
+ *  CHUNK_HASH_MAX_RANGES_PER_REQUEST
+ *                              — must match server-side cap in
+ *                                sftp-hpn-server.c (SFTP_HASH_RANGE_MAX_RANGES).
+ *                                At 64 MiB chunks this covers files up to
+ *                                4 TiB.  Bigger files decline and fall
+ *                                through to the existing full-file gate.
+ */
+#define CHUNK_HASH_CHUNK_SIZE			((u_int64_t)(64ULL * 1024ULL * 1024ULL))
+#define CHUNK_HASH_MIN_FILE_SIZE		((u_int64_t)(2ULL * CHUNK_HASH_CHUNK_SIZE))
+#define CHUNK_HASH_MAX_RANGES_PER_REQUEST	65536U
+
+int
+sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
+    const char *local_path, const char *remote_path, off_t file_size)
+{
+	struct sftp_hash_range	*ranges = NULL;
+	u_int64_t		*local_hashes = NULL;
+	u_int64_t		*remote_hashes = NULL;
+	u_int64_t		 fsize;
+	u_int64_t		 bytes_retransferred = 0;
+	u_int			 n_chunks, n_mismatched = 0;
+	u_int			 i;
+	int			 rc = -1;
+
+	if (conn == NULL || local_path == NULL || remote_path == NULL ||
+	    local_fd < 0 || file_size <= 0)
+		return -1;
+
+	if (!sftp_conn_has_hash_range(conn)) {
+		debug_f("server lacks sftp-hash-range; declining chunked path "
+		    "for \"%s\"", local_path);
+		return -1;
+	}
+	fsize = (u_int64_t)file_size;
+	if (fsize < CHUNK_HASH_MIN_FILE_SIZE) {
+		debug_f("file \"%s\" size %llu below chunked threshold %llu; "
+		    "declining", local_path, (unsigned long long)fsize,
+		    (unsigned long long)CHUNK_HASH_MIN_FILE_SIZE);
+		return -1;
+	}
+
+	n_chunks = (u_int)((fsize + CHUNK_HASH_CHUNK_SIZE - 1) /
+	    CHUNK_HASH_CHUNK_SIZE);
+	if (n_chunks > CHUNK_HASH_MAX_RANGES_PER_REQUEST) {
+		debug_f("file \"%s\" would need %u chunks > cap %u; declining",
+		    local_path, n_chunks, CHUNK_HASH_MAX_RANGES_PER_REQUEST);
+		return -1;
+	}
+
+	if ((ranges = calloc(n_chunks, sizeof(*ranges))) == NULL ||
+	    (local_hashes = calloc(n_chunks, sizeof(*local_hashes))) == NULL ||
+	    (remote_hashes = calloc(n_chunks, sizeof(*remote_hashes))) == NULL) {
+		error_f("calloc for %u chunks failed", n_chunks);
+		goto out;
+	}
+
+	/*
+	 * Build the chunk layout.  Last chunk's length is clamped to
+	 * end-of-file so the server's matching XXH3 (also clamped) lines up
+	 * with the local hash.
+	 */
+	for (i = 0; i < n_chunks; i++) {
+		u_int64_t off = (u_int64_t)i * CHUNK_HASH_CHUNK_SIZE;
+		u_int64_t remain = fsize - off;
+		ranges[i].off = off;
+		ranges[i].len = remain < CHUNK_HASH_CHUNK_SIZE
+		    ? remain : CHUNK_HASH_CHUNK_SIZE;
+	}
+
+	/* Local hashing: any I/O error here is a real local-file problem;
+	 * fall through to existing whole-file path (which will rediscover
+	 * the same error and report it to the user). */
+	for (i = 0; i < n_chunks; i++) {
+		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
+		    ranges[i].len, &local_hashes[i]) != 0) {
+			error_f("local hash failed at chunk %u offset %llu "
+			    "for \"%s\"", i,
+			    (unsigned long long)ranges[i].off, local_path);
+			goto out;
+		}
+	}
+
+	/* Remote hashing: all-or-nothing.  Helper emits the user-visible
+	 * warning on failure. */
+	if (sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n_chunks,
+	    remote_hashes) != 0)
+		goto out;
+
+	for (i = 0; i < n_chunks; i++) {
+		if (local_hashes[i] != remote_hashes[i])
+			n_mismatched++;
+	}
+
+	if (n_mismatched == 0) {
+		debug("chunked verified transfer: all %u chunks match, "
+		    "\"%s\" already complete", n_chunks, local_path);
+		rc = 1;
+		goto out;
+	}
+
+	/*
+	 * Walk the chunk list and re-transfer each contiguous run of
+	 * mismatches as a single sftp_upload_range call.  This minimises the
+	 * number of open/close round trips relative to one call per chunk
+	 * while keeping the byte-transfer footprint minimal (we still only
+	 * send the mismatched chunks, not the gaps between them).
+	 *
+	 * Partial failure within a run leaves the destination in an
+	 * indeterminate state, so we return -1 and let the caller's fallback
+	 * path (full-file hash gate -> TRUNC + fresh upload) restore a sane
+	 * destination.  No partial-progress accounting here.
+	 */
+	i = 0;
+	while (i < n_chunks) {
+		u_int run_start;
+		u_int64_t run_off, run_len;
+
+		if (local_hashes[i] == remote_hashes[i]) {
+			i++;
+			continue;
+		}
+		run_start = i;
+		while (i < n_chunks && local_hashes[i] != remote_hashes[i])
+			i++;
+		run_off = ranges[run_start].off;
+		run_len = (ranges[i - 1].off + ranges[i - 1].len) - run_off;
+
+		debug3("chunked resume: re-transferring chunks [%u, %u) "
+		    "at offset %llu length %llu for \"%s\"",
+		    run_start, i,
+		    (unsigned long long)run_off,
+		    (unsigned long long)run_len, local_path);
+		if (sftp_upload_range(conn, local_path, remote_path,
+		    (off_t)run_off, (off_t)run_len) != 0) {
+			error_f("re-transfer of chunks [%u, %u) failed for "
+			    "\"%s\"; falling back to full-file path",
+			    run_start, i, local_path);
+			goto out;
+		}
+		bytes_retransferred += run_len;
+	}
+
+	logit("chunked verified resume \"%s\": re-transferred %u/%u chunks "
+	    "(%llu / %llu bytes, %.1f%% of file)",
+	    local_path, n_mismatched, n_chunks,
+	    (unsigned long long)bytes_retransferred,
+	    (unsigned long long)fsize,
+	    100.0 * (double)bytes_retransferred / (double)fsize);
+	rc = 0;
+out:
+	free(ranges);
+	free(local_hashes);
+	free(remote_hashes);
+	return rc;
+}
+
+int
+sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
+    const char *local_path, const char *remote_path, off_t file_size)
+{
+	struct sftp_hash_range	*ranges = NULL;
+	u_int64_t		*local_hashes = NULL;
+	u_int64_t		*remote_hashes = NULL;
+	u_int64_t		 fsize;
+	u_int64_t		 bytes_refetched = 0;
+	u_int			 n_chunks, n_mismatched = 0;
+	u_int			 i;
+	int			 rc = -1;
+
+	if (conn == NULL || local_path == NULL || remote_path == NULL ||
+	    local_fd < 0 || file_size <= 0)
+		return -1;
+
+	if (!sftp_conn_has_hash_range(conn)) {
+		debug_f("server lacks sftp-hash-range; declining chunked path "
+		    "for \"%s\"", local_path);
+		return -1;
+	}
+	fsize = (u_int64_t)file_size;
+	if (fsize < CHUNK_HASH_MIN_FILE_SIZE) {
+		debug_f("file \"%s\" size %llu below chunked threshold %llu; "
+		    "declining", local_path, (unsigned long long)fsize,
+		    (unsigned long long)CHUNK_HASH_MIN_FILE_SIZE);
+		return -1;
+	}
+
+	n_chunks = (u_int)((fsize + CHUNK_HASH_CHUNK_SIZE - 1) /
+	    CHUNK_HASH_CHUNK_SIZE);
+	if (n_chunks > CHUNK_HASH_MAX_RANGES_PER_REQUEST) {
+		debug_f("file \"%s\" would need %u chunks > cap %u; declining",
+		    local_path, n_chunks, CHUNK_HASH_MAX_RANGES_PER_REQUEST);
+		return -1;
+	}
+
+	if ((ranges = calloc(n_chunks, sizeof(*ranges))) == NULL ||
+	    (local_hashes = calloc(n_chunks, sizeof(*local_hashes))) == NULL ||
+	    (remote_hashes = calloc(n_chunks, sizeof(*remote_hashes))) == NULL) {
+		error_f("calloc for %u chunks failed", n_chunks);
+		goto out;
+	}
+
+	/* Chunk layout identical to the upload sibling — the last chunk
+	 * clamps to EOF and the server's matching XXH3 (also clamped) lines
+	 * up with the local hash. */
+	for (i = 0; i < n_chunks; i++) {
+		u_int64_t off = (u_int64_t)i * CHUNK_HASH_CHUNK_SIZE;
+		u_int64_t remain = fsize - off;
+		ranges[i].off = off;
+		ranges[i].len = remain < CHUNK_HASH_CHUNK_SIZE
+		    ? remain : CHUNK_HASH_CHUNK_SIZE;
+	}
+
+	/* Local hashing: the destination's current state (partial / sparse). */
+	for (i = 0; i < n_chunks; i++) {
+		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
+		    ranges[i].len, &local_hashes[i]) != 0) {
+			error_f("local hash failed at chunk %u offset %llu "
+			    "for \"%s\"", i,
+			    (unsigned long long)ranges[i].off, local_path);
+			goto out;
+		}
+	}
+
+	/* Remote hashing: the source-of-truth.  All-or-nothing semantics;
+	 * helper emits the user-visible warning on failure. */
+	if (sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n_chunks,
+	    remote_hashes) != 0)
+		goto out;
+
+	for (i = 0; i < n_chunks; i++) {
+		if (local_hashes[i] != remote_hashes[i])
+			n_mismatched++;
+	}
+
+	if (n_mismatched == 0) {
+		debug("chunked verified transfer: all %u chunks match, "
+		    "\"%s\" already complete", n_chunks, local_path);
+		rc = 1;
+		goto out;
+	}
+
+	/*
+	 * Walk the chunk list and re-fetch each contiguous run of mismatches
+	 * as a single sftp_download_range call.  Partial failure mid-run
+	 * leaves the local destination in an indeterminate state, so we
+	 * return -1 and let the caller's fallback (full-file hash gate ->
+	 * truncate + fresh download) restore a sane destination.
+	 */
+	i = 0;
+	while (i < n_chunks) {
+		u_int run_start;
+		u_int64_t run_off, run_len;
+
+		if (local_hashes[i] == remote_hashes[i]) {
+			i++;
+			continue;
+		}
+		run_start = i;
+		while (i < n_chunks && local_hashes[i] != remote_hashes[i])
+			i++;
+		run_off = ranges[run_start].off;
+		run_len = (ranges[i - 1].off + ranges[i - 1].len) - run_off;
+
+		debug3("chunked resume: re-fetching chunks [%u, %u) at "
+		    "offset %llu length %llu for \"%s\"",
+		    run_start, i,
+		    (unsigned long long)run_off,
+		    (unsigned long long)run_len, local_path);
+		if (sftp_download_range(conn, remote_path, local_path,
+		    (off_t)run_off, (off_t)run_len) != 0) {
+			error_f("re-fetch of chunks [%u, %u) failed for "
+			    "\"%s\"; falling back to full-file path",
+			    run_start, i, local_path);
+			goto out;
+		}
+		bytes_refetched += run_len;
+	}
+
+	logit("chunked verified resume \"%s\": re-fetched %u/%u chunks "
+	    "(%llu / %llu bytes, %.1f%% of file)",
+	    local_path, n_mismatched, n_chunks,
+	    (unsigned long long)bytes_refetched,
+	    (unsigned long long)fsize,
+	    100.0 * (double)bytes_refetched / (double)fsize);
+	rc = 0;
+out:
+	free(ranges);
+	free(local_hashes);
+	free(remote_hashes);
+	return rc;
+}
+
+/* ── END sftp-hash-range ──────────────────────────────────────────────── */
