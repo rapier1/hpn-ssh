@@ -41,8 +41,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "atomicio.h"
 #include "sshbuf.h"
 #include "ssherr.h"
 #include "log.h"
@@ -1295,6 +1297,66 @@ struct hash_range {
 	u_int64_t	len;
 };
 
+/*
+ * Drain oqueue synchronously to STDOUT_FILENO via atomicio().  Used by the
+ * heartbeat path so the bytes actually reach the SSH transport mid-handler
+ * instead of sitting in oqueue until the handler returns (sftp-server's
+ * main poll loop does not iterate during a handler call).  Order is
+ * preserved: pre-handler pending bytes leave first, the heartbeat after.
+ */
+static void
+flush_oqueue_blocking(struct sshbuf *oqueue)
+{
+	size_t	len, wrote;
+
+	len = sshbuf_len(oqueue);
+	if (len == 0)
+		return;
+	wrote = atomicio(vwrite, STDOUT_FILENO,
+	    (void *)sshbuf_ptr(oqueue), len);
+	if (wrote > 0)
+		(void)sshbuf_consume(oqueue, wrote);
+}
+
+/*
+ * Emit an sftp-hash-range heartbeat into oqueue, then synchronously
+ * drain.  Wire shape matches the final reply prefix
+ * (type | id | num_hashes) but with the reserved sentinel
+ * HPN_NUM_HASHES_HEARTBEAT in num_hashes.  Called from the inner read
+ * loop every HPN_HEARTBEAT_EMIT_INTERVAL_SEC seconds; lets the client
+ * refresh its watchdog-pause window so the parallel orchestrator doesn't
+ * kill the worker mid-hash on a slow / contended disk.
+ */
+static void
+send_hpn_hash_range_heartbeat(u_int id, struct sshbuf *oqueue)
+{
+	struct sshbuf	*msg;
+	int		 r;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u32(msg,
+	        (u_int32_t)HPN_NUM_HASHES_HEARTBEAT)) != 0)
+		fatal_fr(r, "compose heartbeat");
+	debug3("sftp-hash-range: heartbeat id=%u", id);
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue heartbeat");
+	sshbuf_free(msg);
+	flush_oqueue_blocking(oqueue);
+}
+
+static time_t
+hpn_hash_range_monotonic_sec(void)
+{
+	struct timespec	 ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return ts.tv_sec;
+}
+
 static void
 process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
@@ -1307,6 +1369,7 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	struct stat		 st;
 	u_char			 buf[65536];
 	u_int64_t		 fsize = 0;
+	time_t			 last_hb_sec;
 	u_int32_t		 i;
 	int			 fd = -1;
 	int			 r;
@@ -1377,7 +1440,14 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	 * starting `remaining` at the clamped length (zero if offset >= fsize).
 	 * All-or-nothing: any read or hash failure bails out with a single
 	 * SSH2_FXP_STATUS reply.
+	 *
+	 * Heartbeats: every HPN_HEARTBEAT_EMIT_INTERVAL_SEC of elapsed wall
+	 * time inside this loop we enqueue a tiny "still working" reply on
+	 * oqueue.  Lets the client's parallel orchestrator's watchdog see
+	 * proof of life so it doesn't kill the worker mid-hash on slow /
+	 * contended storage.  See sftp-hpn-server.h for the wire format.
 	 */
+	last_hb_sec = hpn_hash_range_monotonic_sec();
 	for (i = 0; i < num_ranges; i++) {
 		u_int64_t	 off = ranges[i].off;
 		u_int64_t	 want = ranges[i].len;
@@ -1421,6 +1491,20 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 					goto fail_status;
 				}
 				remaining -= (u_int64_t)nread;
+
+				/* Time-keyed heartbeat (see comment above). */
+				{
+					time_t now =
+					    hpn_hash_range_monotonic_sec();
+					if (now != 0 && last_hb_sec != 0 &&
+					    (now - last_hb_sec) >=
+					    (time_t)
+					    HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
+						send_hpn_hash_range_heartbeat(
+						    id, oqueue);
+						last_hb_sec = now;
+					}
+				}
 			}
 		}
 		hashes[i] = (u_int64_t)XXH3_64bits_digest(state);

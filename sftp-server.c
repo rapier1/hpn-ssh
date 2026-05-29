@@ -1879,6 +1879,69 @@ process_extended_get_users_groups_by_id(uint32_t id)
 	sshbuf_free(msg);
 }
 
+/*
+ * Drain the entire oqueue to STDOUT_FILENO via atomicio() — blocking until
+ * the kernel has accepted every byte.  Used by the heartbeat path inside
+ * long-running handlers so the heartbeat actually reaches the wire mid-
+ * handler instead of sitting in oqueue until the handler returns (the main
+ * poll loop does not iterate while a handler is running).  Order is
+ * preserved: any pending pre-handler bytes go out first, the heartbeat
+ * follows.
+ */
+static void
+flush_oqueue_blocking(void)
+{
+	size_t len, wrote;
+
+	len = sshbuf_len(oqueue);
+	if (len == 0)
+		return;
+	wrote = atomicio(vwrite, STDOUT_FILENO,
+	    (void *)sshbuf_ptr(oqueue), len);
+	if (wrote > 0)
+		(void)sshbuf_consume(oqueue, wrote);
+}
+
+/*
+ * Emit an hpn-check-file heartbeat reply (EXTENDED_REPLY with the reserved
+ * HPN_HASH_CHECK_FILE_HEARTBEAT sentinel in the hash field).  Called from
+ * the inner read+hash loop every HPN_HEARTBEAT_EMIT_INTERVAL_SEC seconds;
+ * lets the client refresh its watchdog-pause window so the parallel
+ * orchestrator doesn't kill the worker mid-hash on a slow / contended
+ * disk.  Wire shape matches the final reply; only the hash value differs.
+ *
+ * Append to oqueue then synchronously drain so the bytes actually leave
+ * the process during the handler (the main poll loop is blocked here).
+ */
+static void
+send_hpn_check_file_heartbeat(uint32_t id)
+{
+	struct sshbuf *msg;
+	int r;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u64(msg,
+	        (uint64_t)HPN_HASH_CHECK_FILE_HEARTBEAT)) != 0)
+		fatal_fr(r, "compose heartbeat");
+	debug3("hpn-check-file: heartbeat id=%u", id);
+	send_msg(msg);
+	sshbuf_free(msg);
+	flush_oqueue_blocking();
+}
+
+static time_t
+hpn_monotonic_sec(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+	return ts.tv_sec;
+}
+
 static void
 process_extended_hpn_check_file(uint32_t id)
 {
@@ -1891,6 +1954,7 @@ process_extended_hpn_check_file(uint32_t id)
 	XXH64_hash_t hash;
 	u_char buf[65536];
 	uint64_t remaining;
+	time_t last_hb_sec;
 	ssize_t nread;
 	struct sshbuf *msg;
 	struct stat st;
@@ -1955,6 +2019,7 @@ process_extended_hpn_check_file(uint32_t id)
 	}
 
 	remaining = length;
+	last_hb_sec = hpn_monotonic_sec();
 	while (remaining > 0) {
 		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
 
@@ -1971,6 +2036,22 @@ process_extended_hpn_check_file(uint32_t id)
 			goto out;
 		}
 		remaining -= (uint64_t)nread;
+
+		/*
+		 * Emit a heartbeat every HPN_HEARTBEAT_EMIT_INTERVAL_SEC so the
+		 * client's watchdog-pause stays refreshed.  Cheap monotonic-sec
+		 * check per 64KB read iteration; the actual reply build/send
+		 * only runs every ~5 s of elapsed wall time.
+		 */
+		{
+			time_t now = hpn_monotonic_sec();
+			if (now != 0 && last_hb_sec != 0 &&
+			    (now - last_hb_sec) >=
+			    (time_t)HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
+				send_hpn_check_file_heartbeat(id);
+				last_hb_sec = now;
+			}
+		}
 	}
 	hash = XXH3_64bits_digest(state);
 	debug3("hpn-check-file: computed hash %016llx for \"%s\" "

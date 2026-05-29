@@ -247,32 +247,16 @@ sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
 	    __ATOMIC_RELAXED);
 }
 
-unsigned int
-sftp_hpn_grace_for_hash(u_int64_t size_bytes)
-{
-	/*
-	 * Conservative disk-read floor: 1 GB/s (= 10^9 B/s).  XXH3 itself
-	 * is RAM-speed (~30 GB/s); the bottleneck for hashing a file is
-	 * always disk read on whichever end is slower.  Modern HPN
-	 * deployments (Lustre/GPFS, NVMe, multi-stripe parallel FS) routinely
-	 * beat 1 GB/s; we use it as a safety margin for slower setups
-	 * (single-stripe Lustre, contended FS, SATA SSD).
-	 *
-	 * Grace = ceil(size / 1 GB/s) + 30 s headroom for protocol round
-	 * trips and brief stalls.  At the chunked-resume MAX file-size cap
-	 * (CHUNK_HASH_MAX_FILE_SIZE = 50 GiB) this is ~80 s, well within a
-	 * sensible watchdog grace window.
-	 *
-	 * Caller may need a longer grace if it knows its environment has
-	 * slower-than-1-GB/s storage; this default is the conservative
-	 * floor a generic caller can rely on.
-	 */
-	unsigned int secs;
-
-	secs = (unsigned int)(size_bytes /
-	    (1024ULL * 1024ULL * 1024ULL)) + 1u;
-	return secs + 30u;
-}
+/*
+ * sftp_hpn_grace_for_hash() was retired in favour of the heartbeat
+ * protocol (see sftp-hpn-server.h: HPN_HEARTBEAT_*).  The watchdog pause
+ * is now refreshed by each heartbeat the server emits during a long
+ * hash, so the initial pause window is a fixed
+ * HPN_HEARTBEAT_REFRESH_SEC at every callsite — independent of file
+ * size or assumed disk speed.  The old grace formula's 1 GB/s assumption
+ * broke under parallel-worker disk contention; heartbeats observe actual
+ * progress instead of predicting it.
+ */
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Adaptive read-ahead controller (HPN).  See sftp-hpn-client.h for rationale.
@@ -1463,75 +1447,111 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 		    "falling back to whole-file hash", path);
 		goto out;
 	}
-	sshbuf_reset(msg);
 
-	if (get_msg(conn, msg) != 0) {
-		logit_f("sftp-hash-range \"%s\": transport receive failed; "
-		    "falling back to whole-file hash", path);
-		goto out;
-	}
-	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &rid)) != 0) {
-		logit_f("sftp-hash-range \"%s\": parse reply header: %s; "
-		    "falling back to whole-file hash", path, ssh_err(r));
-		goto out;
-	}
-	if (rid != id) {
-		logit_f("sftp-hash-range \"%s\": reply id mismatch "
-		    "(got %u expected %u); falling back to whole-file hash",
-		    path, rid, id);
-		goto out;
-	}
+	/*
+	 * Initial watchdog grace covers the worker time until the first
+	 * server heartbeat lands.  Each heartbeat refreshes the pause for
+	 * another HPN_HEARTBEAT_REFRESH_SEC so the orchestrator never kills
+	 * us while the server is making forward progress.  See
+	 * sftp-hpn-server.h for the protocol.
+	 */
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 
-	if (type == SSH2_FXP_STATUS) {
-		u_int	 status = SSH2_FX_FAILURE;
-		char	*errmsg = NULL;
+	for (;;) {
+		sshbuf_reset(msg);
 
-		(void)sshbuf_get_u32(msg, &status);
-		(void)sshbuf_get_cstring(msg, &errmsg, NULL);
-		/*
-		 * User-visible warning per the chunked-resume design:
-		 * server failure to hash a range indicates a problem on
-		 * the destination (FS corruption, concurrent modification,
-		 * permission change, etc.) and the user should know even
-		 * if the fallback transfer succeeds.
-		 */
-		logit_f("sftp-hash-range \"%s\": server reported error "
-		    "(%s); the destination may have storage / FS / "
-		    "permission issues — falling back to whole-file hash",
-		    path,
-		    (errmsg != NULL && *errmsg != '\0')
-		        ? errmsg : fx2txt(status));
-		free(errmsg);
-		goto out;
-	}
-	if (type != SSH2_FXP_EXTENDED_REPLY) {
-		logit_f("sftp-hash-range \"%s\": unexpected reply type %u; "
-		    "falling back to whole-file hash", path, type);
-		goto out;
-	}
-	if ((r = sshbuf_get_u32(msg, &num_hashes)) != 0) {
-		logit_f("sftp-hash-range \"%s\": parse num_hashes: %s; "
-		    "falling back to whole-file hash", path, ssh_err(r));
-		goto out;
-	}
-	if (num_hashes != n) {
-		logit_f("sftp-hash-range \"%s\": server returned %u hashes "
-		    "for %u ranges; falling back to whole-file hash",
-		    path, num_hashes, n);
-		goto out;
-	}
-	for (i = 0; i < n; i++) {
-		if ((r = sshbuf_get_u64(msg, &hashes_out[i])) != 0) {
-			logit_f("sftp-hash-range \"%s\": parse hash %u: %s; "
-			    "falling back to whole-file hash",
-			    path, i, ssh_err(r));
-			goto out;
+		if (get_msg(conn, msg) != 0) {
+			logit_f("sftp-hash-range \"%s\": transport receive "
+			    "failed; falling back to whole-file hash", path);
+			break;
 		}
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+			logit_f("sftp-hash-range \"%s\": parse reply header: "
+			    "%s; falling back to whole-file hash",
+			    path, ssh_err(r));
+			break;
+		}
+		if (rid != id) {
+			logit_f("sftp-hash-range \"%s\": reply id mismatch "
+			    "(got %u expected %u); falling back to "
+			    "whole-file hash", path, rid, id);
+			break;
+		}
+
+		if (type == SSH2_FXP_STATUS) {
+			u_int	 status = SSH2_FX_FAILURE;
+			char	*errmsg = NULL;
+
+			(void)sshbuf_get_u32(msg, &status);
+			(void)sshbuf_get_cstring(msg, &errmsg, NULL);
+			/*
+			 * User-visible warning per the chunked-resume design:
+			 * server failure to hash a range indicates a problem
+			 * on the destination (FS corruption, concurrent
+			 * modification, permission change, etc.) and the user
+			 * should know even if the fallback transfer succeeds.
+			 */
+			logit_f("sftp-hash-range \"%s\": server reported "
+			    "error (%s); the destination may have storage / "
+			    "FS / permission issues — falling back to "
+			    "whole-file hash",
+			    path,
+			    (errmsg != NULL && *errmsg != '\0')
+			        ? errmsg : fx2txt(status));
+			free(errmsg);
+			break;
+		}
+		if (type != SSH2_FXP_EXTENDED_REPLY) {
+			logit_f("sftp-hash-range \"%s\": unexpected reply "
+			    "type %u; falling back to whole-file hash",
+			    path, type);
+			break;
+		}
+		if ((r = sshbuf_get_u32(msg, &num_hashes)) != 0) {
+			logit_f("sftp-hash-range \"%s\": parse num_hashes: "
+			    "%s; falling back to whole-file hash",
+			    path, ssh_err(r));
+			break;
+		}
+
+		/*
+		 * Heartbeat reply: refresh the watchdog pause and wait for
+		 * the next message.  Real num_hashes is bounded by the
+		 * SFTP_HASH_RANGE_MAX_RANGES cap (65536), well below the
+		 * sentinel.
+		 */
+		if (num_hashes == HPN_NUM_HASHES_HEARTBEAT) {
+			debug3_f("sftp-hash-range \"%s\" id=%u heartbeat",
+			    path, id);
+			sftp_conn_watchdog_pause(conn,
+			    HPN_HEARTBEAT_REFRESH_SEC);
+			continue;
+		}
+
+		if (num_hashes != n) {
+			logit_f("sftp-hash-range \"%s\": server returned %u "
+			    "hashes for %u ranges; falling back to "
+			    "whole-file hash", path, num_hashes, n);
+			break;
+		}
+		for (i = 0; i < n; i++) {
+			if ((r = sshbuf_get_u64(msg, &hashes_out[i])) != 0) {
+				logit_f("sftp-hash-range \"%s\": parse hash "
+				    "%u: %s; falling back to whole-file "
+				    "hash", path, i, ssh_err(r));
+				rc = -1;
+				goto loop_done;
+			}
+		}
+
+		debug3_f("sftp-hash-range \"%s\": received %u hashes", path, n);
+		rc = 0;
+		break;
 	}
 
-	debug3_f("sftp-hash-range \"%s\": received %u hashes", path, n);
-	rc = 0;
+loop_done:
+	sftp_conn_watchdog_resume(conn);
 out:
 	sshbuf_free(msg);
 	return rc;
@@ -1646,7 +1666,7 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 	/* Pause the orchestrator watchdog for the combined local+remote
 	 * hash phase.  Auto-expires; explicit resume on every exit path
 	 * below for promptness. */
-	sftp_conn_watchdog_pause(conn, sftp_hpn_grace_for_hash(fsize));
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 
 	/* Local hashing: any I/O error here is a real local-file problem;
 	 * fall through to existing whole-file path (which will rediscover
@@ -1805,7 +1825,7 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 
 	/* Pause the orchestrator watchdog for the combined local+remote
 	 * hash phase.  Auto-expires; explicit resume on every exit path. */
-	sftp_conn_watchdog_pause(conn, sftp_hpn_grace_for_hash(fsize));
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 
 	/* Local hashing: the destination's current state (partial / sparse). */
 	for (i = 0; i < n_chunks; i++) {

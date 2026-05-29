@@ -1879,7 +1879,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * HPNVerifyTransfer is enabled).
 				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
-				    sftp_hpn_grace_for_hash(size));
+				    HPN_HEARTBEAT_REFRESH_SEC);
 				u_int32_t flags =
 				    sftp_conn_verify_transfer_enabled(conn)
 				    ? HPN_CHECK_FILE_STRICT : 0;
@@ -1932,8 +1932,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * but pass flags=0 for protocol completeness.
 				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
-				    sftp_hpn_grace_for_hash(
-				        (u_int64_t)st.st_size));
+				    HPN_HEARTBEAT_REFRESH_SEC);
 				lret = sftp_xxhash_local_fd(local_fd,
 				    (uint64_t)st.st_size, &local_hash);
 				rret = sftp_hash_remote_file(conn,
@@ -2461,39 +2460,73 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 		fatal_fr(r, "compose");
 	send_msg(conn, msg);
 
-	if (get_msg(conn, msg) != 0)
-		return -1;
-	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &rid)) != 0)
-		fatal_fr(r, "parse");
-	debug3_f("got response type=%u rid=%u (expected id=%u)", type, rid, id);
-	if (rid != id)
-		fatal("ID mismatch (%u != %u)", rid, id);
+	/*
+	 * Initial watchdog grace covers worker time spent here before the
+	 * first server heartbeat lands.  Each heartbeat received below
+	 * refreshes the pause for another HPN_HEARTBEAT_REFRESH_SEC, so the
+	 * orchestrator never kills us while the server is making forward
+	 * progress.  See sftp-hpn-server.h for the protocol.
+	 */
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 
-	if (type == SSH2_FXP_STATUS) {
-		u_int status;
-		char *errmsg = NULL;
+	for (;;) {
+		if (get_msg(conn, msg) != 0) {
+			sftp_conn_watchdog_resume(conn);
+			return -1;
+		}
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &rid)) != 0)
+			fatal_fr(r, "parse");
+		debug3_f("got response type=%u rid=%u (expected id=%u)",
+		    type, rid, id);
+		if (rid != id)
+			fatal("ID mismatch (%u != %u)", rid, id);
 
-		if ((r = sshbuf_get_u32(msg, &status)) != 0)
-			fatal_fr(r, "parse status");
-		/* consume error-message and language-tag to leave msg clean */
-		(void)sshbuf_get_cstring(msg, &errmsg, NULL);
-		(void)sshbuf_get_cstring(msg, NULL, NULL);
-		error("hpn-check-file \"%s\": %s", path,
-		    (errmsg != NULL && *errmsg != '\0') ? errmsg : fx2txt(status));
-		debug3_f("server returned status %u for \"%s\"", status, path);
-		free(errmsg);
-		return -1;
-	} else if (type != SSH2_FXP_EXTENDED_REPLY) {
-		fatal("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
-		    SSH2_FXP_EXTENDED_REPLY, type);
+		if (type == SSH2_FXP_STATUS) {
+			u_int status;
+			char *errmsg = NULL;
+
+			if ((r = sshbuf_get_u32(msg, &status)) != 0)
+				fatal_fr(r, "parse status");
+			/* consume error-message and language-tag to leave
+			 * msg clean */
+			(void)sshbuf_get_cstring(msg, &errmsg, NULL);
+			(void)sshbuf_get_cstring(msg, NULL, NULL);
+			error("hpn-check-file \"%s\": %s", path,
+			    (errmsg != NULL && *errmsg != '\0')
+			    ? errmsg : fx2txt(status));
+			debug3_f("server returned status %u for \"%s\"",
+			    status, path);
+			free(errmsg);
+			sftp_conn_watchdog_resume(conn);
+			return -1;
+		} else if (type != SSH2_FXP_EXTENDED_REPLY) {
+			fatal("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, "
+			    "got %u", SSH2_FXP_EXTENDED_REPLY, type);
+		}
+
+		if ((r = sshbuf_get_u64(msg, hash_out)) != 0)
+			fatal_fr(r, "parse hash");
+
+		/*
+		 * Heartbeat reply: refresh the watchdog pause and wait for
+		 * the next message.  Real hash values never collide with
+		 * the sentinel (probability 1/2^64).
+		 */
+		if (*hash_out == HPN_HASH_CHECK_FILE_HEARTBEAT) {
+			debug3_f("hpn-check-file heartbeat for \"%s\" id=%u",
+			    path, id);
+			sftp_conn_watchdog_pause(conn,
+			    HPN_HEARTBEAT_REFRESH_SEC);
+			continue;
+		}
+
+		debug3_f("remote hash of \"%s\" first %llu bytes: %016llx",
+		    path, (unsigned long long)length,
+		    (unsigned long long)*hash_out);
+		sftp_conn_watchdog_resume(conn);
+		return 0;
 	}
-
-	if ((r = sshbuf_get_u64(msg, hash_out)) != 0)
-		fatal_fr(r, "parse hash");
-	debug3_f("remote hash of \"%s\" first %llu bytes: %016llx",
-	    path, (unsigned long long)length, (unsigned long long)*hash_out);
-	return 0;
 }
 
 /*
@@ -2534,8 +2567,7 @@ sftp_verify_transfer(struct sftp_conn *conn, const char *local_path,
 		close(fd);
 		return -1;
 	}
-	sftp_hpn_watchdog_pause(conn->hpn,
-	    sftp_hpn_grace_for_hash((u_int64_t)sb.st_size));
+	sftp_hpn_watchdog_pause(conn->hpn, HPN_HEARTBEAT_REFRESH_SEC);
 	/*
 	 * Post-transfer integrity check: ALWAYS require the real XXH3, no
 	 * sparse-skip trust shortcut.  The purpose of this function is to
@@ -2845,8 +2877,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * resume() called explicitly on the success
 				 * paths below for promptness. */
 				sftp_hpn_watchdog_pause(conn->hpn,
-				    sftp_hpn_grace_for_hash(
-				        (u_int64_t)sb.st_size));
+				    HPN_HEARTBEAT_REFRESH_SEC);
 				/*
 				 * Sparse-skip path: ask the server first.  A
 				 * HPN_HASH_FULLY_ALLOCATED_SENTINEL response
@@ -2899,7 +2930,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				int lret, rret;
 
 				sftp_hpn_watchdog_pause(conn->hpn,
-				    sftp_hpn_grace_for_hash(c.size));
+				    HPN_HEARTBEAT_REFRESH_SEC);
 				lret = sftp_xxhash_local_fd(local_fd, c.size,
 				    &local_hash);
 				/* prefix-resume: length < st_size, sparse-skip

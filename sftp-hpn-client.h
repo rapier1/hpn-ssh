@@ -228,13 +228,15 @@ int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
  * called, bounding any "forgot to clear it" mistake to the declared
  * duration.  Safe to call from any thread.  No-op when hpn is NULL.
  *
- * Use sftp_hpn_grace_for_hash(size) when sizing for a verify-hash phase
- * on a file; the helper computes a conservative duration accounting for
- * disk read throughput (XXH3 itself is RAM-speed).
+ * Pass HPN_HEARTBEAT_REFRESH_SEC (from sftp-hpn-server.h) for the initial
+ * grace window when entering a hash extension call; the server emits
+ * heartbeats during long hashes and each one refreshes the pause for
+ * another HPN_HEARTBEAT_REFRESH_SEC — so the watchdog tracks actual
+ * server progress rather than a size-derived prediction that fell apart
+ * under parallel-worker disk contention.
  */
 void sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds);
 void sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn);
-unsigned int sftp_hpn_grace_for_hash(u_int64_t size_bytes);
 
 /*
  * Compute XXH3_64bits over bytes [offset, offset+length) of the open fd.

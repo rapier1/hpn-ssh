@@ -58,6 +58,46 @@
 	((u_int64_t)0xDEADBEEFCAFEBABEULL)
 #define HPN_CHECK_FILE_STRICT		0x00000001U
 
+/*
+ * Heartbeat protocol for long-running HPN hash extensions (19.0):
+ *
+ * Server-side hash loops (process_extended_hpn_check_file in sftp-server.c
+ * and process_hpn_hash_range in this file) emit a tiny "still working"
+ * reply on the SFTP out-queue every HPN_HEARTBEAT_EMIT_INTERVAL_SEC seconds
+ * of elapsed wall time inside the inner read+hash loop.  The client treats
+ * each heartbeat as proof of life and refreshes the orchestrator's
+ * watchdog-pause window to HPN_HEARTBEAT_REFRESH_SEC from now.
+ *
+ * Heartbeat wire format is the EXTENDED_REPLY shape of the underlying
+ * extension, with a reserved sentinel in the "result" field:
+ *
+ *   hpn-check-file heartbeat:   u8 EXTENDED_REPLY | u32 id |
+ *                               u64 HPN_HASH_CHECK_FILE_HEARTBEAT
+ *   sftp-hash-range heartbeat:  u8 EXTENDED_REPLY | u32 id |
+ *                               u32 HPN_NUM_HASHES_HEARTBEAT
+ *
+ * Each sentinel is impossible as a real result:
+ *   - HPN_HASH_CHECK_FILE_HEARTBEAT collides with a real XXH3_64 with
+ *     probability 1/2^64;
+ *   - HPN_NUM_HASHES_HEARTBEAT is well above SFTP_HASH_RANGE_MAX_RANGES
+ *     (65536), so it can never appear as a legitimate count.
+ *
+ * The heartbeat replaces the brittle grace-formula model that estimated
+ * hash duration from file size and assumed 1 GB/s disk read.  Under
+ * parallel-worker contention on a single device, that assumption was off
+ * by ~4x and triggered watchdog-driven worker kills mid-hash.  With
+ * heartbeats, the watchdog timeout (HPN_HEARTBEAT_REFRESH_SEC) is
+ * "how long without any word from the server" — independent of file size
+ * or disk speed.
+ *
+ * Within 19.0 both ends always speak heartbeats; no negotiation needed.
+ */
+#define HPN_HEARTBEAT_EMIT_INTERVAL_SEC	5u
+#define HPN_HEARTBEAT_REFRESH_SEC	30u
+#define HPN_HASH_CHECK_FILE_HEARTBEAT \
+	((u_int64_t)0xC0FFEEDEADBEEF42ULL)
+#define HPN_NUM_HASHES_HEARTBEAT	0xFFFFFFFEU
+
 struct sshbuf;
 
 /*
