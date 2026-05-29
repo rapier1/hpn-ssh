@@ -92,4 +92,17 @@ void sftp_conn_watchdog_resume(struct sftp_conn *conn);
 void sftp_conn_set_verify_transfer(struct sftp_conn *conn, int enabled);
 int  sftp_conn_verify_transfer_enabled(struct sftp_conn *conn);
 
+/*
+ * Cumulative SFTP-payload bytes that actually crossed the wire on this
+ * connection — SSH2_FXP_WRITE payload sent (uploads) + SSH2_FXP_DATA
+ * payload received (downloads).  Excludes SSH framing / cipher overhead.
+ * Distinct from the worker's "work-units completed in bytes" counter,
+ * which counts the full file size even when chunked-resume verified the
+ * file already matched and skipped the transfer.  Read by the parallel
+ * orchestrator at session end so the reporter can show both "resolved"
+ * and "wired" so operators see what actually flowed.  Returns 0 if
+ * conn or conn->hpn is NULL.  Safe to call from any thread.
+ */
+uint64_t sftp_conn_bytes_wired(struct sftp_conn *conn);
+
 #endif /* _SFTP_CLIENT_INTERNAL_H */

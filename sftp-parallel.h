@@ -350,6 +350,18 @@ struct sftp_parallel_stats {
 	size_t   queue_capacity;
 	size_t   queue_high_watermark;
 	uint64_t bytes_total_aggregate;
+	/*
+	 * Cumulative SFTP payload bytes that actually crossed the wire
+	 * across all workers (uploads: SSH2_FXP_WRITE payload sent;
+	 * downloads: SSH2_FXP_DATA payload received).  Distinct from
+	 * bytes_total_aggregate, which counts the full size of every
+	 * successfully resolved work unit even when chunked-resume verified
+	 * the data already matched and skipped the transfer.  Use this when
+	 * reporting "what actually moved" vs bytes_total_aggregate's "what
+	 * was resolved."  Sourced from sftp_conn_bytes_wired() on each
+	 * worker's conn.
+	 */
+	uint64_t bytes_wired_aggregate;
 	uint64_t units_completed_aggregate;
 	uint64_t units_failed_aggregate;
 	/* Files the recursive walker dropped before submission

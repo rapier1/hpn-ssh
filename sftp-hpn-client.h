@@ -96,6 +96,18 @@ struct sftp_hpn_conn {
 	 * trust optimisation, not just the post-transfer integrity check. */
 	int              verify_transfer_enabled;
 
+	/* Cumulative SFTP payload bytes that actually crossed the wire on
+	 * this connection: incremented after each successful SSH2_FXP_WRITE
+	 * send (uploads) and SSH2_FXP_DATA payload receive (downloads).
+	 * Excludes SSH framing and cipher overhead and is uncorrelated with
+	 * the worker's "work units completed" byte count, which counts the
+	 * full unit size even when chunked-resume verified the data already
+	 * matched on the remote (zero wire bytes).  Read by the parallel
+	 * orchestrator at session end to report "X resolved, Y wired" so the
+	 * throughput line reflects what actually moved, not what was visited.
+	 * Atomic add; safe from any thread. */
+	volatile uint64_t bytes_wired_payload;
+
 	/* Adaptive read-ahead controller — sizes the in-flight request
 	 * window to the path BDP instead of a flat num_requests. */
 	struct sftp_rdahead rd;
@@ -108,6 +120,20 @@ struct sftp_hpn_conn {
 	uint64_t fault_bytes_sent;     /* bytes sent so far on this connection */
 #endif
 };
+
+/*
+ * Account `n` payload bytes that just left this connection on a
+ * SSH2_FXP_WRITE (upload) or arrived on a SSH2_FXP_DATA (download).
+ * Safe with hpn==NULL (no-op) and n==0 (no-op).  Atomic; safe from any
+ * thread.  Read back via sftp_conn_bytes_wired() (sftp-client-internal.h).
+ */
+static inline void
+sftp_hpn_bytes_wired_add(struct sftp_hpn_conn *hpn, uint64_t n)
+{
+	if (hpn == NULL || n == 0)
+		return;
+	__atomic_fetch_add(&hpn->bytes_wired_payload, n, __ATOMIC_RELAXED);
+}
 
 /* Allocate and initialise a zeroed sftp_hpn_conn. Never returns NULL. */
 /* Allocate and initialise a zeroed sftp_hpn_conn. Never returns NULL. */

@@ -4456,7 +4456,7 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	memset(out, 0, sizeof(*out));
 	if (p == NULL) return;
 
-	uint64_t b = 0, c = 0, f = 0;
+	uint64_t b = 0, c = 0, f = 0, w_bytes_wired = 0;
 	pthread_mutex_lock(&p->workers_mu);
 	out->num_workers        = p->num_workers;
 	out->protocol_violations = p->protocol_violations;
@@ -4467,11 +4467,17 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 		b += w->bytes_total;
 		c += w->units_completed;
 		f += w->units_failed;
+		/* Snapshot the conn's wired-bytes counter outside the worker
+		 * mutex if conn can race — but conn lifetime is tied to the
+		 * worker, so reading under the worker mutex is fine and we
+		 * already hold it. */
+		w_bytes_wired += sftp_conn_bytes_wired(w->conn);
 		pthread_mutex_unlock(&w->mu);
 	}
 	pthread_mutex_unlock(&p->workers_mu);
 
 	out->bytes_total_aggregate = b;
+	out->bytes_wired_aggregate = w_bytes_wired;
 	out->units_completed_aggregate = c;
 	out->units_failed_aggregate = f;
 	out->walker_failures_aggregate =

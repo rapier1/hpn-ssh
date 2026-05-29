@@ -760,17 +760,48 @@ parallel_flush(void)
 	 * so the signal isn't buried under a long failed-paths list. */
 	if (pstats.elapsed_ms > 0 && pstats.bytes_total_aggregate > 0) {
 		double secs   = pstats.elapsed_ms / 1000.0;
-		double mibps  = (double)pstats.bytes_total_aggregate
-		    / (1024.0 * 1024.0) / secs;
-		double bytes  = (double)pstats.bytes_total_aggregate;
-		const char *size_unit;
-		double size_val;
-		if (bytes >= 1024.0 * 1024.0 * 1024.0) {
-			size_val  = bytes / (1024.0 * 1024.0 * 1024.0);
-			size_unit = "GiB";
+		double wired  = (double)pstats.bytes_wired_aggregate;
+		/*
+		 * Primary number is bytes actually transferred (wired) and
+		 * throughput is computed against it — operators care about
+		 * what moved over the network, not what was visited.  When
+		 * chunked-resume or prefix-resume avoided pushing bytes that
+		 * were already correct on the peer, we tack on a "Y skipped
+		 * via resume" beat so the savings are visible.  No beat is
+		 * emitted for fresh transfers where nothing was skippable.
+		 */
+		double mibps  = wired > 0
+		    ? wired / (1024.0 * 1024.0) / secs : 0.0;
+		uint64_t skipped_b =
+		    pstats.bytes_total_aggregate > pstats.bytes_wired_aggregate
+		    ? pstats.bytes_total_aggregate - pstats.bytes_wired_aggregate
+		    : 0;
+		const char *wired_unit;
+		double wired_val;
+		if (wired >= 1024.0 * 1024.0 * 1024.0) {
+			wired_val  = wired / (1024.0 * 1024.0 * 1024.0);
+			wired_unit = "GiB";
 		} else {
-			size_val  = bytes / (1024.0 * 1024.0);
-			size_unit = "MiB";
+			wired_val  = wired / (1024.0 * 1024.0);
+			wired_unit = "MiB";
+		}
+		char skipped_str[64];
+		skipped_str[0] = '\0';
+		if (skipped_b > 0) {
+			double skipped_d = (double)skipped_b;
+			const char *skipped_unit;
+			double skipped_val;
+			if (skipped_d >= 1024.0 * 1024.0 * 1024.0) {
+				skipped_val  = skipped_d /
+				    (1024.0 * 1024.0 * 1024.0);
+				skipped_unit = "GiB";
+			} else {
+				skipped_val  = skipped_d / (1024.0 * 1024.0);
+				skipped_unit = "MiB";
+			}
+			snprintf(skipped_str, sizeof(skipped_str),
+			    "; %.2f %s skipped via resume",
+			    skipped_val, skipped_unit);
 		}
 		int j         = pstats.num_workers > 0
 		    ? pstats.num_workers : parallel_num_streams;
@@ -780,15 +811,17 @@ parallel_flush(void)
 		     respawn_hint_threshold > 0)
 		    ? " \xe2\x80\x94 consider lowering -j" : "";
 		if (pstats.total_respawns > 0) {
-			logit("Parallel streams: %.2f %s in %.1fs (%.0f MiB/s); "
-			    "%d worker respawn%s%s",
-			    size_val, size_unit, secs, mibps,
+			logit("Parallel streams: %.2f %s transferred in %.1fs "
+			    "(%.0f MiB/s)%s; %d worker respawn%s%s",
+			    wired_val, wired_unit, secs, mibps,
+			    skipped_str,
 			    pstats.total_respawns,
 			    pstats.total_respawns == 1 ? "" : "s",
 			    churn_hint);
 		} else {
-			logit("Parallel streams: %.2f %s in %.1fs (%.0f MiB/s)",
-			    size_val, size_unit, secs, mibps);
+			logit("Parallel streams: %.2f %s transferred in %.1fs "
+			    "(%.0f MiB/s)%s",
+			    wired_val, wired_unit, secs, mibps, skipped_str);
 		}
 	}
 

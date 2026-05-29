@@ -1927,9 +1927,19 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				/*
 				 * Partial local file: hash the overlapping
 				 * prefix to decide resume (continue) vs
-				 * restart (truncate).  Sparse-skip can't fire
-				 * here because length < st_size on the server,
-				 * but pass flags=0 for protocol completeness.
+				 * restart (truncate).  Must pass
+				 * HPN_CHECK_FILE_STRICT: the server's
+				 * sparse-skip optimisation fires when
+				 * length == st.st_size on the *remote* (the
+				 * server has no knowledge of local size).
+				 * For a prefix-resume request the client
+				 * deliberately asks for length == remote
+				 * st_size, which would mis-trigger
+				 * sparse-skip and return a sentinel that the
+				 * client treats as a hash mismatch — forcing
+				 * a full re-transfer of bytes already on the
+				 * peer.  Strict suppresses the sentinel and
+				 * yields the real prefix hash to compare.
 				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
@@ -1937,7 +1947,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				    (uint64_t)st.st_size, &local_hash);
 				rret = sftp_hash_remote_file(conn,
 				    remote_path, (uint64_t)st.st_size,
-				    0u, &remote_hash);
+				    HPN_CHECK_FILE_STRICT, &remote_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
@@ -2052,6 +2062,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			if (len > req->len)
 				fatal("Received more data than asked for "
 				    "%zu > %zu", len, req->len);
+			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
 			lmodified = 1;
 			if ((lseek(local_fd, req->offset, SEEK_SET) == -1 ||
 			    atomicio(vwrite, local_fd, data, len) != len) &&
@@ -2659,6 +2670,7 @@ do_upload_body(struct sftp_conn *conn,
 				fatal_fr(r, "compose");
 			if (send_msg(conn, msg) != 0)
 				break;
+			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
 			debug3("Sent message SSH2_FXP_WRITE I:%u O:%llu S:%u",
 			    id, (unsigned long long)offset, len);
 		} else if (TAILQ_FIRST(&acks) == NULL)
@@ -2933,10 +2945,22 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				    HPN_HEARTBEAT_REFRESH_SEC);
 				lret = sftp_xxhash_local_fd(local_fd, c.size,
 				    &local_hash);
-				/* prefix-resume: length < st_size, sparse-skip
-				 * can't fire; flags=0. */
+				/*
+				 * Must pass HPN_CHECK_FILE_STRICT here: the
+				 * server's sparse-skip optimisation triggers
+				 * on length == st.st_size of the *remote*
+				 * file (the server has no knowledge of local
+				 * size).  For prefix-resume the client asks
+				 * for length == remote_st_size, which fits
+				 * the sparse-skip condition exactly and would
+				 * return the sentinel — which the client then
+				 * treats as a hash mismatch, forcing a full
+				 * re-transfer of bytes already present on the
+				 * remote.  Strict suppresses the sentinel and
+				 * yields the real prefix XXH3.
+				 */
 				rret = sftp_hash_remote_file(conn, remote_path,
-				    c.size, 0u, &remote_hash);
+				    c.size, HPN_CHECK_FILE_STRICT, &remote_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				debug3_f("lret=%d rret=%d local_hash=%016llx "
 				    "remote_hash=%016llx match=%d",
@@ -3380,6 +3404,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			    (r = sshbuf_put_string(msg, data, (size_t)len)) != 0)
 				fatal_fr(r, "compose write");
 			send_msg(conn, msg);
+			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
 
 			offset    += len;
 			bytes_left -= len;
@@ -3544,6 +3569,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			if (len > req->len)
 				fatal("received more data than requested "
 				    "%zu > %zu", len, req->len);
+			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
 			if ((lseek(local_fd, (off_t)req->offset,
 			    SEEK_SET) == -1 ||
 			    atomicio(vwrite, local_fd, data, len) != len) &&
@@ -3948,6 +3974,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 			    (r = sshbuf_put_string(msg, data, len)) != 0)
 				fatal_fr(r, "compose batch write");
 			send_msg(conn, msg);
+			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
 			sshbuf_free(msg);
 		}
 		free(data);
@@ -4234,6 +4261,15 @@ sftp_conn_verify_transfer_enabled(struct sftp_conn *conn)
 	    conn->hpn->verify_transfer_enabled;
 }
 
+uint64_t
+sftp_conn_bytes_wired(struct sftp_conn *conn)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return 0;
+	return __atomic_load_n(&conn->hpn->bytes_wired_payload,
+	    __ATOMIC_RELAXED);
+}
+
 static void
 handle_dest_replies(struct sftp_conn *to, const char *to_path, int synchronous,
     u_int *nreqsp, u_int *write_errorp)
@@ -4443,6 +4479,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 			if (len > req->len)
 				fatal("Received more data than asked for "
 				    "%zu > %zu", len, req->len);
+			sftp_hpn_bytes_wired_add(from->hpn, (uint64_t)len);
 
 			/* Write this chunk out to the destination */
 			sshbuf_reset(msg);
@@ -4454,6 +4491,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 			    (r = sshbuf_put_string(msg, data, len)) != 0)
 				fatal_fr(r, "compose write");
 			send_msg(to, msg);
+			sftp_hpn_bytes_wired_add(to->hpn, (uint64_t)len);
 			debug3("Sent message SSH2_FXP_WRITE I:%u O:%llu S:%zu",
 			    id, (unsigned long long)offset, len);
 			num_upload_req++;
