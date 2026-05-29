@@ -62,4 +62,23 @@ u_int sftp_conn_alloc_msg_id(struct sftp_conn *conn);
  */
 void sftp_conn_set_dead(struct sftp_conn *conn);
 
+/*
+ * Atomic-load and return the watchdog-pause deadline for this
+ * connection (monotonic nanoseconds), or 0 if no pause is active.
+ * Used by the parallel orchestrator's watchdog to decide whether to
+ * suppress its inactivity-based heuristics for this worker.  Safe to
+ * call from any thread.  Returns 0 if conn or conn->hpn is NULL.
+ */
+uint64_t sftp_conn_watchdog_pause_until_ns(struct sftp_conn *conn);
+
+/*
+ * Conn-side wrappers around sftp_hpn_watchdog_pause/_resume.  Let HPN
+ * extension code that works through the opaque struct sftp_conn * (the
+ * chunked-resume helpers, the bundle path, etc.) pause/resume the
+ * watchdog without needing to extract conn->hpn manually.  No-op when
+ * conn or conn->hpn is NULL.
+ */
+void sftp_conn_watchdog_pause(struct sftp_conn *conn, unsigned int seconds);
+void sftp_conn_watchdog_resume(struct sftp_conn *conn);
+
 #endif /* _SFTP_CLIENT_INTERNAL_H */

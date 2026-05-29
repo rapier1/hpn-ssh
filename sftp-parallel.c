@@ -53,6 +53,7 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
+#include "sftp-client-internal.h"	/* sftp_conn_watchdog_pause_until_ns */
 #include "sftp-workqueue.h"
 #include "sftp-parallel.h"
 
@@ -2659,6 +2660,26 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		}
 
 		/*
+		 * Watchdog pause: a code path on the worker side (typically
+		 * a verify-hash phase, but the primitive is generic) has
+		 * declared a window of legitimate non-byte-transfer work via
+		 * sftp_hpn_watchdog_pause().  Suppress every inactivity-based
+		 * heuristic below — none of them can tell "stuck" from
+		 * "legitimately quiet" during the declared window.  The
+		 * SSH-child-gone check above still ran; that's the only
+		 * positive-death signal and never gets suppressed.
+		 *
+		 * Atomic load, no lock — paused_until_ns is written by the
+		 * worker thread and read here from the watchdog thread.
+		 */
+		if (next != WORKER_DEAD) {
+			uint64_t paused_until =
+			    sftp_conn_watchdog_pause_until_ns(w->conn);
+			if (paused_until > now)
+				goto inactivity_checks_done;
+		}
+
+		/*
 		 * Born-dead fast-kill.  Worker popped a unit but has zero
 		 * forward progress (no completions, no bytes ever, no live
 		 * bytes on the current unit) for BORN_DEAD_KILL_SEC.  This is
@@ -2817,6 +2838,15 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			next = WORKER_DEAD;
 		}
 
+	inactivity_checks_done:
+		/*
+		 * Past this point: state-transition logging, doom (SIGTERM),
+		 * and SIGKILL escalation.  All three honor whatever value
+		 * `next` has now (whether set by an inactivity heuristic
+		 * above OR by the SSH-child-gone check, which fires
+		 * regardless of pause).  None of them is an inactivity
+		 * inference, so pause is no longer relevant.
+		 */
 		if (next != prev) {
 			pthread_mutex_lock(&w->mu);
 			w->health = next;

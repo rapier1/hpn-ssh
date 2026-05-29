@@ -1867,10 +1867,13 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * and re-download.  Closes the crash-resume
 				 * sparse-hole corruption gap.
 				 */
+				sftp_hpn_watchdog_pause(conn->hpn,
+				    sftp_hpn_grace_for_hash(size));
 				lret = sftp_xxhash_local_fd(local_fd,
 				    size, &local_hash);
 				rret = sftp_hash_remote_file(conn,
 				    remote_path, size, &remote_hash);
+				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
 					debug("verified transfer: "
@@ -1902,11 +1905,15 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * prefix to decide resume (continue) vs
 				 * restart (truncate).
 				 */
+				sftp_hpn_watchdog_pause(conn->hpn,
+				    sftp_hpn_grace_for_hash(
+				        (u_int64_t)st.st_size));
 				lret = sftp_xxhash_local_fd(local_fd,
 				    (uint64_t)st.st_size, &local_hash);
 				rret = sftp_hash_remote_file(conn,
 				    remote_path, (uint64_t)st.st_size,
 				    &remote_hash);
+				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
 					debug("verified resume: prefix "
@@ -2500,10 +2507,13 @@ sftp_verify_transfer(struct sftp_conn *conn, const char *local_path,
 		close(fd);
 		return -1;
 	}
+	sftp_hpn_watchdog_pause(conn->hpn,
+	    sftp_hpn_grace_for_hash((u_int64_t)sb.st_size));
 	if (sftp_xxhash_local_fd(fd, (uint64_t)sb.st_size, &local_hash) == 0 &&
 	    sftp_hash_remote_file(conn, remote_path, (uint64_t)sb.st_size,
 	    &remote_hash) == 0)
 		r = (local_hash == remote_hash) ? 0 : 1;
+	sftp_hpn_watchdog_resume(conn->hpn);
 	close(fd);
 	debug3_f("verify \"%s\": local=%016llx remote=%016llx result=%d",
 	    remote_path, (unsigned long long)local_hash,
@@ -2794,10 +2804,21 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				uint64_t local_hash, remote_hash;
 				int lret, rret;
 
+				/* Hashing on both ends is legitimate
+				 * non-byte-transfer work; pause the
+				 * orchestrator watchdog for the duration so
+				 * its born-dead / silence heuristics don't
+				 * kill the worker mid-hash.  Auto-expires;
+				 * resume() called explicitly on the success
+				 * paths below for promptness. */
+				sftp_hpn_watchdog_pause(conn->hpn,
+				    sftp_hpn_grace_for_hash(
+				        (u_int64_t)sb.st_size));
 				lret = sftp_xxhash_local_fd(local_fd,
 				    sb.st_size, &local_hash);
 				rret = sftp_hash_remote_file(conn, remote_path,
 				    sb.st_size, &remote_hash);
+				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
 					debug("verified transfer: full-file hash "
@@ -2823,10 +2844,13 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				uint64_t local_hash, remote_hash;
 				int lret, rret;
 
+				sftp_hpn_watchdog_pause(conn->hpn,
+				    sftp_hpn_grace_for_hash(c.size));
 				lret = sftp_xxhash_local_fd(local_fd, c.size,
 				    &local_hash);
 				rret = sftp_hash_remote_file(conn, remote_path,
 				    c.size, &remote_hash);
+				sftp_hpn_watchdog_resume(conn->hpn);
 				debug3_f("lret=%d rret=%d local_hash=%016llx "
 				    "remote_hash=%016llx match=%d",
 				    lret, rret,
@@ -4071,6 +4095,38 @@ sftp_conn_set_dead(struct sftp_conn *conn)
 {
 	if (conn != NULL && conn->hpn != NULL)
 		conn->hpn->dead = 1;
+}
+
+/* Atomic read of the watchdog-pause deadline.  Public accessor so the
+ * parallel orchestrator (which only sees an opaque struct sftp_conn *)
+ * can consult it from the watchdog thread without reaching into the
+ * struct directly.  Returns 0 if no pause is active or hpn is missing.
+ * Declared in sftp-client-internal.h. */
+uint64_t
+sftp_conn_watchdog_pause_until_ns(struct sftp_conn *conn)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return 0;
+	return __atomic_load_n(&conn->hpn->watchdog_pause_until_ns,
+	    __ATOMIC_RELAXED);
+}
+
+/* Conn-side wrappers around sftp_hpn_watchdog_pause/_resume.  Declared in
+ * sftp-client-internal.h.  Let HPN extension code that works through the
+ * opaque struct sftp_conn * pause/resume the watchdog without needing to
+ * extract conn->hpn directly. */
+void
+sftp_conn_watchdog_pause(struct sftp_conn *conn, unsigned int seconds)
+{
+	if (conn != NULL)
+		sftp_hpn_watchdog_pause(conn->hpn, seconds);
+}
+
+void
+sftp_conn_watchdog_resume(struct sftp_conn *conn)
+{
+	if (conn != NULL)
+		sftp_hpn_watchdog_resume(conn->hpn);
 }
 
 static void

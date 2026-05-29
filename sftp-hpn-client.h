@@ -78,6 +78,16 @@ struct sftp_hpn_conn {
 	 * (non-parallel) mode. */
 	volatile uint64_t *live_counter;
 
+	/* Watchdog pause: monotonic-ns deadline before which the parallel
+	 * orchestrator's inactivity-based heuristics (born-dead, silence,
+	 * isolation, throughput-outlier, born-slow) suppress for this
+	 * worker.  The SSH-child-gone check still fires regardless.  Set by
+	 * sftp_hpn_watchdog_pause() before a long non-byte-transfer
+	 * operation (verify-hash, fsync after large write, bundle
+	 * accumulate/extract, etc.), cleared by sftp_hpn_watchdog_resume()
+	 * or auto-expires.  Atomic load/store; safe from any thread. */
+	volatile uint64_t watchdog_pause_until_ns;
+
 	/* Adaptive read-ahead controller — sizes the in-flight request
 	 * window to the path BDP instead of a flat num_requests. */
 	struct sftp_rdahead rd;
@@ -191,6 +201,32 @@ struct sftp_conn;
  */
 int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
     const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out);
+
+/*
+ * Watchdog pause: tell the parallel orchestrator's worker-fault watchdog
+ * that this worker is about to spend up to `seconds` doing legitimate
+ * non-byte-transfer work (typically a verify-hash phase, but the primitive
+ * is generic — any code path that knows it will be quiet on the SFTP wire
+ * for an extended interval can use it).  The watchdog suppresses its
+ * inactivity-based kills (born-dead, silence, isolation escalation,
+ * throughput-outlier, born-slow) until the deadline expires or
+ * sftp_hpn_watchdog_resume() is called.  The SSH-child-gone check continues
+ * to fire regardless — pause cannot save a worker whose ssh transport has
+ * physically exited.
+ *
+ * Multiple calls extend the pause to the LATER of the existing deadline
+ * and the new deadline; a shorter pause can never shrink a longer one
+ * already in flight.  Auto-expires at the deadline if resume is never
+ * called, bounding any "forgot to clear it" mistake to the declared
+ * duration.  Safe to call from any thread.  No-op when hpn is NULL.
+ *
+ * Use sftp_hpn_grace_for_hash(size) when sizing for a verify-hash phase
+ * on a file; the helper computes a conservative duration accounting for
+ * disk read throughput (XXH3 itself is RAM-speed).
+ */
+void sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds);
+void sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn);
+unsigned int sftp_hpn_grace_for_hash(u_int64_t size_bytes);
 
 /*
  * Compute XXH3_64bits over bytes [offset, offset+length) of the open fd.

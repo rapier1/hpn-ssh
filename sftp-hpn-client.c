@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -183,6 +184,94 @@ sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
 		    (unsigned long long)fi_pv_state.threshold);
 	}
 #endif /* HPN_FAULT_INJECTION */
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Watchdog pause primitive (HPN).  Lets a worker tell the parallel
+ * orchestrator's watchdog that it's about to be busy with legitimate
+ * non-byte-transfer work (verify-hash phase, fsync after large write,
+ * bundle accumulate/extract, etc.) for up to N seconds.  Watchdog
+ * suppresses its inactivity-based heuristics for this worker until the
+ * deadline expires; the SSH-child-gone check still fires regardless.
+ * See sftp-hpn-client.h for full semantics.
+ *
+ * Used now by the verify-hash path in sftp_upload / sftp_download / the
+ * chunked-resume helpers / sftp_verify_transfer.  Designed to be reusable
+ * for any future operation that legitimately pauses byte flow on the SFTP
+ * wire for an extended interval.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/* Local CLOCK_MONOTONIC reader.  Mirrors the static monotonic_ns() in
+ * sftp-parallel.c — kept inline here rather than exposing a shared symbol,
+ * since this file already has its own time-related primitives. */
+static uint64_t
+sftp_hpn_monotonic_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+void
+sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds)
+{
+	uint64_t deadline_ns;
+	uint64_t cur;
+
+	if (hpn == NULL)
+		return;
+
+	deadline_ns = sftp_hpn_monotonic_ns() +
+	    (uint64_t)seconds * 1000000000ULL;
+
+	/*
+	 * Extend, never shrink.  A shorter pause arriving while a longer
+	 * pause is in flight must not undo the longer one (think: two
+	 * different code paths each declaring their grace; whichever needs
+	 * more time should win).
+	 */
+	cur = __atomic_load_n(&hpn->watchdog_pause_until_ns,
+	    __ATOMIC_RELAXED);
+	if (deadline_ns > cur) {
+		__atomic_store_n(&hpn->watchdog_pause_until_ns,
+		    deadline_ns, __ATOMIC_RELAXED);
+	}
+}
+
+void
+sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
+{
+	if (hpn == NULL)
+		return;
+	__atomic_store_n(&hpn->watchdog_pause_until_ns, 0,
+	    __ATOMIC_RELAXED);
+}
+
+unsigned int
+sftp_hpn_grace_for_hash(u_int64_t size_bytes)
+{
+	/*
+	 * Conservative disk-read floor: 1 GB/s (= 10^9 B/s).  XXH3 itself
+	 * is RAM-speed (~30 GB/s); the bottleneck for hashing a file is
+	 * always disk read on whichever end is slower.  Modern HPN
+	 * deployments (Lustre/GPFS, NVMe, multi-stripe parallel FS) routinely
+	 * beat 1 GB/s; we use it as a safety margin for slower setups
+	 * (single-stripe Lustre, contended FS, SATA SSD).
+	 *
+	 * Grace = ceil(size / 1 GB/s) + 30 s headroom for protocol round
+	 * trips and brief stalls.  At the chunked-resume MAX file-size cap
+	 * (CHUNK_HASH_MAX_FILE_SIZE = 50 GiB) this is ~80 s, well within a
+	 * sensible watchdog grace window.
+	 *
+	 * Caller may need a longer grace if it knows its environment has
+	 * slower-than-1-GB/s storage; this default is the conservative
+	 * floor a generic caller can rely on.
+	 */
+	unsigned int secs;
+
+	secs = (unsigned int)(size_bytes /
+	    (1024ULL * 1024ULL * 1024ULL)) + 1u;
+	return secs + 30u;
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -1471,6 +1560,22 @@ out:
 #define CHUNK_HASH_CHUNK_SIZE			((u_int64_t)(64ULL * 1024ULL * 1024ULL))
 #define CHUNK_HASH_MIN_FILE_SIZE		((u_int64_t)(2ULL * CHUNK_HASH_CHUNK_SIZE))
 #define CHUNK_HASH_MAX_RANGES_PER_REQUEST	65536U
+/*
+ * Conservative file-size cap above which chunked resume declines and falls
+ * through to the existing whole-file gate (or to a fresh full re-transfer if
+ * that fails).  Rationale: chunked-resume's value is bounded by the
+ * cost-benefit formula f > BW/D (fraction-transferred must exceed the
+ * network/disk-read ratio); above a certain file size at moderate network
+ * speeds, the hash phase eats most of the bandwidth savings and the
+ * watchdog pause window becomes unwieldy.  See
+ * [[project_chunked_resume_plan]] memory for the math and the deferred
+ * tier 2/3 cost-benefit gate that would replace this static cap with a
+ * regime-aware decision.  50 GiB is a defensible default: at 1 GB/s
+ * conservative hash rate the hash phase tops out around 50 s, well within
+ * a sensible watchdog grace window.
+ */
+#define CHUNK_HASH_MAX_FILE_SIZE \
+	((u_int64_t)(50ULL * 1024ULL * 1024ULL * 1024ULL))	/* 50 GiB */
 
 int
 sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
@@ -1499,6 +1604,14 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 		debug_f("file \"%s\" size %llu below chunked threshold %llu; "
 		    "declining", local_path, (unsigned long long)fsize,
 		    (unsigned long long)CHUNK_HASH_MIN_FILE_SIZE);
+		return -1;
+	}
+	if (fsize > CHUNK_HASH_MAX_FILE_SIZE) {
+		debug_f("file \"%s\" size %llu exceeds chunked-resume cap %llu; "
+		    "declining to keep hash phase bounded (above this the "
+		    "cost-benefit math may favor full re-transfer)",
+		    local_path, (unsigned long long)fsize,
+		    (unsigned long long)CHUNK_HASH_MAX_FILE_SIZE);
 		return -1;
 	}
 
@@ -1530,6 +1643,11 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 		    ? remain : CHUNK_HASH_CHUNK_SIZE;
 	}
 
+	/* Pause the orchestrator watchdog for the combined local+remote
+	 * hash phase.  Auto-expires; explicit resume on every exit path
+	 * below for promptness. */
+	sftp_conn_watchdog_pause(conn, sftp_hpn_grace_for_hash(fsize));
+
 	/* Local hashing: any I/O error here is a real local-file problem;
 	 * fall through to existing whole-file path (which will rediscover
 	 * the same error and report it to the user). */
@@ -1539,6 +1657,7 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 			error_f("local hash failed at chunk %u offset %llu "
 			    "for \"%s\"", i,
 			    (unsigned long long)ranges[i].off, local_path);
+			sftp_conn_watchdog_resume(conn);
 			goto out;
 		}
 	}
@@ -1546,8 +1665,11 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 	/* Remote hashing: all-or-nothing.  Helper emits the user-visible
 	 * warning on failure. */
 	if (sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n_chunks,
-	    remote_hashes) != 0)
+	    remote_hashes) != 0) {
+		sftp_conn_watchdog_resume(conn);
 		goto out;
+	}
+	sftp_conn_watchdog_resume(conn);
 
 	for (i = 0; i < n_chunks; i++) {
 		if (local_hashes[i] != remote_hashes[i])
@@ -1646,6 +1768,14 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 		    (unsigned long long)CHUNK_HASH_MIN_FILE_SIZE);
 		return -1;
 	}
+	if (fsize > CHUNK_HASH_MAX_FILE_SIZE) {
+		debug_f("file \"%s\" size %llu exceeds chunked-resume cap %llu; "
+		    "declining to keep hash phase bounded (above this the "
+		    "cost-benefit math may favor full re-transfer)",
+		    local_path, (unsigned long long)fsize,
+		    (unsigned long long)CHUNK_HASH_MAX_FILE_SIZE);
+		return -1;
+	}
 
 	n_chunks = (u_int)((fsize + CHUNK_HASH_CHUNK_SIZE - 1) /
 	    CHUNK_HASH_CHUNK_SIZE);
@@ -1673,6 +1803,10 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 		    ? remain : CHUNK_HASH_CHUNK_SIZE;
 	}
 
+	/* Pause the orchestrator watchdog for the combined local+remote
+	 * hash phase.  Auto-expires; explicit resume on every exit path. */
+	sftp_conn_watchdog_pause(conn, sftp_hpn_grace_for_hash(fsize));
+
 	/* Local hashing: the destination's current state (partial / sparse). */
 	for (i = 0; i < n_chunks; i++) {
 		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
@@ -1680,6 +1814,7 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 			error_f("local hash failed at chunk %u offset %llu "
 			    "for \"%s\"", i,
 			    (unsigned long long)ranges[i].off, local_path);
+			sftp_conn_watchdog_resume(conn);
 			goto out;
 		}
 	}
@@ -1687,8 +1822,11 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 	/* Remote hashing: the source-of-truth.  All-or-nothing semantics;
 	 * helper emits the user-visible warning on failure. */
 	if (sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n_chunks,
-	    remote_hashes) != 0)
+	    remote_hashes) != 0) {
+		sftp_conn_watchdog_resume(conn);
 		goto out;
+	}
+	sftp_conn_watchdog_resume(conn);
 
 	for (i = 0; i < n_chunks; i++) {
 		if (local_hashes[i] != remote_hashes[i])
