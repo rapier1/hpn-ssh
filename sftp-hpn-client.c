@@ -48,10 +48,13 @@ static struct {
 } fi_pv_state = { 0, 0, PTHREAD_ONCE_INIT };
 
 /*
- * Parsed once from SFTP_FAULT_INJECT=<bytes>[:<max_kills>].
+ * ENV-VAR SFTP_FAULT_INJECT — compile-gated (HPN_FAULT_INJECTION):
+ * fault-injection knob.  Parsed once from
+ * SFTP_FAULT_INJECT=<bytes>[:<max_kills>] :
  *   bytes     — worker connection dies after sending this many bytes.
  *   max_kills — optional; at most this many workers are killed (default: all).
  * Example: SFTP_FAULT_INJECT=150000:2  kills at most 2 out of N workers.
+ * See benchmark/env-vars-reference.md.
  */
 static void
 fi_state_init(void)
@@ -69,10 +72,13 @@ fi_state_init(void)
 }
 
 /*
- * Parsed once from SFTP_FAULT_PROTOCOL=<bytes>[:<max_kills>].
+ * ENV-VAR SFTP_FAULT_PROTOCOL — compile-gated (HPN_FAULT_INJECTION):
+ * fault-injection knob.  Parsed once from
+ * SFTP_FAULT_PROTOCOL=<bytes>[:<max_kills>] :
  *   bytes     — worker fires a protocol violation after sending this many bytes.
  *   max_kills — optional; at most this many workers trigger the fault.
  * Example: SFTP_FAULT_PROTOCOL=150000:1  triggers one protocol violation.
+ * See benchmark/env-vars-reference.md.
  */
 static void
 fi_pv_state_init(void)
@@ -286,7 +292,12 @@ sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
 	hpn->rd.last_rising = hpn->rd.floor;
 	hpn->rd.win_start = monotime_double();
 	hpn->rd.enabled = 1;
-	/* HPN_RDAHEAD=fixed reverts to the legacy flat num_requests pipeline. */
+	/* ENV-VAR HPN_RDAHEAD — developer-only: kill switch for the
+	 * adaptive read-ahead controller.  Setting HPN_RDAHEAD=fixed
+	 * reverts to the legacy flat num_requests pipeline (a fixed
+	 * in-flight window equal to the -R ceiling).  Any other value or
+	 * the unset case keeps the controller adaptive.  See
+	 * benchmark/env-vars-reference.md. */
 	if ((e = getenv("HPN_RDAHEAD")) != NULL && strcmp(e, "fixed") == 0)
 		hpn->rd.enabled = 0;
 }
