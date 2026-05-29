@@ -1584,29 +1584,17 @@ out:
  *  CHUNK_HASH_MAX_RANGES_PER_REQUEST
  *                              — must match server-side cap in
  *                                sftp-hpn-server.c (SFTP_HASH_RANGE_MAX_RANGES).
- *                                At 64 MiB chunks this covers files up to
- *                                4 TiB.  Bigger files decline and fall
- *                                through to the existing full-file gate.
+ *                                Bounds server-side allocation against an
+ *                                unbounded request; the server allocates
+ *                                N range + N hash entries up front.  At
+ *                                64 MiB chunks this also caps single-file
+ *                                chunked-resume at 4 TiB; bigger files
+ *                                decline and fall through to the existing
+ *                                full-file gate.
  */
 #define CHUNK_HASH_CHUNK_SIZE			((u_int64_t)(64ULL * 1024ULL * 1024ULL))
 #define CHUNK_HASH_MIN_FILE_SIZE		((u_int64_t)(2ULL * CHUNK_HASH_CHUNK_SIZE))
 #define CHUNK_HASH_MAX_RANGES_PER_REQUEST	65536U
-/*
- * Conservative file-size cap above which chunked resume declines and falls
- * through to the existing whole-file gate (or to a fresh full re-transfer if
- * that fails).  Rationale: chunked-resume's value is bounded by the
- * cost-benefit formula f > BW/D (fraction-transferred must exceed the
- * network/disk-read ratio); above a certain file size at moderate network
- * speeds, the hash phase eats most of the bandwidth savings and the
- * watchdog pause window becomes unwieldy.  See
- * [[project_chunked_resume_plan]] memory for the math and the deferred
- * tier 2/3 cost-benefit gate that would replace this static cap with a
- * regime-aware decision.  50 GiB is a defensible default: at 1 GB/s
- * conservative hash rate the hash phase tops out around 50 s, well within
- * a sensible watchdog grace window.
- */
-#define CHUNK_HASH_MAX_FILE_SIZE \
-	((u_int64_t)(50ULL * 1024ULL * 1024ULL * 1024ULL))	/* 50 GiB */
 
 int
 sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
@@ -1635,14 +1623,6 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 		debug_f("file \"%s\" size %llu below chunked threshold %llu; "
 		    "declining", local_path, (unsigned long long)fsize,
 		    (unsigned long long)CHUNK_HASH_MIN_FILE_SIZE);
-		return -1;
-	}
-	if (fsize > CHUNK_HASH_MAX_FILE_SIZE) {
-		debug_f("file \"%s\" size %llu exceeds chunked-resume cap %llu; "
-		    "declining to keep hash phase bounded (above this the "
-		    "cost-benefit math may favor full re-transfer)",
-		    local_path, (unsigned long long)fsize,
-		    (unsigned long long)CHUNK_HASH_MAX_FILE_SIZE);
 		return -1;
 	}
 
@@ -1797,14 +1777,6 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 		debug_f("file \"%s\" size %llu below chunked threshold %llu; "
 		    "declining", local_path, (unsigned long long)fsize,
 		    (unsigned long long)CHUNK_HASH_MIN_FILE_SIZE);
-		return -1;
-	}
-	if (fsize > CHUNK_HASH_MAX_FILE_SIZE) {
-		debug_f("file \"%s\" size %llu exceeds chunked-resume cap %llu; "
-		    "declining to keep hash phase bounded (above this the "
-		    "cost-benefit math may favor full re-transfer)",
-		    local_path, (unsigned long long)fsize,
-		    (unsigned long long)CHUNK_HASH_MAX_FILE_SIZE);
 		return -1;
 	}
 
