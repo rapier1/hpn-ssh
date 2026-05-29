@@ -26,6 +26,38 @@
 #define HPN_EXT_BUNDLE_FETCH "hpn-bundle-fetch@hpnssh.org"  /* download bundle open */
 #define HPN_EXT_HASH_RANGE   "sftp-hash-range@hpnssh.org"   /* chunked-resume ranged hashing */
 
+/*
+ * hpn-check-file@hpnssh.org sparse-skip protocol (19.0):
+ *
+ * The wire-format request now carries a flags field after length:
+ *
+ *   string  path
+ *   uint64  length
+ *   uint32  flags
+ *
+ * The server short-circuits the read+hash and returns the sentinel
+ * HPN_HASH_FULLY_ALLOCATED_SENTINEL when:
+ *   - the client did NOT set HPN_CHECK_FILE_STRICT, AND
+ *   - length == st.st_size (the client is asking about the whole file),
+ *   - st.st_blocks * 512 >= 95% of st.st_size (fully allocated).
+ *
+ * Client sets HPN_CHECK_FILE_STRICT when HPNVerifyTransfer is enabled
+ * (the user explicitly asked for maximum verification; no trust-based
+ * shortcuts).  Strict mode forces the server to compute and return the
+ * real XXH3.
+ *
+ * Collision probability of a real XXH3 producing the sentinel value is
+ * 1 in 2^64 — effectively zero in any realistic workload.
+ *
+ * Within 19.0: all servers and clients implement this.  Cross-version
+ * 19.0 <-> 18.x is handled by the existing extension-advertisement
+ * mechanism (18.x doesn't advertise hpn-check-file, 19.0 client falls
+ * through to RESUME_INCOMPAT_MSG; 18.x client never sends the request).
+ */
+#define HPN_HASH_FULLY_ALLOCATED_SENTINEL \
+	((u_int64_t)0xDEADBEEFCAFEBABEULL)
+#define HPN_CHECK_FILE_STRICT		0x00000001U
+
 struct sshbuf;
 
 /*

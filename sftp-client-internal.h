@@ -81,4 +81,15 @@ uint64_t sftp_conn_watchdog_pause_until_ns(struct sftp_conn *conn);
 void sftp_conn_watchdog_pause(struct sftp_conn *conn, unsigned int seconds);
 void sftp_conn_watchdog_resume(struct sftp_conn *conn);
 
+/*
+ * Set / query the HPNVerifyTransfer enabled state on a connection.
+ * Resolved from ssh_config in sftp.c and stashed on conn->hpn so the
+ * resume-decision callers can pass HPN_CHECK_FILE_STRICT in the
+ * hpn-check-file request when the user has asked for maximum
+ * verification.  Safe with conn / conn->hpn NULL; query returns 0 in
+ * that case.
+ */
+void sftp_conn_set_verify_transfer(struct sftp_conn *conn, int enabled);
+int  sftp_conn_verify_transfer_enabled(struct sftp_conn *conn);
+
 #endif /* _SFTP_CLIENT_INTERNAL_H */

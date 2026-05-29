@@ -57,6 +57,7 @@ typedef void EditLine;
 #include "sshbuf.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
+#include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
 #include "sftp-usergroup.h"
 #include "sftp-parallel.h"
 
@@ -3485,6 +3486,14 @@ main(int argc, char **argv)
 	 */
 	hpn_verify_transfer = sftp_resolve_hpn_verify_transfer(host,
 	    parallel_config_file);
+	/*
+	 * Propagate HPNVerifyTransfer state onto the connection so the
+	 * resume-decision hash callers can flag the hpn-check-file request
+	 * as STRICT (no sparse-skip sentinel).  When set, the user has
+	 * explicitly asked for maximum verification and shouldn't accept
+	 * the size+allocation trust optimisation.
+	 */
+	sftp_conn_set_verify_transfer(conn, hpn_verify_transfer);
 
 	err = interactive_loop(conn, file1, file2);
 

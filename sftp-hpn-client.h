@@ -88,6 +88,14 @@ struct sftp_hpn_conn {
 	 * or auto-expires.  Atomic load/store; safe from any thread. */
 	volatile uint64_t watchdog_pause_until_ns;
 
+	/* HPNVerifyTransfer state, propagated from ssh_config at sftp_init
+	 * time so the resume-decision hash callers can ask the server for
+	 * the real XXH3 (HPN_CHECK_FILE_STRICT) instead of accepting the
+	 * sparse-skip sentinel.  See [[verify-nomenclature-collision]] —
+	 * HPNVerifyTransfer here also gates the resume-decision-flow
+	 * trust optimisation, not just the post-transfer integrity check. */
+	int              verify_transfer_enabled;
+
 	/* Adaptive read-ahead controller — sizes the in-flight request
 	 * window to the path BDP instead of a flat num_requests. */
 	struct sftp_rdahead rd;

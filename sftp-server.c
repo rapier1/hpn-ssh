@@ -1884,6 +1884,7 @@ process_extended_hpn_check_file(uint32_t id)
 {
 	char *path = NULL;
 	uint64_t length;
+	uint32_t flags;
 	int r;
 	int fd = -1;
 	XXH3_state_t *state = NULL;
@@ -1895,13 +1896,14 @@ process_extended_hpn_check_file(uint32_t id)
 	struct stat st;
 
 	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0 ||
-	    (r = sshbuf_get_u64(iqueue, &length)) != 0)
+	    (r = sshbuf_get_u64(iqueue, &length)) != 0 ||
+	    (r = sshbuf_get_u32(iqueue, &flags)) != 0)
 		fatal_fr(r, "parse");
 
-	debug3("request %u: hpn-check-file \"%s\" length %llu",
-	    id, path, (unsigned long long)length);
-	logit("hpn-check-file \"%s\" length %llu", path,
-	    (unsigned long long)length);
+	debug3("request %u: hpn-check-file \"%s\" length %llu flags=0x%x",
+	    id, path, (unsigned long long)length, flags);
+	logit("hpn-check-file \"%s\" length %llu flags=0x%x", path,
+	    (unsigned long long)length, flags);
 
 	if ((fd = open(path, O_RDONLY|O_NOFOLLOW)) == -1) {
 		send_status(id, errno_to_portable(errno));
@@ -1916,6 +1918,31 @@ process_extended_hpn_check_file(uint32_t id)
 	 * requesting a hash of UINT64_MAX bytes and causing unbounded I/O. */
 	if (length > (uint64_t)st.st_size)
 		length = (uint64_t)st.st_size;
+
+	/*
+	 * Sparse-skip optimisation: when the client asks about the WHOLE
+	 * file (length == st_size) AND the file is fully allocated
+	 * (st_blocks*512 >= 95% of st_size, with the 5% margin covering
+	 * filesystem metadata blocks + minor legitimate sparseness) AND
+	 * the client did NOT set HPN_CHECK_FILE_STRICT, short-circuit:
+	 * return HPN_HASH_FULLY_ALLOCATED_SENTINEL without doing any
+	 * read+hash work.  Saves bilateral disk I/O + CPU on multi-file
+	 * resumes where most files completed before the interrupt.
+	 *
+	 * Strict mode (set by client when HPNVerifyTransfer is enabled)
+	 * skips this short-circuit so the user gets full-hash verification
+	 * even for fully-allocated files.
+	 */
+	if ((flags & HPN_CHECK_FILE_STRICT) == 0 &&
+	    length == (uint64_t)st.st_size &&
+	    (uint64_t)st.st_blocks * 512 >=
+	        (uint64_t)st.st_size * 95 / 100) {
+		hash = (XXH64_hash_t)HPN_HASH_FULLY_ALLOCATED_SENTINEL;
+		debug3("hpn-check-file: sparse-skip short-circuit, sending "
+		    "sentinel for \"%s\" (st_size=%lld st_blocks=%lld)",
+		    path, (long long)st.st_size, (long long)st.st_blocks);
+		goto sentinel_reply;
+	}
 
 	if ((state = XXH3_createState()) == NULL) {
 		send_status(id, SSH2_FX_FAILURE);
@@ -1950,6 +1977,7 @@ process_extended_hpn_check_file(uint32_t id)
 	    "length %llu", (unsigned long long)hash, path,
 	    (unsigned long long)length);
 
+ sentinel_reply:
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||

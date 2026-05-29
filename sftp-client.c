@@ -54,6 +54,8 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-hpn-client.h" /* HPN */
+#include "sftp-hpn-server.h" /* HPN_CHECK_FILE_STRICT, HPN_HASH_FULLY_ALLOCATED_SENTINEL */
+#include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
 
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -160,7 +162,7 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 /* Forward declarations for hash helpers used by sftp_download (verified resume) */
 static int sftp_xxhash_local_fd(int, uint64_t, uint64_t *);
 static int sftp_hash_remote_file(struct sftp_conn *, const char *,
-    uint64_t, uint64_t *);
+    uint64_t, uint32_t, uint64_t *);
 
 static struct request *
 request_enqueue(struct requests *requests, u_int id, size_t len,
@@ -1867,12 +1869,34 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * and re-download.  Closes the crash-resume
 				 * sparse-hole corruption gap.
 				 */
+				/*
+				 * Sparse-skip path: ask the server first.  If
+				 * it returns HPN_HASH_FULLY_ALLOCATED_SENTINEL,
+				 * the remote file is full-size and fully
+				 * allocated; trust it and skip the local hash
+				 * entirely.  Sentinel suppressed by
+				 * HPN_CHECK_FILE_STRICT (set when
+				 * HPNVerifyTransfer is enabled).
+				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    sftp_hpn_grace_for_hash(size));
+				u_int32_t flags =
+				    sftp_conn_verify_transfer_enabled(conn)
+				    ? HPN_CHECK_FILE_STRICT : 0;
+				rret = sftp_hash_remote_file(conn,
+				    remote_path, size, flags, &remote_hash);
+				if (rret == 0 && remote_hash ==
+				    HPN_HASH_FULLY_ALLOCATED_SENTINEL) {
+					sftp_hpn_watchdog_resume(conn->hpn);
+					debug("verified transfer: server "
+					    "reports \"%s\" fully allocated; "
+					    "skipping local hash and treating "
+					    "as identical", local_path);
+					skip_ret = 1; /* identical */
+					goto resume_fail;
+				}
 				lret = sftp_xxhash_local_fd(local_fd,
 				    size, &local_hash);
-				rret = sftp_hash_remote_file(conn,
-				    remote_path, size, &remote_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
@@ -1903,7 +1927,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				/*
 				 * Partial local file: hash the overlapping
 				 * prefix to decide resume (continue) vs
-				 * restart (truncate).
+				 * restart (truncate).  Sparse-skip can't fire
+				 * here because length < st_size on the server,
+				 * but pass flags=0 for protocol completeness.
 				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    sftp_hpn_grace_for_hash(
@@ -1912,7 +1938,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				    (uint64_t)st.st_size, &local_hash);
 				rret = sftp_hash_remote_file(conn,
 				    remote_path, (uint64_t)st.st_size,
-				    &remote_hash);
+				    0u, &remote_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
@@ -2410,7 +2436,7 @@ sftp_xxhash_local_fd(int fd, uint64_t length, uint64_t *hash_out)
  */
 static int
 sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
-    uint64_t length, uint64_t *hash_out)
+    uint64_t length, uint32_t flags, uint64_t *hash_out)
 {
 	struct sshbuf *msg = conn->msg;
 	u_int id, rid;
@@ -2423,14 +2449,15 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 	}
 
 	id = conn->msg_id++;
-	debug3_f("sending hpn-check-file for \"%s\" length=%llu id=%u",
-	    path, (unsigned long long)length, id);
+	debug3_f("sending hpn-check-file for \"%s\" length=%llu flags=0x%x id=%u",
+	    path, (unsigned long long)length, flags, id);
 	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, "hpn-check-file@hpnssh.org")) != 0 ||
 	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
-	    (r = sshbuf_put_u64(msg, length)) != 0)
+	    (r = sshbuf_put_u64(msg, length)) != 0 ||
+	    (r = sshbuf_put_u32(msg, flags)) != 0)
 		fatal_fr(r, "compose");
 	send_msg(conn, msg);
 
@@ -2509,9 +2536,15 @@ sftp_verify_transfer(struct sftp_conn *conn, const char *local_path,
 	}
 	sftp_hpn_watchdog_pause(conn->hpn,
 	    sftp_hpn_grace_for_hash((u_int64_t)sb.st_size));
+	/*
+	 * Post-transfer integrity check: ALWAYS require the real XXH3, no
+	 * sparse-skip trust shortcut.  The purpose of this function is to
+	 * verify what actually transferred, not to trust allocation
+	 * metadata.  Pass HPN_CHECK_FILE_STRICT unconditionally.
+	 */
 	if (sftp_xxhash_local_fd(fd, (uint64_t)sb.st_size, &local_hash) == 0 &&
 	    sftp_hash_remote_file(conn, remote_path, (uint64_t)sb.st_size,
-	    &remote_hash) == 0)
+	    HPN_CHECK_FILE_STRICT, &remote_hash) == 0)
 		r = (local_hash == remote_hash) ? 0 : 1;
 	sftp_hpn_watchdog_resume(conn->hpn);
 	close(fd);
@@ -2814,10 +2847,31 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    sftp_hpn_grace_for_hash(
 				        (u_int64_t)sb.st_size));
+				/*
+				 * Sparse-skip path: ask the server first.  A
+				 * HPN_HASH_FULLY_ALLOCATED_SENTINEL response
+				 * means "fully allocated, trust the size match,
+				 * skip local hash entirely."  Suppressed by
+				 * HPN_CHECK_FILE_STRICT (set when
+				 * HPNVerifyTransfer is enabled).
+				 */
+				u_int32_t flags =
+				    sftp_conn_verify_transfer_enabled(conn)
+				    ? HPN_CHECK_FILE_STRICT : 0;
+				rret = sftp_hash_remote_file(conn, remote_path,
+				    sb.st_size, flags, &remote_hash);
+				if (rret == 0 && remote_hash ==
+				    HPN_HASH_FULLY_ALLOCATED_SENTINEL) {
+					sftp_hpn_watchdog_resume(conn->hpn);
+					debug("verified transfer: server "
+					    "reports \"%s\" fully allocated; "
+					    "skipping local hash and treating "
+					    "as identical", local_path);
+					close(local_fd);
+					return 1; /* identical */
+				}
 				lret = sftp_xxhash_local_fd(local_fd,
 				    sb.st_size, &local_hash);
-				rret = sftp_hash_remote_file(conn, remote_path,
-				    sb.st_size, &remote_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
@@ -2848,8 +2902,10 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				    sftp_hpn_grace_for_hash(c.size));
 				lret = sftp_xxhash_local_fd(local_fd, c.size,
 				    &local_hash);
+				/* prefix-resume: length < st_size, sparse-skip
+				 * can't fire; flags=0. */
 				rret = sftp_hash_remote_file(conn, remote_path,
-				    c.size, &remote_hash);
+				    c.size, 0u, &remote_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				debug3_f("lret=%d rret=%d local_hash=%016llx "
 				    "remote_hash=%016llx match=%d",
@@ -4127,6 +4183,24 @@ sftp_conn_watchdog_resume(struct sftp_conn *conn)
 {
 	if (conn != NULL)
 		sftp_hpn_watchdog_resume(conn->hpn);
+}
+
+/* HPNVerifyTransfer state accessors.  Declared in sftp-client-internal.h.
+ * Set from sftp.c after ssh_config resolution; read by the resume-decision
+ * hash call sites in sftp_upload / sftp_download to decide whether to set
+ * the HPN_CHECK_FILE_STRICT flag on hpn-check-file requests. */
+void
+sftp_conn_set_verify_transfer(struct sftp_conn *conn, int enabled)
+{
+	if (conn != NULL && conn->hpn != NULL)
+		conn->hpn->verify_transfer_enabled = enabled ? 1 : 0;
+}
+
+int
+sftp_conn_verify_transfer_enabled(struct sftp_conn *conn)
+{
+	return conn != NULL && conn->hpn != NULL &&
+	    conn->hpn->verify_transfer_enabled;
 }
 
 static void
