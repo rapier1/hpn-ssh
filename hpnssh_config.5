@@ -34,7 +34,7 @@
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
 .\" $OpenBSD: ssh_config.5,v 1.423 2026/03/23 01:33:46 djm Exp $
-.Dd $Mdocdate: March 23 2026 $
+.Dd $Mdocdate: May 29 2026 $
 .Dt HPNSSH_CONFIG 5
 .Os
 .Sh NAME
@@ -1268,7 +1268,27 @@ the remote
 to advertise the
 .Cm hpn-check-file@hpnssh.org
 extension; if it does not, a per-file warning is emitted and the file is
-not counted as a failure. Consulted only by
+not counted as a failure.
+.Pp
+Enabling
+.Cm HPNVerifyTransfer
+also affects resume-decision hashing during the
+.Fl v
+verified-resume path in
+.Xr hpnsftp 1 .
+Without it, the resume decision for a same-size file may accept a
+server-supplied
+.Dq fully allocated
+sentinel response in place of a full XXH3 hash, avoiding bilateral disk
+reads when the destination is already complete.
+With
+.Cm HPNVerifyTransfer
+enabled, the sentinel shortcut is suppressed and the real XXH3 is computed
+on both sides for every resume decision, increasing CPU and disk activity
+on resumes where many files are already present but providing the
+strongest verification.
+.Pp
+Consulted only by
 .Xr hpnsftp 1
 and
 .Xr hpnscp 1 ;

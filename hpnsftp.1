@@ -22,7 +22,7 @@
 .\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
-.Dd $Mdocdate: December 6 2024 $
+.Dd $Mdocdate: May 29 2026 $
 .Dt HPNSFTP 1
 .Os
 .Sh NAME
@@ -240,6 +240,26 @@ on commodity LAN paths and
 .Fl j Ar 8
 on high-bandwidth/high-RTT WAN paths to striped parallel filesystems
 (Lustre, GPFS); tune from there using the respawn-count signal.
+.Pp
+At the end of a parallel-streams session a summary line is emitted of
+the form:
+.Bd -literal -offset indent
+Parallel streams: X transferred in Ys (Z MiB/s)
+.Ed
+.Pp
+where
+.Sy X
+is the number of file bytes that actually crossed the network and
+.Sy Z
+is the corresponding wire throughput in mebibytes per second.
+When verified-resume avoided pushing bytes that already matched on the
+peer (via chunked-resume or prefix-resume) the line gains a
+.Sq ; W skipped via resume
+beat reporting the bytes that did not need to flow.
+If any workers were respawned during the session a worker-respawn count
+is appended, with the same
+.Sq consider lowering -j
+hint noted above.
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
 .It Fl M Ar range_split_min_mb
@@ -615,16 +635,36 @@ If the
 .Fl v
 flag is specified, then attempt to resume partial transfers of existing files
 using hash verification.
-Before resuming, the hash of the local partial file is compared against
-the hash of the corresponding prefix of the remote file using the
+The exact behaviour depends on how the local file compares to the remote
+file.
+.Pp
+When the local file is shorter than the remote file, the XXH3 hash of the
+local partial file is compared against the hash of the corresponding prefix
+of the remote file using the
 .Cm hpn-check-file@hpnssh.org
 extension.
-If the hashes match the transfer is resumed from the end of the local file;
-if they differ the local file is truncated and the transfer restarts from
-the beginning.
-If the local file is already the same size or larger than the remote file
-the transfer is skipped.
-This flag implies
+Matching hashes resume the download from the end of the local file;
+differing hashes truncate the local file and restart from the beginning.
+.Pp
+When the local and remote files are the same size, the
+.Cm sftp-hash-range@hpnssh.org
+extension is used (when the server advertises it) to hash and compare both
+files in 64 MiB chunks, and only the chunks that differ are re-fetched.
+This catches sparse-zero holes left by a crashed parallel-streams transfer
+without re-pulling every byte of the file.
+If the server does not advertise
+.Cm sftp-hash-range@hpnssh.org
+the implementation falls back to hashing the full file end-to-end via
+.Cm hpn-check-file@hpnssh.org ;
+matching hashes treat the file as complete and the transfer is skipped,
+otherwise the local file is truncated and re-downloaded from scratch.
+.Pp
+When the local file is already larger than the remote file the transfer
+is skipped.
+.Pp
+The
+.Fl v
+flag implies
 .Fl a
 and requires that the remote server support the
 .Cm hpn-check-file@hpnssh.org
@@ -779,16 +819,36 @@ If the
 .Fl v
 flag is specified, then attempt to resume partial transfers of existing files
 using hash verification.
-Before resuming, the hash of the remote partial file is compared against
-the hash of the corresponding prefix of the local file using the
+The exact behaviour depends on how the remote file compares to the local
+file.
+.Pp
+When the remote file is shorter than the local file, the XXH3 hash of the
+remote partial file is compared against the hash of the corresponding prefix
+of the local file using the
 .Cm hpn-check-file@hpnssh.org
 extension.
-If the hashes match the transfer is resumed from the end of the remote file;
-if they differ the remote file is truncated and the transfer restarts from
-the beginning.
-If the remote file is already the same size or larger than the local file
-the transfer is skipped.
-This flag implies
+Matching hashes resume the upload from the end of the remote file;
+differing hashes truncate the remote file and restart from the beginning.
+.Pp
+When the remote and local files are the same size, the
+.Cm sftp-hash-range@hpnssh.org
+extension is used (when the server advertises it) to hash and compare both
+files in 64 MiB chunks, and only the chunks that differ are re-transferred.
+This catches sparse-zero holes left by a crashed parallel-streams transfer
+without re-pushing every byte of the file.
+If the server does not advertise
+.Cm sftp-hash-range@hpnssh.org
+the implementation falls back to hashing the full file end-to-end via
+.Cm hpn-check-file@hpnssh.org ;
+matching hashes treat the file as complete and the transfer is skipped,
+otherwise the remote file is truncated and re-uploaded from scratch.
+.Pp
+When the remote file is already larger than the local file the transfer
+is skipped.
+.Pp
+The
+.Fl v
+flag implies
 .Fl a
 and requires that the remote server support the
 .Cm hpn-check-file@hpnssh.org

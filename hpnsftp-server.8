@@ -22,7 +22,7 @@
 .\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
-.Dd $Mdocdate: February 7 2022 $
+.Dd $Mdocdate: May 29 2026 $
 .Dt HPNSFTP-SERVER 8
 .Os
 .Sh NAME
@@ -181,6 +181,87 @@ for logging to work, and use of
 in a chroot configuration therefore requires that
 .Xr syslogd 8
 establish a logging socket inside the chroot directory.
+.Sh HPN-SSH SFTP EXTENSIONS
+In addition to the SFTP extensions inherited from upstream OpenSSH,
+.Nm
+advertises the following HPN-specific extensions in its
+.Sy SSH_FXP_VERSION
+reply.
+A
+.Xr hpnsftp 1
+client uses the advertisements to decide whether each feature is
+available; non-HPN clients ignore them.
+.Pp
+These extensions require a compatible peer (HPN-SSH 19.0 or later) on
+both ends.
+When the client side is an HPN-SSH 19.0 or later
+.Xr hpnsftp 1
+and the server does not advertise an extension, the client falls back to
+the closest equivalent path that does not require it; when the server is
+19.0 or later but the client is older or non-HPN, the extensions remain
+advertised but unused.
+.Bl -tag -width Ds
+.It Sy hpn-check-file@hpnssh.org
+Compute an XXH3_64 hash over a path's first
+.Ar length
+bytes and return it to the client.
+Used by the verified-resume code paths in
+.Xr hpnsftp 1
+.Pq Fl v
+to decide whether an existing destination file matches the source.
+When the request asks about the whole remote file
+.Pq Ar length No == Ar st_size ,
+the file is fully allocated on disk, and the client did not request strict
+mode, the server returns a sparse-allocation sentinel without reading the
+file; this short-circuits bilateral disk I/O on multi-file resumes where
+most files completed before the interrupt.
+Strict mode is selected by
+.Cm HPNVerifyTransfer
+in
+.Xr hpnssh_config 5
+and forces a real hash regardless of allocation state.
+.It Sy sftp-hash-range@hpnssh.org
+Compute XXH3_64 hashes over a list of byte ranges of a path in a single
+request/response round trip.
+Used by chunked verified-resume to identify exactly which 64 MiB chunks of
+a same-size destination differ from the source, so only those chunks are
+re-transferred instead of the whole file.
+This is the
+.Dq sparse-zero hole
+recovery path for crashed parallel-streams uploads.
+.It Sy hpn-fs-info@hpnssh.org
+Return the filesystem type and, for striped parallel filesystems
+(Lustre, GPFS), the stripe geometry of a given path.
+Used by
+.Xr hpnsftp 1
+to align byte-range parallel transfers
+.Pq Fl j , Fl M
+to stripe boundaries on the destination.
+.It Sy hpn-bundle@hpnssh.org
+Capability advertisement for tar-stream bundling of small files; the
+actual bundle upload is driven by SSH_FXP_OPEN with bundle-specific
+attributes and accumulates per-bundle and total-bundle data subject to
+the
+.Fl B
+and
+.Fl T
+caps documented above.
+.It Sy hpn-bundle-fetch@hpnssh.org
+Server-side bundling of small files for download: the server tar-streams
+a set of files into a single bundle handle that the client then drains
+with SSH_FXP_READ.
+Reduces per-file open/close round trips on high-RTT downloads of many
+small files.
+.El
+.Pp
+For long-running hash extensions
+.Pq Sy hpn-check-file , sftp-hash-range
+the server emits a small
+.Dq still working
+heartbeat reply on a fixed cadence while the hash is in progress.
+The client refreshes its parallel-streams watchdog grace on each heartbeat,
+which prevents the orchestrator from killing a worker that is legitimately
+waiting on a slow or contended-storage hash.
 .Sh SEE ALSO
 .Xr hpnsftp 1 ,
 .Xr hpnssh 1 ,
