@@ -2039,8 +2039,19 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		debug3("Received reply T:%u I:%u R:%d", type, id, max_req);
 
 		/* Find the request in our queue */
-		if ((req = request_find(&requests, id)) == NULL)
-			fatal("Unexpected reply %u", id);
+		if ((req = request_find(&requests, id)) == NULL) {
+			/* Was fatal("Unexpected reply %u", id); — would
+			 * crash the entire orchestrator if this worker is
+			 * one of N in a parallel-streams transfer.  Mark
+			 * this connection dead and bail to the worker
+			 * thread's safety net, which checks conn->dead and
+			 * triggers respawn. */
+			sftp_conn_die(conn, "Unexpected reply %u", id);
+			read_error = 1;
+			max_req = 0;
+			num_req = 0;
+			break;
+		}
 
 		switch (type) {
 		case SSH2_FXP_STATUS:
@@ -2490,8 +2501,18 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 			fatal_fr(r, "parse");
 		debug3_f("got response type=%u rid=%u (expected id=%u)",
 		    type, rid, id);
-		if (rid != id)
-			fatal("ID mismatch (%u != %u)", rid, id);
+		if (rid != id) {
+			/* Was fatal("ID mismatch (%u != %u)", rid, id); —
+			 * would crash the entire orchestrator if this
+			 * worker is one of N in a parallel-streams
+			 * transfer.  Mark the connection dead and let the
+			 * caller's resume / verify path observe -1. */
+			sftp_conn_die(conn,
+			    "hpn-check-file ID mismatch (%u != %u)",
+			    rid, id);
+			sftp_conn_watchdog_resume(conn);
+			return -1;
+		}
 
 		if (type == SSH2_FXP_STATUS) {
 			u_int status;
@@ -2512,8 +2533,17 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 			sftp_conn_watchdog_resume(conn);
 			return -1;
 		} else if (type != SSH2_FXP_EXTENDED_REPLY) {
-			fatal("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, "
-			    "got %u", SSH2_FXP_EXTENDED_REPLY, type);
+			/* Was fatal("Expected SSH2_FXP_EXTENDED_REPLY ...");
+			 * — would crash the entire orchestrator if this
+			 * worker is one of N in a parallel-streams
+			 * transfer.  Mark the connection dead and let the
+			 * caller's resume / verify path observe -1. */
+			sftp_conn_die(conn,
+			    "hpn-check-file: expected "
+			    "SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
+			    SSH2_FXP_EXTENDED_REPLY, type);
+			sftp_conn_watchdog_resume(conn);
+			return -1;
 		}
 
 		if ((r = sshbuf_get_u64(msg, hash_out)) != 0)
