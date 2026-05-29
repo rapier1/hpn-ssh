@@ -187,24 +187,29 @@ struct sftp_parallel *sftp_parallel_start(const struct sftp_parallel_config *cfg
  * compile-time defaults (use_bundle = 1).
  */
 int sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
-    const char *host, const char *user_config_file);
+    const char *host, const char *user_config_file,
+    char *const *extra_argv);
 
 /*
  * Resolve just the HPNVerifyTransfer ssh_config option for a host.  Used by
  * the single-stream sftp/scp paths, which otherwise don't read ssh_config.
+ * `extra_argv` is the NULL-terminated array of -o KEY=VALUE strings collected
+ * from the command line (parallel_extra_o), applied as overrides after the
+ * config file is parsed.  May be NULL.
  * Returns 1 if HPNVerifyTransfer is enabled, 0 otherwise (default/off/error).
  */
 int sftp_resolve_hpn_verify_transfer(const char *host,
-    const char *user_config_file);
+    const char *user_config_file, char *const *extra_argv);
 
 /*
  * Resolve HPNLustreStripeCount from ssh_config for a host.
+ * `extra_argv` plumbing as above.
  * Returns: -1 = auto (default), 0 = feature off, >0 = explicit count.
  * Used by the parallel orchestrator to decide whether (and at what count)
  * to issue hpn-file-layout requests before file creation.
  */
 int sftp_resolve_hpn_lustre_stripe_count(const char *host,
-    const char *user_config_file);
+    const char *user_config_file, char *const *extra_argv);
 
 /*
  * Submit a work unit. These calls copy the path strings; the caller retains
@@ -244,6 +249,21 @@ int sftp_parallel_is_aborting(const struct sftp_parallel *p);
 /* Number of parallel worker streams configured (-j N).  Returns 1 when
  * `p` is NULL (i.e. parallel mode is not engaged). */
 int sftp_parallel_num_streams(const struct sftp_parallel *p);
+
+/*
+ * HPNLustreStripeCount entry point.  Called by the recursive walker after
+ * mkdir of a destination subdirectory, and by sftp.c's single-file upload
+ * dispatch on the destination directory.  No-op when the feature is
+ * disabled (HPNLustreStripeCount=0), not in parallel mode, the server
+ * does not advertise hpn-file-layout, the destination is not on Lustre,
+ * the current stripe count already meets or exceeds the desired count,
+ * or a prior call on the same conn returned a non-success status (the
+ * declined-latch is checked first so subsequent calls short-circuit).
+ * On success emits one INFO log line.  Safe to call repeatedly on the
+ * same directory — Lustre setstripe is idempotent.
+ */
+void maybe_apply_lustre_layout(struct sftp_parallel *p,
+    struct sftp_conn *conn, const char *dst);
 
 /*
  * Walker-side failure recorder.  Bumps the orchestrator's

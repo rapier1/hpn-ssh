@@ -103,11 +103,19 @@ process_config_files(const char *user_config_file, struct passwd *pw,
 /*
  * Read ssh_config for `host` into *options (two-pass Match resolution).
  * initialize_options() is done here; the caller must always free_options()
- * afterward, including on a -1 return.  Returns 0 on success, -1 on failure.
+ * afterward, including on a -1 return.
+ *
+ * `extra_argv` is the array of command-line `-o KEY=VALUE` strings
+ * collected by sftp.c's argv parser (parallel_extra_o), NULL-terminated;
+ * each entry is applied via process_config_line() AFTER the config files
+ * are read but BEFORE fill_default_options(), matching the order ssh.c
+ * uses so command-line overrides win over config values.  May be NULL.
+ *
+ * Returns 0 on success, -1 on failure.
  */
 static int
 resolve_ssh_config(const char *host, const char *user_config_file,
-    Options *options)
+    char *const *extra_argv, Options *options)
 {
 	struct passwd *pw;
 	int want_final_pass = 0;
@@ -139,13 +147,36 @@ resolve_ssh_config(const char *host, const char *user_config_file,
 		    host_name, /* final_pass */ 1, NULL, options);
 	}
 
+	/*
+	 * Apply -o overrides from the command line so they trump config
+	 * values, matching how ssh.c handles -o.  Without this, options
+	 * like `-o HPNLustreStripeCount=0` and `-o HPNVerifyTransfer=yes`
+	 * silently fail to override the config defaults.
+	 */
+	if (extra_argv != NULL) {
+		for (int i = 0; extra_argv[i] != NULL; i++) {
+			char *line = xstrdup(extra_argv[i]);
+			if (process_config_line(options, pw,
+			    host ? host : "", host ? host : "", "",
+			    line, "command-line", 0, NULL,
+			    SSHCONF_USERCONF) != 0) {
+				error_f("bad -o option \"%s\"",
+				    extra_argv[i]);
+				free(line);
+				return -1;
+			}
+			free(line);
+		}
+	}
+
 	fill_default_options(options);
 	return 0;
 }
 
 int
 sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
-    const char *host, const char *user_config_file)
+    const char *host, const char *user_config_file,
+    char *const *extra_argv)
 {
 	Options options;
 
@@ -159,7 +190,8 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	pcfg->max_auth_concurrent = 0;  /* 0 = auto */
 	pcfg->verify_transfer = 0;  /* default off */
 
-	if (resolve_ssh_config(host, user_config_file, &options) < 0) {
+	if (resolve_ssh_config(host, user_config_file, extra_argv,
+	    &options) < 0) {
 		free_options(&options);
 		return -1;
 	}
@@ -186,14 +218,15 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 
 int
 sftp_resolve_hpn_verify_transfer(const char *host,
-    const char *user_config_file)
+    const char *user_config_file, char *const *extra_argv)
 {
 	Options options;
 	int r = 0;
 
 	if (host == NULL || *host == '\0')
 		return 0;
-	if (resolve_ssh_config(host, user_config_file, &options) == 0)
+	if (resolve_ssh_config(host, user_config_file, extra_argv,
+	    &options) == 0)
 		r = (options.hpn_verify_transfer != 0);
 	free_options(&options);
 	return r;
@@ -201,14 +234,15 @@ sftp_resolve_hpn_verify_transfer(const char *host,
 
 int
 sftp_resolve_hpn_lustre_stripe_count(const char *host,
-    const char *user_config_file)
+    const char *user_config_file, char *const *extra_argv)
 {
 	Options options;
 	int r = -1;	/* default: auto */
 
 	if (host == NULL || *host == '\0')
 		return -1;
-	if (resolve_ssh_config(host, user_config_file, &options) == 0)
+	if (resolve_ssh_config(host, user_config_file, extra_argv,
+	    &options) == 0)
 		r = options.hpn_lustre_stripe_count;
 	free_options(&options);
 	return r;

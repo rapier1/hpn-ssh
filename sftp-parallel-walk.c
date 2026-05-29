@@ -81,7 +81,7 @@
  * Called only when parallel mode is engaged (-j N with N >= 2); skipped
  * on single-stream transfers.
  */
-static void
+void
 maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *dst)
 {
@@ -199,6 +199,19 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	a.perm = saved_perm;
 
+	/*
+	 * Now that the destination directory exists, try to bump its Lustre
+	 * stripe count if HPNLustreStripeCount asks for one wider than the
+	 * current default.  Silent + no-op on non-Lustre destinations, on
+	 * non-parallel transfers, and after the first failure on the conn
+	 * (the helper latches conn->hpn->layout_set_declined).  Files
+	 * subsequently created in this directory (worker writes, bundle
+	 * extraction, walker children) inherit the new layout.  Runs on
+	 * both freshly-created and pre-existing destination dirs by design
+	 * — see HPNLustreStripeCount in hpnssh_config(5) for opt-out.
+	 */
+	maybe_apply_lustre_layout(p, conn, dst);
+
 	if ((dirp = opendir(src)) == NULL) {
 		error("local opendir \"%s\": %s", src, strerror(errno));
 		sftp_parallel_walker_record_failure(p, src, strerror(errno));
@@ -285,11 +298,6 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Entering %s\n", src);
-	/* HPNLustreStripeCount: bump the destination dir's Lustre stripe
-	 * before any files land here, so range-split and bundled-file
-	 * extractions inherit the layout for free.  Silent on non-Lustre
-	 * destinations and when the feature is disabled. */
-	maybe_apply_lustre_layout(p, conn, dst);
 	return parallel_upload_walk(p, conn, src, dst, 0, resume, verify);
 }
 

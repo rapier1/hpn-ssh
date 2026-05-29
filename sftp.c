@@ -1189,6 +1189,32 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
+			/*
+			 * HPNLustreStripeCount: same-thread analogue of the
+			 * walker hook.  Apply the layout to the parent
+			 * directory of `abs_dst` (the file's destination
+			 * directory) so a single-file -j N upload to an
+			 * un-striped Lustre directory also fans out across
+			 * OSTs.  Idempotent; the declined-latch on conn
+			 * prevents log spam after the first failure.
+			 */
+			{
+				const char *slash = strrchr(abs_dst, '/');
+				char *parent;
+				if (slash == NULL) {
+					parent = xstrdup(".");
+				} else if (slash == abs_dst) {
+					parent = xstrdup("/");
+				} else {
+					size_t plen = (size_t)(slash - abs_dst);
+					parent = xmalloc(plen + 1);
+					memcpy(parent, abs_dst, plen);
+					parent[plen] = '\0';
+				}
+				maybe_apply_lustre_layout(parallel_orch, conn,
+				    parent);
+				free(parent);
+			}
 			if (sftp_parallel_submit_upload(parallel_orch, conn,
 			    g.gl_pathv[i], abs_dst,
 			    sb.st_size, sb.st_mode, resume, verify) != 0)
@@ -3394,7 +3420,7 @@ main(int argc, char **argv)
 		 * pcfg fields.  Sets pcfg.use_bundle; defaults to 1 (yes)
 		 * if parsing fails or the option isn't set. */
 		(void)sftp_parallel_apply_ssh_config(&pcfg, host,
-		    parallel_config_file);
+		    parallel_config_file, parallel_extra_o);
 		pcfg.preserve_flag    = global_pflag;
 		pcfg.fsync_flag       = global_fflag;
 		pcfg.print_flag       = quiet ? 0 : 1;
@@ -3518,7 +3544,7 @@ main(int argc, char **argv)
 	 * separately).  Safe with a NULL/empty host (returns 0 = off).
 	 */
 	hpn_verify_transfer = sftp_resolve_hpn_verify_transfer(host,
-	    parallel_config_file);
+	    parallel_config_file, parallel_extra_o);
 	/*
 	 * Propagate HPNVerifyTransfer state onto the connection so the
 	 * resume-decision hash callers can flag the hpn-check-file request
@@ -3534,7 +3560,8 @@ main(int argc, char **argv)
 	 * it.  Value: -1 = auto (use -j N), 0 = feature off, >0 = explicit.
 	 */
 	sftp_conn_set_lustre_stripe_count(conn,
-	    sftp_resolve_hpn_lustre_stripe_count(host, parallel_config_file));
+	    sftp_resolve_hpn_lustre_stripe_count(host, parallel_config_file,
+	        parallel_extra_o));
 
 	err = interactive_loop(conn, file1, file2);
 
