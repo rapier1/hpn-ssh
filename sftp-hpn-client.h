@@ -108,6 +108,24 @@ struct sftp_hpn_conn {
 	 * Atomic add; safe from any thread. */
 	volatile uint64_t bytes_wired_payload;
 
+	/* HPNLustreStripeCount resolved from ssh_config at sftp_init time.
+	 *   -1  : auto (use -j N as the desired count when destination is
+	 *         on Lustre and currently has stripe_count < N)
+	 *    0  : feature disabled — never call hpn-file-layout
+	 *   >0  : explicit override; ask for this stripe count when the
+	 *         destination is Lustre and currently has stripe_count <
+	 *         this value
+	 * Read by the dir-layout decision site once per transfer (top-level
+	 * destination dir). */
+	int              lustre_stripe_count;
+
+	/* Latched after the first non-success reply to hpn-file-layout on
+	 * this connection.  Subsequent dir-layout calls skip the wire round
+	 * trip entirely so a single declined / unsupported reply doesn't
+	 * generate per-directory log spam.  Resets when a new conn is built
+	 * (a new sftp invocation). */
+	int              layout_set_declined;
+
 	/* Adaptive read-ahead controller — sizes the in-flight request
 	 * window to the path BDP instead of a flat num_requests. */
 	struct sftp_rdahead rd;
@@ -235,6 +253,28 @@ struct sftp_conn;
  */
 int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
     const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out);
+
+/* ── hpn-file-layout@hpnssh.org client helper (EXPERIMENTAL) ─────────────
+ *
+ * Ask the server to set a Lustre stripe count on `path` (must be an
+ * existing directory).  Subsequent file creations in that directory
+ * inherit the layout — including files unpacked from a bundle stream.
+ *
+ * Returns one of HPN_FILE_LAYOUT_OK / _NOT_FS / _PERM / _FAIL.  The caller
+ * is responsible for:
+ *   - gating on sftp_conn_has_file_layout(conn) before calling
+ *   - gating on sftp_conn_layout_set_declined(conn) — a previous
+ *     non-success reply latches that flag and subsequent calls should
+ *     skip the wire round trip
+ *   - latching the flag via sftp_conn_set_layout_set_declined(conn, 1)
+ *     on any non-OK reply so future calls short-circuit
+ *
+ * `*applied_out`, if non-NULL, is set to the stripe count the server
+ * reported applying (may be silently clamped by Lustre below the
+ * requested value if the filesystem has fewer OSTs).
+ */
+int sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
+    u_int32_t stripe_count, u_int32_t *applied_out);
 
 /*
  * Watchdog pause: tell the parallel orchestrator's worker-fault watchdog

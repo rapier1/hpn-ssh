@@ -25,6 +25,43 @@
 #define HPN_EXT_BUNDLE_OPEN  "hpn-bundle-open@hpnssh.org"   /* upload  bundle open  */
 #define HPN_EXT_BUNDLE_FETCH "hpn-bundle-fetch@hpnssh.org"  /* download bundle open */
 #define HPN_EXT_HASH_RANGE   "sftp-hash-range@hpnssh.org"   /* chunked-resume ranged hashing */
+#define HPN_EXT_FILE_LAYOUT  "hpn-file-layout@hpnssh.org"   /* filesystem layout (Lustre stripe today) */
+
+/*
+ * hpn-file-layout@hpnssh.org wire format (revision 1):
+ *
+ *   request:  string path
+ *             uint32 stripe_count   (0 = "use all available" per Lustre lfs -c 0)
+ *
+ *   reply:    uint32 status         (0 = applied, non-zero = error code; see below)
+ *             uint32 applied_count  (what the server actually set; may be
+ *                                    clamped below the requested value if the
+ *                                    filesystem has fewer OSTs than requested,
+ *                                    zero on any error)
+ *
+ * Status values:
+ *   0                          — applied successfully; applied_count valid
+ *   HPN_FILE_LAYOUT_NOT_FS     — path is not on a layout-capable filesystem
+ *                                (today: not Lustre). Client treats as "skip"
+ *                                without warning.
+ *   HPN_FILE_LAYOUT_PERM       — server lacks permission to set the layout
+ *                                (EPERM / restricted OST pool). Client warns
+ *                                once per connection then short-circuits all
+ *                                further hpn-file-layout calls.
+ *   HPN_FILE_LAYOUT_FAIL       — other error (ENOENT, ENOSPC during OST pick,
+ *                                etc.). Client warns once and short-circuits.
+ *
+ * Lustre is the only backend today.  The generic extension name leaves room
+ * to add GPFS / BeeGFS / etc. with the same wire shape (a single uint32
+ * "layout count" that each backend can interpret appropriately).
+ *
+ * EXPERIMENTAL: behaviour may change in future revisions.  Operators who
+ * need to disable it set HPNLustreStripeCount=0 in ssh_config.
+ */
+#define HPN_FILE_LAYOUT_OK        0u
+#define HPN_FILE_LAYOUT_NOT_FS    1u
+#define HPN_FILE_LAYOUT_PERM      2u
+#define HPN_FILE_LAYOUT_FAIL      3u
 
 /*
  * hpn-check-file@hpnssh.org sparse-skip protocol (19.0):

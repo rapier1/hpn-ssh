@@ -140,6 +140,7 @@ struct sftp_conn {
 #define SFTP_EXT_HPN_BUNDLE		0x00001000
 #define SFTP_EXT_HPN_BUNDLE_FETCH	0x00002000
 #define SFTP_EXT_HASH_RANGE		0x00004000
+#define SFTP_EXT_HPN_FILE_LAYOUT	0x00008000
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
@@ -674,6 +675,14 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 			/* Phase 5: server can produce tar-format bundles from
 			 * a list of paths via hpn-bundle-fetch@hpnssh.org. */
 			ret->exts |= SFTP_EXT_HPN_BUNDLE_FETCH;
+			known = 1;
+		} else if (strcmp(name, "hpn-file-layout@hpnssh.org") == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			/* Server can apply a Lustre stripe layout to a
+			 * destination directory before files land there.
+			 * Used by HPNLustreStripeCount auto-stripe.  See
+			 * sftp-hpn-server.h for wire format. */
+			ret->exts |= SFTP_EXT_HPN_FILE_LAYOUT;
 			known = 1;
 		}
 		if (known) {
@@ -4220,6 +4229,12 @@ sftp_conn_has_hash_range(struct sftp_conn *conn)
 	return conn && (conn->exts & SFTP_EXT_HASH_RANGE) != 0;
 }
 
+int
+sftp_conn_has_file_layout(struct sftp_conn *conn)
+{
+	return conn && (conn->exts & SFTP_EXT_HPN_FILE_LAYOUT) != 0;
+}
+
 /* Allocate the next outbound SFTP message id for `conn`.  Internal-only
  * accessor used by HPN extension code in sftp-hpn-client.c so it doesn't
  * have to know struct sftp_conn's layout (which lives in sftp-client.c).
@@ -4298,6 +4313,35 @@ sftp_conn_bytes_wired(struct sftp_conn *conn)
 		return 0;
 	return __atomic_load_n(&conn->hpn->bytes_wired_payload,
 	    __ATOMIC_RELAXED);
+}
+
+void
+sftp_conn_set_lustre_stripe_count(struct sftp_conn *conn, int value)
+{
+	if (conn != NULL && conn->hpn != NULL)
+		conn->hpn->lustre_stripe_count = value;
+}
+
+int
+sftp_conn_lustre_stripe_count(struct sftp_conn *conn)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return 0;
+	return conn->hpn->lustre_stripe_count;
+}
+
+int
+sftp_conn_layout_set_declined(struct sftp_conn *conn)
+{
+	return conn != NULL && conn->hpn != NULL &&
+	    conn->hpn->layout_set_declined;
+}
+
+void
+sftp_conn_set_layout_set_declined(struct sftp_conn *conn, int v)
+{
+	if (conn != NULL && conn->hpn != NULL)
+		conn->hpn->layout_set_declined = v ? 1 : 0;
 }
 
 static void

@@ -362,6 +362,13 @@ int sftp_conn_has_hpn_check_file(struct sftp_conn *conn);
 int sftp_conn_has_hash_range(struct sftp_conn *conn);
 
 /*
+ * True iff the server advertised hpn-file-layout@hpnssh.org, i.e. it can
+ * apply a filesystem layout (today: Lustre stripe count) to a destination
+ * directory before files land in it.  Used by HPNLustreStripeCount.
+ */
+int sftp_conn_has_file_layout(struct sftp_conn *conn);
+
+/*
  * Download-side counterpart of sftp_hpn_bundle_upload.  Asks the server to
  * pack the listed `entries[].remote_path` files into a single tar stream,
  * then untars locally into each `entries[].local_path`.  Per-entry result

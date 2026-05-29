@@ -146,6 +146,13 @@ typedef struct {
 	int     hpn_max_auth_concurrent; /* Max concurrent worker SSH children
 					  * in the auth phase, hpnsftp client.
 					  * Default 8, clamped to [1, 64]. */
+	int     hpn_lustre_stripe_count; /* HPNLustreStripeCount (EXPERIMENTAL):
+					  * desired Lustre stripe count for
+					  * destination directories on parallel
+					  * (-j N) uploads.  -1 = auto (use N);
+					  * 0 = feature disabled; >0 = explicit
+					  * override.  Only consulted by hpnsftp;
+					  * hpnssh ignores. */
 	int     disable_multithreaded; /* Disable multithreaded aes-ctr */
         int     metrics; /* enable metrics */
         int     metrics_interval; /* time in seconds between polls */

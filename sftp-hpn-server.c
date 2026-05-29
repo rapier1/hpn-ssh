@@ -37,10 +37,12 @@
 # include <sys/vfs.h>
 #endif
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -98,6 +100,77 @@ fstype_from_magic(unsigned long ftype)
 	case TMPFS_MAGIC:        return "tmpfs";
 	case BTRFS_SUPER_MAGIC:  return "btrfs";
 	default:                 return "unknown";
+	}
+}
+
+/*
+ * Lustre layout ioctl ABI — inlined to avoid a build-time dependency on
+ * liblustreapi.  The constants and struct shape are stable kernel ABI; any
+ * Lustre install that supports stripe-set via lfs(1) also supports this
+ * ioctl on an open directory or freshly-created (zero-data) file.
+ *
+ * We only need v1 to set stripe_count.  Stripe size and pool selection are
+ * future revisions of hpn-file-layout — payload is intentionally just the
+ * stripe_count today.
+ */
+#ifndef LOV_USER_MAGIC_V1
+# define LOV_USER_MAGIC_V1     0x0BD10BD0
+#endif
+#ifndef LL_IOC_LOV_SETSTRIPE
+# define LL_IOC_LOV_SETSTRIPE  _IOW('f', 154, long)
+#endif
+
+struct hpn_lov_user_md_v1 {
+	uint32_t lmm_magic;
+	uint32_t lmm_pattern;        /* 0 = RAID0 (default) */
+	uint64_t lmm_object_id;
+	uint64_t lmm_object_seq;
+	uint32_t lmm_stripe_size;    /* bytes per stripe; 0 = filesystem default */
+	uint16_t lmm_stripe_count;   /* requested count; 0 = "use all OSTs" */
+	uint16_t lmm_stripe_offset;  /* starting OST index; (uint16_t)-1 = MDT picks */
+} __attribute__((packed));
+
+/*
+ * Apply a stripe layout to an open directory or freshly-created file FD.
+ * Caller is responsible for opening the path with the appropriate flags
+ * (directories: O_RDONLY; new files: O_CREAT|O_RDWR with no prior writes).
+ *
+ * Returns one of HPN_FILE_LAYOUT_OK / _NOT_FS / _PERM / _FAIL.
+ * On OK, *applied_count is set to the count we asked for (Lustre clamps
+ * silently if the filesystem has fewer OSTs; we report the requested
+ * value, since the actual landed-on-disk count is what subsequent file
+ * creates will inherit).
+ */
+static uint32_t
+lustre_set_stripe_fd(int fd, uint32_t requested_count,
+    uint32_t *applied_count)
+{
+	struct hpn_lov_user_md_v1 lum;
+
+	memset(&lum, 0, sizeof(lum));
+	lum.lmm_magic         = LOV_USER_MAGIC_V1;
+	lum.lmm_pattern       = 0;   /* RAID0 */
+	lum.lmm_stripe_size   = 0;   /* fs default */
+	lum.lmm_stripe_count  = (uint16_t)(requested_count & 0xFFFFu);
+	lum.lmm_stripe_offset = (uint16_t)-1;
+
+	if (ioctl(fd, LL_IOC_LOV_SETSTRIPE, &lum) == 0) {
+		if (applied_count != NULL)
+			*applied_count = requested_count;
+		return HPN_FILE_LAYOUT_OK;
+	}
+	if (applied_count != NULL)
+		*applied_count = 0;
+	switch (errno) {
+	case ENOTTY:
+	case EINVAL:
+	case EOPNOTSUPP:
+		return HPN_FILE_LAYOUT_NOT_FS;
+	case EPERM:
+	case EACCES:
+		return HPN_FILE_LAYOUT_PERM;
+	default:
+		return HPN_FILE_LAYOUT_FAIL;
 	}
 }
 
@@ -1545,6 +1618,104 @@ out:
 
 /* ── END sftp-hash-range ───────────────────────────────────────────────── */
 
+/* ── BEGIN hpn-file-layout: filesystem layout (Lustre stripe today) ──────
+ *
+ * Client requests a stripe count for a destination directory before any
+ * files land in it; server opens the directory and issues
+ * LL_IOC_LOV_SETSTRIPE on the directory FD.  Subsequent files created in
+ * the directory inherit the layout — including files extracted from a
+ * bundle, which means the bundling path costs nothing extra.
+ *
+ * On non-Lustre destinations the ioctl returns ENOTTY / EINVAL and we
+ * reply HPN_FILE_LAYOUT_NOT_FS without touching the path.  On EPERM /
+ * EACCES (restricted OST pools or controlled layouts) we reply
+ * HPN_FILE_LAYOUT_PERM; the client warns once per connection and
+ * short-circuits future calls.
+ *
+ * EXPERIMENTAL feature.  See sftp-hpn-server.h for wire format.
+ */
+static void
+process_hpn_file_layout(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
+{
+	char		*path = NULL;
+	u_int32_t	 requested = 0;
+	u_int32_t	 applied = 0;
+	u_int32_t	 status = HPN_FILE_LAYOUT_FAIL;
+	int		 fd = -1;
+	int		 r;
+	struct sshbuf	*msg = NULL;
+
+	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0 ||
+	    (r = sshbuf_get_u32(iqueue, &requested)) != 0) {
+		error_f("parse: %s", ssh_err(r));
+		goto out;
+	}
+
+	debug3("request %u: hpn-file-layout \"%s\" stripe_count=%u",
+	    id, path, requested);
+
+	/*
+	 * The path is expected to be a directory the client has already
+	 * created (mkdir succeeded earlier in the SFTP session).  Open
+	 * O_RDONLY|O_DIRECTORY|O_NOFOLLOW for the ioctl.  Non-directories
+	 * fall through to ENOTDIR → HPN_FILE_LAYOUT_FAIL, which client
+	 * logs once and short-circuits.
+	 */
+	fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	if (fd == -1) {
+		debug3("hpn-file-layout: open \"%s\": %s",
+		    path, strerror(errno));
+		switch (errno) {
+		case EACCES:
+		case EPERM:
+			status = HPN_FILE_LAYOUT_PERM;
+			break;
+		default:
+			status = HPN_FILE_LAYOUT_FAIL;
+			break;
+		}
+		goto reply;
+	}
+
+	status = lustre_set_stripe_fd(fd, requested, &applied);
+	switch (status) {
+	case HPN_FILE_LAYOUT_OK:
+		logit("hpn-file-layout \"%s\" stripe_count %u (requested %u)",
+		    path, applied, requested);
+		break;
+	case HPN_FILE_LAYOUT_NOT_FS:
+		debug3("hpn-file-layout: \"%s\" not on a layout-capable fs",
+		    path);
+		break;
+	case HPN_FILE_LAYOUT_PERM:
+		logit("hpn-file-layout \"%s\": permission denied", path);
+		break;
+	default:
+		logit("hpn-file-layout \"%s\": %s", path, strerror(errno));
+		break;
+	}
+
+ reply:
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u32(msg, status)) != 0 ||
+	    (r = sshbuf_put_u32(msg, applied)) != 0)
+		fatal_fr(r, "compose hpn-file-layout reply");
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue hpn-file-layout reply");
+
+ out:
+	if (msg != NULL)
+		sshbuf_free(msg);
+	if (fd != -1)
+		close(fd);
+	free(path);
+}
+
+/* ── END hpn-file-layout ─────────────────────────────────────────────── */
+
 void
 sftp_hpn_server_dispatch(u_int id, const char *name,
     struct sshbuf *iqueue, struct sshbuf *oqueue)
@@ -1569,6 +1740,12 @@ sftp_hpn_server_dispatch(u_int id, const char *name,
 	/* Chunked-resume ranged hashing — see process_hpn_hash_range above. */
 	if (strcmp(name, HPN_EXT_HASH_RANGE) == 0) {
 		process_hpn_hash_range(id, iqueue, oqueue);
+		return;
+	}
+
+	/* Lustre / future-fs layout — see process_hpn_file_layout above. */
+	if (strcmp(name, HPN_EXT_FILE_LAYOUT) == 0) {
+		process_hpn_file_layout(id, iqueue, oqueue);
 		return;
 	}
 

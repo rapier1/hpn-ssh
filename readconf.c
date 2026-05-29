@@ -160,7 +160,7 @@ typedef enum {
 	oTcpRcvBufPoll, oTcpRcvBufRescue, oHPNDisabled, oHPNMemoryLimit,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch, oHPNUseBundle,
 	oHPNMaxRetries, oHPNBundleSize, oHPNMaxAuthConcurrent,
-	oHPNVerifyTransfer,
+	oHPNVerifyTransfer, oHPNLustreStripeCount,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oVisualHostKey,
@@ -306,6 +306,7 @@ static struct {
 	{ "hpnbundlesize", oHPNBundleSize },
 	{ "hpnmaxauthconcurrent", oHPNMaxAuthConcurrent },
 	{ "hpnverifytransfer", oHPNVerifyTransfer },
+	{ "hpnlustrestripecount", oHPNLustreStripeCount },
 	{ "usemptcp", oUseMPTCP},
 	{ "happyeyes", oHappyEyes },
 	{ "happydelay", oHappyDelay },
@@ -1438,6 +1439,41 @@ parse_time:
 	case oHPNMaxAuthConcurrent:
 		intptr = &options->hpn_max_auth_concurrent;
 		goto parse_int;
+
+	case oHPNLustreStripeCount:
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0') {
+			error("%.200s line %d: Missing argument.", filename,
+			    linenum);
+			goto out;
+		}
+		/*
+		 * Accept: "auto" (or -1) = use -j N; "0" / "off" / "no" =
+		 * feature disabled; a positive integer = explicit override.
+		 * Negative values other than -1 are rejected.
+		 */
+		if (strcasecmp(arg, "auto") == 0 ||
+		    strcmp(arg, "-1") == 0) {
+			value = -1;
+		} else if (strcasecmp(arg, "off") == 0 ||
+		    strcasecmp(arg, "no") == 0 ||
+		    strcmp(arg, "0") == 0) {
+			value = 0;
+		} else {
+			char *ep;
+			long lv = strtol(arg, &ep, 10);
+			if (*ep != '\0' || lv < 1 || lv > 65535) {
+				error("%.200s line %d: HPNLustreStripeCount "
+				    "must be \"auto\", \"off\", or an integer "
+				    "in [0, 65535]: got \"%s\"",
+				    filename, linenum, arg);
+				goto out;
+			}
+			value = (int)lv;
+		}
+		if (*activep && options->hpn_lustre_stripe_count == -2)
+			options->hpn_lustre_stripe_count = value;
+		break;
 
 	case oUseMPTCP:
 		intptr = &options->use_mptcp;
@@ -2967,6 +3003,13 @@ initialize_options(Options * options)
 	options->hpn_max_retries = -1;
 	options->hpn_bundle_size = -1;
 	options->hpn_max_auth_concurrent = -1;
+	/*
+	 * Sentinel for "not yet parsed."  Final default after read is -1
+	 * which means "auto: use -j N."  We use -2 here so the parse case
+	 * can distinguish first-wins / already-set without conflicting with
+	 * the valid -1 value.
+	 */
+	options->hpn_lustre_stripe_count = -2;
 	options->use_mptcp = -1;
 	options->use_happyeyes = -1;
 	options->happy_delay = -1;
@@ -3200,6 +3243,9 @@ fill_default_options(Options * options)
 		    options->hpn_max_auth_concurrent);
 		options->hpn_max_auth_concurrent = 64;
 	}
+	/* Fold the -2 "not parsed" sentinel down to -1 ("auto"). */
+	if (options->hpn_lustre_stripe_count == -2)
+		options->hpn_lustre_stripe_count = -1;
 	if (options->nonemac_enabled > 0 && (options->none_enabled == 0 ||
 					     options->none_switch == 0)) {
 		fprintf(stderr, "None MAC can only be used with the None cipher. None MAC disabled.\n");

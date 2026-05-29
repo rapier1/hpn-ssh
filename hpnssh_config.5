@@ -1241,6 +1241,92 @@ per-file pipelined batch upload path. Consulted only by
 .Xr hpnsftp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
+.It Cm HPNLustreStripeCount
+.Sy EXPERIMENTAL :
+desired Lustre stripe count for destination directories when
+.Xr hpnsftp 1
+is uploading with
+.Fl j Ar N
+parallel streams.
+Lustre's default per-directory layout often gives small files a single
+OST, so all parallel workers pile onto one storage server and the
+transfer caps out below the path's actual capacity.
+With this option enabled,
+.Xr hpnsftp 1
+asks the server to apply a wider stripe to the destination directory
+before any files land in it, so new files (whether created by the
+range-split path or extracted from a bundle) automatically inherit the
+wider layout and the workers fan out across multiple OSTs.
+The argument is one of:
+.Bl -tag -width "auto" -offset indent
+.It Cm auto
+(default) use the same number of OSTs as the value supplied to
+.Fl j .
+.It Cm off Pq or Cm 0
+disable the feature entirely; the destination directory's existing
+stripe is left as-is.
+.It Ar N
+an explicit positive integer up to 65535 OSTs.
+Takes priority over
+.Fl j Ar N .
+Useful when an operator wants a wider stripe than the per-transfer
+worker count would set.
+.El
+.Pp
+The feature engages only when all of the following hold:
+.Bl -bullet -compact -offset indent
+.It
+.Xr hpnsftp 1
+is running in parallel mode
+.Pq Fl j Ar N No with Ar N No \(>= 2 ;
+.It
+the destination directory's filesystem is reported as Lustre by the
+.Cm hpn-fs-info@hpnssh.org
+server-side query;
+.It
+the directory's current stripe count is strictly less than the
+desired count;
+.It
+.Cm HPNLustreStripeCount
+is not
+.Cm 0 ;
+.It
+the server advertises the
+.Cm hpn-file-layout@hpnssh.org
+extension.
+.El
+.Pp
+When the layout is applied, one
+.Sy info
+log line is emitted naming the path and the before/after stripe count.
+A first-failure response from the server
+.Pq EPERM, restricted OST pools, controlled layouts
+emits a single
+.Sy warn
+line and suppresses further
+.Cm hpn-file-layout
+calls on the same connection \(em the rest of the transfer runs
+through whatever layout was already in place, the user is told what
+happened, and the transfer is never aborted.
+Non-Lustre destinations are silent: nothing is logged and no extension
+call is made.
+.Pp
+This option modifies persistent state on the destination filesystem:
+Lustre's setstripe operation only affects newly-created files but
+persists across sessions, so subsequent file creations in the same
+directory (by any process, not just
+.Xr hpnsftp 1 )
+will inherit the layout we set.
+Operators on shared sites with site-managed Lustre policies may want
+to disable it with
+.Cm HPNLustreStripeCount Cm 0
+in
+.Pa /etc/hpnssh/ssh_config .
+.Pp
+Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
 .It Cm HPNVerifyTransfer
 Controls whether
 .Xr hpnsftp 1

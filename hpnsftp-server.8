@@ -252,6 +252,35 @@ a set of files into a single bundle handle that the client then drains
 with SSH_FXP_READ.
 Reduces per-file open/close round trips on high-RTT downloads of many
 small files.
+.It Sy hpn-file-layout@hpnssh.org
+.Sy EXPERIMENTAL :
+apply a filesystem-specific layout to a destination directory before
+files are created in it.
+Today the only supported backend is Lustre; the server uses the
+.Sy LL_IOC_LOV_SETSTRIPE
+ioctl directly on the open directory file descriptor, no
+.Sy liblustreapi
+runtime dependency.
+Used by
+.Xr hpnsftp 1
+to set the stripe count on the destination directory of a parallel
+.Pq Fl j
+upload so subsequent file creations
+.Pq including bundled files extracted by libarchive
+inherit the wider layout automatically.
+See
+.Cm HPNLustreStripeCount
+in
+.Xr hpnssh_config 5
+for the client-side configuration.
+The generic extension name is deliberate: it leaves room to add GPFS
+or BeeGFS layout control in a future revision using the same wire
+shape.
+On non-Lustre filesystems the server reports
+.Dq not on a layout-capable filesystem
+without modifying anything;
+.Xr hpnsftp 1
+treats that response as a silent no-op.
 .El
 .Pp
 For long-running hash extensions

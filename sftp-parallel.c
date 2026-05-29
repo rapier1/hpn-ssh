@@ -4435,6 +4435,12 @@ sftp_parallel_preserve_flag(const struct sftp_parallel *p)
 }
 
 int
+sftp_parallel_num_streams(const struct sftp_parallel *p)
+{
+	return (p != NULL) ? p->cfg.num_streams : 1;
+}
+
+int
 sftp_parallel_follow_link_flag(const struct sftp_parallel *p)
 {
 	return (p != NULL) ? p->cfg.follow_link_flag : 0;

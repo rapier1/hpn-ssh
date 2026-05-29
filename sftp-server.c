@@ -126,6 +126,7 @@ static void process_extended_hpn_fs_info(uint32_t id);
 static void process_extended_hpn_bundle_open(uint32_t id);
 static void process_extended_hpn_bundle_cap(uint32_t id);
 static void process_extended_hpn_bundle_fetch(uint32_t id);
+static void process_extended_hpn_file_layout(uint32_t id);
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -188,6 +189,8 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_hpn_bundle_open, 1 },
 	{ "hpn-bundle-fetch", HPN_EXT_BUNDLE_FETCH, 0,
 	    process_extended_hpn_bundle_fetch, 0 },
+	{ "hpn-file-layout", HPN_EXT_FILE_LAYOUT, 0,
+	    process_extended_hpn_file_layout, 1 },
 	{ NULL, NULL, 0, NULL, 0 }
 };
 
@@ -798,6 +801,7 @@ process_init(void)
 	compose_extension(msg, HPN_EXT_FS_INFO, "1");
 	compose_extension(msg, HPN_EXT_BUNDLE, "1");
 	compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
+	compose_extension(msg, HPN_EXT_FILE_LAYOUT, "1");
 
 	send_msg(msg);
 	sshbuf_free(msg);
@@ -2124,6 +2128,14 @@ static void
 process_extended_hpn_bundle_fetch(uint32_t id)
 {
 	sftp_hpn_server_dispatch(id, HPN_EXT_BUNDLE_FETCH, iqueue, oqueue);
+}
+
+/* hpn-file-layout@hpnssh.org dispatch wrapper.  The real implementation
+ * lives in sftp-hpn-server.c (process_hpn_file_layout). */
+static void
+process_extended_hpn_file_layout(uint32_t id)
+{
+	sftp_hpn_server_dispatch(id, HPN_EXT_FILE_LAYOUT, iqueue, oqueue);
 }
 
 static void

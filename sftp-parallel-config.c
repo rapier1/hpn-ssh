@@ -198,3 +198,18 @@ sftp_resolve_hpn_verify_transfer(const char *host,
 	free_options(&options);
 	return r;
 }
+
+int
+sftp_resolve_hpn_lustre_stripe_count(const char *host,
+    const char *user_config_file)
+{
+	Options options;
+	int r = -1;	/* default: auto */
+
+	if (host == NULL || *host == '\0')
+		return -1;
+	if (resolve_ssh_config(host, user_config_file, &options) == 0)
+		r = options.hpn_lustre_stripe_count;
+	free_options(&options);
+	return r;
+}

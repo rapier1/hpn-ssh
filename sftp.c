@@ -3528,6 +3528,14 @@ main(int argc, char **argv)
 	 */
 	sftp_conn_set_verify_transfer(conn, hpn_verify_transfer);
 
+	/*
+	 * Propagate HPNLustreStripeCount (EXPERIMENTAL) onto the connection
+	 * so the parallel upload-walker's dir-layout decision site can see
+	 * it.  Value: -1 = auto (use -j N), 0 = feature off, >0 = explicit.
+	 */
+	sftp_conn_set_lustre_stripe_count(conn,
+	    sftp_resolve_hpn_lustre_stripe_count(host, parallel_config_file));
+
 	err = interactive_loop(conn, file1, file2);
 
 	/*

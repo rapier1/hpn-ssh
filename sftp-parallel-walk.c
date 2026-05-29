@@ -53,6 +53,9 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
+#include "sftp-client-internal.h"  /* sftp_conn_{lustre_stripe_count,layout_set_declined} */
+#include "sftp-hpn-client.h"        /* sftp_hpn_set_file_layout */
+#include "sftp-hpn-server.h"        /* HPN_FILE_LAYOUT_* */
 #include "sftp-parallel.h"
 
 /*
@@ -60,6 +63,90 @@
  * walker failure rather than risking stack exhaustion.
  */
 #define PARALLEL_MAX_DIR_DEPTH 64
+
+/*
+ * HPNLustreStripeCount (EXPERIMENTAL): one-shot helper run at the top of
+ * the upload walker.  Queries the destination directory's filesystem via
+ * hpn-fs-info; if it's Lustre and the current stripe count is below the
+ * desired value, asks the server to apply the new stripe count via
+ * hpn-file-layout.  Subsequent files created in the directory (including
+ * those extracted from bundles) inherit the layout.
+ *
+ * Silent on every non-Lustre destination — operators of non-Lustre sites
+ * see nothing change.  On Lustre destinations the actual stripe-set
+ * action emits one INFO line per directory modified.  Server-side
+ * failure (EPERM, controlled OST pools) emits one WARN line and latches
+ * conn->hpn->layout_set_declined so subsequent calls short-circuit.
+ *
+ * Called only when parallel mode is engaged (-j N with N >= 2); skipped
+ * on single-stream transfers.
+ */
+static void
+maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *dst)
+{
+	struct sftp_fs_info info;
+	int desired;
+	int configured;
+	int n_workers;
+	uint32_t applied = 0;
+	int rc;
+
+	if (p == NULL || conn == NULL || dst == NULL)
+		return;
+	if (sftp_conn_layout_set_declined(conn))
+		return;  /* prior failure on this conn — short-circuit */
+
+	configured = sftp_conn_lustre_stripe_count(conn);
+	if (configured == 0)
+		return;  /* HPNLustreStripeCount=0 → feature disabled */
+
+	n_workers = sftp_parallel_num_streams(p);
+	if (n_workers < 2)
+		return;  /* not in parallel mode */
+
+	if (!sftp_conn_has_file_layout(conn))
+		return;  /* server is too old or built without it */
+
+	/* desired = explicit count if HPNLustreStripeCount was set; else -j N */
+	desired = (configured > 0) ? configured : n_workers;
+
+	if (sftp_fs_info(conn, dst, &info) != 0)
+		return;  /* server lacks hpn-fs-info, or query failed */
+	if (strcmp(info.fs_type, "lustre") != 0)
+		return;  /* not a Lustre destination */
+	if (info.stripe_count >= (uint32_t)desired) {
+		debug_f("Lustre auto-stripe: \"%s\" already at stripe_count=%u "
+		    "(desired %d); no change", dst, info.stripe_count, desired);
+		return;
+	}
+
+	rc = sftp_hpn_set_file_layout(conn, dst, (u_int32_t)desired, &applied);
+	switch (rc) {
+	case HPN_FILE_LAYOUT_OK:
+		logit("Lustre auto-stripe (experimental): \"%s\" "
+		    "stripe_count %u -> %u", dst, info.stripe_count, applied);
+		break;
+	case HPN_FILE_LAYOUT_NOT_FS:
+		debug_f("Lustre auto-stripe: \"%s\" reports not on a "
+		    "layout-capable filesystem despite fs-info=lustre; "
+		    "skipping further calls on this connection", dst);
+		sftp_conn_set_layout_set_declined(conn, 1);
+		break;
+	case HPN_FILE_LAYOUT_PERM:
+		logit("Lustre auto-stripe (experimental): \"%s\": permission "
+		    "denied; layout will not be set for the rest of this "
+		    "transfer.  Disable with HPNLustreStripeCount=0.", dst);
+		sftp_conn_set_layout_set_declined(conn, 1);
+		break;
+	default:
+		logit("Lustre auto-stripe (experimental): \"%s\": layout set "
+		    "failed (status %d); layout will not be set for the rest "
+		    "of this transfer.", dst, rc);
+		sftp_conn_set_layout_set_declined(conn, 1);
+		break;
+	}
+}
 
 static int
 parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
@@ -198,6 +285,11 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Entering %s\n", src);
+	/* HPNLustreStripeCount: bump the destination dir's Lustre stripe
+	 * before any files land here, so range-split and bundled-file
+	 * extractions inherit the layout for free.  Silent on non-Lustre
+	 * destinations and when the feature is disabled. */
+	maybe_apply_lustre_layout(p, conn, dst);
 	return parallel_upload_walk(p, conn, src, dst, 0, resume, verify);
 }
 

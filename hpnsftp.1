@@ -241,6 +241,24 @@ on commodity LAN paths and
 on high-bandwidth/high-RTT WAN paths to striped parallel filesystems
 (Lustre, GPFS); tune from there using the respawn-count signal.
 .Pp
+On Lustre destinations,
+.Nm
+optionally bumps the destination directory's stripe count to match
+.Fl j Ar N
+so the parallel workers fan out across multiple OSTs instead of all
+piling onto whatever single OST the directory's default layout
+selected.
+See
+.Cm HPNLustreStripeCount
+in
+.Xr hpnssh_config 5 ;
+the feature is
+.Sy experimental ,
+on by default for parallel
+.Pq Fl j Ar N No with Ar N No \(>= 2
+Lustre uploads, and disabled with
+.Cm HPNLustreStripeCount Cm 0 .
+.Pp
 At the end of a parallel-streams session a summary line is emitted of
 the form:
 .Bd -literal -offset indent

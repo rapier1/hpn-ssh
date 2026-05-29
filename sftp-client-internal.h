@@ -93,6 +93,23 @@ void sftp_conn_set_verify_transfer(struct sftp_conn *conn, int enabled);
 int  sftp_conn_verify_transfer_enabled(struct sftp_conn *conn);
 
 /*
+ * Set / query the HPNLustreStripeCount resolved-from-ssh_config value
+ * stashed on conn->hpn.  Values: -1 = auto (use -j N); 0 = feature off;
+ * >0 = explicit override.  Safe with conn / conn->hpn NULL; query returns
+ * 0 in that case.
+ */
+void sftp_conn_set_lustre_stripe_count(struct sftp_conn *conn, int value);
+int  sftp_conn_lustre_stripe_count(struct sftp_conn *conn);
+
+/*
+ * Query the latched "hpn-file-layout was declined on this conn" flag.
+ * Set by the client-side helper after the first non-success reply so
+ * subsequent calls short-circuit.  Safe with conn / conn->hpn NULL.
+ */
+int  sftp_conn_layout_set_declined(struct sftp_conn *conn);
+void sftp_conn_set_layout_set_declined(struct sftp_conn *conn, int v);
+
+/*
  * Cumulative SFTP-payload bytes that actually crossed the wire on this
  * connection — SSH2_FXP_WRITE payload sent (uploads) + SSH2_FXP_DATA
  * payload received (downloads).  Excludes SSH framing / cipher overhead.

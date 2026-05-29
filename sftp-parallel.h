@@ -198,6 +198,15 @@ int sftp_resolve_hpn_verify_transfer(const char *host,
     const char *user_config_file);
 
 /*
+ * Resolve HPNLustreStripeCount from ssh_config for a host.
+ * Returns: -1 = auto (default), 0 = feature off, >0 = explicit count.
+ * Used by the parallel orchestrator to decide whether (and at what count)
+ * to issue hpn-file-layout requests before file creation.
+ */
+int sftp_resolve_hpn_lustre_stripe_count(const char *host,
+    const char *user_config_file);
+
+/*
  * Submit a work unit. These calls copy the path strings; the caller retains
  * ownership of its own buffers. Returns 0 on success, -1 if the orchestrator
  * is in shutdown / abort state.
@@ -232,6 +241,9 @@ int sftp_parallel_submit_download(struct sftp_parallel *p,
 int sftp_parallel_preserve_flag(const struct sftp_parallel *p);
 int sftp_parallel_follow_link_flag(const struct sftp_parallel *p);
 int sftp_parallel_is_aborting(const struct sftp_parallel *p);
+/* Number of parallel worker streams configured (-j N).  Returns 1 when
+ * `p` is NULL (i.e. parallel mode is not engaged). */
+int sftp_parallel_num_streams(const struct sftp_parallel *p);
 
 /*
  * Walker-side failure recorder.  Bumps the orchestrator's

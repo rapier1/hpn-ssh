@@ -1895,3 +1895,108 @@ out:
 }
 
 /* ── END sftp-hash-range ──────────────────────────────────────────────── */
+
+/* ── BEGIN hpn-file-layout: Lustre auto-stripe (EXPERIMENTAL) ────────────
+ *
+ * Client side of the hpn-file-layout@hpnssh.org extension.  The caller
+ * pre-decides whether to invoke this (Lustre destination + parallel mode
+ * + HPNLustreStripeCount != 0); this function just runs the wire
+ * transaction and translates the reply status.
+ *
+ * Wire format and status codes are defined in sftp-hpn-server.h.
+ */
+int
+sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
+    u_int32_t stripe_count, u_int32_t *applied_out)
+{
+	struct sshbuf	*msg = NULL;
+	u_int		 id, rid;
+	u_int32_t	 status = HPN_FILE_LAYOUT_FAIL;
+	u_int32_t	 applied = 0;
+	u_char		 type;
+	int		 r;
+	int		 rc = HPN_FILE_LAYOUT_FAIL;
+
+	if (applied_out != NULL)
+		*applied_out = 0;
+
+	if (conn == NULL || path == NULL) {
+		errno = EINVAL;
+		return HPN_FILE_LAYOUT_FAIL;
+	}
+
+	if (!sftp_conn_has_file_layout(conn)) {
+		debug_f("server lacks hpn-file-layout; skipping");
+		return HPN_FILE_LAYOUT_NOT_FS;
+	}
+
+	if ((msg = sshbuf_new()) == NULL) {
+		error_f("sshbuf_new failed");
+		return HPN_FILE_LAYOUT_FAIL;
+	}
+
+	id = sftp_conn_alloc_msg_id(conn);
+	debug3_f("sending hpn-file-layout \"%s\" stripe_count=%u id=%u",
+	    path, stripe_count, id);
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_FILE_LAYOUT)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
+	    (r = sshbuf_put_u32(msg, stripe_count)) != 0)
+		fatal_fr(r, "compose hpn-file-layout request");
+	if (send_msg(conn, msg) != 0) {
+		logit_f("hpn-file-layout \"%s\": transport send failed", path);
+		goto out;
+	}
+	sshbuf_reset(msg);
+
+	if (get_msg(conn, msg) != 0) {
+		logit_f("hpn-file-layout \"%s\": transport receive failed",
+		    path);
+		goto out;
+	}
+	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+	    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+		logit_f("hpn-file-layout \"%s\": parse reply header: %s",
+		    path, ssh_err(r));
+		goto out;
+	}
+	if (rid != id) {
+		sftp_conn_die(conn,
+		    "hpn-file-layout reply id mismatch (got %u expected %u)",
+		    rid, id);
+		goto out;
+	}
+	if (type == SSH2_FXP_STATUS) {
+		u_int	 fx_status = SSH2_FX_FAILURE;
+		(void)sshbuf_get_u32(msg, &fx_status);
+		logit_f("hpn-file-layout \"%s\": server STATUS reply %s",
+		    path, fx2txt(fx_status));
+		goto out;
+	}
+	if (type != SSH2_FXP_EXTENDED_REPLY) {
+		sftp_conn_die(conn,
+		    "hpn-file-layout: expected SSH2_FXP_EXTENDED_REPLY(%u), "
+		    "got %u", SSH2_FXP_EXTENDED_REPLY, type);
+		goto out;
+	}
+
+	if ((r = sshbuf_get_u32(msg, &status)) != 0 ||
+	    (r = sshbuf_get_u32(msg, &applied)) != 0) {
+		logit_f("hpn-file-layout \"%s\": parse reply body: %s",
+		    path, ssh_err(r));
+		goto out;
+	}
+
+	debug3_f("hpn-file-layout \"%s\" status=%u applied=%u",
+	    path, status, applied);
+	if (applied_out != NULL)
+		*applied_out = applied;
+	rc = (int)status;
+
+out:
+	sshbuf_free(msg);
+	return rc;
+}
+
+/* ── END hpn-file-layout ──────────────────────────────────────────────── */
