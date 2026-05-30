@@ -82,6 +82,18 @@ void sftp_conn_watchdog_pause(struct sftp_conn *conn, unsigned int seconds);
 void sftp_conn_watchdog_resume(struct sftp_conn *conn);
 
 /*
+ * Conn-side wrappers around sftp_hpn_rdahead_cap / _account.  Used by the
+ * bundle path in sftp-hpn-client.c (which sees struct sftp_conn as opaque)
+ * to bound outstanding bundle WRITEs by the adaptive controller's current
+ * depth and to feed accurate per-ack byte counts back to the throughput
+ * sampler.  Both return / no-op cleanly when conn or conn->hpn is NULL;
+ * sftp_conn_rdahead_cap returns `fallback` in that case so callers see
+ * their fixed ceiling instead of zero.
+ */
+uint32_t sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback);
+void     sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes);
+
+/*
  * Set / query the HPNVerifyTransfer enabled state on a connection.
  * Resolved from ssh_config in sftp.c and stashed on conn->hpn so the
  * resume-decision callers can pass HPN_CHECK_FILE_STRICT in the

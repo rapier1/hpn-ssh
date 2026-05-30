@@ -953,12 +953,18 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
  * shared with the server side. */
 
 /*
- * Defensive cap on outstanding (unread) STATUS replies.  Each queued
- * STATUS is ~13 bytes on the wire, so 4096 is well under any plausible
- * socket / channel buffer.  In practice the default 4 MiB bundle at the
- * 128 KiB libarchive block size below queues only ~32 STATUSes per
- * bundle — the cap exists only so a user cranking HPNBundleSize very
- * high doesn't fill kernel buffers and deadlock.
+ * Hard ceiling on outstanding (unread) STATUS replies.  The adaptive
+ * read-ahead controller (sftp_hpn_rdahead_*) drives the *operational*
+ * depth — small on LAN (RDAHEAD_FLOOR == 64) growing toward this cap on
+ * fat HPC pipes.  This constant serves two roles:
+ *   1. Upper bound the controller probes toward (its `cap`).
+ *   2. Sizing the per-WRITE size ring buffer (ctx->wsizes) used by
+ *      bundle_drain_n to feed accurate byte counts back into the
+ *      controller's throughput measurement.
+ * Each queued STATUS is ~13 bytes on the wire so 4096 is well under any
+ * plausible socket / channel buffer.  When HPN_RDAHEAD=fixed disables
+ * adaptation, sftp_hpn_rdahead_cap() returns this fallback and we revert
+ * to the legacy flat 4096 pipeline.
  */
 #define BUNDLE_MAX_INFLIGHT     4096
 
@@ -982,6 +988,17 @@ struct bundle_write_ctx {
 	uint64_t      n_sent;        /* WRITEs sent */
 	uint64_t      n_drained;     /* STATUS replies successfully drained */
 	u_int         first_rid;     /* rid of WRITE #0; valid when n_sent > 0 */
+
+	/*
+	 * Ring of per-WRITE byte counts so bundle_drain_n can feed the
+	 * exact ack size into sftp_hpn_rdahead_account().  Indexed by
+	 * (n_sent % wsizes_cap) on store, (n_drained % wsizes_cap) on read.
+	 * Always sized to BUNDLE_MAX_INFLIGHT — the ceiling on inflight
+	 * means index reuse is safe.  NULL if allocation failed; the
+	 * controller-feed becomes a no-op and we still send/drain correctly.
+	 */
+	uint32_t     *wsizes;
+	uint32_t      wsizes_cap;
 };
 
 /*
@@ -1051,6 +1068,15 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
 			break;
 		}
 		ctx->n_drained++;
+		/* Feed the adaptive read-ahead controller with the true
+		 * size of the just-acked WRITE so its throughput
+		 * measurement reflects actual bytes moved, not request
+		 * count.  No-op when allocation failed (wsizes == NULL)
+		 * or when adaptation is disabled. */
+		if (ctx->wsizes != NULL)
+			sftp_conn_rdahead_account(ctx->conn,
+			    ctx->wsizes[(ctx->n_drained - 1) %
+			    ctx->wsizes_cap]);
 	}
 	sshbuf_free(msg);
 	return rc;
@@ -1068,14 +1094,31 @@ bundle_archive_write_cb(struct archive *a, void *client_data,
 	if (ctx->any_fail)
 		return -1;
 
-	/* Defensive drain: keep outstanding WRITEs bounded so kernel
-	 * channel buffers don't fill on pathologically large bundles.
-	 * For the default 4 MiB bundle / 128 KiB block this never trips. */
-	if ((ctx->n_sent - ctx->n_drained) >= BUNDLE_MAX_INFLIGHT) {
-		if (bundle_drain_n(ctx, BUNDLE_MAX_INFLIGHT / 2) < 0) {
-			archive_set_error(a, EIO,
-			    "bundle drain: server status failure");
-			return -1;
+	/*
+	 * Adaptive back-pressure: cap outstanding WRITEs at the read-ahead
+	 * controller's current depth (BUNDLE_MAX_INFLIGHT when adaptation
+	 * is disabled).  Before this gate the bundle path used a fixed
+	 * 4096-deep pipeline that filled kernel pipe + TCP buffers on
+	 * low/medium-BDP paths and stalled get_msg waiting on STATUS.  The
+	 * controller probes from RDAHEAD_FLOOR upward, settling at the
+	 * BDP knee, so depth matches the path on both LAN and HPC.  When
+	 * the cap is reached we drain half of the inflight to keep the
+	 * pipeline single-window-deep rather than thrashing on every WRITE.
+	 */
+	{
+		uint32_t cap = sftp_conn_rdahead_cap(ctx->conn,
+		    BUNDLE_MAX_INFLIGHT);
+		if (cap == 0)
+			cap = BUNDLE_MAX_INFLIGHT;
+		if ((ctx->n_sent - ctx->n_drained) >= cap) {
+			size_t drain_n = cap / 2;
+			if (drain_n == 0)
+				drain_n = 1;
+			if (bundle_drain_n(ctx, drain_n) < 0) {
+				archive_set_error(a, EIO,
+				    "bundle drain: server status failure");
+				return -1;
+			}
 		}
 	}
 
@@ -1099,6 +1142,10 @@ bundle_archive_write_cb(struct archive *a, void *client_data,
 		ctx->any_fail = 1;
 		return -1;
 	}
+	/* Record this WRITE's payload length so the matching ack can
+	 * feed an accurate byte count to the read-ahead controller. */
+	if (ctx->wsizes != NULL)
+		ctx->wsizes[ctx->n_sent % ctx->wsizes_cap] = (uint32_t)length;
 	send_msg(ctx->conn, msg);
 	sshbuf_free(msg);
 
@@ -1134,6 +1181,18 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		debug_f("hpn-bundle: server does not advertise extension");
 		return -1;
 	}
+
+	/* Allocate the per-WRITE size ring used by bundle_drain_n to feed
+	 * accurate ack sizes into the adaptive read-ahead controller.  On
+	 * allocation failure we proceed anyway (wsizes stays NULL); the
+	 * controller-feed becomes a no-op so it sits at the seed depth, but
+	 * transfers still complete correctly.  ctx.conn is wired up below
+	 * after the OPEN handshake yields a usable handle. */
+	ctx.wsizes_cap = BUNDLE_MAX_INFLIGHT;
+	ctx.wsizes = calloc(ctx.wsizes_cap, sizeof(uint32_t));
+	if (ctx.wsizes == NULL)
+		debug_f("hpn-bundle: wsizes calloc failed; "
+		    "rdahead controller will see zero-byte acks");
 
 	debug_f("hpn-bundle upload: n=%d dest=\"%s\" preserve=%d fsync=%d",
 	    n, remote_dest_dir, preserve_flag, fsync_flag);
@@ -1322,6 +1381,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	if (a != NULL)
 		archive_write_free(a);
 	free(handle);
+	free(ctx.wsizes);
 	if (msg != NULL)
 		sshbuf_free(msg);
 	return rc;

@@ -4288,6 +4288,26 @@ sftp_conn_watchdog_resume(struct sftp_conn *conn)
 		sftp_hpn_watchdog_resume(conn->hpn);
 }
 
+/* Adaptive read-ahead controller wrappers.  Declared in
+ * sftp-client-internal.h so HPN extension code that works through the
+ * opaque struct sftp_conn * (the bundle path) can feed the controller
+ * and read its current cap without extracting conn->hpn directly.  Both
+ * forward to the sftp_hpn_rdahead_* primitives. */
+uint32_t
+sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback)
+{
+	if (conn == NULL)
+		return fallback;
+	return sftp_hpn_rdahead_cap(conn->hpn, fallback);
+}
+
+void
+sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes)
+{
+	if (conn != NULL)
+		sftp_hpn_rdahead_account(conn->hpn, nbytes);
+}
+
 /* HPNVerifyTransfer state accessors.  Declared in sftp-client-internal.h.
  * Set from sftp.c after ssh_config resolution; read by the resume-decision
  * hash call sites in sftp_upload / sftp_download to decide whether to set
