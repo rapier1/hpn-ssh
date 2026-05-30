@@ -189,6 +189,36 @@ uint32_t sftp_hpn_rdahead_window(struct sftp_hpn_conn *, size_t nbytes,
              uint32_t cur, uint32_t cap);
 
 /*
+ * Wedge-detection threshold (seconds).  A STATUS read that blocks longer
+ * than this is treated as evidence the path is wedged: the caller invokes
+ * sftp_hpn_rdahead_backpressure_signal() and the controller multiplicatively
+ * decreases `cur` (analogous to TCP cwnd /= 2 on RTO).
+ *
+ * 10 s catches every wedge the 2026-05-30 campaign captured (all blocked
+ * > 90 s) while being above the 3–8 s STATUS latencies legitimately
+ * produced by Lustre OST contention.  Without this signal the grow-only
+ * controller settles high and never recovers when conditions degrade
+ * mid-transfer; see [[bundle-inflight-backpressure]] in project memory.
+ *
+ * NB: this whole layer is application-level congestion control on top of
+ * TCP's, because the SFTP client can't see the SSH transport socket's
+ * TCP_INFO from across the hpnssh-subprocess boundary.  See
+ * [[hpn-code-organization-vision]] and [[post-18-10-tcp-info-self-monitor]]
+ * for the architectural direction (TCP_INFO integration) that would
+ * eventually subsume this.
+ *
+ * Used by: do_upload_body, sftp_upload_range, bundle_drain_n.
+ */
+#define SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC  10.0
+
+/* Backpressure signal: invoke when a STATUS read blocked longer than
+ * SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC.  Halves the in-flight depth
+ * (clamped to floor) and clears `settled` so re-probing resumes.  No-op
+ * when the controller is disabled.  Threshold detection is the caller's
+ * responsibility. */
+void     sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *);
+
+/*
  * Mark a connection as dead due to a non-recoverable error, log the
  * cause at ERROR level for diagnostic visibility, but do NOT terminate
  * the process. Used by the SFTP RPC layer to replace fatal() in code

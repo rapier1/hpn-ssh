@@ -94,6 +94,16 @@ uint32_t sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback);
 void     sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes);
 
 /*
+ * Backpressure signal — caller observed a STATUS read that blocked longer
+ * than the controller's wedge-detection threshold (RDAHEAD_BP_THRESHOLD_SEC
+ * in sftp-hpn-client.c, currently 10 s).  Forwards to
+ * sftp_hpn_rdahead_backpressure_signal, which halves the in-flight depth
+ * and re-enters the probe phase.  No-op when conn / conn->hpn is NULL or
+ * the controller is disabled.
+ */
+void sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn);
+
+/*
  * Set / query the HPNVerifyTransfer enabled state on a connection.
  * Resolved from ssh_config in sftp.c and stashed on conn->hpn so the
  * resume-decision callers can pass HPN_CHECK_FILE_STRICT in the

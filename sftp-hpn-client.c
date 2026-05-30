@@ -273,6 +273,9 @@ sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
 #define RDAHEAD_EWMA_ALPHA   0.6    /* weight of the newest window's rate */
 #define RDAHEAD_MIN_WIN_SEC  0.02   /* ignore windows shorter than this (noise) */
 
+/* SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC lives in sftp-hpn-client.h so the
+ * STATUS-read sites in sftp-client.c share the same constant. */
+
 /*
  * Seed the controller for a new connection: cap = num_requests (the -R
  * ceiling), floor = RDAHEAD_FLOOR clamped to cap, start probing at the floor.
@@ -374,6 +377,40 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
 	debug2_f("rdahead: depth=%u cap=%u rate=%.1f MiB/s%s",
 	    rd->cur, rd->cap, rate / (1024.0 * 1024.0),
 	    rd->settled ? " (settled)" : "");
+}
+
+/*
+ * Backpressure signal: caller observed a STATUS read that blocked longer
+ * than RDAHEAD_BP_THRESHOLD_SEC and concluded the pipeline is wedged.
+ * Multiplicatively decrease the in-flight depth (clamped to RDAHEAD_FLOOR),
+ * clear `settled` so the controller re-probes from the new lower depth,
+ * and discard the throughput baseline so the next window's rate isn't
+ * compared against the now-invalid pre-wedge measurement.  No-op when the
+ * controller is disabled (HPN_RDAHEAD=fixed) — in that mode the caller
+ * is on a fixed pipeline and has nothing for us to adjust.
+ *
+ * Analogue: TCP's RTO-triggered multiplicative decrease.  See the
+ * RDAHEAD_BP_THRESHOLD_SEC comment for the design rationale.
+ */
+void
+sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *hpn)
+{
+	struct sftp_rdahead *rd;
+	uint32_t before;
+
+	if (hpn == NULL || !hpn->rd.enabled)
+		return;
+	rd = &hpn->rd;
+	before = rd->cur;
+	rd->cur = MAXIMUM(rd->cur / 2, rd->floor);
+	rd->settled = 0;
+	rd->last_rate = 0.0;
+	rd->last_rising = rd->cur;
+	rd->win_bytes = 0;
+	rd->win_reqs = 0;
+	rd->win_start = monotime_double();
+	debug2_f("rdahead: backpressure → depth %u -> %u (re-probing)",
+	    before, rd->cur);
 }
 
 /*
@@ -1032,8 +1069,16 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
 		u_int status, reply_rid;
 		u_int expected_rid =
 		    ctx->first_rid + (u_int)ctx->n_drained;
+		double t_status_start;
 
 		sshbuf_reset(msg);
+		/* Time the STATUS read so the bundle path can also signal
+		 * the rdahead controller on a wedge (same mechanism as the
+		 * per-file path in sftp-client.c).  Catches the bundle
+		 * Pattern 1 stall from the 2026-05-30 campaign when the
+		 * controller has already settled high and the path
+		 * subsequently backs up. */
+		t_status_start = monotime_double();
 		if (get_msg(ctx->conn, msg) != 0) {
 			error_f("bundle drain: connection closed waiting "
 			    "for WRITE STATUS (drained %llu/%llu)",
@@ -1043,6 +1088,9 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
 			rc = -1;
 			break;
 		}
+		if (monotime_double() - t_status_start >
+		    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+			sftp_conn_rdahead_backpressure_signal(ctx->conn);
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &reply_rid)) != 0 ||
 		    type != SSH2_FXP_STATUS ||

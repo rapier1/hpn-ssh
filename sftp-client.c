@@ -2732,10 +2732,21 @@ do_upload_body(struct sftp_conn *conn,
 		    id - ackid >= sftp_hpn_rdahead_cap(conn->hpn,
 		    conn->num_requests)) {
 			u_int rid;
+			double t_status_start;
 
 			sshbuf_reset(msg);
+			/* Time the STATUS read so the rdahead controller
+			 * can react to wedged paths (Pattern 2 stall in
+			 * the 2026-05-30 campaign).  A read above the
+			 * threshold means the pipeline is too deep for
+			 * the current path; signal the controller to
+			 * halve its depth and re-probe. */
+			t_status_start = monotime_double();
 			if (get_msg(conn, msg) != 0)
 				break;
+			if (monotime_double() - t_status_start >
+			    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+				sftp_hpn_rdahead_backpressure_signal(conn->hpn);
 			if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 			    (r = sshbuf_get_u32(msg, &rid)) != 0)
 				fatal_fr(r, "parse");
@@ -3458,10 +3469,19 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		/* Check get_msg_extended return — connection death (EPIPE)
 		 * already sets conn->hpn->dead inside get_msg_extended.
 		 * Without this check, the subsequent parse would fatal_fr
-		 * on the empty msg buffer and crash the orchestrator. */
-		if (get_msg_extended(conn, msg, 0) != 0) {
-			status = SSH2_FX_FAILURE;
-			break;
+		 * on the empty msg buffer and crash the orchestrator.
+		 *
+		 * Time the STATUS read so a wedged-path signal can reach
+		 * the rdahead controller — same mechanism as do_upload_body. */
+		{
+			double t_status_start = monotime_double();
+			if (get_msg_extended(conn, msg, 0) != 0) {
+				status = SSH2_FX_FAILURE;
+				break;
+			}
+			if (monotime_double() - t_status_start >
+			    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+				sftp_hpn_rdahead_backpressure_signal(conn->hpn);
 		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &ackid)) != 0)
@@ -4306,6 +4326,13 @@ sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes)
 {
 	if (conn != NULL)
 		sftp_hpn_rdahead_account(conn->hpn, nbytes);
+}
+
+void
+sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn)
+{
+	if (conn != NULL)
+		sftp_hpn_rdahead_backpressure_signal(conn->hpn);
 }
 
 /* HPNVerifyTransfer state accessors.  Declared in sftp-client-internal.h.
