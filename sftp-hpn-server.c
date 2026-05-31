@@ -1328,16 +1328,26 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	 * continuing would produce a structurally-truncated stream that the
 	 * client's libarchive reader rejects as "Truncated input file" (the
 	 * failure mode observed in the 2026-05-31 br008 many-small download
-	 * validation campaign before this fix). */
+	 * validation campaign before this fix).
+	 *
+	 * Diagnostic counters: surfaced in the post-close debug line below so
+	 * post-mortem analysis can attribute a bundle's final size to packed
+	 * files vs metadata-skipped files. */
+	uint32_t packed_ok = 0;
+	uint32_t meta_skip = 0;
 	for (i = 0; i < n_paths; i++) {
 		int prc = bundle_fetch_pack_one(a, paths[i]);
 		if (prc == -2) {
 			error_f("hpn-bundle-fetch: bundle aborted after "
-			    "mid-archive failure on \"%s\" (%u/%u paths "
-			    "attempted)", paths[i], i + 1, n_paths);
+			    "mid-archive failure on \"%s\" "
+			    "(%u/%u paths attempted, %u packed, %u skipped)",
+			    paths[i], i + 1, n_paths, packed_ok, meta_skip);
 			goto fail;
 		}
-		/* prc == 0 (packed) or -1 (metadata-only skip): continue. */
+		if (prc == 0)
+			packed_ok++;
+		else
+			meta_skip++;
 	}
 
 	if (archive_write_close(a) != ARCHIVE_OK) {
@@ -1354,8 +1364,9 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 
-	debug_f("hpn-bundle-fetch: handle=%d n_paths=%u accum=%zu bytes",
-	    handle, n_paths, s->accum_len);
+	debug_f("hpn-bundle-fetch: handle=%d n_paths=%u packed=%u "
+	    "skipped=%u accum=%zu bytes",
+	    handle, n_paths, packed_ok, meta_skip, s->accum_len);
 
 	/* Hand ownership of `s` over to the handle table. */
 	s = NULL;
