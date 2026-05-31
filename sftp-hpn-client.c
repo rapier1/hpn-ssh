@@ -708,82 +708,275 @@ bundle_dl_mkdir_p(const char *dirpath, mode_t mode)
 }
 
 /*
- * Drain READ replies until we have at least one byte to give back,
- * EOF, or an error.  Stores result in `*out` and `*out_len`.
- * Returns 0 on success (including EOF, where *out_len == 0),
- * -1 on transport/protocol failure.
+ * Per-READ chunk size for bundle downloads.  128 KiB matches the
+ * server-side libarchive bytes_per_block on the fetch path and the
+ * default SFTP_MAX_READ_LENGTH ceiling on most server builds, so each
+ * READ returns one full block from the server's pre-packed accumulator.
+ */
+#define BUNDLE_DL_CHUNK_BYTES   (128u * 1024u)
+
+/*
+ * Safety bound on outstanding (unread) READ requests for the bundle
+ * download path.  The operational depth is normally driven by the
+ * memory cap (queue + in-flight bytes ≤ HPN_BUNDLE_DL_QUEUE_MAX_BYTES)
+ * and the adaptive read-ahead controller; this cap is just a sanity
+ * ceiling so a misconfigured queue size can't blow the in-flight count
+ * unbounded.
+ */
+#define BUNDLE_DL_MAX_INFLIGHT  1024u
+
+/*
+ * Default per-worker memory ceiling on the bundle download streaming
+ * queue, in bytes.  Caps the combined size of (received-and-queued +
+ * in-flight) chunks; when adding one more chunk would exceed this
+ * value the receive loop stops firing new READs until libarchive
+ * drains a chunk.  Overridable at runtime via
+ * HPN_BUNDLE_DL_QUEUE_MAX_BYTES (see bundle_dl_queue_max_bytes()).
+ *
+ * 32 MiB gives ~256 outstanding chunks at 128 KiB each — enough to
+ * keep ~10 Gbps × 25 ms or ~1 Gbps × 250 ms WAN BDPs saturated, while
+ * bounding per-worker memory regardless of bundle or path BDP size.
+ */
+#define BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT  (32u * 1024u * 1024u)
+
+/*
+ * One received DATA payload waiting for libarchive to consume.  Linked
+ * into a FIFO so chunks reach libarchive in fire order.
+ */
+struct bundle_dl_chunk {
+	u_char *data;
+	size_t  len;
+	struct bundle_dl_chunk *next;
+};
+
+/*
+ * Streaming download context: passed to libarchive's read_cb /
+ * close_cb so libarchive can pull tar bytes incrementally from the
+ * server while the receive loop keeps the SFTP wire pipelined.
+ *
+ * Read IDs are issued sequentially by sftp_conn_alloc_msg_id and no
+ * other operation interleaves while bundle_dl_stream_pump is running,
+ * so the N-th outstanding reply's expected ID is always
+ * first_read_id + chunks_received.  This lets us track ID expectations
+ * with a counter instead of a per-request ring — keeping metadata
+ * cost flat regardless of pipeline depth.
+ */
+struct bundle_dl_stream {
+	struct sftp_conn *conn;
+	const u_char     *handle;
+	size_t            handle_len;
+
+	u_int    first_read_id;
+	int      first_read_id_set;
+	u_int    chunks_sent;
+	u_int    chunks_received;
+	uint64_t fire_off;
+	int      eof_seen;
+
+	struct bundle_dl_chunk *q_head;
+	struct bundle_dl_chunk *q_tail;
+	size_t                  q_bytes;
+	size_t                  q_max_bytes;
+
+	/* Chunk currently handed to libarchive.  Freed on the next
+	 * read_cb call (libarchive guarantees it's done with the
+	 * previous buffer before asking for more) or in close_cb. */
+	u_char  *current;
+	size_t   current_len;
+
+	int      error;	/* sticky after any drain / fire failure */
+};
+
+/*
+ * Parse a byte size with optional K/M/G suffix into a size_t.
+ * Returns 0 on parse error or zero value (caller treats either as
+ * "use default").  Mirrors parse_bytes_arg() in sftp-hpn-server.c
+ * but is duplicated here to avoid an inter-module link dependency
+ * just for one helper.
+ */
+static size_t
+bundle_dl_parse_bytes(const char *spec)
+{
+	char     *end = NULL;
+	u_int64_t n, mult = 1;
+
+	if (spec == NULL || *spec == '\0')
+		return 0;
+	n = strtoull(spec, &end, 10);
+	if (end == spec)
+		return 0;
+	switch (*end) {
+	case 'G': case 'g': mult = 1024ULL * 1024 * 1024; break;
+	case 'M': case 'm': mult = 1024ULL * 1024;        break;
+	case 'K': case 'k': mult = 1024ULL;               break;
+	case '\0':                                         break;
+	default: return 0;
+	}
+	if (mult > 1 && n > (u_int64_t)SIZE_MAX / mult)
+		return 0;
+	n *= mult;
+	if (n == 0 || n > SIZE_MAX)
+		return 0;
+	return (size_t)n;
+}
+
+/*
+ * ENV-VAR HPN_BUNDLE_DL_QUEUE_MAX_BYTES — developer-only: per-worker
+ * memory ceiling on the bundle download streaming queue.  Caps the
+ * combined bytes of received-and-queued + in-flight chunks; when one
+ * more chunk would exceed the cap the receive loop stops firing new
+ * READs until libarchive drains.
+ *
+ * Default: BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT (32 MiB).  Accepts K/M/G
+ * suffix, e.g. "16M", "128M", "1G".  Values below one chunk
+ * (BUNDLE_DL_CHUNK_BYTES) are clamped up to one chunk so the pipeline
+ * can always make forward progress.
+ *
+ * Smaller values reduce per-worker memory at the cost of throughput
+ * when libarchive extraction can't keep up with the wire (queue
+ * fills → fire stops → wire idles).  Larger values give more headroom
+ * for bursty extraction but raise the per-worker memory ceiling.
+ * Currently an env var so we can test sweep values; if a preferred
+ * setting emerges, promote to ssh_config.  See
+ * benchmark/env-vars-reference.md.
+ */
+static size_t
+bundle_dl_queue_max_bytes(void)
+{
+	static size_t cached     = 0;
+	static int    initialized = 0;
+	const char   *ev;
+	size_t        v;
+
+	if (initialized)
+		return cached;
+	ev = getenv("HPN_BUNDLE_DL_QUEUE_MAX_BYTES");
+	v  = bundle_dl_parse_bytes(ev);
+	if (v == 0)
+		v = BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT;
+	if (v < BUNDLE_DL_CHUNK_BYTES)
+		v = BUNDLE_DL_CHUNK_BYTES;
+	cached     = v;
+	initialized = 1;
+	debug_f("hpn-bundle-fetch queue cap %zu bytes (%zu chunks)",
+	    cached, cached / BUNDLE_DL_CHUNK_BYTES);
+	return cached;
+}
+
+/*
+ * Fire one READ against the bundle handle at s->fire_off.  Captures
+ * s->first_read_id on the first successful allocation; subsequent IDs
+ * are implicit (sequential).  Updates s->chunks_sent and s->fire_off.
+ * Returns 0 on success, -1 on transport / OOM error.
  */
 static int
-bundle_dl_read_one(struct sftp_conn *conn, const u_char *handle,
-    size_t handle_len, uint64_t off, u_int chunk,
-    u_char **out, size_t *out_len, int *eof_out)
+bundle_dl_stream_fire_one(struct bundle_dl_stream *s)
 {
-	struct sshbuf *msg = NULL;
-	u_int read_id, recv_id, status;
-	u_char type;
+	struct sshbuf *msg;
+	u_int read_id;
 	int r;
 
-	*out = NULL;
-	*out_len = 0;
-	*eof_out = 0;
-
+	read_id = sftp_conn_alloc_msg_id(s->conn);
+	if (!s->first_read_id_set) {
+		s->first_read_id     = read_id;
+		s->first_read_id_set = 1;
+	}
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
-	read_id = sftp_conn_alloc_msg_id(conn);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_READ)) != 0 ||
 	    (r = sshbuf_put_u32(msg, read_id)) != 0 ||
-	    (r = sshbuf_put_string(msg, handle, handle_len)) != 0 ||
-	    (r = sshbuf_put_u64(msg, off)) != 0 ||
-	    (r = sshbuf_put_u32(msg, chunk)) != 0) {
+	    (r = sshbuf_put_string(msg, s->handle, s->handle_len)) != 0 ||
+	    (r = sshbuf_put_u64(msg, s->fire_off)) != 0 ||
+	    (r = sshbuf_put_u32(msg, BUNDLE_DL_CHUNK_BYTES)) != 0) {
 		error_f("compose hpn-bundle-fetch READ: %s", ssh_err(r));
 		sshbuf_free(msg);
 		return -1;
 	}
-	if (send_msg(conn, msg) != 0) {
+	if (send_msg(s->conn, msg) != 0) {
 		sshbuf_free(msg);
 		return -1;
 	}
-	sshbuf_reset(msg);
+	sshbuf_free(msg);
+	s->chunks_sent++;
+	s->fire_off += BUNDLE_DL_CHUNK_BYTES;
+	return 0;
+}
 
-	/* Time the DATA-reply read so the rdahead controller can react
-	 * to a wedged bundle download.  Bundle download is synchronous
-	 * (one READ, one reply) — there is no inflight pipeline for an
-	 * adaptive cap to bound (Part A doesn't apply here) — but the
-	 * wedge-detection mechanism still does: a slow reply indicates
-	 * transport backpressure that the controller's Part B/C/D state
-	 * machine should react to. */
-	double t_data_start = monotime_double();
-	if (get_msg(conn, msg) != 0) {
+/*
+ * Drain one outstanding reply, appending DATA payloads to the queue.
+ * Returns:
+ *    0 — DATA appended (queue grew)
+ *    1 — STATUS reply with SSH_FX_EOF (server has no more bytes)
+ *   -1 — transport, protocol, or server error
+ *
+ * The Part B backpressure-detection timing wraps get_msg so a slow
+ * STATUS read triggers the adaptive controller the same way it does
+ * on the upload-side bundle_drain_n path.
+ */
+static int
+bundle_dl_stream_drain_one(struct bundle_dl_stream *s)
+{
+	struct sshbuf *msg = NULL;
+	u_int recv_id, status, expected_id;
+	u_char type;
+	double t_start;
+	int r;
+
+	expected_id = s->first_read_id + s->chunks_received;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+
+	t_start = monotime_double();
+	if (get_msg(s->conn, msg) != 0) {
 		sshbuf_free(msg);
 		return -1;
 	}
-	if (monotime_double() - t_data_start >
+	if (monotime_double() - t_start >
 	    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
-		sftp_conn_rdahead_backpressure_signal(conn);
+		sftp_conn_rdahead_backpressure_signal(s->conn);
+
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 	    (r = sshbuf_get_u32(msg, &recv_id)) != 0) {
 		error_f("parse hpn-bundle-fetch reply header: %s", ssh_err(r));
 		sshbuf_free(msg);
 		return -1;
 	}
-	if (recv_id != read_id) {
-		error_f("hpn-bundle-fetch: id mismatch want=%u got=%u",
-		    read_id, recv_id);
+	if (recv_id != expected_id) {
+		error_f("hpn-bundle-fetch: id mismatch want=%u got=%u "
+		    "(chunks_received=%u)", expected_id, recv_id,
+		    s->chunks_received);
 		sshbuf_free(msg);
 		return -1;
 	}
+	s->chunks_received++;
 
 	if (type == SSH2_FXP_DATA) {
+		struct bundle_dl_chunk *node;
 		u_char *data = NULL;
 		size_t  dlen = 0;
 		if ((r = sshbuf_get_string(msg, &data, &dlen)) != 0) {
-			error_f("parse hpn-bundle-fetch DATA: %s", ssh_err(r));
+			error_f("parse hpn-bundle-fetch DATA: %s",
+			    ssh_err(r));
 			sshbuf_free(msg);
 			return -1;
 		}
-		*out = data;
-		*out_len = dlen;
 		sshbuf_free(msg);
+		node = calloc(1, sizeof(*node));
+		if (node == NULL) {
+			free(data);
+			error_f("hpn-bundle-fetch: calloc chunk node");
+			return -1;
+		}
+		node->data = data;
+		node->len  = dlen;
+		if (s->q_tail == NULL)
+			s->q_head = node;
+		else
+			s->q_tail->next = node;
+		s->q_tail = node;
+		s->q_bytes += dlen;
+		sftp_conn_rdahead_account(s->conn, dlen);
 		return 0;
 	}
 	if (type == SSH2_FXP_STATUS) {
@@ -794,11 +987,11 @@ bundle_dl_read_one(struct sftp_conn *conn, const u_char *handle,
 			return -1;
 		}
 		sshbuf_free(msg);
-		if (status == SSH2_FX_EOF) {
-			*eof_out = 1;
-			return 0;
-		}
-		error_f("hpn-bundle-fetch server error: %u", status);
+		if (status == SSH2_FX_EOF)
+			return 1;
+		error_f("hpn-bundle-fetch server error: %u "
+		    "(chunks_received=%u)", status,
+		    s->chunks_received - 1);
 		return -1;
 	}
 	error_f("hpn-bundle-fetch: unexpected reply type %u", (unsigned)type);
@@ -807,50 +1000,137 @@ bundle_dl_read_one(struct sftp_conn *conn, const u_char *handle,
 }
 
 /*
- * libarchive read-callback context: holds a single staged buffer
- * returned by bundle_dl_read_one.  archive_read_open_callback hands
- * libarchive a pointer/length pair on each callback call; we satisfy
- * by streaming one SFTP READ reply at a time.
+ * Pump fire/drain until at least one chunk is available on the queue
+ * or the bundle is fully drained (eof_seen && nothing in flight).
+ *
+ * Fire is bounded by:
+ *   - eof_seen        (stop firing once server signalled EOF)
+ *   - adaptive cap    (sftp_conn_rdahead_cap)
+ *   - memory budget   (q_bytes + in_flight * CHUNK_BYTES ≤ q_max_bytes)
+ *   - safety cap      (in_flight < BUNDLE_DL_MAX_INFLIGHT)
+ *
+ * Returns 0 on success, -1 on any error during fire/drain.  The
+ * caller checks s->q_head to distinguish "chunk available" from
+ * "true EOF reached".
  */
-struct bundle_dl_read_ctx {
-	struct sftp_conn *conn;
-	const u_char     *handle;
-	size_t            handle_len;
-	uint64_t          off;        /* next READ offset */
-	u_int             chunk;      /* per-READ length */
-	int               eof;
-	u_char           *staged;     /* current staged buffer (free on next call) */
-	size_t            staged_len;
-};
-
-static la_ssize_t
-bundle_dl_archive_read_cb(struct archive *a, void *client_data,
-    const void **buf_out)
+static int
+bundle_dl_stream_pump(struct bundle_dl_stream *s)
 {
-	struct bundle_dl_read_ctx *ctx = client_data;
-	(void)a;
+	while (s->q_head == NULL) {
+		u_int    in_flight = s->chunks_sent - s->chunks_received;
+		uint32_t target;
+		int      dr;
 
-	free(ctx->staged);
-	ctx->staged = NULL;
-	ctx->staged_len = 0;
+		target = sftp_conn_rdahead_cap(s->conn, BUNDLE_DL_MAX_INFLIGHT);
+		if (target == 0 || target > BUNDLE_DL_MAX_INFLIGHT)
+			target = BUNDLE_DL_MAX_INFLIGHT;
 
-	if (ctx->eof) {
-		*buf_out = NULL;
-		return 0;
+		while (!s->eof_seen && in_flight < target) {
+			size_t projected = s->q_bytes +
+			    (size_t)(in_flight + 1) * BUNDLE_DL_CHUNK_BYTES;
+			if (projected > s->q_max_bytes)
+				break;
+			if (bundle_dl_stream_fire_one(s) != 0)
+				return -1;
+			in_flight++;
+		}
+
+		if (in_flight == 0) {
+			if (s->eof_seen)
+				return 0;
+			/* Memory budget too small to fit a single chunk
+			 * alongside an empty queue; bundle_dl_queue_max_bytes
+			 * has already clamped the lower bound to one chunk,
+			 * so this branch is unreachable. */
+			error_f("hpn-bundle-fetch: stuck with empty queue "
+			    "and no in-flight reads (q_max_bytes=%zu)",
+			    s->q_max_bytes);
+			return -1;
+		}
+
+		dr = bundle_dl_stream_drain_one(s);
+		if (dr < 0)
+			return -1;
+		if (dr == 1)
+			s->eof_seen = 1;
 	}
+	return 0;
+}
 
-	if (bundle_dl_read_one(ctx->conn, ctx->handle, ctx->handle_len,
-	    ctx->off, ctx->chunk, &ctx->staged, &ctx->staged_len,
-	    &ctx->eof) != 0)
+/*
+ * libarchive read callback: hand the next queued chunk to libarchive.
+ * Frees the previous chunk first (libarchive contracts that it's done
+ * with the previous buffer before calling read_cb again).  Drives the
+ * pipeline pump only when the queue is empty, so libarchive consumes
+ * from RAM most of the time and only blocks on the wire when it has
+ * outpaced receive.
+ */
+static la_ssize_t
+bundle_dl_read_cb(struct archive *a, void *client_data, const void **buff)
+{
+	struct bundle_dl_stream *s = client_data;
+	struct bundle_dl_chunk  *node;
+
+	free(s->current);
+	s->current     = NULL;
+	s->current_len = 0;
+
+	if (s->error) {
+		*buff = NULL;
 		return -1;
+	}
 
-	if (ctx->staged_len == 0 || ctx->eof) {
-		*buf_out = NULL;
+	if (bundle_dl_stream_pump(s) != 0) {
+		s->error = 1;
+		archive_set_error(a, EIO, "hpn-bundle-fetch pump failed");
+		*buff = NULL;
+		return -1;
+	}
+
+	if (s->q_head == NULL) {
+		/* True EOF: nothing queued, nothing in flight, server EOF
+		 * signalled. */
+		*buff = NULL;
 		return 0;
 	}
-	ctx->off += ctx->staged_len;
-	*buf_out = ctx->staged;
-	return (la_ssize_t)ctx->staged_len;
+
+	node = s->q_head;
+	s->q_head = node->next;
+	if (s->q_head == NULL)
+		s->q_tail = NULL;
+	s->q_bytes -= node->len;
+	s->current     = node->data;
+	s->current_len = node->len;
+	free(node);
+	*buff = s->current;
+	return (la_ssize_t)s->current_len;
+}
+
+/*
+ * libarchive close callback: drop any chunks still queued (only
+ * reached on early bailout) and the current handed-to-libarchive
+ * chunk.  Always returns ARCHIVE_OK — there is no underlying
+ * descriptor to fail on.
+ */
+static int
+bundle_dl_close_cb(struct archive *a, void *client_data)
+{
+	struct bundle_dl_stream *s = client_data;
+	struct bundle_dl_chunk  *n, *next;
+
+	(void)a;
+	free(s->current);
+	s->current     = NULL;
+	s->current_len = 0;
+	for (n = s->q_head; n != NULL; n = next) {
+		next = n->next;
+		free(n->data);
+		free(n);
+	}
+	s->q_head  = NULL;
+	s->q_tail  = NULL;
+	s->q_bytes = 0;
+	return ARCHIVE_OK;
 }
 
 /*
@@ -949,8 +1229,11 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	u_int  open_id, flags;
 	struct archive *a = NULL;
 	struct archive_entry *ae;
-	struct bundle_dl_read_ctx ctx = { 0 };
+	struct bundle_dl_stream stream;
+	int    stream_opened = 0;
 	int i, r, rc = -1;
+
+	memset(&stream, 0, sizeof(stream));
 
 	for (i = 0; i < n; i++)
 		entries[i].result = -1;
@@ -997,26 +1280,54 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 		goto cleanup;
 	}
 
-	/* ── Drain tar bytes through libarchive and extract entries ──── */
-	ctx.conn       = conn;
-	ctx.handle     = handle;
-	ctx.handle_len = handle_len;
-	ctx.off        = 0;
-	/* 128 KiB matches the upload-side HPN_BUNDLE_BLOCK_BYTES; aligns with
-	 * the server's libarchive write-block boundary for cache friendliness. */
-	ctx.chunk      = 128 * 1024;
+	/* ── Streaming receive: libarchive pulls chunks from a bounded
+	 *    queue while the SFTP wire pipelines underneath ───────────────
+	 *
+	 * Earlier the bundle download was synchronous (one READ per
+	 * libarchive read_cb iteration), which made throughput RTT-bound
+	 * (~1.8 MiB/s per worker on juliet's simulated WAN during the
+	 * 2026-05-31 validation campaign).  Reframing to "receive whole
+	 * bundle, then extract" fixed throughput but parked the entire
+	 * bundle (up to HPN_BUNDLE_PER_CAP_DEFAULT = 64 MiB) in memory per
+	 * worker — aggregate footprint at -j 16 worst-case ≈ 1 GiB.
+	 *
+	 * This streaming form keeps the wire pipelined while bounding
+	 * per-worker memory to HPN_BUNDLE_DL_QUEUE_MAX_BYTES (default
+	 * 32 MiB).  The receive loop fires READs into a FIFO queue;
+	 * libarchive's read_cb pops chunks off the queue head and parses
+	 * tar entries; bytes are freed as libarchive consumes them.  When
+	 * the queue is full the fire loop stalls, applying natural
+	 * backpressure to slow extraction (e.g. Lustre metadata contention)
+	 * without buffering arbitrary in-flight bytes.
+	 *
+	 * The adaptive read-ahead controller still drives the depth target
+	 * (RDAHEAD_FLOOR floor, grows toward BUNDLE_DL_MAX_INFLIGHT under
+	 * Part A signals); the queue cap intersects it with a hard memory
+	 * bound.  See [[feedback-upload-download-parity]] — this brings
+	 * download parity with the upload path's pipelined write_cb. */
+	stream.conn        = conn;
+	stream.handle      = handle;
+	stream.handle_len  = handle_len;
+	stream.q_max_bytes = bundle_dl_queue_max_bytes();
 
 	a = archive_read_new();
 	if (a == NULL) {
 		error_f("archive_read_new failed");
 		goto cleanup;
 	}
-	if (archive_read_support_format_tar(a) != ARCHIVE_OK ||
-	    archive_read_open(a, &ctx, NULL,
-	        bundle_dl_archive_read_cb, NULL) != ARCHIVE_OK) {
-		error_f("archive_read_open: %s", archive_error_string(a));
+	if (archive_read_support_format_tar(a) != ARCHIVE_OK) {
+		error_f("archive_read_support_format_tar: %s",
+		    archive_error_string(a));
 		goto cleanup;
 	}
+	if (archive_read_set_callback_data(a, &stream) != ARCHIVE_OK ||
+	    archive_read_set_read_callback(a, bundle_dl_read_cb) != ARCHIVE_OK ||
+	    archive_read_set_close_callback(a, bundle_dl_close_cb) != ARCHIVE_OK ||
+	    archive_read_open1(a) != ARCHIVE_OK) {
+		error_f("archive_read_open1: %s", archive_error_string(a));
+		goto cleanup;
+	}
+	stream_opened = 1;
 
 	while ((r = archive_read_next_header(a, &ae)) == ARCHIVE_OK) {
 		const char *tar_path = archive_entry_pathname(ae);
@@ -1048,10 +1359,15 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 
  cleanup:
 	if (a != NULL) {
+		/* archive_read_close invokes our close_cb which frees any
+		 * queued chunks and the currently-handed-out buffer.  If
+		 * archive_read_open1 failed before stream_opened was set,
+		 * the callback was never installed — release directly. */
 		archive_read_close(a);
 		archive_read_free(a);
 	}
-	free(ctx.staged);
+	if (!stream_opened)
+		(void)bundle_dl_close_cb(NULL, &stream);
 
 	/* Close the bundle handle.  We don't strictly need to wait for the
 	 * STATUS — the server releases the accumulator either way — but
