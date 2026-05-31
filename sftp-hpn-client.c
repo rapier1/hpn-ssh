@@ -1058,6 +1058,70 @@ bundle_dl_stream_pump(struct bundle_dl_stream *s)
 }
 
 /*
+ * Drain every still-outstanding READ reply off the wire and discard
+ * its payload.  Called by the bundle download function after
+ * libarchive returns ARCHIVE_EOF (it stops after the tar end-of-
+ * archive marker, typically tens of chunks before the server-side
+ * accumulator's true byte EOF) and before SSH_FXP_CLOSE.  Without
+ * this, the orphaned DATA / STATUS replies arrive AFTER the CLOSE's
+ * STATUS and collide with the next bundle's READ replies — surfacing
+ * as "ID mismatch (X != Y)" sftp_conn_die calls and a worker abort.
+ *
+ * Returns 0 on success, -1 on transport / protocol error.  The drain
+ * is not allowed to grow the queue (we already passed the high-water
+ * mark and any further bytes are pure waste) — DATA payloads are
+ * read into msg and immediately discarded.
+ */
+static int
+bundle_dl_stream_drain_inflight(struct bundle_dl_stream *s)
+{
+	while (s->chunks_sent > s->chunks_received) {
+		struct sshbuf *msg;
+		u_int recv_id, status, expected_id;
+		u_char type;
+		int r;
+
+		expected_id = s->first_read_id + s->chunks_received;
+		if ((msg = sshbuf_new()) == NULL)
+			fatal_f("sshbuf_new failed");
+		if (get_msg(s->conn, msg) != 0) {
+			sshbuf_free(msg);
+			return -1;
+		}
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &recv_id)) != 0) {
+			error_f("hpn-bundle-fetch drain: parse header: %s",
+			    ssh_err(r));
+			sshbuf_free(msg);
+			return -1;
+		}
+		if (recv_id != expected_id) {
+			error_f("hpn-bundle-fetch drain: id mismatch "
+			    "want=%u got=%u (chunks_received=%u)",
+			    expected_id, recv_id, s->chunks_received);
+			sshbuf_free(msg);
+			return -1;
+		}
+		s->chunks_received++;
+		/* DATA: payload would be sshbuf_get_string'd; we don't
+		 * call it — sshbuf_free below drops the whole message.
+		 * STATUS: read the status code so we surface a real
+		 * server error if one occurred (EOF is fine and expected
+		 * here; anything else is logged). */
+		if (type == SSH2_FXP_STATUS &&
+		    sshbuf_get_u32(msg, &status) == 0 &&
+		    status != SSH2_FX_EOF) {
+			error_f("hpn-bundle-fetch drain: server error %u",
+			    status);
+			sshbuf_free(msg);
+			return -1;
+		}
+		sshbuf_free(msg);
+	}
+	return 0;
+}
+
+/*
  * libarchive read callback: hand the next queued chunk to libarchive.
  * Frees the previous chunk first (libarchive contracts that it's done
  * with the previous buffer before calling read_cb again).  Drives the
@@ -1358,6 +1422,24 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	rc = 0;
 
  cleanup:
+	/* Drain any in-flight wire replies BEFORE closing the bundle handle.
+	 *
+	 * libarchive normally returns ARCHIVE_EOF after parsing the tar
+	 * end-of-archive marker, which sits tens-to-hundreds of chunks before
+	 * the server-side accumulator's true byte EOF.  At that moment the
+	 * stream typically has many in-flight READs whose DATA/STATUS replies
+	 * are still queued on the wire.  Without draining them they arrive
+	 * AFTER our SSH_FXP_CLOSE STATUS and interleave with the NEXT bundle's
+	 * READ replies, surfacing as "ID mismatch (X != Y)" sftp_conn_die
+	 * calls and a worker abort.
+	 *
+	 * Skip the drain if a fire/drain error already poisoned the stream
+	 * (conn likely dead; further get_msg will hang or fail).  In that
+	 * case the worker is already on the path to respawn and protocol
+	 * cleanliness for this conn doesn't matter. */
+	if (stream_opened && !stream.error)
+		(void)bundle_dl_stream_drain_inflight(&stream);
+
 	if (a != NULL) {
 		/* archive_read_close invokes our close_cb which frees any
 		 * queued chunks and the currently-handed-out buffer.  If
