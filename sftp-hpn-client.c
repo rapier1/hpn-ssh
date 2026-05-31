@@ -733,12 +733,16 @@ bundle_dl_debug_log(const char *fmt, ...)
 	va_list ap;
 
 	if (!initialised) {
-		const char *path = getenv("HPN_BUNDLE_DEBUG_LOG");
-		if (path == NULL)
-			path = "/tmp/hpn-bundle-debug-client.log";
-		if (*path != '\0')
-			fp = fopen(path, "a");
+		/* Set initialised before any work so re-entrant or signal-
+		 * interrupted calls don't reopen.  Logging is OFF unless
+		 * HPN_BUNDLE_DEBUG_LOG is explicitly set to a non-empty
+		 * path.  Empty / unset → fp stays NULL → no-op.  Lets us
+		 * run timing-sensitive comparisons against the same binary
+		 * with logging disabled. */
 		initialised = 1;
+		const char *path = getenv("HPN_BUNDLE_DEBUG_LOG");
+		if (path != NULL && *path != '\0')
+			fp = fopen(path, "a");
 	}
 	if (fp == NULL)
 		return;

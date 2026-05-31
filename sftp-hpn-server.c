@@ -1187,12 +1187,16 @@ bundle_debug_log(const char *fmt, ...)
 	va_list ap;
 
 	if (!initialised) {
-		const char *path = getenv("HPN_BUNDLE_DEBUG_LOG");
-		if (path == NULL)
-			path = "/tmp/hpn-bundle-debug.log";
-		if (*path != '\0')
-			fp = fopen(path, "a");
+		/* Set initialised before any work so re-entrant or signal-
+		 * interrupted calls don't reopen.  Logging is OFF unless
+		 * HPN_BUNDLE_DEBUG_LOG is explicitly set to a non-empty
+		 * path.  Empty / unset → fp stays NULL → no-op.  Lets us
+		 * deploy the instrumentation binary in production with
+		 * effectively zero overhead by leaving the env var unset. */
 		initialised = 1;
+		const char *path = getenv("HPN_BUNDLE_DEBUG_LOG");
+		if (path != NULL && *path != '\0')
+			fp = fopen(path, "a");
 	}
 	if (fp == NULL)
 		return;
