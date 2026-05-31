@@ -204,45 +204,26 @@ struct bundle_dl_stream {
 	int      error;
 };
 
-static size_t
-bundle_dl_parse_bytes(const char *spec)
-{
-	char     *end = NULL;
-	u_int64_t n, mult = 1;
-
-	if (spec == NULL || *spec == '\0')
-		return 0;
-	n = strtoull(spec, &end, 10);
-	if (end == spec)
-		return 0;
-	switch (*end) {
-	case 'G': case 'g': mult = 1024ULL * 1024 * 1024; break;
-	case 'M': case 'm': mult = 1024ULL * 1024;        break;
-	case 'K': case 'k': mult = 1024ULL;               break;
-	case '\0':                                         break;
-	default: return 0;
-	}
-	if (mult > 1 && n > (u_int64_t)SIZE_MAX / mult)
-		return 0;
-	n *= mult;
-	if (n == 0 || n > SIZE_MAX)
-		return 0;
-	return (size_t)n;
-}
-
 /*
  * ENV-VAR HPN_BUNDLE_QUEUE_MAX_BYTES — developer-only: per-worker
  * memory ceiling on in-flight READ requests for the bundle download
  * path.  Bounds in_flight_count × BUNDLE_DL_CHUNK_BYTES ≤ this value.
  *
  * Default: BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT (32 MiB).  Accepts K/M/G
- * suffix.  Values below one chunk are clamped up.  Higher values let
- * us saturate fatter BDPs; lower values bound memory (and indirectly,
- * server-side bundle accumulator commitment) at the cost of throughput
- * when extract can't keep up with the wire.
+ * suffix (parsed via the openbsd-compat scan_scaled helper).  Values
+ * below one chunk are clamped up.  Higher values let us saturate
+ * fatter BDPs; lower values bound memory (and indirectly, server-side
+ * bundle accumulator commitment) at the cost of throughput when
+ * extract can't keep up with the wire.
  *
  * Renamed from HPN_BUNDLE_DL_QUEUE_MAX_BYTES (2026-05-31) when the
  * upload path gained the symmetric cap.  See benchmark/env-vars-reference.md.
+ *
+ * The previous in-file bundle_dl_parse_bytes helper was deduplicated
+ * against the server-side parse_bytes_arg by routing both through
+ * scan_scaled (2026-05-31 cleanup) — the rest of the codebase uses
+ * scan_scaled for the same job, so the bundle modules now follow the
+ * project idiom.
  */
 static size_t
 bundle_dl_queue_max_bytes(void)
@@ -250,12 +231,16 @@ bundle_dl_queue_max_bytes(void)
 	static size_t cached     = 0;
 	static int    initialized = 0;
 	const char   *ev;
-	size_t        v;
+	long long     llv;
+	size_t        v = 0;
 
 	if (initialized)
 		return cached;
 	ev = getenv("HPN_BUNDLE_QUEUE_MAX_BYTES");
-	v  = bundle_dl_parse_bytes(ev);
+	if (ev != NULL && *ev != '\0' &&
+	    scan_scaled((char *)ev, &llv) == 0 &&
+	    llv > 0 && (unsigned long long)llv <= SIZE_MAX)
+		v = (size_t)llv;
 	if (v == 0)
 		v = BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT;
 	if (v < BUNDLE_DL_CHUNK_BYTES)

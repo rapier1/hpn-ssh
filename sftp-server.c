@@ -49,6 +49,7 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-hpn-server.h"
+#include "sftp-hpn-bundle-server.h"	/* HPN_EXT_BUNDLE_* + bundle dispatch */
 
 #define XXH_INLINE_ALL
 #include "xxhash.h"

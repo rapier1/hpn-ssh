@@ -19,19 +19,12 @@
 #ifndef _SFTP_SERVER_HPN_H
 #define _SFTP_SERVER_HPN_H
 
-/* Extension names advertised in SSH_FXP_VERSION and dispatched by sftp-server.c. */
+/* Extension names advertised in SSH_FXP_VERSION and dispatched by sftp-server.c.
+ *
+ * Bundle-scope extension names (HPN_EXT_BUNDLE, _OPEN, _FETCH,
+ * _MAX_SIZE) moved to sftp-hpn-bundle-server.h on 2026-05-31 alongside
+ * the bundle code itself. */
 #define HPN_EXT_FS_INFO      "hpn-fs-info@hpnssh.org"
-#define HPN_EXT_BUNDLE          "hpn-bundle@hpnssh.org"         /* capability advert */
-#define HPN_EXT_BUNDLE_OPEN     "hpn-bundle-open@hpnssh.org"    /* upload  bundle open  */
-#define HPN_EXT_BUNDLE_FETCH    "hpn-bundle-fetch@hpnssh.org"   /* download bundle open */
-#define HPN_EXT_BUNDLE_MAX_SIZE "hpn-bundle-max-size@hpnssh.org"/* server-advertised
-                                                                 * HPNMaxBundleSize:
-                                                                 * value is the cap
-                                                                 * in bytes as an
-                                                                 * ASCII decimal
-                                                                 * string.  Absent
-                                                                 * → client treats
-                                                                 * as no cap. */
 #define HPN_EXT_HASH_RANGE   "sftp-hash-range@hpnssh.org"   /* chunked-resume ranged hashing */
 #define HPN_EXT_FILE_LAYOUT  "hpn-file-layout@hpnssh.org"   /* filesystem layout (Lustre stripe today) */
 
@@ -160,109 +153,11 @@ struct sshbuf;
 void sftp_hpn_server_dispatch(u_int id, const char *name,
     struct sshbuf *iqueue, struct sshbuf *oqueue);
 
-/* ── BEGIN Phase 5: bundle handle support ─────────────────────────────────
- *
- * Bundle handles are allocated by the hpn-bundle-open@hpnssh.org extension
- * handler.  They appear in sftp-server.c's handle table as HANDLE_BUNDLE
- * (a new use type).  Subsequent SSH_FXP_WRITE messages on a bundle handle
- * append data to an accumulation buffer; SSH_FXP_CLOSE triggers libarchive
- * extraction into the destination directory, then frees the bundle state.
- *
- * The sftp-server.c WRITE/CLOSE dispatchers detect bundle handles via
- * the use type and call the functions below.  All bundle state lives
- * inside sftp-hpn-server.c so sftp-server.c carries a minimal diff.
- *
- * Requires libarchive (-larchive); enforced as a hard configure
- * requirement.
- */
-
-/*
- * True iff the given handle index refers to a bundle handle allocated
- * by this module.  sftp-server.c calls this in process_write and
- * process_close before its standard fd-based dispatch.
- */
-int sftp_hpn_server_is_bundle_handle(int handle);
-
-/*
- * Append WRITE data to a bundle handle's accumulation buffer.
- * Returns SSH2_FX_OK on success or an SSH2_FX_* error.
- */
-int sftp_hpn_server_bundle_write(int handle, uint64_t off,
-    const u_char *data, size_t len);
-
-/*
- * Close a bundle handle: run libarchive extraction on the accumulated
- * tar bytes, then release all bundle state and the handle itself.
- * Returns SSH2_FX_OK if every file in the bundle was extracted
- * successfully, otherwise an SSH2_FX_* error.
- *
- * For fetch-mode handles (download-side bundles populated up front by
- * process_hpn_bundle_fetch), close simply releases the accumulator and
- * always returns SSH2_FX_OK.
- */
-int sftp_hpn_server_bundle_close(int handle);
-
-/*
- * Read up to len bytes from a fetch-mode bundle handle's accumulator
- * into out_buf, starting at offset off.
- *
- * On success returns SSH2_FX_OK and sets *out_len to the number of bytes
- * actually returned (0 < *out_len <= len for in-range reads).
- *
- * Returns SSH2_FX_EOF if off >= accumulator length (end of bundle).
- *
- * Returns an SSH2_FX_* error if the handle is not a fetch-mode bundle
- * (e.g. an upload-side bundle being WRITten into) or other failure.
- *
- * Used by sftp-server.c's process_read for handles where
- * sftp_hpn_server_is_bundle_handle() returns true.
- */
-int sftp_hpn_server_bundle_read(int handle, uint64_t off,
-    u_char *out_buf, size_t len, size_t *out_len);
-
-/*
- * Apply operator-supplied per-bundle and total bundle-accumulator caps
- * from K/M/G-suffixed byte strings (e.g. "64M", "1500M", "2G").  Either
- * argument may be NULL or "" to leave that cap at its compiled default.
- * Values outside the supported range are clamped to the nearest bound
- * with a warning to stderr; unparseable values cause exit via fatal().
- *
- * Bounds:
- *   per-bundle: [1 MiB, 1 GiB]   default 64 MiB
- *   total:      [16 MiB, 16 GiB] default 1.5 GiB
- *
- * Called by sftp-server.c after parsing -B / -T CLI flags, before the
- * SFTP main loop starts.  Safe to call with both NULLs (no-op).
- */
-void sftp_hpn_server_set_bundle_caps(const char *per_arg,
-    const char *total_arg);
-
-/*
- * True iff the bundle path is enabled at this server.  Driven by
- * sshd_config's HPNUseBundle (propagated via the HPN_USE_BUNDLE env
- * var that sshd-session sets).  When false:
- *   - sftp-server.c omits hpn-bundle / hpn-bundle-open /
- *     hpn-bundle-fetch from the SSH_FXP_VERSION extension list.
- *   - sftp-hpn-server.c rejects bundle-open / bundle-fetch with
- *     SSH2_FX_OP_UNSUPPORTED if a misbehaving client tries anyway.
- *
- * The check is cached after the first call; safe to invoke on any
- * code path without performance concern.
- */
-int sftp_hpn_server_bundle_enabled(void);
-
-/*
- * The per-bundle byte ceiling the server is currently enforcing,
- * derived from sshd_config's HPNMaxBundleSize (or the -B CLI default
- * if no sshd_config value was supplied).  Used by sftp-server.c's
- * process_init to advertise the cap to clients via the
- * hpn-bundle-max-size@hpnssh.org extension so they can clamp
- * proactively instead of being rejected mid-transfer.  Returns 0 if
- * the bundle path is disabled (HPNUseBundle=no); callers should treat
- * 0 as "do not advertise".
- */
-size_t sftp_hpn_server_bundle_per_cap(void);
-
-/* ── END Phase 5 ─────────────────────────────────────────────────────── */
+/* Bundle handle dispatch (sftp_hpn_server_bundle_*, _is_bundle_handle,
+ * _enabled, _per_cap, _set_bundle_caps) moved to
+ * sftp-hpn-bundle-server.h on 2026-05-31 alongside the bundle code
+ * itself.  sftp-server.c now includes both this header (for the
+ * dispatcher + hash-range / file-layout decls) and
+ * sftp-hpn-bundle-server.h (for the bundle ones). */
 
 #endif /* _SFTP_SERVER_HPN_H */

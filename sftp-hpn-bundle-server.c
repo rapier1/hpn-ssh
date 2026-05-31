@@ -183,37 +183,55 @@ static size_t bundle_total_bytes = 0; /* sum of accum_cap across open handles */
 static int    bundle_enabled    = -1;   /* -1 = uninitialised */
 
 /*
- * Parse a K/M/G-suffixed byte count.  Returns the parsed value on
- * success, or 0 if spec is NULL/empty/unparseable or would overflow
- * size_t when the suffix is applied.  Callers must check for 0
- * separately from a legitimately-parsed value, since 0 itself is never
- * a valid cap.
+ * Parse a K/M/G-suffixed byte count via the openbsd-compat helper
+ * scan_scaled().  Returns the parsed value on success, or 0 if spec
+ * is NULL/empty/unparseable/negative or would overflow size_t.
+ * Callers treat 0 as "no value supplied" — 0 itself is never a
+ * valid cap.  Thin wrapper kept here so the call sites stay clean
+ * (cast + bounds check live in one place).  The previous in-module
+ * parse_bytes_arg was deduplicated against bundle-client.c's
+ * bundle_dl_parse_bytes by routing both through scan_scaled
+ * (2026-05-31 cleanup).
  */
 static size_t
-parse_bytes_arg(const char *spec)
+bundle_parse_scaled(const char *spec)
 {
-	char *end = NULL;
-	u_int64_t n, mult = 1;
+	long long llv;
 
 	if (spec == NULL || *spec == '\0')
 		return 0;
-	n = strtoull(spec, &end, 10);
-	if (end == spec)
+	if (scan_scaled((char *)spec, &llv) != 0)
 		return 0;
-	switch (*end) {
-	case 'G': case 'g': mult = 1024ULL * 1024 * 1024; break;
-	case 'M': case 'm': mult = 1024ULL * 1024;        break;
-	case 'K': case 'k': mult = 1024ULL;               break;
-	case '\0':                                         break;
-	default: return 0;
-	}
-	/* Overflow check BEFORE multiplying. */
-	if (mult > 1 && n > (u_int64_t)SIZE_MAX / mult)
+	if (llv <= 0 || (unsigned long long)llv > SIZE_MAX)
 		return 0;
-	n *= mult;
-	if (n == 0 || n > SIZE_MAX)
-		return 0;
-	return (size_t)n;
+	return (size_t)llv;
+}
+
+/*
+ * Compose and enqueue an SSH_FXP_STATUS failure reply on oqueue.
+ * Shared by the fail labels of process_hpn_bundle_open and
+ * process_hpn_bundle_fetch — both handlers reply with the same
+ * 5-field STATUS shape on error (only the error-tag string differs,
+ * which we pass through for the fatal_fr() log line).
+ */
+static void
+bundle_send_status_failure(struct sshbuf *oqueue, u_int id, int status,
+    const char *tag)
+{
+	struct sshbuf *msg;
+	int r;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u32(msg, (u_int)status)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "")) != 0)
+		fatal_fr(r, "compose %s", tag);
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue %s", tag);
+	sshbuf_free(msg);
 }
 
 /*
@@ -242,14 +260,14 @@ void
 sftp_hpn_server_set_bundle_caps(const char *per_arg, const char *total_arg)
 {
 	if (per_arg != NULL && *per_arg != '\0') {
-		size_t v = parse_bytes_arg(per_arg);
+		size_t v = bundle_parse_scaled(per_arg);
 		if (v == 0)
 			fatal("Invalid -B value \"%s\"", per_arg);
 		bundle_per_cap = clamp_cap("-B", v,
 		    HPN_BUNDLE_PER_CAP_MIN, HPN_BUNDLE_PER_CAP_MAX);
 	}
 	if (total_arg != NULL && *total_arg != '\0') {
-		size_t v = parse_bytes_arg(total_arg);
+		size_t v = bundle_parse_scaled(total_arg);
 		if (v == 0)
 			fatal("Invalid -T value \"%s\"", total_arg);
 		bundle_total_cap = clamp_cap("-T", v,
@@ -273,7 +291,7 @@ bundle_caps_init(void)
 	if (bundle_per_cap == 0) {
 		ev = getenv("HPN_MAX_BUNDLE_SIZE");
 		if (ev != NULL && *ev != '\0') {
-			size_t v = parse_bytes_arg(ev);
+			size_t v = bundle_parse_scaled(ev);
 			if (v > 0)
 				bundle_per_cap = clamp_cap("HPNMaxBundleSize",
 				    v, HPN_BUNDLE_PER_CAP_MIN,
@@ -841,17 +859,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	return;
 
  fail:
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u32(msg, status)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0)
-		fatal_fr(r, "compose bundle open failure");
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue bundle open failure");
-	sshbuf_free(msg);
+	bundle_send_status_failure(oqueue, id, status, "bundle open failure");
 	free(dest_dir);
 }
 
@@ -1023,15 +1031,5 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	for (i = 0; i < n_collected; i++)
 		free(paths[i]);
 	free(paths);
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u32(msg, status)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0)
-		fatal_fr(r, "compose bundle-fetch failure");
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue bundle-fetch failure");
-	sshbuf_free(msg);
+	bundle_send_status_failure(oqueue, id, status, "bundle-fetch failure");
 }
