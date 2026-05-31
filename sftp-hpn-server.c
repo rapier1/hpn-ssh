@@ -39,6 +39,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -633,6 +634,11 @@ bundle_state_free(struct hpn_bundle_state *s)
  * Returns 0 on success, -1 on allocation failure OR cap exceeded.
  * Callers translate -1 into SSH2_FX_FAILURE on the wire.
  */
+/* Forward declaration so bundle_state_reserve can log via the
+ * direct-to-file diagnostic; the actual definition is further down. */
+static void bundle_debug_log(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
+
 static int
 bundle_state_reserve(struct hpn_bundle_state *s, size_t need)
 {
@@ -643,6 +649,9 @@ bundle_state_reserve(struct hpn_bundle_state *s, size_t need)
 		error_f("hpn-bundle: per-bundle cap exceeded "
 		    "(would be %zu, cap %zu)",
 		    s->accum_len + need, bundle_per_cap);
+		bundle_debug_log("RESERVE_FAIL per-bundle-cap would_be=%zu "
+		    "cap=%zu accum_len=%zu need=%zu",
+		    s->accum_len + need, bundle_per_cap, s->accum_len, need);
 		return -1;
 	}
 	if (s->accum_len + need <= s->accum_cap)
@@ -650,8 +659,12 @@ bundle_state_reserve(struct hpn_bundle_state *s, size_t need)
 
 	size_t new_cap = s->accum_cap ? s->accum_cap : 65536;
 	while (new_cap < s->accum_len + need) {
-		if (new_cap > SIZE_MAX / 2)
+		if (new_cap > SIZE_MAX / 2) {
+			bundle_debug_log("RESERVE_FAIL geometric-overflow "
+			    "accum_cap=%zu need=%zu",
+			    s->accum_cap, need);
 			return -1;
+		}
 		new_cap *= 2;
 	}
 	/* Clamp the geometric growth to the per-bundle cap so we don't
@@ -666,12 +679,23 @@ bundle_state_reserve(struct hpn_bundle_state *s, size_t need)
 		error_f("hpn-bundle: total-across-handles cap exceeded "
 		    "(would be %zu, cap %zu)",
 		    bundle_total_bytes + added, bundle_total_cap);
+		bundle_debug_log("RESERVE_FAIL total-cap would_be=%zu cap=%zu "
+		    "accum_cap=%zu new_cap=%zu",
+		    bundle_total_bytes + added, bundle_total_cap,
+		    s->accum_cap, new_cap);
 		return -1;
 	}
 
 	u_char *p = realloc(s->accum, new_cap);
-	if (p == NULL)
+	if (p == NULL) {
+		bundle_debug_log("RESERVE_FAIL realloc-null old_cap=%zu "
+		    "new_cap=%zu need=%zu accum_len=%zu",
+		    s->accum_cap, new_cap, need, s->accum_len);
 		return -1;
+	}
+	bundle_debug_log("RESERVE_GROW old_cap=%zu new_cap=%zu need=%zu "
+	    "accum_len=%zu",
+	    s->accum_cap, new_cap, need, s->accum_len);
 	s->accum     = p;
 	s->accum_cap = new_cap;
 	bundle_total_bytes += added;
@@ -1100,16 +1124,89 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
  * client upload side, but here the destination is in-process memory
  * rather than the SFTP wire.
  */
+/*
+ * Diagnostic counter for the 2026-05-31 truncation hunt.  Tracks the
+ * cumulative bytes libarchive has handed us across all callback
+ * invocations for the current bundle.  Should equal s->accum_len at the
+ * end of process_hpn_bundle_fetch — divergence means we lost bytes
+ * between libarchive and the memcpy.
+ *
+ * Static and process-local: a single sftp-server process handles one
+ * connection's bundles sequentially, so this is reset at the start of
+ * each process_hpn_bundle_fetch call (see that function for the reset).
+ * No threading concerns; sftp-server is single-threaded.
+ */
+static size_t bundle_fetch_writecb_bytes_total = 0;
+static uint32_t bundle_fetch_writecb_call_count = 0;
+
+/*
+ * Direct-to-file diagnostic logger, bypassing the standard log subsystem
+ * (and therefore syslog / journal routing).  Used for the 2026-05-31
+ * truncation hunt because the test sshd's normal log pipeline wasn't
+ * surfacing sftp-server child output via journalctl.
+ *
+ * Path comes from the HPN_BUNDLE_DEBUG_LOG env var with a sensible
+ * default.  Opens once per process, appends per call (O_APPEND so
+ * concurrent sftp-server children writing to the same file get atomic
+ * line appends at the OS level, no interleaving up to PIPE_BUF).
+ *
+ * Each line is "<unix_sec>.<usec> pid=<pid> <message>\n" — easy to grep,
+ * easy to sort by timestamp across processes.
+ *
+ * No-op when:
+ *   - HPN_BUNDLE_DEBUG_LOG is set to the empty string (explicit disable)
+ *   - the file can't be opened (we don't want to wedge sftp-server on a
+ *     log path that doesn't exist; just fail quiet)
+ *
+ * REMOVE OR PROPERLY GATE after the truncation hunt closes.  This is
+ * raw debug-spew code with no rate limiting and no log rotation.
+ */
+static void
+bundle_debug_log(const char *fmt, ...)
+{
+	static FILE *fp = NULL;
+	static int  initialised = 0;
+	struct timespec ts;
+	va_list ap;
+
+	if (!initialised) {
+		const char *path = getenv("HPN_BUNDLE_DEBUG_LOG");
+		if (path == NULL)
+			path = "/tmp/hpn-bundle-debug.log";
+		if (*path != '\0')
+			fp = fopen(path, "a");
+		initialised = 1;
+	}
+	if (fp == NULL)
+		return;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	flockfile(fp);
+	fprintf(fp, "%lu.%06ld pid=%d ",
+	    (unsigned long)ts.tv_sec, (long)(ts.tv_nsec / 1000), getpid());
+	va_start(ap, fmt);
+	vfprintf(fp, fmt, ap);
+	va_end(ap);
+	fputc('\n', fp);
+	fflush(fp);
+	funlockfile(fp);
+}
+
 static la_ssize_t
 bundle_fetch_archive_write_cb(struct archive *a, void *client_data,
     const void *buf, size_t len)
 {
 	struct hpn_bundle_state *s = client_data;
 	(void)a;
-	if (bundle_state_reserve(s, len) != 0)
+	if (bundle_state_reserve(s, len) != 0) {
+		bundle_debug_log("WRITECB_FAIL reserve len=%zu "
+		    "accum_len=%zu", len, s->accum_len);
 		return -1;
+	}
 	memcpy(s->accum + s->accum_len, buf, len);
 	s->accum_len += len;
+	bundle_fetch_writecb_bytes_total += len;
+	bundle_fetch_writecb_call_count++;
 	return (la_ssize_t)len;
 }
 
@@ -1153,22 +1250,29 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
 	if (fd < 0) {
 		error_f("hpn-bundle-fetch: open \"%s\": %s",
 		    path, strerror(errno));
+		bundle_debug_log("PACK_FAIL open path=%s errno=%d %s",
+		    path, errno, strerror(errno));
 		goto out;
 	}
 	if (fstat(fd, &sb) < 0) {
 		error_f("hpn-bundle-fetch: fstat \"%s\": %s",
 		    path, strerror(errno));
+		bundle_debug_log("PACK_FAIL fstat path=%s errno=%d %s",
+		    path, errno, strerror(errno));
 		goto out;
 	}
 	if (!S_ISREG(sb.st_mode)) {
 		debug_f("hpn-bundle-fetch: \"%s\" not a regular file, skipping",
 		    path);
+		bundle_debug_log("PACK_SKIP non-regular path=%s mode=0%o",
+		    path, (unsigned)sb.st_mode);
 		goto out;
 	}
 
 	ae = archive_entry_new();
 	if (ae == NULL) {
 		error_f("hpn-bundle-fetch: archive_entry_new failed");
+		bundle_debug_log("PACK_FAIL archive_entry_new path=%s", path);
 		goto out;
 	}
 	archive_entry_set_pathname(ae, path);
@@ -1180,10 +1284,17 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
 	if (archive_write_header(a, ae) != ARCHIVE_OK) {
 		error_f("hpn-bundle-fetch: header \"%s\": %s",
 		    path, archive_error_string(a));
+		bundle_debug_log("PACK_FAIL write_header path=%s size=%lld "
+		    "libarchive=%s",
+		    path, (long long)sb.st_size,
+		    archive_error_string(a));
 		rc = -2;	/* archive state may be invalid */
 		goto out;
 	}
 	header_written = 1;
+	bundle_debug_log("PACK_HEADER path=%s size=%lld accum=%zu",
+	    path, (long long)sb.st_size, /* s passed via global counters */
+	    bundle_fetch_writecb_bytes_total);
 
 	{
 		off_t remaining = sb.st_size;
@@ -1197,6 +1308,10 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
 					continue;
 				error_f("hpn-bundle-fetch: read \"%s\": %s",
 				    path, strerror(errno));
+				bundle_debug_log("PACK_FAIL read path=%s "
+				    "remaining=%lld errno=%d %s",
+				    path, (long long)remaining,
+				    errno, strerror(errno));
 				rc = -2;	/* mid-entry; archive broken */
 				goto out;
 			}
@@ -1217,12 +1332,21 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
 				    path,
 				    (long long)(sb.st_size - remaining),
 				    (long long)sb.st_size);
+				bundle_debug_log("PACK_FAIL shrank path=%s "
+				    "read=%lld size=%lld",
+				    path,
+				    (long long)(sb.st_size - remaining),
+				    (long long)sb.st_size);
 				rc = -2;
 				goto out;
 			}
 			if (archive_write_data(a, buf, (size_t)n) != n) {
 				error_f("hpn-bundle-fetch: write_data "
 				    "\"%s\": %s", path,
+				    archive_error_string(a));
+				bundle_debug_log("PACK_FAIL write_data path=%s "
+				    "n=%zd remaining=%lld libarchive=%s",
+				    path, n, (long long)remaining,
 				    archive_error_string(a));
 				rc = -2;	/* mid-entry; archive broken */
 				goto out;
@@ -1231,6 +1355,9 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
 		}
 	}
 	rc = 0;
+	bundle_debug_log("PACK_OK path=%s size=%lld accum=%zu",
+	    path, (long long)sb.st_size,
+	    bundle_fetch_writecb_bytes_total);
 
  out:
 	(void)header_written;	/* reserved for future entry-finalize
@@ -1275,21 +1402,28 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	if ((r = sshbuf_get_u32(iqueue, &flags)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &n_paths)) != 0) {
 		error_f("parse hpn-bundle-fetch header: %s", ssh_err(r));
+		bundle_debug_log("FETCH_FAIL parse-header ssh_err=%s",
+		    ssh_err(r));
 		goto fail;
 	}
 	if (n_paths == 0 || n_paths > 65535) {
 		error_f("hpn-bundle-fetch: implausible n_paths=%u", n_paths);
+		bundle_debug_log("FETCH_FAIL implausible-n_paths n=%u",
+		    n_paths);
 		goto fail;
 	}
 	paths = calloc(n_paths, sizeof(*paths));
 	if (paths == NULL) {
 		error_f("hpn-bundle-fetch: out of memory");
+		bundle_debug_log("FETCH_FAIL calloc-paths n=%u", n_paths);
 		goto fail;
 	}
 	for (i = 0; i < n_paths; i++) {
 		if ((r = sshbuf_get_cstring(iqueue, &paths[i], NULL)) != 0) {
 			error_f("parse hpn-bundle-fetch path[%u]: %s",
 			    i, ssh_err(r));
+			bundle_debug_log("FETCH_FAIL parse-path idx=%u "
+			    "ssh_err=%s", i, ssh_err(r));
 			goto fail;
 		}
 		n_collected++;
@@ -1298,15 +1432,29 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	debug3("request %u: hpn-bundle-fetch n=%u flags=0x%x",
 	    id, n_paths, flags);
 
+	/* 2026-05-31 truncation hunt: reset write_cb counters so this
+	 * fetch's numbers are not polluted by a previous one on the
+	 * same connection. */
+	bundle_fetch_writecb_bytes_total = 0;
+	bundle_fetch_writecb_call_count = 0;
+	bundle_debug_log("FETCH_START n_paths=%u flags=0x%x", n_paths, flags);
+	/* Path list so we can correlate a specific bundle with a specific
+	 * client-side "Truncated input file" error on a specific file. */
+	for (i = 0; i < n_paths; i++)
+		bundle_debug_log("FETCH_PATH idx=%u path=%s",
+		    i, paths[i] ? paths[i] : "(null)");
+
 	s = bundle_state_new_fetch(flags);
 	if (s == NULL) {
 		error_f("hpn-bundle-fetch: out of memory");
+		bundle_debug_log("FETCH_FAIL state-new oom");
 		goto fail;
 	}
 
 	a = archive_write_new();
 	if (a == NULL) {
 		error_f("hpn-bundle-fetch: archive_write_new failed");
+		bundle_debug_log("FETCH_FAIL archive_write_new");
 		goto fail;
 	}
 	if (archive_write_set_format_ustar(a) != ARCHIVE_OK ||
@@ -1315,6 +1463,8 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	    archive_write_open(a, s, NULL,
 	        bundle_fetch_archive_write_cb, NULL) != ARCHIVE_OK) {
 		error_f("hpn-bundle-fetch: libarchive setup: %s",
+		    archive_error_string(a));
+		bundle_debug_log("FETCH_FAIL libarchive-setup libarchive=%s",
 		    archive_error_string(a));
 		goto fail;
 	}
@@ -1342,6 +1492,10 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 			    "mid-archive failure on \"%s\" "
 			    "(%u/%u paths attempted, %u packed, %u skipped)",
 			    paths[i], i + 1, n_paths, packed_ok, meta_skip);
+			bundle_debug_log("FETCH_ABORT path=%s idx=%u/%u "
+			    "packed=%u skipped=%u accum=%zu writecb_total=%zu",
+			    paths[i], i + 1, n_paths, packed_ok, meta_skip,
+			    s->accum_len, bundle_fetch_writecb_bytes_total);
 			goto fail;
 		}
 		if (prc == 0)
@@ -1350,9 +1504,23 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 			meta_skip++;
 	}
 
-	if (archive_write_close(a) != ARCHIVE_OK) {
+	/* 2026-05-31 truncation hunt: log accumulator state before and
+	 * after archive_write_close so we can attribute the
+	 * end-of-archive markers + bytes_per_block padding bytes. */
+	bundle_debug_log("PRE_CLOSE  accum=%zu writecb_total=%zu calls=%u",
+	    s->accum_len, bundle_fetch_writecb_bytes_total,
+	    bundle_fetch_writecb_call_count);
+	int wclose_rc = archive_write_close(a);
+	bundle_debug_log("POST_CLOSE rc=%d accum=%zu writecb_total=%zu "
+	    "calls=%u %s",
+	    wclose_rc, s->accum_len, bundle_fetch_writecb_bytes_total,
+	    bundle_fetch_writecb_call_count,
+	    wclose_rc == ARCHIVE_OK ? "OK" : "FAIL");
+	if (wclose_rc != ARCHIVE_OK) {
 		error_f("hpn-bundle-fetch: archive_write_close: %s",
 		    archive_error_string(a));
+		bundle_debug_log("FETCH_FAIL archive_write_close rc=%d "
+		    "libarchive=%s", wclose_rc, archive_error_string(a));
 		goto fail;
 	}
 	archive_write_free(a);
@@ -1361,12 +1529,35 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	handle = handle_new_bundle(s);
 	if (handle < 0) {
 		error_f("hpn-bundle-fetch: handle table full");
+		bundle_debug_log("FETCH_FAIL handle-table-full accum=%zu",
+		    s->accum_len);
 		goto fail;
 	}
 
-	debug_f("hpn-bundle-fetch: handle=%d n_paths=%u packed=%u "
-	    "skipped=%u accum=%zu bytes",
-	    handle, n_paths, packed_ok, meta_skip, s->accum_len);
+	/* 2026-05-31 truncation hunt: promoted from debug_f to logit so it
+	 * appears at default LogLevel.  Surfaces the comparison between
+	 * libarchive's claimed write byte count and our accumulator's
+	 * final size — these should match exactly.  Divergence pinpoints
+	 * byte loss between archive_write_close and what we serve.  Same
+	 * message is also written to the bundle_debug_log file so we don't
+	 * depend on syslog/journal routing. */
+	logit("hpn-bundle-fetch: handle=%d n_paths=%u packed=%u "
+	    "skipped=%u accum=%zu writecb_total=%zu writecb_calls=%u "
+	    "%s",
+	    handle, n_paths, packed_ok, meta_skip, s->accum_len,
+	    bundle_fetch_writecb_bytes_total,
+	    bundle_fetch_writecb_call_count,
+	    s->accum_len == bundle_fetch_writecb_bytes_total
+	        ? "MATCH"
+	        : "DIVERGED");
+	bundle_debug_log("FETCH_DONE handle=%d n_paths=%u packed=%u "
+	    "skipped=%u accum=%zu writecb_total=%zu writecb_calls=%u %s",
+	    handle, n_paths, packed_ok, meta_skip, s->accum_len,
+	    bundle_fetch_writecb_bytes_total,
+	    bundle_fetch_writecb_call_count,
+	    s->accum_len == bundle_fetch_writecb_bytes_total
+	        ? "MATCH"
+	        : "DIVERGED");
 
 	/* Hand ownership of `s` over to the handle table. */
 	s = NULL;
