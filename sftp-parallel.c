@@ -473,6 +473,24 @@ struct sftp_worker {
 	uint64_t           reconnect_count;
 	uint64_t           last_completion_ns; /* monotonic ns of last finish */
 
+	/*
+	 * Per-worker respawn timing — observability only, no gating decision
+	 * is made on these.  Respawn limits today are session-wide (see the
+	 * comment block at the respawn dispatch site).  These fields exist
+	 * so post-mortem forensics on a stats CSV can answer "which worker
+	 * respawned and when," which we wanted while debugging the 2026-05-30
+	 * br008 Pattern 2 wedges.  Set under w->mu at the same site as
+	 * reconnect_count++.  Zero values mean "never respawned this session."
+	 *
+	 * If we ever discover one persistently-bad worker is starving healthy
+	 * workers of the session's respawn budget, the right answer is a
+	 * per-worker time-windowed thrash detector (sliding window, cooldown
+	 * on burst) — see the design discussion at the respawn dispatch site.
+	 * Until then these are read-only stats fields.
+	 */
+	uint64_t           first_reconnect_ns;  /* ns of this worker's first respawn */
+	uint64_t           last_reconnect_ns;   /* ns of this worker's most recent respawn */
+
 	/* Adaptive throughput-based stall detection state.  See
 	 * cfg.tput_path_healthy_kbps in sftp-parallel.h for the algorithm.
 	 * Updated at each watchdog tick. */
@@ -2989,8 +3007,12 @@ respawn_worker_thread(void *arg)
 	if (w == NULL) {
 		error_ft("worker respawn failed");
 	} else {
+		uint64_t now = monotonic_ns();
 		pthread_mutex_lock(&w->mu);
 		w->reconnect_count++;
+		if (w->first_reconnect_ns == 0)
+			w->first_reconnect_ns = now;
+		w->last_reconnect_ns = now;
 		pthread_mutex_unlock(&w->mu);
 		debug_ft("worker %d respawned (reconnect_count=%llu)",
 		    w->id, (unsigned long long)w->reconnect_count);
@@ -3007,7 +3029,8 @@ respawn_worker_thread(void *arg)
  * first call (lazy), emits one row per worker per slow tick.
  *
  * Columns: t_ms, worker_id, bytes_total, live_bytes, units_started,
- *          units_completed, units_failed, health, reconnect_count
+ *          units_completed, units_failed, health, reconnect_count,
+ *          first_reconnect_ms, last_reconnect_ms
  *
  * Factored out of reporter_thread to keep the slow-tick body readable.
  * Holds workers_mu while iterating, plus per-worker mu for each row.
@@ -3028,7 +3051,8 @@ reporter_emit_stats_csv(struct sftp_parallel *p)
 		setvbuf(p->stats_csv, NULL, _IOLBF, 0);
 		fprintf(p->stats_csv,
 		    "t_ms,worker_id,bytes_total,live_bytes,units_started"
-		    ",units_completed,units_failed,health,reconnect_count\n");
+		    ",units_completed,units_failed,health,reconnect_count"
+		    ",first_reconnect_ms,last_reconnect_ms\n");
 		p->stats_csv_start_ns = monotonic_ns();
 	}
 	uint64_t t_ms =
@@ -3037,8 +3061,16 @@ reporter_emit_stats_csv(struct sftp_parallel *p)
 	for (int i = 0; i < p->num_workers; i++) {
 		struct sftp_worker *w = p->workers[i];
 		pthread_mutex_lock(&w->mu);
+		/* Per-worker respawn timestamps emitted as ms-since-CSV-start
+		 * (matching t_ms's basis).  Zero means "no respawn yet for
+		 * this worker."  Observability only — no gating depends on
+		 * these; see the respawn dispatch comment for the policy. */
+		uint64_t first_ms = w->first_reconnect_ns == 0 ? 0 :
+		    (w->first_reconnect_ns - p->stats_csv_start_ns) / 1000000ULL;
+		uint64_t last_ms = w->last_reconnect_ns == 0 ? 0 :
+		    (w->last_reconnect_ns - p->stats_csv_start_ns) / 1000000ULL;
 		fprintf(p->stats_csv,
-		    "%llu,%d,%llu,%llu,%llu,%llu,%llu,%d,%llu\n",
+		    "%llu,%d,%llu,%llu,%llu,%llu,%llu,%d,%llu,%llu,%llu\n",
 		    (unsigned long long)t_ms,
 		    w->id,
 		    (unsigned long long)w->bytes_total,
@@ -3047,7 +3079,9 @@ reporter_emit_stats_csv(struct sftp_parallel *p)
 		    (unsigned long long)w->units_completed,
 		    (unsigned long long)w->units_failed,
 		    (int)w->health,
-		    (unsigned long long)w->reconnect_count);
+		    (unsigned long long)w->reconnect_count,
+		    (unsigned long long)first_ms,
+		    (unsigned long long)last_ms);
 		pthread_mutex_unlock(&w->mu);
 	}
 	pthread_mutex_unlock(&p->workers_mu);
@@ -3137,6 +3171,34 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
  *   worker is still pushing the configured healthy-path floor, grant
  *   an uncounted extension cooldown (warn but continue).  If the
  *   path itself is unhealthy, abort.
+ *
+ * Per-worker scope (deliberate non-decision, 2026-05-30):
+ *   This gate is intentionally session-wide, not per-worker.  One
+ *   persistently-degraded worker can therefore consume some of the
+ *   session's respawn budget that other workers might otherwise need
+ *   for legitimate transient failures.  Decided session-wide because:
+ *
+ *     1. One mechanism is easier to maintain than two.  A future reader
+ *        looking at respawn behaviour finds it all here.
+ *     2. The 2026-05-30 Part B validation campaign (br008 mixed-tree +
+ *        br008 many-small + juliet many-small, 60 iters total) did not
+ *        produce a case where a session-wide pause wrongly froze
+ *        healthy workers because of one bad one.  Adding per-worker
+ *        gating speculatively would be code we'd have to maintain
+ *        without evidence it earns its keep.
+ *     3. Per-worker observability (first_reconnect_ns, last_reconnect_ns
+ *        on struct sftp_worker, surfaced in the stats CSV) gives the
+ *        operator the data to attribute respawn churn to specific
+ *        workers post-hoc, without adding a second gating system.
+ *
+ *   If we ever do see a real case where one bad worker is starving the
+ *   session's budget, the right shape for the fix is a per-worker
+ *   sliding-window thrash detector (count respawns in a rolling N-second
+ *   window; on burst, cooldown that worker only; window resets on
+ *   stability).  Time-windowed, not lifetime-capped — a days-long
+ *   transfer should accumulate many isolated transient respawns without
+ *   ever tripping.  Mirror RESPAWN_STABILITY_SEC's semantics at the
+ *   per-worker scope.  Don't add until you have data showing it matters.
  */
 static int
 reporter_dispatch_respawns(struct sftp_parallel *p, int n_to_respawn)
