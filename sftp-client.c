@@ -676,6 +676,25 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 			 * a list of paths via hpn-bundle-fetch@hpnssh.org. */
 			ret->exts |= SFTP_EXT_HPN_BUNDLE_FETCH;
 			known = 1;
+		} else if (strcmp(name,
+		    "hpn-bundle-max-size@hpnssh.org") == 0) {
+			/* Server-advertised HPNMaxBundleSize.  Value is the
+			 * cap in bytes as an ASCII decimal string.  The
+			 * worker init uses this to clamp bundle_target_bytes
+			 * proactively (sftp-parallel.c) so we don't generate
+			 * bundles the server would reject mid-stream.
+			 *
+			 * Parse errors / zero values are treated as "no cap"
+			 * (server_max_bundle_size stays 0); absence has the
+			 * same meaning, so callers don't have a separate
+			 * present/absent flag. */
+			char     *ep;
+			unsigned long long v = strtoull((char *)value,
+			    &ep, 10);
+			if (ep != (char *)value && *ep == '\0' && v > 0)
+				ret->hpn->server_max_bundle_size =
+				    (uint64_t)v;
+			known = 1;
 		} else if (strcmp(name, "hpn-file-layout@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			/* Server can apply a Lustre stripe layout to a
@@ -4255,6 +4274,14 @@ int
 sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn)
 {
 	return conn && (conn->exts & SFTP_EXT_HPN_BUNDLE_FETCH) != 0;
+}
+
+uint64_t
+sftp_conn_server_max_bundle_size(struct sftp_conn *conn)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return 0;
+	return conn->hpn->server_max_bundle_size;
 }
 
 int

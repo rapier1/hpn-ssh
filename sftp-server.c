@@ -805,8 +805,26 @@ process_init(void)
 	 * see no advertisement and use the per-file path.  Dispatchers
 	 * also refuse the ops defensively in case a client somehow tries. */
 	if (sftp_hpn_server_bundle_enabled()) {
+		size_t cap = sftp_hpn_server_bundle_per_cap();
+		char   cap_buf[32];
+
 		compose_extension(msg, HPN_EXT_BUNDLE, "1");
 		compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
+
+		/* hpn-bundle-max-size: server-advertised hard cap on per-
+		 * bundle bytes (sshd_config: HPNMaxBundleSize).  Clients
+		 * use this to clamp their bundle target proactively so they
+		 * don't generate bundles the server would reject mid-stream.
+		 * Backward-compat: old clients ignore unknown extension
+		 * names; old servers don't advertise → new clients treat
+		 * absence as "no cap" and rely on the server's defensive
+		 * enforcement (bundle_per_cap on the upload accumulator
+		 * + fetch declared-size check). */
+		if (cap > 0) {
+			snprintf(cap_buf, sizeof(cap_buf), "%zu", cap);
+			compose_extension(msg, HPN_EXT_BUNDLE_MAX_SIZE,
+			    cap_buf);
+		}
 	}
 	compose_extension(msg, HPN_EXT_FILE_LAYOUT, "1");
 

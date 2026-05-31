@@ -21,9 +21,17 @@
 
 /* Extension names advertised in SSH_FXP_VERSION and dispatched by sftp-server.c. */
 #define HPN_EXT_FS_INFO      "hpn-fs-info@hpnssh.org"
-#define HPN_EXT_BUNDLE       "hpn-bundle@hpnssh.org"        /* capability advert */
-#define HPN_EXT_BUNDLE_OPEN  "hpn-bundle-open@hpnssh.org"   /* upload  bundle open  */
-#define HPN_EXT_BUNDLE_FETCH "hpn-bundle-fetch@hpnssh.org"  /* download bundle open */
+#define HPN_EXT_BUNDLE          "hpn-bundle@hpnssh.org"         /* capability advert */
+#define HPN_EXT_BUNDLE_OPEN     "hpn-bundle-open@hpnssh.org"    /* upload  bundle open  */
+#define HPN_EXT_BUNDLE_FETCH    "hpn-bundle-fetch@hpnssh.org"   /* download bundle open */
+#define HPN_EXT_BUNDLE_MAX_SIZE "hpn-bundle-max-size@hpnssh.org"/* server-advertised
+                                                                 * HPNMaxBundleSize:
+                                                                 * value is the cap
+                                                                 * in bytes as an
+                                                                 * ASCII decimal
+                                                                 * string.  Absent
+                                                                 * → client treats
+                                                                 * as no cap. */
 #define HPN_EXT_HASH_RANGE   "sftp-hash-range@hpnssh.org"   /* chunked-resume ranged hashing */
 #define HPN_EXT_FILE_LAYOUT  "hpn-file-layout@hpnssh.org"   /* filesystem layout (Lustre stripe today) */
 
@@ -242,6 +250,18 @@ void sftp_hpn_server_set_bundle_caps(const char *per_arg,
  * code path without performance concern.
  */
 int sftp_hpn_server_bundle_enabled(void);
+
+/*
+ * The per-bundle byte ceiling the server is currently enforcing,
+ * derived from sshd_config's HPNMaxBundleSize (or the -B CLI default
+ * if no sshd_config value was supplied).  Used by sftp-server.c's
+ * process_init to advertise the cap to clients via the
+ * hpn-bundle-max-size@hpnssh.org extension so they can clamp
+ * proactively instead of being rejected mid-transfer.  Returns 0 if
+ * the bundle path is disabled (HPNUseBundle=no); callers should treat
+ * 0 as "do not advertise".
+ */
+size_t sftp_hpn_server_bundle_per_cap(void);
 
 /* ── END Phase 5 ─────────────────────────────────────────────────────── */
 

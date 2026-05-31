@@ -1941,6 +1941,25 @@ worker_thread_init(struct sftp_worker *w)
 	w->bundle_target_bytes = (w->parent->cfg.bundle_size > 0)
 	    ? w->parent->cfg.bundle_size
 	    : BUNDLE_TARGET_BYTES;
+
+	/* Server-advertised HPNMaxBundleSize (from sshd_config).  Clamp
+	 * our chosen target so we never generate a bundle the server
+	 * would reject mid-stream.  Worker 0 only — other workers either
+	 * produce duplicate warnings or quietly inherit the same value. */
+	{
+		uint64_t srv_max =
+		    sftp_conn_server_max_bundle_size(w->conn);
+		if (srv_max > 0 && w->bundle_target_bytes > srv_max) {
+			if (w->id == 0)
+				logit("server caps HPNBundleSize at %llu "
+				    "bytes; clamping from %llu",
+				    (unsigned long long)srv_max,
+				    (unsigned long long)
+				    w->bundle_target_bytes);
+			w->bundle_target_bytes = srv_max;
+		}
+	}
+
 	if (w->parent->cfg.use_bundle == 0) {
 		debug_ft("worker %d: bundle disabled by "
 		    "ssh_config HPNUseBundle no", w->id);

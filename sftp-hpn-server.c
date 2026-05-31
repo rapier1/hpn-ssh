@@ -748,6 +748,15 @@ sftp_hpn_server_bundle_enabled(void)
 	return bundle_enabled;
 }
 
+size_t
+sftp_hpn_server_bundle_per_cap(void)
+{
+	bundle_caps_init();
+	if (!bundle_enabled)
+		return 0;
+	return bundle_per_cap;
+}
+
 /* Compose the full destination path for one tar entry.  Returns a
  * malloc'd string on success or NULL on OOM / unsafe path.  *out_safe
  * is set to 0 (unsafe path; caller fails the bundle) or 1 (OK). */

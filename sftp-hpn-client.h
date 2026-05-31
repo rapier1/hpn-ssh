@@ -138,6 +138,15 @@ struct sftp_hpn_conn {
 	 * (a new sftp invocation). */
 	int              layout_set_declined;
 
+	/* Server-advertised HPNMaxBundleSize, parsed from the
+	 * hpn-bundle-max-size@hpnssh.org extension in SSH_FXP_VERSION.
+	 * 0 = absent (no cap advertised; client uses its own values and
+	 * relies on the server's defensive bundle_per_cap rejection if
+	 * any).  Non-zero values let the worker init clamp bundle_target_bytes
+	 * proactively so the client never generates a bundle the server
+	 * would reject mid-stream. */
+	uint64_t         server_max_bundle_size;
+
 	/* Adaptive read-ahead controller — sizes the in-flight request
 	 * window to the path BDP instead of a flat num_requests. */
 	struct sftp_rdahead rd;
