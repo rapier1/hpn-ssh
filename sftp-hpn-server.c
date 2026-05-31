@@ -910,29 +910,28 @@ sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
 		*out_len = 0;
 		return SSH2_FX_EOF;
 	}
-	/* Sequential-only: SFTP READs arrive in offset order on a single
-	 * channel.  Skip out-of-order requests (they can't happen with the
-	 * current client; if they ever do, we surface a clear error rather
-	 * than silently producing wrong bytes). */
-	if (off != s->bytes_produced) {
-		if (off > s->bytes_produced) {
-			error_f("hpn-bundle READ: out-of-order offset "
-			    "%llu (next %llu)",
-			    (unsigned long long)off,
-			    (unsigned long long)s->bytes_produced);
-			return SSH2_FX_FAILURE;
-		}
-		/* off < bytes_produced: client re-reading earlier bytes.
-		 * Streaming codec doesn't support back-seek; bytes are
-		 * already gone.  Fail loudly. */
+	/* SFTP READs arrive in offset order on a single channel.  Reject
+	 * backward seeks loudly — streaming codec can't replay produced
+	 * bytes.  Forward "gaps" (off > bytes_produced) are silently
+	 * absorbed: they happen naturally when a previous read returned
+	 * fewer than CHUNK_BYTES because the bundle ended mid-chunk.  The
+	 * client fires each read at fixed chunk_index × CHUNK_BYTES, so
+	 * once one read is short, every subsequent read has off >
+	 * bytes_produced.  We just produce whatever's left (probably 0,
+	 * past the EOA marker) and return EOF.  Without this graceful
+	 * absorbtion the client's drain-of-orphan-reads sees STATUS
+	 * FAILURE replies, bails the drain, and the next bundle's READs
+	 * collide with leftover orphan replies on the wire — surfacing as
+	 * "ID mismatch" sftp_conn_die calls and worker abort. */
+	if (off < s->bytes_produced) {
 		error_f("hpn-bundle READ: backward seek %llu (next %llu)",
 		    (unsigned long long)off,
 		    (unsigned long long)s->bytes_produced);
 		return SSH2_FX_FAILURE;
 	}
 
-	/* Fill up to `len` bytes by looping pack_next.  Returns 0 only
-	 * when EOA has been emitted and no more bytes will follow. */
+	/* Fill up to `len` bytes by looping pack_next.  Returns 0 when
+	 * EOA has been emitted and no more bytes will follow. */
 	size_t produced = 0;
 	while (produced < len) {
 		ssize_t n = sftp_hpn_tar_writer_pack_next(s->writer,
