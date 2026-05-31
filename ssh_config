@@ -43,5 +43,17 @@
 #   ProxyCommand ssh -q -W %h:%p gateway.example.com
 #   RekeyLimit 1G 1h
 #   UserKnownHostsFile ~/.ssh/known_hosts.d/%k
-#   UseMPTCP no
-#   HappyEyes no
+#
+# HPN-SSH specific options (defaults shown):
+#   UseMPTCP no			 # Use MPTCP for connections
+#   HappyEyes no		 # Enable RFC 8305 for dual stack hosts
+#   HPNDisabled no               # disable the HPN performance fast paths
+#   HPNUseBundle yes             # small-file SFTP bundling on put/get -r
+#   HPNBundleSize 8M             # bundle target size [1M, 64M]
+#   HPNVerifyTransfer no         # XXH3 post-transfer hash compare
+#   HPNMaxRetries 3              # parallel-worker retry budget per session
+#   HPNMaxAuthConcurrent 8       # max parallel-worker auths in flight [1, 64]
+#   HPNLustreStripeCount auto    # Lustre stripe count on remote destination
+#                                #   auto = match -j N (default)
+#                                #   off  = disable (server picks)
+#                                #   1..65535 = explicit override

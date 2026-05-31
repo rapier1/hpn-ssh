@@ -506,6 +506,19 @@ static size_t bundle_total_cap = 0;
 static size_t bundle_total_bytes = 0; /* sum of accum_cap across open handles */
 
 /*
+ * Operator master toggle (sshd_config: HPNUseBundle).  When 0, the
+ * server omits the hpn-bundle* extensions from SSH_FXP_VERSION and
+ * refuses bundle-open / bundle-fetch with SSH2_FX_OP_UNSUPPORTED.
+ * Read from the HPN_USE_BUNDLE env var that sshd-session sets from
+ * options.hpn_use_bundle.  Defaults to 1 when the env var is absent
+ * or unparseable (preserves prior behaviour for callers that haven't
+ * propagated the option).
+ *
+ * Cached after the first lookup so the hot path is a simple read.
+ */
+static int    bundle_enabled    = -1;   /* -1 = uninitialised */
+
+/*
  * Parse a K/M/G-suffixed byte count.  Returns the parsed value on
  * success, or 0 if spec is NULL/empty/unparseable or would overflow
  * size_t when the suffix is applied.  Callers must check for 0
@@ -584,15 +597,47 @@ static void
 bundle_caps_init(void)
 {
 	static int initialised = 0;
+	const char *ev;
 
 	if (initialised)
 		return;
+
+	/* HPN_MAX_BUNDLE_SIZE (sshd_config: HPNMaxBundleSize) — server-
+	 * side hard cap on per-bundle accumulator.  Overrides the -B
+	 * CLI default if the env var is set and the operator did not
+	 * already pass -B explicitly (CLI -B takes precedence). */
+	if (bundle_per_cap == 0) {
+		ev = getenv("HPN_MAX_BUNDLE_SIZE");
+		if (ev != NULL && *ev != '\0') {
+			size_t v = parse_bytes_arg(ev);
+			if (v > 0)
+				bundle_per_cap = clamp_cap("HPNMaxBundleSize",
+				    v, HPN_BUNDLE_PER_CAP_MIN,
+				    HPN_BUNDLE_PER_CAP_MAX);
+		}
+	}
 	if (bundle_per_cap == 0)
 		bundle_per_cap = HPN_BUNDLE_PER_CAP_DEFAULT;
 	if (bundle_total_cap == 0)
 		bundle_total_cap = HPN_BUNDLE_TOTAL_CAP_DEFAULT;
+
+	/* HPN_USE_BUNDLE (sshd_config: HPNUseBundle) — master toggle.
+	 * Absent / unparseable defaults to 1 (enabled). */
+	if (bundle_enabled == -1) {
+		ev = getenv("HPN_USE_BUNDLE");
+		if (ev != NULL && *ev != '\0') {
+			if (strcmp(ev, "0") == 0 || strcmp(ev, "no") == 0)
+				bundle_enabled = 0;
+			else
+				bundle_enabled = 1;
+		} else {
+			bundle_enabled = 1;
+		}
+	}
+
 	initialised = 1;
-	debug_f("hpn-bundle caps: per=%zu MiB total=%zu MiB",
+	debug_f("hpn-bundle: enabled=%d per_cap=%zu MiB total_cap=%zu MiB",
+	    bundle_enabled,
 	    bundle_per_cap   / (1024*1024),
 	    bundle_total_cap / (1024*1024));
 }
@@ -694,6 +739,13 @@ int
 sftp_hpn_server_is_bundle_handle(int handle)
 {
 	return handle_is_bundle(handle);
+}
+
+int
+sftp_hpn_server_bundle_enabled(void)
+{
+	bundle_caps_init();	/* ensures bundle_enabled is populated */
+	return bundle_enabled;
 }
 
 /* Compose the full destination path for one tar entry.  Returns a
@@ -1053,6 +1105,16 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	int handle = -1;
 	int r, status = SSH2_FX_FAILURE;
 
+	/* Operator master toggle: refuse bundle ops with OP_UNSUPPORTED
+	 * when sshd_config has HPNUseBundle=no.  Belt-and-suspenders —
+	 * the extension is normally not advertised in that mode, but a
+	 * misbehaving client could still send a bundle-open. */
+	if (!sftp_hpn_server_bundle_enabled()) {
+		debug_f("hpn-bundle-open refused: HPNUseBundle=no");
+		status = SSH2_FX_OP_UNSUPPORTED;
+		goto fail;
+	}
+
 	if ((r = sshbuf_get_cstring(iqueue, &dest_dir, NULL)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &flags)) != 0) {
 		error_f("parse hpn-bundle-open: %s", ssh_err(r));
@@ -1158,6 +1220,13 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	int handle = -1;
 	int r, status = SSH2_FX_FAILURE;
 	uint32_t i;
+
+	/* Operator master toggle (same as bundle-open). */
+	if (!sftp_hpn_server_bundle_enabled()) {
+		debug_f("hpn-bundle-fetch refused: HPNUseBundle=no");
+		status = SSH2_FX_OP_UNSUPPORTED;
+		goto fail;
+	}
 
 	if ((r = sshbuf_get_u32(iqueue, &flags)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &n_paths)) != 0) {

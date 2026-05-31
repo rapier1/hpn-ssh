@@ -3011,7 +3011,8 @@ usage(void)
 	    "          [-J destination] [-j parallel_streams] [-l limit]\n"
 	    "          [-M range_split_min_mb] [-o ssh_option] [-P port]\n"
 	    "          [-R num_requests] [-S program]\n"
-	    "          [-s subsystem | sftp_server] [-X sftp_option] destination\n",
+	    "          [-s subsystem | sftp_server] [-X sftp_option]\n"
+	    "          [--bundle-size N[KMG]] destination\n",
 	    __progname);
 	exit(1);
 }
@@ -3069,6 +3070,86 @@ main(int argc, char **argv)
 
 	ll = SYSLOG_LEVEL_INFO;
 	infile = stdin;
+
+	/*
+	 * Long-only option pre-scan.  hpnsftp uses the openbsd-compat
+	 * BSDgetopt (defines.h macros `optarg` → `BSDoptarg` when
+	 * HAVE_GETOPT_OPTRESET is undefined), so a getopt_long() call
+	 * from glibc writes its own `optarg` while our code reads
+	 * BSDoptarg — they're different symbols.  Easier than wrestling
+	 * with that mismatch: pre-scan argv before getopt runs, extract
+	 * any `--bundle-size=N[KMG]` or `--bundle-size N[KMG]`, propagate
+	 * to the parallel layer via `-oHPNBundleSize=...`, and compact
+	 * argv so getopt never sees the flag.
+	 */
+	{
+		int i, j;
+		for (i = 1; i < argc; ) {
+			const char *arg = argv[i];
+			const char *val = NULL;
+			int consume = 0;
+			if (arg == NULL) { i++; continue; }
+			if (strncmp(arg, "--bundle-size=", 14) == 0) {
+				val = arg + 14;
+				consume = 1;
+			} else if (strcmp(arg, "--bundle-size") == 0) {
+				if (i + 1 >= argc)
+					fatal("--bundle-size requires an "
+					    "argument");
+				val = argv[i + 1];
+				consume = 2;
+			}
+			if (consume == 0) { i++; continue; }
+			{
+				long long bsv;
+				if (scan_scaled((char *)val, &bsv) == -1)
+					fatal("--bundle-size: bad value "
+					    "\"%s\": %s",
+					    val, strerror(errno));
+				if (bsv < (long long)(1 * 1024 * 1024)) {
+					fprintf(stderr, "--bundle-size %lld "
+					    "is below the minimum (1 MiB); "
+					    "clamping to 1 MiB.\n", bsv);
+					bsv = 1 * 1024 * 1024;
+				} else if (bsv >
+				    (long long)(64 * 1024 * 1024)) {
+					fprintf(stderr, "--bundle-size %lld "
+					    "is above the maximum (64 MiB); "
+					    "clamping to 64 MiB.\n", bsv);
+					bsv = 64 * 1024 * 1024;
+				}
+				{
+					char buf[64];
+					snprintf(buf, sizeof(buf),
+					    "HPNBundleSize=%lld", bsv);
+					addargs(&args, "-o%s", buf);
+					if (parallel_extra_o_count + 2 >
+					    parallel_extra_o_cap) {
+						parallel_extra_o_cap =
+						    parallel_extra_o_cap ?
+						    parallel_extra_o_cap * 2
+						    : 8;
+						parallel_extra_o =
+						    xreallocarray(
+						    parallel_extra_o,
+						    parallel_extra_o_cap,
+						    sizeof(*parallel_extra_o));
+					}
+					parallel_extra_o[
+					    parallel_extra_o_count++] =
+					    xstrdup(buf);
+					parallel_extra_o[
+					    parallel_extra_o_count] = NULL;
+				}
+			}
+			/* Shift remaining argv left over the consumed slot(s). */
+			for (j = i; j + consume < argc; j++)
+				argv[j] = argv[j + consume];
+			argc -= consume;
+			argv[argc] = NULL;
+			/* don't increment i — re-examine the now-shifted slot */
+		}
+	}
 
 	while ((ch = getopt(argc, argv,
 	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:X:")) != -1) {

@@ -205,6 +205,10 @@ initialize_server_options(ServerOptions *options)
 	options->tcp_rcv_buf_rescue = -1;
 	options->hpn_disabled = -1;
 	options->hpn_memory_limit = -1;
+	options->hpn_use_bundle = -1;
+	options->hpn_bundle_size = -1;
+	options->hpn_max_bundle_size = -1;
+	options->hpn_max_concurrent_workers = -1;
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
 	options->use_mptcp = -1;
@@ -494,6 +498,14 @@ fill_default_server_options(ServerOptions *options)
 		options->hpn_disabled = 0;
 	if (options->hpn_memory_limit == -1)
 		options->hpn_memory_limit = 0;
+	if (options->hpn_use_bundle == -1)
+		options->hpn_use_bundle = 1;	/* default: bundle path on */
+	if (options->hpn_bundle_size == -1)
+		options->hpn_bundle_size = 8 * 1024 * 1024;	/* 8 MiB */
+	if (options->hpn_max_bundle_size == -1)
+		options->hpn_max_bundle_size = 64 * 1024 * 1024;/* 64 MiB */
+	if (options->hpn_max_concurrent_workers == -1)
+		options->hpn_max_concurrent_workers = 0;	/* 0 = no cap */
 	if (options->use_mptcp == -1)
 		options->use_mptcp = 0;
 	if (options->ip_qos_interactive == -1)
@@ -583,6 +595,8 @@ typedef enum {
 	sPrintMotd, sPrintLastLog, sIgnoreRhosts,
 	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sTcpRcvBufRescue,
 	sHPNDisabled, sHPNMemoryLimit,
+	sHPNUseBundle, sHPNBundleSize,
+	sHPNMaxBundleSize, sHPNMaxConcurrentWorkers,
 	sDisableMTAES, sUseMPTCP,
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
@@ -760,6 +774,10 @@ static struct {
 	{ "authorizedprincipalsfile", sAuthorizedPrincipalsFile, SSHCFG_ALL },
 	{ "hpndisabled", sHPNDisabled, SSHCFG_ALL },
 	{ "hpnmemorylimit", sHPNMemoryLimit, SSHCFG_ALL },
+	{ "hpnusebundle", sHPNUseBundle, SSHCFG_ALL },
+	{ "hpnbundlesize", sHPNBundleSize, SSHCFG_ALL },
+	{ "hpnmaxbundlesize", sHPNMaxBundleSize, SSHCFG_ALL },
+	{ "hpnmaxconcurrentworkers", sHPNMaxConcurrentWorkers, SSHCFG_ALL },
 	{ "tcprcvbufpoll", sTcpRcvBufPoll, SSHCFG_ALL },
 	{ "tcprcvbufrescue", sTcpRcvBufRescue, SSHCFG_ALL },
 	{ "noneenabled", sNoneEnabled, SSHCFG_ALL },
@@ -1623,6 +1641,63 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		multistate_ptr = multistate_hpnmemorylimit;
 		intptr = &options->hpn_memory_limit;
 		goto parse_multistate;
+
+	case sHPNUseBundle:
+		intptr = &options->hpn_use_bundle;
+		goto parse_flag;
+
+	case sHPNBundleSize:
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0')
+			fatal("%s line %d: %s missing argument.",
+			    filename, linenum, keyword);
+		if (scan_scaled(arg, &val64) == -1)
+			fatal("%.200s line %d: Bad %s number '%s': %s",
+			    filename, linenum, keyword, arg, strerror(errno));
+		/* Clamp to [1 MiB, 64 MiB] matching the client-side
+		 * HPNBundleSize bounds.  Operator gets a stderr warning if
+		 * their value was adjusted. */
+		if (val64 < (int64_t)(1 * 1024 * 1024)) {
+			fprintf(stderr, "%s line %d: HPNBundleSize %lld is "
+			    "below the minimum (1 MiB); clamping to 1 MiB.\n",
+			    filename, linenum, (long long)val64);
+			val64 = 1 * 1024 * 1024;
+		} else if (val64 > (int64_t)(64 * 1024 * 1024)) {
+			fprintf(stderr, "%s line %d: HPNBundleSize %lld is "
+			    "above the maximum (64 MiB); clamping to 64 MiB.\n",
+			    filename, linenum, (long long)val64);
+			val64 = 64 * 1024 * 1024;
+		}
+		if (*activep && options->hpn_bundle_size == -1)
+			options->hpn_bundle_size = val64;
+		break;
+
+	case sHPNMaxBundleSize:
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0')
+			fatal("%s line %d: %s missing argument.",
+			    filename, linenum, keyword);
+		if (scan_scaled(arg, &val64) == -1)
+			fatal("%.200s line %d: Bad %s number '%s': %s",
+			    filename, linenum, keyword, arg, strerror(errno));
+		if (val64 < (int64_t)(1 * 1024 * 1024)) {
+			fprintf(stderr, "%s line %d: HPNMaxBundleSize %lld is "
+			    "below the minimum (1 MiB); clamping to 1 MiB.\n",
+			    filename, linenum, (long long)val64);
+			val64 = 1 * 1024 * 1024;
+		} else if (val64 > (int64_t)(64 * 1024 * 1024)) {
+			fprintf(stderr, "%s line %d: HPNMaxBundleSize %lld is "
+			    "above the maximum (64 MiB); clamping to 64 MiB.\n",
+			    filename, linenum, (long long)val64);
+			val64 = 64 * 1024 * 1024;
+		}
+		if (*activep && options->hpn_max_bundle_size == -1)
+			options->hpn_max_bundle_size = val64;
+		break;
+
+	case sHPNMaxConcurrentWorkers:
+		intptr = &options->hpn_max_concurrent_workers;
+		goto parse_int;
 
 	case sNoneEnabled:
 		intptr = &options->none_enabled;
@@ -3402,6 +3477,10 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sExposeAuthInfo, o->expose_userauth_info);
 	dump_cfg_fmtint(sHPNDisabled, o->hpn_disabled);
 	dump_cfg_fmtint(sHPNMemoryLimit, o->hpn_memory_limit);
+	dump_cfg_fmtint(sHPNUseBundle, o->hpn_use_bundle);
+	printf("hpnbundlesize %lld\n", (long long)o->hpn_bundle_size);
+	printf("hpnmaxbundlesize %lld\n", (long long)o->hpn_max_bundle_size);
+	dump_cfg_int(sHPNMaxConcurrentWorkers, o->hpn_max_concurrent_workers);
 	dump_cfg_fmtint(sTcpRcvBufPoll, o->tcp_rcv_buf_poll);
 	dump_cfg_fmtint(sTcpRcvBufRescue, o->tcp_rcv_buf_rescue);
 	dump_cfg_fmtint(sNoneEnabled, o->none_enabled);

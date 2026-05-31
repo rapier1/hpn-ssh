@@ -127,19 +127,38 @@ static int hpn_max_retries(struct sftp_parallel *p);
  *
  * When a worker has the bundle path enabled (HPNUseBundle yes in
  * ssh_config AND the server advertised hpn-bundle support), the worker
- * collects upload batches up to BUNDLE_TARGET_BYTES instead of
+ * collects upload batches up to BUNDLE_TARGET_BYTES_DEFAULT instead of
  * UPLOAD_BATCH_BYTE_CAP, then dispatches them as a single tar stream via
  * sftp_hpn_bundle_upload.  The smaller target produces many small bundles
  * that compose well with parallel streams — each worker can have a
  * different bundle in flight, the way each worker has a different batch
  * in flight in the non-bundle path.
  *
- * 4 MiB is a starting point; a server-side fsync after each extract on
- * the bundle close makes very large bundles bad (longer flush before the
- * next OPEN), and very small bundles add tar header overhead.  Override
- * with HPNBundleSize in ssh_config.
+ * 8 MiB default (raised from 4 MiB on 2026-05-31 after libarchive removal
+ * decoupled server memory from bundle size).  Override with HPNBundleSize
+ * in ssh_config, --bundle-size on hpnsftp, or -o HPNBundleSize=N.  Range
+ * clamped to [BUNDLE_TARGET_BYTES_MIN, BUNDLE_TARGET_BYTES_MAX].
+ *
+ * Files larger than BUNDLE_TARGET_BYTES / BUNDLE_MIN_FILES_PER_BUNDLE
+ * are excluded from the bundle path: bundling a single large file
+ * doesn't amortise the OPEN/CLOSE round-trip cost the way many small
+ * files do, and would just block the worker that picked it up while
+ * other workers run dry.  The excluded files go through the regular
+ * single-file SFTP path (which may further split via range-split).
  */
-#define BUNDLE_TARGET_BYTES     ((uint64_t)4 * 1024 * 1024)
+#define BUNDLE_TARGET_BYTES_DEFAULT  ((uint64_t)8 * 1024 * 1024)
+#define BUNDLE_TARGET_BYTES_MIN      ((uint64_t)1 * 1024 * 1024)
+#define BUNDLE_TARGET_BYTES_MAX      ((uint64_t)64 * 1024 * 1024)
+#define BUNDLE_MIN_FILES_PER_BUNDLE  4u
+
+/* Maximum size of a single file the walker is willing to place in a
+ * bundle.  Computed from the worker's bundle_target_bytes.  Files at
+ * or above this size go through the non-bundle path. */
+#define BUNDLE_FILE_MAX_BYTES(target) \
+    ((target) / BUNDLE_MIN_FILES_PER_BUNDLE)
+
+/* Back-compat: some sites still reference the old un-suffixed name. */
+#define BUNDLE_TARGET_BYTES BUNDLE_TARGET_BYTES_DEFAULT
 
 /*
  * Maximum number of failed-path entries the orchestrator retains for
@@ -3667,12 +3686,41 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	return NULL;
 }
 
+/*
+ * Return the maximum file size (in bytes) eligible for the bundle path
+ * given this parallel's bundle target.  Files at or above this size
+ * waste the bundle protocol's OPEN/CLOSE amortisation (a "bundle" of
+ * one large file is just an SFTP put/get with extra round-trips) and
+ * starve other workers while this one packs.  See BUNDLE_MIN_FILES_PER_BUNDLE
+ * for the derivation.
+ *
+ * Computed once per submit; no caching needed (a divide + branch).
+ */
+static uint64_t
+bundle_file_size_max_for(const struct sftp_parallel *p)
+{
+	uint64_t target = (p != NULL && p->cfg.bundle_size > 0)
+	    ? p->cfg.bundle_size
+	    : BUNDLE_TARGET_BYTES_DEFAULT;
+	return BUNDLE_FILE_MAX_BYTES(target);
+}
+
 static int
 submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 {
 	if (p == NULL || p->stopped || p->abort_flag) {
 		free_unit(u);
 		return -1;
+	}
+	/* Bundle-eligibility gate: when bundle mode is enabled and the
+	 * unit's file size exceeds the per-target threshold, mark it
+	 * ineligible so the worker routes it through the single-file
+	 * path (which may further range-split it).  Range and resume
+	 * units are never bundle-eligible regardless of size — handled
+	 * by their op-type elsewhere. */
+	if (u != NULL && p->cfg.use_bundle && u->size > 0 &&
+	    (uint64_t)u->size > bundle_file_size_max_for(p)) {
+		u->bundle_ineligible = 1;
 	}
 	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
 	pthread_mutex_lock(&p->pending_mu);

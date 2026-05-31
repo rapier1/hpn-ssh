@@ -799,8 +799,15 @@ process_init(void)
 	compose_extension(msg, "hpn-check-file@hpnssh.org", "1");
 	compose_extension(msg, HPN_EXT_HASH_RANGE, "1");
 	compose_extension(msg, HPN_EXT_FS_INFO, "1");
-	compose_extension(msg, HPN_EXT_BUNDLE, "1");
-	compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
+	/* Gate hpn-bundle / hpn-bundle-fetch on the operator-controlled
+	 * master toggle (sshd_config: HPNUseBundle).  When disabled, the
+	 * extensions don't show up in SSH_FXP_VERSION at all — clients
+	 * see no advertisement and use the per-file path.  Dispatchers
+	 * also refuse the ops defensively in case a client somehow tries. */
+	if (sftp_hpn_server_bundle_enabled()) {
+		compose_extension(msg, HPN_EXT_BUNDLE, "1");
+		compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
+	}
 	compose_extension(msg, HPN_EXT_FILE_LAYOUT, "1");
 
 	send_msg(msg);

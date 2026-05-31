@@ -1416,16 +1416,21 @@ parse_time:
 			    "%s", filename, linenum, arg, strerror(errno));
 			goto out;
 		}
-		/* Clamp to [64 KiB, 64 MiB] with warning when out of range.
-		 * 64 KiB lower bound is the existing sanity floor in the
-		 * worker startup code; 64 MiB upper bound matches the
-		 * server-side per-bundle cap default — values above that
-		 * would just be rejected by the server. */
-		if (val64 < 65536LL) {
+		/* Clamp to [1 MiB, 64 MiB] with warning when out of range.
+		 * Lower bound raised from 64 KiB to 1 MiB on 2026-05-31:
+		 * sub-MiB bundles can't usefully amortise the OPEN/CLOSE
+		 * round-trip (the bundle threshold's BUNDLE_MIN_FILES_PER_BUNDLE
+		 * derivation requires at least 1 MiB / 4 = 256 KiB max per
+		 * file, and ext4 / Lustre extent overheads dominate below
+		 * that anyway).  Upper bound matches the server-side per-
+		 * bundle cap default (HPN_BUNDLE_PER_CAP_DEFAULT, 64 MiB);
+		 * larger values would be clamped by the server's
+		 * HPNMaxBundleSize at run time. */
+		if (val64 < (int64_t)(1 * 1024 * 1024)) {
 			fprintf(stderr, "HPNBundleSize %lld is below the "
-			    "minimum (65536 bytes); clamping to 65536.\n",
-			    (long long)val64);
-			val64 = 65536LL;
+			    "minimum (1048576 bytes / 1 MiB); clamping to "
+			    "1 MiB.\n", (long long)val64);
+			val64 = 1 * 1024 * 1024;
 		} else if (val64 > (int64_t)(64 * 1024 * 1024)) {
 			fprintf(stderr, "HPNBundleSize %lld is above the "
 			    "maximum (67108864 bytes / 64 MiB); clamping to "
@@ -3229,7 +3234,7 @@ fill_default_options(Options * options)
 		options->hpn_max_retries = 20;
 	}
 	if (options->hpn_bundle_size == -1)
-		options->hpn_bundle_size = 4 * 1024 * 1024;	/* default 4 MiB */
+		options->hpn_bundle_size = 8 * 1024 * 1024;	/* default 8 MiB */
 	if (options->hpn_max_auth_concurrent == -1) {
 		options->hpn_max_auth_concurrent = 8;		/* default 8 */
 	} else if (options->hpn_max_auth_concurrent < 1) {

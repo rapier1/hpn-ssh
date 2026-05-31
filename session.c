@@ -1037,6 +1037,29 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 	/* Normal systems set SHELL by default. */
 	child_set_env(&env, &envsize, "SHELL", shell);
 
+	/* HPN-SSH: propagate bundle-path operator controls to the child
+	 * (most notably sftp-server when launched as a subsystem) via
+	 * the well-known env vars sftp-hpn-server.c reads at startup.
+	 * Only set when the option was explicitly given (non-default
+	 * sentinel test would have already been resolved to the default
+	 * during fill_default_server_options).  Other processes ignore
+	 * unknown env vars; no harm in setting them universally. */
+	{
+		char tmp[64];
+		snprintf(tmp, sizeof(tmp), "%d", options.hpn_use_bundle);
+		child_set_env(&env, &envsize, "HPN_USE_BUNDLE", tmp);
+		snprintf(tmp, sizeof(tmp), "%lld",
+		    (long long)options.hpn_bundle_size);
+		child_set_env(&env, &envsize, "HPN_BUNDLE_SIZE", tmp);
+		snprintf(tmp, sizeof(tmp), "%lld",
+		    (long long)options.hpn_max_bundle_size);
+		child_set_env(&env, &envsize, "HPN_MAX_BUNDLE_SIZE", tmp);
+		snprintf(tmp, sizeof(tmp), "%d",
+		    options.hpn_max_concurrent_workers);
+		child_set_env(&env, &envsize,
+		    "HPN_MAX_CONCURRENT_WORKERS", tmp);
+	}
+
 	if (getenv("TZ"))
 		child_set_env(&env, &envsize, "TZ", getenv("TZ"));
 #ifdef HAVE_LOGIN_CAP

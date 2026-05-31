@@ -229,6 +229,20 @@ int sftp_hpn_server_bundle_read(int handle, uint64_t off,
 void sftp_hpn_server_set_bundle_caps(const char *per_arg,
     const char *total_arg);
 
+/*
+ * True iff the bundle path is enabled at this server.  Driven by
+ * sshd_config's HPNUseBundle (propagated via the HPN_USE_BUNDLE env
+ * var that sshd-session sets).  When false:
+ *   - sftp-server.c omits hpn-bundle / hpn-bundle-open /
+ *     hpn-bundle-fetch from the SSH_FXP_VERSION extension list.
+ *   - sftp-hpn-server.c rejects bundle-open / bundle-fetch with
+ *     SSH2_FX_OP_UNSUPPORTED if a misbehaving client tries anyway.
+ *
+ * The check is cached after the first call; safe to invoke on any
+ * code path without performance concern.
+ */
+int sftp_hpn_server_bundle_enabled(void);
+
 /* ── END Phase 5 ─────────────────────────────────────────────────────── */
 
 #endif /* _SFTP_SERVER_HPN_H */
