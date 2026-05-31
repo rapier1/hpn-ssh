@@ -273,6 +273,29 @@ sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
 #define RDAHEAD_EWMA_ALPHA   0.6    /* weight of the newest window's rate */
 #define RDAHEAD_MIN_WIN_SEC  0.02   /* ignore windows shorter than this (noise) */
 
+/*
+ * Time-based recovery-probe interval (seconds).  When the controller has
+ * been shrunk to floor by Part B's backpressure signal, it would
+ * normally wait for a full window of `cur` acks before doubling — at
+ * floor=64 on a slow path that can take tens of seconds and was the
+ * dominant component of the ~100 s wedge-recovery tails observed in the
+ * 2026-05-30 br008 mixed-tree Phase 2b run (iter15, iter16).
+ *
+ * If we've been at floor with `settled=0` for this long without filling
+ * a window, force a doubling without waiting for full-window evidence.
+ * This is a probe — if path conditions are still bad, Part B will fire
+ * again and shrink us back to floor.  Oscillation cost is bounded:
+ * one probe-and-shrink cycle every ~15 s (5 s probe interval + ~10 s
+ * Part B detection), which is far better than indefinite floor-stuck
+ * behaviour.  Restricted to cur==floor so we never accelerate growth
+ * above the BDP knee on healthy paths.
+ *
+ * Half of Part B's threshold (10 s) is the chosen value: faster than
+ * Part B's reaction means we bias toward higher depth, which is the
+ * right direction when recovering from a transient wedge.
+ */
+#define RDAHEAD_PROBE_INTERVAL_SEC  5.0
+
 /* SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC lives in sftp-hpn-client.h so the
  * STATUS-read sites in sftp-client.c share the same constant. */
 
@@ -335,7 +358,39 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
 		return;
 	rd = &hpn->rd;
 	rd->win_bytes += nbytes;
-	if (++rd->win_reqs < rd->cur)
+	rd->win_reqs++;
+
+	/*
+	 * Time-based recovery probe: when Part B's backpressure signal
+	 * shrunk us to floor with settled=0, the next window would
+	 * normally need `cur` acks to complete before doubling.  At
+	 * floor=64 on a slow path that takes tens of seconds (the dominant
+	 * component of the ~100 s wedge-recovery tails observed in the
+	 * 2026-05-30 br008 mixed-tree Phase 2b iter15/iter16 runs).
+	 * Force a doubling after RDAHEAD_PROBE_INTERVAL_SEC even without
+	 * a full window's worth of evidence.  If the path is still bad,
+	 * Part B will fire again and shrink us back to floor — bounded
+	 * oscillation cycle of ~15 s, far better than indefinite floor-
+	 * stuck behaviour.  Restricted to cur==floor so probes never
+	 * accelerate growth above the BDP knee on healthy paths.
+	 */
+	if (rd->cur == rd->floor && rd->cur < rd->cap) {
+		double probe_elapsed = monotime_double() - rd->win_start;
+		if (probe_elapsed > RDAHEAD_PROBE_INTERVAL_SEC) {
+			uint32_t before = rd->cur;
+			rd->last_rising = rd->cur;
+			rd->cur = MINIMUM(rd->cur * 2, rd->cap);
+			rd->win_bytes = 0;
+			rd->win_reqs = 0;
+			rd->win_start = monotime_double();
+			debug2_f("rdahead: time-probe → depth %u -> %u "
+			    "(forced after %.1fs at floor)",
+			    before, rd->cur, probe_elapsed);
+			return;
+		}
+	}
+
+	if (rd->win_reqs < rd->cur)
 		return;				/* window = one depth's worth */
 	now = monotime_double();
 	elapsed = now - rd->win_start;
