@@ -2040,8 +2040,21 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		}
 
 		sshbuf_reset(msg);
-		if (get_msg(conn, msg) != 0)
-			break;
+		/* Time the DATA-reply read so the rdahead controller can
+		 * react to a wedged path — same mechanism as the upload-
+		 * side STATUS-read instrumentation in do_upload_body.  A
+		 * read that blocks longer than the threshold means the
+		 * server isn't sending DATA back fast enough (TCP back-
+		 * pressure, busy server-side I/O, etc.); signal so the
+		 * controller can halve depth and re-probe. */
+		{
+			double t_data_start = monotime_double();
+			if (get_msg(conn, msg) != 0)
+				break;
+			if (monotime_double() - t_data_start >
+			    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+				sftp_hpn_rdahead_backpressure_signal(conn->hpn);
+		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &id)) != 0)
 			fatal_fr(r, "parse");
@@ -3586,6 +3599,10 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 		}
 
 		sshbuf_reset(msg);
+		/* Time the DATA-reply read so the rdahead controller can
+		 * react to a wedged path — same mechanism as the upload-
+		 * side STATUS-read instrumentation in sftp_upload_range. */
+		double t_data_start = monotime_double();
 		if (get_msg_extended(conn, msg, 0) != 0) {
 			read_error = 1;
 			while ((req = TAILQ_FIRST(&requests)) != NULL) {
@@ -3595,6 +3612,9 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			num_req = max_req = 0;
 			break;
 		}
+		if (monotime_double() - t_data_start >
+		    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+			sftp_hpn_rdahead_backpressure_signal(conn->hpn);
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &id)) != 0)
 			fatal_fr(r, "parse");
@@ -4569,7 +4589,16 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 		    &num_upload_req, &write_error);
 
 		sshbuf_reset(msg);
+		/* Time the DATA-reply read from the source connection so
+		 * the rdahead controller on `from` can react to a wedged
+		 * download — same mechanism as the other data-side reads.
+		 * Note: backpressure here is fired on `from`, not `to` —
+		 * the wedge is on the download path. */
+		double t_data_start = monotime_double();
 		get_msg(from, msg);
+		if (monotime_double() - t_data_start >
+		    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+			sftp_hpn_rdahead_backpressure_signal(from->hpn);
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &id)) != 0)
 			fatal_fr(r, "parse");

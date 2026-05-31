@@ -1114,9 +1114,31 @@ bundle_fetch_archive_write_cb(struct archive *a, void *client_data,
 }
 
 /*
- * Pack one path into the libarchive writer.  Returns 0 on success.
- * On read/header errors the entry is skipped (logged) and the bundle
- * continues — symmetric to upload-side per-entry skip behaviour.
+ * Pack one path into the libarchive writer.
+ *
+ * Return codes:
+ *   0   entry successfully packed.
+ *  -1   per-file metadata error before any archive bytes were written
+ *       (open / fstat / non-regular-file).  The archive's libarchive state
+ *       has not been touched, so the caller may safely skip this entry and
+ *       continue with the next path — symmetric to upload-side per-entry
+ *       skip behaviour.
+ *  -2   mid-entry failure (libarchive header / write_data error, premature
+ *       EOF on the source file, transient read failure).  The libarchive
+ *       writer is mid-stream with a half-written entry; the on-the-wire
+ *       tar is structurally broken from this point on.  The caller MUST
+ *       abandon the bundle rather than continue, because subsequent
+ *       archive_write_header / archive_write_close calls cannot reliably
+ *       repair the truncation and would produce a tar that decompresses
+ *       to "Truncated input file" on the client side (the failure mode
+ *       observed in the 2026-05-31 br008 many-small download validation).
+ *
+ * Previously this function returned only 0/-1 and the caller (void)-
+ * discarded the result, which meant a mid-entry failure produced exactly
+ * the kind of truncated bundle libarchive could not unpack on the client.
+ * The two-tier return code preserves the documented "single bad file does
+ * not kill the whole bundle" intent for pre-header failures while
+ * correctly failing the bundle when libarchive state becomes invalid.
  */
 static int
 bundle_fetch_pack_one(struct archive *a, const char *path)
@@ -1125,6 +1147,7 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
 	struct stat sb;
 	int fd = -1;
 	int rc = -1;
+	int header_written = 0;
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
@@ -1157,8 +1180,10 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
 	if (archive_write_header(a, ae) != ARCHIVE_OK) {
 		error_f("hpn-bundle-fetch: header \"%s\": %s",
 		    path, archive_error_string(a));
+		rc = -2;	/* archive state may be invalid */
 		goto out;
 	}
+	header_written = 1;
 
 	{
 		off_t remaining = sb.st_size;
@@ -1172,14 +1197,34 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
 					continue;
 				error_f("hpn-bundle-fetch: read \"%s\": %s",
 				    path, strerror(errno));
+				rc = -2;	/* mid-entry; archive broken */
 				goto out;
 			}
-			if (n == 0)
-				break;
+			if (n == 0) {
+				/* Premature EOF: file shrank after fstat
+				 * reported sb.st_size.  We have already
+				 * committed to writing sb.st_size bytes via
+				 * archive_write_header.  The archive entry is
+				 * now structurally short by `remaining` bytes
+				 * — neither libarchive's automatic padding nor
+				 * archive_write_finish_entry can reliably
+				 * repair it after the fact.  Treat as fatal to
+				 * the bundle so the client never sees a
+				 * truncated tar. */
+				error_f("hpn-bundle-fetch: \"%s\" shrank "
+				    "during read (%lld of %lld bytes); "
+				    "abandoning bundle",
+				    path,
+				    (long long)(sb.st_size - remaining),
+				    (long long)sb.st_size);
+				rc = -2;
+				goto out;
+			}
 			if (archive_write_data(a, buf, (size_t)n) != n) {
 				error_f("hpn-bundle-fetch: write_data "
 				    "\"%s\": %s", path,
 				    archive_error_string(a));
+				rc = -2;	/* mid-entry; archive broken */
 				goto out;
 			}
 			remaining -= n;
@@ -1188,6 +1233,11 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
 	rc = 0;
 
  out:
+	(void)header_written;	/* reserved for future entry-finalize
+				 * accounting; archive_write_finish_entry
+				 * cannot reliably recover the truncated cases
+				 * above, so we just bail and let the caller
+				 * mark the bundle dead. */
 	if (ae != NULL)
 		archive_entry_free(ae);
 	if (fd >= 0)
@@ -1269,11 +1319,26 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 
-	/* Pack each path.  Per-entry failures are logged and skipped so a
-	 * single bad file (race-deleted, permission flap) doesn't kill the
-	 * whole bundle — symmetric to upload-side per-entry skip. */
-	for (i = 0; i < n_paths; i++)
-		(void)bundle_fetch_pack_one(a, paths[i]);
+	/* Pack each path.  Per-entry metadata failures (open/fstat/non-regular)
+	 * are logged and skipped so a single bad file (race-deleted, permission
+	 * flap) doesn't kill the whole bundle — symmetric to upload-side
+	 * per-entry skip.  Mid-entry libarchive failures (header / write_data /
+	 * source shrink) abandon the entire bundle: the archive's tar state is
+	 * already partially written and cannot be reliably repaired, so
+	 * continuing would produce a structurally-truncated stream that the
+	 * client's libarchive reader rejects as "Truncated input file" (the
+	 * failure mode observed in the 2026-05-31 br008 many-small download
+	 * validation campaign before this fix). */
+	for (i = 0; i < n_paths; i++) {
+		int prc = bundle_fetch_pack_one(a, paths[i]);
+		if (prc == -2) {
+			error_f("hpn-bundle-fetch: bundle aborted after "
+			    "mid-archive failure on \"%s\" (%u/%u paths "
+			    "attempted)", paths[i], i + 1, n_paths);
+			goto fail;
+		}
+		/* prc == 0 (packed) or -1 (metadata-only skip): continue. */
+	}
 
 	if (archive_write_close(a) != ARCHIVE_OK) {
 		error_f("hpn-bundle-fetch: archive_write_close: %s",

@@ -745,10 +745,21 @@ bundle_dl_read_one(struct sftp_conn *conn, const u_char *handle,
 	}
 	sshbuf_reset(msg);
 
+	/* Time the DATA-reply read so the rdahead controller can react
+	 * to a wedged bundle download.  Bundle download is synchronous
+	 * (one READ, one reply) — there is no inflight pipeline for an
+	 * adaptive cap to bound (Part A doesn't apply here) — but the
+	 * wedge-detection mechanism still does: a slow reply indicates
+	 * transport backpressure that the controller's Part B/C/D state
+	 * machine should react to. */
+	double t_data_start = monotime_double();
 	if (get_msg(conn, msg) != 0) {
 		sshbuf_free(msg);
 		return -1;
 	}
+	if (monotime_double() - t_data_start >
+	    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+		sftp_conn_rdahead_backpressure_signal(conn);
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 	    (r = sshbuf_get_u32(msg, &recv_id)) != 0) {
 		error_f("parse hpn-bundle-fetch reply header: %s", ssh_err(r));
