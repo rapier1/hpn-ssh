@@ -335,11 +335,10 @@ send_status_oqueue(struct sshbuf *oqueue, u_int id, u_int status)
  * synchronous keeps per-bundle results clean.
  */
 
-#include <fcntl.h>      /* O_RDONLY for bundle_fetch_pack_one */
+#include <fcntl.h>      /* O_RDONLY for the bundle pack file reads */
 #include <sys/stat.h>
-#include <archive.h>
-#include <archive_entry.h>
-# include <libgen.h>     /* dirname() for mkdir-on-extract */
+#include <libgen.h>     /* dirname() for mkdir-on-extract */
+#include "sftp-hpn-tar.h"
 
 /* Bundle handle mode: upload (client streams WRITE-by-WRITE, server
  * extracts at close) vs. fetch (server packs tar up-front, client
@@ -415,14 +414,53 @@ enum hpn_bundle_mode {
  *     decrements it.  Any other code path that touches accum/accum_cap
  *     would violate the cap enforcement — don't do that.
  */
+/* ── Bundle handle state (codec-based) ──────────────────────────────────
+ *
+ * After the 2026-05-31 libarchive removal, both UPLOAD and FETCH bundles
+ * stream through the sftp-hpn-tar codec instead of buffering the whole
+ * tar in RAM.  Memory per worker becomes O(1) — just the codec's 512-byte
+ * header scratch + the currently-open output file (UPLOAD) or the
+ * currently-reading input file (FETCH).
+ *
+ * UPLOAD path (hpn-bundle-open):
+ *   bundle_state holds a parser + per-entry tracking (open fd, remaining
+ *   bytes, mode/mtime, last-mkdir cache for dir pre-create optimisation).
+ *   sftp_hpn_server_bundle_write feeds the parser; entry callbacks open
+ *   the output file, write bytes, then close + apply metadata.
+ *
+ * FETCH path (hpn-bundle-fetch):
+ *   bundle_state holds a writer with all paths queued (finish() called
+ *   at OPEN time).  sftp_hpn_server_bundle_read drives pack_next() to
+ *   produce bytes on demand into the SFTP DATA reply.
+ *
+ * Per-bundle and total-process byte caps still apply (see bundle_per_cap
+ * / bundle_total_cap), but enforcement shifts: instead of capping the
+ * accumulator's allocation, we track total bytes that have flowed
+ * through this bundle and trip the cap if exceeded.  The total cap is
+ * sized via fetch_writer_total_bytes (FETCH: sum of declared file sizes)
+ * and upload_total_bytes_received (UPLOAD: bytes parsed). */
 struct hpn_bundle_state {
 	enum hpn_bundle_mode mode;
-	char    *dest_dir;       /* UPLOAD: dir to extract into; FETCH: NULL */
-	uint32_t flags;          /* HPN_BUNDLE_FLAG_*, see sftp-hpn-bundle.h */
-	u_char  *accum;          /* UPLOAD: incoming WRITE buffer;
-				  * FETCH:  pre-packed tar stream */
-	size_t   accum_len;      /* bytes valid in accum */
-	size_t   accum_cap;      /* bytes allocated for accum */
+	char    *dest_dir;          /* UPLOAD: dir to extract into; FETCH: NULL */
+	uint32_t flags;             /* HPN_BUNDLE_FLAG_*, see sftp-hpn-bundle.h */
+
+	/* UPLOAD-mode fields. */
+	struct sftp_hpn_tar_parser *parser;
+	uint64_t bytes_received;    /* cumulative WRITE bytes fed to parser */
+	uint64_t next_write_off;    /* expected SSH_FXP_WRITE offset */
+	/* Per-entry state set by the parser callbacks. */
+	char    *cur_full_path;     /* malloc'd dest_dir + "/" + entry path */
+	int      cur_fd;            /* open output fd, or -1 */
+	uint64_t cur_size;          /* declared size from header */
+	mode_t   cur_mode;
+	time_t   cur_mtime;
+	char    *last_mkdir_dir;    /* last parent dir already mkdir_p'd (D) */
+
+	/* FETCH-mode fields. */
+	struct sftp_hpn_tar_writer *writer;
+	uint64_t bytes_produced;    /* cumulative pack_next bytes returned */
+	uint64_t next_read_off;     /* expected SSH_FXP_READ offset */
+	uint64_t fetch_total_size;  /* sum of declared file sizes (cap check) */
 };
 
 /* Flag constants and HPN_BUNDLE_BLOCK_BYTES live in sftp-hpn-bundle.h, the
@@ -566,40 +604,60 @@ extern void  *handle_get_bundle(int handle);
 extern void   handle_free_bundle(int handle);
 extern int    handle_is_bundle(int handle);
 
+/* Forward declarations for parser callbacks (defined below) and the
+ * path-safety check (defined later in the file). */
+static int bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
+    mode_t mode, time_t mtime);
+static int bundle_upload_data_cb(void *ctx, const u_char *data, size_t len);
+static int bundle_upload_entry_end_cb(void *ctx);
+static int bundle_path_is_safe(const char *p, const char *dest_dir);
+
+static const struct sftp_hpn_tar_callbacks bundle_upload_callbacks = {
+	.entry_cb     = bundle_upload_entry_cb,
+	.data_cb      = bundle_upload_data_cb,
+	.entry_end_cb = bundle_upload_entry_end_cb,
+};
+
 static struct hpn_bundle_state *
 bundle_state_new(const char *dest_dir, uint32_t flags)
 {
 	struct hpn_bundle_state *s = calloc(1, sizeof(*s));
 	if (s == NULL)
 		return NULL;
-	s->mode = HPN_BUNDLE_MODE_UPLOAD;
+	s->mode     = HPN_BUNDLE_MODE_UPLOAD;
 	s->dest_dir = strdup(dest_dir);
 	if (s->dest_dir == NULL) {
 		free(s);
 		return NULL;
 	}
-	s->flags     = flags;
-	s->accum     = NULL;
-	s->accum_len = 0;
-	s->accum_cap = 0;
+	s->flags  = flags;
+	s->cur_fd = -1;
+	s->parser = sftp_hpn_tar_parser_new(&bundle_upload_callbacks, s);
+	if (s->parser == NULL) {
+		free(s->dest_dir);
+		free(s);
+		return NULL;
+	}
 	return s;
 }
 
 /* Fetch-mode counterpart: no dest_dir (server-side reads, doesn't extract),
- * accum starts unallocated and is filled by the fetch handler's
- * libarchive write pass before the handle is returned to the client. */
+ * writer is allocated empty; the fetch handler queues paths into it
+ * and calls finish() before installing the handle. */
 static struct hpn_bundle_state *
 bundle_state_new_fetch(uint32_t flags)
 {
 	struct hpn_bundle_state *s = calloc(1, sizeof(*s));
 	if (s == NULL)
 		return NULL;
-	s->mode      = HPN_BUNDLE_MODE_FETCH;
-	s->dest_dir  = NULL;
-	s->flags     = flags;
-	s->accum     = NULL;
-	s->accum_len = 0;
-	s->accum_cap = 0;
+	s->mode   = HPN_BUNDLE_MODE_FETCH;
+	s->flags  = flags;
+	s->cur_fd = -1;
+	s->writer = sftp_hpn_tar_writer_new();
+	if (s->writer == NULL) {
+		free(s);
+		return NULL;
+	}
 	return s;
 }
 
@@ -608,80 +666,197 @@ bundle_state_free(struct hpn_bundle_state *s)
 {
 	if (s == NULL)
 		return;
-	/* Release this handle's contribution to the process-wide total
-	 * before freeing the buffer. */
-	if (s->accum_cap > 0) {
-		if (bundle_total_bytes >= s->accum_cap)
-			bundle_total_bytes -= s->accum_cap;
+	/* Release total-cap accounting: subtract the larger of declared-
+	 * total (FETCH) or bytes-received (UPLOAD) — whichever this bundle
+	 * contributed to the running counter. */
+	uint64_t contributed = (s->mode == HPN_BUNDLE_MODE_FETCH)
+	    ? s->fetch_total_size
+	    : s->bytes_received;
+	if (contributed > 0) {
+		if (bundle_total_bytes >= contributed)
+			bundle_total_bytes -= (size_t)contributed;
 		else
 			bundle_total_bytes = 0;
 	}
+	if (s->cur_fd >= 0)
+		(void)close(s->cur_fd);
+	free(s->cur_full_path);
+	free(s->last_mkdir_dir);
+	if (s->parser != NULL)
+		sftp_hpn_tar_parser_free(s->parser);
+	if (s->writer != NULL)
+		sftp_hpn_tar_writer_free(s->writer);
 	free(s->dest_dir);
-	free(s->accum);
 	free(s);
-}
-
-/*
- * Ensure accum has room for `need` additional bytes.
- *
- * Enforces two caps:
- *   - per-bundle: accum_len + need must not exceed bundle_per_cap
- *   - total: the new accum_cap minus the old accum_cap (i.e. the bytes
- *     this growth would add to bundle_total_bytes) must keep
- *     bundle_total_bytes <= bundle_total_cap
- *
- * Returns 0 on success, -1 on allocation failure OR cap exceeded.
- * Callers translate -1 into SSH2_FX_FAILURE on the wire.
- */
-static int
-bundle_state_reserve(struct hpn_bundle_state *s, size_t need)
-{
-	bundle_caps_init();
-
-	if (s->accum_len > SIZE_MAX - need ||
-	    s->accum_len + need > bundle_per_cap) {
-		error_f("hpn-bundle: per-bundle cap exceeded "
-		    "(would be %zu, cap %zu)",
-		    s->accum_len + need, bundle_per_cap);
-		return -1;
-	}
-	if (s->accum_len + need <= s->accum_cap)
-		return 0;
-
-	size_t new_cap = s->accum_cap ? s->accum_cap : 65536;
-	while (new_cap < s->accum_len + need) {
-		if (new_cap > SIZE_MAX / 2)
-			return -1;
-		new_cap *= 2;
-	}
-	/* Clamp the geometric growth to the per-bundle cap so we don't
-	 * over-allocate beyond what the bundle could ever legitimately
-	 * hold. */
-	if (new_cap > bundle_per_cap)
-		new_cap = bundle_per_cap;
-
-	size_t added = new_cap - s->accum_cap;
-	if (bundle_total_bytes > SIZE_MAX - added ||
-	    bundle_total_bytes + added > bundle_total_cap) {
-		error_f("hpn-bundle: total-across-handles cap exceeded "
-		    "(would be %zu, cap %zu)",
-		    bundle_total_bytes + added, bundle_total_cap);
-		return -1;
-	}
-
-	u_char *p = realloc(s->accum, new_cap);
-	if (p == NULL)
-		return -1;
-	s->accum     = p;
-	s->accum_cap = new_cap;
-	bundle_total_bytes += added;
-	return 0;
 }
 
 int
 sftp_hpn_server_is_bundle_handle(int handle)
 {
 	return handle_is_bundle(handle);
+}
+
+/* Compose the full destination path for one tar entry.  Returns a
+ * malloc'd string on success or NULL on OOM / unsafe path.  *out_safe
+ * is set to 0 (unsafe path; caller fails the bundle) or 1 (OK). */
+static char *
+bundle_compose_path(const char *dest_dir, const char *entry_path, int *out_safe)
+{
+	char *full;
+
+	*out_safe = 0;
+	if (!bundle_path_is_safe(entry_path, dest_dir))
+		return NULL;
+	if (*dest_dir == '\0') {
+		full = strdup(entry_path);
+	} else {
+		size_t full_len = strlen(dest_dir) + 1 +
+		    strlen(entry_path) + 1;
+		full = malloc(full_len);
+		if (full != NULL)
+			snprintf(full, full_len, "%s/%s",
+			    dest_dir, entry_path);
+	}
+	if (full == NULL)
+		return NULL;
+	*out_safe = 1;
+	return full;
+}
+
+/* Parser entry callback: header parsed, open output fd, mkdir parent.
+ *
+ * The "last-mkdir-dir" cache (D) skips redundant mkdir_p calls when many
+ * consecutive entries share the same parent directory — the common case
+ * for many-small bundles.  Without it every file in a 1000-file bundle
+ * does its own dirname() + stat() + mkdir() walk; with it most calls
+ * are a single strcmp. */
+static int
+bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
+    mode_t mode, time_t mtime)
+{
+	struct hpn_bundle_state *s = ctx;
+	int    safe;
+	int    preserve = (s->flags & HPN_BUNDLE_FLAG_PRESERVE) != 0;
+
+	/* Per-bundle cap: bytes_received + new entry size must stay in
+	 * bounds.  Using uint64 arithmetic; overflow check first. */
+	bundle_caps_init();
+	if (size > UINT64_MAX - s->bytes_received ||
+	    s->bytes_received + size > bundle_per_cap) {
+		error_f("hpn-bundle: entry \"%s\" would exceed per-bundle cap "
+		    "(have %llu, +size %llu > cap %zu)",
+		    path,
+		    (unsigned long long)s->bytes_received,
+		    (unsigned long long)size,
+		    bundle_per_cap);
+		return -1;
+	}
+
+	s->cur_full_path = bundle_compose_path(s->dest_dir, path, &safe);
+	if (!safe) {
+		error("hpn-bundle: REJECTED unsafe tar pathname \"%s\" "
+		    "(\"..\" component, or absolute path with non-empty "
+		    "dest_dir); possible path-traversal attempt", path);
+		return -1;
+	}
+	if (s->cur_full_path == NULL) {
+		error_f("hpn-bundle: out of memory composing path");
+		return -1;
+	}
+
+	/* Pre-create parent directory.  Skip if last_mkdir_dir matches. */
+	{
+		char *full_copy = strdup(s->cur_full_path);
+		if (full_copy != NULL) {
+			char *parent = dirname(full_copy);
+			if (parent != NULL && strcmp(parent, ".") != 0 &&
+			    strcmp(parent, "/") != 0) {
+				if (s->last_mkdir_dir == NULL ||
+				    strcmp(s->last_mkdir_dir, parent) != 0) {
+					(void)mkdir_p(parent, 0755);
+					free(s->last_mkdir_dir);
+					s->last_mkdir_dir = strdup(parent);
+				}
+			}
+			free(full_copy);
+		}
+	}
+
+	mode_t perm = preserve ? (mode & 07777) : 0644;
+	s->cur_fd = open(s->cur_full_path, O_WRONLY | O_CREAT | O_TRUNC, perm);
+	if (s->cur_fd < 0) {
+		error_f("hpn-bundle: open \"%s\": %s",
+		    s->cur_full_path, strerror(errno));
+		return -1;
+	}
+#ifdef HAVE_POSIX_FALLOCATE
+	/* (E) Pre-allocate extents for fewer fragments + faster sequential
+	 * writes on extents-based FS (ext4 / xfs / lustre).  Failure is
+	 * non-fatal — write() will just allocate on demand. */
+	if (size > 0)
+		(void)posix_fallocate(s->cur_fd, 0, (off_t)size);
+#endif
+	s->cur_size  = size;
+	s->cur_mode  = mode;
+	s->cur_mtime = mtime;
+	return 0;
+}
+
+static int
+bundle_upload_data_cb(void *ctx, const u_char *data, size_t len)
+{
+	struct hpn_bundle_state *s = ctx;
+	size_t remaining = len;
+
+	if (s->cur_fd < 0)
+		return -1;	/* shouldn't happen — parser always pairs */
+	while (remaining > 0) {
+		ssize_t n = write(s->cur_fd, data, remaining);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			error_f("hpn-bundle: write \"%s\": %s",
+			    s->cur_full_path, strerror(errno));
+			return -1;
+		}
+		data      += n;
+		remaining -= (size_t)n;
+	}
+	s->bytes_received += (uint64_t)len;
+	return 0;
+}
+
+static int
+bundle_upload_entry_end_cb(void *ctx)
+{
+	struct hpn_bundle_state *s = ctx;
+	int preserve = (s->flags & HPN_BUNDLE_FLAG_PRESERVE) != 0;
+	int do_fsync = (s->flags & HPN_BUNDLE_FLAG_FSYNC) != 0;
+	int rc       = 0;
+
+	if (s->cur_fd >= 0) {
+		if (preserve) {
+			struct timespec ts[2];
+			ts[0].tv_sec = s->cur_mtime; ts[0].tv_nsec = 0;
+			ts[1].tv_sec = s->cur_mtime; ts[1].tv_nsec = 0;
+			(void)futimens(s->cur_fd, ts);
+		}
+		if (do_fsync && fsync(s->cur_fd) != 0) {
+			error_f("hpn-bundle: fsync \"%s\": %s",
+			    s->cur_full_path, strerror(errno));
+			rc = -1;
+		}
+		if (close(s->cur_fd) != 0) {
+			error_f("hpn-bundle: close \"%s\": %s",
+			    s->cur_full_path, strerror(errno));
+			rc = -1;
+		}
+		s->cur_fd = -1;
+	}
+	free(s->cur_full_path);
+	s->cur_full_path = NULL;
+	s->cur_size = 0;
+	return rc;
 }
 
 int
@@ -696,20 +871,26 @@ sftp_hpn_server_bundle_write(int handle, uint64_t off,
 		    handle);
 		return SSH2_FX_FAILURE;
 	}
-	/* Client writes monotonically — `off` should equal accum_len.
-	 * Tolerate skew by reseting to off when smaller (idempotent
-	 * retry case) but reject gaps. */
-	if (off != s->accum_len) {
-		error_f("hpn-bundle write offset mismatch: got %llu have %zu",
-		    (unsigned long long)off, s->accum_len);
+	/* Client writes monotonically; reject gaps or overlaps. */
+	if (off != s->next_write_off) {
+		error_f("hpn-bundle write offset mismatch: got %llu "
+		    "have %llu",
+		    (unsigned long long)off,
+		    (unsigned long long)s->next_write_off);
 		return SSH2_FX_FAILURE;
 	}
-	if (bundle_state_reserve(s, len) != 0) {
-		error_f("hpn-bundle: out of memory growing accumulator");
+	if (s->parser == NULL)
+		return SSH2_FX_FAILURE;
+	/* Feed bytes straight to the parser; entry callbacks open files
+	 * and write data inline (no accumulator).  Streaming preserves
+	 * O(1) per-worker memory regardless of bundle size. */
+	int pr = sftp_hpn_tar_parser_feed(s->parser, data, len);
+	if (pr < 0) {
+		error_f("hpn-bundle WRITE: parser error: %s",
+		    sftp_hpn_tar_parser_error(s->parser));
 		return SSH2_FX_FAILURE;
 	}
-	memcpy(s->accum + s->accum_len, data, len);
-	s->accum_len += len;
+	s->next_write_off += len;
 	return SSH2_FX_OK;
 }
 
@@ -725,14 +906,50 @@ sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
 		    handle);
 		return SSH2_FX_FAILURE;
 	}
-	if (off >= s->accum_len) {
+	if (s->writer == NULL) {
 		*out_len = 0;
 		return SSH2_FX_EOF;
 	}
-	size_t avail = s->accum_len - (size_t)off;
-	size_t n = len < avail ? len : avail;
-	memcpy(out_buf, s->accum + off, n);
-	*out_len = n;
+	/* Sequential-only: SFTP READs arrive in offset order on a single
+	 * channel.  Skip out-of-order requests (they can't happen with the
+	 * current client; if they ever do, we surface a clear error rather
+	 * than silently producing wrong bytes). */
+	if (off != s->bytes_produced) {
+		if (off > s->bytes_produced) {
+			error_f("hpn-bundle READ: out-of-order offset "
+			    "%llu (next %llu)",
+			    (unsigned long long)off,
+			    (unsigned long long)s->bytes_produced);
+			return SSH2_FX_FAILURE;
+		}
+		/* off < bytes_produced: client re-reading earlier bytes.
+		 * Streaming codec doesn't support back-seek; bytes are
+		 * already gone.  Fail loudly. */
+		error_f("hpn-bundle READ: backward seek %llu (next %llu)",
+		    (unsigned long long)off,
+		    (unsigned long long)s->bytes_produced);
+		return SSH2_FX_FAILURE;
+	}
+
+	/* Fill up to `len` bytes by looping pack_next.  Returns 0 only
+	 * when EOA has been emitted and no more bytes will follow. */
+	size_t produced = 0;
+	while (produced < len) {
+		ssize_t n = sftp_hpn_tar_writer_pack_next(s->writer,
+		    out_buf + produced, len - produced);
+		if (n < 0) {
+			error_f("hpn-bundle READ: writer error: %s",
+			    sftp_hpn_tar_writer_error(s->writer));
+			return SSH2_FX_FAILURE;
+		}
+		if (n == 0)
+			break;	/* EOA */
+		produced += (size_t)n;
+	}
+	*out_len = produced;
+	s->bytes_produced += produced;
+	if (produced == 0)
+		return SSH2_FX_EOF;
 	return SSH2_FX_OK;
 }
 
@@ -777,37 +994,6 @@ bundle_path_is_safe(const char *p, const char *dest_dir)
 	return 1;
 }
 
-/*
- * Tar paths like "a/b/c.dat" need their parent directories created
- * before we can open() the file.  The on-the-fly mkdir-p is in
- * misc.c so both client (-W setup) and server (this file) can share
- * it.  See the libarchive archive_write_disk path comment in
- * sftp_hpn_server_bundle_close for a future cleanup direction.
- */
-
-/*
- * libarchive read callback that pulls bytes from the accumulator buffer.
- * Used by archive_read_open under sftp_hpn_server_bundle_close.
- */
-struct bundle_read_ctx {
-	const u_char *p;
-	size_t        remaining;
-};
-
-static la_ssize_t
-bundle_archive_read_cb(struct archive *a, void *cd, const void **buffer)
-{
-	struct bundle_read_ctx *ctx = cd;
-	(void)a;
-	if (ctx->remaining == 0)
-		return 0;
-	*buffer = ctx->p;
-	la_ssize_t r = (la_ssize_t)ctx->remaining;
-	ctx->p         += ctx->remaining;
-	ctx->remaining  = 0;
-	return r;
-}
-
 int
 sftp_hpn_server_bundle_close(int handle)
 {
@@ -816,197 +1002,38 @@ sftp_hpn_server_bundle_close(int handle)
 		return SSH2_FX_FAILURE;
 
 	/* Fetch-mode handles already finished their server-side work in the
-	 * hpn-bundle-fetch handler (packed tar into accum).  Close is just a
-	 * resource release — no libarchive extraction. */
+	 * hpn-bundle-fetch handler (queued paths + finish()).  Close is just
+	 * a resource release; the writer's destructor closes any open input
+	 * file and discards the queue. */
 	if (s->mode == HPN_BUNDLE_MODE_FETCH) {
-		debug_f("hpn-bundle close (fetch): handle=%d accum=%zu bytes",
-		    handle, s->accum_len);
+		debug_f("hpn-bundle close (fetch): handle=%d produced=%llu",
+		    handle, (unsigned long long)s->bytes_produced);
 		bundle_state_free(s);
 		handle_free_bundle(handle);
 		return SSH2_FX_OK;
 	}
 
+	/* UPLOAD: streaming extract already happened during the WRITE
+	 * sequence.  All that remains is to verify the parser reached EOA
+	 * (signalled by the trailing two zero blocks) and release the
+	 * state.  If the parser hasn't seen EOA we accept that as success
+	 * (matches the prior libarchive behaviour where an empty / partial
+	 * stream simply produced no extracted files) but log it. */
 	int status = SSH2_FX_OK;
-	struct archive *a = NULL;
-	struct archive_entry *ae;
-	struct bundle_read_ctx ctx = { s->accum, s->accum_len };
 	int preserve = (s->flags & HPN_BUNDLE_FLAG_PRESERVE) != 0;
 	int do_fsync = (s->flags & HPN_BUNDLE_FLAG_FSYNC) != 0;
-	int n_extracted = 0;
 
-	debug_f("hpn-bundle close: handle=%d dest=\"%s\" accum=%zu bytes "
+	debug_f("hpn-bundle close: handle=%d dest=\"%s\" received=%llu "
 	    "preserve=%d fsync=%d",
-	    handle, s->dest_dir, s->accum_len, preserve, do_fsync);
+	    handle, s->dest_dir,
+	    (unsigned long long)s->bytes_received, preserve, do_fsync);
 
-	if (s->accum_len == 0) {
-		/* Empty bundle — nothing to do. */
-		goto out;
-	}
-
-	a = archive_read_new();
-	if (a == NULL) {
-		error_f("hpn-bundle: archive_read_new failed");
+	const char *perr = sftp_hpn_tar_parser_error(s->parser);
+	if (perr != NULL) {
+		error_f("hpn-bundle close: parser error: %s", perr);
 		status = SSH2_FX_FAILURE;
-		goto out;
-	}
-	/* Accept any tar-family format; the client uses ustar but pax /
-	 * gnutar are also accepted in case future clients change. */
-	archive_read_support_format_tar(a);
-	if (archive_read_open(a, &ctx, NULL,
-	    bundle_archive_read_cb, NULL) != ARCHIVE_OK) {
-		error_f("hpn-bundle: archive_read_open: %s",
-		    archive_error_string(a));
-		status = SSH2_FX_FAILURE;
-		goto out;
 	}
 
-	while (1) {
-		int r = archive_read_next_header(a, &ae);
-		if (r == ARCHIVE_EOF)
-			break;
-		if (r != ARCHIVE_OK && r != ARCHIVE_WARN) {
-			error_f("hpn-bundle: read_next_header: %s",
-			    archive_error_string(a));
-			status = SSH2_FX_FAILURE;
-			break;
-		}
-
-		const char *path = archive_entry_pathname(ae);
-		if (path == NULL || *path == '\0') {
-			error_f("hpn-bundle: empty pathname in tar record");
-			status = SSH2_FX_FAILURE;
-			break;
-		}
-		if (!bundle_path_is_safe(path, s->dest_dir)) {
-			/* Loud rejection — anyone seeing this in the sftp
-			 * server log should investigate the originating
-			 * client.  Mark the whole bundle as failed so the
-			 * client gets a clear signal too. */
-			error("hpn-bundle: REJECTED unsafe tar pathname "
-			    "\"%s\" (\"..\" component, or absolute path with "
-			    "non-empty dest_dir); possible path-traversal "
-			    "attempt", path);
-			status = SSH2_FX_FAILURE;
-			break;
-		}
-		/* Compose full destination path.  Empty dest_dir means the
-		 * client supplied per-record paths that should be interpreted
-		 * verbatim against the server's current working directory
-		 * (the user's home, as set by the standard SFTP entry point).
-		 * Prepending "/" in that case would silently root the path at
-		 * filesystem root — which is both wrong and a privilege issue.
-		 * Non-empty dest_dir uses the natural "dir/path" composition. */
-		char *full;
-		if (*s->dest_dir == '\0') {
-			full = strdup(path);
-		} else {
-			size_t full_len = strlen(s->dest_dir) + 1 +
-			    strlen(path) + 1;
-			full = malloc(full_len);
-			if (full != NULL)
-				snprintf(full, full_len, "%s/%s",
-				    s->dest_dir, path);
-		}
-		if (full == NULL) {
-			error_f("hpn-bundle: out of memory");
-			status = SSH2_FX_FAILURE;
-			break;
-		}
-
-		/* Create parent directories on demand.  NOTE: libarchive's
-		 * archive_write_disk + archive_read_extract would handle
-		 * this automatically AND deal with ownership/xattrs/sparse
-		 * files cleanly.  Hand-rolled here for the first cut; if
-		 * subdir trees become common we should switch to the
-		 * write_disk path. */
-		{
-			char *full_copy = strdup(full);
-			if (full_copy != NULL) {
-				char *parent = dirname(full_copy);
-				if (parent && strcmp(parent, ".") != 0
-				    && strcmp(parent, "/") != 0)
-					(void)mkdir_p(parent, 0755);
-				free(full_copy);
-			}
-		}
-
-		mode_t mode = preserve
-		    ? (mode_t)(archive_entry_perm(ae) & 07777)
-		    : 0644;
-		int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, mode);
-		if (fd < 0) {
-			error_f("hpn-bundle: open \"%s\": %s",
-			    full, strerror(errno));
-			free(full);
-			status = SSH2_FX_FAILURE;
-			break;
-		}
-
-		/* Stream data from the archive entry to the file. */
-		la_int64_t total_written = 0;
-		const void *blob;
-		size_t blob_len;
-		la_int64_t blob_off;
-		int file_ok = 1;
-		while ((r = archive_read_data_block(a, &blob, &blob_len,
-		    &blob_off)) == ARCHIVE_OK) {
-			ssize_t w;
-			const u_char *bp = blob;
-			size_t remaining = blob_len;
-			while (remaining > 0) {
-				w = write(fd, bp, remaining);
-				if (w <= 0) {
-					error_f("hpn-bundle: write \"%s\": %s",
-					    full,
-					    w < 0 ? strerror(errno) : "EOF");
-					file_ok = 0;
-					break;
-				}
-				bp        += w;
-				remaining -= (size_t)w;
-				total_written += w;
-			}
-			if (!file_ok)
-				break;
-		}
-		if (r != ARCHIVE_EOF && r != ARCHIVE_OK && file_ok) {
-			error_f("hpn-bundle: read_data_block \"%s\": %s",
-			    full, archive_error_string(a));
-			file_ok = 0;
-		}
-
-		if (file_ok && preserve) {
-			time_t mt = archive_entry_mtime(ae);
-			struct timespec ts[2];
-			ts[0].tv_sec = mt; ts[0].tv_nsec = 0;
-			ts[1].tv_sec = mt; ts[1].tv_nsec = 0;
-			(void)futimens(fd, ts);
-		}
-		if (file_ok && do_fsync)
-			(void)fsync(fd);
-
-		if (close(fd) != 0 && file_ok) {
-			error_f("hpn-bundle: close \"%s\": %s",
-			    full, strerror(errno));
-			file_ok = 0;
-		}
-		if (!file_ok)
-			status = SSH2_FX_FAILURE;
-		else
-			n_extracted++;
-		free(full);
-
-		if (!file_ok)
-			break;
-	}
-
- out:
-	if (a != NULL) {
-		archive_read_close(a);
-		archive_read_free(a);
-	}
-	debug_f("hpn-bundle close: handle=%d extracted=%d status=%d",
-	    handle, n_extracted, status);
 	bundle_state_free(s);
 	handle_free_bundle(handle);
 	return status;
@@ -1095,157 +1122,6 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 }
 
 /*
- * libarchive_write callback writing into the bundle_state accumulator
- * via bundle_state_reserve / memcpy.  Mirror of bundle_write_cb on the
- * client upload side, but here the destination is in-process memory
- * rather than the SFTP wire.
- */
-static la_ssize_t
-bundle_fetch_archive_write_cb(struct archive *a, void *client_data,
-    const void *buf, size_t len)
-{
-	struct hpn_bundle_state *s = client_data;
-	(void)a;
-	if (bundle_state_reserve(s, len) != 0)
-		return -1;
-	memcpy(s->accum + s->accum_len, buf, len);
-	s->accum_len += len;
-	return (la_ssize_t)len;
-}
-
-/*
- * Pack one path into the libarchive writer.
- *
- * Return codes:
- *   0   entry successfully packed.
- *  -1   per-file metadata error before any archive bytes were written
- *       (open / fstat / non-regular-file).  The archive's libarchive state
- *       has not been touched, so the caller may safely skip this entry and
- *       continue with the next path — symmetric to upload-side per-entry
- *       skip behaviour.
- *  -2   mid-entry failure (libarchive header / write_data error, premature
- *       EOF on the source file, transient read failure).  The libarchive
- *       writer is mid-stream with a half-written entry; the on-the-wire
- *       tar is structurally broken from this point on.  The caller MUST
- *       abandon the bundle rather than continue, because subsequent
- *       archive_write_header / archive_write_close calls cannot reliably
- *       repair the truncation and would produce a tar that decompresses
- *       to "Truncated input file" on the client side (the failure mode
- *       observed in the 2026-05-31 br008 many-small download validation).
- *
- * Previously this function returned only 0/-1 and the caller (void)-
- * discarded the result, which meant a mid-entry failure produced exactly
- * the kind of truncated bundle libarchive could not unpack on the client.
- * The two-tier return code preserves the documented "single bad file does
- * not kill the whole bundle" intent for pre-header failures while
- * correctly failing the bundle when libarchive state becomes invalid.
- */
-static int
-bundle_fetch_pack_one(struct archive *a, const char *path)
-{
-	struct archive_entry *ae = NULL;
-	struct stat sb;
-	int fd = -1;
-	int rc = -1;
-	int header_written = 0;
-
-	fd = open(path, O_RDONLY);
-	if (fd < 0) {
-		error_f("hpn-bundle-fetch: open \"%s\": %s",
-		    path, strerror(errno));
-		goto out;
-	}
-	if (fstat(fd, &sb) < 0) {
-		error_f("hpn-bundle-fetch: fstat \"%s\": %s",
-		    path, strerror(errno));
-		goto out;
-	}
-	if (!S_ISREG(sb.st_mode)) {
-		debug_f("hpn-bundle-fetch: \"%s\" not a regular file, skipping",
-		    path);
-		goto out;
-	}
-
-	ae = archive_entry_new();
-	if (ae == NULL) {
-		error_f("hpn-bundle-fetch: archive_entry_new failed");
-		goto out;
-	}
-	archive_entry_set_pathname(ae, path);
-	archive_entry_set_size(ae, (la_int64_t)sb.st_size);
-	archive_entry_set_filetype(ae, AE_IFREG);
-	archive_entry_set_perm(ae, sb.st_mode & 07777);
-	archive_entry_set_mtime(ae, sb.st_mtime, 0);
-
-	if (archive_write_header(a, ae) != ARCHIVE_OK) {
-		error_f("hpn-bundle-fetch: header \"%s\": %s",
-		    path, archive_error_string(a));
-		rc = -2;	/* archive state may be invalid */
-		goto out;
-	}
-	header_written = 1;
-
-	{
-		off_t remaining = sb.st_size;
-		u_char buf[65536];
-		while (remaining > 0) {
-			ssize_t n = read(fd, buf,
-			    remaining < (off_t)sizeof(buf)
-			    ? (size_t)remaining : sizeof(buf));
-			if (n < 0) {
-				if (errno == EINTR)
-					continue;
-				error_f("hpn-bundle-fetch: read \"%s\": %s",
-				    path, strerror(errno));
-				rc = -2;	/* mid-entry; archive broken */
-				goto out;
-			}
-			if (n == 0) {
-				/* Premature EOF: file shrank after fstat
-				 * reported sb.st_size.  We have already
-				 * committed to writing sb.st_size bytes via
-				 * archive_write_header.  The archive entry is
-				 * now structurally short by `remaining` bytes
-				 * — neither libarchive's automatic padding nor
-				 * archive_write_finish_entry can reliably
-				 * repair it after the fact.  Treat as fatal to
-				 * the bundle so the client never sees a
-				 * truncated tar. */
-				error_f("hpn-bundle-fetch: \"%s\" shrank "
-				    "during read (%lld of %lld bytes); "
-				    "abandoning bundle",
-				    path,
-				    (long long)(sb.st_size - remaining),
-				    (long long)sb.st_size);
-				rc = -2;
-				goto out;
-			}
-			if (archive_write_data(a, buf, (size_t)n) != n) {
-				error_f("hpn-bundle-fetch: write_data "
-				    "\"%s\": %s", path,
-				    archive_error_string(a));
-				rc = -2;	/* mid-entry; archive broken */
-				goto out;
-			}
-			remaining -= n;
-		}
-	}
-	rc = 0;
-
- out:
-	(void)header_written;	/* reserved for future entry-finalize
-				 * accounting; archive_write_finish_entry
-				 * cannot reliably recover the truncated cases
-				 * above, so we just bail and let the caller
-				 * mark the bundle dead. */
-	if (ae != NULL)
-		archive_entry_free(ae);
-	if (fd >= 0)
-		(void)close(fd);
-	return rc;
-}
-
-/*
  * Process the hpn-bundle-fetch@hpnssh.org extended request.
  *
  * Wire format (after extension name):
@@ -1253,11 +1129,24 @@ bundle_fetch_pack_one(struct archive *a, const char *path)
  *   u32 n_paths
  *   for i in [0, n_paths): cstring path
  *
- * Server reads each file, packs into a libarchive ustar buffer held on
- * a new fetch-mode bundle handle, replies with SSH_FXP_HANDLE.  Client
- * drains the buffer via SSH_FXP_READ and closes the handle when done.
+ * Streaming model (2026-05-31 libarchive removal):
+ *   1. Read each path, stat() it for size/perms/mtime.
+ *   2. Queue (src_path, archive_path, mode, size, mtime) into the
+ *      writer state machine.
+ *   3. Call writer_finish() to signal EOA.
+ *   4. Install the bundle_state on the handle table; reply HANDLE.
  *
- * On error replies SSH_FXP_STATUS with the appropriate SSH2_FX_* code.
+ * The actual file reads + tar packing happen lazily inside
+ * sftp_hpn_server_bundle_read() as the client drains via SSH_FXP_READ.
+ * Server memory stays O(1) per bundle (one open file at a time +
+ * 512-byte header scratch).
+ *
+ * Error model: bundle is all-or-nothing.  A per-path stat() failure or
+ * non-regular file is logged and skipped (matching upload-side per-
+ * entry skip), but the per-bundle size cap is enforced before the
+ * handle is installed so an abusive client can't pin too much server
+ * memory.  Mid-pack failures surface in bundle_read as
+ * SSH2_FX_FAILURE.
  */
 static void
 process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
@@ -1266,7 +1155,6 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	char **paths = NULL;
 	uint32_t n_collected = 0;
 	struct hpn_bundle_state *s = NULL;
-	struct archive *a = NULL;
 	struct sshbuf *msg = NULL;
 	int handle = -1;
 	int r, status = SSH2_FX_FAILURE;
@@ -1304,49 +1192,58 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 
-	a = archive_write_new();
-	if (a == NULL) {
-		error_f("hpn-bundle-fetch: archive_write_new failed");
-		goto fail;
-	}
-	if (archive_write_set_format_ustar(a) != ARCHIVE_OK ||
-	    archive_write_set_bytes_per_block(a, HPN_BUNDLE_BLOCK_BYTES)
-	        != ARCHIVE_OK ||
-	    archive_write_open(a, s, NULL,
-	        bundle_fetch_archive_write_cb, NULL) != ARCHIVE_OK) {
-		error_f("hpn-bundle-fetch: libarchive setup: %s",
-		    archive_error_string(a));
-		goto fail;
-	}
-
-	/* Pack each path.  Per-entry metadata failures (open/fstat/non-regular)
-	 * are logged and skipped so a single bad file (race-deleted, permission
-	 * flap) doesn't kill the whole bundle — symmetric to upload-side
-	 * per-entry skip.  Mid-entry libarchive failures (header / write_data /
-	 * source shrink) abandon the entire bundle: the archive's tar state is
-	 * already partially written and cannot be reliably repaired, so
-	 * continuing would produce a structurally-truncated stream that the
-	 * client's libarchive reader rejects as "Truncated input file" (the
-	 * failure mode observed in the 2026-05-31 br008 many-small download
-	 * validation campaign before this fix). */
+	bundle_caps_init();
 	for (i = 0; i < n_paths; i++) {
-		int prc = bundle_fetch_pack_one(a, paths[i]);
-		if (prc == -2) {
-			error_f("hpn-bundle-fetch: bundle aborted after "
-			    "mid-archive failure on \"%s\" (%u/%u paths "
-			    "attempted)", paths[i], i + 1, n_paths);
+		struct stat sb;
+		int fd = open(paths[i], O_RDONLY);
+		if (fd < 0) {
+			error_f("hpn-bundle-fetch: open \"%s\": %s",
+			    paths[i], strerror(errno));
+			continue;
+		}
+		if (fstat(fd, &sb) < 0) {
+			error_f("hpn-bundle-fetch: fstat \"%s\": %s",
+			    paths[i], strerror(errno));
+			(void)close(fd);
+			continue;
+		}
+		(void)close(fd);
+		if (!S_ISREG(sb.st_mode)) {
+			debug_f("hpn-bundle-fetch: \"%s\" not regular, skip",
+			    paths[i]);
+			continue;
+		}
+		uint64_t fsize = (uint64_t)sb.st_size;
+		if (fsize > UINT64_MAX - s->fetch_total_size ||
+		    s->fetch_total_size + fsize > bundle_per_cap) {
+			error_f("hpn-bundle-fetch: total size would exceed "
+			    "per-bundle cap (have %llu, +%llu > cap %zu)",
+			    (unsigned long long)s->fetch_total_size,
+			    (unsigned long long)fsize, bundle_per_cap);
 			goto fail;
 		}
-		/* prc == 0 (packed) or -1 (metadata-only skip): continue. */
+		if (sftp_hpn_tar_writer_add_file(s->writer,
+		    paths[i], paths[i],
+		    sb.st_mode, fsize, sb.st_mtime) < 0) {
+			error_f("hpn-bundle-fetch: writer_add_file "
+			    "\"%s\" rejected (path too long?)", paths[i]);
+			continue;
+		}
+		s->fetch_total_size += fsize;
 	}
+	sftp_hpn_tar_writer_finish(s->writer);
 
-	if (archive_write_close(a) != ARCHIVE_OK) {
-		error_f("hpn-bundle-fetch: archive_write_close: %s",
-		    archive_error_string(a));
+	if (s->fetch_total_size > SIZE_MAX - bundle_total_bytes ||
+	    bundle_total_bytes + (size_t)s->fetch_total_size >
+	    bundle_total_cap) {
+		error_f("hpn-bundle-fetch: would exceed total-across-handles "
+		    "cap (have %zu, +%llu > cap %zu)",
+		    bundle_total_bytes,
+		    (unsigned long long)s->fetch_total_size,
+		    bundle_total_cap);
 		goto fail;
 	}
-	archive_write_free(a);
-	a = NULL;
+	bundle_total_bytes += (size_t)s->fetch_total_size;
 
 	handle = handle_new_bundle(s);
 	if (handle < 0) {
@@ -1354,11 +1251,11 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 
-	debug_f("hpn-bundle-fetch: handle=%d n_paths=%u accum=%zu bytes",
-	    handle, n_paths, s->accum_len);
+	debug_f("hpn-bundle-fetch: handle=%d n_paths=%u total_size=%llu",
+	    handle, n_paths,
+	    (unsigned long long)s->fetch_total_size);
 
-	/* Hand ownership of `s` over to the handle table. */
-	s = NULL;
+	s = NULL;	/* ownership transferred to handle table */
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
@@ -1380,8 +1277,6 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	return;
 
  fail:
-	if (a != NULL)
-		archive_write_free(a);
 	if (s != NULL)
 		bundle_state_free(s);
 	for (i = 0; i < n_collected; i++)

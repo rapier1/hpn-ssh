@@ -136,7 +136,7 @@ SSHD_SESSION_OBJS=sshd-session.o auth-rhosts.o auth-passwd.o \
 	monitor.o monitor_wrap.o auth-krb5.o \
 	auth2-gss.o gss-serv.o gss-serv-krb5.o \
 	loginrec.o auth-pam.o auth-shadow.o auth-sia.o \
-	sftp-server.o sftp-hpn-server.o sftp-common.o \
+	sftp-server.o sftp-hpn-server.o sftp-hpn-tar.o sftp-common.o \
 	uidswap.o platform-listen.o cipher-switch.o $(P11OBJS) $(SKOBJS)
 
 SSHD_AUTH_OBJS=sshd-auth.o \
@@ -151,10 +151,10 @@ SSHD_AUTH_OBJS=sshd-auth.o \
 	loginrec.o auth-pam.o auth-shadow.o auth-sia.o \
 	sandbox-null.o sandbox-rlimit.o sandbox-darwin.o \
 	sandbox-seccomp-filter.o sandbox-capsicum.o  sandbox-solaris.o \
-	sftp-server.o sftp-hpn-server.o sftp-common.o \
+	sftp-server.o sftp-hpn-server.o sftp-hpn-tar.o sftp-common.o \
 	uidswap.o cipher-switch.o $(P11OBJS) $(SKOBJS)
 
-SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-glob.o ssherr-nolibcrypto.o
+SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-hpn-tar.o sftp-glob.o ssherr-nolibcrypto.o
 
 SCP_OBJS=	scp.o progressmeter.o $(SFTP_CLIENT_OBJS)
 
@@ -172,7 +172,7 @@ SKHELPER_OBJS=	ssh-sk-helper.o ssh-sk.o sk-usbhid.o ssherr-nolibcrypto.o
 
 SSHKEYSCAN_OBJS=ssh-keyscan.o $(P11OBJS) $(SKOBJS)
 
-SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-hpn-server.o sftp-server-main.o ssherr-nolibcrypto.o
+SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-hpn-server.o sftp-hpn-tar.o sftp-server-main.o ssherr-nolibcrypto.o
 
 SFTP_OBJS=	sftp.o sftp-usergroup.o progressmeter.o $(SFTP_CLIENT_OBJS) \
 		sftp-workqueue.o sftp-parallel.o sftp-parallel-walk.o \

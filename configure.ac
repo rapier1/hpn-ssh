@@ -3594,17 +3594,13 @@ if test "x$enable_sk" = "xyes" -a "x$enable_sk_internal" != "xno" ; then
 	fi
 fi
 
-# ── Phase 5: libarchive for hpn-bundle SFTP extension ──────────────────────
-# Required dependency.  HPN-SSH's bundle path (small-file aggregation in
-# put -r / get -r over the hpn-bundle@hpnssh.org extension) tar-streams via
-# libarchive and is part of the parallel-streams critical path.  No stub
-# fallback is shipped; configure aborts here if the library or header is
-# missing.
-AC_CHECK_LIB([archive], [archive_write_new], [],
-	[AC_MSG_ERROR([libarchive (-larchive) is required.  Install the libarchive development package (libarchive-dev / libarchive-devel) and re-run configure.])])
-AC_CHECK_HEADER([archive.h], [],
-	[AC_MSG_ERROR([archive.h is required.  Install the libarchive development headers (libarchive-dev / libarchive-devel) and re-run configure.])])
-LIBARCHIVE="-larchive"
+# ── Phase 5: bundle codec ─────────────────────────────────────────────────
+# 2026-05-31: libarchive removed in favour of the in-tree USTAR codec
+# (sftp-hpn-tar.{c,h}).  The codec is pure C99 with no external library
+# dependencies — no configure check needed.  See
+# project_libarchive_removal.md for rationale (streaming impedance
+# mismatch fixed; security surface reduced; we used ~5% of libarchive).
+LIBARCHIVE=""
 AC_SUBST([LIBARCHIVE])
 # ── END Phase 5 ──────────────────────────────────────────────────────────
 
