@@ -635,8 +635,10 @@ bundle_state_free(struct hpn_bundle_state *s)
  * Callers translate -1 into SSH2_FX_FAILURE on the wire.
  */
 /* Forward declaration so bundle_state_reserve can log via the
- * direct-to-file diagnostic; the actual definition is further down. */
-static void bundle_debug_log(const char *fmt, ...)
+ * direct-to-file diagnostic; the actual definition is further down.
+ * Non-static so sftp-server.c's process_read can also call it for the
+ * 2026-05-31 truncation hunt.  Declared in sftp-hpn-server.h. */
+void bundle_debug_log(const char *fmt, ...)
     __attribute__((format(printf, 1, 2)));
 
 static int
@@ -742,21 +744,32 @@ sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
     size_t len, size_t *out_len)
 {
 	struct hpn_bundle_state *s = handle_get_bundle(handle);
-	if (s == NULL || out_buf == NULL || out_len == NULL)
+	if (s == NULL || out_buf == NULL || out_len == NULL) {
+		bundle_debug_log("READ_FAIL bad-args handle=%d s=%p "
+		    "out_buf=%p out_len=%p",
+		    handle, (void *)s, (void *)out_buf, (void *)out_len);
 		return SSH2_FX_FAILURE;
+	}
 	if (s->mode != HPN_BUNDLE_MODE_FETCH) {
 		error_f("hpn-bundle: READ on non-fetch bundle handle %d",
 		    handle);
+		bundle_debug_log("READ_FAIL non-fetch-mode handle=%d mode=%d",
+		    handle, (int)s->mode);
 		return SSH2_FX_FAILURE;
 	}
 	if (off >= s->accum_len) {
 		*out_len = 0;
+		bundle_debug_log("READ_EOF handle=%d off=%llu accum_len=%zu",
+		    handle, (unsigned long long)off, s->accum_len);
 		return SSH2_FX_EOF;
 	}
 	size_t avail = s->accum_len - (size_t)off;
 	size_t n = len < avail ? len : avail;
 	memcpy(out_buf, s->accum + off, n);
 	*out_len = n;
+	bundle_debug_log("READ_OK handle=%d off=%llu req_len=%zu "
+	    "served=%zu accum_len=%zu avail=%zu",
+	    handle, (unsigned long long)off, len, n, s->accum_len, avail);
 	return SSH2_FX_OK;
 }
 
@@ -836,14 +849,18 @@ int
 sftp_hpn_server_bundle_close(int handle)
 {
 	struct hpn_bundle_state *s = handle_get_bundle(handle);
-	if (s == NULL)
+	if (s == NULL) {
+		bundle_debug_log("CLOSE_FAIL no-state handle=%d", handle);
 		return SSH2_FX_FAILURE;
+	}
 
 	/* Fetch-mode handles already finished their server-side work in the
 	 * hpn-bundle-fetch handler (packed tar into accum).  Close is just a
 	 * resource release — no libarchive extraction. */
 	if (s->mode == HPN_BUNDLE_MODE_FETCH) {
 		debug_f("hpn-bundle close (fetch): handle=%d accum=%zu bytes",
+		    handle, s->accum_len);
+		bundle_debug_log("CLOSE_FETCH handle=%d accum=%zu",
 		    handle, s->accum_len);
 		bundle_state_free(s);
 		handle_free_bundle(handle);
@@ -1161,7 +1178,7 @@ static uint32_t bundle_fetch_writecb_call_count = 0;
  * REMOVE OR PROPERLY GATE after the truncation hunt closes.  This is
  * raw debug-spew code with no rate limiting and no log rotation.
  */
-static void
+void
 bundle_debug_log(const char *fmt, ...)
 {
 	static FILE *fp = NULL;

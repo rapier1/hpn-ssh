@@ -231,4 +231,18 @@ void sftp_hpn_server_set_bundle_caps(const char *per_arg,
 
 /* ── END Phase 5 ─────────────────────────────────────────────────────── */
 
+/*
+ * Direct-to-file diagnostic logger for the 2026-05-31 bundle truncation
+ * hunt.  Bypasses the standard syslog/journal path so the per-iter test
+ * setup can write to a known file controlled by HPN_BUNDLE_DEBUG_LOG
+ * (defaults to /tmp/hpn-bundle-debug.log).  Each line is
+ * "<unix_sec>.<usec> pid=<PID> <fmt-expanded>".
+ *
+ * Declared here only so sftp-server.c can call it from process_read /
+ * process_close paths.  REMOVE OR GATE this declaration along with the
+ * implementation once the hunt closes.
+ */
+void bundle_debug_log(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
+
 #endif /* _SFTP_SERVER_HPN_H */

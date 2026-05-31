@@ -892,6 +892,7 @@ process_read(uint32_t id)
 	 * reading from an OS file descriptor. */
 	if (sftp_hpn_server_is_bundle_handle(handle)) {
 		size_t got = 0;
+		uint32_t req_len = len;
 		if (len > SFTP_MAX_READ_LENGTH)
 			len = SFTP_MAX_READ_LENGTH;
 		if (len > buflen) {
@@ -901,10 +902,20 @@ process_read(uint32_t id)
 		}
 		status = sftp_hpn_server_bundle_read(handle, off, buf, len,
 		    &got);
-		if (status == SSH2_FX_OK && got > 0)
+		if (status == SSH2_FX_OK && got > 0) {
+			bundle_debug_log("PROCREAD_DATA id=%u handle=%d "
+			    "off=%llu req_len=%u capped_len=%u got=%zu",
+			    (unsigned)id, handle,
+			    (unsigned long long)off, req_len, len, got);
 			send_data(id, buf, got);
-		else
+		} else {
+			bundle_debug_log("PROCREAD_STATUS id=%u handle=%d "
+			    "off=%llu req_len=%u capped_len=%u status=%d",
+			    (unsigned)id, handle,
+			    (unsigned long long)off, req_len, len,
+			    status);
 			send_status(id, status);
+		}
 		return;
 	}
 
