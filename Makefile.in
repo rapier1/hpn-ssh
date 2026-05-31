@@ -154,7 +154,7 @@ SSHD_AUTH_OBJS=sshd-auth.o \
 	sftp-server.o sftp-hpn-server.o sftp-hpn-tar.o sftp-common.o \
 	uidswap.o cipher-switch.o $(P11OBJS) $(SKOBJS)
 
-SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-hpn-tar.o sftp-glob.o ssherr-nolibcrypto.o
+SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-hpn-bundle-client.o sftp-hpn-tar.o sftp-glob.o ssherr-nolibcrypto.o
 
 SCP_OBJS=	scp.o progressmeter.o $(SFTP_CLIENT_OBJS)
 
