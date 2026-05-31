@@ -2160,8 +2160,26 @@ worker_thread(void *arg)
 			    : UPLOAD_BATCH_BYTE_CAP;
 
 			batch[bn++] = u0;
+			/* Gate: in bundle mode, stop iterating BEFORE
+			 * popping a unit that we have no room for.  The
+			 * original soft gate (`batch_bytes <= cap`) tripped
+			 * one iteration too late: when batch_bytes already
+			 * equals cap, the gate was true → pop next → only
+			 * then discover it can't fit → leftover.  That
+			 * popped-just-to-discard pattern was a fencepost
+			 * costing exactly one bundle-eligible unit per
+			 * batch, forcing that unit through the slow per-
+			 * file leftover dispatch.
+			 *
+			 * In bundle mode, gate strictly so we don't pop
+			 * unless there's free byte budget.  Non-bundle path
+			 * keeps the soft `<=` cap so a single
+			 * larger-than-target unit isn't orphaned by a
+			 * stricter gate. */
 			while (bn < UPLOAD_BATCH_SIZE && !p->abort_flag &&
-			    batch_bytes <= batch_byte_cap) {
+			    (w->bundle_enabled
+			        ? batch_bytes <  batch_byte_cap
+			        : batch_bytes <= batch_byte_cap)) {
 				void *nxt = NULL;
 				if (sftp_workqueue_trypop(p->q, &nxt) != 0)
 					break; /* queue empty or shutdown */
@@ -2170,18 +2188,31 @@ worker_thread(void *arg)
 					__atomic_fetch_sub(&p->queued_bytes,
 					    (uint64_t)nu->size,
 					    __ATOMIC_RELAXED);
+				/* Even with the strict gate, a unit of
+				 * non-uniform size may overshoot the cap on
+				 * its own (e.g. batch_bytes=1 MiB, cap=4 MiB,
+				 * popped unit=4 MiB → projected total 5 MiB).
+				 * Still need a fits check; that unit goes to
+				 * leftover dispatch.  Bundle-ineligibility at
+				 * submit() bounds unit size to cap/4 so this
+				 * branch is rare in practice. */
+				int fits = 1;
+				if (w->bundle_enabled && nu->size > 0 &&
+				    batch_bytes + (uint64_t)nu->size >
+				    batch_byte_cap) {
+					fits = 0;
+				}
 				if (nu->op == batch_op &&
-				    !nu->bundle_ineligible) {
+				    !nu->bundle_ineligible && fits) {
 					batch[bn++] = nu;
 					if (nu->size > 0)
 						batch_bytes +=
 						    (uint64_t)nu->size;
 				} else {
-					/* Off-op OR bundle-ineligible: stop
-					 * collecting, handle after batch.
-					 * Ineligible units must not be bundled;
-					 * leftover dispatch sends them through
-					 * the per-file path. */
+					/* Off-op, bundle-ineligible, OR
+					 * would-overshoot: stop collecting
+					 * and dispatch nu via the post-batch
+					 * leftover path. */
 					leftover = nu;
 					break;
 				}
