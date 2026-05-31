@@ -708,59 +708,6 @@ bundle_dl_mkdir_p(const char *dirpath, mode_t mode)
 }
 
 /*
- * Direct-to-file client-side diagnostic logger for the 2026-05-31
- * bundle truncation hunt.  Mirrors the server-side bundle_debug_log
- * helper but writes from the client process to a path on the CLIENT
- * host (kilo by convention).  Lets us correlate the server's
- * READ_OK / READ_EOF events with what the client actually received.
- *
- * Path: HPN_BUNDLE_DEBUG_LOG env var, defaults to
- * /tmp/hpn-bundle-debug-client.log.  Distinct default from the server
- * default so that running both on the same host doesn't interleave.
- *
- * REMOVE OR GATE after the hunt closes.
- */
-static void
-bundle_dl_debug_log(const char *fmt, ...)
-    __attribute__((format(printf, 1, 2)));
-
-static void
-bundle_dl_debug_log(const char *fmt, ...)
-{
-	static FILE *fp = NULL;
-	static int  initialised = 0;
-	struct timespec ts;
-	va_list ap;
-
-	if (!initialised) {
-		/* Set initialised before any work so re-entrant or signal-
-		 * interrupted calls don't reopen.  Logging is OFF unless
-		 * HPN_BUNDLE_DEBUG_LOG is explicitly set to a non-empty
-		 * path.  Empty / unset → fp stays NULL → no-op.  Lets us
-		 * run timing-sensitive comparisons against the same binary
-		 * with logging disabled. */
-		initialised = 1;
-		const char *path = getenv("HPN_BUNDLE_DEBUG_LOG");
-		if (path != NULL && *path != '\0')
-			fp = fopen(path, "a");
-	}
-	if (fp == NULL)
-		return;
-
-	clock_gettime(CLOCK_REALTIME, &ts);
-	flockfile(fp);
-	fprintf(fp, "%lu.%06ld pid=%d tid=%lu ",
-	    (unsigned long)ts.tv_sec, (long)(ts.tv_nsec / 1000),
-	    getpid(), (unsigned long)pthread_self());
-	va_start(ap, fmt);
-	vfprintf(fp, fmt, ap);
-	va_end(ap);
-	fputc('\n', fp);
-	fflush(fp);
-	funlockfile(fp);
-}
-
-/*
  * Drain READ replies until we have at least one byte to give back,
  * EOF, or an error.  Stores result in `*out` and `*out_len`.
  * Returns 0 on success (including EOF, where *out_len == 0),
@@ -789,16 +736,10 @@ bundle_dl_read_one(struct sftp_conn *conn, const u_char *handle,
 	    (r = sshbuf_put_u64(msg, off)) != 0 ||
 	    (r = sshbuf_put_u32(msg, chunk)) != 0) {
 		error_f("compose hpn-bundle-fetch READ: %s", ssh_err(r));
-		bundle_dl_debug_log("DL_READ_FAIL compose ssh_err=%s",
-		    ssh_err(r));
 		sshbuf_free(msg);
 		return -1;
 	}
-	bundle_dl_debug_log("DL_READ_SEND read_id=%u off=%llu chunk=%u",
-	    read_id, (unsigned long long)off, chunk);
 	if (send_msg(conn, msg) != 0) {
-		bundle_dl_debug_log("DL_READ_FAIL send_msg read_id=%u "
-		    "off=%llu", read_id, (unsigned long long)off);
 		sshbuf_free(msg);
 		return -1;
 	}
@@ -813,29 +754,20 @@ bundle_dl_read_one(struct sftp_conn *conn, const u_char *handle,
 	 * machine should react to. */
 	double t_data_start = monotime_double();
 	if (get_msg(conn, msg) != 0) {
-		bundle_dl_debug_log("DL_READ_FAIL get_msg read_id=%u "
-		    "off=%llu", read_id, (unsigned long long)off);
 		sshbuf_free(msg);
 		return -1;
 	}
-	double get_msg_elapsed = monotime_double() - t_data_start;
-	if (get_msg_elapsed > SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC) {
-		bundle_dl_debug_log("DL_READ_BACKPRESSURE read_id=%u "
-		    "elapsed=%.3fs", read_id, get_msg_elapsed);
+	if (monotime_double() - t_data_start >
+	    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
 		sftp_conn_rdahead_backpressure_signal(conn);
-	}
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 	    (r = sshbuf_get_u32(msg, &recv_id)) != 0) {
 		error_f("parse hpn-bundle-fetch reply header: %s", ssh_err(r));
-		bundle_dl_debug_log("DL_READ_FAIL parse-reply-header "
-		    "read_id=%u ssh_err=%s", read_id, ssh_err(r));
 		sshbuf_free(msg);
 		return -1;
 	}
 	if (recv_id != read_id) {
 		error_f("hpn-bundle-fetch: id mismatch want=%u got=%u",
-		    read_id, recv_id);
-		bundle_dl_debug_log("DL_READ_FAIL id-mismatch want=%u got=%u",
 		    read_id, recv_id);
 		sshbuf_free(msg);
 		return -1;
@@ -846,17 +778,11 @@ bundle_dl_read_one(struct sftp_conn *conn, const u_char *handle,
 		size_t  dlen = 0;
 		if ((r = sshbuf_get_string(msg, &data, &dlen)) != 0) {
 			error_f("parse hpn-bundle-fetch DATA: %s", ssh_err(r));
-			bundle_dl_debug_log("DL_READ_FAIL parse-data "
-			    "read_id=%u ssh_err=%s", read_id, ssh_err(r));
 			sshbuf_free(msg);
 			return -1;
 		}
 		*out = data;
 		*out_len = dlen;
-		bundle_dl_debug_log("DL_READ_DATA read_id=%u off=%llu "
-		    "requested=%u dlen=%zu elapsed=%.3fs",
-		    read_id, (unsigned long long)off, chunk, dlen,
-		    get_msg_elapsed);
 		sshbuf_free(msg);
 		return 0;
 	}
@@ -864,25 +790,17 @@ bundle_dl_read_one(struct sftp_conn *conn, const u_char *handle,
 		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
 			error_f("parse hpn-bundle-fetch STATUS: %s",
 			    ssh_err(r));
-			bundle_dl_debug_log("DL_READ_FAIL parse-status "
-			    "read_id=%u ssh_err=%s", read_id, ssh_err(r));
 			sshbuf_free(msg);
 			return -1;
 		}
 		sshbuf_free(msg);
 		if (status == SSH2_FX_EOF) {
 			*eof_out = 1;
-			bundle_dl_debug_log("DL_READ_EOF read_id=%u "
-			    "off=%llu", read_id, (unsigned long long)off);
 			return 0;
 		}
-		bundle_dl_debug_log("DL_READ_STATUS read_id=%u off=%llu "
-		    "status=%u", read_id, (unsigned long long)off, status);
 		error_f("hpn-bundle-fetch server error: %u", status);
 		return -1;
 	}
-	bundle_dl_debug_log("DL_READ_FAIL unexpected-reply read_id=%u "
-	    "type=%u", read_id, (unsigned)type);
 	error_f("hpn-bundle-fetch: unexpected reply type %u", (unsigned)type);
 	sshbuf_free(msg);
 	return -1;
@@ -918,29 +836,18 @@ bundle_dl_archive_read_cb(struct archive *a, void *client_data,
 
 	if (ctx->eof) {
 		*buf_out = NULL;
-		bundle_dl_debug_log("DL_CB_EOF off=%llu (eof-was-already-set)",
-		    (unsigned long long)ctx->off);
 		return 0;
 	}
 
 	if (bundle_dl_read_one(ctx->conn, ctx->handle, ctx->handle_len,
 	    ctx->off, ctx->chunk, &ctx->staged, &ctx->staged_len,
-	    &ctx->eof) != 0) {
-		bundle_dl_debug_log("DL_CB_ERR off=%llu staged_len=%zu eof=%d",
-		    (unsigned long long)ctx->off, ctx->staged_len, ctx->eof);
+	    &ctx->eof) != 0)
 		return -1;
-	}
 
 	if (ctx->staged_len == 0 || ctx->eof) {
 		*buf_out = NULL;
-		bundle_dl_debug_log("DL_CB_EOF off=%llu staged_len=%zu "
-		    "eof=%d (returning EOF to libarchive)",
-		    (unsigned long long)ctx->off, ctx->staged_len, ctx->eof);
 		return 0;
 	}
-	bundle_dl_debug_log("DL_CB_DATA off=%llu staged_len=%zu "
-	    "(returning to libarchive)",
-	    (unsigned long long)ctx->off, ctx->staged_len);
 	ctx->off += ctx->staged_len;
 	*buf_out = ctx->staged;
 	return (la_ssize_t)ctx->staged_len;
@@ -1108,54 +1015,32 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	    archive_read_open(a, &ctx, NULL,
 	        bundle_dl_archive_read_cb, NULL) != ARCHIVE_OK) {
 		error_f("archive_read_open: %s", archive_error_string(a));
-		bundle_dl_debug_log("DL_OPEN_FAIL libarchive=%s",
-		    archive_error_string(a));
 		goto cleanup;
 	}
-	bundle_dl_debug_log("DL_BUNDLE_START n=%d", n);
 
-	int extracted_count = 0;
 	while ((r = archive_read_next_header(a, &ae)) == ARCHIVE_OK) {
 		const char *tar_path = archive_entry_pathname(ae);
 		if (tar_path == NULL || *tar_path == '\0') {
 			error_f("hpn-bundle-fetch: empty pathname in tar record");
-			bundle_dl_debug_log("DL_ENTRY_EMPTY");
 			continue;
 		}
 		int idx = bundle_dl_lookup_entry(entries, n, tar_path);
 		if (idx < 0) {
 			debug_f("hpn-bundle-fetch: tar record \"%s\" "
 			    "not in entries[]; skipping", tar_path);
-			bundle_dl_debug_log("DL_ENTRY_UNKNOWN tar_path=%s",
-			    tar_path);
 			continue;
 		}
 		if (entries[idx].local_path == NULL) {
 			error_f("hpn-bundle-fetch: entry %d local_path NULL",
 			    idx);
-			bundle_dl_debug_log("DL_ENTRY_NULLPATH idx=%d", idx);
 			continue;
 		}
 		if (bundle_dl_extract_one(a, ae, entries[idx].local_path,
-		    preserve_flag) == 0) {
+		    preserve_flag) == 0)
 			entries[idx].result = 0;
-			extracted_count++;
-			bundle_dl_debug_log("DL_ENTRY_OK tar_path=%s idx=%d",
-			    tar_path, idx);
-		} else {
-			bundle_dl_debug_log("DL_ENTRY_EXTRACT_FAIL "
-			    "tar_path=%s idx=%d", tar_path, idx);
-		}
 	}
-	bundle_dl_debug_log("DL_BUNDLE_END n=%d extracted=%d r=%d "
-	    "ctx.off=%llu",
-	    n, extracted_count, r, (unsigned long long)ctx.off);
 	if (r != ARCHIVE_EOF) {
 		error_f("archive_read_next_header: %s", archive_error_string(a));
-		bundle_dl_debug_log("DL_BUNDLE_FAIL archive_read_next_header "
-		    "r=%d libarchive=%s ctx.off=%llu",
-		    r, archive_error_string(a),
-		    (unsigned long long)ctx.off);
 		goto cleanup;
 	}
 
