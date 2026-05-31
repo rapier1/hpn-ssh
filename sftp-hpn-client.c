@@ -383,6 +383,12 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
 			rd->win_bytes = 0;
 			rd->win_reqs = 0;
 			rd->win_start = monotime_double();
+			/* Part D: cur is leaving floor, clear the
+			 * persistent-degradation counters so a future bad
+			 * patch starts a fresh accounting run rather than
+			 * inheriting history from before recovery. */
+			rd->consecutive_bp_at_floor = 0;
+			rd->time_first_at_floor = 0.0;
 			debug2_f("rdahead: time-probe → depth %u -> %u "
 			    "(forced after %.1fs at floor)",
 			    before, rd->cur, probe_elapsed);
@@ -429,6 +435,13 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
 	rd->win_bytes = 0;
 	rd->win_reqs = 0;
 	rd->win_start = now;
+	/* Part D: any successful window that lands cur above floor counts
+	 * as recovery — clear the persistent-degradation counters so a
+	 * future bad patch starts a fresh accounting run. */
+	if (rd->cur > rd->floor) {
+		rd->consecutive_bp_at_floor = 0;
+		rd->time_first_at_floor = 0.0;
+	}
 	debug2_f("rdahead: depth=%u cap=%u rate=%.1f MiB/s%s",
 	    rd->cur, rd->cap, rate / (1024.0 * 1024.0),
 	    rd->settled ? " (settled)" : "");
@@ -452,18 +465,55 @@ sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *hpn)
 {
 	struct sftp_rdahead *rd;
 	uint32_t before;
+	double now;
 
 	if (hpn == NULL || !hpn->rd.enabled)
 		return;
 	rd = &hpn->rd;
 	before = rd->cur;
+	now = monotime_double();
 	rd->cur = MAXIMUM(rd->cur / 2, rd->floor);
 	rd->settled = 0;
 	rd->last_rate = 0.0;
 	rd->last_rising = rd->cur;
 	rd->win_bytes = 0;
 	rd->win_reqs = 0;
-	rd->win_start = monotime_double();
+	rd->win_start = now;
+
+	/*
+	 * Part D — persistent-degradation tracking.  Each backpressure event
+	 * that lands us at floor adds to the count and, on first arrival,
+	 * stamps the time.  If either reap threshold is crossed, mark the
+	 * connection dead so the orchestrator's existing watchdog reaps and
+	 * respawns the worker on a fresh TCP session.  A fresh connection
+	 * gets fresh kernel TCP state (cwnd, RTO, retransmits) which is the
+	 * cure for TCP-wedge-class failures; path-wide degradation will
+	 * re-trigger on the new connection, the session-wide respawn
+	 * cooldown machinery (sftp-parallel.c) bounds the resulting churn.
+	 */
+	if (rd->cur == rd->floor) {
+		if (rd->time_first_at_floor <= 0.0)
+			rd->time_first_at_floor = now;
+		rd->consecutive_bp_at_floor++;
+
+		if (rd->consecutive_bp_at_floor >=
+		    SFTP_HPN_RDAHEAD_REAP_BP_COUNT ||
+		    (now - rd->time_first_at_floor) >
+		    SFTP_HPN_RDAHEAD_REAP_TIME_AT_FLOOR_SEC) {
+			debug_f("rdahead: connection persistently degraded "
+			    "(bp_at_floor=%u floor_for=%.1fs); marking dead "
+			    "for orchestrator respawn",
+			    rd->consecutive_bp_at_floor,
+			    now - rd->time_first_at_floor);
+			hpn->dead = 1;
+			/* Reset Part D state for hygiene — this hpn is
+			 * about to be torn down anyway, but a clean state
+			 * means a fresh respawn doesn't inherit anything. */
+			rd->consecutive_bp_at_floor = 0;
+			rd->time_first_at_floor = 0.0;
+		}
+	}
+
 	debug2_f("rdahead: backpressure → depth %u -> %u (re-probing)",
 	    before, rd->cur);
 }

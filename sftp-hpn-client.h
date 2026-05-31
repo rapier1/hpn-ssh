@@ -55,6 +55,18 @@ struct sftp_rdahead {
 	double   last_rate;   /* smoothed throughput of previous window (bytes/s) */
 	int      settled;     /* 1 once the knee is found — stop probing */
 	int      enabled;     /* 0 => legacy fixed depth (HPN_RDAHEAD=fixed) */
+
+	/* Part D — persistent-degradation tracking.  Backpressure events
+	 * occurring while already at floor accumulate here.  When the
+	 * controller can't keep cur above floor for an extended period,
+	 * the connection is marked dead so the orchestrator's existing
+	 * respawn machinery can replace it with a fresh TCP session.
+	 * Reset when cur grows above floor again (either via normal
+	 * window completion or the Part C time-probe). */
+	uint32_t consecutive_bp_at_floor; /* backpressure events while cur==floor */
+	double   time_first_at_floor;     /* monotime_double() when cur first hit
+	                                   * floor in the current degradation run;
+	                                   * 0 if cur > floor */
 };
 
 /*
@@ -217,6 +229,31 @@ uint32_t sftp_hpn_rdahead_window(struct sftp_hpn_conn *, size_t nbytes,
  * when the controller is disabled.  Threshold detection is the caller's
  * responsibility. */
 void     sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *);
+
+/*
+ * Part D — persistent-degradation reap thresholds.  When the controller
+ * has been forced to floor by repeated backpressure events (TCP wedge,
+ * sustained server slowdown, etc.) and isn't recovering, mark the
+ * connection dead so the orchestrator can replace it with a fresh TCP
+ * session.  Either threshold suffices:
+ *
+ *   _BP_COUNT      consecutive backpressure events while cur==floor
+ *   _SEC           total wallclock time spent at floor in this run
+ *
+ * Chosen values are deliberately conservative — the goal is to give a
+ * truly-broken connection a way out without thrashing legitimate
+ * transient slowdowns.  5 events of Part B firing at floor is well past
+ * what any healthy path produces; 60 s at floor without recovery means
+ * the floor-doubling probes (Part C) haven't found any headroom either.
+ *
+ * The reap signal itself feeds the existing orchestrator respawn
+ * machinery (cooldowns, total_respawns, BORN_SLOW budgets) — Part D
+ * adds a trigger, not a parallel respawn path.  See the design
+ * discussion at reporter_dispatch_respawns in sftp-parallel.c for why
+ * thrash protection stays session-wide for now.
+ */
+#define SFTP_HPN_RDAHEAD_REAP_BP_COUNT       5
+#define SFTP_HPN_RDAHEAD_REAP_TIME_AT_FLOOR_SEC  60.0
 
 /*
  * Mark a connection as dead due to a non-recoverable error, log the
