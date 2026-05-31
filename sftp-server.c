@@ -125,6 +125,7 @@ static void process_extended_sftp_hash_range(uint32_t id);
 static void process_extended_hpn_fs_info(uint32_t id);
 static void process_extended_hpn_bundle_open(uint32_t id);
 static void process_extended_hpn_bundle_cap(uint32_t id);
+static void process_extended_hpn_bundle_max_size_advert(uint32_t id);
 static void process_extended_hpn_bundle_fetch(uint32_t id);
 static void process_extended_hpn_file_layout(uint32_t id);
 static void process_extended(uint32_t id);
@@ -189,6 +190,8 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_hpn_bundle_open, 1 },
 	{ "hpn-bundle-fetch", HPN_EXT_BUNDLE_FETCH, 0,
 	    process_extended_hpn_bundle_fetch, 0 },
+	{ "hpn-bundle-max-size", HPN_EXT_BUNDLE_MAX_SIZE, 0,
+	    process_extended_hpn_bundle_max_size_advert, 0 },
 	{ "hpn-file-layout", HPN_EXT_FILE_LAYOUT, 0,
 	    process_extended_hpn_file_layout, 1 },
 	{ NULL, NULL, 0, NULL, 0 }
@@ -2140,6 +2143,18 @@ process_extended_hpn_bundle_cap(uint32_t id)
 {
 	error("hpn-bundle@hpnssh.org received as a request; clients should "
 	    "send hpn-bundle-open@hpnssh.org");
+	send_status(id, SSH2_FX_OP_UNSUPPORTED);
+}
+
+/* Stub: hpn-bundle-max-size@hpnssh.org is a server-to-client advert
+ * only.  Clients should never send it as a request.  This handler
+ * exists so compose_extension's handler-lookup-or-fatal can find a
+ * registration when advertising the cap in process_init(). */
+static void
+process_extended_hpn_bundle_max_size_advert(uint32_t id)
+{
+	error("hpn-bundle-max-size@hpnssh.org received as a request; "
+	    "this extension is server→client advertisement only");
 	send_status(id, SSH2_FX_OP_UNSUPPORTED);
 }
 
