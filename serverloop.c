@@ -880,6 +880,38 @@ server_arm_parallel_worker(struct ssh *ssh)
 }
 
 /*
+ * Terminate a wedged parallel worker, delivering the cause to the client as
+ * an exit-status channel request so the client's orchestrator reaps the
+ * precise HPN_EXIT_TCP_* code.  The request is queued in the connection's
+ * packet output -- which channel_force_close does NOT discard (it only
+ * resets the channel data buffer) -- and the main loop flushes it
+ * best-effort as the connection tears down.  A hard wedge may stop it
+ * reaching the peer, in which case the worker still dies and is respawned,
+ * just labeled generically.  With no open channel to ride, fall back to a
+ * plain disconnect.
+ */
+static void
+srv_terminate_worker(struct ssh *ssh, int code, const char *reason)
+{
+	Channel *c = NULL;
+	int chanid, r;
+
+	srv_tcp_health_armed = 0;	/* the connection is going away */
+	logit("HPN: %s; terminating parallel worker", reason);
+
+	chanid = channel_find_open(ssh);
+	if (chanid == -1 || (c = channel_lookup(ssh, chanid)) == NULL) {
+		ssh_packet_disconnect(ssh, "HPN: %s", reason);
+		return;	/* not reached; ssh_packet_disconnect exits */
+	}
+	channel_request_start(ssh, chanid, "exit-status", 0);
+	if ((r = sshpkt_put_u32(ssh, (u_int)code)) != 0 ||
+	    (r = sshpkt_send(ssh)) != 0)
+		debug_fr(r, "exit-status");
+	channel_force_close(ssh, c, 1);
+}
+
+/*
  * Poll the server-side monitor and act on a wedge.  On the download path the
  * server is the sender, so the same classifier fires here; on uploads the
  * server is the receiver (notsent ~ 0) and stays silent.  WEDGE / PEER_STALL
@@ -890,6 +922,7 @@ static void
 srv_tcp_health_tick(struct ssh *ssh)
 {
 	struct sftp_hpn_tcp_health h;
+	char reason[160];
 
 	if (!srv_tcp_health_armed)
 		return;
@@ -900,15 +933,16 @@ srv_tcp_health_tick(struct ssh *ssh)
 	}
 	switch (sftp_hpn_classify(&srv_tcp_health, &h)) {
 	case SFTP_HPN_WEDGE_TCP_WEDGE:
-		/* ssh_packet_disconnect logs, notifies the peer, and exits. */
-		ssh_packet_disconnect(ssh, "HPN: TCP connection wedged "
-		    "(cwnd=%u rtt=%uus), terminating parallel worker",
+		snprintf(reason, sizeof(reason),
+		    "TCP connection wedged (cwnd=%u rtt=%uus)",
 		    h.raw.snd_cwnd, h.raw.rtt);
-		break;
+		srv_terminate_worker(ssh, HPN_EXIT_TCP_WEDGE, reason);
+		return;
 	case SFTP_HPN_WEDGE_PEER_STALL:
-		ssh_packet_disconnect(ssh, "HPN: peer receive window pinned, "
-		    "terminating parallel worker");
-		break;
+		snprintf(reason, sizeof(reason),
+		    "peer receive window pinned (cwnd=%u)", h.raw.snd_cwnd);
+		srv_terminate_worker(ssh, HPN_EXIT_TCP_PEER_STALL, reason);
+		return;
 	case SFTP_HPN_WEDGE_PATH_DEGRADED:
 		logit("HPN: parallel worker path degraded, sustained "
 		    "retransmits (cwnd=%u rtt=%uus)", h.raw.snd_cwnd, h.raw.rtt);
