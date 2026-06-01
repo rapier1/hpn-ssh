@@ -48,11 +48,32 @@ struct sftp_hpn_tcp_health_ctx {
 	int		fd;		/* worker transport socket */
 	enum sftp_hpn_tcp_health_avail avail;
 	u_int32_t	pending_retries; /* probes spent waiting for a sample */
-	/*
-	 * Room for trend state (RTT / cwnd / retrans history, last-poll
-	 * time) once the wedge-detection logic lands.  Kept out of the
-	 * first cut deliberately -- nothing reads it yet.
-	 */
+
+	/* Trend state for sftp_hpn_classify().  prev_* hold the previous
+	 * sample's cumulative counters (for deltas); the *_secs counters
+	 * track how many consecutive ~1s samples a signature has held. */
+	int		trend_valid;		/* prev_* populated */
+	u_int32_t	prev_total_rto_time;
+	u_int64_t	prev_total_retrans;
+	u_int64_t	prev_rwnd_limited;
+	u_int32_t	wedge_secs;
+	u_int32_t	peer_stall_secs;
+	u_int32_t	path_degraded_secs;
+	int		wedge_retrans_seen;	/* loss observed during wedge window
+						 * (< 6.7 fallback corroboration) */
+};
+
+/*
+ * Verdict from the wedge classifier.  WEDGE and PEER_STALL warrant
+ * self-termination (the caller maps them to HPN_EXIT_TCP_* codes);
+ * PATH_DEGRADED is reported but does NOT trigger a kill yet -- it is
+ * monitored to judge whether the signal is trustworthy enough to act on.
+ */
+enum sftp_hpn_wedge_verdict {
+	SFTP_HPN_WEDGE_NONE = 0,
+	SFTP_HPN_WEDGE_TCP_WEDGE,
+	SFTP_HPN_WEDGE_PEER_STALL,
+	SFTP_HPN_WEDGE_PATH_DEGRADED,
 };
 
 struct sftp_hpn_tcp_health {
@@ -80,5 +101,16 @@ void	sftp_hpn_tcp_health_ctx_init(struct sftp_hpn_tcp_health_ctx *ctx,
  */
 int	sftp_hpn_tcp_health_poll(struct sftp_hpn_tcp_health_ctx *ctx,
 	    struct sftp_hpn_tcp_health *out);
+
+/*
+ * Feed one health sample to the wedge classifier, advancing the trend
+ * state in ctx, and return a verdict.  Only EXTENDED samples are judged
+ * (BASIC/PENDING always return NONE); the caller is expected to log
+ * BASIC samples separately.  Pure aside from the trend state it keeps in
+ * ctx, so it is unit-testable with synthetic samples.
+ */
+enum sftp_hpn_wedge_verdict
+sftp_hpn_classify(struct sftp_hpn_tcp_health_ctx *ctx,
+    const struct sftp_hpn_tcp_health *h);
 
 #endif /* SFTP_HPN_CONGESTION_H */

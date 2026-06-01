@@ -239,3 +239,135 @@ sftp_hpn_tcp_health_poll(struct sftp_hpn_tcp_health_ctx *ctx,
 	health_classify(ctx, out);
 	return (ctx->avail == TCP_HEALTH_UNSUPPORTED) ? -1 : 0;
 }
+
+/*
+ * Wedge classifier.  Thresholds are conservative first-cut values; all
+ * named so they are easy to tune.  Signatures and the rationale behind
+ * each field are documented in the file banner's watchdog-interplay
+ * section.
+ *
+ * Key principle (confirmed against net/ipv4/{tcp,tcp_rate}.c): we judge a
+ * connection by ACTIVE NETWORK DISTRESS, never by absence of throughput.
+ * delivery_rate and the app_limited bit are recomputed only per delivered
+ * ACK, so during a no-ACK stall they go STALE -- useless for detecting the
+ * stall, and they can't tell a wedge from the app simply pausing (e.g. to
+ * hash during verification).  The distress signals we use are computed at
+ * read time and stay live: total_rto_time includes the in-progress RTO
+ * episode, rwnd_limited includes the in-progress chrono interval, and
+ * snd_cwnd / notsent_bytes / total_retrans are current-state.
+ */
+#define WEDGE_SUSTAIN_SECS	10	/* consecutive ~1s samples before acting */
+#define WEDGE_CWND_COLLAPSED	4	/* snd_cwnd (segments) at/below = collapsed */
+#define WEDGE_MIN_RTT_LAN_US	5000	/* skip paths under 5 ms (LAN) */
+
+enum sftp_hpn_wedge_verdict
+sftp_hpn_classify(struct sftp_hpn_tcp_health_ctx *ctx,
+    const struct sftp_hpn_tcp_health *h)
+{
+	const struct tcpi_portable *t = &h->raw;
+	u_int64_t	d_rto, d_retrans, d_rwnd;
+	int		have_data, cwnd_collapsed, have_rto, wedge_now;
+
+	/*
+	 * Only EXTENDED carries the signals we act on.  Anything less:
+	 * reset trend state and stay silent (the caller still logs the
+	 * sample so BASIC data can be evaluated later).
+	 */
+	if (h->availability != TCP_HEALTH_EXTENDED) {
+		ctx->trend_valid = 0;
+		ctx->wedge_secs = ctx->peer_stall_secs =
+		    ctx->path_degraded_secs = 0;
+		ctx->wedge_retrans_seen = 0;
+		return SFTP_HPN_WEDGE_NONE;
+	}
+
+	/* The delta signals need a previous sample to compare against. */
+	if (!ctx->trend_valid) {
+		ctx->prev_total_rto_time = t->total_rto_time;
+		ctx->prev_total_retrans  = t->total_retrans;
+		ctx->prev_rwnd_limited   = t->rwnd_limited;
+		ctx->trend_valid = 1;
+		return SFTP_HPN_WEDGE_NONE;
+	}
+	d_rto = (t->total_rto_time >= ctx->prev_total_rto_time) ?
+	    (u_int64_t)(t->total_rto_time - ctx->prev_total_rto_time) : 0;
+	d_retrans = (t->total_retrans >= ctx->prev_total_retrans) ?
+	    (t->total_retrans - ctx->prev_total_retrans) : 0;
+	d_rwnd = (t->rwnd_limited >= ctx->prev_rwnd_limited) ?
+	    (t->rwnd_limited - ctx->prev_rwnd_limited) : 0;
+	ctx->prev_total_rto_time = t->total_rto_time;
+	ctx->prev_total_retrans  = t->total_retrans;
+	ctx->prev_rwnd_limited   = t->rwnd_limited;
+
+	/* LAN paths: signals are noisy and wedges don't manifest the same. */
+	if (t->min_rtt < WEDGE_MIN_RTT_LAN_US) {
+		ctx->wedge_secs = ctx->peer_stall_secs =
+		    ctx->path_degraded_secs = 0;
+		ctx->wedge_retrans_seen = 0;
+		return SFTP_HPN_WEDGE_NONE;
+	}
+
+	/*
+	 * notsent_bytes > 0 = we have data queued the network hasn't taken.
+	 * A healthy path drains it fast even if the app pauses, so a value
+	 * stuck above zero is itself a network signal -- and it scopes the
+	 * client-side classifier to the sending side (uploads), since a
+	 * download's notsent is ~0.
+	 */
+	have_data = (t->notsent_bytes > 0);
+	cwnd_collapsed = (t->snd_cwnd <= WEDGE_CWND_COLLAPSED);
+	have_rto = (t->avail_flags & TCPI_AVAIL_TOTAL_RTO) != 0;
+
+	/*
+	 * PEER_STALL: the peer's receive window is pinning us while the
+	 * network (cwnd) is otherwise healthy -- the far end isn't draining.
+	 * Checked first: a healthy cwnd distinguishes "peer won't accept"
+	 * from "network has collapsed".  Needs the 4.10 rwnd_limited field.
+	 */
+	if ((t->avail_flags & TCPI_AVAIL_RWND_LIMITED) &&
+	    have_data && d_rwnd > 0 && !cwnd_collapsed) {
+		ctx->wedge_secs = ctx->path_degraded_secs = 0;
+		ctx->wedge_retrans_seen = 0;
+		if (++ctx->peer_stall_secs >= WEDGE_SUSTAIN_SECS)
+			return SFTP_HPN_WEDGE_PEER_STALL;
+		return SFTP_HPN_WEDGE_NONE;
+	}
+	ctx->peer_stall_secs = 0;
+
+	/*
+	 * WEDGE.  Primary signal (kernel >= 6.7): RTO time actively
+	 * accruing -- the connection is sitting in timeout recovery.
+	 * Fallback (EXTENDED but < 6.7, no RTO accounting): a sustained
+	 * collapsed cwnd, corroborated by retransmits seen during the
+	 * window so a legitimately slow / small-cwnd link (small cwnd but
+	 * no loss) is not mistaken for a wedge.
+	 */
+	wedge_now = have_rto ? (have_data && d_rto > 0)
+			     : (have_data && cwnd_collapsed);
+	if (wedge_now) {
+		ctx->path_degraded_secs = 0;
+		if (d_retrans > 0)
+			ctx->wedge_retrans_seen = 1;
+		if (ctx->wedge_secs < WEDGE_SUSTAIN_SECS)
+			ctx->wedge_secs++;
+		if (ctx->wedge_secs >= WEDGE_SUSTAIN_SECS &&
+		    (have_rto || ctx->wedge_retrans_seen))
+			return SFTP_HPN_WEDGE_TCP_WEDGE;
+		return SFTP_HPN_WEDGE_NONE;
+	}
+	ctx->wedge_secs = 0;
+	ctx->wedge_retrans_seen = 0;
+
+	/*
+	 * PATH_DEGRADED (monitor only): still moving, but losing packets
+	 * steadily.  Reported once per episode; never triggers a kill yet.
+	 */
+	if (have_data && d_retrans > 0) {
+		if (++ctx->path_degraded_secs == WEDGE_SUSTAIN_SECS)
+			return SFTP_HPN_WEDGE_PATH_DEGRADED;
+		return SFTP_HPN_WEDGE_NONE;
+	}
+	ctx->path_degraded_secs = 0;
+
+	return SFTP_HPN_WEDGE_NONE;
+}

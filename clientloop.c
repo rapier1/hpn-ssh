@@ -102,6 +102,7 @@
 #include "hostfile.h"
 #include "metrics.h"
 #include "sftp-hpn-congestion.h"
+#include "hpn-exit-codes.h"
 
 /* Permitted RSA signature algorithms for UpdateHostkeys proofs */
 #define HOSTKEY_PROOF_RSA_ALGS	"rsa-sha2-512,rsa-sha2-256"
@@ -155,6 +156,8 @@ static int connection_out;	/* Connection to server (output). */
  */
 static struct sftp_hpn_tcp_health_ctx tcp_health;
 static int tcp_health_armed;	/* nonzero once tcp_health is initialised */
+static time_t tcp_health_check_time;	/* monotime deadline for next poll */
+#define HPN_TCP_HEALTH_INTERVAL 1	/* seconds between health polls */
 static int need_rekeying;	/* Set to non-zero if rekeying is requested. */
 static int session_closed;	/* In SSH2: login session closed. */
 static time_t x11_refuse_time;	/* If >0, refuse x11 opens after this time. */
@@ -504,6 +507,60 @@ schedule_server_alive_check(void)
 }
 
 static void
+schedule_tcp_health_check(void)
+{
+	if (tcp_health_armed)
+		tcp_health_check_time = monotime() + HPN_TCP_HEALTH_INTERVAL;
+}
+
+/*
+ * Poll the parallel-worker TCP-health monitor.  Driven by a ppoll deadline
+ * (schedule_tcp_health_check), NOT by data activity, so it still fires when
+ * the connection has wedged and no traffic is flowing.  4a samples and logs
+ * only; the wedge classifier + self-termination consume the sample later.
+ */
+static void
+tcp_health_tick(void)
+{
+	struct sftp_hpn_tcp_health h;
+
+	if (!tcp_health_armed)
+		return;
+	if (sftp_hpn_tcp_health_poll(&tcp_health, &h) != 0) {
+		/* Settled UNSUPPORTED — stop polling this connection. */
+		tcp_health_armed = 0;
+		debug_f("HPN: TCP health monitor disabled (unsupported)");
+		return;
+	}
+	debug_f("HPN: tcp health avail=%d cwnd=%u rtt=%uus mss=%u "
+	    "rcv_space=%u retrans=%llu", (int)h.availability,
+	    h.raw.snd_cwnd, h.raw.rtt, h.raw.snd_mss, h.raw.rcv_space,
+	    (unsigned long long)h.raw.total_retrans);
+
+	switch (sftp_hpn_classify(&tcp_health, &h)) {
+	case SFTP_HPN_WEDGE_TCP_WEDGE:
+		logit("HPN: worker TCP connection wedged (cwnd=%u rtt=%uus "
+		    "retrans=%llu) - self-terminating", h.raw.snd_cwnd,
+		    h.raw.rtt, (unsigned long long)h.raw.total_retrans);
+		cleanup_exit(HPN_EXIT_TCP_WEDGE);
+		break;
+	case SFTP_HPN_WEDGE_PEER_STALL:
+		logit("HPN: worker peer not draining (receive window pinned) "
+		    "- self-terminating");
+		cleanup_exit(HPN_EXIT_TCP_PEER_STALL);
+		break;
+	case SFTP_HPN_WEDGE_PATH_DEGRADED:
+		/* Monitored only -- no self-termination yet. */
+		logit("HPN: worker path degraded, sustained retransmits "
+		    "(cwnd=%u rtt=%uus)", h.raw.snd_cwnd, h.raw.rtt);
+		break;
+	case SFTP_HPN_WEDGE_NONE:
+		break;
+	}
+	schedule_tcp_health_check();
+}
+
+static void
 server_alive_check(struct ssh *ssh)
 {
 	int r;
@@ -737,6 +794,8 @@ client_wait_until_can_do_something(struct ssh *ssh, struct pollfd **pfdp,
 		ptimeout_deadline_monotime(&timeout, control_persist_exit_time);
 	if (options.server_alive_interval > 0)
 		ptimeout_deadline_monotime(&timeout, server_alive_time);
+	if (tcp_health_armed)
+		ptimeout_deadline_monotime(&timeout, tcp_health_check_time);
 	if (options.rekey_interval > 0 && !ssh_packet_is_rekeying(ssh)) {
 		ptimeout_deadline_sec(&timeout,
 		    ssh_packet_get_rekey_timeout(ssh));
@@ -771,6 +830,9 @@ client_wait_until_can_do_something(struct ssh *ssh, struct pollfd **pfdp,
 		 */
 		server_alive_check(ssh);
 	}
+
+	if (tcp_health_armed && monotime() >= tcp_health_check_time)
+		tcp_health_tick();
 }
 
 static void
@@ -1532,9 +1594,13 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	 */
 	if (getenv("HPN_PARALLEL_WORKER") != NULL) {
 		sftp_hpn_tcp_health_ctx_init(&tcp_health, connection_in);
-		tcp_health_armed = 1;
-		debug_f("HPN: parallel-worker TCP health monitor armed on "
-		    "fd %d (avail=%d)", connection_in, (int)tcp_health.avail);
+		tcp_health_armed =
+		    (tcp_health.avail != TCP_HEALTH_UNSUPPORTED);
+		debug_f("HPN: parallel-worker TCP health monitor %s on "
+		    "fd %d (avail=%d)",
+		    tcp_health_armed ? "armed" : "unavailable",
+		    connection_in, (int)tcp_health.avail);
+		schedule_tcp_health_check();
 	}
 
 	quit_pending = 0;

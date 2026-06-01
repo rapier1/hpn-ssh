@@ -192,12 +192,196 @@ test_unsupported_contract(void)
 	OK("unsupported_contract");
 }
 
+/* ---- wedge classifier tests (synthetic samples, no live socket) ---- */
+
+/* A healthy EXTENDED baseline: WAN RTT, data queued, delivering fast. */
+static struct sftp_hpn_tcp_health
+mk_ext_sample(void)
+{
+	struct sftp_hpn_tcp_health h;
+
+	memset(&h, 0, sizeof(h));
+	h.availability = TCP_HEALTH_EXTENDED;
+	h.raw.avail_flags = TCPI_AVAIL_MIN_RTT | TCPI_AVAIL_DELIVERY_RATE |
+	    TCPI_AVAIL_TOTAL_RETRANS | TCPI_AVAIL_RWND_LIMITED |
+	    TCPI_AVAIL_TOTAL_RTO;
+	h.raw.snd_mss = 1460;
+	h.raw.snd_cwnd = 100;			/* healthy window */
+	h.raw.min_rtt = 20000;			/* 20 ms -> WAN */
+	h.raw.rtt = 21000;
+	h.raw.notsent_bytes = 65536;		/* we have data to send */
+	h.raw.delivery_rate = 100000000;	/* ~100 MB/s, healthy */
+	h.raw.delivery_rate_app_limited = 0;
+	return h;
+}
+
+/* Feed up to `n` samples (mutated by `tweak`) and return the first
+ * non-NONE verdict, or NONE if none fired. */
+static enum sftp_hpn_wedge_verdict
+drive(struct sftp_hpn_tcp_health_ctx *ctx, int n,
+    void (*tweak)(struct sftp_hpn_tcp_health *, int))
+{
+	enum sftp_hpn_wedge_verdict v = SFTP_HPN_WEDGE_NONE;
+	struct sftp_hpn_tcp_health h;
+	int i;
+
+	for (i = 0; i < n && v == SFTP_HPN_WEDGE_NONE; i++) {
+		h = mk_ext_sample();
+		tweak(&h, i);
+		v = sftp_hpn_classify(ctx, &h);
+	}
+	return v;
+}
+
+static void tw_healthy(struct sftp_hpn_tcp_health *h, int i) { (void)h; (void)i; }
+
+static void
+tw_wedge(struct sftp_hpn_tcp_health *h, int i)
+{
+	h->raw.delivery_rate = 0;			/* stalled */
+	h->raw.total_rto_time = (u_int32_t)(100 + i * 50); /* RTO accruing */
+}
+
+/* Idle but healthy: data queued, zero throughput, but NO network distress
+ * (cwnd healthy, no RTO growth) -- e.g. the worker paused to hash during
+ * verification.  delivery_rate=0 must NOT by itself look like a wedge. */
+static void
+tw_idle(struct sftp_hpn_tcp_health *h, int i)
+{
+	(void)i;
+	h->raw.delivery_rate = 0;
+}
+
+/* Wedge on a < 6.7 kernel: no RTO accounting, cwnd collapsed, retransmits
+ * climbing -> fallback path should fire. */
+static void
+tw_wedge_fallback(struct sftp_hpn_tcp_health *h, int i)
+{
+	h->raw.avail_flags &= ~TCPI_AVAIL_TOTAL_RTO;	/* simulate < 6.7 */
+	h->raw.snd_cwnd = 2;				/* collapsed */
+	h->raw.total_retrans = (u_int64_t)(10 + i * 3);	/* active loss */
+}
+
+/* Slow link on a < 6.7 kernel: small cwnd but NOT losing packets.  The
+ * fallback's retransmit corroboration must keep this from firing. */
+static void
+tw_slow_link(struct sftp_hpn_tcp_health *h, int i)
+{
+	(void)i;
+	h->raw.avail_flags &= ~TCPI_AVAIL_TOTAL_RTO;
+	h->raw.snd_cwnd = 2;				/* small but stable */
+	/* total_retrans stays 0 -> no loss observed */
+}
+
+static void
+tw_lan(struct sftp_hpn_tcp_health *h, int i)
+{
+	h->raw.delivery_rate = 0;
+	h->raw.total_rto_time = (u_int32_t)(100 + i * 50);
+	h->raw.min_rtt = 1000;				/* 1 ms -> LAN, skip */
+}
+
+static void
+tw_peer_stall(struct sftp_hpn_tcp_health *h, int i)
+{
+	h->raw.rwnd_limited = (u_int64_t)(1000 + i * 1000); /* peer window pinning */
+	/* cwnd stays healthy (100) -> distinguishes from wedge */
+}
+
+static void
+tw_path_degraded(struct sftp_hpn_tcp_health *h, int i)
+{
+	h->raw.total_retrans = (u_int64_t)(10 + i * 5);	/* steady loss */
+	/* delivery stays healthy -> not stalled, not a wedge */
+}
+
+static void
+tw_download(struct sftp_hpn_tcp_health *h, int i)
+{
+	h->raw.notsent_bytes = 0;			/* not sending -> receiver */
+	h->raw.delivery_rate = 0;
+	h->raw.total_rto_time = (u_int32_t)(100 + i * 50);
+}
+
+static void
+test_classify(void)
+{
+	struct sftp_hpn_tcp_health_ctx ctx;
+	struct sftp_hpn_tcp_health h;
+	enum sftp_hpn_wedge_verdict v;
+	int i;
+
+	memset(&ctx, 0, sizeof(ctx));
+	if (drive(&ctx, 30, tw_healthy) != SFTP_HPN_WEDGE_NONE)
+		FAIL("healthy sample sequence produced a verdict");
+
+	memset(&ctx, 0, sizeof(ctx));
+	if (drive(&ctx, 20, tw_wedge) != SFTP_HPN_WEDGE_TCP_WEDGE)
+		FAIL("sustained wedge did not classify as WEDGE");
+
+	memset(&ctx, 0, sizeof(ctx));
+	if (drive(&ctx, 20, tw_idle) != SFTP_HPN_WEDGE_NONE)
+		FAIL("idle-but-healthy (zero throughput, no distress) fired");
+
+	memset(&ctx, 0, sizeof(ctx));
+	if (drive(&ctx, 20, tw_wedge_fallback) != SFTP_HPN_WEDGE_TCP_WEDGE)
+		FAIL("< 6.7 fallback wedge did not classify as WEDGE");
+
+	memset(&ctx, 0, sizeof(ctx));
+	if (drive(&ctx, 30, tw_slow_link) != SFTP_HPN_WEDGE_NONE)
+		FAIL("slow link (small cwnd, no loss) misclassified as wedge");
+
+	memset(&ctx, 0, sizeof(ctx));
+	if (drive(&ctx, 20, tw_lan) != SFTP_HPN_WEDGE_NONE)
+		FAIL("LAN path was not skipped");
+
+	memset(&ctx, 0, sizeof(ctx));
+	if (drive(&ctx, 20, tw_peer_stall) != SFTP_HPN_WEDGE_PEER_STALL)
+		FAIL("sustained rwnd-limit did not classify as PEER_STALL");
+
+	memset(&ctx, 0, sizeof(ctx));
+	if (drive(&ctx, 20, tw_path_degraded) != SFTP_HPN_WEDGE_PATH_DEGRADED)
+		FAIL("sustained loss did not classify as PATH_DEGRADED");
+
+	memset(&ctx, 0, sizeof(ctx));
+	if (drive(&ctx, 20, tw_download) != SFTP_HPN_WEDGE_NONE)
+		FAIL("download (notsent=0) produced a sender-side verdict");
+
+	/* BASIC tier never acts. */
+	memset(&ctx, 0, sizeof(ctx));
+	for (i = 0, v = SFTP_HPN_WEDGE_NONE;
+	    i < 20 && v == SFTP_HPN_WEDGE_NONE; i++) {
+		h = mk_ext_sample();
+		h.availability = TCP_HEALTH_BASIC;
+		tw_wedge(&h, i);
+		v = sftp_hpn_classify(&ctx, &h);
+	}
+	if (v != SFTP_HPN_WEDGE_NONE)
+		FAIL("BASIC tier produced a verdict");
+
+	/* A wedge that recovers before the sustain window must not fire. */
+	memset(&ctx, 0, sizeof(ctx));
+	for (i = 0; i < 5; i++) {
+		h = mk_ext_sample();
+		tw_wedge(&h, i);
+		if (sftp_hpn_classify(&ctx, &h) != SFTP_HPN_WEDGE_NONE)
+			FAIL("wedge fired before sustain window");
+	}
+	for (i = 0; i < 5; i++) {
+		h = mk_ext_sample();		/* healthy -> resets counter */
+		if (sftp_hpn_classify(&ctx, &h) != SFTP_HPN_WEDGE_NONE)
+			FAIL("recovery produced a verdict");
+	}
+	OK("classify");
+}
+
 int
 main(void)
 {
 	test_live_connection();
 	test_non_tcp_settles();
 	test_unsupported_contract();
+	test_classify();
 	printf("PASS tcp_health\n");
 	return 0;
 }
