@@ -330,6 +330,8 @@ clean:	regressclean
 	rm -f regress/unittests/sshkey/test_sshkey$(EXEEXT)
 	rm -f regress/unittests/sftp_workqueue/*.o
 	rm -f regress/unittests/sftp_workqueue/test_sftp_workqueue$(EXEEXT)
+	rm -f regress/unittests/tcp_health/*.o
+	rm -f regress/unittests/tcp_health/test_tcp_health$(EXEEXT)
 	rm -f regress/unittests/sshsig/*.o
 	rm -f regress/unittests/sshsig/test_sshsig$(EXEEXT)
 	rm -f regress/unittests/utf8/*.o
@@ -415,6 +417,8 @@ distclean:	regressclean
 	rm -f regress/unittests/sshbuf/test_sshbuf
 	rm -f regress/unittests/sftp_workqueue/*.o
 	rm -f regress/unittests/sftp_workqueue/test_sftp_workqueue
+	rm -f regress/unittests/tcp_health/*.o
+	rm -f regress/unittests/tcp_health/test_tcp_health
 	rm -f regress/unittests/sshkey/*.o
 	rm -f regress/unittests/sshkey/test_sshkey
 	rm -f regress/unittests/sshsig/*.o
@@ -597,6 +601,7 @@ regress-prep:
 	$(MKDIR_P) `pwd`/regress/unittests/match
 	$(MKDIR_P) `pwd`/regress/unittests/misc
 	$(MKDIR_P) `pwd`/regress/unittests/sftp_workqueue
+	$(MKDIR_P) `pwd`/regress/unittests/tcp_health
 	$(MKDIR_P) `pwd`/regress/unittests/sshbuf
 	$(MKDIR_P) `pwd`/regress/unittests/sshkey
 	$(MKDIR_P) `pwd`/regress/unittests/sshsig
@@ -787,6 +792,18 @@ regress/unittests/sftp_workqueue/test_sftp_workqueue$(EXEEXT): \
 	$(LD) -o $@ $(LDFLAGS) $(UNITTESTS_TEST_SFTP_WORKQUEUE_OBJS) \
 	    -lpthread $(TESTLIBS)
 
+# TCP_INFO health monitor (tcpi-portable + sftp-hpn-congestion). Own main(),
+# no test_helper. Links the two modules directly against a localhost socket.
+UNITTESTS_TEST_TCP_HEALTH_OBJS=\
+	regress/unittests/tcp_health/tests.o \
+	sftp-hpn-congestion.o \
+	tcpi-portable.o
+
+regress/unittests/tcp_health/test_tcp_health$(EXEEXT): \
+    ${UNITTESTS_TEST_TCP_HEALTH_OBJS}
+	$(LD) -o $@ $(LDFLAGS) $(UNITTESTS_TEST_TCP_HEALTH_OBJS) \
+	    $(TESTLIBS)
+
 # These all need to be compiled -fPIC, so they are treated differently.
 SK_DUMMY_OBJS=\
 	regress/misc/sk-dummy/sk-dummy.lo \
@@ -830,6 +847,7 @@ regress-unit-binaries: regress-prep $(REGRESSLIBS) \
 	regress/unittests/match/test_match$(EXEEXT) \
 	regress/unittests/misc/test_misc$(EXEEXT) \
 	regress/unittests/sftp_workqueue/test_sftp_workqueue$(EXEEXT) \
+	regress/unittests/tcp_health/test_tcp_health$(EXEEXT) \
 	regress/unittests/sshbuf/test_sshbuf$(EXEEXT) \
 	regress/unittests/sshkey/test_sshkey$(EXEEXT) \
 	regress/unittests/sshsig/test_sshsig$(EXEEXT) \

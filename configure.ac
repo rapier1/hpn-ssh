@@ -4729,6 +4729,21 @@ AC_CHECK_MEMBER([struct sockaddr_in.sin_len],
     ]])]
 )
 
+# HPN: presence of struct tcp_info gates the OpenBSD branch of the
+# TCP_INFO health monitor (tcpi-portable.c).  OpenBSD only grew the
+# struct in 7.7 (May 2025); pre-7.7 -- and any platform without it --
+# must fall back to the time-based watchdog.  Linux/FreeBSD/NetBSD enable
+# the monitor via platform macros and do not depend on this define, but
+# defining it there is harmless.  tcpi_snd_cwnd is a safe-region Tier-1
+# member present wherever the struct exists at all, so it is a clean
+# "does a usable tcp_info exist here" sentinel.
+AC_CHECK_MEMBERS([struct tcp_info.tcpi_snd_cwnd], [], [], [[
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+]])
+
 AC_CACHE_CHECK([for ss_family field in struct sockaddr_storage],
 		ac_cv_have_ss_family_in_struct_ss, [
 	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
