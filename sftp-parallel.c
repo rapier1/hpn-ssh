@@ -56,6 +56,7 @@
 #include "sftp-client-internal.h"	/* sftp_conn_watchdog_pause_until_ns */
 #include "sftp-workqueue.h"
 #include "sftp-parallel.h"
+#include "hpn-exit-codes.h"
 
 extern int showprogress;
 
@@ -917,6 +918,15 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 
 		close(p2c[0]); close(p2c[1]);
 		close(c2p[0]); close(c2p[1]);
+
+		/*
+		 * ENV-VAR HPN_PARALLEL_WORKER: marks this hpnssh child as a
+		 * parallel-streams worker so it arms the TCP-health monitor
+		 * (clientloop.c) and may self-terminate on a confirmed wedge.
+		 * Internal orchestrator->worker signal only; never required
+		 * for normal operation.
+		 */
+		(void)setenv("HPN_PARALLEL_WORKER", "1", 1);
 
 		/* Build argv for an independent (non-mux) SSH connection. */
 		char *argv[40];
@@ -3157,6 +3167,71 @@ reporter_emit_stats_csv(struct sftp_parallel *p)
 }
 
 /*
+ * Classify and log how a reaped worker died, using the wait status plus
+ * w->doomed (did WE kill it?).  Diagnostic only — it changes no control
+ * flow; the caller respawns regardless.  Death modes:
+ *
+ *   - doomed                  : the watchdog terminated it (reason already
+ *                               logged when it was doomed).
+ *   - HPN transport exit code : the worker self-diagnosed and self-exited
+ *                               (the "known cause" tier — see
+ *                               hpn-exit-codes.h).
+ *   - exit 255                : ssh transport error / dropped connection.
+ *   - other exit code         : remote subsystem status, propagated.
+ *   - SIGKILL (¬doomed)       : ambiguous — this reap path force-SIGKILLs,
+ *                               so it most likely reflects OUR kill of a
+ *                               child that had not yet exited, not a crash.
+ *   - other signal            : a genuine crash (we only ever send SIGKILL).
+ *
+ * Read on the reporter thread, which also owns the doom state — so
+ * w->doomed needs no lock here.
+ */
+static void
+classify_worker_death(const struct sftp_worker *w, int have_status, int status)
+{
+	if (w->doomed) {
+		debug_ft("worker %d: reaped after orchestrator termination",
+		    w->id);
+		return;
+	}
+	if (!have_status) {
+		debug_ft("worker %d: died (no wait status)", w->id);
+		return;
+	}
+	if (WIFEXITED(status)) {
+		int code = WEXITSTATUS(status);
+		if (HPN_EXIT_IS_TCP(code)) {
+			const char *what =
+			    code == HPN_EXIT_TCP_WEDGE ? "TCP wedge" :
+			    code == HPN_EXIT_TCP_PATH_DEGRADED ? "path degraded" :
+			    code == HPN_EXIT_TCP_PEER_STALL ? "peer stall" :
+			    "transport";
+			debug_ft("worker %d: self-terminated: %s (exit %d)",
+			    w->id, what, code);
+		} else if (code == 255) {
+			debug_ft("worker %d: ssh transport error / dropped "
+			    "connection (exit 255)", w->id);
+		} else if (code == 0) {
+			debug_ft("worker %d: exited cleanly (watchdog had not "
+			    "doomed it)", w->id);
+		} else {
+			debug_ft("worker %d: exited with status %d",
+			    w->id, code);
+		}
+	} else if (WIFSIGNALED(status)) {
+		int sig = WTERMSIG(status);
+		if (sig == SIGKILL)
+			debug_ft("worker %d: force-reaped (SIGKILL), no clean "
+			    "exit", w->id);
+		else
+			debug_ft("worker %d: killed by signal %d (likely "
+			    "crash)", w->id, sig);
+	} else {
+		debug_ft("worker %d: reaped (unrecognized wait status)", w->id);
+	}
+}
+
+/*
  * Reap workers that have marked themselves exited (connection died,
  * fault-injected exit, or fatal protocol violation).  Every exit is
  * involuntary — the orchestrator always respawns.
@@ -3206,11 +3281,15 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 		if (w->fd_in >= 0) close(w->fd_in);
 		if (w->fd_out >= 0) close(w->fd_out);
 		if (w->ssh_pid > 0) {
-			int s;
+			int s = 0;
+			int reaped;
 			/* Belt-and-suspenders: may already be dead from
-			 * SIGTERM above. */
+			 * SIGTERM above.  A child that self-exited is already a
+			 * zombie, so this SIGKILL is a no-op and waitpid still
+			 * returns its real exit code. */
 			(void)kill(w->ssh_pid, SIGKILL);
-			(void)waitpid(w->ssh_pid, &s, 0);
+			reaped = (waitpid(w->ssh_pid, &s, 0) == w->ssh_pid);
+			classify_worker_death(w, reaped, s);
 		}
 		pthread_mutex_destroy(&w->mu);
 		free(w);

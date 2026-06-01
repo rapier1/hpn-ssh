@@ -101,6 +101,7 @@
 #include "ssherr.h"
 #include "hostfile.h"
 #include "metrics.h"
+#include "sftp-hpn-congestion.h"
 
 /* Permitted RSA signature algorithms for UpdateHostkeys proofs */
 #define HOSTKEY_PROOF_RSA_ALGS	"rsa-sha2-512,rsa-sha2-256"
@@ -146,6 +147,14 @@ static int last_was_cr;		/* Last character was a newline. */
 static int exit_status;		/* Used to store the command exit status. */
 static int connection_in;	/* Connection to server (input). */
 static int connection_out;	/* Connection to server (output). */
+/*
+ * HPN parallel-streams worker TCP-health monitor.  Armed only when this
+ * ssh is a parallel-streams worker (the orchestrator sets the
+ * HPN_PARALLEL_WORKER environment variable); ordinary ssh sessions leave
+ * it untouched.  The periodic poll + wedge decision land in a later change.
+ */
+static struct sftp_hpn_tcp_health_ctx tcp_health;
+static int tcp_health_armed;	/* nonzero once tcp_health is initialised */
 static int need_rekeying;	/* Set to non-zero if rekeying is requested. */
 static int session_closed;	/* In SSH2: login session closed. */
 static time_t x11_refuse_time;	/* If >0, refuse x11 opens after this time. */
@@ -1514,6 +1523,19 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	exit_status = -1;
 	connection_in = ssh_packet_get_connection_in(ssh);
 	connection_out = ssh_packet_get_connection_out(ssh);
+
+	/*
+	 * Arm the parallel-worker TCP-health monitor.  ctx_init eagerly
+	 * probes TCP_INFO on the server socket, so this also exercises the
+	 * accessor on the real worker connection.  Gated on HPN_PARALLEL_WORKER
+	 * so only orchestrator-spawned workers run it.  No poll/decision yet.
+	 */
+	if (getenv("HPN_PARALLEL_WORKER") != NULL) {
+		sftp_hpn_tcp_health_ctx_init(&tcp_health, connection_in);
+		tcp_health_armed = 1;
+		debug_f("HPN: parallel-worker TCP health monitor armed on "
+		    "fd %d (avail=%d)", connection_in, (int)tcp_health.avail);
+	}
 
 	quit_pending = 0;
 
