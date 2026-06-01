@@ -825,6 +825,13 @@ parallel_flush(void)
 		}
 	}
 
+	if (pstats.total_respawns > 0 || pstats.wedge_terminations > 0 ||
+	    pstats.peer_stall_terminations > 0) {
+		logit("parallel transfer health: %d worker respawn(s) "
+		    "(%d wedge, %d peer-stall)",
+		    pstats.total_respawns, pstats.wedge_terminations,
+		    pstats.peer_stall_terminations);
+	}
 	if (pstats.protocol_violations > 0) {
 		logit("warning: %d worker protocol violation detected "
 		    "(recovered via worker respawn) - investigate if "

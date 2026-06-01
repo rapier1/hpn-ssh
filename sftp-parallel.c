@@ -277,6 +277,14 @@ static int hpn_max_retries(struct sftp_parallel *p);
 #define BORN_SLOW_MAX_KILLS       5
 
 /*
+ * After a worker has reconnected this many times, emit a one-time
+ * user-visible notice that the path may be unreliable.  The cause of each
+ * individual respawn is already reported as it happens; this is the
+ * cumulative "churn" signal.
+ */
+#define HPN_WORKER_CHURN_NOTICE   3
+
+/*
  * Range-split chunk multiplier.  Each large file is split into
  * RANGE_CHUNK_MULTIPLIER × num_workers chunks rather than 1 per worker.
  * Fast workers that finish early pick up additional chunks from the queue,
@@ -686,6 +694,9 @@ struct sftp_parallel {
 						       * not yet in workers[];
 						       * guards premature abort */
 	int                         total_respawns;  /* lifetime respawn count */
+	int                         wedge_terminations;	/* workers reaped with
+							 * HPN_EXIT_TCP_WEDGE */
+	int                         peer_stall_terminations; /* ditto, PEER_STALL */
 	uint64_t                    session_start_ns;  /* monotonic_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in
@@ -3093,6 +3104,10 @@ respawn_worker_thread(void *arg)
 			w->first_reconnect_ns = now;
 		w->last_reconnect_ns = now;
 		pthread_mutex_unlock(&w->mu);
+		if (w->reconnect_count == HPN_WORKER_CHURN_NOTICE)
+			logit("worker %d has reconnected %llu times; this "
+			    "path may be unreliable", w->id,
+			    (unsigned long long)w->reconnect_count);
 		debug_ft("worker %d respawned (reconnect_count=%llu)",
 		    w->id, (unsigned long long)w->reconnect_count);
 	}
@@ -3200,14 +3215,24 @@ classify_worker_death(const struct sftp_worker *w, int have_status, int status)
 	}
 	if (WIFEXITED(status)) {
 		int code = WEXITSTATUS(status);
-		if (HPN_EXIT_IS_TCP(code)) {
-			const char *what =
-			    code == HPN_EXIT_TCP_WEDGE ? "TCP wedge" :
-			    code == HPN_EXIT_TCP_PATH_DEGRADED ? "path degraded" :
-			    code == HPN_EXIT_TCP_PEER_STALL ? "peer stall" :
-			    "transport";
-			debug_ft("worker %d: self-terminated: %s (exit %d)",
-			    w->id, what, code);
+		struct sftp_parallel *p = w->parent;
+
+		if (code == HPN_EXIT_TCP_WEDGE) {
+			/* Default-visible: explains the slowdown to the user. */
+			if (p != NULL)
+				p->wedge_terminations++;
+			logit("worker %d: connection wedged, reconnecting "
+			    "(reconnect #%llu)", w->id,
+			    (unsigned long long)(w->reconnect_count + 1));
+		} else if (code == HPN_EXIT_TCP_PEER_STALL) {
+			if (p != NULL)
+				p->peer_stall_terminations++;
+			logit("worker %d: remote not draining (peer stall), "
+			    "reconnecting (reconnect #%llu)", w->id,
+			    (unsigned long long)(w->reconnect_count + 1));
+		} else if (HPN_EXIT_IS_TCP(code)) {
+			debug_ft("worker %d: self-terminated: transport "
+			    "(exit %d)", w->id, code);
 		} else if (code == 255) {
 			debug_ft("worker %d: ssh transport error / dropped "
 			    "connection (exit 255)", w->id);
@@ -4706,6 +4731,8 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	out->num_workers        = p->num_workers;
 	out->protocol_violations = p->protocol_violations;
 	out->total_respawns      = p->total_respawns;
+	out->wedge_terminations  = p->wedge_terminations;
+	out->peer_stall_terminations = p->peer_stall_terminations;
 	for (int i = 0; i < p->num_workers; i++) {
 		struct sftp_worker *w = p->workers[i];
 		pthread_mutex_lock(&w->mu);

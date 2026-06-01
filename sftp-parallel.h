@@ -411,6 +411,10 @@ struct sftp_parallel_stats {
 	 * ~25 % of -j, additional workers stop adding throughput because
 	 * they're flapping in and out of the outlier-detector reap path. */
 	int      total_respawns;
+	/* Per-cause worker self-termination counts (a subset of
+	 * total_respawns), surfaced in the end-of-transfer summary. */
+	int      wedge_terminations;
+	int      peer_stall_terminations;
 	/* Wall-clock duration of the parallel-streams session in
 	 * milliseconds.  start_ns is captured in sftp_parallel_start();
 	 * elapsed_ms is computed against the monotonic clock at
