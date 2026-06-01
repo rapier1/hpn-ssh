@@ -110,7 +110,7 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
 	kexsntrup761x25519.o kexmlkem768x25519.o sntrup761.o kexgen.o \
 	sftp-realpath.o platform-pledge.o platform-tracing.o platform-misc.o \
 	sshbuf-io.o misc-agent.o ssherr-libcrypto.o \
-	metrics.o binn.o happyeyeballs.o cipher-ctr-mt-provider.o \
+	metrics.o tcpi-portable.o binn.o happyeyeballs.o cipher-ctr-mt-provider.o \
 	cipher-ctr-mt-functions.o ossl3-provider-err.o num.o
 
 P11OBJS= ssh-pkcs11-client.o
@@ -176,6 +176,7 @@ SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-hpn-server.o sftp-hpn-bundle-se
 
 SFTP_OBJS=	sftp.o sftp-usergroup.o progressmeter.o $(SFTP_CLIENT_OBJS) \
 		sftp-workqueue.o sftp-parallel.o sftp-parallel-walk.o \
+		sftp-hpn-congestion.o \
 		sftp-parallel-config.o readconf.o $(P11OBJS) $(SKOBJS)
 
 MANPAGES	= hpnmoduli.5.out hpnscp.1.out hpnssh-add.1.out hpnssh-agent.1.out hpnssh-keygen.1.out hpnssh-keyscan.1.out hpnssh.1.out hpnsshd.8.out hpnsftp-server.8.out hpnsftp.1.out hpnssh-keysign.8.out hpnssh-pkcs11-helper.8.out hpnssh-sk-helper.8.out hpnsshd_config.5.out hpnssh_config.5.out
