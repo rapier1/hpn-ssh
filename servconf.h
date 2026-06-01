@@ -219,6 +219,10 @@ typedef struct {
         int     tcp_rcv_buf_poll;       /* poll tcp rcv window in autotuning kernels*/
         int     tcp_rcv_buf_rescue;     /* forcibly grow SO_RCVBUF when autotune stuck on lossy paths */
 	int	hpn_disabled;		/* disable hpn functionality. false by default */
+	int	hpn_workers_die;	/* let the server terminate a parallel
+					 * worker's connection on a confirmed TCP
+					 * wedge (honors the worker's opt-in).
+					 * yes by default */
 	int	hpn_memory_limit;	/* HPN memory limit: default, high, max */
 	/*
 	 * Bundle-path operator controls (2026-05-31).

@@ -139,6 +139,11 @@ Subsystem	sftp	/usr/libexec/hpnsftp-server
 # Also see MaxSessions and MaxStartups.
 #HPNMaxConcurrentWorkers 0
 
+# Let the server terminate a parallel-streams worker's connection if it
+# detects (via TCP_INFO) that the connection has wedged. Only affects
+# connections that identify themselves as parallel workers.
+#HPNWorkersDie yes
+
 # Example of overriding settings on a per-user basis
 #Match User anoncvs
 #	X11Forwarding no

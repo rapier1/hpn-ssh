@@ -78,6 +78,8 @@
 #include "ssherr.h"
 #include "metrics.h"
 #include "cipher-switch.h"
+#include "sftp-hpn-congestion.h"
+#include "hpn-exit-codes.h"
 
 extern ServerOptions options;
 
@@ -86,6 +88,20 @@ extern Authctxt *the_authctxt;
 extern struct sshauthopt *auth_opts;
 
 static int no_more_sessions = 0; /* Disallow further sessions. */
+
+/*
+ * HPN server-side worker TCP-health monitor.  Armed only when a parallel
+ * worker opts in (hpn-parallel-worker@hpnssh.org) AND the operator permits
+ * it (HPNWorkersDie).  Lets the server self-terminate the worker's
+ * connection on a confirmed wedge -- the download-direction counterpart of
+ * the client's monitor.  Polled off a ppoll deadline, traffic-independent.
+ */
+static struct sftp_hpn_tcp_health_ctx srv_tcp_health;
+static int srv_tcp_health_armed;
+static time_t srv_tcp_health_check_time;
+#define HPN_SRV_TCP_HEALTH_INTERVAL 1	/* seconds between health polls */
+static int server_arm_parallel_worker(struct ssh *);
+static void srv_tcp_health_tick(struct ssh *);
 
 static volatile sig_atomic_t child_terminated = 0; /* set on SIGCHLD */
 static volatile sig_atomic_t siginfo_received = 0;
@@ -207,6 +223,11 @@ wait_until_can_do_something(struct ssh *ssh,
 		client_alive_scheduled = 1;
 	}
 
+	/* HPN worker health monitor: wake ~1s so the poll fires even when the
+	 * connection has wedged and no traffic is moving. */
+	if (srv_tcp_health_armed)
+		ptimeout_deadline_monotime(&timeout, srv_tcp_health_check_time);
+
 #if 0
 	/* wrong: bad condition XXX */
 	if (channel_not_very_much_buffered_data())
@@ -251,6 +272,9 @@ wait_until_can_do_something(struct ssh *ssh,
 			last_client_time = now;
 		}
 	}
+
+	if (srv_tcp_health_armed && now >= srv_tcp_health_check_time)
+		srv_tcp_health_tick(ssh);
 
 	/* UnusedConnectionTimeout handling */
 	if (unused_connection_expiry != 0 &&
@@ -829,6 +853,72 @@ server_input_hostkeys_prove(struct ssh *ssh, struct sshbuf **respp)
 	return success;
 }
 
+/*
+ * A parallel-streams worker advertised itself (hpn-parallel-worker@hpnssh.org).
+ * If the operator permits it (HPNWorkersDie, default yes), arm the
+ * server-side TCP-health monitor on this connection.  Honoring the request
+ * only ever affects THIS connection.  Always returns success (we understood
+ * the request); the arming is what's conditional.
+ */
+static int
+server_arm_parallel_worker(struct ssh *ssh)
+{
+	int sock_in;
+
+	if (!options.hpn_workers_die) {
+		debug_f("HPN: parallel-worker opt-in ignored (HPNWorkersDie no)");
+		return 1;
+	}
+	sock_in = ssh_packet_get_connection_in(ssh);
+	sftp_hpn_tcp_health_ctx_init(&srv_tcp_health, sock_in);
+	srv_tcp_health_armed = (srv_tcp_health.avail != TCP_HEALTH_UNSUPPORTED);
+	srv_tcp_health_check_time = monotime() + HPN_SRV_TCP_HEALTH_INTERVAL;
+	debug_f("HPN: server TCP health monitor %s on fd %d (avail=%d)",
+	    srv_tcp_health_armed ? "armed" : "unavailable",
+	    sock_in, (int)srv_tcp_health.avail);
+	return 1;
+}
+
+/*
+ * Poll the server-side monitor and act on a wedge.  On the download path the
+ * server is the sender, so the same classifier fires here; on uploads the
+ * server is the receiver (notsent ~ 0) and stays silent.  WEDGE / PEER_STALL
+ * terminate the connection (the client's orchestrator then respawns the
+ * worker); PATH_DEGRADED logs only.  Driven by a ppoll deadline, not traffic.
+ */
+static void
+srv_tcp_health_tick(struct ssh *ssh)
+{
+	struct sftp_hpn_tcp_health h;
+
+	if (!srv_tcp_health_armed)
+		return;
+	if (sftp_hpn_tcp_health_poll(&srv_tcp_health, &h) != 0) {
+		srv_tcp_health_armed = 0;
+		debug_f("HPN: server TCP health monitor disabled (unsupported)");
+		return;
+	}
+	switch (sftp_hpn_classify(&srv_tcp_health, &h)) {
+	case SFTP_HPN_WEDGE_TCP_WEDGE:
+		/* ssh_packet_disconnect logs, notifies the peer, and exits. */
+		ssh_packet_disconnect(ssh, "HPN: TCP connection wedged "
+		    "(cwnd=%u rtt=%uus), terminating parallel worker",
+		    h.raw.snd_cwnd, h.raw.rtt);
+		break;
+	case SFTP_HPN_WEDGE_PEER_STALL:
+		ssh_packet_disconnect(ssh, "HPN: peer receive window pinned, "
+		    "terminating parallel worker");
+		break;
+	case SFTP_HPN_WEDGE_PATH_DEGRADED:
+		logit("HPN: parallel worker path degraded, sustained "
+		    "retransmits (cwnd=%u rtt=%uus)", h.raw.snd_cwnd, h.raw.rtt);
+		break;
+	case SFTP_HPN_WEDGE_NONE:
+		break;
+	}
+	srv_tcp_health_check_time = monotime() + HPN_SRV_TCP_HEALTH_INTERVAL;
+}
+
 static int
 server_input_global_request(int type, uint32_t seq, struct ssh *ssh)
 {
@@ -921,6 +1011,8 @@ server_input_global_request(int type, uint32_t seq, struct ssh *ssh)
 		/* resp is the response (sshbuf struct) from the function which is
 		 * handled below in the want_reply stanza */
 		success = server_input_metrics_request(ssh, &resp);
+	} else if (strcmp(rtype, "hpn-parallel-worker@hpnssh.org") == 0) {
+		success = server_arm_parallel_worker(ssh);
 	}
 	/* XXX sshpkt_get_end() */
 	if (want_reply) {

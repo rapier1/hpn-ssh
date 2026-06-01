@@ -198,6 +198,7 @@ static struct global_confirms global_confirms =
     TAILQ_HEAD_INITIALIZER(global_confirms);
 
 void client_request_metrics(struct ssh *);
+static void client_request_parallel_worker(struct ssh *);
 
 static void quit_message(const char *fmt, ...)
     __attribute__((__format__ (printf, 1, 2)));
@@ -1601,6 +1602,8 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 		    tcp_health_armed ? "armed" : "unavailable",
 		    connection_in, (int)tcp_health.avail);
 		schedule_tcp_health_check();
+		/* tell the server too, so it can monitor the download path */
+		client_request_parallel_worker(ssh);
 	}
 
 	quit_pending = 0;
@@ -2929,6 +2932,29 @@ out:
  * I can probably do this by using clint_input_global_request but
  * I need to understand that better.
  */
+/*
+ * Tell the server this connection is a parallel-streams worker, so it may
+ * arm its own TCP-health monitor and self-terminate on a wedge (gated
+ * server-side by HPNWorkerSelfTerminate).  An opt-in flag only -- it
+ * carries no data, and we don't need a reply: the server arms locally and
+ * the client doesn't care whether it did.  Same global-request mechanism
+ * as stack-metrics@hpnssh.org, different purpose.
+ */
+static void
+client_request_parallel_worker(struct ssh *ssh)
+{
+	int r;
+
+	debug_f("HPN: advertising parallel-worker status to server");
+	if ((r = sshpkt_start(ssh, SSH2_MSG_GLOBAL_REQUEST)) != 0 ||
+	    (r = sshpkt_put_cstring(ssh,
+	    "hpn-parallel-worker@hpnssh.org")) != 0 ||
+	    (r = sshpkt_put_u8(ssh, 0)) != 0)	/* want_reply = no */
+		fatal_fr(r, "prepare hpn-parallel-worker request");
+	if ((r = sshpkt_send(ssh)) != 0)
+		fatal_fr(r, "send hpn-parallel-worker request");
+}
+
 void client_request_metrics(struct ssh *ssh) {
 	int r;
 

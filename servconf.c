@@ -204,6 +204,7 @@ initialize_server_options(ServerOptions *options)
 	options->tcp_rcv_buf_poll = -1;
 	options->tcp_rcv_buf_rescue = -1;
 	options->hpn_disabled = -1;
+	options->hpn_workers_die = -1;
 	options->hpn_memory_limit = -1;
 	options->hpn_use_bundle = -1;
 	options->hpn_bundle_size = -1;
@@ -496,6 +497,8 @@ fill_default_server_options(ServerOptions *options)
 		options->disable_multithreaded = 0;
 	if (options->hpn_disabled == -1)
 		options->hpn_disabled = 0;
+	if (options->hpn_workers_die == -1)
+		options->hpn_workers_die = 1;
 	if (options->hpn_memory_limit == -1)
 		options->hpn_memory_limit = 0;
 	if (options->hpn_use_bundle == -1)
@@ -594,7 +597,7 @@ typedef enum {
 	sKbdInteractiveAuthentication, sListenAddress, sAddressFamily,
 	sPrintMotd, sPrintLastLog, sIgnoreRhosts,
 	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sTcpRcvBufRescue,
-	sHPNDisabled, sHPNMemoryLimit,
+	sHPNDisabled, sHPNWorkersDie, sHPNMemoryLimit,
 	sHPNUseBundle, sHPNBundleSize,
 	sHPNMaxBundleSize, sHPNMaxConcurrentWorkers,
 	sDisableMTAES, sUseMPTCP,
@@ -773,6 +776,7 @@ static struct {
 	{ "trustedusercakeys", sTrustedUserCAKeys, SSHCFG_ALL },
 	{ "authorizedprincipalsfile", sAuthorizedPrincipalsFile, SSHCFG_ALL },
 	{ "hpndisabled", sHPNDisabled, SSHCFG_ALL },
+	{ "hpnworkersdie", sHPNWorkersDie, SSHCFG_ALL },
 	{ "hpnmemorylimit", sHPNMemoryLimit, SSHCFG_ALL },
 	{ "hpnusebundle", sHPNUseBundle, SSHCFG_ALL },
 	{ "hpnbundlesize", sHPNBundleSize, SSHCFG_ALL },
@@ -1635,6 +1639,10 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 
 	case sHPNDisabled:
 		intptr = &options->hpn_disabled;
+		goto parse_flag;
+
+	case sHPNWorkersDie:
+		intptr = &options->hpn_workers_die;
 		goto parse_flag;
 
 	case sHPNMemoryLimit:
@@ -3476,6 +3484,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sFingerprintHash, o->fingerprint_hash);
 	dump_cfg_fmtint(sExposeAuthInfo, o->expose_userauth_info);
 	dump_cfg_fmtint(sHPNDisabled, o->hpn_disabled);
+	dump_cfg_fmtint(sHPNWorkersDie, o->hpn_workers_die);
 	dump_cfg_fmtint(sHPNMemoryLimit, o->hpn_memory_limit);
 	dump_cfg_fmtint(sHPNUseBundle, o->hpn_use_bundle);
 	printf("hpnbundlesize %lld\n", (long long)o->hpn_bundle_size);

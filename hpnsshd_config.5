@@ -908,8 +908,22 @@ The list of available signature algorithms may also be obtained using
 .It Cm HPNDisabled
 In some situations, such as transfers on a local area network, the impact
 of the HPN code produces a net decrease in performance. In these cases it is
-helpful to disable the HPN functionality. By default HPNDisabled is set to 
+helpful to disable the HPN functionality. By default HPNDisabled is set to
 .Cm no.
+.It Cm HPNWorkersDie
+Controls whether the server may terminate a parallel-streams transfer
+worker's connection when it detects, from
+.Xr getsockopt 2
+.Dv TCP_INFO ,
+that the connection has wedged \(en the congestion window has collapsed
+without recovering, or the peer has stopped accepting data.
+Terminating the wedged connection lets the client's transfer orchestrator
+respawn the worker on a fresh connection rather than wait out the much
+longer application-level stall timeout.
+This only affects connections that identify themselves as parallel
+streams workers; ordinary sessions are never terminated by this mechanism.
+By default HPNWorkersDie is set to
+.Cm yes.
 .It Cm IgnoreRhosts
 Specifies whether to ignore per-user
 .Pa .rhosts
