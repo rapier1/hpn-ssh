@@ -335,10 +335,23 @@ struct sftp_hpn_bundle_upload_entry {
  * Returns -1 immediately if conn does not advertise hpn-bundle support.
  * Caller must detect this and fall back to per-file mode.
  */
+/* INSTR-BUNDLE-TIMING: per-bundle phase split in microseconds.  Temporary
+ * profiling hook; back out by removing everything tagged INSTR-BUNDLE-TIMING. */
+struct sftp_hpn_bundle_phase_us {
+	uint64_t open_us;	/* hpn-bundle-open round-trip */
+	uint64_t queue_us;	/* client stat()/queue of all entries */
+	uint64_t packsend_us;	/* read local files + send WRITEs (= read_us+send_us) */
+	uint64_t read_us;	/* pack_next only: local file read + tar pack */
+	uint64_t send_us;	/* bundle_ul_send_write only: compose + socket write */
+	uint64_t drain_us;	/* wait for all WRITE acks ~= server extraction */
+	uint64_t close_us;	/* CLOSE round-trip */
+};
+
 int sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n,
-    int preserve_flag, int fsync_flag);
+    int preserve_flag, int fsync_flag,
+    struct sftp_hpn_bundle_phase_us *timing /* INSTR-BUNDLE-TIMING; NULL ok */);
 
 /* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
 int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);

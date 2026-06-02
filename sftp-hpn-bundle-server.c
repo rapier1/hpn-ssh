@@ -126,6 +126,14 @@ struct hpn_bundle_state {
 	uint64_t bytes_produced;    /* cumulative pack_next bytes returned */
 	uint64_t next_read_off;     /* expected SSH_FXP_READ offset */
 	uint64_t fetch_total_size;  /* sum of declared file sizes (cap check) */
+
+	/* INSTR-BUNDLE-TIMING: server-side per-bundle extraction profiling.
+	 * Temporary; back out by removing everything tagged INSTR-BUNDLE-TIMING. */
+	double   ist_open_s;        /* INSTR-BUNDLE-TIMING: monotonic time at open */
+	double   ist_write_s;       /* INSTR-BUNDLE-TIMING: cumulative write() time */
+	double   ist_fsync_s;       /* INSTR-BUNDLE-TIMING: cumulative fsync() time */
+	double   ist_fsync_max_s;   /* INSTR-BUNDLE-TIMING: worst single fsync() */
+	uint32_t ist_files;         /* INSTR-BUNDLE-TIMING: files extracted */
 };
 
 /* Flag constants and HPN_BUNDLE_BLOCK_BYTES live in sftp-hpn-bundle.h, the
@@ -553,6 +561,7 @@ bundle_upload_data_cb(void *ctx, const u_char *data, size_t len)
 
 	if (s->cur_fd < 0)
 		return -1;	/* shouldn't happen - parser always pairs */
+	double _w0 = monotime_double();	/* INSTR-BUNDLE-TIMING */
 	while (remaining > 0) {
 		ssize_t n = write(s->cur_fd, data, remaining);
 		if (n < 0) {
@@ -565,6 +574,7 @@ bundle_upload_data_cb(void *ctx, const u_char *data, size_t len)
 		data      += n;
 		remaining -= (size_t)n;
 	}
+	s->ist_write_s += monotime_double() - _w0;	/* INSTR-BUNDLE-TIMING */
 	s->bytes_received += (uint64_t)len;
 	return 0;
 }
@@ -578,16 +588,25 @@ bundle_upload_entry_end_cb(void *ctx)
 	int rc       = 0;
 
 	if (s->cur_fd >= 0) {
+		s->ist_files++;	/* INSTR-BUNDLE-TIMING: count extracted file */
 		if (preserve) {
 			struct timespec ts[2];
 			ts[0].tv_sec = s->cur_mtime; ts[0].tv_nsec = 0;
 			ts[1].tv_sec = s->cur_mtime; ts[1].tv_nsec = 0;
 			(void)futimens(s->cur_fd, ts);
 		}
-		if (do_fsync && fsync(s->cur_fd) != 0) {
-			error_f("hpn-bundle: fsync \"%s\": %s",
-			    s->cur_full_path, strerror(errno));
-			rc = -1;
+		if (do_fsync) {
+			double _f0 = monotime_double();	/* INSTR-BUNDLE-TIMING */
+			int _fr = fsync(s->cur_fd);
+			double _fd = monotime_double() - _f0;	/* INSTR-BUNDLE-TIMING */
+			s->ist_fsync_s += _fd;	/* INSTR-BUNDLE-TIMING */
+			if (_fd > s->ist_fsync_max_s)	/* INSTR-BUNDLE-TIMING */
+				s->ist_fsync_max_s = _fd;	/* INSTR-BUNDLE-TIMING */
+			if (_fr != 0) {
+				error_f("hpn-bundle: fsync \"%s\": %s",
+				    s->cur_full_path, strerror(errno));
+				rc = -1;
+			}
 		}
 		if (close(s->cur_fd) != 0) {
 			error_f("hpn-bundle: close \"%s\": %s",
@@ -736,6 +755,39 @@ bundle_path_is_safe(const char *p, const char *dest_dir)
 	return 1;
 }
 
+/* INSTR-BUNDLE-TIMING: append one per-bundle server-extraction record to
+ * $HPN_BUNDLE_TIMING_DIR/<pid>.log.  Env unset/empty => no-op.  One file per
+ * sftp-server PID (sshd forks one per channel) avoids interleaved writes; the
+ * client-side observe script globs them back and removes them.  Back the probe
+ * out by deleting this function, its call below, and the struct fields. */
+static void
+ist_bundle_emit(int handle, struct hpn_bundle_state *s)
+{
+	static FILE *fp = (FILE *)-1;	/* (FILE*)-1 = not yet tried to open */
+	struct timeval tv;
+	double wall;
+
+	if (fp == (FILE *)-1) {
+		const char *dir = getenv("HPN_BUNDLE_TIMING_DIR");
+		char path[1024];
+		if (dir == NULL || *dir == '\0') { fp = NULL; return; }
+		(void)mkdir_p(dir, 0755);
+		snprintf(path, sizeof(path), "%s/%ld.log", dir, (long)getpid());
+		fp = fopen(path, "a");
+	}
+	if (fp == NULL)
+		return;
+	gettimeofday(&tv, NULL);
+	wall = monotime_double() - s->ist_open_s;
+	fprintf(fp, "HPNSRV ts=%.3f pid=%ld handle=%d files=%u bytes=%llu "
+	    "wall_ms=%.1f write_ms=%.1f fsync_ms=%.1f fsync_max_ms=%.1f\n",
+	    (double)tv.tv_sec + (double)tv.tv_usec / 1e6, (long)getpid(),
+	    handle, s->ist_files, (unsigned long long)s->bytes_received,
+	    wall * 1e3, s->ist_write_s * 1e3, s->ist_fsync_s * 1e3,
+	    s->ist_fsync_max_s * 1e3);
+	fflush(fp);
+}
+
 int
 sftp_hpn_server_bundle_close(int handle)
 {
@@ -775,6 +827,8 @@ sftp_hpn_server_bundle_close(int handle)
 		error_f("hpn-bundle close: parser error: %s", perr);
 		status = SSH2_FX_FAILURE;
 	}
+
+	ist_bundle_emit(handle, s);	/* INSTR-BUNDLE-TIMING */
 
 	bundle_state_free(s);
 	handle_free_bundle(handle);
@@ -834,6 +888,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		status = SSH2_FX_FAILURE;
 		goto fail;
 	}
+	s->ist_open_s = monotime_double();	/* INSTR-BUNDLE-TIMING */
 
 	handle = handle_new_bundle(s);
 	if (handle < 0) {

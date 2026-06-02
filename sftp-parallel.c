@@ -100,6 +100,17 @@ static int hpn_max_retries(struct sftp_parallel *p);
 #define UPLOAD_BATCH_SIZE       64
 
 /*
+ * Bundle mode caps a batch by BYTES (bundle_target_bytes, default 8 MiB),
+ * not by file count.  UPLOAD_BATCH_SIZE's 64-file cap is a per-file-path
+ * constraint (SSH channel-window pressure from N concurrent file handles)
+ * that does NOT apply to a bundle: a bundle is one tar stream over one
+ * handle with its own BUNDLE_MAX_INFLIGHT write window.  This is just a high
+ * safety ceiling so a pathological stream of tiny files cannot grow a single
+ * batch without bound; the 8 MiB byte cap binds first for any file >= ~1 KiB.
+ */
+#define BUNDLE_BATCH_MAX_FILES  8192
+
+/*
  * Soft byte cap on the size of a single upload batch.  Once a worker's
  * batch crosses this many bytes it stops grabbing additional units, even
  * if UPLOAD_BATCH_SIZE units have not been collected.  This is a SOFT cap
@@ -1766,6 +1777,7 @@ worker_run_bundle(struct sftp_worker *w,
 	uint64_t total_bytes = 0;
 	int i, ok_count = 0;
 	uint64_t t_start_ns, t_end_ns, elapsed_us;
+	struct sftp_hpn_bundle_phase_us _bt;	/* INSTR-BUNDLE-TIMING */
 
 	entries = xcalloc(bn, sizeof(*entries));
 	for (i = 0; i < bn; i++) {
@@ -1789,7 +1801,7 @@ worker_run_bundle(struct sftp_worker *w,
 	 * Slight wire-size cost (full path repeated in every tar header)
 	 * but trivial compared to the small-file payloads. */
 	int bundle_rc = sftp_hpn_bundle_upload(w->conn, "", entries, bn,
-	    p->cfg.preserve_flag, p->cfg.fsync_flag);
+	    p->cfg.preserve_flag, p->cfg.fsync_flag, &_bt);	/* INSTR-BUNDLE-TIMING (&_bt) */
 
 	t_end_ns = monotonic_ns();
 	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
@@ -1803,10 +1815,20 @@ worker_run_bundle(struct sftp_worker *w,
 			    (1024.0 * 1024.0)) /
 			    ((double)elapsed_us / 1e6);
 		logit("BUNDLE worker=%d files=%d ok=%d bytes=%llu "
-		    "elapsed_us=%llu MiBps=%.2f",
+		    "elapsed_us=%llu MiBps=%.2f "
+		    "open_us=%llu queue_us=%llu packsend_us=%llu "	/* INSTR-BUNDLE-TIMING */
+		    "read_us=%llu send_us=%llu "			/* INSTR-BUNDLE-TIMING */
+		    "drain_us=%llu close_us=%llu",			/* INSTR-BUNDLE-TIMING */
 		    w->id, bn, ok_count,
 		    (unsigned long long)total_bytes,
-		    (unsigned long long)elapsed_us, mibps);
+		    (unsigned long long)elapsed_us, mibps,
+		    (unsigned long long)_bt.open_us,			/* INSTR-BUNDLE-TIMING */
+		    (unsigned long long)_bt.queue_us,			/* INSTR-BUNDLE-TIMING */
+		    (unsigned long long)_bt.packsend_us,		/* INSTR-BUNDLE-TIMING */
+		    (unsigned long long)_bt.read_us,			/* INSTR-BUNDLE-TIMING */
+		    (unsigned long long)_bt.send_us,			/* INSTR-BUNDLE-TIMING */
+		    (unsigned long long)_bt.drain_us,			/* INSTR-BUNDLE-TIMING */
+		    (unsigned long long)_bt.close_us);			/* INSTR-BUNDLE-TIMING */
 	}
 
 	/* Bundle wire failed (server refused open, transport error): the
@@ -2163,7 +2185,13 @@ worker_thread(void *arg)
 
 		if ((u0->op == SFTP_OP_UPLOAD && !u0->bundle_ineligible) ||
 		    batch_eligible_download) {
-			struct sftp_work_unit *batch[UPLOAD_BATCH_SIZE];
+			/* Bundle mode is byte-capped (bundle_target_bytes), so allow
+			 * many more than UPLOAD_BATCH_SIZE files per batch; heap-
+			 * allocate since the bundle ceiling is large. */
+			int batch_cap = w->bundle_enabled
+			    ? BUNDLE_BATCH_MAX_FILES : UPLOAD_BATCH_SIZE;
+			struct sftp_work_unit **batch =
+			    xcalloc((size_t)batch_cap, sizeof(*batch));
 			struct sftp_work_unit *leftover = NULL;
 			int bn = 0;
 			/* Soft byte cap: keep adding while batch_bytes is at or
@@ -2197,7 +2225,7 @@ worker_thread(void *arg)
 			 * keeps the soft `<=` cap so a single
 			 * larger-than-target unit isn't orphaned by a
 			 * stricter gate. */
-			while (bn < UPLOAD_BATCH_SIZE && !p->abort_flag &&
+			while (bn < batch_cap && !p->abort_flag &&
 			    (w->bundle_enabled
 			        ? batch_bytes <  batch_byte_cap
 			        : batch_bytes <= batch_byte_cap)) {
@@ -2284,6 +2312,7 @@ worker_thread(void *arg)
 			/* Process the leftover non-batch unit (if any). */
 			if (leftover != NULL)
 				worker_execute_single(w, leftover);
+			free(batch);	/* heap batch; bundle mode can exceed UPLOAD_BATCH_SIZE */
 		} else {
 			/* Download (no bundle) or any range op - all bypass
 			 * the upload-batch path. */

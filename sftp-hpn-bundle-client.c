@@ -968,8 +968,10 @@ int
 sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n,
-    int preserve_flag, int fsync_flag)
+    int preserve_flag, int fsync_flag,
+    struct sftp_hpn_bundle_phase_us *timing)	/* INSTR-BUNDLE-TIMING */
 {
+	double _ti_prev = 0.0, _ti_now;	/* INSTR-BUNDLE-TIMING */
 	struct sshbuf *msg = NULL;
 	u_char *handle = NULL;
 	size_t handle_len = 0;
@@ -980,6 +982,9 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	u_char  outbuf[HPN_BUNDLE_BLOCK_BYTES];  /* per-WRITE payload buf */
 	int i, r;
 	int rc = -1;
+
+	if (timing != NULL)	/* INSTR-BUNDLE-TIMING */
+		memset(timing, 0, sizeof(*timing));
 
 	for (i = 0; i < n; i++)
 		entries[i].result = -1;   /* pessimistic; flip to 0 on success */
@@ -1002,6 +1007,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 
 	debug_f("hpn-bundle upload: n=%d dest=\"%s\" preserve=%d fsync=%d",
 	    n, remote_dest_dir, preserve_flag, fsync_flag);
+	_ti_prev = monotime_double();	/* INSTR-BUNDLE-TIMING: t0, before open */
 
 	/* ── Send hpn-bundle-open@hpnssh.org and collect HANDLE ─────────── */
 	if ((msg = sshbuf_new()) == NULL)
@@ -1023,6 +1029,12 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	if (handle == NULL) {
 		debug_f("hpn-bundle: server refused open");
 		goto cleanup;
+	}
+
+	if (timing != NULL) {	/* INSTR-BUNDLE-TIMING: open round-trip done */
+		_ti_now = monotime_double();
+		timing->open_us = (uint64_t)((_ti_now - _ti_prev) * 1e6);
+		_ti_prev = _ti_now;
 	}
 
 	/* ── Build the tar writer ────────────────────────────────────────── */
@@ -1075,11 +1087,23 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 					 * if a later pack/drain fails */
 	}
 	sftp_hpn_tar_writer_finish(writer);
+	if (timing != NULL) {	/* INSTR-BUNDLE-TIMING: client stat/queue done */
+		_ti_now = monotime_double();
+		timing->queue_us = (uint64_t)((_ti_now - _ti_prev) * 1e6);
+		_ti_prev = _ti_now;
+	}
 
 	/* ── Pack/send loop ─────────────────────────────────────────────── */
 	for (;;) {
-		ssize_t produced = sftp_hpn_tar_writer_pack_next(writer,
+		double _tr0 = 0, _tr1 = 0;	/* INSTR-BUNDLE-TIMING: per-block read/send split */
+		ssize_t produced;
+		if (timing != NULL) _tr0 = monotime_double();	/* INSTR-BUNDLE-TIMING */
+		produced = sftp_hpn_tar_writer_pack_next(writer,
 		    outbuf, sizeof(outbuf));
+		if (timing != NULL) {	/* INSTR-BUNDLE-TIMING: pack_next = local read+tar */
+			_tr1 = monotime_double();
+			timing->read_us += (uint64_t)((_tr1 - _tr0) * 1e6);
+		}
 		if (produced < 0) {
 			error_f("hpn-bundle: pack: %s",
 			    sftp_hpn_tar_writer_error(writer));
@@ -1089,6 +1113,13 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 			break;	/* EOA reached - all bytes sent */
 		if (bundle_ul_send_write(&ctx, outbuf, (size_t)produced) != 0)
 			goto cleanup;
+		if (timing != NULL)	/* INSTR-BUNDLE-TIMING: send = compose+socket write */
+			timing->send_us += (uint64_t)((monotime_double() - _tr1) * 1e6);
+	}
+	if (timing != NULL) {	/* INSTR-BUNDLE-TIMING: read local + send WRITEs done */
+		_ti_now = monotime_double();
+		timing->packsend_us = (uint64_t)((_ti_now - _ti_prev) * 1e6);
+		_ti_prev = _ti_now;
 	}
 
 	/* Drain the deferred WRITE STATUSes before SSH_FXP_CLOSE. */
@@ -1099,6 +1130,11 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	if (ctx.any_fail) {
 		debug_f("hpn-bundle: WRITE phase reported failure");
 		goto cleanup;
+	}
+	if (timing != NULL) {	/* INSTR-BUNDLE-TIMING: drain ~= server extraction */
+		_ti_now = monotime_double();
+		timing->drain_us = (uint64_t)((_ti_now - _ti_prev) * 1e6);
+		_ti_prev = _ti_now;
 	}
 
 	/* ── Close the bundle handle, collect overall STATUS ────────────── */
@@ -1133,6 +1169,11 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 			    status, reply_rid, close_id);
 			goto cleanup;
 		}
+	}
+	if (timing != NULL) {	/* INSTR-BUNDLE-TIMING: close round-trip done */
+		_ti_now = monotime_double();
+		timing->close_us = (uint64_t)((_ti_now - _ti_prev) * 1e6);
+		_ti_prev = _ti_now;
 	}
 
 	rc = 0;   /* success - entries[].result already set to 0 above */
