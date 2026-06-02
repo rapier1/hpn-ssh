@@ -57,3 +57,8 @@ hpnsshd-auth
 !regress/unittests/**/Makefile
 tags
 *.0
+
+# compiled unittest drivers (build artifacts); keep sources + Makefiles tracked
+regress/unittests/*/test_*
+!regress/unittests/*/*.c
+!regress/unittests/*/*.h
