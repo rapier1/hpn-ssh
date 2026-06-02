@@ -882,13 +882,21 @@ server_arm_parallel_worker(struct ssh *ssh)
 /*
  * Terminate a wedged parallel worker, delivering the cause to the client as
  * an exit-status channel request so the client's orchestrator reaps the
- * precise HPN_EXIT_TCP_* code.  The request is queued in the connection's
- * packet output -- which channel_force_close does NOT discard (it only
- * resets the channel data buffer) -- and the main loop flushes it
- * best-effort as the connection tears down.  A hard wedge may stop it
- * reaching the peer, in which case the worker still dies and is respawned,
- * just labeled generically.  With no open channel to ride, fall back to a
- * plain disconnect.
+ * precise HPN_EXIT_TCP_* code.
+ *
+ * We close via chan_write_failed(), NOT channel_force_close(): testing showed
+ * channel_force_close (which abandons the channel immediately) drops the
+ * just-queued exit-status packet before the main loop flushes it, so the
+ * client never saw the code.  chan_write_failed is the same graceful path
+ * session.c uses to send its exit-status on a normal subsystem exit -- it
+ * closes the output direction but lets the loop drain the connection's packet
+ * output first, so our exit-status actually reaches the peer.  The subsystem
+ * then EOFs and the normal session teardown sends its own exit-status (the
+ * subsystem's code, usually 0) afterward; the client's sticky-HPN-code logic
+ * (clientloop) keeps our wedge code rather than letting that trailing 0
+ * override it.  Still best-effort: on a wedge that also blocks the forward
+ * path the packet can't get out, and the worker dies + respawns unlabeled.
+ * With no open channel to ride, fall back to a plain disconnect.
  */
 static void
 srv_terminate_worker(struct ssh *ssh, int code, const char *reason)
@@ -897,7 +905,7 @@ srv_terminate_worker(struct ssh *ssh, int code, const char *reason)
 	int chanid, r;
 
 	srv_tcp_health_armed = 0;	/* the connection is going away */
-	logit("HPN: %s; terminating parallel worker", reason);
+	logit("HPN: %s; closing connection, client will reconnect", reason);
 
 	chanid = channel_find_open(ssh);
 	if (chanid == -1 || (c = channel_lookup(ssh, chanid)) == NULL) {
@@ -905,10 +913,20 @@ srv_terminate_worker(struct ssh *ssh, int code, const char *reason)
 		return;	/* not reached; ssh_packet_disconnect exits */
 	}
 	channel_request_start(ssh, chanid, "exit-status", 0);
-	if ((r = sshpkt_put_u32(ssh, (u_int)code)) != 0 ||
-	    (r = sshpkt_send(ssh)) != 0)
+	r = sshpkt_put_u32(ssh, (u_int)code);
+	if (r == 0)
+		r = sshpkt_send(ssh);
+	/* HPN diagnostic (debug2): the value we put on the wire + the send
+	 * result.  Correlate with the per-poll notsent above (backlog ahead of
+	 * this packet) and the client-side recv log. */
+	debug2_f("HPN: sent exit-status code=%d on chan %d (r=%d)",
+	    code, chanid, r);
+	if (r != 0)
 		debug_fr(r, "exit-status");
-	channel_force_close(ssh, c, 1);
+	/* graceful close (same as session.c): drains the queued exit-status,
+	 * unlike channel_force_close which would drop it. */
+	if (c->ostate != CHAN_OUTPUT_CLOSED)
+		chan_write_failed(ssh, c);
 }
 
 /*
@@ -922,7 +940,7 @@ static void
 srv_tcp_health_tick(struct ssh *ssh)
 {
 	struct sftp_hpn_tcp_health h;
-	char reason[160];
+	char reason[256];
 
 	if (!srv_tcp_health_armed)
 		return;
@@ -931,21 +949,35 @@ srv_tcp_health_tick(struct ssh *ssh)
 		debug_f("HPN: server TCP health monitor disabled (unsupported)");
 		return;
 	}
+	debug2_f("HPN: srv tcp health avail=%d cwnd=%u rtt=%uus "
+	    "rcv_space=%u retrans=%llu notsent=%u drate=%llu rto_time=%u",
+	    (int)h.availability, h.raw.snd_cwnd, h.raw.rtt, h.raw.rcv_space,
+	    (unsigned long long)h.raw.total_retrans, h.raw.notsent_bytes,
+	    (unsigned long long)h.raw.delivery_rate, h.raw.total_rto_time);
 	switch (sftp_hpn_classify(&srv_tcp_health, &h)) {
 	case SFTP_HPN_WEDGE_TCP_WEDGE:
 		snprintf(reason, sizeof(reason),
-		    "TCP connection wedged (cwnd=%u rtt=%uus)",
-		    h.raw.snd_cwnd, h.raw.rtt);
+		    "parallel worker TCP wedge from %s: cwnd=%u, rtt=%.1fms, "
+		    "%.1f MB unsent, stalled %.1fs, %llu retransmits",
+		    ssh_remote_ipaddr(ssh), h.raw.snd_cwnd, h.raw.rtt / 1000.0,
+		    h.raw.notsent_bytes / 1000000.0,
+		    h.raw.total_rto_time / 1000.0,
+		    (unsigned long long)h.raw.total_retrans);
 		srv_terminate_worker(ssh, HPN_EXIT_TCP_WEDGE, reason);
 		return;
 	case SFTP_HPN_WEDGE_PEER_STALL:
 		snprintf(reason, sizeof(reason),
-		    "peer receive window pinned (cwnd=%u)", h.raw.snd_cwnd);
+		    "parallel worker peer stall from %s: recv window pinned, "
+		    "cwnd=%u, %.1f MB unsent",
+		    ssh_remote_ipaddr(ssh), h.raw.snd_cwnd,
+		    h.raw.notsent_bytes / 1000000.0);
 		srv_terminate_worker(ssh, HPN_EXIT_TCP_PEER_STALL, reason);
 		return;
 	case SFTP_HPN_WEDGE_PATH_DEGRADED:
-		logit("HPN: parallel worker path degraded, sustained "
-		    "retransmits (cwnd=%u rtt=%uus)", h.raw.snd_cwnd, h.raw.rtt);
+		logit("HPN: parallel worker path degraded from %s: sustained "
+		    "retransmits, cwnd=%u, rtt=%.1fms, %llu retransmits",
+		    ssh_remote_ipaddr(ssh), h.raw.snd_cwnd, h.raw.rtt / 1000.0,
+		    (unsigned long long)h.raw.total_retrans);
 		break;
 	case SFTP_HPN_WEDGE_NONE:
 		break;

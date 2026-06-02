@@ -146,6 +146,17 @@ static time_t control_persist_exit_time = 0;
 volatile sig_atomic_t quit_pending; /* Set non-zero to quit the loop. */
 static int last_was_cr;		/* Last character was a newline. */
 static int exit_status;		/* Used to store the command exit status. */
+/*
+ * Set once we've recorded an HPN transport self-termination code (the
+ * reserved 80-89 range) from the server.  See the exit-status handler in
+ * client_input_channel_req() for why this lock is needed: the server-side
+ * worker monitor sends exit-status(HPN_EXIT_TCP_*) and then tears the
+ * channel down, after which the normal session teardown sends a *second*
+ * exit-status carrying the subsystem's own code (typically 0).  Without
+ * this lock the later 0 overwrites the wedge code (last write wins), so the
+ * orchestrator that reaps this worker never learns the real cause.
+ */
+static int exit_status_hpn_locked;
 static int connection_in;	/* Connection to server (input). */
 static int connection_out;	/* Connection to server (output). */
 /*
@@ -528,15 +539,17 @@ tcp_health_tick(void)
 	if (!tcp_health_armed)
 		return;
 	if (sftp_hpn_tcp_health_poll(&tcp_health, &h) != 0) {
-		/* Settled UNSUPPORTED — stop polling this connection. */
+		/* Settled UNSUPPORTED - stop polling this connection. */
 		tcp_health_armed = 0;
 		debug_f("HPN: TCP health monitor disabled (unsupported)");
 		return;
 	}
-	debug_f("HPN: tcp health avail=%d cwnd=%u rtt=%uus mss=%u "
-	    "rcv_space=%u retrans=%llu", (int)h.availability,
-	    h.raw.snd_cwnd, h.raw.rtt, h.raw.snd_mss, h.raw.rcv_space,
-	    (unsigned long long)h.raw.total_retrans);
+	debug2_f("HPN: tcp health avail=%d cwnd=%u rtt=%uus mss=%u "
+	    "rcv_space=%u retrans=%llu notsent=%u drate=%llu rto_time=%u",
+	    (int)h.availability, h.raw.snd_cwnd, h.raw.rtt, h.raw.snd_mss,
+	    h.raw.rcv_space, (unsigned long long)h.raw.total_retrans,
+	    h.raw.notsent_bytes, (unsigned long long)h.raw.delivery_rate,
+	    h.raw.total_rto_time);
 
 	switch (sftp_hpn_classify(&tcp_health, &h)) {
 	case SFTP_HPN_WEDGE_TCP_WEDGE:
@@ -2134,13 +2147,38 @@ client_input_channel_req(int type, uint32_t seq, struct ssh *ssh)
 	} else if (strcmp(rtype, "exit-status") == 0) {
 		if ((r = sshpkt_get_u32(ssh, &exitval)) != 0)
 			goto out;
+		/* HPN diagnostic (debug2): every exit-status received, raw value
+		 * + routing, before any recording.  Shows whether a wedge code
+		 * (80-89) ever arrives, on which channel, and whether the
+		 * sticky lock is already held. */
+		debug2_f("HPN: recv exit-status chan=%u session_ident=%d "
+		    "exitval=%u hpn_locked=%d ctl_chan=%d", id, session_ident,
+		    exitval, exit_status_hpn_locked, c->ctl_chan);
 		if (c->ctl_chan != -1) {
 			mux_exit_message(ssh, c, exitval);
 			success = 1;
 		} else if ((int)id == session_ident) {
-			/* Record exit value of local session */
+			/* Record exit value of local session.
+			 *
+			 * HPN: a transport self-termination code (80-89) is
+			 * "sticky" -- once seen it is not overwritten by a
+			 * later exit-status.  On a download wedge the server's
+			 * worker monitor sends exit-status(HPN_EXIT_TCP_*) and
+			 * then closes the channel; the subsequent normal
+			 * session teardown emits another exit-status with the
+			 * subsystem's code (usually 0).  We must keep the
+			 * first (the wedge cause) so the parallel orchestrator
+			 * reaps the precise code instead of a clobbering 0.
+			 * The lock only ever engages for the reserved HPN
+			 * range the HPN server sends, so ordinary ssh sessions
+			 * are unaffected.
+			 */
 			success = 1;
-			exit_status = exitval;
+			if (!exit_status_hpn_locked) {
+				exit_status = exitval;
+				if (HPN_EXIT_IS_TCP(exitval))
+					exit_status_hpn_locked = 1;
+			}
 		} else {
 			/* Probably for a mux channel that has already closed */
 			debug_f("no sink for exit-status on channel %d",
