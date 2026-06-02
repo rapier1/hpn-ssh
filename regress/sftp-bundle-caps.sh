@@ -26,7 +26,7 @@ sed -i "s|^\(\s*Subsystem\s\+sftp\s\+\)\(.*\)$|\1\2 -B 4M -T 16M|" \
 start_sshd
 
 # Bundle dispatch needs many small files to actually exercise the
-# accumulator.  Twenty 4 KiB files = 80 KiB total — single bundle.
+# accumulator.  Twenty 4 KiB files = 80 KiB total - single bundle.
 xclean
 for i in 01 02 03 04 05 06 07 08 09 10 \
          11 12 13 14 15 16 17 18 19 20; do
@@ -50,7 +50,7 @@ else
 fi
 
 # NOTE: we don't grep the sshd log to confirm the caps message was
-# emitted — start_sshd unlinks the real log file and replaces it with
+# emitted - start_sshd unlinks the real log file and replaces it with
 # a dangling symlink, so the regress harness loses sftp-server's
 # debug_f output.  The transfer-success above + sshd_config -t
 # validation in start_sshd are sufficient to confirm the flags are

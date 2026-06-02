@@ -220,7 +220,7 @@ int	 safe_path_fd(int, const char *, struct passwd *,
  * missing parent directories with the given mode.  Returns 0 on
  * success (or if dirpath already exists), -1 on any other failure
  * (errno set).  An existing path that isn't a directory is treated
- * as success too — the caller is expected to follow up with a stat
+ * as success too - the caller is expected to follow up with a stat
  * if the type matters.
  */
 int	 mkdir_p(const char *dirpath, mode_t mode);

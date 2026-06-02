@@ -782,7 +782,7 @@ regress/unittests/utf8/test_utf8$(EXEEXT): \
 	    -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(TESTLIBS)
 
 # sftp-workqueue is a self-contained MPMC queue used by the parallel-streams
-# orchestrator. The test does not use test_helper — it has its own main().
+# orchestrator. The test does not use test_helper - it has its own main().
 UNITTESTS_TEST_SFTP_WORKQUEUE_OBJS=\
 	regress/unittests/sftp_workqueue/tests.o \
 	sftp-workqueue.o

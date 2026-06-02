@@ -54,7 +54,7 @@ static struct {
  * Hard-capped at GLOB_ATTRIB_CACHE_MAX entries to bound memory under unusually
  * large globs; lookups past the cap simply miss and the caller falls back to
  * an explicit sftp_stat.  ~200 B/entry including string + uthash overhead, so
- * 262144 = ~50 MB worst case — comfortably above any realistic HPC glob.
+ * 262144 = ~50 MB worst case - comfortably above any realistic HPC glob.
  */
 struct glob_attrib_entry {
 	char *path;	/* hash key (xstrdup'd) */

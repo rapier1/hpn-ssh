@@ -2341,7 +2341,7 @@ sink(int argc, char **argv, const char *src)
 			 * so we need to read it so we don't get out of sync */
 			(void) atomicio(read, remin, &match, 1);
 			if (match != 'M') {
-				/* Hash mismatch or unexpected response — transfer full file. */
+				/* Hash mismatch or unexpected response - transfer full file. */
 #ifdef DEBUG
 				fprintf(stderr, "%s: match status is '%c', restarting full transfer\n",
 					hostname, match);

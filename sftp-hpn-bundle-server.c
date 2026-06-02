@@ -17,7 +17,7 @@
  */
 
 /*
- * sftp-hpn-bundle-server.c — server-side SFTP bundle protocol.
+ * sftp-hpn-bundle-server.c - server-side SFTP bundle protocol.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Extracted from sftp-hpn-server.c on 2026-05-31 as part of the
@@ -84,7 +84,7 @@ enum hpn_bundle_mode {
  *
  * Both UPLOAD and FETCH bundles stream through the sftp-hpn-tar codec
  * instead of buffering the whole tar in RAM.  Memory per worker is
- * O(1) — just the codec's 512-byte header scratch + the currently-open
+ * O(1) - just the codec's 512-byte header scratch + the currently-open
  * output file (UPLOAD) or the currently-reading input file (FETCH).
  *
  * UPLOAD path (hpn-bundle-open):
@@ -140,7 +140,7 @@ struct hpn_bundle_state {
  * server-side cap a malicious or misconfigured client can drive the
  * server to OOM.
  *
- * Caps are process-local — sftp-server is forked per user connection by
+ * Caps are process-local - sftp-server is forked per user connection by
  * sshd, so the "total across handles" cap is per-connection.  Per-system
  * memory protection (RLIMIT_AS, sshd's MaxStartups) is the OS's
  * responsibility.
@@ -186,7 +186,7 @@ static int    bundle_enabled    = -1;   /* -1 = uninitialised */
  * Parse a K/M/G-suffixed byte count via the openbsd-compat helper
  * scan_scaled().  Returns the parsed value on success, or 0 if spec
  * is NULL/empty/unparseable/negative or would overflow size_t.
- * Callers treat 0 as "no value supplied" — 0 itself is never a
+ * Callers treat 0 as "no value supplied" - 0 itself is never a
  * valid cap.  Thin wrapper kept here so the call sites stay clean
  * (cast + bounds check live in one place).  The previous in-module
  * parse_bytes_arg was deduplicated against bundle-client.c's
@@ -210,7 +210,7 @@ bundle_parse_scaled(const char *spec)
 /*
  * Compose and enqueue an SSH_FXP_STATUS failure reply on oqueue.
  * Shared by the fail labels of process_hpn_bundle_open and
- * process_hpn_bundle_fetch — both handlers reply with the same
+ * process_hpn_bundle_fetch - both handlers reply with the same
  * 5-field STATUS shape on error (only the error-tag string differs,
  * which we pass through for the fatal_fr() log line).
  */
@@ -284,7 +284,7 @@ bundle_caps_init(void)
 	if (initialised)
 		return;
 
-	/* HPN_MAX_BUNDLE_SIZE (sshd_config: HPNMaxBundleSize) — server-
+	/* HPN_MAX_BUNDLE_SIZE (sshd_config: HPNMaxBundleSize) - server-
 	 * side hard cap on per-bundle accumulator.  Overrides the -B
 	 * CLI default if the env var is set and the operator did not
 	 * already pass -B explicitly (CLI -B takes precedence). */
@@ -303,7 +303,7 @@ bundle_caps_init(void)
 	if (bundle_total_cap == 0)
 		bundle_total_cap = HPN_BUNDLE_TOTAL_CAP_DEFAULT;
 
-	/* HPN_USE_BUNDLE (sshd_config: HPNUseBundle) — master toggle.
+	/* HPN_USE_BUNDLE (sshd_config: HPNUseBundle) - master toggle.
 	 * Absent / unparseable defaults to 1 (enabled). */
 	if (bundle_enabled == -1) {
 		ev = getenv("HPN_USE_BUNDLE");
@@ -394,7 +394,7 @@ bundle_state_free(struct hpn_bundle_state *s)
 	if (s == NULL)
 		return;
 	/* Release total-cap accounting: subtract the larger of declared-
-	 * total (FETCH) or bytes-received (UPLOAD) — whichever this bundle
+	 * total (FETCH) or bytes-received (UPLOAD) - whichever this bundle
 	 * contributed to the running counter. */
 	uint64_t contributed = (s->mode == HPN_BUNDLE_MODE_FETCH)
 	    ? s->fetch_total_size
@@ -469,7 +469,7 @@ bundle_compose_path(const char *dest_dir, const char *entry_path, int *out_safe)
 /* Parser entry callback: header parsed, open output fd, mkdir parent.
  *
  * The "last-mkdir-dir" cache (D) skips redundant mkdir_p calls when many
- * consecutive entries share the same parent directory — the common case
+ * consecutive entries share the same parent directory - the common case
  * for many-small bundles.  Without it every file in a 1000-file bundle
  * does its own dirname() + stat() + mkdir() walk; with it most calls
  * are a single strcmp. */
@@ -535,7 +535,7 @@ bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
 #ifdef HAVE_POSIX_FALLOCATE
 	/* (E) Pre-allocate extents for fewer fragments + faster sequential
 	 * writes on extents-based FS (ext4 / xfs / lustre).  Failure is
-	 * non-fatal — write() will just allocate on demand. */
+	 * non-fatal - write() will just allocate on demand. */
 	if (size > 0)
 		(void)posix_fallocate(s->cur_fd, 0, (off_t)size);
 #endif
@@ -552,7 +552,7 @@ bundle_upload_data_cb(void *ctx, const u_char *data, size_t len)
 	size_t remaining = len;
 
 	if (s->cur_fd < 0)
-		return -1;	/* shouldn't happen — parser always pairs */
+		return -1;	/* shouldn't happen - parser always pairs */
 	while (remaining > 0) {
 		ssize_t n = write(s->cur_fd, data, remaining);
 		if (n < 0) {
@@ -654,7 +654,7 @@ sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
 		return SSH2_FX_EOF;
 	}
 	/* SFTP READs arrive in offset order on a single channel.  Reject
-	 * backward seeks loudly — streaming codec can't replay produced
+	 * backward seeks loudly - streaming codec can't replay produced
 	 * bytes.  Forward "gaps" (off > bytes_produced) are silently
 	 * absorbed: they happen naturally when a previous read returned
 	 * fewer than CHUNK_BYTES because the bundle ended mid-chunk.  The
@@ -664,7 +664,7 @@ sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
 	 * past the EOA marker) and return EOF.  Without this graceful
 	 * absorbtion the client's drain-of-orphan-reads sees STATUS
 	 * FAILURE replies, bails the drain, and the next bundle's READs
-	 * collide with leftover orphan replies on the wire — surfacing as
+	 * collide with leftover orphan replies on the wire - surfacing as
 	 * "ID mismatch" sftp_conn_die calls and worker abort. */
 	if (off < s->bytes_produced) {
 		error_f("hpn-bundle READ: backward seek %llu (next %llu)",
@@ -699,7 +699,7 @@ sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
  * Validate a tar entry pathname before composing it into a destination
  * path.  Rejects:
  *   - NULL or empty
- *   - any "/"-separated component equal to ".." (traversal — always
+ *   - any "/"-separated component equal to ".." (traversal - always
  *     anomalous for a bundle producer; plain SFTP OPEN never has
  *     reason to encode a "../" climb in a single pathname)
  *   - leading "/" ONLY when dest_dir is non-empty.  When dest_dir is
@@ -797,7 +797,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	int r, status = SSH2_FX_FAILURE;
 
 	/* Operator master toggle: refuse bundle ops with OP_UNSUPPORTED
-	 * when sshd_config has HPNUseBundle=no.  Belt-and-suspenders —
+	 * when sshd_config has HPNUseBundle=no.  Belt-and-suspenders -
 	 * the extension is normally not advertised in that mode, but a
 	 * misbehaving client could still send a bundle-open. */
 	if (!sftp_hpn_server_bundle_enabled()) {
@@ -843,7 +843,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 
-	/* Reply with SSH_FXP_HANDLE — standard SFTP framing. */
+	/* Reply with SSH_FXP_HANDLE - standard SFTP framing. */
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	u_char hbuf[sizeof(int32_t)];

@@ -17,7 +17,7 @@
  */
 
 /*
- * sftp-hpn-tar.h — HPN-SSH USTAR codec for the bundle path.
+ * sftp-hpn-tar.h - HPN-SSH USTAR codec for the bundle path.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Replaces libarchive on both the bundle upload and download paths,
@@ -25,20 +25,20 @@
  *
  * Two streaming state machines, mirror images:
  *
- *   writer  — used by the client upload path and the server download
+ *   writer  - used by the client upload path and the server download
  *             (hpn-bundle-fetch) path.  Caller adds files to a pack
  *             list, then drives byte production via pack_next() which
  *             generates tar bytes on demand without holding the whole
  *             bundle in memory.
  *
- *   parser  — used by the server upload extract path and the client
+ *   parser  - used by the server upload extract path and the client
  *             download extract path.  Caller feeds wire bytes via
  *             parse_feed(); parser invokes callbacks as each entry's
  *             header / data / end is recognised.
  *
  * Format constraints (matches what we put on the wire today):
  *
- *   - POSIX 1003.1-1988 USTAR — 512-byte fixed header, file data
+ *   - POSIX 1003.1-1988 USTAR - 512-byte fixed header, file data
  *     padded to 512-byte boundary, two-block all-zero EOA marker.
  *   - USTAR "prefix" field used for paths up to 255 chars total
  *     (155-byte prefix + "/" + 100-byte name).  Pathnames longer
@@ -66,7 +66,7 @@
 #include <stdint.h>
 #include <time.h>
 
-/* USTAR block size — fixed by the format. */
+/* USTAR block size - fixed by the format. */
 #define SFTP_HPN_TAR_BLOCK	512u
 
 /* Maximum total path length the USTAR prefix+name combination
@@ -94,17 +94,17 @@ void sftp_hpn_tar_writer_free(struct sftp_hpn_tar_writer *w);
 /*
  * Queue a file for inclusion in the tar stream.
  *
- *   src_path      — local path the writer will open() and read from.
+ *   src_path      - local path the writer will open() and read from.
  *                   May be NULL only if you are using the in-memory
  *                   variant (not supported; src_path is required).
- *   archive_path  — path as it appears in the tar header.  Subject
+ *   archive_path  - path as it appears in the tar header.  Subject
  *                   to SFTP_HPN_TAR_MAX_PATH.
- *   mode          — POSIX permissions bits (only low 12 bits used).
- *   size          — file size in bytes; MUST match the actual file
+ *   mode          - POSIX permissions bits (only low 12 bits used).
+ *   size          - file size in bytes; MUST match the actual file
  *                   size at pack_next() time or the codec returns
  *                   error (matches our "bundle bails on mid-stream
  *                   truncation" contract).
- *   mtime         — modification time in seconds since the epoch.
+ *   mtime         - modification time in seconds since the epoch.
  *
  * Returns 0 on success or -1 on error (path too long, OOM, etc.).
  * On -1 the writer's queue is unchanged.
@@ -128,10 +128,10 @@ void sftp_hpn_tar_writer_finish(struct sftp_hpn_tar_writer *w);
  * Pack tar bytes into the caller's buffer.
  *
  * Returns:
- *    > 0  — number of bytes written into out (up to max_bytes).
- *    0    — EOA reached and trailing zero blocks emitted; no more
+ *    > 0  - number of bytes written into out (up to max_bytes).
+ *    0    - EOA reached and trailing zero blocks emitted; no more
  *           bytes will be produced.  Only returned after finish().
- *   -1    — codec error.  Inspect sftp_hpn_tar_writer_error() for
+ *   -1    - codec error.  Inspect sftp_hpn_tar_writer_error() for
  *           a human-readable message.  Caller MUST abandon the
  *           bundle (the on-wire tar stream is now invalid).
  *
@@ -156,19 +156,19 @@ struct sftp_hpn_tar_parser;
  * recognised.  Caller supplies ctx (parser passes it back unchanged).
  *
  * Callback return value:
- *    0  — continue parsing
- *   !0  — abort parser with error
+ *    0  - continue parsing
+ *   !0  - abort parser with error
  *
  * Lifecycle for each entry:
- *   1. entry_cb       — header parsed; caller may open output fd,
+ *   1. entry_cb       - header parsed; caller may open output fd,
  *                       validate path, pre-allocate via fallocate(),
  *                       etc.  If callback returns non-zero the entry
  *                       is treated as a per-entry failure and bundle
  *                       is abandoned.
- *   2. data_cb         (one or more calls) — file bytes.  Total bytes
+ *   2. data_cb         (one or more calls) - file bytes.  Total bytes
  *                      across all data_cb calls equals the entry's
  *                      declared size.  May be 0 calls for empty files.
- *   3. entry_end_cb   — entry's bytes fully delivered.  Caller closes
+ *   3. entry_end_cb   - entry's bytes fully delivered.  Caller closes
  *                      fd, applies perms/mtime, etc.
  */
 struct sftp_hpn_tar_callbacks {
@@ -195,10 +195,10 @@ void sftp_hpn_tar_parser_free(struct sftp_hpn_tar_parser *p);
  * synchronously; callbacks may be invoked during this call.
  *
  * Returns:
- *    0  — bytes consumed, continue feeding.
- *    1  — two-block all-zero EOA seen; parser has finished cleanly.
+ *    0  - bytes consumed, continue feeding.
+ *    1  - two-block all-zero EOA seen; parser has finished cleanly.
  *         Any further feed() calls are an error.
- *   -1  — parse error.  Inspect sftp_hpn_tar_parser_error() for a
+ *   -1  - parse error.  Inspect sftp_hpn_tar_parser_error() for a
  *         human-readable message.  Caller MUST abandon the bundle.
  */
 int sftp_hpn_tar_parser_feed(struct sftp_hpn_tar_parser *p,

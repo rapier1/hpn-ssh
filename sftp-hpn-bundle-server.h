@@ -17,16 +17,16 @@
  */
 
 /*
- * sftp-hpn-bundle-server.h — server-side bundle protocol module.
+ * sftp-hpn-bundle-server.h - server-side bundle protocol module.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  *
- * Scope: the server end of the SFTP bundle path —
+ * Scope: the server end of the SFTP bundle path -
  *
- *   hpn-bundle-open@hpnssh.org   (upload  — accept tar bytes via WRITE,
+ *   hpn-bundle-open@hpnssh.org   (upload  - accept tar bytes via WRITE,
  *                                  feed codec parser inline, write files
  *                                  as entries are recognised)
- *   hpn-bundle-fetch@hpnssh.org  (download — accept file list, queue
+ *   hpn-bundle-fetch@hpnssh.org  (download - accept file list, queue
  *                                  into codec writer, serve READs via
  *                                  pack_next on demand)
  *
@@ -53,7 +53,7 @@ struct sshbuf;
  *
  * Strings the dispatcher (sftp-hpn-server.c) routes by, and that
  * sftp-server.c uses in compose_extension at session init.  Moved here
- * from sftp-hpn-server.h during the 2026-05-31 module split — bundle-
+ * from sftp-hpn-server.h during the 2026-05-31 module split - bundle-
  * scope macros belong with the bundle module's other public interface. */
 #define HPN_EXT_BUNDLE          "hpn-bundle@hpnssh.org"         /* capability advert */
 #define HPN_EXT_BUNDLE_OPEN     "hpn-bundle-open@hpnssh.org"    /* upload  bundle open  */
@@ -94,7 +94,7 @@ int sftp_hpn_server_bundle_write(int handle, uint64_t off,
 
 /*
  * Close a bundle handle: for UPLOAD, the streaming extract already
- * happened during the WRITE sequence — close just verifies parser
+ * happened during the WRITE sequence - close just verifies parser
  * state and frees.  For FETCH, close releases the writer and any
  * still-open input file.  Always frees the handle.
  */
@@ -108,7 +108,7 @@ int sftp_hpn_server_bundle_close(int handle);
  * reaches end-of-archive.
  *
  * Off is monotonic per handle; backward seeks return SSH2_FX_FAILURE.
- * Forward gaps (off > bytes_produced) are absorbed silently — they
+ * Forward gaps (off > bytes_produced) are absorbed silently - they
  * happen naturally when a previous read returned fewer than CHUNK
  * bytes because the bundle ended mid-chunk.
  *

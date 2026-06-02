@@ -227,7 +227,7 @@ typedef struct {
 	/*
 	 * Bundle-path operator controls (2026-05-31).
 	 *
-	 *   hpn_use_bundle              — server-side master toggle for the
+	 *   hpn_use_bundle              - server-side master toggle for the
 	 *                                 hpn-bundle / hpn-bundle-open /
 	 *                                 hpn-bundle-fetch SFTP extensions.
 	 *                                 When 0, sftp-server does not
@@ -236,7 +236,7 @@ typedef struct {
 	 *                                 SSH2_FX_OP_UNSUPPORTED.
 	 *                                 -1 (unset) → defaults to 1 (yes).
 	 *
-	 *   hpn_bundle_size             — operator's preferred default bundle
+	 *   hpn_bundle_size             - operator's preferred default bundle
 	 *                                 target in bytes.  Informational on
 	 *                                 the server today (the client picks
 	 *                                 the actual size via its own
@@ -245,7 +245,7 @@ typedef struct {
 	 *                                 mechanism so they can clamp
 	 *                                 proactively.  -1 (unset) → 8 MiB.
 	 *
-	 *   hpn_max_bundle_size         — hard server-side ceiling on the
+	 *   hpn_max_bundle_size         - hard server-side ceiling on the
 	 *                                 client-requested bundle size.  When
 	 *                                 a bundle-open / bundle-fetch
 	 *                                 carries a target above this value,
@@ -253,7 +253,7 @@ typedef struct {
 	 *                                 emits one INFO log line.  -1 (unset)
 	 *                                 → 64 MiB.
 	 *
-	 *   hpn_max_concurrent_workers  — hard per-user cap on the number of
+	 *   hpn_max_concurrent_workers  - hard per-user cap on the number of
 	 *                                 concurrent SFTP-subsystem channels
 	 *                                 (parallel-streams workers) from one
 	 *                                 authenticated user.  Cross-process

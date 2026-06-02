@@ -311,7 +311,7 @@ send_string_request(struct sftp_conn *conn, u_int id, u_int code, const char *s,
 
 	/*
 	 * Reset before building: response-reading helpers (e.g. get_status)
-	 * do not consume the full STATUS packet — error-message and
+	 * do not consume the full STATUS packet - error-message and
 	 * language-tag strings are left unread.  Without this reset, those
 	 * leftover bytes would be prepended to the outgoing request by
 	 * send_msg(), corrupting the message stream.
@@ -361,13 +361,13 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 		fatal_fr(r, "compose");
 
 	if (id != expected_id) {
-		error_f("ID mismatch (%u != %u) — possible MITM or "
+		error_f("ID mismatch (%u != %u) - possible MITM or "
 		    "server protocol corruption", id, expected_id);
 		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 		return SSH2_FX_CONNECTION_LOST;
 	}
 	if (type != SSH2_FXP_STATUS) {
-		error_f("expected SSH2_FXP_STATUS(%u) packet, got %u — "
+		error_f("expected SSH2_FXP_STATUS(%u) packet, got %u - "
 		    "possible MITM or server protocol corruption",
 		    SSH2_FXP_STATUS, type);
 		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
@@ -406,7 +406,7 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 		fatal_fr(r, "parse");
 
 	if (id != expected_id) {
-		error("%s: ID mismatch (%u != %u) — possible MITM or "
+		error("%s: ID mismatch (%u != %u) - possible MITM or "
 		    "server protocol corruption",
 		    errfmt == NULL ? __func__ : errmsg, id, expected_id);
 		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
@@ -419,7 +419,7 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 			error("%s: %s", errmsg, fx2txt(status));
 		return NULL;
 	} else if (type != SSH2_FXP_HANDLE) {
-		error("%s: expected SSH2_FXP_HANDLE(%u) packet, got %u — "
+		error("%s: expected SSH2_FXP_HANDLE(%u) packet, got %u - "
 		    "possible MITM or server protocol corruption",
 		    errfmt == NULL ? __func__ : errmsg, SSH2_FXP_HANDLE, type);
 		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
@@ -451,7 +451,7 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 		fatal_fr(r, "parse");
 
 	if (id != expected_id) {
-		error_f("ID mismatch (%u != %u) — possible MITM or "
+		error_f("ID mismatch (%u != %u) - possible MITM or "
 		    "server protocol corruption", id, expected_id);
 		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 		return -1;
@@ -467,7 +467,7 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 			error("stat remote: %s", fx2txt(status));
 		return -1;
 	} else if (type != SSH2_FXP_ATTRS) {
-		error_f("expected SSH2_FXP_ATTRS(%u) packet, got %u — "
+		error_f("expected SSH2_FXP_ATTRS(%u) packet, got %u - "
 		    "possible MITM or server protocol corruption",
 		    SSH2_FXP_ATTRS, type);
 		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
@@ -505,7 +505,7 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 
 	debug3("Received statvfs reply T:%u I:%u", type, id);
 	if (id != expected_id) {
-		error_f("ID mismatch (%u != %u) — possible MITM or "
+		error_f("ID mismatch (%u != %u) - possible MITM or "
 		    "server protocol corruption", id, expected_id);
 		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 		return -1;
@@ -522,7 +522,7 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 		return -1;
 	} else if (type != SSH2_FXP_EXTENDED_REPLY) {
 		error_f("expected SSH2_FXP_EXTENDED_REPLY(%u) packet, "
-		    "got %u — possible MITM or server protocol corruption",
+		    "got %u - possible MITM or server protocol corruption",
 		    SSH2_FXP_EXTENDED_REPLY, type);
 		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 		return -1;
@@ -769,7 +769,7 @@ sftp_proto_version(struct sftp_conn *conn)
 	return conn->version;
 }
 
-/* HPN: thin wrappers — logic lives in sftp-hpn-client.c */
+/* HPN: thin wrappers - logic lives in sftp-hpn-client.c */
 int
 sftp_conn_is_dead(struct sftp_conn *conn)
 {
@@ -1855,7 +1855,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			 * Verified resume requires hpn-check-file@hpnssh.org.
 			 * Check it up front (before inspecting the local file)
 			 * so the failure is identical whether the local file
-			 * is absent, partial, or full-size — mirroring
+			 * is absent, partial, or full-size - mirroring
 			 * sftp_upload.  No silent fallback to a fresh
 			 * download; the caller asked for verification.  See
 			 * RESUME_INCOMPAT_MSG.
@@ -1872,7 +1872,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * whole file.  Declines (returns -1) on small
 				 * files, missing extension, or internal
 				 * failure; we fall through to the whole-file
-				 * gate below — same correctness, just costlier
+				 * gate below - same correctness, just costlier
 				 * on a size-match-hash-mismatch.
 				 */
 				int chunked =
@@ -1964,7 +1964,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * deliberately asks for length == remote
 				 * st_size, which would mis-trigger
 				 * sparse-skip and return a sentinel that the
-				 * client treats as a hash mismatch — forcing
+				 * client treats as a hash mismatch - forcing
 				 * a full re-transfer of bytes already on the
 				 * peer.  Strict suppresses the sentinel and
 				 * yields the real prefix hash to compare.
@@ -2060,7 +2060,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 
 		sshbuf_reset(msg);
 		/* Time the DATA-reply read so the rdahead controller can
-		 * react to a wedged path — same mechanism as the upload-
+		 * react to a wedged path - same mechanism as the upload-
 		 * side STATUS-read instrumentation in do_upload_body.  A
 		 * read that blocks longer than the threshold means the
 		 * server isn't sending DATA back fast enough (TCP back-
@@ -2081,7 +2081,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 
 		/* Find the request in our queue */
 		if ((req = request_find(&requests, id)) == NULL) {
-			/* Was fatal("Unexpected reply %u", id); — would
+			/* Was fatal("Unexpected reply %u", id); - would
 			 * crash the entire orchestrator if this worker is
 			 * one of N in a parallel-streams transfer.  Mark
 			 * this connection dead and bail to the worker
@@ -2543,7 +2543,7 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 		debug3_f("got response type=%u rid=%u (expected id=%u)",
 		    type, rid, id);
 		if (rid != id) {
-			/* Was fatal("ID mismatch (%u != %u)", rid, id); —
+			/* Was fatal("ID mismatch (%u != %u)", rid, id); -
 			 * would crash the entire orchestrator if this
 			 * worker is one of N in a parallel-streams
 			 * transfer.  Mark the connection dead and let the
@@ -2575,7 +2575,7 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 			return -1;
 		} else if (type != SSH2_FXP_EXTENDED_REPLY) {
 			/* Was fatal("Expected SSH2_FXP_EXTENDED_REPLY ...");
-			 * — would crash the entire orchestrator if this
+			 * - would crash the entire orchestrator if this
 			 * worker is one of N in a parallel-streams
 			 * transfer.  Mark the connection dead and let the
 			 * caller's resume / verify path observe -1. */
@@ -2615,13 +2615,13 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
  * Post-transfer integrity check (HPNVerifyTransfer): XXH3 the full local
  * file and the full remote file and compare.  Used by both single-stream
  * (sftp/scp) and parallel paths to confirm a completed transfer matches
- * end-to-end — catches client/server disk corruption, range-offset bugs,
+ * end-to-end - catches client/server disk corruption, range-offset bugs,
  * and crash-resume sparse-zero holes that the SSH MAC and size checks miss.
  *
  * Returns:
  *    0  hashes match (transfer verified good)
- *    1  hashes differ (CORRUPTION — caller warns + exits SFTP_EX_VERIFY_FAILED)
- *   -1  could not verify (server lacks hpn-check-file, open/hash error) —
+ *    1  hashes differ (CORRUPTION - caller warns + exits SFTP_EX_VERIFY_FAILED)
+ *   -1  could not verify (server lacks hpn-check-file, open/hash error) -
  *       caller should warn that verification was skipped, but this is NOT
  *       a content-mismatch failure.
  */
@@ -2748,7 +2748,7 @@ do_upload_body(struct sftp_conn *conn,
 			break;
 
 		if (ack == NULL) {
-			/* Was fatal("Unexpected ACK %u", id); — would crash the
+			/* Was fatal("Unexpected ACK %u", id); - would crash the
 			 * entire orchestrator if this worker is one of N in a
 			 * parallel-streams transfer.  Mark this connection dead
 			 * and bail to the worker thread's safety net, which
@@ -2916,14 +2916,14 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	 *
 	 * If the server does not advertise hpn-check-file@hpnssh.org we cannot
 	 * verify anything, so we fail loudly (fatal below) rather than silently
-	 * degrade to a blind size-only resume or a full re-transfer — the
+	 * degrade to a blind size-only resume or a full re-transfer - the
 	 * caller explicitly requested hash verification.
 	 */
 	if (verify) {
 		debug3_f("verify=1 inplace_flag=%d exts=0x%x HPN_CHECK_FILE=0x%x",
 		    inplace_flag, conn->exts, SFTP_EXT_HPN_CHECK_FILE);
 		if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0) {
-			/* No silent fallback — see RESUME_INCOMPAT_MSG. */
+			/* No silent fallback - see RESUME_INCOMPAT_MSG. */
 			fatal("\"%s\": %s", local_path, RESUME_INCOMPAT_MSG);
 		} else if (sftp_stat(conn, remote_path, 1 /* quiet */, &c) == 0
 		    && c.size > 0) {
@@ -2939,7 +2939,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * (returns -1) on small files, missing
 				 * extension, or any internal failure, in which
 				 * case we fall through to the whole-file gate
-				 * below — same correctness, just costlier on a
+				 * below - same correctness, just costlier on a
 				 * size-match-hash-mismatch.
 				 */
 				int chunked = sftp_hpn_try_chunked_resume_upload(
@@ -3035,7 +3035,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * size).  For prefix-resume the client asks
 				 * for length == remote_st_size, which fits
 				 * the sparse-skip condition exactly and would
-				 * return the sentinel — which the client then
+				 * return the sentinel - which the client then
 				 * treats as a hash mismatch, forcing a full
 				 * re-transfer of bytes already present on the
 				 * remote.  Strict suppresses the sentinel and
@@ -3379,12 +3379,12 @@ sftp_precreate(struct sftp_conn *conn, const char *remote_path, off_t size)
 	 * extends the file's logical EOF to size and produces a true sparse
 	 * extent (no blocks allocated until pwrites land there).  Without
 	 * this, the file's stat-size grows only as workers extend it via
-	 * pwrite — and an interrupt before all workers finish their ranges
+	 * pwrite - and an interrupt before all workers finish their ranges
 	 * leaves the file at the highwater of pwrite offsets rather than at
 	 * size, which (a) breaks the documented contract of this function and
 	 * (b) prevents the size-match-content-different recovery path
 	 * (verified-resume chunked rehash) from engaging on an interrupted
-	 * range-split upload — the very state it was built to handle.
+	 * range-split upload - the very state it was built to handle.
 	 *
 	 * The change is base-protocol SFTP; every compliant server supports it.
 	 * One extra round trip per precreate call; negligible vs. the parallel
@@ -3436,7 +3436,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		    (long long)range_offset, strerror(errno));
 		goto out;
 	}
-	/* Open remote without O_CREAT/O_TRUNC — file was pre-created. */
+	/* Open remote without O_CREAT/O_TRUNC - file was pre-created. */
 	if (send_open(conn, remote_path, "range-dest",
 	    SSH2_FXF_WRITE, NULL, &handle, &handle_len) != 0)
 		goto out;
@@ -3498,13 +3498,13 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			break;
 		ack = TAILQ_FIRST(&acks);
 		sshbuf_reset(msg);
-		/* Check get_msg_extended return — connection death (EPIPE)
+		/* Check get_msg_extended return - connection death (EPIPE)
 		 * already sets conn->hpn->dead inside get_msg_extended.
 		 * Without this check, the subsequent parse would fatal_fr
 		 * on the empty msg buffer and crash the orchestrator.
 		 *
 		 * Time the STATUS read so a wedged-path signal can reach
-		 * the rdahead controller — same mechanism as do_upload_body. */
+		 * the rdahead controller - same mechanism as do_upload_body. */
 		{
 			double t_status_start = monotime_double();
 			if (get_msg_extended(conn, msg, 0) != 0) {
@@ -3586,7 +3586,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	    SSH2_FXF_READ, NULL, &handle, &handle_len) != 0)
 		return -1;
 
-	/* Open pre-created local file for writing; no O_CREAT/O_TRUNC —
+	/* Open pre-created local file for writing; no O_CREAT/O_TRUNC -
 	 * the orchestrator pre-created it at the correct size. */
 	if ((local_fd = open(local_path, O_WRONLY)) < 0) {
 		error("open local \"%s\": %s", local_path, strerror(errno));
@@ -3619,7 +3619,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 
 		sshbuf_reset(msg);
 		/* Time the DATA-reply read so the rdahead controller can
-		 * react to a wedged path — same mechanism as the upload-
+		 * react to a wedged path - same mechanism as the upload-
 		 * side STATUS-read instrumentation in sftp_upload_range. */
 		double t_data_start = monotime_double();
 		if (get_msg_extended(conn, msg, 0) != 0) {
@@ -3685,7 +3685,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				free(req);
 				num_req--;
 			} else {
-				/* Short read — re-request remainder. */
+				/* Short read - re-request remainder. */
 				req->id = conn->msg_id++;
 				req->len -= len;
 				req->offset += len;
@@ -3750,7 +3750,7 @@ struct batch_file {
  * Mark every entry in the batch that has not already been recorded as
  * failed as failed.  Used by sftp_upload_batch when a collection phase
  * hits a dead connection or a protocol problem mid-batch: rather than
- * calling fatal_fr (which terminates the entire process — catastrophic
+ * calling fatal_fr (which terminates the entire process - catastrophic
  * for parallel workers handling unrelated transfers), we abandon the
  * batch.  The caller (worker_thread) re-queues each failed entry via
  * worker_process_result on a fresh connection.
@@ -3779,14 +3779,14 @@ batch_fail_all_remaining(struct batch_file *bs,
  *
  * Wire ordering when send is called with prev != NULL:
  *   1. Send THIS batch's OPENs (phase 1)
- *   2. Drain PREV's CLOSE STATUSes (the prev_finish step) — they should be
+ *   2. Drain PREV's CLOSE STATUSes (the prev_finish step) - they should be
  *      arriving / arrived since prev's CLOSEs were sent before this call
  *   3. Collect THIS batch's HANDLEs (phase 2)
  *   4. The rest of phases 3-4 for this batch
  *
  * The overlap: between step 1 (we send opens) and step 2 (we read close
- * statuses), the server is processing both — sending close statuses for
- * prev AND opening files for the current batch — concurrently.
+ * statuses), the server is processing both - sending close statuses for
+ * prev AND opening files for the current batch - concurrently.
  *
  * To disable at runtime: HPN_NO_BATCH_PIPELINE=1.  Forces the worker to
  * fall back to the un-pipelined sftp_upload_batch() entry point.  Useful
@@ -3834,7 +3834,7 @@ batch_phase5_and_cleanup(struct sftp_conn *conn,
 		}
 		if (type != SSH2_FXP_STATUS) {
 			error_f("batch close: expected SSH2_FXP_STATUS(%d), "
-			    "got %d — connection may be corrupt",
+			    "got %d - connection may be corrupt",
 			    SSH2_FXP_STATUS, type);
 			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 			batch_fail_all_remaining(bs, entries, n, &any_fail);
@@ -3849,7 +3849,7 @@ batch_phase5_and_cleanup(struct sftp_conn *conn,
 		}
 		if (rid != bs[i].close_id) {
 			error_f("batch close ID mismatch: got %u expected %u "
-			    "— possible MITM or server corruption",
+			    "- possible MITM or server corruption",
 			    rid, bs[i].close_id);
 			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 			batch_fail_all_remaining(bs, entries, n, &any_fail);
@@ -3988,7 +3988,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	 * which will also send back the close STATUSes for the prev batch
 	 * (whose CLOSEs were sent before this call).  By draining now we
 	 * overlap server processing of THIS batch's opens with collection of
-	 * PREV batch's close statuses — saving ~1 RTT per batch boundary.
+	 * PREV batch's close statuses - saving ~1 RTT per batch boundary.
 	 *
 	 * If the drain fails (connection died, protocol violation), prev's
 	 * remaining entries are marked failed inside finish; we still proceed
@@ -4037,7 +4037,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 			if (bs[i].failed || bs[i].handle == NULL)
 				continue;
 			if (bs[i].sb.st_size > (off_t)conn->upload_buflen)
-				continue; /* large file — handled in phase 3d */
+				continue; /* large file - handled in phase 3d */
 			if (bs[i].sb.st_size == 0) {
 				/* Empty file: remote is already zeroed by TRUNC open. */
 				close(bs[i].local_fd);
@@ -4085,8 +4085,8 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	 * On dead connection or protocol violation here we abandon the
 	 * rest of the batch (mark all unfailed entries failed, skip to
 	 * cleanup).  Calling fatal_fr in this loop would terminate the
-	 * whole process — catastrophic for parallel workers handling
-	 * unrelated transfers — so we degrade gracefully instead.
+	 * whole process - catastrophic for parallel workers handling
+	 * unrelated transfers - so we degrade gracefully instead.
 	 */
 	{
 		if ((msg = sshbuf_new()) == NULL)
@@ -4113,7 +4113,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 			}
 			if (type != SSH2_FXP_STATUS) {
 				error_f("batch write: expected SSH2_FXP_STATUS(%d), "
-				    "got %d — connection may be corrupt",
+				    "got %d - connection may be corrupt",
 				    SSH2_FXP_STATUS, type);
 				sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 				batch_fail_all_remaining(bs, entries, n, &any_fail);
@@ -4128,7 +4128,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 			}
 			if (rid != bs[i].write_id) {
 				error_f("batch write ID mismatch: got %u expected "
-				    "%u — possible MITM or server corruption",
+				    "%u - possible MITM or server corruption",
 				    rid, bs[i].write_id);
 				sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
 				batch_fail_all_remaining(bs, entries, n, &any_fail);
@@ -4156,7 +4156,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		if (bs[i].failed || bs[i].handle == NULL)
 			continue;
 		if (bs[i].sb.st_size > (off_t)conn->upload_buflen)
-			continue; /* large file — handled below */
+			continue; /* large file - handled below */
 		if (preserve_flag)
 			sftp_fsetstat(conn, bs[i].handle, bs[i].handle_len,
 			    &bs[i].a);
@@ -4165,14 +4165,14 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	}
 
 	/*
-	 * Phase 3d: large files — one at a time via do_upload_body.
+	 * Phase 3d: large files - one at a time via do_upload_body.
 	 * preserve and fsync are applied inside do_upload_body per file.
 	 */
 	for (i = 0; i < n; i++) {
 		if (bs[i].failed || bs[i].handle == NULL)
 			continue;
 		if (bs[i].sb.st_size <= (off_t)conn->upload_buflen)
-			continue; /* small file — already handled */
+			continue; /* small file - already handled */
 		debug_f("batch upload large file %d/%d: %s -> %s (%lld bytes)",
 		    i + 1, n, entries[i].local_path, entries[i].remote_path,
 		    (long long)bs[i].sb.st_size);
@@ -4213,7 +4213,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		sshbuf_free(msg);
 	}
 
-	/* Phase 5 is deferred to sftp_upload_batch_finish — packaged into
+	/* Phase 5 is deferred to sftp_upload_batch_finish - packaged into
 	 * a pending struct and returned to the caller, who calls finish
 	 * either inline (legacy sftp_upload_batch wrapper) or later, after
 	 * sending the next batch's phase 1 OPENs (sliding-window pipelining). */
@@ -4228,7 +4228,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	/* Phase 3b error path: connection dead or protocol violation BEFORE
 	 * we sent phase 4 CLOSEs.  Mark every entry failed, clean up the
 	 * batch state, and return NULL.  Phase 4 CLOSEs are NOT sent, so
-	 * there is nothing for finish to collect — return NULL signals this
+	 * there is nothing for finish to collect - return NULL signals this
 	 * to the caller. */
 	for (i = 0; i < n; i++) {
 		if (bs[i].local_fd >= 0)
@@ -4260,7 +4260,7 @@ sftp_upload_batch(struct sftp_conn *conn,
  *
  * The bundle wire protocol implementations (sftp_hpn_bundle_upload,
  * sftp_hpn_bundle_download) live in sftp-hpn-client.c.  Only the small
- * accessors that need to peek inside struct sftp_conn stay here — they
+ * accessors that need to peek inside struct sftp_conn stay here - they
  * cross the upstream-aligned / HPN boundary minimally.
  */
 
@@ -4313,7 +4313,7 @@ sftp_conn_alloc_msg_id(struct sftp_conn *conn)
 }
 
 /* Mark `conn` as dead due to a non-recoverable I/O failure.  Public
- * accessor for HPN bundle code in sftp-hpn-client.c — same effect as
+ * accessor for HPN bundle code in sftp-hpn-client.c - same effect as
  * the direct `conn->hpn->dead = 1` assignment that internal code in
  * this file can do.  Declared in sftp-client-internal.h. */
 void
@@ -4618,8 +4618,8 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 		sshbuf_reset(msg);
 		/* Time the DATA-reply read from the source connection so
 		 * the rdahead controller on `from` can react to a wedged
-		 * download — same mechanism as the other data-side reads.
-		 * Note: backpressure here is fired on `from`, not `to` —
+		 * download - same mechanism as the other data-side reads.
+		 * Note: backpressure here is fired on `from`, not `to` -
 		 * the wedge is on the download path. */
 		double t_data_start = monotime_double();
 		get_msg(from, msg);

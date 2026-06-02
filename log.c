@@ -710,7 +710,7 @@ log_ratelimit(struct log_ratelimit_ctx *rl, time_t now, int *active,
  * failed-paths summary).
  *
  * Per-thread storage means the worker thread that hit the error is the
- * same one that reads it back — no cross-thread races.
+ * same one that reads it back - no cross-thread races.
  *
  * ~260 bytes per thread.  Used by the parallel-streams failed-paths
  * summary; size of that bounded path list is set by

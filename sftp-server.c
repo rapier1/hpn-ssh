@@ -805,7 +805,7 @@ process_init(void)
 	compose_extension(msg, HPN_EXT_FS_INFO, "1");
 	/* Gate hpn-bundle / hpn-bundle-fetch on the operator-controlled
 	 * master toggle (sshd_config: HPNUseBundle).  When disabled, the
-	 * extensions don't show up in SSH_FXP_VERSION at all — clients
+	 * extensions don't show up in SSH_FXP_VERSION at all - clients
 	 * see no advertisement and use the per-file path.  Dispatchers
 	 * also refuse the ops defensively in case a client somehow tries. */
 	if (sftp_hpn_server_bundle_enabled()) {
@@ -1913,7 +1913,7 @@ process_extended_get_users_groups_by_id(uint32_t id)
 }
 
 /*
- * Drain the entire oqueue to STDOUT_FILENO via atomicio() — blocking until
+ * Drain the entire oqueue to STDOUT_FILENO via atomicio() - blocking until
  * the kernel has accepted every byte.  Used by the heartbeat path inside
  * long-running handlers so the heartbeat actually reaches the wire mid-
  * handler instead of sitting in oqueue until the handler returns (the main
@@ -2058,7 +2058,7 @@ process_extended_hpn_check_file(uint32_t id)
 
 		nread = read(fd, buf, toread);
 		if (nread == 0)
-			break; /* EOF before length bytes — hash what we have */
+			break; /* EOF before length bytes - hash what we have */
 		if (nread < 0) {
 			send_status(id, errno_to_portable(errno));
 			goto out;
@@ -2136,7 +2136,7 @@ process_extended_hpn_bundle_open(uint32_t id)
 }
 
 /* Phase 5: capability-only advertisement.  Clients never send a request
- * named hpn-bundle@hpnssh.org — they send hpn-bundle-open instead.  This
+ * named hpn-bundle@hpnssh.org - they send hpn-bundle-open instead.  This
  * stub exists so compose_extension's handler-lookup-or-fatal can find a
  * registration when advertising the capability in process_init(). */
 static void

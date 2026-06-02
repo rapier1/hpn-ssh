@@ -1,5 +1,5 @@
 /*
- * sftp-hpn-server.c — HPN-SSH server-side SFTP extensions.
+ * sftp-hpn-server.c - HPN-SSH server-side SFTP extensions.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Isolating HPN-specific extension handlers here keeps sftp-server.c's
@@ -76,14 +76,14 @@
 # define BTRFS_SUPER_MAGIC  0x9123683E
 #endif
 /*
- * Lustre magic — may not appear in older <linux/magic.h>.
+ * Lustre magic - may not appear in older <linux/magic.h>.
  * GPFS has no widely-distributed magic; we rely on a less-common value
  * that matches GPFS internal superblock type.
  */
 #ifndef LUSTRE_SUPER_MAGIC
 # define LUSTRE_SUPER_MAGIC 0x0BD00BD0
 #endif
-#define GPFS_SUPER_MAGIC    0x47504653u   /* 'G','P','F','S' — unofficial */
+#define GPFS_SUPER_MAGIC    0x47504653u   /* 'G','P','F','S' - unofficial */
 
 /*
  * Map a statfs() f_type value to a printable filesystem name.
@@ -105,13 +105,13 @@ fstype_from_magic(unsigned long ftype)
 }
 
 /*
- * Lustre layout ioctl ABI — inlined to avoid a build-time dependency on
+ * Lustre layout ioctl ABI - inlined to avoid a build-time dependency on
  * liblustreapi.  The constants and struct shape are stable kernel ABI; any
  * Lustre install that supports stripe-set via lfs(1) also supports this
  * ioctl on an open directory or freshly-created (zero-data) file.
  *
  * We only need v1 to set stripe_count.  Stripe size and pool selection are
- * future revisions of hpn-file-layout — payload is intentionally just the
+ * future revisions of hpn-file-layout - payload is intentionally just the
  * stripe_count today.
  */
 #ifndef LOV_USER_MAGIC_V1
@@ -176,7 +176,7 @@ lustre_set_stripe_fd(int fd, uint32_t requested_count,
 }
 
 /*
- * Run "lfs getstripe -d --yaml <path>" as a child process (no shell —
+ * Run "lfs getstripe -d --yaml <path>" as a child process (no shell -
  * path is passed as an argv element to execlp, preventing command injection)
  * and parse stripe_count / stripe_size from the YAML output.
  *
@@ -234,10 +234,10 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 	}
 	while (fgets(line, sizeof(line), f) != NULL) {
 		/* Keep as `unsigned long long` to match the %llu format
-		 * specifier — sscanf is strict about the underlying type
+		 * specifier - sscanf is strict about the underlying type
 		 * (u_int64_t is `unsigned long int` on LP64 Linux, not
 		 * `unsigned long long`).  Same exception as the printf cast
-		 * idiom — format-spec matching wins over typedef preference. */
+		 * idiom - format-spec matching wins over typedef preference. */
 		unsigned long long v = 0;
 		if (sscanf(line, " stripe_count: %llu", &v) == 1 ||
 		    sscanf(line, " lmm_stripe_count: %llu", &v) == 1) {
@@ -603,7 +603,7 @@ out:
  * Client requests a stripe count for a destination directory before any
  * files land in it; server opens the directory and issues
  * LL_IOC_LOV_SETSTRIPE on the directory FD.  Subsequent files created in
- * the directory inherit the layout — including files extracted from a
+ * the directory inherit the layout - including files extracted from a
  * bundle, which means the bundling path costs nothing extra.
  *
  * On non-Lustre destinations the ioctl returns ENOTTY / EINVAL and we
@@ -717,13 +717,13 @@ sftp_hpn_server_dispatch(u_int id, const char *name,
 		return;
 	}
 
-	/* Chunked-resume ranged hashing — see process_hpn_hash_range above. */
+	/* Chunked-resume ranged hashing - see process_hpn_hash_range above. */
 	if (strcmp(name, HPN_EXT_HASH_RANGE) == 0) {
 		process_hpn_hash_range(id, iqueue, oqueue);
 		return;
 	}
 
-	/* Lustre / future-fs layout — see process_hpn_file_layout above. */
+	/* Lustre / future-fs layout - see process_hpn_file_layout above. */
 	if (strcmp(name, HPN_EXT_FILE_LAYOUT) == 0) {
 		process_hpn_file_layout(id, iqueue, oqueue);
 		return;
@@ -757,7 +757,7 @@ sftp_hpn_server_dispatch(u_int id, const char *name,
 		while (stat(effective_path, &st) != 0) {
 			char *slash = strrchr(effective_path, '/');
 			if (slash == NULL) {
-				/* Ran out of slashes — bail.  Server returns
+				/* Ran out of slashes - bail.  Server returns
 				 * "unknown" / zeros; client falls back. */
 				debug3("hpn-fs-info: no existing ancestor "
 				    "for \"%s\"", path);

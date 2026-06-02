@@ -1,5 +1,5 @@
 /*
- * sftp_fs_info_fuzz.cc — libFuzzer harness for the client-side reply
+ * sftp_fs_info_fuzz.cc - libFuzzer harness for the client-side reply
  * parser of the HPN-SSH hpn-fs-info@hpnssh.org SFTP extension.
  *
  * The on-the-wire reply (after the SSH_FXP_EXTENDED_REPLY type byte
@@ -13,7 +13,7 @@
  * The fuzzer feeds arbitrary bytes through the same sshbuf_get_*
  * sequence that sftp_fs_info() runs in sftp-client.c (around the
  * "parse reply:" diagnostic).  Goal: catch decoder bugs that could
- * be triggered by a malicious or compromised server — short-read
+ * be triggered by a malicious or compromised server - short-read
  * panics, cstring length-prefix overflow, etc.  All of those would
  * normally be caught by sshbuf's bounds checks; this harness verifies
  * that assumption against structured mutation.
@@ -22,7 +22,7 @@
  *   ./sftp_fs_info_fuzz <corpus_dir>
  *
  * NB: we deliberately do NOT recreate the SFTP framing (type byte +
- * request id) — the input bytes ARE the post-framing payload, so the
+ * request id) - the input bytes ARE the post-framing payload, so the
  * fuzzer can mutate the on-wire reply body directly without wasting
  * cycles on bytes the parser would skip anyway.
  */
@@ -61,7 +61,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	/*
 	 * Mirror the cstring + u64 + u32 + u64 sequence in sftp-client.c's
 	 * sftp_fs_info().  Each step exercises bounds checks inside
-	 * sshbuf.  We're not asserting success — bad inputs SHOULD make
+	 * sshbuf.  We're not asserting success - bad inputs SHOULD make
 	 * these return SSH_ERR_*, what matters is no UB / no crash.
 	 */
 	if ((r = sshbuf_get_cstring(msg, &fs_type, NULL)) == 0 &&
@@ -69,7 +69,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	    (r = sshbuf_get_u32(msg, &stripe_count)) == 0 &&
 	    (r = sshbuf_get_u64(msg, &block_size)) == 0) {
 		/*
-		 * Successful parse — touch each output so out-of-band
+		 * Successful parse - touch each output so out-of-band
 		 * sanitizer findings (e.g. uninitialized read) have
 		 * somewhere to fire.  snprintf rather than strlcpy because
 		 * the harness compile line in oss-fuzz doesn't pull in

@@ -79,7 +79,7 @@ static int parallel_user_opt_in = 0;
 static int range_split_min_mb_user = 0;
 
 /* Directory for per-worker SSH stderr capture, set by -W flag.  NULL = off
- * (production default — worker stderr is inherited so connection errors
+ * (production default - worker stderr is inherited so connection errors
  * reach the user's terminal).  When set, each parallel worker writes its
  * SSH child's stderr to <dir>/hpnssh-worker-<pid>.stderr.  Validated to be
  * an existing writable directory at parse time. */
@@ -95,7 +95,7 @@ static const char *worker_log_dir = NULL;
  *     put file3
  * pipelines all three files instead of serialising on each command's wait.
  *
- * Interactive mode leaves this at 0 by default — users expect their prompt
+ * Interactive mode leaves this at 0 by default - users expect their prompt
  * to come back when an upload completes.  A future "job submission mode" in
  * the interactive shell can flip this on per-session via the same hook.
  */
@@ -106,7 +106,7 @@ static int defer_parallel_wait = 0;
  * whenever it detects undelivered files (units_failed_aggregate or
  * walker_failures_aggregate > 0).  Consulted by interactive_loop's
  * final return so the process exits non-zero whenever ANY transfer
- * during the session lost data — even if a later command succeeded
+ * during the session lost data - even if a later command succeeded
  * and reset the local err counter.
  *
  * Why this exists: in interactive (non-batch) mode,
@@ -145,7 +145,7 @@ int global_fflag = 0;
 /*
  * HPNVerifyTransfer: when enabled (ssh_config HPNVerifyTransfer yes,
  * resolved at startup), every successfully transferred single-stream file
- * is XXH3-verified end-to-end after transfer.  A mismatch does NOT abort —
+ * is XXH3-verified end-to-end after transfer.  A mismatch does NOT abort -
  * it is logged loudly and recorded; at exit a summary is printed and the
  * process returns SFTP_EX_VERIFY_FAILED (57).
  */
@@ -753,7 +753,7 @@ parallel_flush(void)
 	/* End-of-transfer summary.  Leads with bytes/throughput so the
 	 * operator gets a one-line health check; appends the respawn
 	 * count when non-zero (so a clean transfer stays terse), and a
-	 * tuning hint when respawn churn crosses ~25 % of -j — the same
+	 * tuning hint when respawn churn crosses ~25 % of -j - the same
 	 * threshold the outlier detector uses, and the empirically
 	 * observed knee-of-the-curve for too many parallel streams on a
 	 * saturated path.  Emitted BEFORE any TRANSFER INCOMPLETE block
@@ -763,7 +763,7 @@ parallel_flush(void)
 		double wired  = (double)pstats.bytes_wired_aggregate;
 		/*
 		 * Primary number is bytes actually transferred (wired) and
-		 * throughput is computed against it — operators care about
+		 * throughput is computed against it - operators care about
 		 * what moved over the network, not what was visited.  When
 		 * chunked-resume or prefix-resume avoided pushing bytes that
 		 * were already correct on the peer, we tack on a "Y skipped
@@ -809,7 +809,7 @@ parallel_flush(void)
 		const char *churn_hint =
 		    (pstats.total_respawns >= respawn_hint_threshold &&
 		     respawn_hint_threshold > 0)
-		    ? " \xe2\x80\x94 consider lowering -j" : "";
+		    ? " - consider lowering -j" : "";
 		if (pstats.total_respawns > 0) {
 			logit("Parallel streams: %.2f %s transferred in %.1fs "
 			    "(%.0f MiB/s)%s; %d worker respawn%s%s",
@@ -853,7 +853,7 @@ parallel_flush(void)
 	}
 
 	/* Drain the failed-paths list and print it.  This is the
-	 * user-facing inventory of what didn't make it — separate from
+	 * user-facing inventory of what didn't make it - separate from
 	 * the per-aggregate counts above because a path can show up via
 	 * the worker-failure or walker-failure code path. */
 	{
@@ -903,8 +903,8 @@ verify_one(struct sftp_conn *conn, const char *local_path,
 		    remote_path);
 		return;
 	}
-	/* r == 1: content mismatch — loud, recorded, but don't abort. */
-	error("VERIFY FAILED: \"%s\" (post-transfer hash mismatch — the "
+	/* r == 1: content mismatch - loud, recorded, but don't abort. */
+	error("VERIFY FAILED: \"%s\" (post-transfer hash mismatch - the "
 	    "transferred file does NOT match the source)", remote_path);
 	verify_fail_list = xreallocarray(verify_fail_list,
 	    verify_fail_count + 1, sizeof(*verify_fail_list));
@@ -1025,7 +1025,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			 * split this file.  sftp_glob already paid an RTT for
 			 * the stat via fudge_stat/fudge_lstat; we just reuse it.
 			 *
-			 * If the lookup misses (rare — typically only the
+			 * If the lookup misses (rare - typically only the
 			 * GLOB_NOCHECK fallback path), do an explicit stat so
 			 * that the single-file get case (the workload most
 			 * likely to benefit from range splitting) still gets
@@ -1070,7 +1070,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 
 	/*
 	 * In deferred-wait mode (batch mode or future "job submission mode"),
-	 * skip the drain — the caller (interactive_loop end-of-batch) will
+	 * skip the drain - the caller (interactive_loop end-of-batch) will
 	 * flush the queue once after all commands have been submitted, which
 	 * lets multiple get commands pipeline their files instead of stalling
 	 * each get on a slow chunk from the previous one.  Err reporting and
@@ -1243,7 +1243,7 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		}
 	}
 
-	/* See process_get — deferred mode skips the per-command drain so
+	/* See process_get - deferred mode skips the per-command drain so
 	 * successive put commands pipeline their files instead of each one
 	 * stalling on a slow tail chunk from the previous file. */
 	if (parallel_orch != NULL && !defer_parallel_wait) {
@@ -2267,7 +2267,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		 * pipeline through the worker pool.
 		 *
 		 * Transitioning from ON to OFF drains any pending work
-		 * first (parallel_flush) — `defer off` is a synchronisation
+		 * first (parallel_flush) - `defer off` is a synchronisation
 		 * barrier as well as a state change.  Going ON to ON or OFF
 		 * to OFF is a no-op.  With no argument, the current state
 		 * is printed.
@@ -2308,7 +2308,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		/* Synchronisation barrier: drain any submissions queued by
 		 * deferred put/get commands.  No-op when nothing is in
 		 * flight or when the orchestrator isn't running.  Always
-		 * safe — independent of the defer flag. */
+		 * safe - independent of the defer flag. */
 		if (parallel_orch != NULL) {
 			if (parallel_flush() != 0)
 				err = -1;
@@ -2906,7 +2906,7 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	 * End-of-batch drain.  In deferred mode (batch mode, or a future
 	 * interactive "job submission mode") process_put / process_get only
 	 * submit to the queue and return; the actual wait happens here.  Safe
-	 * to call unconditionally — parallel_flush() is a no-op when no
+	 * to call unconditionally - parallel_flush() is a no-op when no
 	 * orchestrator exists or no submissions are outstanding.
 	 *
 	 * In non-deferred interactive mode this is also safe: each command
@@ -3058,7 +3058,7 @@ main(int argc, char **argv)
 
 	/*
 	 * Ignore SIGPIPE process-wide.  Without this, a write to a closed
-	 * pipe terminates the entire process — fatal in parallel mode
+	 * pipe terminates the entire process - fatal in parallel mode
 	 * because a worker thread writing to its (now-dead) ssh child
 	 * delivers SIGPIPE to the whole sftp process, killing the control
 	 * connection and the orchestrator as collateral damage.  After this
@@ -3083,7 +3083,7 @@ main(int argc, char **argv)
 	 * BSDgetopt (defines.h macros `optarg` → `BSDoptarg` when
 	 * HAVE_GETOPT_OPTRESET is undefined), so a getopt_long() call
 	 * from glibc writes its own `optarg` while our code reads
-	 * BSDoptarg — they're different symbols.  Easier than wrestling
+	 * BSDoptarg - they're different symbols.  Easier than wrestling
 	 * with that mismatch: pre-scan argv before getopt runs, extract
 	 * any `--bundle-size=N[KMG]` or `--bundle-size N[KMG]`, propagate
 	 * to the parallel layer via `-oHPNBundleSize=...`, and compact
@@ -3154,7 +3154,7 @@ main(int argc, char **argv)
 				argv[j] = argv[j + consume];
 			argc -= consume;
 			argv[argc] = NULL;
-			/* don't increment i — re-examine the now-shifted slot */
+			/* don't increment i - re-examine the now-shifted slot */
 		}
 	}
 
@@ -3314,7 +3314,7 @@ main(int argc, char **argv)
 			 * aid: when set, each parallel worker writes its SSH
 			 * child's stderr to <dir>/hpnssh-worker-<pid>.stderr,
 			 * giving users a clear per-worker log to send when
-			 * reporting failures.  Off by default — production
+			 * reporting failures.  Off by default - production
 			 * inherits stderr so connection errors / banners /
 			 * warnings reach the user's terminal directly.
 			 *
@@ -3323,7 +3323,7 @@ main(int argc, char **argv)
 			 * create it (mkdir-p semantics, mode 0755).  Anything
 			 * else (missing arg, dash-prefixed token, mkdir
 			 * failure, existing path that isn't a directory, no
-			 * write access) is fatal — the user typed something
+			 * write access) is fatal - the user typed something
 			 * they probably didn't mean. */
 			if (optarg == NULL || *optarg == '\0' ||
 			    *optarg == '-')
@@ -3530,18 +3530,18 @@ main(int argc, char **argv)
 		 *   SFTP_TPUT_EMA_ALPHA=F     EMA smoothing factor (default 0.2)
 		 */
 		{
-			/* ENV-VAR SFTP_TPUT_HEALTHY_KBPS — developer-only:
+			/* ENV-VAR SFTP_TPUT_HEALTHY_KBPS - developer-only:
 			 * adaptive stall detector path-health floor (kbps).
 			 * Tuning knob for the throughput-outlier detector; not
 			 * meaningful to end users. */
 			const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
-			/* ENV-VAR SFTP_TPUT_FRACTION — developer-only:
+			/* ENV-VAR SFTP_TPUT_FRACTION - developer-only:
 			 * adaptive stall detector outlier fraction (0–1). */
 			const char *e_f = getenv("SFTP_TPUT_FRACTION");
-			/* ENV-VAR SFTP_TPUT_CONSEC — developer-only:
+			/* ENV-VAR SFTP_TPUT_CONSEC - developer-only:
 			 * adaptive stall detector consecutive-tick count. */
 			const char *e_c = getenv("SFTP_TPUT_CONSEC");
-			/* ENV-VAR SFTP_TPUT_EMA_ALPHA — developer-only:
+			/* ENV-VAR SFTP_TPUT_EMA_ALPHA - developer-only:
 			 * adaptive stall detector EMA smoothing factor. */
 			const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
 			pcfg.tput_path_healthy_kbps =

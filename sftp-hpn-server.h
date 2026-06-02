@@ -1,11 +1,11 @@
-/* sftp-hpn-server.h — HPN-SSH server-side SFTP extensions.
+/* sftp-hpn-server.h - HPN-SSH server-side SFTP extensions.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Server-side HPN extension handlers are isolated here so that
  * sftp-server.c carries a minimal diff against upstream.
  *
  * Current extensions (Phase 3):
- *   hpn-fs-info@hpnssh.org — returns filesystem type and stripe geometry
+ *   hpn-fs-info@hpnssh.org - returns filesystem type and stripe geometry
  *     for a given path, allowing the client to align byte-range parallel
  *     transfers to Lustre/GPFS stripe boundaries.
  *
@@ -41,15 +41,15 @@
  *                                    zero on any error)
  *
  * Status values:
- *   0                          — applied successfully; applied_count valid
- *   HPN_FILE_LAYOUT_NOT_FS     — path is not on a layout-capable filesystem
+ *   0                          - applied successfully; applied_count valid
+ *   HPN_FILE_LAYOUT_NOT_FS     - path is not on a layout-capable filesystem
  *                                (today: not Lustre). Client treats as "skip"
  *                                without warning.
- *   HPN_FILE_LAYOUT_PERM       — server lacks permission to set the layout
+ *   HPN_FILE_LAYOUT_PERM       - server lacks permission to set the layout
  *                                (EPERM / restricted OST pool). Client warns
  *                                once per connection then short-circuits all
  *                                further hpn-file-layout calls.
- *   HPN_FILE_LAYOUT_FAIL       — other error (ENOENT, ENOSPC during OST pick,
+ *   HPN_FILE_LAYOUT_FAIL       - other error (ENOENT, ENOSPC during OST pick,
  *                                etc.). Client warns once and short-circuits.
  *
  * Lustre is the only backend today.  The generic extension name leaves room
@@ -85,7 +85,7 @@
  * real XXH3.
  *
  * Collision probability of a real XXH3 producing the sentinel value is
- * 1 in 2^64 — effectively zero in any realistic workload.
+ * 1 in 2^64 - effectively zero in any realistic workload.
  *
  * Within 19.0: all servers and clients implement this.  Cross-version
  * 19.0 <-> 18.x is handled by the existing extension-advertisement
@@ -125,7 +125,7 @@
  * parallel-worker contention on a single device, that assumption was off
  * by ~4x and triggered watchdog-driven worker kills mid-hash.  With
  * heartbeats, the watchdog timeout (HPN_HEARTBEAT_REFRESH_SEC) is
- * "how long without any word from the server" — independent of file size
+ * "how long without any word from the server" - independent of file size
  * or disk speed.
  *
  * Within 19.0 both ends always speak heartbeats; no negotiation needed.
@@ -145,10 +145,10 @@ struct sshbuf;
  * so this entry point switches on `name` to call the right HPN-side
  * handler.
  *
- *   id      — SFTP request ID from the client
- *   name    — extension name string (one of HPN_EXT_*)
- *   iqueue  — input buffer (positioned after the extension name)
- *   oqueue  — output buffer for the reply
+ *   id      - SFTP request ID from the client
+ *   name    - extension name string (one of HPN_EXT_*)
+ *   iqueue  - input buffer (positioned after the extension name)
+ *   oqueue  - output buffer for the reply
  */
 void sftp_hpn_server_dispatch(u_int id, const char *name,
     struct sshbuf *iqueue, struct sshbuf *oqueue);

@@ -1,4 +1,4 @@
-/* sftp-client-internal.h — narrow internal API exposed by sftp-client.c
+/* sftp-client-internal.h - narrow internal API exposed by sftp-client.c
  * to HPN-only client files (sftp-hpn-client.c).
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
@@ -94,7 +94,7 @@ uint32_t sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback);
 void     sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes);
 
 /*
- * Backpressure signal — caller observed a STATUS read that blocked longer
+ * Backpressure signal - caller observed a STATUS read that blocked longer
  * than the controller's wedge-detection threshold (RDAHEAD_BP_THRESHOLD_SEC
  * in sftp-hpn-client.c, currently 10 s).  Forwards to
  * sftp_hpn_rdahead_backpressure_signal, which halves the in-flight depth
@@ -133,7 +133,7 @@ void sftp_conn_set_layout_set_declined(struct sftp_conn *conn, int v);
 
 /*
  * Cumulative SFTP-payload bytes that actually crossed the wire on this
- * connection — SSH2_FXP_WRITE payload sent (uploads) + SSH2_FXP_DATA
+ * connection - SSH2_FXP_WRITE payload sent (uploads) + SSH2_FXP_DATA
  * payload received (downloads).  Excludes SSH framing / cipher overhead.
  * Distinct from the worker's "work-units completed in bytes" counter,
  * which counts the full file size even when chunked-resume verified the

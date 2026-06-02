@@ -17,7 +17,7 @@
  */
 
 /*
- * sftp-hpn-tar.c — HPN-SSH USTAR codec for the bundle path.
+ * sftp-hpn-tar.c - HPN-SSH USTAR codec for the bundle path.
  *
  * See sftp-hpn-tar.h for API + design.  Replaces libarchive on all
  * four bundle code paths (client UL/DL, server UL/DL).
@@ -110,7 +110,7 @@ tar_put_octal(u_char *buf, size_t off, size_t width, uint64_t value)
 	/* Largest value representable in (width-1) octal digits is
 	 * 8^(width-1) - 1.  For SIZE_OFF (12 bytes), that is 8^11 - 1
 	 * = 8 GiB - 1, which is comfortably above the per-bundle cap.
-	 * For MTIME, 8 GiB seconds is many years past Y2038 — fine.
+	 * For MTIME, 8 GiB seconds is many years past Y2038 - fine.
 	 * Detect overflow by formatting and checking length. */
 	char  tmp[32];
 	int n = snprintf(tmp, sizeof(tmp), "%llo",
@@ -181,12 +181,12 @@ tar_checksum(const u_char *hdr)
 
 /*
  * Split an archive path into (prefix, name) for USTAR.  Returns:
- *    0    — fits in name alone (<=100 chars); prefix is empty.
- *    1    — split successful; *prefix_len is the prefix component
+ *    0    - fits in name alone (<=100 chars); prefix is empty.
+ *    1    - split successful; *prefix_len is the prefix component
  *           length, *name_off is the offset into path where the
  *           name component starts (i.e. just past the "/" we split
  *           on).
- *   -1    — does not fit even with prefix splitting (path too long,
+ *   -1    - does not fit even with prefix splitting (path too long,
  *           or no "/" in a suitable position).
  *
  * USTAR convention: prefix ≤ 155 chars, "/" separator (implicit),
@@ -533,7 +533,7 @@ sftp_hpn_tar_writer_pack_next(struct sftp_hpn_tar_writer *w,
 			if (n == 0) {
 				/* Source file shrank after add_file
 				 * reported size.  We have already committed
-				 * `size` in the header — there is no way to
+				 * `size` in the header - there is no way to
 				 * repair the stream.  Fail the bundle. */
 				writer_set_error(w,
 				    "\"%s\" shrank during read "
@@ -723,7 +723,7 @@ parser_handle_header(struct sftp_hpn_tar_parser *p)
 	}
 
 	/* Typeflag: accept '0' (regular) and '\0' (old-style regular).
-	 * Reject anything else — directories, symlinks, special files
+	 * Reject anything else - directories, symlinks, special files
 	 * are not in our bundle vocabulary. */
 	u_char tf = p->hdr_buf[TAR_TYPE_OFF];
 	if (tf != TAR_TYPE_REG && tf != TAR_TYPE_REG_OLD) {
@@ -747,7 +747,7 @@ parser_handle_header(struct sftp_hpn_tar_parser *p)
 	}
 
 	/* Reconstruct full path: prefix + "/" + name (if prefix non-empty).
-	 * Each side is NUL-terminated within its field — except when the
+	 * Each side is NUL-terminated within its field - except when the
 	 * field is fully used, in which case there's no NUL and we use
 	 * the field width.  Strnlen handles both. */
 	size_t pre_len  = strnlen((const char *)p->hdr_buf + TAR_PREFIX_OFF,
@@ -860,7 +860,7 @@ sftp_hpn_tar_parser_feed(struct sftp_hpn_tar_parser *p,
 
 		if (p->state == PS_PADDING) {
 			/* Padding bytes should be zero but we don't bother
-			 * checking — they're implementation-defined in the
+			 * checking - they're implementation-defined in the
 			 * spec and some tars write garbage.  Just skip. */
 			size_t take = len < p->pad_remaining
 			    ? len : (size_t)p->pad_remaining;

@@ -76,8 +76,8 @@ struct sftp_limits {
 /*
  * Exit code returned by hpnsftp/hpnscp when one or more files fail
  * post-transfer XXH3 verification (HPNVerifyTransfer) or the verified
- * resume gate.  The transfer is NOT aborted on a mismatch — the file is
- * re-transferred (resume) or flagged (verify) and a summary is printed —
+ * resume gate.  The transfer is NOT aborted on a mismatch - the file is
+ * re-transferred (resume) or flagged (verify) and a summary is printed -
  * but the process exits non-zero so automation can detect it.  57 = a
  * Pittsburgh/PSC nod (Heinz 57); chosen to avoid the existing 0/1/255
  * exit codes and the BSD sysexits block (64-78).
@@ -215,7 +215,7 @@ int sftp_download_dir(struct sftp_conn *, const char *, const char *, Attrib *,
  * if 'pflag' is set. If 'verify' is set, the server MUST support the
  * hpn-check-file@hpnssh.org extension: the overlapping prefix is
  * hash-compared before deciding whether to resume or restart. If the
- * extension is unavailable this is fatal (RESUME_INCOMPAT_MSG) — there is
+ * extension is unavailable this is fatal (RESUME_INCOMPAT_MSG) - there is
  * no silent fallback to size-only resume. Plain (verify=0) resume is
  * size-only and works against any server.
  */
@@ -278,7 +278,7 @@ int sftp_upload_batch(struct sftp_conn *, struct sftp_upload_batch_entry *,
  *
  * The legacy sftp_upload_batch() is now a wrapper: send(NULL) + finish().
  * Identical end-to-end behaviour and identical error semantics when called
- * with prev=NULL — existing call sites need no changes. */
+ * with prev=NULL - existing call sites need no changes. */
 struct sftp_upload_batch_pending;
 
 struct sftp_upload_batch_pending *sftp_upload_batch_send(
@@ -296,7 +296,7 @@ int sftp_upload_batch_finish(struct sftp_conn *conn,
  *
  * Bundle upload via the `hpn-bundle-open@hpnssh.org` SFTP extension.
  * Many small files are packed into a single tar-format byte stream and
- * delivered through one OPEN / WRITE×N / CLOSE sequence — amortising the
+ * delivered through one OPEN / WRITE×N / CLOSE sequence - amortising the
  * per-file OPEN/CLOSE round-trip cost that limits small-file throughput
  * even after Phase 4 pipelining.
  *
@@ -330,7 +330,7 @@ struct sftp_hpn_bundle_upload_entry {
  *
  * Returns 0 on success (all entries[].result == 0).  Returns -1 if the
  * bundle failed; all entries[].result are set to -1 in that case (the
- * protocol does not return per-record status — whole-bundle re-queue).
+ * protocol does not return per-record status - whole-bundle re-queue).
  *
  * Returns -1 immediately if conn does not advertise hpn-bundle support.
  * Caller must detect this and fall back to per-file mode.
@@ -349,7 +349,7 @@ int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
 /*
  * Server-advertised HPNMaxBundleSize (from sshd_config) parsed out of
  * the hpn-bundle-max-size@hpnssh.org extension in SSH_FXP_VERSION.
- * Returns 0 if absent — caller treats as "no cap advertised" and
+ * Returns 0 if absent - caller treats as "no cap advertised" and
  * relies on the server's defensive bundle_per_cap rejection if any.
  *
  * The parallel worker init uses this to clamp bundle_target_bytes
@@ -460,10 +460,10 @@ int sftp_precreate(struct sftp_conn *, const char *remote_path, off_t size);
  * pre-created by the orchestrator).  Opens the remote file with O_WRONLY only
  * (no O_CREAT, no O_TRUNC) so concurrent range workers don't clobber each other.
  *
- * local_path    — source file on the local filesystem
- * remote_path   — destination file on the remote server
- * range_offset  — byte offset in both files where this range starts
- * range_length  — number of bytes to transfer
+ * local_path    - source file on the local filesystem
+ * remote_path   - destination file on the remote server
+ * range_offset  - byte offset in both files where this range starts
+ * range_length  - number of bytes to transfer
  *
  * Returns 0 on success, -1 on error.
  */
@@ -477,10 +477,10 @@ int sftp_upload_range(struct sftp_conn *, const char *local_path,
  * only (no O_CREAT, no O_TRUNC) so concurrent range workers don't clobber
  * each other.
  *
- * remote_path   — source file on the remote server
- * local_path    — destination file on the local filesystem
- * range_offset  — byte offset in both files where this range starts
- * range_length  — number of bytes to transfer
+ * remote_path   - source file on the remote server
+ * local_path    - destination file on the local filesystem
+ * range_offset  - byte offset in both files where this range starts
+ * range_length  - number of bytes to transfer
  *
  * Returns 0 on success, -1 on error.
  */

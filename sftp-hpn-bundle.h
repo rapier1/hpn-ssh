@@ -1,11 +1,11 @@
-/* sftp-hpn-bundle.h — shared wire-protocol constants for the HPN-SSH
+/* sftp-hpn-bundle.h - shared wire-protocol constants for the HPN-SSH
  * bundle extensions (hpn-bundle-open@hpnssh.org for upload,
  * hpn-bundle-fetch@hpnssh.org for download).
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  *
  * Both ends MUST agree on these values.  They live in a single header
- * so the compiler enforces the agreement — previously they were
+ * so the compiler enforces the agreement - previously they were
  * defined separately in sftp-hpn-client.c and sftp-hpn-server.c with
  * "must match the other side" comments, which is the kind of contract
  * that drifts during refactoring.
@@ -17,9 +17,9 @@
 /*
  * Bundle flags carried in the SSH_FXP_EXTENDED open / fetch request:
  *
- *   PRESERVE — keep mtime + perm bits on the extracted/packed file
+ *   PRESERVE - keep mtime + perm bits on the extracted/packed file
  *              (mirror of the standard SFTP -p semantics).
- *   FSYNC    — request the server fsync() each file after extraction.
+ *   FSYNC    - request the server fsync() each file after extraction.
  *              Upload-side only; ignored on the download/fetch path
  *              (fsync is a server-side operation).
  *

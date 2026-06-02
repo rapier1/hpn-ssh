@@ -17,22 +17,22 @@
  */
 
 /*
- * sftp-hpn-bundle-client.h — client-side bundle protocol module.
+ * sftp-hpn-bundle-client.h - client-side bundle protocol module.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  *
- * Scope: the client end of the SFTP bundle path —
+ * Scope: the client end of the SFTP bundle path -
  *
- *   hpn-bundle-open@hpnssh.org   (upload  — pack tar bytes,
+ *   hpn-bundle-open@hpnssh.org   (upload  - pack tar bytes,
  *                                  ship via WRITE, drain STATUSes)
- *   hpn-bundle-fetch@hpnssh.org  (download — fire READs ahead,
+ *   hpn-bundle-fetch@hpnssh.org  (download - fire READs ahead,
  *                                  feed wire bytes into the codec
  *                                  parser as they arrive)
  *
  * The public entry points (sftp_hpn_bundle_download,
  * sftp_hpn_bundle_upload) are declared in sftp-client.h because
  * the parallel orchestrator calls them with an opaque struct sftp_conn.
- * This header is intentionally minimal — it documents the module's
+ * This header is intentionally minimal - it documents the module's
  * boundary and serves as an include hook for any future intra-bundle
  * declarations.  Everything inside sftp-hpn-bundle-client.c is static.
  *

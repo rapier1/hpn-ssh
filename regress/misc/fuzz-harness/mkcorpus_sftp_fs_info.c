@@ -1,5 +1,5 @@
 /*
- * mkcorpus_sftp_fs_info.c — generate seed corpus for sftp_fs_info_fuzz.
+ * mkcorpus_sftp_fs_info.c - generate seed corpus for sftp_fs_info_fuzz.
  *
  * Writes a handful of small wire-format blobs to ./sftp_fs_info_corpus/.
  * Each seed is a valid (or boundary-valid) post-framing payload for the
@@ -11,14 +11,14 @@
  *   u64     block_size
  *
  * Seeds:
- *   lustre.bin     — fs_type="lustre", stripe_size=1MiB,
+ *   lustre.bin     - fs_type="lustre", stripe_size=1MiB,
  *                    stripe_count=8, block_size=1MiB
- *   ext4.bin       — fs_type="ext4", zeros for stripe fields,
+ *   ext4.bin       - fs_type="ext4", zeros for stripe fields,
  *                    block_size=4KiB
- *   gpfs.bin       — fs_type="gpfs", zeros for stripe fields,
+ *   gpfs.bin       - fs_type="gpfs", zeros for stripe fields,
  *                    block_size=1MiB
- *   empty.bin      — fs_type="" (length-zero cstring)
- *   maxname.bin    — fs_type set to a 31-byte string (one less than
+ *   empty.bin      - fs_type="" (length-zero cstring)
+ *   maxname.bin    - fs_type set to a 31-byte string (one less than
  *                    the parser's strlcpy limit of 32, so the
  *                    successful-parse branch still fires)
  *

@@ -9,7 +9,7 @@
  */
 
 /*
- * sftp-parallel-walk.c — recursive directory walkers (Approach B) for the
+ * sftp-parallel-walk.c - recursive directory walkers (Approach B) for the
  * parallel-streams orchestrator.  Split out of sftp-parallel.c during the
  * 18.10 cleanup pass.
  *
@@ -72,7 +72,7 @@
  * hpn-file-layout.  Subsequent files created in the directory (including
  * those extracted from bundles) inherit the layout.
  *
- * Silent on every non-Lustre destination — operators of non-Lustre sites
+ * Silent on every non-Lustre destination - operators of non-Lustre sites
  * see nothing change.  On Lustre destinations the actual stripe-set
  * action emits one INFO line per directory modified.  Server-side
  * failure (EPERM, controlled OST pools) emits one WARN line and latches
@@ -95,7 +95,7 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (p == NULL || conn == NULL || dst == NULL)
 		return;
 	if (sftp_conn_layout_set_declined(conn))
-		return;  /* prior failure on this conn — short-circuit */
+		return;  /* prior failure on this conn - short-circuit */
 
 	configured = sftp_conn_lustre_stripe_count(conn);
 	if (configured == 0)
@@ -208,7 +208,7 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	 * subsequently created in this directory (worker writes, bundle
 	 * extraction, walker children) inherit the new layout.  Runs on
 	 * both freshly-created and pre-existing destination dirs by design
-	 * — see HPNLustreStripeCount in hpnssh_config(5) for opt-out.
+	 * - see HPNLustreStripeCount in hpnssh_config(5) for opt-out.
 	 */
 	maybe_apply_lustre_layout(p, conn, dst);
 

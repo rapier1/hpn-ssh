@@ -15,7 +15,7 @@
  * worker SSH connections each open their own SFTP subsystem. A producer
  * thread (typically the caller) submits work units; N worker threads pop
  * units and execute them via the standard sftp_upload / sftp_download /
- * sftp_mkdir APIs. Each worker owns its own struct sftp_conn — no shared
+ * sftp_mkdir APIs. Each worker owns its own struct sftp_conn - no shared
  * cipher state, no shared TCP socket. A reporter thread aggregates per-worker
  * progress counters and drives a single global progress meter.
  *
@@ -34,7 +34,7 @@ struct sftp_parallel;
 struct sftp_conn;	/* opaque; defined in sftp-client.c */
 
 struct sftp_parallel_config {
-	int          num_streams;       /* N — must be >= 1 */
+	int          num_streams;       /* N - must be >= 1 */
 
 	/* Worker SSH connection parameters */
 	const char  *host;              /* required */
@@ -57,7 +57,7 @@ struct sftp_parallel_config {
 	int          range_split_min_mb;
 
 	/* Per-worker SSH stderr capture directory, set by -W flag in sftp.c.
-	 * NULL = off (production default — worker stderr is inherited so
+	 * NULL = off (production default - worker stderr is inherited so
 	 * connection errors reach the user's terminal).  When non-NULL, each
 	 * spawned worker writes its SSH child's stderr to
 	 * <worker_log_dir>/hpnssh-worker-<pid>.stderr.  sftp.c validates the
@@ -114,7 +114,7 @@ struct sftp_parallel_config {
 	 * The existing watchdog detects STALLED/DEAD via TIME since last
 	 * completion. A worker whose TCP cwnd has been hammered into
 	 * collapse may still complete the occasional 10 MiB file at
-	 * ~800 kbps — well below useful throughput, but never crossing
+	 * ~800 kbps - well below useful throughput, but never crossing
 	 * the 60/120 s time threshold. We add an outlier-based detector
 	 * for that case.
 	 *
@@ -123,12 +123,12 @@ struct sftp_parallel_config {
 	 *
 	 * - "Slow link" case: if the fastest worker is itself slow
 	 *   (under tput_path_healthy_kbps), the PATH is the bottleneck
-	 *   and we skip — respawning would only churn.
+	 *   and we skip - respawning would only churn.
 	 * - "Congestion" case: if all workers are similarly slow, no
-	 *   outlier exists, no action taken — respawning would not help.
+	 *   outlier exists, no action taken - respawning would not help.
 	 *
 	 * The detector only acts when one worker is dramatically slower
-	 * than its healthy peers — the cwnd-collapse signature.
+	 * than its healthy peers - the cwnd-collapse signature.
 	 *
 	 * Enabled iff tput_path_healthy_kbps > 0. Per watchdog tick (~1s):
 	 *   1. Sample each worker's bytes_total+live_bytes delta -> raw kbps.
@@ -155,7 +155,7 @@ struct sftp_parallel_config {
 	 * `hpn-conn-stats@hpnssh.org` would let the orchestrator query
 	 * the server's TCP_INFO and cross-check the local-side signal
 	 * against what the receiver actually observed.  Not in this
-	 * first pass — see watchdog_check_workers() for the integration
+	 * first pass - see watchdog_check_workers() for the integration
 	 * point.
 	 */
 	uint64_t     tput_path_healthy_kbps;
@@ -224,7 +224,7 @@ int sftp_resolve_hpn_lustre_stripe_count(const char *host,
  * resume/verify carry the originating command's intent (reget vs regetv,
  * scp -Z).  When either is set the file is submitted whole-file (range-split
  * resume is deferred) and, if verify is set, the remote MUST advertise
- * hpn-check-file@hpnssh.org — otherwise this is fatal (RESUME_INCOMPAT_MSG),
+ * hpn-check-file@hpnssh.org - otherwise this is fatal (RESUME_INCOMPAT_MSG),
  * checked once up front on conn in the calling thread.
  */
 int sftp_parallel_submit_upload(struct sftp_parallel *p,
@@ -240,7 +240,7 @@ int sftp_parallel_submit_download(struct sftp_parallel *p,
  * Walker-helper accessors.  Exposed for sftp-parallel-walk.c (the
  * recursive-directory walkers, split out of sftp-parallel.c) so it
  * doesn't need to see struct sftp_parallel's internals.  All read-only
- * (or write-only-via-helper) — no callers should grow direct field
+ * (or write-only-via-helper) - no callers should grow direct field
  * access to bypass these.
  */
 int sftp_parallel_preserve_flag(const struct sftp_parallel *p);
@@ -260,7 +260,7 @@ int sftp_parallel_num_streams(const struct sftp_parallel *p);
  * or a prior call on the same conn returned a non-success status (the
  * declined-latch is checked first so subsequent calls short-circuit).
  * On success emits one INFO log line.  Safe to call repeatedly on the
- * same directory — Lustre setstripe is idempotent.
+ * same directory - Lustre setstripe is idempotent.
  */
 void maybe_apply_lustre_layout(struct sftp_parallel *p,
     struct sftp_conn *conn, const char *dst);
@@ -407,7 +407,7 @@ struct sftp_parallel_stats {
 	/* Lifetime worker respawn count for this orchestrator session.
 	 * Incremented atomically at respawn dispatch.  Surfaced in the
 	 * end-of-transfer summary as the operator-visible signal for
-	 * "you may have set -j too high" — once respawn churn climbs to
+	 * "you may have set -j too high" - once respawn churn climbs to
 	 * ~25 % of -j, additional workers stop adding throughput because
 	 * they're flapping in and out of the outlier-detector reap path. */
 	int      total_respawns;
@@ -429,7 +429,7 @@ void sftp_parallel_get_stats(struct sftp_parallel *p,
  * Drain the orchestrator's bounded list of paths that could not be
  * delivered (permanent give-up after MAX_RETRIES, workqueue push-fail,
  * walker skip-on-error).  Returns the TOTAL number of failures seen
- * (which may exceed the number of held entries — the held list is
+ * (which may exceed the number of held entries - the held list is
  * bounded at orchestrator init time).
  *
  * If `out_paths` and `out_used` are non-NULL, on return *out_paths is
@@ -454,8 +454,8 @@ uint64_t sftp_parallel_drain_verify_failures(struct sftp_parallel *p,
  * Hard cap on the number of parallel worker SSH connections per process.
  *
  * This is intentionally a compile-time constant, not a runtime parameter.
- * Client-side rate limiting is advisory by nature — a malicious actor with
- * control of their own system can bypass any client-side check — so the
+ * Client-side rate limiting is advisory by nature - a malicious actor with
+ * control of their own system can bypass any client-side check - so the
  * cap exists to prevent accidental self-DoS (e.g. scripts that launch many
  * hpnsftp processes without realising each spawns N workers) rather than
  * to defend against determined abuse.  The correct defence against abusive

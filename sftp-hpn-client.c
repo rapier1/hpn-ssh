@@ -1,5 +1,5 @@
 /*
- * sftp-hpn-client.c — HPN-SSH extensions to the SFTP client connection.
+ * sftp-hpn-client.c - HPN-SSH extensions to the SFTP client connection.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Isolating HPN-specific logic here keeps sftp-client.c's diff against
@@ -52,7 +52,7 @@ static struct {
 	pthread_once_t once;
 } fi_state = { 0, 0, PTHREAD_ONCE_INIT };
 
-/* Parallel struct for SFTP_FAULT_PROTOCOL — triggers protocol violation. */
+/* Parallel struct for SFTP_FAULT_PROTOCOL - triggers protocol violation. */
 static struct {
 	uint64_t       threshold;
 	int            kills_left;
@@ -60,11 +60,11 @@ static struct {
 } fi_pv_state = { 0, 0, PTHREAD_ONCE_INIT };
 
 /*
- * ENV-VAR SFTP_FAULT_INJECT — compile-gated (HPN_FAULT_INJECTION):
+ * ENV-VAR SFTP_FAULT_INJECT - compile-gated (HPN_FAULT_INJECTION):
  * fault-injection knob.  Parsed once from
  * SFTP_FAULT_INJECT=<bytes>[:<max_kills>] :
- *   bytes     — worker connection dies after sending this many bytes.
- *   max_kills — optional; at most this many workers are killed (default: all).
+ *   bytes     - worker connection dies after sending this many bytes.
+ *   max_kills - optional; at most this many workers are killed (default: all).
  * Example: SFTP_FAULT_INJECT=150000:2  kills at most 2 out of N workers.
  * See benchmark/env-vars-reference.md.
  */
@@ -84,11 +84,11 @@ fi_state_init(void)
 }
 
 /*
- * ENV-VAR SFTP_FAULT_PROTOCOL — compile-gated (HPN_FAULT_INJECTION):
+ * ENV-VAR SFTP_FAULT_PROTOCOL - compile-gated (HPN_FAULT_INJECTION):
  * fault-injection knob.  Parsed once from
  * SFTP_FAULT_PROTOCOL=<bytes>[:<max_kills>] :
- *   bytes     — worker fires a protocol violation after sending this many bytes.
- *   max_kills — optional; at most this many workers trigger the fault.
+ *   bytes     - worker fires a protocol violation after sending this many bytes.
+ *   max_kills - optional; at most this many workers trigger the fault.
  * Example: SFTP_FAULT_PROTOCOL=150000:1  triggers one protocol violation.
  * See benchmark/env-vars-reference.md.
  */
@@ -220,7 +220,7 @@ sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
  * ────────────────────────────────────────────────────────────────────────── */
 
 /* Local CLOCK_MONOTONIC reader.  Mirrors the static monotonic_ns() in
- * sftp-parallel.c — kept inline here rather than exposing a shared symbol,
+ * sftp-parallel.c - kept inline here rather than exposing a shared symbol,
  * since this file already has its own time-related primitives. */
 static uint64_t
 sftp_hpn_monotonic_ns(void)
@@ -270,7 +270,7 @@ sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
  * protocol (see sftp-hpn-server.h: HPN_HEARTBEAT_*).  The watchdog pause
  * is now refreshed by each heartbeat the server emits during a long
  * hash, so the initial pause window is a fixed
- * HPN_HEARTBEAT_REFRESH_SEC at every callsite — independent of file
+ * HPN_HEARTBEAT_REFRESH_SEC at every callsite - independent of file
  * size or assumed disk speed.  The old grace formula's 1 GB/s assumption
  * broke under parallel-worker disk contention; heartbeats observe actual
  * progress instead of predicting it.
@@ -288,14 +288,14 @@ sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
 /*
  * Time-based recovery-probe interval (seconds).  When the controller has
  * been shrunk to floor by Part B's backpressure signal, it would
- * normally wait for a full window of `cur` acks before doubling — at
+ * normally wait for a full window of `cur` acks before doubling - at
  * floor=64 on a slow path that can take tens of seconds and was the
  * dominant component of the ~100 s wedge-recovery tails observed in the
  * 2026-05-30 br008 mixed-tree Phase 2b run (iter15, iter16).
  *
  * If we've been at floor with `settled=0` for this long without filling
  * a window, force a doubling without waiting for full-window evidence.
- * This is a probe — if path conditions are still bad, Part B will fire
+ * This is a probe - if path conditions are still bad, Part B will fire
  * again and shrink us back to floor.  Oscillation cost is bounded:
  * one probe-and-shrink cycle every ~15 s (5 s probe interval + ~10 s
  * Part B detection), which is far better than indefinite floor-stuck
@@ -330,7 +330,7 @@ sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
 	hpn->rd.last_rising = hpn->rd.floor;
 	hpn->rd.win_start = monotime_double();
 	hpn->rd.enabled = 1;
-	/* ENV-VAR HPN_RDAHEAD — developer-only: kill switch for the
+	/* ENV-VAR HPN_RDAHEAD - developer-only: kill switch for the
 	 * adaptive read-ahead controller.  Setting HPN_RDAHEAD=fixed
 	 * reverts to the legacy flat num_requests pipeline (a fixed
 	 * in-flight window equal to the -R ceiling).  Any other value or
@@ -341,7 +341,7 @@ sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
 }
 
 /*
- * Current target in-flight depth, or 0 when adaptation is disabled — callers
+ * Current target in-flight depth, or 0 when adaptation is disabled - callers
  * treat 0 as "keep the fixed num_requests pipeline".
  */
 uint32_t
@@ -381,7 +381,7 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
 	 * 2026-05-30 br008 mixed-tree Phase 2b iter15/iter16 runs).
 	 * Force a doubling after RDAHEAD_PROBE_INTERVAL_SEC even without
 	 * a full window's worth of evidence.  If the path is still bad,
-	 * Part B will fire again and shrink us back to floor — bounded
+	 * Part B will fire again and shrink us back to floor - bounded
 	 * oscillation cycle of ~15 s, far better than indefinite floor-
 	 * stuck behaviour.  Restricted to cur==floor so probes never
 	 * accelerate growth above the BDP knee on healthy paths.
@@ -448,7 +448,7 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
 	rd->win_reqs = 0;
 	rd->win_start = now;
 	/* Part D: any successful window that lands cur above floor counts
-	 * as recovery — clear the persistent-degradation counters so a
+	 * as recovery - clear the persistent-degradation counters so a
 	 * future bad patch starts a fresh accounting run. */
 	if (rd->cur > rd->floor) {
 		rd->consecutive_bp_at_floor = 0;
@@ -466,7 +466,7 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
  * clear `settled` so the controller re-probes from the new lower depth,
  * and discard the throughput baseline so the next window's rate isn't
  * compared against the now-invalid pre-wedge measurement.  No-op when the
- * controller is disabled (HPN_RDAHEAD=fixed) — in that mode the caller
+ * controller is disabled (HPN_RDAHEAD=fixed) - in that mode the caller
  * is on a fixed pipeline and has nothing for us to adjust.
  *
  * Analogue: TCP's RTO-triggered multiplicative decrease.  See the
@@ -493,7 +493,7 @@ sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *hpn)
 	rd->win_start = now;
 
 	/*
-	 * Part D — persistent-degradation tracking.  Each backpressure event
+	 * Part D - persistent-degradation tracking.  Each backpressure event
 	 * that lands us at floor adds to the count and, on first arrival,
 	 * stamps the time.  If either reap threshold is crossed, mark the
 	 * connection dead so the orchestrator's existing watchdog reaps and
@@ -518,7 +518,7 @@ sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *hpn)
 			    rd->consecutive_bp_at_floor,
 			    now - rd->time_first_at_floor);
 			hpn->dead = 1;
-			/* Reset Part D state for hygiene — this hpn is
+			/* Reset Part D state for hygiene - this hpn is
 			 * about to be torn down anyway, but a clean state
 			 * means a fresh respawn doesn't inherit anything. */
 			rd->consecutive_bp_at_floor = 0;
@@ -546,7 +546,7 @@ sftp_hpn_rdahead_cap(struct sftp_hpn_conn *hpn, uint32_t fallback)
 /*
  * Next read-ahead window for the DOWNLOAD-style ramp sites (sftp_download,
  * sftp_download_range, sftp_crossload): feed `nbytes` to the controller, then
- * return the new window — the adaptive depth, or the legacy +1 ramp
+ * return the new window - the adaptive depth, or the legacy +1 ramp
  * (cur -> cur+1, capped at `cap`) when adaptation is disabled.
  */
 uint32_t
@@ -598,7 +598,7 @@ sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
 			sftp_hpn_set_protocol_violation(hpn);
 			return -1;
 		}
-		/* No slot — restore and disarm for this connection. */
+		/* No slot - restore and disarm for this connection. */
 		__atomic_fetch_add(&fi_pv_state.kills_left, 1,
 		    __ATOMIC_SEQ_CST);
 		hpn->fault_pv_after_bytes = 0;
@@ -616,7 +616,7 @@ sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
 			hpn->dead = 1;
 			return -1;
 		}
-		/* No slot — restore and disarm for this connection. */
+		/* No slot - restore and disarm for this connection. */
 		__atomic_fetch_add(&fi_state.kills_left, 1, __ATOMIC_SEQ_CST);
 		hpn->fault_after_bytes = 0;
 	}
@@ -632,8 +632,8 @@ sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
  * Helpers for chunked resume.  See sftp-hpn-client.h for the public API
  * and the design rationale at project_chunked_resume_plan.md in memory.
  *
- * sftp_hpn_xxhash_local_range — local XXH3 over an open fd's range
- * sftp_hpn_hash_remote_ranges  — wire-level sftp-hash-range@hpnssh.org query
+ * sftp_hpn_xxhash_local_range - local XXH3 over an open fd's range
+ * sftp_hpn_hash_remote_ranges  - wire-level sftp-hash-range@hpnssh.org query
  */
 
 #define HASH_RANGE_READ_BUF_LEN	65536U
@@ -681,7 +681,7 @@ sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
 		    (u_int64_t)sizeof(buf), remaining);
 		nread = read(fd, buf, toread);
 		if (nread == 0)
-			break;	/* short read — caller may treat as
+			break;	/* short read - caller may treat as
 				 * truncated; we hash what we got */
 		if (nread < 0) {
 			if (errno == EINTR)
@@ -803,7 +803,7 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 			 */
 			logit_f("sftp-hash-range \"%s\": server reported "
 			    "error (%s); the destination may have storage / "
-			    "FS / permission issues — falling back to "
+			    "FS / permission issues - falling back to "
 			    "whole-file hash",
 			    path,
 			    (errmsg != NULL && *errmsg != '\0')
@@ -870,17 +870,17 @@ out:
  * Tunables for chunked resume.  Defaults chosen per the locked design
  * (project_chunked_resume_plan.md memory):
  *
- *  CHUNK_HASH_CHUNK_SIZE       — granularity of re-transfer.  64 MiB makes
+ *  CHUNK_HASH_CHUNK_SIZE       - granularity of re-transfer.  64 MiB makes
  *                                per-chunk protocol overhead (16 B request,
  *                                8 B response) negligible vs. typical
  *                                missed-chunk transfer cost.
- *  CHUNK_HASH_MIN_FILE_SIZE    — below this, skip the chunked path; the
+ *  CHUNK_HASH_MIN_FILE_SIZE    - below this, skip the chunked path; the
  *                                full-file hash gate is cheaper than the
  *                                chunked-request round trip on small files.
  *                                Chosen as 2 * CHUNK_SIZE so any engaged
  *                                run has at least two chunks to map.
  *  CHUNK_HASH_MAX_RANGES_PER_REQUEST
- *                              — must match server-side cap in
+ *                              - must match server-side cap in
  *                                sftp-hpn-server.c (SFTP_HASH_RANGE_MAX_RANGES).
  *                                Bounds server-side allocation against an
  *                                unbounded request; the server allocates
@@ -1093,7 +1093,7 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 		goto out;
 	}
 
-	/* Chunk layout identical to the upload sibling — the last chunk
+	/* Chunk layout identical to the upload sibling - the last chunk
 	 * clamps to EOF and the server's matching XXH3 (also clamped) lines
 	 * up with the local hash. */
 	for (i = 0; i < n_chunks; i++) {

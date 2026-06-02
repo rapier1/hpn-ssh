@@ -2485,7 +2485,7 @@ safe_path_fd(int fd, const char *file, struct passwd *pw,
  * tree is fine.  Returns 0 on success or -1 (errno set) on the first
  * mkdir failure that isn't EEXIST.
  *
- * An existing path that isn't a directory is treated as success here —
+ * An existing path that isn't a directory is treated as success here -
  * we only care that the path is reachable.  Callers that need the
  * leaf to be a directory should stat afterward.
  */

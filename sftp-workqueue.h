@@ -64,7 +64,7 @@ int sftp_workqueue_trypop(struct sftp_workqueue *q, void **itemp);
  */
 void sftp_workqueue_shutdown(struct sftp_workqueue *q);
 
-/* Current number of items in the queue. Snapshot — may be stale by the
+/* Current number of items in the queue. Snapshot - may be stale by the
  * time the caller reads it, which is fine for telemetry. */
 size_t sftp_workqueue_depth(struct sftp_workqueue *q);
 

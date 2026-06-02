@@ -76,7 +76,7 @@ sftp_bundle_extract_fuzz: sftp_bundle_extract_fuzz.o
 sftp_fs_info_fuzz: sftp_fs_info_fuzz.o $(COMMON_DEPS)
 	$(CXX) -o $@ sftp_fs_info_fuzz.o $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
 
-# Corpus generators — built with plain CFLAGS (no sanitizer/fuzzer).
+# Corpus generators - built with plain CFLAGS (no sanitizer/fuzzer).
 # These are dev tools, not fuzz targets; they emit binary seed files
 # into ./sftp_bundle_extract_corpus/ and ./sftp_fs_info_corpus/.
 mkcorpus_sftp_bundle_extract: mkcorpus_sftp_bundle_extract.c

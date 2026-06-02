@@ -120,7 +120,7 @@ run_check(const char *ssh_binary, const char *socket_path, const char *host)
 	if (pid < 0)
 		return -1;
 	if (pid == 0) {
-		/* child: silence stdout/stderr — we only care about exit code */
+		/* child: silence stdout/stderr - we only care about exit code */
 		int devnull = open("/dev/null", O_WRONLY);
 		if (devnull >= 0) {
 			dup2(devnull, STDOUT_FILENO);
@@ -248,7 +248,7 @@ sftp_cm_start(const struct sftp_cm_config *cfg)
 		if (r == cm->pid) {
 			cm->pid = -1;
 			error_f("ControlMaster exited before auth completed "
-			    "(status %d) — is pubkey/agent auth set up?",
+			    "(status %d) - is pubkey/agent auth set up?",
 			    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 			goto fail;
 		}

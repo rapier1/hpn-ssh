@@ -3597,7 +3597,7 @@ fi
 # ── Phase 5: bundle codec ─────────────────────────────────────────────────
 # 2026-05-31: libarchive removed in favour of the in-tree USTAR codec
 # (sftp-hpn-tar.{c,h}).  The codec is pure C99 with no external library
-# dependencies — no configure check needed.  See
+# dependencies - no configure check needed.  See
 # project_libarchive_removal.md for rationale (streaming impedance
 # mismatch fixed; security surface reduced; we used ~5% of libarchive).
 LIBARCHIVE=""

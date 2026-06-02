@@ -44,7 +44,7 @@ cmp ${COPY}.1 ${COPY}.2 || \
     fail "gate (download): same-size content mismatch was NOT re-transferred"
 
 # A genuinely identical destination must be detected as complete (skipped),
-# and the result must still match — i.e. no false "re-transfer" needed and
+# and the result must still match - i.e. no false "re-transfer" needed and
 # no corruption.
 verbose "$tid: reputv treats an identical destination as complete"
 rm -f ${COPY}.1 ${COPY}.2

@@ -1380,7 +1380,7 @@ channel_pre_connecting(struct ssh *ssh, Channel *c)
  * This routine breaks that trap by forcibly setting SO_RCVBUF larger when
  * we see the signature: non-trivial RTT (not a LAN) AND retransmits seen.
  * Setting SO_RCVBUF sets SOCK_RCVBUF_LOCK in the kernel, which disables
- * native autotune for this socket — so subsequent calls here act as a
+ * native autotune for this socket - so subsequent calls here act as a
  * userspace autotune that can grow further if needed.
  *
  * Returns the (possibly grown) SO_RCVBUF size.
@@ -1409,7 +1409,7 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 
 	/* Diagnostic snapshot every check so we can see why rescue does or
 	 * doesn't fire. tcpi_total_retrans is sender-side, so on the receiver
-	 * it's typically 0 — we don't gate on it. */
+	 * it's typically 0 - we don't gate on it. */
 	debug_f("rcvbuf check: cur=%u min_rtt=%uus rtt=%uus retrans=%u "
 	    "rcv_space=%u bytes_recv=%llu",
 	    current_size, ti.tcpi_min_rtt, ti.tcpi_rtt,
@@ -1449,7 +1449,7 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 
 	/*
 	 * Setting SO_RCVBUF also sets SOCK_RCVBUF_LOCK, which freezes
-	 * tcp_rcv_space_adjust() — so rcv_ssthresh (which the kernel uses
+	 * tcp_rcv_space_adjust() - so rcv_ssthresh (which the kernel uses
 	 * to clamp the *advertised* window) stays at whatever autotune
 	 * had it at the moment of rescue. Force the window clamp up to
 	 * the new buffer size so subsequent ACKs can actually advertise
@@ -2703,7 +2703,7 @@ channel_check_window(struct ssh *ssh, Channel *c)
 		 * drained, causing the sender to flood the receiver and refill
 		 * the buffer rapidly. Without deferral the window shrinks
 		 * gradually under backpressure and recovers proportionally as
-		 * the buffer drains — no burst, no oscillation. When output is
+		 * the buffer drains - no burst, no oscillation. When output is
 		 * empty the scale factor is 1.0 and behaviour is identical to
 		 * before.
 		 */
@@ -2730,7 +2730,7 @@ channel_check_window(struct ssh *ssh, Channel *c)
 			    c->local_window_max);
 		}
 
-		/* Always reset local_consumed — no deferral. */
+		/* Always reset local_consumed - no deferral. */
 		c->local_consumed = 0;
 
 		if (grant == 0)

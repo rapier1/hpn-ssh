@@ -19,7 +19,7 @@ start_sshd
 
 # Build a many-small-files dataset that comfortably hits the bundle
 # accumulator (default 4 MiB target).  Twenty 16 KiB files = 320 KiB
-# total — small enough to pack as a single bundle per worker, large
+# total - small enough to pack as a single bundle per worker, large
 # enough that the directory walk exercises the batch path.
 make_dataset() {
 	for i in 01 02 03 04 05 06 07 08 09 10 \
@@ -69,7 +69,7 @@ EOF
 	    fail "$label: downloaded tree differs from source"
 }
 
-# Pass 1: defaults — bundle path enabled (server advertises the
+# Pass 1: defaults - bundle path enabled (server advertises the
 # extension; HPNUseBundle defaults to yes).
 bundle_round_trip "default (bundle enabled)"
 

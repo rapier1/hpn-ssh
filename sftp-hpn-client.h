@@ -1,4 +1,4 @@
-/* sftp-hpn-client.h — HPN-SSH extensions to the SFTP client connection.
+/* sftp-hpn-client.h - HPN-SSH extensions to the SFTP client connection.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * All HPN-specific per-connection state is isolated here so that
@@ -28,7 +28,7 @@
  * Adaptive SFTP read-ahead controller (HPN).
  *
  * The stock client keeps a fixed pipeline of num_requests (-R, default 1024)
- * outstanding 128 KB requests — ~128 MB in flight per connection.  The
+ * outstanding 128 KB requests - ~128 MB in flight per connection.  The
  * receive side must buffer all of it, so on a fat pipe with N parallel
  * workers process RSS and the kernel SO_RCVBUF balloon into the GB range,
  * far past what throughput actually needs.
@@ -36,12 +36,12 @@
  * This controller instead probes for the SMALLEST depth that saturates the
  * path.  Over a sliding window of one depth's worth of completed requests it
  * measures app-layer throughput, then multiplicatively grows the depth (x2)
- * while throughput keeps rising (an RTT-bound ramp — growing by 1 would take
+ * while throughput keeps rising (an RTT-bound ramp - growing by 1 would take
  * thousands of RTTs to fill a fat pipe), and settles at the last depth that
  * still gained once throughput plateaus (the BDP knee); a deeper pipe that
  * reduces throughput (overshoot) likewise falls back to that last-good depth.
  * -R stays a hard ceiling.  Per-connection, so each parallel worker tunes
- * itself.  App-layer only — no TCP_INFO dependency, portable across every OS
+ * itself.  App-layer only - no TCP_INFO dependency, portable across every OS
  * we support.
  */
 struct sftp_rdahead {
@@ -53,10 +53,10 @@ struct sftp_rdahead {
 	uint64_t win_bytes;   /* bytes accumulated in the current window */
 	double   win_start;   /* monotime_double() at window open */
 	double   last_rate;   /* smoothed throughput of previous window (bytes/s) */
-	int      settled;     /* 1 once the knee is found — stop probing */
+	int      settled;     /* 1 once the knee is found - stop probing */
 	int      enabled;     /* 0 => legacy fixed depth (HPN_RDAHEAD=fixed) */
 
-	/* Part D — persistent-degradation tracking.  Backpressure events
+	/* Part D - persistent-degradation tracking.  Backpressure events
 	 * occurring while already at floor accumulate here.  When the
 	 * controller can't keep cur above floor for an extended period,
 	 * the connection is marked dead so the orchestrator's existing
@@ -103,7 +103,7 @@ struct sftp_hpn_conn {
 	/* HPNVerifyTransfer state, propagated from ssh_config at sftp_init
 	 * time so the resume-decision hash callers can ask the server for
 	 * the real XXH3 (HPN_CHECK_FILE_STRICT) instead of accepting the
-	 * sparse-skip sentinel.  See [[verify-nomenclature-collision]] —
+	 * sparse-skip sentinel.  See [[verify-nomenclature-collision]] -
 	 * HPNVerifyTransfer here also gates the resume-decision-flow
 	 * trust optimisation, not just the post-transfer integrity check. */
 	int              verify_transfer_enabled;
@@ -123,7 +123,7 @@ struct sftp_hpn_conn {
 	/* HPNLustreStripeCount resolved from ssh_config at sftp_init time.
 	 *   -1  : auto (use -j N as the desired count when destination is
 	 *         on Lustre and currently has stripe_count < N)
-	 *    0  : feature disabled — never call hpn-file-layout
+	 *    0  : feature disabled - never call hpn-file-layout
 	 *   >0  : explicit override; ask for this stripe count when the
 	 *         destination is Lustre and currently has stripe_count <
 	 *         this value
@@ -147,13 +147,13 @@ struct sftp_hpn_conn {
 	 * would reject mid-stream. */
 	uint64_t         server_max_bundle_size;
 
-	/* Adaptive read-ahead controller — sizes the in-flight request
+	/* Adaptive read-ahead controller - sizes the in-flight request
 	 * window to the path BDP instead of a flat num_requests. */
 	struct sftp_rdahead rd;
 
 #ifdef HPN_FAULT_INJECTION
-	/* SFTP_FAULT_INJECT=bytes[:max_kills]   — simulates connection death.
-	 * SFTP_FAULT_PROTOCOL=bytes[:max_kills] — simulates protocol violation. */
+	/* SFTP_FAULT_INJECT=bytes[:max_kills]   - simulates connection death.
+	 * SFTP_FAULT_PROTOCOL=bytes[:max_kills] - simulates protocol violation. */
 	uint64_t fault_after_bytes;    /* die after N bytes sent (0=off) */
 	uint64_t fault_pv_after_bytes; /* protocol violation after N bytes (0=off) */
 	uint64_t fault_bytes_sent;     /* bytes sent so far on this connection */
@@ -240,7 +240,7 @@ uint32_t sftp_hpn_rdahead_window(struct sftp_hpn_conn *, size_t nbytes,
 void     sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *);
 
 /*
- * Part D — persistent-degradation reap thresholds.  When the controller
+ * Part D - persistent-degradation reap thresholds.  When the controller
  * has been forced to floor by repeated backpressure events (TCP wedge,
  * sustained server slowdown, etc.) and isn't recovering, mark the
  * connection dead so the orchestrator can replace it with a fresh TCP
@@ -249,14 +249,14 @@ void     sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *);
  *   _BP_COUNT      consecutive backpressure events while cur==floor
  *   _SEC           total wallclock time spent at floor in this run
  *
- * Chosen values are deliberately conservative — the goal is to give a
+ * Chosen values are deliberately conservative - the goal is to give a
  * truly-broken connection a way out without thrashing legitimate
  * transient slowdowns.  5 events of Part B firing at floor is well past
  * what any healthy path produces; 60 s at floor without recovery means
  * the floor-doubling probes (Part C) haven't found any headroom either.
  *
  * The reap signal itself feeds the existing orchestrator respawn
- * machinery (cooldowns, total_respawns, BORN_SLOW budgets) — Part D
+ * machinery (cooldowns, total_respawns, BORN_SLOW budgets) - Part D
  * adds a trigger, not a parallel respawn path.  See the design
  * discussion at reporter_dispatch_respawns in sftp-parallel.c for why
  * thrash protection stays session-wide for now.
@@ -325,7 +325,7 @@ struct sftp_conn;
  *
  * Caller must verify `sftp_conn_has_hash_range(conn)` before calling; if
  * the extension is not advertised, this returns -1 immediately with a
- * debug log (the upstream lacks-extension case is not loud — it's expected).
+ * debug log (the upstream lacks-extension case is not loud - it's expected).
  */
 int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
     const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out);
@@ -334,12 +334,12 @@ int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
  *
  * Ask the server to set a Lustre stripe count on `path` (must be an
  * existing directory).  Subsequent file creations in that directory
- * inherit the layout — including files unpacked from a bundle stream.
+ * inherit the layout - including files unpacked from a bundle stream.
  *
  * Returns one of HPN_FILE_LAYOUT_OK / _NOT_FS / _PERM / _FAIL.  The caller
  * is responsible for:
  *   - gating on sftp_conn_has_file_layout(conn) before calling
- *   - gating on sftp_conn_layout_set_declined(conn) — a previous
+ *   - gating on sftp_conn_layout_set_declined(conn) - a previous
  *     non-success reply latches that flag and subsequent calls should
  *     skip the wire round trip
  *   - latching the flag via sftp_conn_set_layout_set_declined(conn, 1)
@@ -356,12 +356,12 @@ int sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
  * Watchdog pause: tell the parallel orchestrator's worker-fault watchdog
  * that this worker is about to spend up to `seconds` doing legitimate
  * non-byte-transfer work (typically a verify-hash phase, but the primitive
- * is generic — any code path that knows it will be quiet on the SFTP wire
+ * is generic - any code path that knows it will be quiet on the SFTP wire
  * for an extended interval can use it).  The watchdog suppresses its
  * inactivity-based kills (born-dead, silence, isolation escalation,
  * throughput-outlier, born-slow) until the deadline expires or
  * sftp_hpn_watchdog_resume() is called.  The SSH-child-gone check continues
- * to fire regardless — pause cannot save a worker whose ssh transport has
+ * to fire regardless - pause cannot save a worker whose ssh transport has
  * physically exited.
  *
  * Multiple calls extend the pause to the LATER of the existing deadline
@@ -373,7 +373,7 @@ int sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
  * Pass HPN_HEARTBEAT_REFRESH_SEC (from sftp-hpn-server.h) for the initial
  * grace window when entering a hash extension call; the server emits
  * heartbeats during long hashes and each one refreshes the pause for
- * another HPN_HEARTBEAT_REFRESH_SEC — so the watchdog tracks actual
+ * another HPN_HEARTBEAT_REFRESH_SEC - so the watchdog tracks actual
  * server progress rather than a size-derived prediction that fell apart
  * under parallel-worker disk contention.
  */
@@ -408,9 +408,9 @@ int sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
  *   - local hashing failed (I/O error on the source)
  *
  * Returns:
- *    1  all chunks matched — file is already identical, caller should
+ *    1  all chunks matched - file is already identical, caller should
  *       skip (return 1 from sftp_upload).
- *    0  one or more chunks mismatched — they have been re-transferred
+ *    0  one or more chunks mismatched - they have been re-transferred
  *       successfully, caller should treat the upload as complete
  *       (return 0 from sftp_upload).
  *   -1  declined or any failure during the chunked path; caller should
@@ -436,7 +436,7 @@ int sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
  * success and on server-side hash failure.
  *
  * Returns:
- *    1  all chunks matched — local file already identical to remote, caller
+ *    1  all chunks matched - local file already identical to remote, caller
  *       should treat the resume as skip (sets skip_ret=1, goto resume_fail).
  *    0  one or more chunks mismatched and were re-fetched successfully,
  *       caller should treat the download as complete (sets skip_ret=0,

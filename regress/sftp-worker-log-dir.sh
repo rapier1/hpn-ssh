@@ -3,7 +3,7 @@
 #
 #	Verifies the -W <dir> flag: each parallel worker should write its
 #	SSH child's stderr to <dir>/hpnssh-worker-<pid>.stderr.  Also
-#	checks that without -W no such files appear under <dir> — the
+#	checks that without -W no such files appear under <dir> - the
 #	production default is "inherit stderr".
 
 tid="sftp -W worker log directory"
@@ -40,7 +40,7 @@ if [ ${nlogs} -lt 1 ]; then
 	fail "-W ${LOGDIR}: expected at least one hpnssh-worker-*.stderr file, got ${nlogs}"
 fi
 # We deliberately do NOT assert non-empty content here.  -W's contract is
-# "create the per-worker stderr file at the documented path" — it cannot
+# "create the per-worker stderr file at the documented path" - it cannot
 # guarantee that ssh emits anything.  Under the regress framework, $SSH is
 # wrapped by ssh-log-wrapper.sh which invokes ssh -E <logfile>, peeling
 # debug output OFF stderr into a separate file; our redirect then catches

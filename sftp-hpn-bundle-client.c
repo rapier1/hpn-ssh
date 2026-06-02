@@ -17,7 +17,7 @@
  */
 
 /*
- * sftp-hpn-bundle-client.c — client-side SFTP bundle protocol.
+ * sftp-hpn-bundle-client.c - client-side SFTP bundle protocol.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Extracted from sftp-hpn-client.c on 2026-05-31 as part of the
@@ -88,7 +88,7 @@
 /*
  * Match a tar record pathname back to an entries[] slot.  The server
  * sets the pathname to the original remote_path verbatim, so this is
- * an exact string match.  Linear scan — bundles are 32–256 entries.
+ * an exact string match.  Linear scan - bundles are 32–256 entries.
  */
 static int
 bundle_dl_lookup_entry(struct sftp_hpn_bundle_download_entry *entries, int n,
@@ -151,7 +151,7 @@ bundle_dl_mkdir_p(const char *dirpath, mode_t mode)
  * Default per-worker memory ceiling on in-flight READ requests, in
  * bytes.  Bounds (in_flight × CHUNK_BYTES) ≤ this value.  Overridable
  * at runtime via HPN_BUNDLE_QUEUE_MAX_BYTES.  32 MiB / 128 KiB = 256
- * outstanding chunks — enough for ~10 Gbps × 25 ms or 1 Gbps × 250 ms.
+ * outstanding chunks - enough for ~10 Gbps × 25 ms or 1 Gbps × 250 ms.
  *
  * Note: with the codec replacing libarchive, client-side memory is
  * actually dominated by the SSH transport's input buffer, not by any
@@ -172,7 +172,7 @@ struct bundle_dl_stream {
 	const u_char     *handle;
 	size_t            handle_len;
 
-	/* SFTP wire pipeline tracking — IDs are sequential within
+	/* SFTP wire pipeline tracking - IDs are sequential within
 	 * the receive loop because nothing else allocates msg_id. */
 	u_int    first_read_id;
 	int      first_read_id_set;
@@ -197,7 +197,7 @@ struct bundle_dl_stream {
 				 * owns the storage; we just point at it) */
 	time_t   cur_mtime;	/* used by entry_end_cb */
 
-	/* (D) Most-recently-mkdir_p'd parent dir — skip repeats. */
+	/* (D) Most-recently-mkdir_p'd parent dir - skip repeats. */
 	char    *last_mkdir_dir;
 
 	/* Sticky error: data_cb / entry_end_cb / etc. failed. */
@@ -205,7 +205,7 @@ struct bundle_dl_stream {
 };
 
 /*
- * ENV-VAR HPN_BUNDLE_QUEUE_MAX_BYTES — developer-only: per-worker
+ * ENV-VAR HPN_BUNDLE_QUEUE_MAX_BYTES - developer-only: per-worker
  * memory ceiling on in-flight READ requests for the bundle download
  * path.  Bounds in_flight_count × BUNDLE_DL_CHUNK_BYTES ≤ this value.
  *
@@ -221,7 +221,7 @@ struct bundle_dl_stream {
  *
  * The previous in-file bundle_dl_parse_bytes helper was deduplicated
  * against the server-side parse_bytes_arg by routing both through
- * scan_scaled (2026-05-31 cleanup) — the rest of the codebase uses
+ * scan_scaled (2026-05-31 cleanup) - the rest of the codebase uses
  * scan_scaled for the same job, so the bundle modules now follow the
  * project idiom.
  */
@@ -325,7 +325,7 @@ bundle_dl_data_cb(void *ctx, const u_char *data, size_t len)
 	size_t remaining;
 
 	if (s->cur_idx < 0) {
-		/* Tar entry not in our requested set — discard bytes.
+		/* Tar entry not in our requested set - discard bytes.
 		 * (Shouldn't normally happen since the server packs only
 		 * the paths we asked for.) */
 		return 0;
@@ -421,13 +421,13 @@ bundle_dl_stream_fire_one(struct bundle_dl_stream *s)
 /*
  * Drain one outstanding reply and feed any DATA bytes through the
  * codec parser inline.  No intermediate queue.  Returns:
- *    0  — DATA reply consumed (parser fed); continue
- *    1  — parser signalled EOA (two zero blocks seen); stop firing
- *    2  — STATUS reply with SSH_FX_EOF received from server
+ *    0  - DATA reply consumed (parser fed); continue
+ *    1  - parser signalled EOA (two zero blocks seen); stop firing
+ *    2  - STATUS reply with SSH_FX_EOF received from server
  *         (server has no more bytes; we should stop firing).
  *         May happen before EOA if we asked for more bytes than the
  *         bundle has; treated identically to (1) for the caller.
- *   -1  — error.
+ *   -1  - error.
  */
 static int
 bundle_dl_stream_drain_one(struct bundle_dl_stream *s,
@@ -512,7 +512,7 @@ bundle_dl_stream_drain_one(struct bundle_dl_stream *s,
 }
 
 /* Drain remaining outstanding replies after EOA / EOF, discarding any
- * DATA payload.  Same purpose as before the codec swap — keep the
+ * DATA payload.  Same purpose as before the codec swap - keep the
  * channel state consistent before CLOSE. */
 static int
 bundle_dl_stream_drain_inflight(struct bundle_dl_stream *s)
@@ -666,7 +666,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 
 		if (in_flight == 0) {
 			/* No reads in flight (cap is below CHUNK_BYTES?
-			 * That should have been clamped — log + fail). */
+			 * That should have been clamped - log + fail). */
 			error_f("hpn-bundle-fetch: stuck with zero in-flight "
 			    "(max_inflight_bytes=%zu)",
 			    stream.max_inflight_bytes);
@@ -677,11 +677,11 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 		if (dr < 0)
 			goto cleanup;
 		if (dr == 1) {
-			/* Parser hit EOA — stop firing, drain orphans. */
+			/* Parser hit EOA - stop firing, drain orphans. */
 			stream.eoa_seen = 1;
 			done = 1;
 		} else if (dr == 2) {
-			/* Server hit EOF before we saw EOA — bundle was
+			/* Server hit EOF before we saw EOA - bundle was
 			 * shorter than we asked for.  Parser may or may
 			 * not have seen its end-of-archive depending on
 			 * what the server packed; either way we stop. */
@@ -748,13 +748,13 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
  */
 
 /* Bundle flag constants (HPN_BUNDLE_FLAG_*) and HPN_BUNDLE_BLOCK_BYTES
- * live in sftp-hpn-bundle.h (included above) — single source of truth
+ * live in sftp-hpn-bundle.h (included above) - single source of truth
  * shared with the server side. */
 
 /*
  * Hard ceiling on outstanding (unread) STATUS replies.  The adaptive
  * read-ahead controller (sftp_hpn_rdahead_*) drives the *operational*
- * depth — small on LAN (RDAHEAD_FLOOR == 64) growing toward this cap on
+ * depth - small on LAN (RDAHEAD_FLOOR == 64) growing toward this cap on
  * fat HPC pipes.  This constant serves two roles:
  *   1. Upper bound the controller probes toward (its `cap`).
  *   2. Sizing the per-WRITE size ring buffer (ctx->wsizes) used by
@@ -775,7 +775,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
  *
  * Because rids come from sftp_conn_alloc_msg_id and SFTP replies are
  * returned in request order, we don't need to track each pending rid
- * individually — the rid of drain #k is simply first_rid + k.
+ * individually - the rid of drain #k is simply first_rid + k.
  */
 struct bundle_write_ctx {
 	struct sftp_conn *conn;
@@ -792,7 +792,7 @@ struct bundle_write_ctx {
 	 * Ring of per-WRITE byte counts so bundle_drain_n can feed the
 	 * exact ack size into sftp_hpn_rdahead_account().  Indexed by
 	 * (n_sent % wsizes_cap) on store, (n_drained % wsizes_cap) on read.
-	 * Always sized to BUNDLE_MAX_INFLIGHT — the ceiling on inflight
+	 * Always sized to BUNDLE_MAX_INFLIGHT - the ceiling on inflight
 	 * means index reuse is safe.  NULL if allocation failed; the
 	 * controller-feed becomes a no-op and we still send/drain correctly.
 	 */
@@ -1048,7 +1048,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		if (entries[i].local_path == NULL ||
 		    entries[i].remote_path == NULL)
 			continue;
-		/* (F) skip stat if the walker already provided size+mtime —
+		/* (F) skip stat if the walker already provided size+mtime -
 		 * not currently in the entry struct, so stat() until that
 		 * field gets added.  TODO: extend the entry struct. */
 		if (stat(entries[i].local_path, &sb) < 0) {
@@ -1086,7 +1086,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 			goto cleanup;
 		}
 		if (produced == 0)
-			break;	/* EOA reached — all bytes sent */
+			break;	/* EOA reached - all bytes sent */
 		if (bundle_ul_send_write(&ctx, outbuf, (size_t)produced) != 0)
 			goto cleanup;
 	}
@@ -1135,7 +1135,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		}
 	}
 
-	rc = 0;   /* success — entries[].result already set to 0 above */
+	rc = 0;   /* success - entries[].result already set to 0 above */
 
  cleanup:
 	/* If we sent WRITEs but bailed before draining, consume the

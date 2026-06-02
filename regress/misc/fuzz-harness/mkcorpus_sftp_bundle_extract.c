@@ -1,17 +1,17 @@
 /*
- * mkcorpus_sftp_bundle_extract.c — generate seed corpus for
+ * mkcorpus_sftp_bundle_extract.c - generate seed corpus for
  * sftp_bundle_extract_fuzz.
  *
  * Writes a handful of small tarballs to ./sftp_bundle_extract_corpus/.
  * Each seed exercises a different point on the tar-pathname spectrum
  * the harness cares about:
  *
- *   normal.tar       — single entry, plain ASCII name
- *   multi.tar        — three entries
- *   deep.tar         — nested directory path (a/b/c/d.txt)
- *   utf8.tar         — non-ASCII pathname
- *   traversal.tar    — entry with "..", which bundle_path_is_safe MUST reject
- *   absolute.tar     — entry with leading "/", which bundle_path_is_safe
+ *   normal.tar       - single entry, plain ASCII name
+ *   multi.tar        - three entries
+ *   deep.tar         - nested directory path (a/b/c/d.txt)
+ *   utf8.tar         - non-ASCII pathname
+ *   traversal.tar    - entry with "..", which bundle_path_is_safe MUST reject
+ *   absolute.tar     - entry with leading "/", which bundle_path_is_safe
  *                      rejects when dest_dir is non-empty
  *
  * Why include the rejection-path seeds: libFuzzer mutates from seeds,

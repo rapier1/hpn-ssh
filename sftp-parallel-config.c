@@ -9,7 +9,7 @@
  */
 
 /*
- * sftp-parallel-config.c — bridge between ssh_config and the
+ * sftp-parallel-config.c - bridge between ssh_config and the
  * parallel-streams orchestrator config.
  *
  * Reads the user's ssh_config files using the same machinery as
@@ -57,7 +57,7 @@
  *
  * Returns 0 on success or -1 if the explicit user config file was
  * provided but couldn't be opened (matches ssh.c's fatal() behaviour
- * loosely — we return an error instead of exiting, since the caller
+ * loosely - we return an error instead of exiting, since the caller
  * may want to fall back to defaults).
  */
 static int

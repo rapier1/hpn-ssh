@@ -1,5 +1,5 @@
 /*
- * sftp_bundle_extract_fuzz.cc — libFuzzer harness for the server-side
+ * sftp_bundle_extract_fuzz.cc - libFuzzer harness for the server-side
  * tar-extraction path of the HPN-SSH bundle extension
  * (hpn-bundle-open@hpnssh.org).
  *
@@ -27,7 +27,7 @@
  * NB: bundle_path_is_safe is `static` in sftp-hpn-server.c and the
  * server TU pulls in heavy server-only dependencies (sftp-server.c,
  * handle table, etc.) that we don't want linked into a fuzz harness.
- * Inline a verbatim copy here with a sync comment — if you change
+ * Inline a verbatim copy here with a sync comment - if you change
  * the validator in sftp-hpn-server.c, mirror the change below.
  */
 
@@ -117,7 +117,7 @@ fuzz_one_pass(const uint8_t *data, size_t size, const char *dest_dir)
 		const char *path = archive_entry_pathname(ae);
 		/*
 		 * Trigger the validator on every entry.  We don't care about
-		 * the return value — libFuzzer cares about whether the call
+		 * the return value - libFuzzer cares about whether the call
 		 * crashes, reads OOB, or trips a sanitizer.
 		 */
 		(void)bundle_path_is_safe(path, dest_dir);

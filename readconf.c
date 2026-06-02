@@ -4119,7 +4119,7 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oHPNVerifyTransfer, o->hpn_verify_transfer);
 	dump_cfg_int(oHPNMaxRetries, o->hpn_max_retries);
 	dump_cfg_int(oHPNMaxAuthConcurrent, o->hpn_max_auth_concurrent);
-	/* oHPNBundleSize — int64 byte count; printed plain (operator can
+	/* oHPNBundleSize - int64 byte count; printed plain (operator can
 	 * compare against the K/M/G suffix they configured). */
 	printf("hpnbundlesize %lld\n", (long long)o->hpn_bundle_size);
 	dump_cfg_fmtint(oFallback, o->fallback);
