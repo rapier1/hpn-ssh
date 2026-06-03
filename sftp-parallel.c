@@ -1777,7 +1777,6 @@ worker_run_bundle(struct sftp_worker *w,
 	uint64_t total_bytes = 0;
 	int i, ok_count = 0;
 	uint64_t t_start_ns, t_end_ns, elapsed_us;
-	struct sftp_hpn_bundle_phase_us _bt;	/* INSTR-BUNDLE-TIMING */
 
 	entries = xcalloc(bn, sizeof(*entries));
 	for (i = 0; i < bn; i++) {
@@ -1801,7 +1800,7 @@ worker_run_bundle(struct sftp_worker *w,
 	 * Slight wire-size cost (full path repeated in every tar header)
 	 * but trivial compared to the small-file payloads. */
 	int bundle_rc = sftp_hpn_bundle_upload(w->conn, "", entries, bn,
-	    p->cfg.preserve_flag, p->cfg.fsync_flag, &_bt);	/* INSTR-BUNDLE-TIMING (&_bt) */
+	    p->cfg.preserve_flag, p->cfg.fsync_flag);
 
 	t_end_ns = monotonic_ns();
 	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
@@ -1815,20 +1814,10 @@ worker_run_bundle(struct sftp_worker *w,
 			    (1024.0 * 1024.0)) /
 			    ((double)elapsed_us / 1e6);
 		logit("BUNDLE worker=%d files=%d ok=%d bytes=%llu "
-		    "elapsed_us=%llu MiBps=%.2f "
-		    "open_us=%llu queue_us=%llu packsend_us=%llu "	/* INSTR-BUNDLE-TIMING */
-		    "read_us=%llu send_us=%llu "			/* INSTR-BUNDLE-TIMING */
-		    "drain_us=%llu close_us=%llu",			/* INSTR-BUNDLE-TIMING */
+		    "elapsed_us=%llu MiBps=%.2f",
 		    w->id, bn, ok_count,
 		    (unsigned long long)total_bytes,
-		    (unsigned long long)elapsed_us, mibps,
-		    (unsigned long long)_bt.open_us,			/* INSTR-BUNDLE-TIMING */
-		    (unsigned long long)_bt.queue_us,			/* INSTR-BUNDLE-TIMING */
-		    (unsigned long long)_bt.packsend_us,		/* INSTR-BUNDLE-TIMING */
-		    (unsigned long long)_bt.read_us,			/* INSTR-BUNDLE-TIMING */
-		    (unsigned long long)_bt.send_us,			/* INSTR-BUNDLE-TIMING */
-		    (unsigned long long)_bt.drain_us,			/* INSTR-BUNDLE-TIMING */
-		    (unsigned long long)_bt.close_us);			/* INSTR-BUNDLE-TIMING */
+		    (unsigned long long)elapsed_us, mibps);
 	}
 
 	/* Bundle wire failed (server refused open, transport error): the
