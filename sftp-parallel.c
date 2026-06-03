@@ -382,11 +382,13 @@ enum sftp_op {
  * Shared across the N range work units that make up a single
  * SFTP_OP_DOWNLOAD_RANGE or SFTP_OP_UPLOAD_RANGE transfer.  Detects
  * partial-range failure: if even one range gives up permanently after
- * retries, the pre-allocated file is silently corrupt (some range
- * offsets contain the just-written bytes, others contain zeros from
- * the pre-allocation).  Without this tracker the user has no way to
- * know - the file exists at the expected size with no error
- * indicator.
+ * retries, the pre-allocated file is full-size with HOLES (some range
+ * offsets contain the just-written bytes, others are still zeros from
+ * the pre-allocation).  The tracker does NOT delete such a file - it
+ * is left in place, resumable via verified resume (reputv / regetv,
+ * which refills only the mismatched ranges) - and reports it loudly so
+ * the user and automation know it is incomplete rather than finding a
+ * full-size file with no error indicator.
  *
  * Protocol (last-completer-frees):
  *   range_tracker_new returns a heap-allocated tracker with
@@ -399,8 +401,9 @@ enum sftp_op {
  *   NEVER on a retry (the unit isn't done yet).  The function takes
  *   the mutex, sets any_failed on give-up, decrements remaining.
  *   Exactly one caller sees remaining transition to 0; that caller
- *   does the post-mortem cleanup (unlink corrupt file if any_failed,
- *   destroy the mutex, free the tracker) and is the LAST owner.
+ *   does the post-mortem cleanup (report the incomplete file if
+ *   any_failed - leaving it in place, resumable - then destroy the
+ *   mutex and free the tracker) and is the LAST owner.
  *
  *   Other callers see remaining > 0 after their decrement and return
  *   without touching the struct further - by design, they cannot
@@ -411,8 +414,8 @@ enum sftp_op {
  *
  *   (I1) Exactly `total` finalize calls per tracker, no more, no less.
  *        Over-calling drives remaining negative (undefined: free-after-
- *        free, double-unlink).  Under-calling leaks the tracker AND
- *        leaves the corrupt file in place.
+ *        free, double-free).  Under-calling leaks the tracker AND
+ *        suppresses the incomplete-file report.
  *
  *   (I2) Finalize fires on FINAL completion only.  On retry, the
  *        unit goes back on the workqueue and finalize must NOT be
@@ -426,11 +429,12 @@ enum sftp_op {
  *        worker_process_result / worker_give_up_unit, so the dead
  *        pointer is unreachable.)
  *
- *   (I4) Worker context `w` is required only when target=REMOTE and
- *        any_failed=1 (we need w->conn to sftp_rm the corrupt remote
- *        file).  Pass NULL for LOCAL targets or when no worker
- *        context exists (e.g., synthesised finalize during a submit
- *        failure in submit_*_ranges).
+ *   (I4) Worker context `w` is retained in the signature but is no
+ *        longer dereferenced: finalize used to need w->conn to sftp_rm
+ *        a corrupt remote file, but incomplete files are now left in
+ *        place for resume instead of removed.  Passing NULL is always
+ *        safe (e.g., synthesised finalize during a submit failure in
+ *        submit_*_ranges).
  *
  *   (I5) range_tracker_finalize(NULL, ...) is a no-op.  Non-range
  *        work units have u->range_tracker == NULL; that's the
@@ -1270,7 +1274,7 @@ static int
 range_tracker_finalize(struct sftp_range_tracker *t, int failed,
     struct sftp_worker *w)
 {
-	int was_last, should_remove;
+	int was_last, incomplete;
 
 	if (t == NULL)
 		return 0;
@@ -1279,47 +1283,41 @@ range_tracker_finalize(struct sftp_range_tracker *t, int failed,
 	if (failed)
 		t->any_failed = 1;
 	t->remaining--;
-	was_last      = (t->remaining == 0);
-	should_remove = was_last && t->any_failed;
+	was_last   = (t->remaining == 0);
+	incomplete = was_last && t->any_failed;
 	pthread_mutex_unlock(&t->mu);
 
 	if (!was_last)
 		return 0;
 
-	if (should_remove) {
-		if (t->target == SFTP_RANGE_TARGET_LOCAL) {
-			if (unlink(t->path) == 0) {
-				error("range-split: unlinked corrupt local "
-				    "file \"%s\" - at least one range failed "
-				    "permanently after retries", t->path);
-			} else {
-				error("range-split: local file \"%s\" is "
-				    "corrupt (partial range failure) but "
-				    "unlink failed: %s",
-				    t->path, strerror(errno));
-			}
-		} else {
-			/* REMOTE: need an SFTP connection to remove.  If the
-			 * caller didn't supply a worker (shouldn't happen for
-			 * upload-range), the corrupt remote file stays - log
-			 * loudly so the user knows. */
-			if (w != NULL && w->conn != NULL &&
-			    sftp_rm(w->conn, t->path) == 0) {
-				error("range-split: removed corrupt remote "
-				    "file \"%s\" - at least one range failed "
-				    "permanently after retries", t->path);
-			} else {
-				error("range-split: remote file \"%s\" is "
-				    "corrupt (partial range failure); remove "
-				    "FAILED - user must clean up manually",
-				    t->path);
-			}
-		}
+	if (incomplete) {
+		/*
+		 * At least one byte-range failed permanently after retries,
+		 * so the pre-allocated file is now full-size with HOLES (the
+		 * failed ranges are still zeros from fallocate).  Do NOT
+		 * delete it.  Leaving it in place keeps it RESUMABLE: the
+		 * user re-runs verified resume (reputv for uploads, regetv
+		 * for downloads), which uses sftp-hash-range@hpnssh.org to
+		 * hash each range and refill only the mismatched ones -
+		 * salvaging every range that already transferred instead of
+		 * forcing a full re-send.  Unlinking would throw all that
+		 * good data away.  Report loudly so the user and any
+		 * automation know the file is incomplete; the non-zero
+		 * process exit comes from the failed-path accounting at the
+		 * give-up site (worker_record_failed_path).
+		 */
+		error("range-split: %s file \"%s\" is INCOMPLETE - at least "
+		    "one byte-range failed permanently after retries. The "
+		    "file is left in place and is resumable: re-run with "
+		    "verified resume (reputv / regetv) to refill the "
+		    "missing ranges.",
+		    t->target == SFTP_RANGE_TARGET_LOCAL ? "local" : "remote",
+		    t->path);
 	}
 	pthread_mutex_destroy(&t->mu);
 	free(t->path);
 	free(t);
-	return should_remove;
+	return incomplete;
 }
 
 /* ---------- Worker thread ---------- */
@@ -1582,8 +1580,22 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		 * completer for the file frees the tracker. */
 		(void)range_tracker_finalize(u->range_tracker, 0, w);
 		free_unit(u);
-	} else if (++u->attempt < hpn_max_retries(p)) {
-		/* Re-queue without freeing. Keeps pending counter consistent. */
+	} else if (sftp_conn_is_dead(w->conn) ||
+	    ++u->attempt < hpn_max_retries(p)) {
+		/*
+		 * Re-queue without freeing (keeps the pending counter
+		 * consistent).  A dead connection (wedge / peer-stall /
+		 * transport drop) is a TRANSIENT, blameless failure: this
+		 * worker is about to break the main loop and be respawned, so
+		 * the || short-circuit skips ++u->attempt and the unit is
+		 * retried WITHOUT charging the retry budget.  This is the
+		 * br008 j8 data-loss fix - peer-stall churn used to burn
+		 * u->attempt up to MAX_RETRIES and permanently abandon the
+		 * byte-range.  Only a failure on a still-LIVE connection
+		 * (ambiguous server error) charges u->attempt and stays
+		 * bounded by MAX_RETRIES.  No hot-loop: the re-queuing worker
+		 * exits, and the respawn delay + cooldown pace the retry.
+		 */
 		if (u->size > 0)
 			__atomic_fetch_add(&p->queued_bytes,
 			    (uint64_t)u->size, __ATOMIC_RELAXED);
@@ -1634,7 +1646,13 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 		free_unit(u);
 		return;
 	}
-	if (++u->attempt < hpn_max_retries(p)) {
+	if (sftp_conn_is_dead(w->conn) || ++u->attempt < hpn_max_retries(p)) {
+		/*
+		 * Transient (dead-conn) failures re-queue WITHOUT charging
+		 * u->attempt - the || short-circuit skips the increment; see
+		 * the full rationale in worker_process_result.  Only a
+		 * still-live-connection ambiguous error charges the budget.
+		 */
 		__atomic_store_n(&w->live_bytes, 0, __ATOMIC_RELAXED);
 		if (u->size > 0)
 			__atomic_fetch_add(&p->queued_bytes,
