@@ -551,6 +551,7 @@ tcp_health_tick(void)
 	    h.raw.notsent_bytes, (unsigned long long)h.raw.delivery_rate,
 	    h.raw.total_rto_time);
 
+	static int ps_waiting = 0;
 	switch (sftp_hpn_classify(&tcp_health, &h)) {
 	case SFTP_HPN_WEDGE_TCP_WEDGE:
 		logit("HPN: worker TCP connection wedged (cwnd=%u rtt=%uus "
@@ -559,8 +560,35 @@ tcp_health_tick(void)
 		cleanup_exit(HPN_EXIT_TCP_WEDGE);
 		break;
 	case SFTP_HPN_WEDGE_PEER_STALL:
-		logit("HPN: worker peer not draining (receive window pinned) "
-		    "- self-terminating");
+		/*
+		 * Peer-stall = the remote isn't draining right now (receive
+		 * window pinned, cwnd healthy) - a transient backend stall
+		 * (e.g. a Lustre write-back flush) that recovers on its own
+		 * when the backend catches up.  Monitor only, do NOT self-
+		 * terminate: killing the worker doesn't make the backend drain
+		 * faster, it just discards a warm cwnd and forces a slow-start
+		 * into the same backend, which re-stalls (the churn storm).
+		 * Validated on br008 (wait vs kill: 5/5 vs 3/5 completion,
+		 * ~3.85x faster).  The wait is bounded: a stall sustained past
+		 * PEER_STALL_BRAKE_SECS becomes PEER_STALL_BRAKE below and we do
+		 * reap.  ps_waiting edge-triggers the log so a long stall doesn't
+		 * spam.
+		 */
+		if (!ps_waiting) {
+			logit("HPN: worker peer not draining (receive window "
+			    "pinned) - waiting for the backend to drain");
+			ps_waiting = 1;
+		}
+		break;
+	case SFTP_HPN_WEDGE_PEER_STALL_BRAKE:
+		/*
+		 * Emergency brake: the peer has pinned our send window for over
+		 * 5 minutes straight.  That is no longer a transient backend
+		 * flush - the far end is wedged.  Self-terminate so the
+		 * orchestrator reaps and respawns onto a fresh session.
+		 */
+		logit("HPN: worker peer not draining for over 5 minutes "
+		    "(receive window pinned) - self-terminating");
 		cleanup_exit(HPN_EXIT_TCP_PEER_STALL);
 		break;
 	case SFTP_HPN_WEDGE_PATH_DEGRADED:
@@ -569,6 +597,7 @@ tcp_health_tick(void)
 		    "(cwnd=%u rtt=%uus)", h.raw.snd_cwnd, h.raw.rtt);
 		break;
 	case SFTP_HPN_WEDGE_NONE:
+		ps_waiting = 0;	/* recovered; let a later stall episode re-log */
 		break;
 	}
 	schedule_tcp_health_check();

@@ -966,6 +966,13 @@ srv_tcp_health_tick(struct ssh *ssh)
 		srv_terminate_worker(ssh, HPN_EXIT_TCP_WEDGE, reason);
 		return;
 	case SFTP_HPN_WEDGE_PEER_STALL:
+	case SFTP_HPN_WEDGE_PEER_STALL_BRAKE:
+		/* NOTE: the download side still reaps on peer-stall at the
+		 * WEDGE_SUSTAIN_SECS floor (it was never converted to the
+		 * client's wait-not-kill), so the BRAKE horizon is not reached
+		 * here - both verdicts terminate.  Bringing this to parity
+		 * (wait, then brake at PEER_STALL_BRAKE_SECS) is a pending
+		 * decision. */
 		snprintf(reason, sizeof(reason),
 		    "parallel worker peer stall from %s: recv window pinned, "
 		    "cwnd=%u, %.1f MB unsent",

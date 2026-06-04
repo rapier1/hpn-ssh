@@ -261,8 +261,18 @@ static int hpn_max_retries(struct sftp_parallel *p);
  * (~1 RTT after the worker enters the main loop) and the first OPEN
  * round-trip (~1 RTT on a 50ms path).  Anything faster risks killing
  * workers whose first chunk happens to span a slow OST.
+ *
+ * RTT-dependent (br008 A/B, 2026-06-04): the *right* tolerance is ~100
+ * round-trips, not a fixed 5s.  At 51ms RTT 5s was correct; at 151ms a
+ * transient backend stall takes longer to clear (it's the same recoverable
+ * rwnd-pin as peer-stall, just caught at the start of a unit), so 5s
+ * over-fired and ~15s held throughput.  The effective threshold is therefore
+ * derived from the measured path RTT: born_dead_sec = clamp(rtt_ms/10,
+ * BORN_DEAD_KILL_SEC, BORN_DEAD_SEC_MAX) (integer, mantissa dropped), set in
+ * sftp_parallel_set_path_rtt.
  */
-#define BORN_DEAD_KILL_SEC        5
+#define BORN_DEAD_KILL_SEC        5    /* floor (RTT <= ~59ms) */
+#define BORN_DEAD_SEC_MAX        40    /* cap (RTT >= ~400ms) */
 
 /*
  * Born-slow fast-kill threshold.  A worker that has completed at least one
@@ -374,6 +384,19 @@ static int hpn_max_retries(struct sftp_parallel *p);
  */
 #define SYNC_STALL_WINDOW     20    /* ~20 s window */
 #define SYNC_STALL_THRESHOLD  0.20  /* fraction at which the log line warns */
+
+/*
+ * Fleet abort.  Give up on the whole transfer only when no worker is alive and
+ * the fleet cannot re-establish a working connection - never while any single
+ * worker is still moving data OR heart-beating (a long verify/hash holds the
+ * watchdog pause; see HPN_HEARTBEAT_* in sftp-hpn-server.h).  The window below
+ * is how long aggregate fleet progress must be zero; the multiplier sets how
+ * many consecutive respawns must die without producing a byte (this multiplier
+ * times num_streams) before we conclude reconnects are not taking hold.
+ */
+#define FLEET_ABORT_NOPROGRESS_SEC    60  /* default zero-progress window (s) */
+#define FLEET_ABORT_UNPRODUCTIVE_MULT  2  /* abort after this * num_streams worker
+                                           * deaths that never produced a byte */
 
 /*
  * Escalation timeout: how long we let a SIGTERMed SSH child clean up before
@@ -699,6 +722,10 @@ struct sftp_worker {
 						* for reaping */
 	int                doomed;             /* (B) set by watchdog before
 						* SIGTERM; prevents double-kill */
+	const char        *doom_reason;        /* (B) which watchdog path doomed
+						* it (born_dead/isolation/stall/
+						* dead/tput_outlier/born_slow);
+						* emitted in the reap trace */
 	uint64_t           doom_ns;            /* (B) monotonic ns when
 						* SIGTERM was sent; consulted by
 						* SIGKILL-escalation deadline when
@@ -945,6 +972,25 @@ struct sftp_parallel {
 	int      born_slow_accepting;    /* slow workers accepted (born-slow gated
 	                                  * off) this watchdog tick; reset each
 	                                  * pass, read by reporter_flare */
+
+	/*
+	 * Fleet abort (see the FLEET_ABORT_* comment): give up on the whole
+	 * transfer only when no worker is alive and the fleet cannot reconnect -
+	 * never while one worker is still moving data or heart-beating.  Fires
+	 * only when ALL hold: zero aggregate progress for noprogress_abort_s,
+	 * no worker watchdog-paused, unproductive_deaths >= FLEET_ABORT_UNPRODUCTIVE_MULT
+	 * * num_streams, and units pending.  HPN_NOPROGRESS_ABORT_SEC overrides the
+	 * window; 0 disables the abort entirely.
+	 */
+	int      noprogress_abort_s;     /* zero-progress window (s); 0 = abort off */
+	int      noprogress_consec_ticks;/* consecutive whole-fleet zero-progress ticks */
+	int      unproductive_deaths;    /* consecutive worker deaths that produced 0
+	                                  * lifetime bytes; reset on any fleet progress
+	                                  * or heartbeat (a sign of life) */
+	int      last_worker_exit_code;  /* last reaped worker's exit code, -1 if
+	                                  * signaled/unknown; for the abort message */
+	int      born_dead_sec;          /* 0-bytes kill threshold; RTT-derived in
+	                                  * sftp_parallel_set_path_rtt */
 
 	/* Optional per-worker stats CSV (enabled via HPN_WORKER_STATS_CSV env).
 	 * Opened lazily by the reporter on first tick; closed at orchestrator
@@ -2773,6 +2819,8 @@ watchdog_check_sync_stall(struct sftp_parallel *p)
 {
 	uint64_t now_bytes = 0;
 	uint64_t total_in_flight = 0;
+	uint64_t now_ns = monotime_ns();
+	int any_paused = 0;	/* any worker heart-beating through a verify/hash */
 
 	pthread_mutex_lock(&p->workers_mu);
 	for (int i = 0; i < p->num_workers; i++) {
@@ -2783,6 +2831,8 @@ watchdog_check_sync_stall(struct sftp_parallel *p)
 		    w->units_failed;
 		pthread_mutex_unlock(&w->mu);
 		now_bytes += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
+		if (sftp_conn_watchdog_pause_until_ns(w->conn) > now_ns)
+			any_paused = 1;
 	}
 	now_bytes += p->retired_bytes;
 	pthread_mutex_unlock(&p->workers_mu);
@@ -2791,9 +2841,62 @@ watchdog_check_sync_stall(struct sftp_parallel *p)
 	    ? (now_bytes - p->sync_stall_prev_bytes) : 0;
 	p->sync_stall_prev_bytes = now_bytes;
 
-	/* First tick: prev_bytes was 0; delta = all bytes ever, not a stall. */
-	if (p->sync_stall_window_pos > 0 && delta == 0 && total_in_flight > 0)
+	pthread_mutex_lock(&p->pending_mu);
+	uint64_t pending = p->pending;
+	pthread_mutex_unlock(&p->pending_mu);
+
+	/* Sync-stall observer (write-cache saturation signal): zero aggregate
+	 * progress WHILE a unit is in flight.  First tick: prev_bytes was 0 so
+	 * delta = all bytes ever, not a stall. */
+	int stalled_now = (p->sync_stall_window_pos > 0 && delta == 0 &&
+	    total_in_flight > 0);
+	if (stalled_now)
 		p->sync_stall_ticks++;
+
+	/* Fleet-abort no-progress window: zero aggregate progress while work
+	 * REMAINS and no worker is heart-beating.  Unlike the observer above this
+	 * does NOT require a unit in flight, so it still accrues when every worker
+	 * is failing to connect (bad keys, dead backend) and holds no unit - the
+	 * case total_in_flight == 0 would otherwise mask. */
+	if (p->sync_stall_window_pos > 0 && delta == 0 && pending > 0 &&
+	    !any_paused)
+		p->noprogress_consec_ticks++;
+	else
+		p->noprogress_consec_ticks = 0;
+
+	/* Any sign of life resets the unproductive-death streak: a worker moved
+	 * bytes this tick, or one is heart-beating through a long verify/hash
+	 * (watchdog-paused).  Either way the fleet is not dead. */
+	if (delta > 0 || any_paused)
+		p->unproductive_deaths = 0;
+
+	/*
+	 * Fleet abort.  Give up on the whole transfer only when EVERY base
+	 * condition holds: zero aggregate fleet progress for the window, NO
+	 * worker heart-beating (a verify/hash would hold the watchdog pause),
+	 * FLEET_ABORT_UNPRODUCTIVE_MULT * num_streams consecutive respawns that
+	 * each died without producing a byte (reconnects are not taking hold), and
+	 * work still pending.  A single worker still moving data or heart-beating
+	 * keeps the
+	 * transfer alive - the no-progress window and the unproductive-death
+	 * streak both reset on any sign of life above.
+	 */
+	if (p->noprogress_abort_s > 0 && !p->abort_flag && !any_paused &&
+	    pending > 0 &&
+	    p->noprogress_consec_ticks >= p->noprogress_abort_s) {
+		int abort_n = p->cfg.num_streams * FLEET_ABORT_UNPRODUCTIVE_MULT;
+		if (abort_n < 2)
+			abort_n = 2;
+		if (p->unproductive_deaths >= abort_n) {
+			error("transfer stalled: no worker can establish a working "
+			    "connection (%d consecutive respawns produced no data, "
+			    "last worker exit %d), 0 bytes moved for ~%ds with "
+			    "%llu unit(s) pending - aborting",
+			    p->unproductive_deaths, p->last_worker_exit_code,
+			    p->noprogress_consec_ticks, (unsigned long long)pending);
+			sftp_parallel_abort(p);
+		}
+	}
 
 	if (++p->sync_stall_window_pos >= SYNC_STALL_WINDOW) {
 		double frac = (double)p->sync_stall_ticks / SYNC_STALL_WINDOW;
@@ -2833,6 +2936,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
     uint64_t now, int queue_has_work, int *tput_dead_this_tick)
 {
 	enum worker_health prev, next;
+	const char *doom_reason = NULL;	/* set at whichever DEAD site fires */
 
 	pthread_mutex_lock(&w->mu);
 	prev = w->health;
@@ -2891,8 +2995,10 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			pid_t wr = waitpid(w->ssh_pid, &wstatus,
 			    WNOHANG | WNOWAIT);
 			if (wr == w->ssh_pid ||
-			    (wr == -1 && errno == ECHILD))
+			    (wr == -1 && errno == ECHILD)) {
 				next = WORKER_DEAD;
+				doom_reason = "child_gone";
+			}
 		}
 
 		/*
@@ -2940,7 +3046,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		if (next != WORKER_DEAD && in_flight > 0
 		    && w_units_completed == 0 && w_bytes_total == 0
 		    && w_live_bytes == 0
-		    && since_unit_start_ns > (uint64_t)BORN_DEAD_KILL_SEC
+		    && since_unit_start_ns > (uint64_t)p->born_dead_sec
 		        * 1000000000ULL) {
 			debug_ft("worker %d: born-dead fast-kill "
 			    "(unit_start=%llus, 0 bytes, 0 completions)",
@@ -2948,14 +3054,16 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			    (unsigned long long)
 			    (since_unit_start_ns / 1000000000ULL));
 			next = WORKER_DEAD;
+			doom_reason = "born_dead";
 		}
 
 		if (next != WORKER_DEAD && queue_has_work && in_flight > 0 &&
 		    effective_silence_ns > 0) {
 			uint64_t s = effective_silence_ns / 1000000000ULL;
-			if (s > DEAD_THRESHOLD_SEC)
+			if (s > DEAD_THRESHOLD_SEC) {
 				next = WORKER_DEAD;
-			else if (s > STALL_THRESHOLD_SEC)
+				doom_reason = "dead";
+			} else if (s > STALL_THRESHOLD_SEC)
 				next = WORKER_STALLED;
 		} else if (!queue_has_work && in_flight > 0 &&
 		    effective_silence_ns > 0) {
@@ -2990,8 +3098,10 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			    w->tput_ema_kbps <
 			        p->cfg.tput_path_healthy_kbps) {
 				next = WORKER_DEAD;
+				doom_reason = "isolation";
 			} else if (s > STALL_THRESHOLD_SEC) {
 				next = WORKER_DEAD;
+				doom_reason = "iso_stall";
 			}
 		}
 
@@ -3029,6 +3139,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			if (consec >= 2 * req) {
 				if (!*tput_dead_this_tick) {
 					next = WORKER_DEAD;
+					doom_reason = "tput_outlier";
 					*tput_dead_this_tick = 1;
 				} else {
 					/* Throttle: another worker already
@@ -3059,9 +3170,13 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 * (best-effort) until the path recovers.  No separate budget.
 		 */
 		if (next != WORKER_DEAD
+		    && !w->doomed
 		    && p->cfg.tput_path_healthy_kbps > 0
 		    && w->tput_below_floor_ticks >= BORN_SLOW_TICKS) {
-			/* Worker qualifies as born-slow (persistently below floor). */
+			/* Worker qualifies as born-slow (persistently below floor).
+			 * The !w->doomed guard stops a worker already killed (but not
+			 * yet reaped) from re-triggering each tick (next resets to
+			 * HEALTHY every pass). */
 			uint64_t floor =
 			    (uint64_t)(p->cfg.tput_path_healthy_kbps *
 			        BORN_SLOW_FLOOR_FRAC);
@@ -3076,6 +3191,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 				    (unsigned long long)floor,
 				    w->tput_below_floor_ticks);
 				next = WORKER_DEAD;
+				doom_reason = "born_slow";
 			} else {
 				/* Gated off: no healthy peer (whole-fleet stall) or a
 				 * cooldown is active.  Accept this slow-but-working
@@ -3146,6 +3262,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			if (!already_doomed) {
 				w->doomed = 1;
 				w->doom_ns = now;
+				w->doom_reason = doom_reason;
 			}
 			pthread_mutex_unlock(&w->mu);
 			if (!already_doomed) {
@@ -3360,8 +3477,8 @@ static void
 classify_worker_death(const struct sftp_worker *w, int have_status, int status)
 {
 	if (w->doomed) {
-		debug_ft("worker %d: reaped after orchestrator termination",
-		    w->id);
+		debug_ft("worker %d: reaped after orchestrator termination (%s)",
+		    w->id, w->doom_reason ? w->doom_reason : "doomed");
 		return;
 	}
 	if (!have_status) {
@@ -3457,6 +3574,10 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 	for (int i = 0; i < n_reap; i++) {
 		struct sftp_worker *w = to_reap[i];
 		pthread_join(w->tid, NULL);
+		/* Worker thread has exited; no concurrent writer, so this read
+		 * needs no lock.  Lifetime committed bytes feed the fleet-abort
+		 * unproductive-death streak below. */
+		uint64_t lifetime_bytes = w->bytes_total;
 		if (w->conn) sftp_free(w->conn);
 		if (w->fd_in >= 0) close(w->fd_in);
 		if (w->fd_out >= 0) close(w->fd_out);
@@ -3469,6 +3590,17 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 			 * returns its real exit code. */
 			(void)kill(w->ssh_pid, SIGKILL);
 			reaped = (waitpid(w->ssh_pid, &s, 0) == w->ssh_pid);
+			p->last_worker_exit_code =
+			    (reaped && WIFEXITED(s)) ? WEXITSTATUS(s) : -1;
+			/* Fleet-abort signal: a worker that died without ever
+			 * committing a byte, and not as a clean end-of-queue
+			 * exit, is a respawn that failed to take hold.  The
+			 * streak resets in watchdog_check_sync_stall on any sign
+			 * of life (fleet progress or a heartbeat). */
+			int clean = reaped && WIFEXITED(s) &&
+			    WEXITSTATUS(s) == 0;
+			if (lifetime_bytes == 0 && !clean)
+				p->unproductive_deaths++;
 			classify_worker_death(w, reaped, s);
 		}
 		pthread_mutex_destroy(&w->mu);
@@ -4021,6 +4153,23 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 
 	p->session_start_ns = monotime_ns();
 
+	/* Fleet-abort zero-progress window (HPN_NOPROGRESS_ABORT_SEC, default
+	 * FLEET_ABORT_NOPROGRESS_SEC).  The abort also requires no worker heart-
+	 * beating and FLEET_ABORT_UNPRODUCTIVE_MULT * num_streams unproductive
+	 * respawns (see watchdog_check_sync_stall); this knob only sizes the
+	 * window.  0 disables
+	 * the abort entirely. */
+	{
+		const char *e = getenv("HPN_NOPROGRESS_ABORT_SEC");
+		p->noprogress_abort_s = (e && *e) ? atoi(e)
+		    : FLEET_ABORT_NOPROGRESS_SEC;
+		if (p->noprogress_abort_s < 0) p->noprogress_abort_s = 0;
+	}
+	p->last_worker_exit_code = -1;	/* no worker reaped yet */
+	/* Born-dead 0-bytes kill threshold.  RTT-derived once the path RTT is
+	 * registered (sftp_parallel_set_path_rtt); BORN_DEAD_KILL_SEC until then. */
+	p->born_dead_sec = BORN_DEAD_KILL_SEC;
+
 	/* Cap chosen so the worst-case allocation is bounded but the
 	 * "show me what failed" list is still useful for moderately
 	 * broken transfers.  HPN_FAILED_PATHS_MAX × ~256 bytes typical
@@ -4304,8 +4453,24 @@ sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
 void
 sftp_parallel_set_path_rtt(struct sftp_parallel *p, uint64_t rtt_us)
 {
-	if (p != NULL)
-		p->path_rtt_us = rtt_us;
+	if (p == NULL)
+		return;
+	p->path_rtt_us = rtt_us;
+
+	/* RTT-dependent born-dead threshold: ~100 round-trips, i.e. rtt_ms/10
+	 * seconds (rtt_us/10000), with the mantissa dropped, floored at
+	 * BORN_DEAD_KILL_SEC (5s, RTT <= ~59ms) and capped at BORN_DEAD_SEC_MAX
+	 * (40s, RTT >= ~400ms).  A transient backend stall takes ~O(RTT) to
+	 * clear, so the kill threshold must scale with RTT or it over-fires on
+	 * high-RTT paths (see the BORN_DEAD_* comment). */
+	if (rtt_us > 0) {
+		int v = (int)(rtt_us / 10000ULL);
+		if (v < BORN_DEAD_KILL_SEC)
+			v = BORN_DEAD_KILL_SEC;
+		if (v > BORN_DEAD_SEC_MAX)
+			v = BORN_DEAD_SEC_MAX;
+		p->born_dead_sec = v;
+	}
 }
 
 void

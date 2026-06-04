@@ -259,6 +259,11 @@ sftp_hpn_tcp_health_poll(struct sftp_hpn_tcp_health_ctx *ctx,
 #define WEDGE_SUSTAIN_SECS	10	/* consecutive ~1s samples before acting */
 #define WEDGE_CWND_COLLAPSED	4	/* snd_cwnd (segments) at/below = collapsed */
 #define WEDGE_MIN_RTT_LAN_US	5000	/* skip paths under 5 ms (LAN) */
+#define PEER_STALL_BRAKE_SECS	300	/* peer-stall emergency brake: a stall
+					 * sustained this long (5 min) is wedged,
+					 * not draining - reap it.  The PEER_STALL
+					 * verdict (>= WEDGE_SUSTAIN_SECS, below
+					 * this) is waited out instead. */
 
 enum sftp_hpn_wedge_verdict
 sftp_hpn_classify(struct sftp_hpn_tcp_health_ctx *ctx,
@@ -328,7 +333,13 @@ sftp_hpn_classify(struct sftp_hpn_tcp_health_ctx *ctx,
 	    have_data && d_rwnd > 0 && !cwnd_collapsed) {
 		ctx->wedge_secs = ctx->path_degraded_secs = 0;
 		ctx->wedge_retrans_seen = 0;
-		if (++ctx->peer_stall_secs >= WEDGE_SUSTAIN_SECS)
+		/* peer_stall_secs keeps climbing while the stall persists.
+		 * Brake first (sustained past the 5 min horizon = wedged, reap),
+		 * otherwise the wait-it-out PEER_STALL verdict once past the
+		 * sustain floor. */
+		if (++ctx->peer_stall_secs >= PEER_STALL_BRAKE_SECS)
+			return SFTP_HPN_WEDGE_PEER_STALL_BRAKE;
+		if (ctx->peer_stall_secs >= WEDGE_SUSTAIN_SECS)
 			return SFTP_HPN_WEDGE_PEER_STALL;
 		return SFTP_HPN_WEDGE_NONE;
 	}

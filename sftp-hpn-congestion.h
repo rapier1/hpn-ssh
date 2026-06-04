@@ -64,8 +64,13 @@ struct sftp_hpn_tcp_health_ctx {
 };
 
 /*
- * Verdict from the wedge classifier.  WEDGE and PEER_STALL warrant
- * self-termination (the caller maps them to HPN_EXIT_TCP_* codes);
+ * Verdict from the wedge classifier.  WEDGE and PEER_STALL_BRAKE warrant
+ * self-termination (the caller maps them to HPN_EXIT_TCP_* codes).
+ * PEER_STALL means the peer has been pinning our send window for at least
+ * WEDGE_SUSTAIN_SECS but less than the brake horizon: the caller waits it
+ * out (a transient backend stall recovers on its own).  PEER_STALL_BRAKE is
+ * the same condition sustained past PEER_STALL_BRAKE_SECS - no longer
+ * "draining slowly," it's wedged, so the caller reaps as an emergency brake.
  * PATH_DEGRADED is reported but does NOT trigger a kill yet -- it is
  * monitored to judge whether the signal is trustworthy enough to act on.
  */
@@ -73,6 +78,7 @@ enum sftp_hpn_wedge_verdict {
 	SFTP_HPN_WEDGE_NONE = 0,
 	SFTP_HPN_WEDGE_TCP_WEDGE,
 	SFTP_HPN_WEDGE_PEER_STALL,
+	SFTP_HPN_WEDGE_PEER_STALL_BRAKE,
 	SFTP_HPN_WEDGE_PATH_DEGRADED,
 };
 
