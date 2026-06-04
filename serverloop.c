@@ -932,15 +932,20 @@ srv_terminate_worker(struct ssh *ssh, int code, const char *reason)
 /*
  * Poll the server-side monitor and act on a wedge.  On the download path the
  * server is the sender, so the same classifier fires here; on uploads the
- * server is the receiver (notsent ~ 0) and stays silent.  WEDGE / PEER_STALL
- * terminate the connection (the client's orchestrator then respawns the
- * worker); PATH_DEGRADED logs only.  Driven by a ppoll deadline, not traffic.
+ * server is the receiver (notsent ~ 0) and stays silent.  WEDGE terminates the
+ * connection; PEER_STALL is waited out (the client's receive window is pinned -
+ * a transient stall that recovers; killing it just churns); PEER_STALL_BRAKE
+ * (the stall sustained past PEER_STALL_BRAKE_SECS) terminates as an emergency
+ * brake; PATH_DEGRADED logs only.  The client's orchestrator respawns the
+ * worker on any termination.  Mirrors clientloop's wait-not-kill so up- and
+ * download behave the same.  Driven by a ppoll deadline, not traffic.
  */
 static void
 srv_tcp_health_tick(struct ssh *ssh)
 {
 	struct sftp_hpn_tcp_health h;
 	char reason[256];
+	static int srv_ps_waiting = 0;	/* edge-trigger the peer-stall wait log */
 
 	if (!srv_tcp_health_armed)
 		return;
@@ -966,16 +971,33 @@ srv_tcp_health_tick(struct ssh *ssh)
 		srv_terminate_worker(ssh, HPN_EXIT_TCP_WEDGE, reason);
 		return;
 	case SFTP_HPN_WEDGE_PEER_STALL:
+		/*
+		 * Peer-stall = the client's receive window is pinned (it can't
+		 * drain to local storage right now) while our cwnd is healthy -
+		 * a transient stall that recovers on its own.  Wait, do NOT
+		 * terminate: killing the worker forces the orchestrator to
+		 * reconnect into the same busy client, which re-stalls (the
+		 * churn storm).  Mirrors the client/upload wait-not-kill
+		 * (clientloop.c); bounded by the brake below.  srv_ps_waiting
+		 * edge-triggers the log so a long stall doesn't spam.
+		 */
+		if (!srv_ps_waiting) {
+			logit("HPN: parallel worker peer not draining from %s "
+			    "(receive window pinned) - waiting for the peer to "
+			    "drain", ssh_remote_ipaddr(ssh));
+			srv_ps_waiting = 1;
+		}
+		break;
 	case SFTP_HPN_WEDGE_PEER_STALL_BRAKE:
-		/* NOTE: the download side still reaps on peer-stall at the
-		 * WEDGE_SUSTAIN_SECS floor (it was never converted to the
-		 * client's wait-not-kill), so the BRAKE horizon is not reached
-		 * here - both verdicts terminate.  Bringing this to parity
-		 * (wait, then brake at PEER_STALL_BRAKE_SECS) is a pending
-		 * decision. */
+		/*
+		 * Emergency brake: the client has pinned our send window for
+		 * over 5 minutes straight (PEER_STALL_BRAKE_SECS).  No longer a
+		 * transient flush - terminate so the orchestrator respawns onto
+		 * a fresh session.
+		 */
 		snprintf(reason, sizeof(reason),
-		    "parallel worker peer stall from %s: recv window pinned, "
-		    "cwnd=%u, %.1f MB unsent",
+		    "parallel worker peer stall from %s for over 5 minutes: recv "
+		    "window pinned, cwnd=%u, %.1f MB unsent",
 		    ssh_remote_ipaddr(ssh), h.raw.snd_cwnd,
 		    h.raw.notsent_bytes / 1000000.0);
 		srv_terminate_worker(ssh, HPN_EXIT_TCP_PEER_STALL, reason);
@@ -987,6 +1009,7 @@ srv_tcp_health_tick(struct ssh *ssh)
 		    (unsigned long long)h.raw.total_retrans);
 		break;
 	case SFTP_HPN_WEDGE_NONE:
+		srv_ps_waiting = 0;	/* recovered; re-log a later episode */
 		break;
 	}
 	srv_tcp_health_check_time = monotime() + HPN_SRV_TCP_HEALTH_INTERVAL;
