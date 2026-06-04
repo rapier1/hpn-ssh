@@ -271,21 +271,35 @@ static int hpn_max_retries(struct sftp_parallel *p);
  * consecutive throughput samples is killed, in the hope that the respawn
  * lands a TCP connection in a better state.
  *
- * Capped globally at BORN_SLOW_MAX_KILLS per orchestrator lifetime: if
- * we've already burned this many respawns chasing slow connections and
- * the path is still slow, additional respawns would just churn - accept
- * the slow path and let remaining workers keep going.
+ * Two gates keep this from thrashing (it has no budget of its own - the
+ * shared respawn cooldown is its budget; see reporter_dispatch_respawns):
+ *
+ *   1. Fleet-state gate: fire only when a healthy peer exists
+ *      (tput_last_raw_max_kbps >= the floor), i.e. this worker is a TRUE
+ *      outlier.  When the WHOLE fleet is slow (no healthy reference -
+ *      backend saturation) born-slow is suppressed; a respawn would land on
+ *      the same saturated path and just burn churn while re-queuing the
+ *      worker's unit.  That all-slow case is the cooldown/probe machinery's
+ *      job, not born-slow's.
+ *
+ *   2. Cooldown gate: suppressed while a respawn cooldown is active
+ *      (respawn_resume_s != 0).  A born-slow kill is a respawn, so repeated
+ *      born-slow kills push respawn_epoch_count and trip the epoch ceiling,
+ *      which enters the escalating/decaying cooldown.  Once in cooldown we
+ *      stop killing slow-but-working workers and accept them (best-effort);
+ *      the cooldown's decay-on-health restores born-slow when the path
+ *      recovers.  Born-slow and peer-stall are two views of the same
+ *      backend-pressure problem at different timescales, so they share one
+ *      back-off mechanism rather than each carrying its own counter.
  *
  * Tuning:
  *   BORN_SLOW_TICKS=6        × ~5 s/sample = ~30 s window
  *   BORN_SLOW_FLOOR_FRAC=0.25 below 25% of the configured healthy floor
  *                            (e.g. < 500 kbps when healthy=2000) is "born
  *                            slow" - much lower than legitimate slow paths
- *   BORN_SLOW_MAX_KILLS=5    total respawn budget for born-slow workers
  */
 #define BORN_SLOW_TICKS           6
 #define BORN_SLOW_FLOOR_FRAC      0.25
-#define BORN_SLOW_MAX_KILLS       5
 
 /*
  * After a worker has reconnected this many times, emit a one-time
@@ -901,12 +915,6 @@ struct sftp_parallel {
 	uint32_t sync_stall_ticks;      /* stall slow-ticks in current window */
 	uint32_t sync_stall_window_pos; /* slow-ticks elapsed in current window */
 	uint64_t sync_stall_prev_bytes; /* aggregate bytes at previous slow-tick */
-
-	/* Born-slow respawn budget.  Total count of workers killed because
-	 * their EMA throughput stayed below the floor for the configured
-	 * window.  Capped at BORN_SLOW_MAX_KILLS to prevent runaway respawn
-	 * churn on a path that's genuinely slow.  Set in the watchdog. */
-	int      born_slow_kills;
 
 	/* Optional per-worker stats CSV (enabled via HPN_WORKER_STATS_CSV env).
 	 * Opened lazily by the reporter on first tick; closed at orchestrator
@@ -3007,32 +3015,34 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		/*
 		 * Born-slow fast-kill.  A connection that came up in a low-
 		 * cwnd / small-recv-window state and never recovers presents
-		 * as a worker whose EMA throughput stays persistently below
-		 * a small fraction of the healthy floor.  Unlike the peer-
-		 * based outlier above, this fires even when EVERY worker is
-		 * slow (e.g. -j 2 with both connections stuck) - the case
-		 * Phase 4 pipelining cannot help.  Killing triggers the
-		 * normal respawn machinery; a fresh SSH session may land in
-		 * a healthier TCP state.  Capped globally at BORN_SLOW_MAX_KILLS
-		 * to avoid runaway respawn churn on paths that are genuinely
-		 * slow rather than just unlucky.
+		 * as a worker whose EMA throughput stays persistently below a
+		 * small fraction of the healthy floor.  Killing triggers the
+		 * normal respawn machinery; a fresh SSH session may land in a
+		 * healthier TCP state.
+		 *
+		 * Gated two ways (see the BORN_SLOW_* comment block): fire only
+		 * when a healthy peer exists (this worker is a true outlier, not
+		 * part of a whole-fleet stall) AND only when no respawn cooldown
+		 * is active.  Repeated born-slow kills are respawns, so they push
+		 * respawn_epoch_count and trip the escalating cooldown, which
+		 * then suppresses born-slow and lets the slow workers run
+		 * (best-effort) until the path recovers.  No separate budget.
 		 */
 		if (next != WORKER_DEAD
 		    && p->cfg.tput_path_healthy_kbps > 0
 		    && w->tput_below_floor_ticks >= BORN_SLOW_TICKS
-		    && p->born_slow_kills < BORN_SLOW_MAX_KILLS) {
+		    && p->tput_last_raw_max_kbps >= p->cfg.tput_path_healthy_kbps
+		    && p->respawn_resume_s == 0) {
 			uint64_t floor =
 			    (uint64_t)(p->cfg.tput_path_healthy_kbps *
 			        BORN_SLOW_FLOOR_FRAC);
 			debug_ft("worker %d: born-slow kill "
-			    "(ema=%llukbps < %llukbps for %d ticks, "
-			    "global kills=%d/%d)",
+			    "(ema=%llukbps < %llukbps for %d ticks; "
+			    "healthy peer present, no cooldown)",
 			    w->id,
 			    (unsigned long long)w->tput_ema_kbps,
 			    (unsigned long long)floor,
-			    w->tput_below_floor_ticks,
-			    p->born_slow_kills + 1, BORN_SLOW_MAX_KILLS);
-			p->born_slow_kills++;
+			    w->tput_below_floor_ticks);
 			next = WORKER_DEAD;
 		}
 
