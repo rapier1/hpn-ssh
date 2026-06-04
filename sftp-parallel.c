@@ -305,14 +305,20 @@ static int hpn_max_retries(struct sftp_parallel *p);
  * Operator flare cadence (reporter_flare).  A "degraded episode" is any
  * contiguous stretch where the orchestrator is backing off respawns
  * (cooldown active) or accepting slow-but-working workers (born-slow gated
- * off).  We emit ONE edge-triggered notice when an episode opens, a periodic
- * reminder every FLARE_REMINDER_SEC while it persists (escalating from notice
- * to warning once it has lasted FLARE_WARN_SEC), and a recovery notice on the
- * falling edge.  This replaces per-event log spam with episode-level framing;
- * the per-worker detail stays at debug level.  Never implies failure - a
- * degraded episode is best-effort-in-progress, not a lost transfer.
+ * off).  We emit ONE edge-triggered notice when an episode opens, periodic
+ * reminders while it persists, and a recovery notice on the falling edge.
+ * The reminder interval uses the same multiplicative back-off as the cooldown
+ * itself: it starts at FLARE_REMINDER_BASE_SEC and doubles per reminder up to
+ * FLARE_REMINDER_CAP_SEC, so the user learns quickly that a stall is
+ * sustained without a long episode spamming the log.  Reminders escalate from
+ * notice to warning wording once the episode has lasted FLARE_WARN_SEC.  All
+ * of this is suppressed under -q / -b (quiet stays quiet); it replaces
+ * per-event log spam with episode-level framing, with the per-worker detail
+ * left at debug level.  Never implies failure - a degraded episode is
+ * best-effort-in-progress, not a lost transfer.
  */
-#define FLARE_REMINDER_SEC       60   /* periodic reminder while degraded */
+#define FLARE_REMINDER_BASE_SEC  60   /* first reminder this far into an episode */
+#define FLARE_REMINDER_CAP_SEC  600   /* reminder interval doubles, capped here */
 #define FLARE_WARN_SEC          300   /* escalate notice -> warning after this */
 
 /*
@@ -934,7 +940,8 @@ struct sftp_parallel {
 	int      flare_in_episode;       /* currently inside a degraded episode */
 	time_t   flare_episode_start_s;  /* monotime() when it opened */
 	time_t   flare_last_reminder_s;  /* last periodic reminder emitted */
-	int      flare_warned;           /* episode has escalated to warning */
+	time_t   flare_reminder_interval_s; /* current reminder gap; x2 per
+	                                  * reminder, capped, reset per episode */
 	int      born_slow_accepting;    /* slow workers accepted (born-slow gated
 	                                  * off) this watchdog tick; reset each
 	                                  * pass, read by reporter_flare */
@@ -3721,10 +3728,18 @@ reporter_dispatch_respawns(struct sftp_parallel *p, int n_to_respawn)
 static void
 reporter_flare(struct sftp_parallel *p)
 {
-	time_t now_s = monotime();
-	int cooldown_active = (p->respawn_resume_s != 0);
-	int accepting_slow  = (p->born_slow_accepting > 0);
-	int degraded        = cooldown_active || accepting_slow;
+	time_t now_s;
+	int cooldown_active, accepting_slow, degraded;
+
+	/* Quiet stays quiet: -q and -b both set print_flag to SFTP_QUIET.
+	 * Errors (TRANSFER INCOMPLETE, failed paths) still surface via error(). */
+	if (p->cfg.print_flag == SFTP_QUIET)
+		return;
+
+	now_s = monotime();
+	cooldown_active = (p->respawn_resume_s != 0);
+	accepting_slow  = (p->born_slow_accepting > 0);
+	degraded        = cooldown_active || accepting_slow;
 
 	if (!degraded) {
 		if (p->flare_in_episode) {
@@ -3733,22 +3748,21 @@ reporter_flare(struct sftp_parallel *p)
 			    "concurrency",
 			    (long long)(now_s - p->flare_episode_start_s));
 			p->flare_in_episode = 0;
-			p->flare_warned = 0;
 		}
 		return;
 	}
 
 	if (!p->flare_in_episode) {
-		/* Rising edge: open an episode. */
+		/* Rising edge: open an episode.  No countdown - the cooldown
+		 * level escalates/decays and isn't actionable; just the state. */
 		p->flare_in_episode = 1;
 		p->flare_episode_start_s = now_s;
 		p->flare_last_reminder_s = now_s;
-		p->flare_warned = 0;
+		p->flare_reminder_interval_s = FLARE_REMINDER_BASE_SEC;
 		if (cooldown_active)
 			logit("transfer backing off: the destination appears "
-			    "saturated - pausing new connections for up to %llds; "
-			    "active workers keep running and no data is lost",
-			    (long long)p->respawn_cooldown_dur_s);
+			    "saturated - pausing new connections; active workers "
+			    "keep running and no data is lost");
 		else
 			logit("transfer backing off: no worker is reaching the "
 			    "healthy rate - accepting %d slow worker(s) rather "
@@ -3757,16 +3771,20 @@ reporter_flare(struct sftp_parallel *p)
 		return;
 	}
 
-	/* Sustained: periodic reminder, escalating to warning once prolonged. */
-	if (now_s - p->flare_last_reminder_s >= FLARE_REMINDER_SEC) {
+	/* Sustained: reminder on a multiplicative back-off cadence (prompt
+	 * first, then spacing out), escalating to warning wording once the
+	 * episode has been prolonged. */
+	if (now_s - p->flare_last_reminder_s >= p->flare_reminder_interval_s) {
 		time_t since = now_s - p->flare_episode_start_s;
 		uint64_t pending;
 		p->flare_last_reminder_s = now_s;
+		p->flare_reminder_interval_s *= 2;
+		if (p->flare_reminder_interval_s > FLARE_REMINDER_CAP_SEC)
+			p->flare_reminder_interval_s = FLARE_REMINDER_CAP_SEC;
 		pthread_mutex_lock(&p->pending_mu);
 		pending = p->pending;
 		pthread_mutex_unlock(&p->pending_mu);
 		if (since >= FLARE_WARN_SEC) {
-			p->flare_warned = 1;
 			logit("warning: transfer degraded for %llds - %llu file(s) "
 			    "still pending; continuing best-effort, no data lost",
 			    (long long)since, (unsigned long long)pending);
