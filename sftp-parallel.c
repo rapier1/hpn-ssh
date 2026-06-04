@@ -356,13 +356,44 @@ static int hpn_max_retries(struct sftp_parallel *p);
 
 #define RESPAWN_MULTIPLIER      2  /* epoch ceiling = this * num_streams;
 				    * each worker slot gets one retry before
-				    * triggering a cooldown pause */
-#define RESPAWN_MAX_COOLDOWNS   3  /* cooldown cycles before throughput gate */
-#define RESPAWN_COOLDOWN_SEC    30 /* seconds to pause respawning per cooldown */
-#define RESPAWN_STABILITY_SEC  300 /* seconds without a new cooldown before the
-				    * cooldown count resets; prevents a long-
-				    * running transfer from accumulating a fatal
-				    * count from churn spread across hours */
+				    * triggering a cooldown pause.  Cause-
+				    * agnostic backstop alongside the peer-
+				    * stall systemic trigger below. */
+
+/*
+ * Respawn cooldown is escalating + decaying, not count-capped.  On each
+ * entry (a systemic peer-stall burst or epoch-ceiling churn) the orchestrator
+ * pauses RESPAWNS ONLY - live workers keep running - for the current level,
+ * starting at BASE and doubling per burst up to CAP.  Sustained healthy
+ * throughput decays the level back toward BASE (halve per DECAY_SEC) and ends
+ * an active pause early.  There is no cooldown-count abort: under a transient
+ * backend stall the tool backs off and retries indefinitely (best-effort),
+ * surfacing the condition rather than dropping the transfer.  The only
+ * automatic abort remains a genuine dead-end (all workers gone and a respawn
+ * probe cannot even be launched).
+ */
+#define RESPAWN_COOLDOWN_BASE_SEC   30   /* initial pause length */
+#define RESPAWN_COOLDOWN_CAP_SEC    3600 /* escalation ceiling (~8 doublings) */
+#define RESPAWN_COOLDOWN_DECAY_SEC  30   /* halve the level per this much
+					  * sustained-healthy throughput, and
+					  * end an active pause early after this
+					  * long a continuous healthy streak */
+
+/*
+ * Systemic peer-stall detector.  Each slow-tick the reporter pushes the
+ * per-tick delta of peer-stall worker DEATHS (p->peer_stall_terminations)
+ * into a rolling window; when the window sum reaches the systemic threshold
+ * the backend is saturated fleet-wide and we enter/escalate a cooldown.
+ * Below the threshold a death is localized - the unit is just re-queued and
+ * work-stolen, no cooldown.  Threshold is a fraction of num_streams with an
+ * absolute floor so small -j is not tripped by a single coincidental death.
+ * The cost asymmetry is lopsided (over-trigger is cheap, self-correcting, and
+ * never touches live workers; under-trigger keeps loading a saturated
+ * backend), so err toward backing off.
+ */
+#define PEER_STALL_WINDOW            10  /* slow-ticks (~10 s) */
+#define PEER_STALL_SYSTEMIC_FRAC_PCT 50  /* >= this % of num_streams ... */
+#define PEER_STALL_SYSTEMIC_MIN       2  /* ... AND >= this many absolute */
 
 enum worker_health {
 	WORKER_HEALTHY = 0,
@@ -570,7 +601,7 @@ struct sftp_worker {
 	uint64_t           idle_ns;            /* ns blocked on workqueue pop,
 					        * for completed pops only */
 	uint64_t           work_ns;            /* ns actively processing */
-	/* Set to monotonic_ns() immediately before each blocking pop call,
+	/* Set to monotime_ns() immediately before each blocking pop call,
 	 * cleared to 0 immediately after.  The reporter adds (now -
 	 * pop_start_ns) to idle_ns when computing idle fraction so that
 	 * an in-progress blocking wait is included even though the pop has
@@ -578,7 +609,7 @@ struct sftp_worker {
 	 * race between clearing and the accounting update causes at most
 	 * a single-tick undercount, which is harmless for a 35% threshold. */
 	uint64_t           pop_start_ns;
-	/* Set to monotonic_ns() when a unit is popped off the workqueue
+	/* Set to monotime_ns() when a unit is popped off the workqueue
 	 * (after pop_start_ns is cleared), reset to 0 when the unit's
 	 * execute_unit returns.  Lets the watchdog measure how long the
 	 * worker has been holding its current unit even when
@@ -712,7 +743,7 @@ struct sftp_parallel {
 	int                         wedge_terminations;	/* workers reaped with
 							 * HPN_EXIT_TCP_WEDGE */
 	int                         peer_stall_terminations; /* ditto, PEER_STALL */
-	uint64_t                    session_start_ns;  /* monotonic_ns() at
+	uint64_t                    session_start_ns;  /* monotime_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in
 						       * stats for the
@@ -721,14 +752,29 @@ struct sftp_parallel {
 	int                         respawn_epoch_count;   /* respawns in current
 							    * epoch; reset when a
 							    * cooldown ends */
-	int                         respawn_cooldown_count; /* cooldown cycles used
-							    * this stability window */
-	uint64_t                    respawn_resume_ns;  /* monotonic ns when
+	time_t                      respawn_cooldown_dur_s; /* escalating cooldown
+							    * level in SECONDS; lazy-
+							    * init to BASE, x2 per
+							    * burst (cap CAP), decays
+							    * /2 per DECAY_SEC of
+							    * sustained health */
+	time_t                      respawn_healthy_since_s; /* monotime() seconds
+							    * when the current
+							    * sustained-healthy streak
+							    * began; 0 = unhealthy */
+	time_t                      respawn_decay_anchor_s; /* last second the level
+							    * was decayed (or the
+							    * health streak began) */
+	int                         peer_stall_window[PEER_STALL_WINDOW]; /* per-
+							    * slow-tick deltas of
+							    * peer-stall deaths */
+	int                         peer_stall_window_pos; /* rolling index */
+	int                         peer_stall_prev_sample; /* peer_stall_
+							    * terminations at the
+							    * previous slow-tick */
+	time_t                      respawn_resume_s;  /* monotime() seconds when
 							* cooldown ends; 0 = not
 							* in cooldown */
-	uint64_t                    respawn_last_cooldown_ns; /* when last cooldown
-							       * was entered; drives
-							       * stability timer */
 	uint64_t                    tput_last_raw_max_kbps;  /* freshest raw max
 							       * from watchdog; used
 							       * by throughput gate */
@@ -1322,14 +1368,6 @@ range_tracker_finalize(struct sftp_range_tracker *t, int failed,
 
 /* ---------- Worker thread ---------- */
 
-static uint64_t
-monotonic_ns(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
 static void
 worker_record_start(struct sftp_worker *w)
 {
@@ -1368,7 +1406,7 @@ worker_record_completion(struct sftp_worker *w, off_t bytes, int success)
 	/* Reset live_bytes so the completed file's bytes aren't counted twice
 	 * (once here in bytes_total and once via the live_counter hook). */
 	__atomic_store_n(&w->live_bytes, 0, __ATOMIC_RELAXED);
-	w->last_completion_ns = monotonic_ns();
+	w->last_completion_ns = monotime_ns();
 	pthread_mutex_unlock(&w->mu);
 }
 
@@ -1825,7 +1863,7 @@ worker_run_bundle(struct sftp_worker *w,
 	/* Phase-5 instrumentation: per-bundle wall time.  Always-on; one
 	 * stderr line per bundle.  Format chosen so the harness can grep
 	 * "BUNDLE worker=" and parse the key=value fields. */
-	t_start_ns = monotonic_ns();
+	t_start_ns = monotime_ns();
 
 	/* dest_dir = "" - each remote_path is treated as an absolute path
 	 * by the server-side bundle handler.  This avoids needing to
@@ -1836,7 +1874,7 @@ worker_run_bundle(struct sftp_worker *w,
 	int bundle_rc = sftp_hpn_bundle_upload(w->conn, "", entries, bn,
 	    p->cfg.preserve_flag, p->cfg.fsync_flag);
 
-	t_end_ns = monotonic_ns();
+	t_end_ns = monotime_ns();
 	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
 	for (i = 0; i < bn; i++)
 		if (entries[i].result == 0)
@@ -1904,10 +1942,10 @@ worker_run_bundle_download(struct sftp_worker *w,
 		worker_record_start(w);
 	}
 
-	t_start_ns = monotonic_ns();
+	t_start_ns = monotime_ns();
 	int bundle_rc = sftp_hpn_bundle_download(w->conn, entries, bn,
 	    p->cfg.preserve_flag);
-	t_end_ns = monotonic_ns();
+	t_end_ns = monotime_ns();
 	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
 	for (i = 0; i < bn; i++)
 		if (entries[i].result == 0)
@@ -2115,7 +2153,7 @@ worker_thread(void *arg)
 		if (p->abort_flag)
 			break;
 		void *item = NULL;
-		uint64_t t_idle_start = monotonic_ns();
+		uint64_t t_idle_start = monotime_ns();
 		__atomic_store_n(&w->pop_start_ns, t_idle_start,
 		    __ATOMIC_RELEASE);
 		/* Phase 4 gap 1 deadlock guard: if we have a deferred
@@ -2138,7 +2176,7 @@ worker_thread(void *arg)
 			    __ATOMIC_RELEASE);
 			break;	/* shutdown && empty */
 		}
-		uint64_t t_work_start = monotonic_ns();
+		uint64_t t_work_start = monotime_ns();
 		__atomic_store_n(&w->pop_start_ns, 0, __ATOMIC_RELEASE);
 		/* Mark when this worker took possession of a unit so the
 		 * watchdog can measure "how long has this worker been
@@ -2344,7 +2382,7 @@ worker_thread(void *arg)
 
 		/* Account for this iteration's idle and work time. */
 		{
-			uint64_t t_work_end = monotonic_ns();
+			uint64_t t_work_end = monotime_ns();
 			pthread_mutex_lock(&w->mu);
 			w->idle_ns += t_work_start - t_idle_start;
 			w->work_ns += t_work_end - t_work_start;
@@ -3087,7 +3125,7 @@ static int
 watchdog_check_workers(struct sftp_parallel *p)
 {
 	int any_dead = 0;
-	uint64_t now = monotonic_ns();
+	uint64_t now = monotime_ns();
 	int queue_has_work = (sftp_workqueue_depth(p->q) > 0);
 
 	pthread_mutex_lock(&p->workers_mu);
@@ -3149,7 +3187,7 @@ respawn_worker_thread(void *arg)
 	if (w == NULL) {
 		error_ft("worker respawn failed");
 	} else {
-		uint64_t now = monotonic_ns();
+		uint64_t now = monotime_ns();
 		pthread_mutex_lock(&w->mu);
 		w->reconnect_count++;
 		if (w->first_reconnect_ns == 0)
@@ -3199,10 +3237,10 @@ reporter_emit_stats_csv(struct sftp_parallel *p)
 		    "t_ms,worker_id,bytes_total,live_bytes,units_started"
 		    ",units_completed,units_failed,health,reconnect_count"
 		    ",first_reconnect_ms,last_reconnect_ms\n");
-		p->stats_csv_start_ns = monotonic_ns();
+		p->stats_csv_start_ns = monotime_ns();
 	}
 	uint64_t t_ms =
-	    (monotonic_ns() - p->stats_csv_start_ns) / 1000000ULL;
+	    (monotime_ns() - p->stats_csv_start_ns) / 1000000ULL;
 	pthread_mutex_lock(&p->workers_mu);
 	for (int i = 0; i < p->num_workers; i++) {
 		struct sftp_worker *w = p->workers[i];
@@ -3379,148 +3417,185 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
  * the count of non-voluntary worker exits seen on this tick and:
  *
  *   - absorbs them into respawn_owed (the persistent backlog)
- *   - updates the epoch ceiling / cooldown state machine
- *   - launches detached respawn threads up to the available slots
- *   - aborts the transfer if every worker is gone and recovery is
- *     exhausted (cooldowns spent on an unhealthy path) or if the
- *     workforce has gone to zero with units still pending
+ *   - samples the systemic peer-stall window and decays the cooldown level
+ *   - on a systemic peer-stall burst or epoch-ceiling churn, enters/escalates
+ *     a cooldown that pauses RESPAWNS ONLY (live workers keep running)
+ *   - launches respawn threads up to the available slots (a single probe when
+ *     the fleet is empty)
+ *   - aborts ONLY as a genuine dead-end: all workers gone, units pending, not
+ *     in cooldown, and a respawn could not even be launched
  *
- * Returns 1 if the reporter should break out of its main loop (an
- * abort condition fired); 0 otherwise.
+ * Returns 1 if the reporter should break out of its main loop; 0 otherwise.
  *
- * Cooldown / ceiling policy:
- *   Each epoch allows RESPAWN_MULTIPLIER × num_streams respawns.
- *   On hitting the ceiling: enter a counted cooldown (pause for
- *   RESPAWN_COOLDOWN_SEC, reset epoch).  After RESPAWN_MAX_COOLDOWNS
- *   counted cooldowns, fall through to a throughput gate: if any
- *   worker is still pushing the configured healthy-path floor, grant
- *   an uncounted extension cooldown (warn but continue).  If the
- *   path itself is unhealthy, abort.
+ * Cooldown policy (escalating + decaying, best-effort, no count cap):
+ *   Two entry triggers, one action.  PRIMARY: a systemic peer-stall burst -
+ *   >= max(PEER_STALL_SYSTEMIC_MIN, PEER_STALL_SYSTEMIC_FRAC_PCT% of
+ *   num_streams) peer-stall worker deaths within the PEER_STALL_WINDOW
+ *   (~10 s) - means the backend is saturated fleet-wide.  BACKSTOP: the cause-
+ *   agnostic epoch ceiling (RESPAWN_MULTIPLIER x num_streams respawns).
+ *   Either pauses respawns for the current cooldown level (BASE, doubling per
+ *   burst to CAP); sustained healthy throughput halves the level per DECAY_SEC
+ *   and ends an active pause early.  There is NO cooldown-count abort: under a
+ *   transient backend stall we back off and retry indefinitely, surfacing the
+ *   condition rather than dropping data.  Pausing respawns shrinks the fleet
+ *   to its functional subset - that IS the concurrency-shedding back-pressure
+ *   on the saturated backend.
  *
- * Per-worker scope (deliberate non-decision, 2026-05-30):
- *   This gate is intentionally session-wide, not per-worker.  One
- *   persistently-degraded worker can therefore consume some of the
- *   session's respawn budget that other workers might otherwise need
- *   for legitimate transient failures.  Decided session-wide because:
+ * Localized vs systemic:
+ *   Below the systemic threshold a peer-stall death is localized: chunk 1 has
+ *   already re-queued the unit (front of the FIFO) and any worker steals it -
+ *   no cooldown.  Only a fleet-wide burst trips the back-off.
  *
- *     1. One mechanism is easier to maintain than two.  A future reader
- *        looking at respawn behaviour finds it all here.
- *     2. The 2026-05-30 Part B validation campaign (br008 mixed-tree +
- *        br008 many-small + juliet many-small, 60 iters total) did not
- *        produce a case where a session-wide pause wrongly froze
- *        healthy workers because of one bad one.  Adding per-worker
- *        gating speculatively would be code we'd have to maintain
- *        without evidence it earns its keep.
- *     3. Per-worker observability (first_reconnect_ns, last_reconnect_ns
- *        on struct sftp_worker, surfaced in the stats CSV) gives the
- *        operator the data to attribute respawn churn to specific
- *        workers post-hoc, without adding a second gating system.
- *
- *   If we ever do see a real case where one bad worker is starving the
- *   session's budget, the right shape for the fix is a per-worker
- *   sliding-window thrash detector (count respawns in a rolling N-second
- *   window; on burst, cooldown that worker only; window resets on
- *   stability).  Time-windowed, not lifetime-capped - a days-long
- *   transfer should accumulate many isolated transient respawns without
- *   ever tripping.  Mirror RESPAWN_STABILITY_SEC's semantics at the
- *   per-worker scope.  Don't add until you have data showing it matters.
+ * Per-worker scope (deliberate, retained from 2026-05-30):
+ *   The gate is session-wide, not per-worker.  Per-worker observability
+ *   (first/last_reconnect_ns in the stats CSV) attributes churn post-hoc.  If
+ *   one bad worker is ever shown to starve the budget, add a per-worker
+ *   sliding-window thrash detector (time-windowed, not lifetime-capped) - do
+ *   not add until the data shows it matters.  A respawn-EFFECTIVENESS trigger
+ *   ("last K probes each re-stalled within T") is the truer signal than
+ *   fleet-fraction and is the next candidate; deferred for now.
  */
 static int
 reporter_dispatch_respawns(struct sftp_parallel *p, int n_to_respawn)
 {
+	time_t now_s = monotime();	/* misc.c, CLOCK_MONOTONIC seconds */
+
 	pthread_mutex_lock(&p->workers_mu);
 	int cur_workers  = p->num_workers;
 	int respawn_ceil = p->cfg.num_streams * RESPAWN_MULTIPLIER;
 	pthread_mutex_unlock(&p->workers_mu);
 
+	pthread_mutex_lock(&p->pending_mu);
+	uint64_t pending = p->pending;
+	pthread_mutex_unlock(&p->pending_mu);
+
 	/* Absorb this tick's involuntary deaths into the backlog.
-	 * respawn_owed carries across cooldowns and pthread_create
-	 * failures, so the worker pool drains back up to num_streams
-	 * once spawning resumes. */
+	 * respawn_owed carries across cooldowns and pthread_create failures,
+	 * so the worker pool drains back up to num_streams once spawning
+	 * resumes. */
 	if (n_to_respawn > 0)
 		p->respawn_owed += n_to_respawn;
 
-	/* Check cooldown: suppress respawns until timer expires. */
+	if (p->respawn_cooldown_dur_s == 0)
+		p->respawn_cooldown_dur_s = RESPAWN_COOLDOWN_BASE_SEC; /* lazy */
+
+	/*
+	 * Systemic peer-stall detector: push this tick's delta of peer-stall
+	 * worker deaths into a rolling window (mirrors the sync_stall window);
+	 * a window sum at/above the systemic threshold means the backend is
+	 * saturated fleet-wide.  The same reporter thread increments
+	 * peer_stall_terminations (in the reap just above) and reads it here,
+	 * so no extra lock is needed.
+	 */
+	int ps_delta = p->peer_stall_terminations - p->peer_stall_prev_sample;
+	if (ps_delta < 0)
+		ps_delta = 0;
+	p->peer_stall_prev_sample = p->peer_stall_terminations;
+	p->peer_stall_window[p->peer_stall_window_pos % PEER_STALL_WINDOW] =
+	    ps_delta;
+	p->peer_stall_window_pos++;
+	int ps_sum = 0;
+	for (int i = 0; i < PEER_STALL_WINDOW; i++)
+		ps_sum += p->peer_stall_window[i];
+	int systemic_min =
+	    (p->cfg.num_streams * PEER_STALL_SYSTEMIC_FRAC_PCT + 99) / 100;
+	if (systemic_min < PEER_STALL_SYSTEMIC_MIN)
+		systemic_min = PEER_STALL_SYSTEMIC_MIN;
+	int systemic = (ps_sum >= systemic_min);
+
+	/*
+	 * Path-health streak drives both the cooldown-level decay and the
+	 * early exit from an active pause.  "Healthy" = the freshest raw max
+	 * throughput is at or above the configured floor (default 2000 kbps).
+	 */
+	int healthy = (p->cfg.tput_path_healthy_kbps > 0) &&
+	    (p->tput_last_raw_max_kbps >= p->cfg.tput_path_healthy_kbps);
+	if (healthy) {
+		if (p->respawn_healthy_since_s == 0) {
+			p->respawn_healthy_since_s = now_s;
+			p->respawn_decay_anchor_s  = now_s;
+		}
+		while (p->respawn_cooldown_dur_s > RESPAWN_COOLDOWN_BASE_SEC &&
+		    now_s - p->respawn_decay_anchor_s >=
+		    RESPAWN_COOLDOWN_DECAY_SEC) {
+			p->respawn_cooldown_dur_s /= 2;
+			if (p->respawn_cooldown_dur_s < RESPAWN_COOLDOWN_BASE_SEC)
+				p->respawn_cooldown_dur_s =
+				    RESPAWN_COOLDOWN_BASE_SEC;
+			p->respawn_decay_anchor_s += RESPAWN_COOLDOWN_DECAY_SEC;
+		}
+	} else {
+		p->respawn_healthy_since_s = 0;
+	}
+
+	/* Cooldown expiry, or early exit once the backend has recovered. */
 	int in_cooldown = 0;
-	if (p->respawn_resume_ns != 0) {
-		uint64_t now_ns = monotonic_ns();
-		if (now_ns < p->respawn_resume_ns) {
-			in_cooldown = 1;
-		} else {
+	if (p->respawn_resume_s != 0) {
+		if (now_s >= p->respawn_resume_s) {
 			debug_ft("respawn cooldown ended, resuming "
 			    "(epoch reset, owed=%d)", p->respawn_owed);
-			p->respawn_resume_ns = 0;
+			p->respawn_resume_s = 0;
 			p->respawn_epoch_count = 0;
-		}
-	}
-
-	/* Ceiling check + cooldown entry (only when we owe a respawn
-	 * and are not already in cooldown). */
-	if (!in_cooldown && p->respawn_owed > 0 &&
-	    p->respawn_epoch_count >= respawn_ceil) {
-		uint64_t now_ns = monotonic_ns();
-		if (p->respawn_cooldown_count < RESPAWN_MAX_COOLDOWNS) {
-			/* Counted cooldown. */
-			p->respawn_cooldown_count++;
-			p->respawn_last_cooldown_ns = now_ns;
-			p->respawn_resume_ns = now_ns +
-			    (uint64_t)RESPAWN_COOLDOWN_SEC * 1000000000ULL;
+		} else if (healthy && p->respawn_healthy_since_s != 0 &&
+		    now_s - p->respawn_healthy_since_s >=
+		    RESPAWN_COOLDOWN_DECAY_SEC) {
+			logit("respawn cooldown ended early: path healthy "
+			    "(%llukbps) for %ds - resuming respawns",
+			    (unsigned long long)p->tput_last_raw_max_kbps,
+			    RESPAWN_COOLDOWN_DECAY_SEC);
+			p->respawn_resume_s = 0;
 			p->respawn_epoch_count = 0;
-			in_cooldown = 1;
-			error_ft("respawn epoch ceiling reached "
-			    "(%d/%d) - entering cooldown %d/%d for %ds; "
-			    "healthy workers continue",
-			    p->total_respawns, respawn_ceil,
-			    p->respawn_cooldown_count,
-			    RESPAWN_MAX_COOLDOWNS,
-			    RESPAWN_COOLDOWN_SEC);
 		} else {
-			/* Cooldowns exhausted - throughput gate. */
-			int path_ok =
-			    (p->cfg.tput_path_healthy_kbps > 0) &&
-			    (p->tput_last_raw_max_kbps >=
-			     p->cfg.tput_path_healthy_kbps);
-			if (path_ok) {
-				/* Productive workers remain - extend rather
-				 * than killing a partially-complete transfer. */
-				p->respawn_resume_ns = now_ns +
-				    (uint64_t)RESPAWN_COOLDOWN_SEC *
-				    1000000000ULL;
-				p->respawn_last_cooldown_ns = now_ns;
-				p->respawn_epoch_count = 0;
-				in_cooldown = 1;
-				error_ft("WARNING: respawn cooldowns "
-				    "exhausted but path still healthy "
-				    "(max=%llukbps) - extending rather than "
-				    "aborting; investigate connection churn",
-				    (unsigned long long)
-				    p->tput_last_raw_max_kbps);
-			} else {
-				error_ft("respawn cooldowns exhausted and "
-				    "path unhealthy (max=%llukbps) - "
-				    "persistent connection failure, "
-				    "aborting transfer",
-				    (unsigned long long)
-				    p->tput_last_raw_max_kbps);
-				sftp_parallel_abort(p);
-				return 1;
-			}
+			in_cooldown = 1;
 		}
 	}
 
-	int target   = p->cfg.num_streams;
-	int slots    = target - cur_workers;
-	int to_spawn = (!in_cooldown && p->respawn_owed > 0 && slots > 0)
-	    ? ((p->respawn_owed < slots) ? p->respawn_owed : slots)
-	    : 0;
+	/*
+	 * Cooldown entry.  Two triggers, one action: a systemic peer-stall
+	 * burst (primary) or the cause-agnostic epoch ceiling (backstop).
+	 * Pause respawns for the current escalating level, then double it
+	 * (capped) for the next burst.  No count cap, no abort - best-effort.
+	 */
+	if (!in_cooldown && p->respawn_owed > 0 &&
+	    (systemic || p->respawn_epoch_count >= respawn_ceil)) {
+		p->respawn_resume_s = now_s + p->respawn_cooldown_dur_s;
+		p->respawn_decay_anchor_s = now_s;	/* freeze decay while paused */
+		p->respawn_healthy_since_s = 0;		/* require fresh sustained
+							 * health to exit early */
+		p->respawn_epoch_count = 0;
+		in_cooldown = 1;
+		error_ft("respawn cooldown: %s - pausing respawns for %llds "
+		    "(healthy workers continue)",
+		    systemic ? "systemic peer stall" : "epoch-ceiling churn",
+		    (long long)p->respawn_cooldown_dur_s);
+		p->respawn_cooldown_dur_s *= 2;
+		if (p->respawn_cooldown_dur_s > RESPAWN_COOLDOWN_CAP_SEC)
+			p->respawn_cooldown_dur_s = RESPAWN_COOLDOWN_CAP_SEC;
+	}
+
+	int target = p->cfg.num_streams;
+	int slots  = target - cur_workers;
+	int to_spawn;
+	if (in_cooldown || p->abort_flag || p->stopped) {
+		to_spawn = 0;
+	} else if (cur_workers == 0) {
+		/* Fleet empty: launch a SINGLE probe rather than num_streams
+		 * fresh connections, so we don't slam a possibly-still-
+		 * saturated backend.  A healthy probe refills normally on the
+		 * following ticks; a re-stall escalates the cooldown. */
+		to_spawn = (p->respawn_owed > 0 || pending > 0) ? 1 : 0;
+	} else {
+		to_spawn = (p->respawn_owed > 0 && slots > 0)
+		    ? ((p->respawn_owed < slots) ? p->respawn_owed : slots)
+		    : 0;
+	}
 	if (to_spawn > 0) {
-		debug_ft("initiating respawn for %d worker(s) "
-		    "(current=%d target=%d owed=%d "
-		    "epoch=%d/%d cooldowns=%d/%d)",
-		    to_spawn, cur_workers, target,
-		    p->respawn_owed,
+		debug_ft("initiating respawn for %d worker(s) (current=%d "
+		    "target=%d owed=%d epoch=%d/%d cooldown_level=%llds%s)",
+		    to_spawn, cur_workers, target, p->respawn_owed,
 		    p->respawn_epoch_count + to_spawn, respawn_ceil,
-		    p->respawn_cooldown_count, RESPAWN_MAX_COOLDOWNS);
+		    (long long)p->respawn_cooldown_dur_s,
+		    cur_workers == 0 ? " probe" : "");
 	}
 	for (int i = 0; i < to_spawn; i++) {
 		if (p->abort_flag || p->stopped)
@@ -3535,8 +3610,10 @@ reporter_dispatch_respawns(struct sftp_parallel *p, int n_to_respawn)
 		    respawn_worker_thread, p) == 0) {
 			(void)pthread_detach(rtid);
 			/* Drain backlog only on success; a failed create
-			 * leaves owed in place so we retry next tick. */
-			p->respawn_owed--;
+			 * leaves owed in place so we retry next tick.  A probe
+			 * (owed may be 0) doesn't underflow the backlog. */
+			if (p->respawn_owed > 0)
+				p->respawn_owed--;
 		} else {
 			error_ft("respawn thread create failed");
 			pthread_mutex_lock(&p->workers_mu);
@@ -3547,23 +3624,23 @@ reporter_dispatch_respawns(struct sftp_parallel *p, int n_to_respawn)
 		}
 	}
 
-	/* If every worker is gone and no respawn is in flight, all
-	 * recovery attempts have failed; abort rather than letting
-	 * sftp_parallel_wait hang. */
+	/*
+	 * Genuine dead-end abort: every worker gone, units still pending, NOT
+	 * in a cooldown pause, and no respawn is in flight - i.e. a probe
+	 * could not even be launched (pthread_create failing).  A backend
+	 * stall is deliberately NOT this case: there we are in cooldown (or
+	 * have a probe pending), so we wait and retry indefinitely rather than
+	 * dropping the transfer.
+	 */
 	pthread_mutex_lock(&p->workers_mu);
 	int all_gone = (p->num_workers == 0 && p->pending_respawns == 0);
 	pthread_mutex_unlock(&p->workers_mu);
-	if (all_gone && !p->abort_flag) {
-		pthread_mutex_lock(&p->pending_mu);
-		int stuck = (p->pending > 0);
-		pthread_mutex_unlock(&p->pending_mu);
-		if (stuck) {
-			error_ft("all workers gone with %llu unit(s) "
-			    "pending -- aborting transfer",
-			    (unsigned long long)p->pending);
-			sftp_parallel_abort(p);
-			return 1;
-		}
+	if (all_gone && !in_cooldown && !p->abort_flag && pending > 0) {
+		error_ft("all workers gone with %llu unit(s) pending and no "
+		    "respawn could be launched -- aborting transfer",
+		    (unsigned long long)pending);
+		sftp_parallel_abort(p);
+		return 1;
 	}
 	return 0;
 }
@@ -3603,28 +3680,6 @@ reporter_thread(void *arg)
 			slow_tick_counter = 0;
 
 			reporter_emit_stats_csv(p);
-
-			/* Stability timer: if no new cooldown was needed for
-			 * RESPAWN_STABILITY_SEC, the cluster has been running
-			 * cleanly - reset the cooldown count so a very long
-			 * transfer doesn't accumulate a fatal count from
-			 * isolated churn events spread over hours. */
-			if (p->respawn_last_cooldown_ns != 0 &&
-			    p->respawn_resume_ns == 0) {
-				uint64_t now_ns = monotonic_ns();
-				uint64_t stability_ns =
-				    (uint64_t)RESPAWN_STABILITY_SEC * 1000000000ULL;
-				if (now_ns - p->respawn_last_cooldown_ns
-				    > stability_ns) {
-					debug_ft("respawn stability window "
-					    "expired (%ds clean) - resetting "
-					    "cooldown count from %d to 0",
-					    RESPAWN_STABILITY_SEC,
-					    p->respawn_cooldown_count);
-					p->respawn_cooldown_count = 0;
-					p->respawn_last_cooldown_ns = 0;
-				}
-			}
 
 			/* Watchdog classifies workers HEALTHY/STALLED/DEAD
 			 * and SIGTERMs newly DEAD ones. We don't abort here;
@@ -3807,7 +3862,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_cond_init(&p->pending_cv, NULL);
 	pthread_mutex_init(&p->workers_mu, NULL);
 
-	p->session_start_ns = monotonic_ns();
+	p->session_start_ns = monotime_ns();
 
 	/* Cap chosen so the worst-case allocation is bounded but the
 	 * "show me what failed" list is still useful for moderately
@@ -4809,7 +4864,7 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 
 	if (p->session_start_ns != 0)
 		out->elapsed_ms =
-		    (monotonic_ns() - p->session_start_ns) / 1000000ULL;
+		    (monotime_ns() - p->session_start_ns) / 1000000ULL;
 	if (p->q) {
 		out->queue_depth = sftp_workqueue_depth(p->q);
 		out->queue_high_watermark = sftp_workqueue_high_watermark(p->q);

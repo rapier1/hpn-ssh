@@ -219,17 +219,6 @@ sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
  * wire for an extended interval.
  * ────────────────────────────────────────────────────────────────────────── */
 
-/* Local CLOCK_MONOTONIC reader.  Mirrors the static monotonic_ns() in
- * sftp-parallel.c - kept inline here rather than exposing a shared symbol,
- * since this file already has its own time-related primitives. */
-static uint64_t
-sftp_hpn_monotonic_ns(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
 void
 sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds)
 {
@@ -239,7 +228,7 @@ sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds)
 	if (hpn == NULL)
 		return;
 
-	deadline_ns = sftp_hpn_monotonic_ns() +
+	deadline_ns = monotime_ns() +
 	    (uint64_t)seconds * 1000000000ULL;
 
 	/*

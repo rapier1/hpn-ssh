@@ -1920,6 +1920,15 @@ monotime_double(void)
 	return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
+uint64_t
+monotime_ns(void)
+{
+	struct timespec ts;
+
+	monotime_ts(&ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 void
 bandwidth_limit_init(struct bwlimit *bw, uint64_t kbps, size_t buflen)
 {

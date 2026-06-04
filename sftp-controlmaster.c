@@ -171,7 +171,7 @@ static int
 wait_pid_with_timeout(pid_t pid, int seconds)
 {
 	struct timespec deadline, now;
-	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	monotime_ts(&deadline);
 	deadline.tv_sec += seconds;
 
 	while (1) {
@@ -181,7 +181,7 @@ wait_pid_with_timeout(pid_t pid, int seconds)
 			return 1;
 		if (r < 0 && errno != EINTR)
 			return 0;
-		clock_gettime(CLOCK_MONOTONIC, &now);
+		monotime_ts(&now);
 		if (now.tv_sec > deadline.tv_sec ||
 		    (now.tv_sec == deadline.tv_sec &&
 		     now.tv_nsec >= deadline.tv_nsec))
@@ -238,7 +238,7 @@ sftp_cm_start(const struct sftp_cm_config *cfg)
 	 * (cheap), then confirm with -O check (more expensive). */
 	int timeout = cfg->timeout_sec > 0 ? cfg->timeout_sec : DEFAULT_TIMEOUT_SEC;
 	struct timespec deadline, now;
-	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	monotime_ts(&deadline);
 	deadline.tv_sec += timeout;
 
 	while (1) {
@@ -262,7 +262,7 @@ sftp_cm_start(const struct sftp_cm_config *cfg)
 				break; /* success */
 		}
 
-		clock_gettime(CLOCK_MONOTONIC, &now);
+		monotime_ts(&now);
 		if (now.tv_sec > deadline.tv_sec ||
 		    (now.tv_sec == deadline.tv_sec &&
 		     now.tv_nsec >= deadline.tv_nsec)) {

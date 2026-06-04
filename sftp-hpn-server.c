@@ -400,16 +400,6 @@ send_hpn_hash_range_heartbeat(u_int id, struct sshbuf *oqueue)
 	flush_oqueue_blocking(oqueue);
 }
 
-static time_t
-hpn_hash_range_monotonic_sec(void)
-{
-	struct timespec	 ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-		return 0;
-	return ts.tv_sec;
-}
-
 static void
 process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
@@ -500,7 +490,7 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	 * proof of life so it doesn't kill the worker mid-hash on slow /
 	 * contended storage.  See sftp-hpn-server.h for the wire format.
 	 */
-	last_hb_sec = hpn_hash_range_monotonic_sec();
+	last_hb_sec = monotime();
 	for (i = 0; i < num_ranges; i++) {
 		u_int64_t	 off = ranges[i].off;
 		u_int64_t	 want = ranges[i].len;
@@ -548,7 +538,7 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 				/* Time-keyed heartbeat (see comment above). */
 				{
 					time_t now =
-					    hpn_hash_range_monotonic_sec();
+					    monotime();
 					if (now != 0 && last_hb_sec != 0 &&
 					    (now - last_hb_sec) >=
 					    (time_t)

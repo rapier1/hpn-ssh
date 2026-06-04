@@ -101,6 +101,7 @@ void	 monotime_ts(struct timespec *);
 void	 monotime_tv(struct timeval *);
 time_t	 monotime(void);
 double	 monotime_double(void);
+uint64_t monotime_ns(void);
 void	 lowercase(char *s);
 int	 unix_listener(const char *, int, int);
 int	 valid_domain(char *, int, const char **);

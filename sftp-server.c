@@ -1965,16 +1965,6 @@ send_hpn_check_file_heartbeat(uint32_t id)
 	flush_oqueue_blocking();
 }
 
-static time_t
-hpn_monotonic_sec(void)
-{
-	struct timespec ts;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-		return 0;
-	return ts.tv_sec;
-}
-
 static void
 process_extended_hpn_check_file(uint32_t id)
 {
@@ -2052,7 +2042,7 @@ process_extended_hpn_check_file(uint32_t id)
 	}
 
 	remaining = length;
-	last_hb_sec = hpn_monotonic_sec();
+	last_hb_sec = monotime();
 	while (remaining > 0) {
 		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
 
@@ -2077,7 +2067,7 @@ process_extended_hpn_check_file(uint32_t id)
 		 * only runs every ~5 s of elapsed wall time.
 		 */
 		{
-			time_t now = hpn_monotonic_sec();
+			time_t now = monotime();
 			if (now != 0 && last_hb_sec != 0 &&
 			    (now - last_hb_sec) >=
 			    (time_t)HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
