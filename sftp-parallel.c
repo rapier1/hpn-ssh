@@ -302,6 +302,20 @@ static int hpn_max_retries(struct sftp_parallel *p);
 #define BORN_SLOW_FLOOR_FRAC      0.25
 
 /*
+ * Operator flare cadence (reporter_flare).  A "degraded episode" is any
+ * contiguous stretch where the orchestrator is backing off respawns
+ * (cooldown active) or accepting slow-but-working workers (born-slow gated
+ * off).  We emit ONE edge-triggered notice when an episode opens, a periodic
+ * reminder every FLARE_REMINDER_SEC while it persists (escalating from notice
+ * to warning once it has lasted FLARE_WARN_SEC), and a recovery notice on the
+ * falling edge.  This replaces per-event log spam with episode-level framing;
+ * the per-worker detail stays at debug level.  Never implies failure - a
+ * degraded episode is best-effort-in-progress, not a lost transfer.
+ */
+#define FLARE_REMINDER_SEC       60   /* periodic reminder while degraded */
+#define FLARE_WARN_SEC          300   /* escalate notice -> warning after this */
+
+/*
  * After a worker has reconnected this many times, emit a one-time
  * user-visible notice that the path may be unreliable.  The cause of each
  * individual respawn is already reported as it happens; this is the
@@ -915,6 +929,15 @@ struct sftp_parallel {
 	uint32_t sync_stall_ticks;      /* stall slow-ticks in current window */
 	uint32_t sync_stall_window_pos; /* slow-ticks elapsed in current window */
 	uint64_t sync_stall_prev_bytes; /* aggregate bytes at previous slow-tick */
+
+	/* Operator flare episode tracking (reporter_flare).  See FLARE_*. */
+	int      flare_in_episode;       /* currently inside a degraded episode */
+	time_t   flare_episode_start_s;  /* monotime() when it opened */
+	time_t   flare_last_reminder_s;  /* last periodic reminder emitted */
+	int      flare_warned;           /* episode has escalated to warning */
+	int      born_slow_accepting;    /* slow workers accepted (born-slow gated
+	                                  * off) this watchdog tick; reset each
+	                                  * pass, read by reporter_flare */
 
 	/* Optional per-worker stats CSV (enabled via HPN_WORKER_STATS_CSV env).
 	 * Opened lazily by the reporter on first tick; closed at orchestrator
@@ -3030,20 +3053,41 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 */
 		if (next != WORKER_DEAD
 		    && p->cfg.tput_path_healthy_kbps > 0
-		    && w->tput_below_floor_ticks >= BORN_SLOW_TICKS
-		    && p->tput_last_raw_max_kbps >= p->cfg.tput_path_healthy_kbps
-		    && p->respawn_resume_s == 0) {
+		    && w->tput_below_floor_ticks >= BORN_SLOW_TICKS) {
+			/* Worker qualifies as born-slow (persistently below floor). */
 			uint64_t floor =
 			    (uint64_t)(p->cfg.tput_path_healthy_kbps *
 			        BORN_SLOW_FLOOR_FRAC);
-			debug_ft("worker %d: born-slow kill "
-			    "(ema=%llukbps < %llukbps for %d ticks; "
-			    "healthy peer present, no cooldown)",
-			    w->id,
-			    (unsigned long long)w->tput_ema_kbps,
-			    (unsigned long long)floor,
-			    w->tput_below_floor_ticks);
-			next = WORKER_DEAD;
+			if (p->tput_last_raw_max_kbps >=
+			        p->cfg.tput_path_healthy_kbps
+			    && p->respawn_resume_s == 0) {
+				debug_ft("worker %d: born-slow kill "
+				    "(ema=%llukbps < %llukbps for %d ticks; "
+				    "healthy peer present, no cooldown)",
+				    w->id,
+				    (unsigned long long)w->tput_ema_kbps,
+				    (unsigned long long)floor,
+				    w->tput_below_floor_ticks);
+				next = WORKER_DEAD;
+			} else {
+				/* Gated off: no healthy peer (whole-fleet stall) or a
+				 * cooldown is active.  Accept this slow-but-working
+				 * worker rather than churning a respawn; count it so
+				 * reporter_flare can surface "accepting N slow
+				 * worker(s)" - also the live signal for whether this
+				 * gating is helping or hurting on a real path. */
+				p->born_slow_accepting++;
+				debug_ft("worker %d: born-slow accepted "
+				    "(ema=%llukbps < %llukbps for %d ticks; "
+				    "%s)",
+				    w->id,
+				    (unsigned long long)w->tput_ema_kbps,
+				    (unsigned long long)floor,
+				    w->tput_below_floor_ticks,
+				    p->respawn_resume_s != 0
+				        ? "cooldown active"
+				        : "no healthy peer");
+			}
 		}
 
 	inactivity_checks_done:
@@ -3137,6 +3181,10 @@ watchdog_check_workers(struct sftp_parallel *p)
 	int any_dead = 0;
 	uint64_t now = monotime_ns();
 	int queue_has_work = (sftp_workqueue_depth(p->q) > 0);
+
+	/* Per-tick scratch: count of slow workers accepted (born-slow gated
+	 * off) this pass; reporter_flare reads it after the watchdog runs. */
+	p->born_slow_accepting = 0;
 
 	pthread_mutex_lock(&p->workers_mu);
 
@@ -3549,7 +3597,9 @@ reporter_dispatch_respawns(struct sftp_parallel *p, int n_to_respawn)
 		} else if (healthy && p->respawn_healthy_since_s != 0 &&
 		    now_s - p->respawn_healthy_since_s >=
 		    RESPAWN_COOLDOWN_DECAY_SEC) {
-			logit("respawn cooldown ended early: path healthy "
+			/* debug-level: the operator-facing recovery line is the
+			 * reporter_flare falling-edge notice. */
+			debug_ft("respawn cooldown ended early: path healthy "
 			    "(%llukbps) for %ds - resuming respawns",
 			    (unsigned long long)p->tput_last_raw_max_kbps,
 			    RESPAWN_COOLDOWN_DECAY_SEC);
@@ -3574,7 +3624,9 @@ reporter_dispatch_respawns(struct sftp_parallel *p, int n_to_respawn)
 							 * health to exit early */
 		p->respawn_epoch_count = 0;
 		in_cooldown = 1;
-		error_ft("respawn cooldown: %s - pausing respawns for %llds "
+		/* debug-level: the operator-facing notice is the reporter_flare
+		 * rising-edge line; this keeps the per-entry detail for traces. */
+		debug_ft("respawn cooldown: %s - pausing respawns for %llds "
 		    "(healthy workers continue)",
 		    systemic ? "systemic peer stall" : "epoch-ceiling churn",
 		    (long long)p->respawn_cooldown_dur_s);
@@ -3655,6 +3707,77 @@ reporter_dispatch_respawns(struct sftp_parallel *p, int n_to_respawn)
 	return 0;
 }
 
+/*
+ * Operator-facing flare for degraded episodes.  Called once per reporter
+ * slow-tick AFTER the watchdog and respawn dispatch, so cooldown state and
+ * born_slow_accepting are fresh.  A "degraded episode" is any contiguous
+ * stretch where we are backing off respawns (cooldown active) or accepting
+ * slow-but-working workers (born-slow gated off).  Edge-triggered: one notice
+ * when it opens, a periodic reminder (escalating notice->warning) while it
+ * lasts, a recovery notice when it closes.  Best-effort framing throughout -
+ * a degraded episode is the transfer slowing down and adapting, NOT failing.
+ * On a clean transfer degraded is always 0 and this is a no-op.
+ */
+static void
+reporter_flare(struct sftp_parallel *p)
+{
+	time_t now_s = monotime();
+	int cooldown_active = (p->respawn_resume_s != 0);
+	int accepting_slow  = (p->born_slow_accepting > 0);
+	int degraded        = cooldown_active || accepting_slow;
+
+	if (!degraded) {
+		if (p->flare_in_episode) {
+			/* Falling edge: recovered. */
+			logit("transfer recovered after %llds - resumed full "
+			    "concurrency",
+			    (long long)(now_s - p->flare_episode_start_s));
+			p->flare_in_episode = 0;
+			p->flare_warned = 0;
+		}
+		return;
+	}
+
+	if (!p->flare_in_episode) {
+		/* Rising edge: open an episode. */
+		p->flare_in_episode = 1;
+		p->flare_episode_start_s = now_s;
+		p->flare_last_reminder_s = now_s;
+		p->flare_warned = 0;
+		if (cooldown_active)
+			logit("transfer backing off: the destination appears "
+			    "saturated - pausing new connections for up to %llds; "
+			    "active workers keep running and no data is lost",
+			    (long long)p->respawn_cooldown_dur_s);
+		else
+			logit("transfer backing off: no worker is reaching the "
+			    "healthy rate - accepting %d slow worker(s) rather "
+			    "than churning connections; transfer continues",
+			    p->born_slow_accepting);
+		return;
+	}
+
+	/* Sustained: periodic reminder, escalating to warning once prolonged. */
+	if (now_s - p->flare_last_reminder_s >= FLARE_REMINDER_SEC) {
+		time_t since = now_s - p->flare_episode_start_s;
+		uint64_t pending;
+		p->flare_last_reminder_s = now_s;
+		pthread_mutex_lock(&p->pending_mu);
+		pending = p->pending;
+		pthread_mutex_unlock(&p->pending_mu);
+		if (since >= FLARE_WARN_SEC) {
+			p->flare_warned = 1;
+			logit("warning: transfer degraded for %llds - %llu file(s) "
+			    "still pending; continuing best-effort, no data lost",
+			    (long long)since, (unsigned long long)pending);
+		} else {
+			logit("transfer still adapting (%llds) - %llu file(s) "
+			    "pending", (long long)since,
+			    (unsigned long long)pending);
+		}
+	}
+}
+
 static void *
 reporter_thread(void *arg)
 {
@@ -3708,6 +3831,12 @@ reporter_thread(void *arg)
 
 			if (reporter_dispatch_respawns(p, n_to_respawn))
 				break;
+
+			/* Operator flare: episode-level notices for degraded
+			 * stretches (cooldown / accepting slow workers).  Runs
+			 * after dispatch so cooldown + born_slow_accepting are
+			 * fresh; no-op on a clean transfer. */
+			reporter_flare(p);
 		}
 	}
 	return NULL;
