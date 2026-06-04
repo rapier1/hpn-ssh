@@ -92,6 +92,35 @@ sftp_workqueue_push(struct sftp_workqueue *q, void *item)
 	return 0;
 }
 
+/*
+ * Like sftp_workqueue_push but inserts at the HEAD so the item is the
+ * very next one popped (LIFO).  Used for transient (connection-death)
+ * unit re-queues: a failed byte-range jumps ahead of fresh work so the
+ * partially-complete file finishes - and its range tracker frees -
+ * promptly, instead of waiting behind every other queued unit.  Still a
+ * dumb primitive (one extra insertion point, no priority sort); the
+ * front-vs-tail policy lives in the caller.
+ */
+int
+sftp_workqueue_push_front(struct sftp_workqueue *q, void *item)
+{
+	pthread_mutex_lock(&q->mu);
+	while (q->count == q->capacity && !q->shutdown)
+		pthread_cond_wait(&q->not_full, &q->mu);
+	if (q->shutdown) {
+		pthread_mutex_unlock(&q->mu);
+		return -1;
+	}
+	q->head = (q->head + q->capacity - 1) % q->capacity;
+	q->ring[q->head] = item;
+	q->count++;
+	if (q->count > q->high_water)
+		q->high_water = q->count;
+	pthread_cond_signal(&q->not_empty);
+	pthread_mutex_unlock(&q->mu);
+	return 0;
+}
+
 int
 sftp_workqueue_pop(struct sftp_workqueue *q, void **itemp)
 {

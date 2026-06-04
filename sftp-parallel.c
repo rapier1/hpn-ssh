@@ -1580,31 +1580,42 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		 * completer for the file frees the tracker. */
 		(void)range_tracker_finalize(u->range_tracker, 0, w);
 		free_unit(u);
-	} else if (sftp_conn_is_dead(w->conn) ||
-	    ++u->attempt < hpn_max_retries(p)) {
-		/*
-		 * Re-queue without freeing (keeps the pending counter
-		 * consistent).  A dead connection (wedge / peer-stall /
-		 * transport drop) is a TRANSIENT, blameless failure: this
-		 * worker is about to break the main loop and be respawned, so
-		 * the || short-circuit skips ++u->attempt and the unit is
-		 * retried WITHOUT charging the retry budget.  This is the
-		 * br008 j8 data-loss fix - peer-stall churn used to burn
-		 * u->attempt up to MAX_RETRIES and permanently abandon the
-		 * byte-range.  Only a failure on a still-LIVE connection
-		 * (ambiguous server error) charges u->attempt and stays
-		 * bounded by MAX_RETRIES.  No hot-loop: the re-queuing worker
-		 * exits, and the respawn delay + cooldown pace the retry.
-		 */
-		if (u->size > 0)
-			__atomic_fetch_add(&p->queued_bytes,
-			    (uint64_t)u->size, __ATOMIC_RELAXED);
-		if (pending_trace_on())
-			pending_trace("REQUEUE", p, u, w->id, "wpr/retry");
-		if (sftp_workqueue_push(p->q, u) != 0)
-			worker_give_up_pushfail(p, w, u, "wpr/pushfail");
 	} else {
-		worker_give_up_unit(p, w, u, "unit", "wpr/maxretries");
+		/*
+		 * Failure.  A dead connection (wedge / peer-stall / transport
+		 * drop) is a TRANSIENT, blameless failure: this worker is about
+		 * to break the main loop and be respawned, so we re-queue the
+		 * unit WITHOUT charging u->attempt - peer-stall churn must not
+		 * burn the retry budget and abandon the byte-range (the br008
+		 * j8 data-loss bug).  Only a failure on a still-LIVE connection
+		 * (ambiguous server error) charges u->attempt and stays bounded
+		 * by MAX_RETRIES.
+		 *
+		 * Re-queue position differs by class:
+		 *   transient -> push_front: the worker exits, so a different
+		 *     worker pops this unit next; jumping ahead of fresh work
+		 *     lets the partially-complete file (and its range tracker)
+		 *     finish promptly instead of waiting behind the whole queue.
+		 *   ambiguous -> push (tail): the SAME live worker loops back
+		 *     and would otherwise immediately re-pop and re-fail the
+		 *     unit, burning MAX_RETRIES in a tight loop; the tail gives
+		 *     the transient condition time to clear before the retry.
+		 */
+		int transient = sftp_conn_is_dead(w->conn);
+		if (transient || ++u->attempt < hpn_max_retries(p)) {
+			if (u->size > 0)
+				__atomic_fetch_add(&p->queued_bytes,
+				    (uint64_t)u->size, __ATOMIC_RELAXED);
+			if (pending_trace_on())
+				pending_trace("REQUEUE", p, u, w->id,
+				    transient ? "wpr/transient" : "wpr/retry");
+			if ((transient
+			    ? sftp_workqueue_push_front(p->q, u)
+			    : sftp_workqueue_push(p->q, u)) != 0)
+				worker_give_up_pushfail(p, w, u, "wpr/pushfail");
+		} else {
+			worker_give_up_unit(p, w, u, "unit", "wpr/maxretries");
+		}
 	}
 }
 
@@ -1646,20 +1657,25 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 		free_unit(u);
 		return;
 	}
-	if (sftp_conn_is_dead(w->conn) || ++u->attempt < hpn_max_retries(p)) {
+	int transient = sftp_conn_is_dead(w->conn);
+	if (transient || ++u->attempt < hpn_max_retries(p)) {
 		/*
 		 * Transient (dead-conn) failures re-queue WITHOUT charging
-		 * u->attempt - the || short-circuit skips the increment; see
-		 * the full rationale in worker_process_result.  Only a
-		 * still-live-connection ambiguous error charges the budget.
+		 * u->attempt and jump to the FRONT so the partial file finishes
+		 * promptly; ambiguous (live-conn) failures charge the budget
+		 * and go to the TAIL.  See the full rationale in
+		 * worker_process_result.
 		 */
 		__atomic_store_n(&w->live_bytes, 0, __ATOMIC_RELAXED);
 		if (u->size > 0)
 			__atomic_fetch_add(&p->queued_bytes,
 			    (uint64_t)u->size, __ATOMIC_RELAXED);
 		if (pending_trace_on())
-			pending_trace("REQUEUE", p, u, w->id, "batch/retry");
-		if (sftp_workqueue_push(p->q, u) != 0)
+			pending_trace("REQUEUE", p, u, w->id,
+			    transient ? "batch/transient" : "batch/retry");
+		if ((transient
+		    ? sftp_workqueue_push_front(p->q, u)
+		    : sftp_workqueue_push(p->q, u)) != 0)
 			worker_give_up_pushfail(p, w, u, "batch/pushfail");
 		return;
 	}

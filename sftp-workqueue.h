@@ -44,6 +44,14 @@ void sftp_workqueue_free(struct sftp_workqueue *q);
 int sftp_workqueue_push(struct sftp_workqueue *q, void *item);
 
 /*
+ * Like sftp_workqueue_push but inserts at the head (LIFO): the item is the
+ * next one popped. Used for transient unit re-queues so a failed byte-range
+ * jumps ahead of fresh work and its file completes promptly. Blocks if full;
+ * returns 0 on success, -1 if shutdown was signaled before the push.
+ */
+int sftp_workqueue_push_front(struct sftp_workqueue *q, void *item);
+
+/*
  * Pop an item. Blocks if the queue is empty. On success sets *itemp and
  * returns 0. Returns -1 if shutdown was signaled and the queue is empty
  * (drains residual items before returning -1).
