@@ -2206,9 +2206,27 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	if (showprogress && size)
 		stop_progress_meter();
 
-	/* Sanity check */
-	if (TAILQ_FIRST(&requests) != NULL)
-		fatal("Transfer complete, but requests still in queue");
+	/*
+	 * Requests still queued here means the loop broke early on a dead
+	 * connection (get_msg failure, or an unexpected reply) - num_req tracks
+	 * the queue, so a clean num_req==0 loop exit always leaves it empty.
+	 * This is a survivable per-worker event, NOT a clean completion: drain
+	 * the queue, mark the connection dead, and fail the download soft so the
+	 * worker's safety net respawns it, rather than fatal()-ing and taking
+	 * the whole parallel orchestrator down with it (cf. the "Unexpected
+	 * reply" sftp_conn_die above).
+	 */
+	if (TAILQ_FIRST(&requests) != NULL) {
+		if (!sftp_conn_is_dead(conn))
+			sftp_conn_die(conn, "download of \"%s\" ended with "
+			    "requests still in flight (connection lost)",
+			    remote_path);
+		while ((req = TAILQ_FIRST(&requests)) != NULL) {
+			TAILQ_REMOVE(&requests, req, tq);
+			free(req);
+		}
+		read_error = 1;
+	}
 
 	if (!read_error && !write_error && !interrupted) {
 		/* we got everything */
@@ -3420,7 +3438,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	struct request *ack;
 	u_char *handle = NULL, *data = NULL, type;
 	size_t handle_len;
-	u_int id, ackid, startid;
+	u_int id, ackid;
 	uint32_t status = SSH2_FX_OK;
 	off_t offset, bytes_left;
 	int local_fd = -1, ret = -1, r;
@@ -3443,7 +3461,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 
 	data = xmalloc(conn->upload_buflen);
 	id = conn->msg_id;
-	startid = ackid = id + 1;
+	ackid = id + 1;
 	offset = range_offset;
 	bytes_left = range_length;
 
@@ -3714,8 +3732,22 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	}
 	sshbuf_free(msg);
 
-	if (TAILQ_FIRST(&requests) != NULL)
-		fatal("range download complete but requests still in queue");
+	/*
+	 * Same as the single-file path: a non-empty queue here is a dead
+	 * connection (early break), not a clean completion.  Fail soft so the
+	 * worker respawns instead of fatal()-ing the whole orchestrator.
+	 */
+	if (TAILQ_FIRST(&requests) != NULL) {
+		if (!sftp_conn_is_dead(conn))
+			sftp_conn_die(conn, "range download of \"%s\" ended "
+			    "with requests still in flight (connection lost)",
+			    remote_path);
+		while ((req = TAILQ_FIRST(&requests)) != NULL) {
+			TAILQ_REMOVE(&requests, req, tq);
+			free(req);
+		}
+		read_error = 1;
+	}
 
 	if (read_error)
 		sftp_close(conn, handle, handle_len);
@@ -4736,9 +4768,24 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 	debug3_f("waiting for %u replies from destination", num_upload_req);
 	handle_dest_replies(to, to_path, 1, &num_upload_req, &write_error);
 
-	/* Sanity check */
-	if (TAILQ_FIRST(&requests) != NULL)
-		fatal("Transfer complete, but requests still in queue");
+	/*
+	 * Same as the download read paths (sftp_download / sftp_download_range):
+	 * a non-empty SOURCE-read queue here means the `from` connection broke
+	 * mid-transfer, not a clean completion.  Fail soft - mark `from` dead and
+	 * set read_error - instead of fatal()-ing the whole process.  (The dest
+	 * write side is handled separately above via handle_dest_replies.)
+	 */
+	if (TAILQ_FIRST(&requests) != NULL) {
+		if (!sftp_conn_is_dead(from))
+			sftp_conn_die(from, "crossload read of \"%s\" ended "
+			    "with requests still in flight (connection lost)",
+			    from_path);
+		while ((req = TAILQ_FIRST(&requests)) != NULL) {
+			TAILQ_REMOVE(&requests, req, tq);
+			free(req);
+		}
+		read_error = 1;
+	}
 	/* Truncate at 0 length on interrupt or error to avoid holes at dest */
 	if (read_error || write_error || interrupted) {
 		debug("truncating \"%s\" at 0", to_path);
