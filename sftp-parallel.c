@@ -60,7 +60,9 @@
 
 extern int showprogress;
 
-#define WORK_QUEUE_DEPTH(N)     ((size_t)((N) * UPLOAD_BATCH_SIZE * 4 + UPLOAD_BATCH_SIZE))
+/* Work-queue depth is computed by work_queue_depth() below (defined after the
+ * bundle constants it depends on), NOT a fixed macro: bundle mode needs a much
+ * deeper queue than the old 64-file pipelining did. */
 
 /* Retry budget per work unit.  Default 3 attempts (initial + 2 retries).
  *
@@ -173,6 +175,55 @@ static int hpn_max_retries(struct sftp_parallel *p);
 #define BUNDLE_TARGET_BYTES BUNDLE_TARGET_BYTES_DEFAULT
 
 /*
+ * Work-queue (ring) depth.
+ *
+ * Non-bundle: the historical N*UPLOAD_BATCH_SIZE*4 + one extra batch - deep
+ * enough to feed the 64-file OPEN/CLOSE pipelining.
+ *
+ * Bundle mode needs far more.  A worker assembles a batch up to
+ * bundle_target_bytes using NON-BLOCKING trypop and flushes whatever is queued
+ * the instant the queue runs dry (sftp-parallel.c bundle batch loop).  So to
+ * let all num_streams workers actually reach a full bundle, the queue must
+ * hold roughly num_streams full bundles' worth of small files at once, plus
+ * headroom for the walker to refill during a concurrent grab - otherwise the
+ * queue starves and bundles flush at a fraction of the target (the old depth,
+ * N*64*4, capped 8 workers at ~queue/8 files => ~4-6 MiB bundles regardless of
+ * --bundle-size).  Sized for a representative small file (BUNDLE_QUEUE_FILE_HINT;
+ * files larger than that just need fewer units, so the queue over-provisions
+ * harmlessly; files smaller still under-fill, tunable via the hint).  Capped at
+ * WORK_QUEUE_DEPTH_MAX to bound pre-claimed work-unit memory.  The ring itself
+ * is pointers; the cost is the queued units the walker pre-enumerates.
+ */
+#define BUNDLE_QUEUE_FILE_HINT   ((uint64_t)16 * 1024)  /* representative small file */
+#define WORK_QUEUE_DEPTH_MAX     ((size_t)65536)        /* hard cap on queued units */
+
+static size_t
+work_queue_depth(const struct sftp_parallel_config *cfg)
+{
+	size_t base = (size_t)cfg->num_streams * UPLOAD_BATCH_SIZE * 4 +
+	    UPLOAD_BATCH_SIZE;
+
+	if (!cfg->use_bundle)
+		return base;
+
+	uint64_t target = (cfg->bundle_size > 0)
+	    ? cfg->bundle_size : BUNDLE_TARGET_BYTES;
+	size_t per_bundle = (size_t)(target / BUNDLE_QUEUE_FILE_HINT);
+	if (per_bundle < UPLOAD_BATCH_SIZE)
+		per_bundle = UPLOAD_BATCH_SIZE;
+
+	/* num_streams full bundles + one round of headroom so the walker stays
+	 * ahead of all workers assembling at once. */
+	size_t depth = (size_t)cfg->num_streams * per_bundle * 2 +
+	    UPLOAD_BATCH_SIZE;
+	if (depth < base)
+		depth = base;
+	if (depth > WORK_QUEUE_DEPTH_MAX)
+		depth = WORK_QUEUE_DEPTH_MAX;
+	return depth;
+}
+
+/*
  * Maximum number of failed-path entries the orchestrator retains for
  * the end-of-transfer summary.  Beyond this, the count keeps growing
  * (so the user knows N files failed) but the per-path strings are
@@ -183,22 +234,35 @@ static int hpn_max_retries(struct sftp_parallel *p);
  */
 #define HPN_FAILED_PATHS_MAX    100
 
-/* Watchdog thresholds. STALL: warn if a worker has had work available but
- * made no bytes-level progress (bytes_total + live_bytes flat) for this
- * long. DEAD: escalate to SIGTERM. The progress signal is bytes-based
- * (live_bytes climbs continuously during a healthy transfer regardless of
- * unit size), so these thresholds reflect "no client-side bytes pushed
- * in N seconds" rather than "no unit completed in N seconds". Real fatal
- * stalls (born-dead workers, frozen channel windows) still get caught by
- * the 5 s born-dead fast-kill before this threshold fires.
+/* Watchdog thresholds.  STALL: warn (status only, NO kill) if a worker has had
+ * work available but made no bytes-level progress (bytes_total + live_bytes
+ * flat) for this long.  The progress signal is bytes-based (live_bytes climbs
+ * continuously during a healthy transfer regardless of unit size), so it
+ * reflects "no client-side bytes in N seconds" rather than "no unit completed
+ * in N seconds".
  *
- * 2026-05-21 note: tried 300/600 to tolerate ext4 writeback-stall pauses
- * in whole-file mode and the data showed whole-file parallelism is a
- * net loss on disk-bound paths anyway (worse than single-stream), so we
- * reverted to 60/120 - fine for the configurations we recommend
- * (Lustre/GPFS range-split, or non-stripe range-split at low -j). */
-#define STALL_THRESHOLD_SEC     60
-#define DEAD_THRESHOLD_SEC      120
+ * Mid-stream silence is the TRANSPORT's lane.  A worker that was producing and
+ * goes quiet is exactly when the connection's TCP_INFO classifier fires: WEDGE
+ * reaps it (~10 s) or PEER_STALL waits and brakes at PEER_STALL_BRAKE_SECS
+ * (300 s, sftp-hpn-congestion.c) - and on any of those the child exits, so the
+ * child-gone check reaps it immediately with the precise cause.  The
+ * orchestrator therefore only needs a backstop ABOVE the brake, for the cases
+ * the transport CANNOT classify (no TCP_INFO, a LAN path, or a genuinely hung
+ * worker): WORKER_SILENCE_BRAKE_SEC.  Keeping it above 300 s lets the
+ * transport's wait-not-kill lead rather than the orchestrator pre-empting it at
+ * 15-120 s (which re-manufactured the churn the wait was built to avoid).
+ * Start-of-unit zero-bytes is a separate lane the transport is usually blind to
+ * (e.g. a download worker waiting on a server disk read - the server is not
+ * rwnd-limited, so no PEER_STALL), so the born-dead fast-kill (5-40 s,
+ * RTT-scaled) stays responsive.
+ *
+ * 2026-06-05: born-dead stays fast; the mid-stream silence reaps (dead /
+ * isolation) were raised from 60/120/15 s to the single backstop below. */
+#define STALL_THRESHOLD_SEC          60  /* STALLED warn status (no kill) */
+#define WORKER_SILENCE_BRAKE_SEC    330  /* reap a still-connected, byte-silent
+                                          * worker only after this - above the
+                                          * 300 s transport peer-stall brake so
+                                          * the transport self-terminates first */
 
 /*
  * Number of watchdog ticks (~1 s each) to wait before a worker becomes
@@ -252,10 +316,11 @@ static int hpn_max_retries(struct sftp_parallel *p);
  * has zero progress (bytes_total + live_bytes + units_completed all 0)
  * for this many seconds is killed and respawned.  The server-side path
  * for that SSH session is wedged - usually a Lustre OST stall that
- * froze the SSH channel window.  Waiting the full STALL_THRESHOLD_SEC
- * (60s) or even ISOLATION_PROGRESS_STALL_SEC (15s) wastes capacity:
- * we know after a few seconds that no bytes have arrived, and zero is
- * unambiguous - no peer comparison or EMA warmup needed.
+ * froze the SSH channel window.  Waiting the full WORKER_SILENCE_BRAKE_SEC
+ * backstop wastes capacity here: we know after a few seconds that no bytes
+ * have arrived, and zero is unambiguous - no peer comparison or EMA warmup
+ * needed.  This is the start-of-unit lane the transport can't classify, so it
+ * stays responsive while the mid-stream silence reaps were relaxed.
  *
  * Set conservatively: 5 seconds is well above SSH auth completion
  * (~1 RTT after the worker enters the main loop) and the first OPEN
@@ -356,24 +421,6 @@ static int hpn_max_retries(struct sftp_parallel *p);
  * benchmark/range-split-tuning-analysis.md for the empirical sweep that
  * picked 2 GiB and for the formula-driven scheme that preceded it.
  */
-
-/*
- * Isolation progress-rate gate.  When a worker is alone with an in-flight
- * unit (queue empty, no peers transferring) the peer-EMA-based outlier path
- * has no signal to compare against - max_kbps decays to zero as peers go
- * idle, the "path is healthy" gate suppresses outlier escalation, and the
- * worker falls through to the full STALL_THRESHOLD_SEC timeout (60 s) even
- * if it's dribbling at a tiny fraction of expected throughput.
- *
- * ISOLATION_PROGRESS_STALL_SEC is a tighter timeout for that case: when a
- * worker has held a unit for at least this long AND its EMA is below the
- * configured tput_path_healthy_kbps floor, declare DEAD without waiting
- * the full STALL_THRESHOLD_SEC.  Defense-in-depth for the "last worker
- * holding the queue" wedge; the architectural fix (non-blocking
- * sftp_parallel_wait between batch commands) is the cleaner long-term
- * answer because it removes the isolation condition entirely.
- */
-#define ISOLATION_PROGRESS_STALL_SEC  15
 
 /*
  * Synchronous-stall observer.  Each reporter slow-tick (~1 s) checks whether
@@ -3060,7 +3107,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		if (next != WORKER_DEAD && queue_has_work && in_flight > 0 &&
 		    effective_silence_ns > 0) {
 			uint64_t s = effective_silence_ns / 1000000000ULL;
-			if (s > DEAD_THRESHOLD_SEC) {
+			if (s > WORKER_SILENCE_BRAKE_SEC) {
 				next = WORKER_DEAD;
 				doom_reason = "dead";
 			} else if (s > STALL_THRESHOLD_SEC)
@@ -3068,38 +3115,36 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		} else if (!queue_has_work && in_flight > 0 &&
 		    effective_silence_ns > 0) {
 			/*
-			 * Isolation escalation: queue is empty but this
-			 * worker still has in-flight units (keeping pending
-			 * > 0).  No other worker can take over its work -
-			 * if it doesn't progress, sftp_parallel_wait hangs
-			 * forever.  Apply a tighter threshold here: any
-			 * worker that's been mute for STALL_THRESHOLD_SEC
-			 * while no other work exists is the holdout, kill
-			 * it so the unit gets re-queued and respawned.
+			 * Isolation: the queue is empty but this worker still
+			 * has in-flight units (keeping pending > 0).  No other
+			 * worker can take over - if it never progresses,
+			 * sftp_parallel_wait hangs forever, so this is the one
+			 * silence path that MUST eventually reap even the last
+			 * worker.  Under wait-not-kill we are patient about it:
+			 * reap only at the WORKER_SILENCE_BRAKE_SEC backstop
+			 * (above the transport's peer-stall brake), letting a
+			 * recoverable stall on the last unit drain rather than
+			 * churning a respawn into the same backend.  A last
+			 * worker stuck at the START of a unit (0 bytes ever) is
+			 * still caught fast by born-dead above; this backstop is
+			 * for one that produced, then went silent mid-stream.
+			 * The below-floor branch only sets the doom_reason label
+			 * (isolation vs iso_stall); both reap at the backstop.
 			 *
-			 * effective_silence_ns falls back to "time since
-			 * unit was popped" when the worker has never
-			 * completed anything - catches a worker wedged on
-			 * its very first unit, where since_completion_ns
-			 * would still be 0.
-			 *
-			 * Fast path: when the worker is dribbling below the
-			 * configured healthy floor (peer-EMA outlier check
-			 * can't fire because there are no peers), declare
-			 * DEAD at ISOLATION_PROGRESS_STALL_SEC instead of
-			 * the full STALL_THRESHOLD_SEC.  Gated on EMA
-			 * warmup so we don't kill a worker that just popped
-			 * a unit and is mid slow-start.
+			 * effective_silence_ns falls back to "time since the
+			 * unit was popped" when the worker has never completed
+			 * anything - catches a worker wedged on its very first
+			 * unit, where since_completion_ns would still be 0.
 			 */
 			uint64_t s = effective_silence_ns / 1000000000ULL;
-			if (s > (uint64_t)ISOLATION_PROGRESS_STALL_SEC &&
+			if (s > (uint64_t)WORKER_SILENCE_BRAKE_SEC &&
 			    p->cfg.tput_path_healthy_kbps > 0 &&
 			    w->tput_ema_warmup_ticks >= TPUT_EMA_WARMUP_TICKS &&
 			    w->tput_ema_kbps <
 			        p->cfg.tput_path_healthy_kbps) {
 				next = WORKER_DEAD;
 				doom_reason = "isolation";
-			} else if (s > STALL_THRESHOLD_SEC) {
+			} else if (s > WORKER_SILENCE_BRAKE_SEC) {
 				next = WORKER_DEAD;
 				doom_reason = "iso_stall";
 			}
@@ -4179,7 +4224,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 
 	/* 1. Workqueue. Sized for cfg->num_streams.  Respawned workers
 	 * reuse the same queue, so capacity is set once at startup. */
-	p->q = sftp_workqueue_new(WORK_QUEUE_DEPTH(cfg->num_streams));
+	p->q = sftp_workqueue_new(work_queue_depth(cfg));
 	if (p->q == NULL) {
 		error_f("workqueue allocation failed");
 		goto fail;
@@ -5193,7 +5238,7 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 		/* queue capacity isn't directly queryable; derive from
 		 * the formula used at construction. Slightly indirect but
 		 * stable. */
-		out->queue_capacity = WORK_QUEUE_DEPTH(p->cfg.num_streams);
+		out->queue_capacity = work_queue_depth(&p->cfg);
 	}
 }
 
