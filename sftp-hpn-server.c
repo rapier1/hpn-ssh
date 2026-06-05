@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -132,6 +133,55 @@ struct hpn_lov_user_md_v1 {
 } __attribute__((packed));
 
 /*
+ * Composite "Data-on-MDT" (DoM) layout ABI, also inlined from the Lustre uapi
+ * header (lustre 2.15 lov_comp_md_v1) - same rationale as the v1 struct above:
+ * NO liblustreapi link and NO `lfs` subprocess.  Restricted data-transfer
+ * nodes commonly allow only sftp and would block a fork/exec, and we keep the
+ * build dependency-free (off-Lustre the ioctl just returns NOT_FS).  See
+ * lustre_set_dom_layout_fd().
+ */
+#ifndef LOV_USER_MAGIC_V3
+# define LOV_USER_MAGIC_V3       0x0BD30BD0
+#endif
+#ifndef LOV_USER_MAGIC_COMP_V1
+# define LOV_USER_MAGIC_COMP_V1  0x0BD60BD0
+#endif
+#ifndef LOV_PATTERN_MDT
+# define LOV_PATTERN_MDT         0x100   /* Data-on-MDT component */
+#endif
+#ifndef LUSTRE_EOF
+# define LUSTRE_EOF              0xffffffffffffffffULL
+#endif
+
+struct hpn_lu_extent {
+	uint64_t e_start;
+	uint64_t e_end;
+} __attribute__((packed));
+
+struct hpn_lov_comp_md_entry_v1 {
+	uint32_t lcme_id;
+	uint32_t lcme_flags;
+	struct hpn_lu_extent lcme_extent;
+	uint32_t lcme_offset;       /* byte offset (from header) to sub-layout */
+	uint32_t lcme_size;         /* size of that sub-layout blob */
+	uint32_t lcme_layout_gen;
+	uint64_t lcme_timestamp;
+	uint32_t lcme_padding_1;
+} __attribute__((packed));      /* 48 bytes */
+
+struct hpn_lov_comp_md_v1 {
+	uint32_t lcm_magic;         /* LOV_USER_MAGIC_COMP_V1 */
+	uint32_t lcm_size;          /* overall size incl. entries + sub-layouts */
+	uint32_t lcm_layout_gen;
+	uint16_t lcm_flags;
+	uint16_t lcm_entry_count;
+	uint16_t lcm_mirror_count;
+	uint16_t lcm_padding1[3];
+	uint64_t lcm_padding2;
+	/* followed by lcm_entry_count entries, then their sub-layouts */
+} __attribute__((packed));      /* 32 bytes */
+
+/*
  * Apply a stripe layout to an open directory or freshly-created file FD.
  * Caller is responsible for opening the path with the appropriate flags
  * (directories: O_RDONLY; new files: O_CREAT|O_RDWR with no prior writes).
@@ -176,83 +226,148 @@ lustre_set_stripe_fd(int fd, uint32_t requested_count,
 }
 
 /*
- * Run "lfs getstripe -d --yaml <path>" as a child process (no shell -
- * path is passed as an argv element to execlp, preventing command injection)
- * and parse stripe_count / stripe_size from the YAML output.
+ * Apply a composite Data-on-MDT (DoM) layout to an open directory FD:
+ * [0, dom_size) on the MDT, [dom_size, EOF) striped RAID0 across
+ * overflow_count OSTs.  Files created under the directory inherit it, so the
+ * small files a bundle extracts land entirely on the MDT - no OST object per
+ * file, which is what dominates small-file Lustre create cost.  Large files
+ * spill past dom_size onto OSTs as usual.
  *
- * Lustre 2.x YAML output contains lines like:
- *   stripe_count:  4
- *   stripe_size:   1048576
- * (older Lustre uses "lmm_" prefixes on the same keys)
+ * Built as a raw LL_IOC_LOV_SETSTRIPE composite buffer from the structs above
+ * (inlined from the Lustre uapi header).  Same rationale as the simple path: NO
+ * `lfs` subprocess (restricted DTNs allow sftp only and would block fork/exec)
+ * and NO liblustreapi link.  Buffer shape (lustre 2.15): 32B header + two 48B
+ * entries + two 32B lov_user_md_v1 sub-layouts = 192B.  Returns
+ * HPN_FILE_LAYOUT_OK / _NOT_FS (DoM off/unsupported, or not Lustre) / _PERM /
+ * _FAIL.
+ */
+static uint32_t
+lustre_set_dom_layout_fd(int fd, uint32_t dom_size, uint32_t overflow_count)
+{
+	enum {
+		HDR   = sizeof(struct hpn_lov_comp_md_v1),       /* 32 */
+		ENT   = sizeof(struct hpn_lov_comp_md_entry_v1), /* 48 */
+		SUB   = sizeof(struct hpn_lov_user_md_v1),       /* 32 */
+		OFF0  = HDR + 2 * ENT,                           /* 128: sub-layout 0 */
+		OFF1  = OFF0 + SUB,                              /* 160: sub-layout 1 */
+		TOTAL = OFF1 + SUB                               /* 192 */
+	};
+	unsigned char buf[TOTAL];
+	struct hpn_lov_comp_md_v1       *cm = (void *)buf;
+	struct hpn_lov_comp_md_entry_v1 *e0 = (void *)(buf + HDR);
+	struct hpn_lov_comp_md_entry_v1 *e1 = (void *)(buf + HDR + ENT);
+	struct hpn_lov_user_md_v1       *s0 = (void *)(buf + OFF0);
+	struct hpn_lov_user_md_v1       *s1 = (void *)(buf + OFF1);
+
+	memset(buf, 0, sizeof(buf));
+
+	cm->lcm_magic       = LOV_USER_MAGIC_COMP_V1;
+	cm->lcm_size        = TOTAL;
+	cm->lcm_entry_count = 2;
+
+	/* Component 1: [0, dom_size) on the MDT (Data-on-MDT). */
+	e0->lcme_id             = 1;
+	e0->lcme_extent.e_start = 0;
+	e0->lcme_extent.e_end   = dom_size;
+	e0->lcme_offset         = OFF0;
+	e0->lcme_size           = SUB;
+	s0->lmm_magic           = LOV_USER_MAGIC_V1;
+	s0->lmm_pattern         = LOV_PATTERN_MDT;
+	s0->lmm_stripe_size     = dom_size;
+	s0->lmm_stripe_count    = 0;
+	s0->lmm_stripe_offset   = 0;
+
+	/* Component 2: [dom_size, EOF) striped RAID0 across overflow_count OSTs. */
+	e1->lcme_id             = 2;
+	e1->lcme_extent.e_start = dom_size;
+	e1->lcme_extent.e_end   = LUSTRE_EOF;
+	e1->lcme_offset         = OFF1;
+	e1->lcme_size           = SUB;
+	s1->lmm_magic           = LOV_USER_MAGIC_V1;
+	s1->lmm_pattern         = 0;          /* RAID0 */
+	s1->lmm_stripe_size     = dom_size;   /* OST stripe size for the overflow */
+	s1->lmm_stripe_count    = (uint16_t)(overflow_count & 0xFFFFu);
+	s1->lmm_stripe_offset   = (uint16_t)-1;
+
+	if (ioctl(fd, LL_IOC_LOV_SETSTRIPE, buf) == 0)
+		return HPN_FILE_LAYOUT_OK;
+	switch (errno) {
+	case ENOTTY:
+	case EINVAL:
+	case EOPNOTSUPP:
+		return HPN_FILE_LAYOUT_NOT_FS;
+	case EPERM:
+	case EACCES:
+		return HPN_FILE_LAYOUT_PERM;
+	default:
+		return HPN_FILE_LAYOUT_FAIL;
+	}
+}
+
+/*
+ * Read a directory's default OST stripe geometry (count + size) WITHOUT a
+ * subprocess: getxattr the raw "lustre.lov" layout EA and parse it.  Replaces a
+ * fork()+execlp("lfs","getstripe","-d") - a fork/exec is a liability on
+ * seccomp-hardened data-transfer nodes (a blocked execve can SIGSYS the child),
+ * and getxattr is a plain syscall any sftp-capable node allows.
  *
- * Returns 1 if both were found with sensible values, 0 otherwise.
+ * The EA is either a simple lov_user_md_v1/v3 (read its stripe_count/size) or a
+ * composite lov_comp_md_v1 (a DoM/PFL layout - report the non-MDT, i.e. OST,
+ * component: the geometry large files stripe with).  Struct ABI is the inlined
+ * set above.  ENOTSUP/ENODATA (non-Lustre, or no explicit default) -> 0.
  */
 static int
 lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_count)
 {
-	int pipefd[2];
-	pid_t pid;
-	FILE *f;
-	char line[256];
-	int got_size = 0, got_count = 0;
+	unsigned char buf[8192];
+	ssize_t n;
+	uint32_t magic;
 
-	if (pipe(pipefd) < 0)
+	n = getxattr(path, "lustre.lov", buf, sizeof(buf));
+	if (n < (ssize_t)sizeof(magic))
 		return 0;
-	/* Set CLOEXEC so the parent's copy of the write-end closes on exec. */
-	FD_CLOSEONEXEC(pipefd[0]);
-	FD_CLOSEONEXEC(pipefd[1]);
+	memcpy(&magic, buf, sizeof(magic));
 
-	pid = fork();
-	if (pid < 0) {
-		close(pipefd[0]);
-		close(pipefd[1]);
-		return 0;
-	}
-	if (pid == 0) {
-		/* Child: wire pipefd[1] to stdout, then exec lfs. */
-		int devnull = open("/dev/null", O_WRONLY);
-		close(pipefd[0]);
-		/* dup2 clears CLOEXEC on STDOUT_FILENO so it survives exec. */
-		if (dup2(pipefd[1], STDOUT_FILENO) < 0)
-			_exit(127);
-		close(pipefd[1]);
-		if (devnull >= 0) {
-			dup2(devnull, STDERR_FILENO);
-			close(devnull);
+	if (magic == LOV_USER_MAGIC_V1 || magic == LOV_USER_MAGIC_V3) {
+		const struct hpn_lov_user_md_v1 *lum = (const void *)buf;
+
+		if (n < (ssize_t)sizeof(*lum))
+			return 0;
+		*stripe_count = lum->lmm_stripe_count;
+		*stripe_size  = lum->lmm_stripe_size;
+	} else if (magic == LOV_USER_MAGIC_COMP_V1) {
+		const struct hpn_lov_comp_md_v1 *cm = (const void *)buf;
+		int found = 0;
+		uint16_t i;
+
+		if (n < (ssize_t)sizeof(*cm))
+			return 0;
+		for (i = 0; i < cm->lcm_entry_count; i++) {
+			size_t eoff = sizeof(*cm) + (size_t)i *
+			    sizeof(struct hpn_lov_comp_md_entry_v1);
+			const struct hpn_lov_comp_md_entry_v1 *e;
+			const struct hpn_lov_user_md_v1 *sub;
+
+			if (eoff + sizeof(*e) > (size_t)n)
+				break;
+			e = (const void *)(buf + eoff);
+			if ((size_t)e->lcme_offset + sizeof(*sub) > (size_t)n)
+				continue;
+			sub = (const void *)(buf + e->lcme_offset);
+			if ((sub->lmm_pattern & LOV_PATTERN_MDT) != 0)
+				continue;   /* skip the Data-on-MDT component */
+			*stripe_count = sub->lmm_stripe_count;
+			*stripe_size  = sub->lmm_stripe_size;
+			found = 1;
+			break;
 		}
-		execlp("lfs", "lfs", "getstripe", "-d", "--yaml", path,
-		    (char *)NULL);
-		_exit(127);
-	}
-
-	/* Parent: read lfs output. */
-	close(pipefd[1]);
-	if ((f = fdopen(pipefd[0], "r")) == NULL) {
-		close(pipefd[0]);
-		waitpid(pid, NULL, 0);
+		if (!found)
+			return 0;
+	} else {
 		return 0;
 	}
-	while (fgets(line, sizeof(line), f) != NULL) {
-		/* Keep as `unsigned long long` to match the %llu format
-		 * specifier - sscanf is strict about the underlying type
-		 * (u_int64_t is `unsigned long int` on LP64 Linux, not
-		 * `unsigned long long`).  Same exception as the printf cast
-		 * idiom - format-spec matching wins over typedef preference. */
-		unsigned long long v = 0;
-		if (sscanf(line, " stripe_count: %llu", &v) == 1 ||
-		    sscanf(line, " lmm_stripe_count: %llu", &v) == 1) {
-			*stripe_count = (uint32_t)v;
-			got_count = 1;
-		} else if (sscanf(line, " stripe_size: %llu", &v) == 1 ||
-		           sscanf(line, " lmm_stripe_size: %llu", &v) == 1) {
-			*stripe_size = (uint64_t)v;
-			got_size = 1;
-		}
-	}
-	fclose(f);   /* closes pipefd[0] */
-	waitpid(pid, NULL, 0);
 
-	return got_size && got_count && *stripe_size > 0 && *stripe_count > 0;
+	return *stripe_size > 0 && *stripe_count > 0;
 }
 
 /* process_hpn_bundle_open / process_hpn_bundle_fetch declarations live
@@ -609,7 +724,9 @@ process_hpn_file_layout(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
 	char		*path = NULL;
 	u_int32_t	 requested = 0;
+	u_int32_t	 dom_size = 0;
 	u_int32_t	 applied = 0;
+	u_int32_t	 layout_kind = 0;   /* 0 = plain stripe, 1 = Data-on-MDT */
 	u_int32_t	 status = HPN_FILE_LAYOUT_FAIL;
 	int		 fd = -1;
 	int		 r;
@@ -620,9 +737,12 @@ process_hpn_file_layout(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		error_f("parse: %s", ssh_err(r));
 		goto out;
 	}
+	/* rev-2 adds dom_size (0 = plain stripe); a rev-1 client omits it. */
+	if (sshbuf_get_u32(iqueue, &dom_size) != 0)
+		dom_size = 0;
 
-	debug3("request %u: hpn-file-layout \"%s\" stripe_count=%u",
-	    id, path, requested);
+	debug3("request %u: hpn-file-layout \"%s\" stripe_count=%u dom_size=%u",
+	    id, path, requested, dom_size);
 
 	/*
 	 * The path is expected to be a directory the client has already
@@ -647,11 +767,29 @@ process_hpn_file_layout(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto reply;
 	}
 
-	status = lustre_set_stripe_fd(fd, requested, &applied);
+	/*
+	 * dom_size > 0 requests a Data-on-MDT composite layout (small files on
+	 * the MDT, the overflow striped across `requested` OSTs).  If DoM is
+	 * off/unsupported on this Lustre the ioctl returns NOT_FS; fall back to a
+	 * plain `requested`-wide stripe so the destination still gets a layout.
+	 */
+	if (dom_size > 0) {
+		status = lustre_set_dom_layout_fd(fd, dom_size, requested);
+		if (status == HPN_FILE_LAYOUT_OK) {
+			layout_kind = 1;
+			applied = requested;
+		} else if (status == HPN_FILE_LAYOUT_NOT_FS) {
+			status = lustre_set_stripe_fd(fd, requested, &applied);
+		}
+	} else {
+		status = lustre_set_stripe_fd(fd, requested, &applied);
+	}
+
 	switch (status) {
 	case HPN_FILE_LAYOUT_OK:
-		logit("hpn-file-layout \"%s\" stripe_count %u (requested %u)",
-		    path, applied, requested);
+		logit("hpn-file-layout \"%s\": %s, stripe_count %u (requested %u)",
+		    path, layout_kind ? "Data-on-MDT" : "plain stripe",
+		    applied, requested);
 		break;
 	case HPN_FILE_LAYOUT_NOT_FS:
 		debug3("hpn-file-layout: \"%s\" not on a layout-capable fs",
@@ -671,7 +809,8 @@ process_hpn_file_layout(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_u32(msg, status)) != 0 ||
-	    (r = sshbuf_put_u32(msg, applied)) != 0)
+	    (r = sshbuf_put_u32(msg, applied)) != 0 ||
+	    (r = sshbuf_put_u32(msg, layout_kind)) != 0)
 		fatal_fr(r, "compose hpn-file-layout reply");
 	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
 		fatal_fr(r, "enqueue hpn-file-layout reply");

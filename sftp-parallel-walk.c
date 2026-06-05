@@ -65,12 +65,26 @@
 #define PARALLEL_MAX_DIR_DEPTH 64
 
 /*
+ * Data-on-MDT component size for the auto layout (see maybe_apply_lustre_layout).
+ * 1 MiB covers the vast majority of "small" files; the server clamps it to the
+ * MDT's dom_stripesize if smaller, or falls back to a plain stripe if DoM is
+ * off.
+ *
+ * TODO: may want to expose this as a config knob (e.g. HPNLustreDomSize)
+ * eventually - 1 MiB is a sensible default but the right value is site-dependent
+ * (MDT capacity, typical small-file size).
+ */
+#define DOM_DEFAULT_SIZE  (1u * 1024u * 1024u)   /* 1 MiB */
+
+/*
  * HPNLustreStripeCount (EXPERIMENTAL): one-shot helper run at the top of
  * the upload walker.  Queries the destination directory's filesystem via
- * hpn-fs-info; if it's Lustre and the current stripe count is below the
- * desired value, asks the server to apply the new stripe count via
- * hpn-file-layout.  Subsequent files created in the directory (including
- * those extracted from bundles) inherit the layout.
+ * hpn-fs-info; if it's Lustre, asks the server to set the directory's default
+ * layout via hpn-file-layout.  Default/auto requests a Data-on-MDT layout
+ * (small files entirely on the MDT - no per-file OST object - large files
+ * striped past the DoM component); an explicit HPNLustreStripeCount=N requests
+ * a plain N-wide stripe instead.  Subsequent files created in the directory
+ * (including those extracted from bundles) inherit the layout.
  *
  * Silent on every non-Lustre destination - operators of non-Lustre sites
  * see nothing change.  On Lustre destinations the actual stripe-set
@@ -89,7 +103,10 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	int desired;
 	int configured;
 	int n_workers;
+	int use_dom;
+	uint32_t dom_size;
 	uint32_t applied = 0;
+	uint32_t layout_kind = 0;
 	int rc;
 
 	if (p == NULL || conn == NULL || dst == NULL)
@@ -108,24 +125,38 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (!sftp_conn_has_file_layout(conn))
 		return;  /* server is too old or built without it */
 
-	/* desired = explicit count if HPNLustreStripeCount was set; else -j N */
-	desired = (configured > 0) ? configured : n_workers;
+	/*
+	 * Default/auto (HPNLustreStripeCount unset = -1): Data-on-MDT, with the
+	 * overflow striped across n_workers OSTs for large files.  Explicit
+	 * HPNLustreStripeCount=N: plain N-wide stripe (DoM off, pre-DoM behaviour).
+	 */
+	use_dom  = (configured < 0);
+	dom_size = use_dom ? DOM_DEFAULT_SIZE : 0;
+	desired  = use_dom ? n_workers : configured;
 
 	if (sftp_fs_info(conn, dst, &info) != 0)
 		return;  /* server lacks hpn-fs-info, or query failed */
 	if (strcmp(info.fs_type, "lustre") != 0)
 		return;  /* not a Lustre destination */
-	if (info.stripe_count >= (uint32_t)desired) {
+	/*
+	 * Plain-stripe path: skip if the dir is already striped wide enough.
+	 * The DoM path always (re)applies - the current stripe_count can't
+	 * distinguish a DoM layout from a plain one, and re-setting the dir
+	 * default is cheap and idempotent.
+	 */
+	if (!use_dom && info.stripe_count >= (uint32_t)desired) {
 		debug_f("Lustre auto-stripe: \"%s\" already at stripe_count=%u "
 		    "(desired %d); no change", dst, info.stripe_count, desired);
 		return;
 	}
 
-	rc = sftp_hpn_set_file_layout(conn, dst, (u_int32_t)desired, &applied);
+	rc = sftp_hpn_set_file_layout(conn, dst, (u_int32_t)desired, dom_size,
+	    &applied, &layout_kind);
 	switch (rc) {
 	case HPN_FILE_LAYOUT_OK:
-		logit("Lustre auto-stripe (experimental): \"%s\" "
-		    "stripe_count %u -> %u", dst, info.stripe_count, applied);
+		logit("Lustre auto-stripe (experimental): \"%s\" -> %s "
+		    "(stripe_count %u)", dst,
+		    layout_kind ? "Data-on-MDT" : "plain stripe", applied);
 		break;
 	case HPN_FILE_LAYOUT_NOT_FS:
 		debug_f("Lustre auto-stripe: \"%s\" reports not on a "

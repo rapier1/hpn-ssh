@@ -1194,18 +1194,22 @@ out:
  */
 int
 sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
-    u_int32_t stripe_count, u_int32_t *applied_out)
+    u_int32_t stripe_count, u_int32_t dom_size, u_int32_t *applied_out,
+    u_int32_t *layout_kind_out)
 {
 	struct sshbuf	*msg = NULL;
 	u_int		 id, rid;
 	u_int32_t	 status = HPN_FILE_LAYOUT_FAIL;
 	u_int32_t	 applied = 0;
+	u_int32_t	 layout_kind = 0;
 	u_char		 type;
 	int		 r;
 	int		 rc = HPN_FILE_LAYOUT_FAIL;
 
 	if (applied_out != NULL)
 		*applied_out = 0;
+	if (layout_kind_out != NULL)
+		*layout_kind_out = 0;
 
 	if (conn == NULL || path == NULL) {
 		errno = EINVAL;
@@ -1223,13 +1227,14 @@ sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
 	}
 
 	id = sftp_conn_alloc_msg_id(conn);
-	debug3_f("sending hpn-file-layout \"%s\" stripe_count=%u id=%u",
-	    path, stripe_count, id);
+	debug3_f("sending hpn-file-layout \"%s\" stripe_count=%u dom_size=%u id=%u",
+	    path, stripe_count, dom_size, id);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, HPN_EXT_FILE_LAYOUT)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
-	    (r = sshbuf_put_u32(msg, stripe_count)) != 0)
+	    (r = sshbuf_put_u32(msg, stripe_count)) != 0 ||
+	    (r = sshbuf_put_u32(msg, dom_size)) != 0)
 		fatal_fr(r, "compose hpn-file-layout request");
 	if (send_msg(conn, msg) != 0) {
 		logit_f("hpn-file-layout \"%s\": transport send failed", path);
@@ -1274,11 +1279,16 @@ sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
 		    path, ssh_err(r));
 		goto out;
 	}
+	/* rev-2 layout_kind (0=plain, 1=DoM); absent from a rev-1 server. */
+	if (sshbuf_get_u32(msg, &layout_kind) != 0)
+		layout_kind = 0;
 
-	debug3_f("hpn-file-layout \"%s\" status=%u applied=%u",
-	    path, status, applied);
+	debug3_f("hpn-file-layout \"%s\" status=%u applied=%u kind=%u",
+	    path, status, applied, layout_kind);
 	if (applied_out != NULL)
 		*applied_out = applied;
+	if (layout_kind_out != NULL)
+		*layout_kind_out = layout_kind;
 	rc = (int)status;
 
 out:
