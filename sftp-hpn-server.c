@@ -233,13 +233,15 @@ lustre_set_stripe_fd(int fd, uint32_t requested_count,
  * file, which is what dominates small-file Lustre create cost.  Large files
  * spill past dom_size onto OSTs as usual.
  *
- * Built as a raw LL_IOC_LOV_SETSTRIPE composite buffer from the structs above
- * (inlined from the Lustre uapi header).  Same rationale as the simple path: NO
- * `lfs` subprocess (restricted DTNs allow sftp only and would block fork/exec)
- * and NO liblustreapi link.  Buffer shape (lustre 2.15): 32B header + two 48B
- * entries + two 32B lov_user_md_v1 sub-layouts = 192B.  Returns
- * HPN_FILE_LAYOUT_OK / _NOT_FS (DoM off/unsupported, or not Lustre) / _PERM /
- * _FAIL.
+ * Built as a composite layout EA and written with fsetxattr("lustre.lov") -
+ * LL_IOC_LOV_SETSTRIPE only accepts SIMPLE layouts (it returns ENOTSUPP for a
+ * composite magic), so the directory default composite is set by writing the
+ * raw EA directly: the same "lustre.lov" blob lustre_get_stripe reads back.
+ * Works on the O_RDONLY dir fd.  Same rationale as the simple path: NO `lfs`
+ * subprocess (restricted DTNs allow sftp only and would block fork/exec) and NO
+ * liblustreapi link.  Buffer shape (lustre 2.15): 32B header + two 48B entries
+ * + two 32B lov_user_md_v1 sub-layouts = 192B.  Returns HPN_FILE_LAYOUT_OK /
+ * _NOT_FS (DoM off/unsupported, or not Lustre) / _PERM / _FAIL.
  */
 static uint32_t
 lustre_set_dom_layout_fd(int fd, uint32_t dom_size, uint32_t overflow_count)
@@ -265,8 +267,8 @@ lustre_set_dom_layout_fd(int fd, uint32_t dom_size, uint32_t overflow_count)
 	cm->lcm_size        = TOTAL;
 	cm->lcm_entry_count = 2;
 
-	/* Component 1: [0, dom_size) on the MDT (Data-on-MDT). */
-	e0->lcme_id             = 1;
+	/* Component 1: [0, dom_size) on the MDT (Data-on-MDT).  lcme_id stays 0
+	 * (the kernel assigns component ids); stripe_offset -1 = Lustre picks. */
 	e0->lcme_extent.e_start = 0;
 	e0->lcme_extent.e_end   = dom_size;
 	e0->lcme_offset         = OFF0;
@@ -275,10 +277,9 @@ lustre_set_dom_layout_fd(int fd, uint32_t dom_size, uint32_t overflow_count)
 	s0->lmm_pattern         = LOV_PATTERN_MDT;
 	s0->lmm_stripe_size     = dom_size;
 	s0->lmm_stripe_count    = 0;
-	s0->lmm_stripe_offset   = 0;
+	s0->lmm_stripe_offset   = (uint16_t)-1;
 
 	/* Component 2: [dom_size, EOF) striped RAID0 across overflow_count OSTs. */
-	e1->lcme_id             = 2;
 	e1->lcme_extent.e_start = dom_size;
 	e1->lcme_extent.e_end   = LUSTRE_EOF;
 	e1->lcme_offset         = OFF1;
@@ -289,12 +290,13 @@ lustre_set_dom_layout_fd(int fd, uint32_t dom_size, uint32_t overflow_count)
 	s1->lmm_stripe_count    = (uint16_t)(overflow_count & 0xFFFFu);
 	s1->lmm_stripe_offset   = (uint16_t)-1;
 
-	if (ioctl(fd, LL_IOC_LOV_SETSTRIPE, buf) == 0)
+	if (fsetxattr(fd, "lustre.lov", buf, sizeof(buf), 0) == 0)
 		return HPN_FILE_LAYOUT_OK;
 	switch (errno) {
 	case ENOTTY:
+	case ENODATA:
 	case EINVAL:
-	case EOPNOTSUPP:
+	case EOPNOTSUPP:   /* == ENOTSUP: non-Lustre, or DoM off/unsupported */
 		return HPN_FILE_LAYOUT_NOT_FS;
 	case EPERM:
 	case EACCES:
@@ -778,7 +780,10 @@ process_hpn_file_layout(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		if (status == HPN_FILE_LAYOUT_OK) {
 			layout_kind = 1;
 			applied = requested;
-		} else if (status == HPN_FILE_LAYOUT_NOT_FS) {
+		} else {
+			/* DoM failed (off/unsupported, or the EA was rejected) -
+			 * fall back to a plain stripe so the dest still gets a
+			 * layout rather than erroring out. */
 			status = lustre_set_stripe_fd(fd, requested, &applied);
 		}
 	} else {
