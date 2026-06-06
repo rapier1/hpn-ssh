@@ -169,6 +169,18 @@ static struct sftp_hpn_tcp_health_ctx tcp_health;
 static int tcp_health_armed;	/* nonzero once tcp_health is initialised */
 static time_t tcp_health_check_time;	/* monotime deadline for next poll */
 #define HPN_TCP_HEALTH_INTERVAL 1	/* seconds between health polls */
+
+/*
+ * Last TCP-health sample, persisted so cleanup_exit() can report the
+ * transport's final TCP state on ANY exit path - including the "silent"
+ * closes (remote channel EOF) that print no self-terminate/classifier line.
+ * This is the transport-side half of the 2026-06-05 fleet-freeze probe:
+ * it tells whether a worker that vanished was wedged (cwnd collapsed) or
+ * peer-stalled (receive window pinned) at the moment it died.
+ */
+static struct sftp_hpn_tcp_health hpn_last_health;
+static int hpn_have_last_health;
+static time_t hpn_last_health_s;
 static int need_rekeying;	/* Set to non-zero if rekeying is requested. */
 static int session_closed;	/* In SSH2: login session closed. */
 static time_t x11_refuse_time;	/* If >0, refuse x11 opens after this time. */
@@ -550,6 +562,32 @@ tcp_health_tick(void)
 	    h.raw.rcv_space, (unsigned long long)h.raw.total_retrans,
 	    h.raw.notsent_bytes, (unsigned long long)h.raw.delivery_rate,
 	    h.raw.total_rto_time);
+
+	hpn_last_health = h;
+	hpn_have_last_health = 1;
+	hpn_last_health_s = monotime();
+
+	/*
+	 * ENV-VAR HPN_BUNDLE_TIMING per-second TCP sample (midstream-freeze
+	 * probe).  Promotes the existing 1s poll from debug2 to a captured
+	 * line so each worker transport yields a longitudinal cwnd/rtt/rwnd/
+	 * retrans/notsent/delivery_rate series.  pid correlates with the
+	 * orchestrator's FLEETSAMPLE (which logs each worker's ssh child pid).
+	 */
+	{
+		static int sample_on = -1;
+		if (sample_on < 0)
+			sample_on = (getenv("HPN_BUNDLE_TIMING") != NULL);
+		if (sample_on)
+			logit("HPN TCPSAMPLE pid=%ld t=%.3f cwnd=%u rtt=%uus "
+			    "rcv_space=%u retrans=%llu notsent=%u drate=%llu "
+			    "rto=%u", (long)getpid(), monotime_double(),
+			    h.raw.snd_cwnd, h.raw.rtt, h.raw.rcv_space,
+			    (unsigned long long)h.raw.total_retrans,
+			    h.raw.notsent_bytes,
+			    (unsigned long long)h.raw.delivery_rate,
+			    h.raw.total_rto_time);
+	}
 
 	static int ps_waiting = 0;
 	switch (sftp_hpn_classify(&tcp_health, &h)) {
@@ -3287,6 +3325,23 @@ client_stop_mux(void)
 void
 cleanup_exit(int i)
 {
+	/*
+	 * Transport-side fleet-freeze probe: on ANY exit (including the
+	 * silent remote-channel-close path that logs no classifier line),
+	 * report the last TCP-health sample so we can tell a wedge (cwnd
+	 * collapsed) from a peer-stall (receive window pinned) at death.
+	 * Only meaningful for parallel workers (health monitor armed).
+	 */
+	if (hpn_have_last_health)
+		logit("HPN transport exit: code=%d last_health_age=%llds "
+		    "cwnd=%u rtt=%uus rcv_space=%u retrans=%llu notsent=%u "
+		    "rto_time=%u", i,
+		    (long long)(monotime() - hpn_last_health_s),
+		    hpn_last_health.raw.snd_cwnd, hpn_last_health.raw.rtt,
+		    hpn_last_health.raw.rcv_space,
+		    (unsigned long long)hpn_last_health.raw.total_retrans,
+		    hpn_last_health.raw.notsent_bytes,
+		    hpn_last_health.raw.total_rto_time);
 	leave_raw_mode(options.request_tty == REQUEST_TTY_FORCE);
 	if (options.control_path != NULL && muxserver_sock != -1)
 		unlink(options.control_path);

@@ -350,7 +350,7 @@ int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
  * requested value if the filesystem has fewer OSTs).
  */
 int sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
-    u_int32_t stripe_count, u_int32_t dom_size, u_int32_t *applied_out,
+    u_int32_t stripe_count, u_int32_t small_threshold, u_int32_t *applied_out,
     u_int32_t *layout_kind_out);
 
 /*

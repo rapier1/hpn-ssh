@@ -263,6 +263,23 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
                                           * worker only after this - above the
                                           * 300 s transport peer-stall brake so
                                           * the transport self-terminates first */
+/*
+ * Endgame stuck-straggler reap threshold.  At the endgame (walker done, queue
+ * drained, idle capacity) a worker that has made zero progress for this long
+ * is reaped so its bundle re-queues (the #1 TRANSPORT_FAILED path) and an idle
+ * worker re-bundles it on a fresh connection.  15s sits comfortably above the
+ * ~9s worst-case normal bundle, so only genuine stragglers are caught; it caps
+ * the endgame tail at ~15s vs. the ~90s+ seen unguarded under heavy loss.
+ */
+/*
+ * Endgame stuck-straggler reap threshold (validated for the 8 MiB default; well
+ * above the ~9-10s worst-case normal 8 MiB bundle).  NOTE: a 2026-06-06 sweep
+ * showed normal bundle duration scales ~linearly with bundle size (RTT-
+ * independent), so this should eventually become size-derived (~0.5*bundle_MiB
+ * + 10) once bundle sizing is finalized - see project_bundle_size_rtt_and_
+ * endgame_threshold.  Fixed 15 is correct while the default is 8 MiB.
+ */
+#define ENDGAME_STUCK_SEC            15
 
 /*
  * Number of watchdog ticks (~1 s each) to wait before a worker becomes
@@ -505,6 +522,50 @@ enum worker_health {
 	WORKER_DEAD,
 };
 
+/*
+ * ENV-VAR HPN_BUNDLE_TIMING midstream-freeze probe (2026-06-05).  Each worker
+ * publishes its current phase (relaxed atomic) so the reporter's per-second
+ * FLEETSAMPLE shows WHERE all workers are at the instant of a freeze: blocked
+ * waiting for work (popwait) vs assembling a batch vs inside a transfer.
+ * Combined with the queue depth and the walker phase, a freeze becomes fully
+ * attributable instead of inferred.
+ */
+enum worker_phase {
+	WPH_INIT = 0,
+	WPH_POP_WAIT,    /* blocked in sftp_workqueue_pop (queue empty) */
+	WPH_ASSEMBLE,    /* collecting a batch via non-blocking trypop */
+	WPH_RUN,         /* inside a bundle / single-file transfer */
+	WPH_FINALIZE,    /* finalizing entries / draining deferred batch */
+	WPH_EXIT,
+};
+
+static const char *
+worker_phase_name(int ph)
+{
+	switch (ph) {
+	case WPH_POP_WAIT: return "popwait";
+	case WPH_ASSEMBLE: return "assemble";
+	case WPH_RUN:      return "run";
+	case WPH_FINALIZE: return "finalize";
+	case WPH_EXIT:     return "exit";
+	default:           return "init";
+	}
+}
+
+static const char *
+walker_phase_name(int ph)
+{
+	switch (ph) {
+	case SFTP_WKP_ENUM:   return "enum";
+	case SFTP_WKP_MKDIR:  return "mkdir";
+	case SFTP_WKP_FSINFO: return "fsinfo";
+	case SFTP_WKP_LAYOUT: return "layout";
+	case SFTP_WKP_SUBMIT: return "submit";
+	case SFTP_WKP_DONE:   return "done";
+	default:              return "init";
+	}
+}
+
 enum sftp_op {
 	SFTP_OP_UPLOAD,
 	SFTP_OP_DOWNLOAD,
@@ -645,6 +706,9 @@ struct sftp_worker {
 	volatile uint64_t  live_bytes;        /* incremental bytes for current
 					       * in-progress file; reset to 0
 					       * when file completes */
+	volatile int       phase;             /* enum worker_phase; relaxed
+					       * atomic, reporter reads for the
+					       * HPN_BUNDLE_TIMING FLEETSAMPLE */
 	uint64_t           units_started;     /* dispatched, may be in flight */
 	uint64_t           units_completed;
 	uint64_t           units_failed;
@@ -851,6 +915,8 @@ struct sftp_parallel {
 	int                         wedge_terminations;	/* workers reaped with
 							 * HPN_EXIT_TCP_WEDGE */
 	int                         peer_stall_terminations; /* ditto, PEER_STALL */
+	int                         endgame_straggler_reaps; /* endgame stuck-
+							 * straggler reaps (orchestrator-doomed) */
 	uint64_t                    session_start_ns;  /* monotime_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in
@@ -906,6 +972,10 @@ struct sftp_parallel {
 	 * clean transfer.  Bumped via __atomic_fetch_add from any thread.
 	 */
 	uint64_t                    walker_failures;
+
+	/* enum sftp_walker_phase; relaxed atomic, set by the walker via
+	 * sftp_parallel_set_walker_phase, read by the reporter FLEETSAMPLE. */
+	volatile int                walker_phase;
 
 	/* Bounded list of paths that could not be delivered, populated at
 	 * every give-up site (worker MAX_RETRIES, workqueue push-fail,
@@ -1329,6 +1399,18 @@ sftp_parallel_walker_record_failure(struct sftp_parallel *p, const char *path,
 	else
 		snprintf(buf, sizeof(buf), "%s", path);
 	hpn_strlist_append(&p->failed_paths, buf);
+}
+
+/*
+ * Publish the walker's current phase (enum sftp_walker_phase).  Public so the
+ * walker in sftp-parallel-walk.c can mark itself blocked/enumerating without
+ * seeing struct sftp_parallel's internals.  Relaxed atomic; observability only.
+ */
+void
+sftp_parallel_set_walker_phase(struct sftp_parallel *p, int phase)
+{
+	if (p != NULL)
+		__atomic_store_n(&p->walker_phase, phase, __ATOMIC_RELAXED);
 }
 
 /*
@@ -2023,13 +2105,18 @@ worker_run_bundle(struct sftp_worker *w,
 		    (unsigned long long)elapsed_us, mibps);
 	}
 
-	/* Bundle wire failed (server refused open, transport error): the
-	 * per-entry results above all say -1, but retrying the same bundle
-	 * path would hit the same failure.  Mark each unit ineligible for
-	 * future bundling so the next worker_thread iteration dispatches
-	 * them via the per-file SFTP path instead.  Files MUST be delivered
-	 * one way or another - bundle is an optimisation, not a contract. */
-	if (bundle_rc != 0) {
+	/*
+	 * Downgrade to single-file ONLY when the server itself can't bundle
+	 * (SERVER_CANT: refused open / no extension) - a permanent, connection-
+	 * agnostic reason any worker would hit.  A TRANSPORT_FAILED (this
+	 * worker's connection died mid-bundle) is NOT such a reason: the units
+	 * bundle fine on a healthy worker, so leave them eligible and let
+	 * worker_finalize_one_entry re-queue them (the dead-conn transient
+	 * path).  Marking them ineligible here was the bundle-ineligible
+	 * poisoning that dragged the whole fleet to single-file speed when a
+	 * few connections wedged (2026-06-05 8-pass campaign).
+	 */
+	if (bundle_rc == SFTP_HPN_BUNDLE_SERVER_CANT) {
 		for (i = 0; i < bn; i++)
 			batch[i]->bundle_ineligible = 1;
 	}
@@ -2093,9 +2180,11 @@ worker_run_bundle_download(struct sftp_worker *w,
 		    (unsigned long long)elapsed_us, mibps);
 	}
 
-	/* Bundle wire failed: mark each unit ineligible so retries go down
-	 * the per-file SFTP_OP_DOWNLOAD path.  See worker_run_bundle. */
-	if (bundle_rc != 0) {
+	/* Cause-scoped downgrade (see worker_run_bundle): only SERVER_CANT
+	 * (server refused / no extension) forces the per-file path; a
+	 * TRANSPORT_FAILED leaves the units bundle-eligible for a healthy
+	 * worker. */
+	if (bundle_rc == SFTP_HPN_BUNDLE_SERVER_CANT) {
 		for (i = 0; i < bn; i++)
 			batch[i]->bundle_ineligible = 1;
 	}
@@ -2285,6 +2374,7 @@ worker_thread(void *arg)
 			break;
 		void *item = NULL;
 		uint64_t t_idle_start = monotime_ns();
+		__atomic_store_n(&w->phase, WPH_POP_WAIT, __ATOMIC_RELAXED);
 		__atomic_store_n(&w->pop_start_ns, t_idle_start,
 		    __ATOMIC_RELEASE);
 		/* Phase 4 gap 1 deadlock guard: if we have a deferred
@@ -2322,6 +2412,7 @@ worker_thread(void *arg)
 			    __ATOMIC_RELEASE);
 			continue;
 		}
+		__atomic_store_n(&w->phase, WPH_ASSEMBLE, __ATOMIC_RELAXED);
 
 		/* DISPATCH-DIAG: worker pulled a unit off the queue.  If
 		 * "entered main loop" appears for a worker but no "popped"
@@ -2463,6 +2554,7 @@ worker_thread(void *arg)
 			    "(queue_depth=%zu)", w->id, bn,
 			    sftp_workqueue_depth(p->q)); */
 
+			__atomic_store_n(&w->phase, WPH_RUN, __ATOMIC_RELAXED);
 			if (bn == 1) {
 				/* Single file - skip batch overhead. */
 				worker_execute_single(w, batch[0]);
@@ -2980,7 +3072,8 @@ watchdog_check_sync_stall(struct sftp_parallel *p)
  */
 static int
 watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
-    uint64_t now, int queue_has_work, int *tput_dead_this_tick)
+    uint64_t now, int queue_has_work, int endgame_idle,
+    int *tput_dead_this_tick)
 {
 	enum worker_health prev, next;
 	const char *doom_reason = NULL;	/* set at whichever DEAD site fires */
@@ -3137,7 +3230,17 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			 * unit, where since_completion_ns would still be 0.
 			 */
 			uint64_t s = effective_silence_ns / 1000000000ULL;
-			if (s > (uint64_t)WORKER_SILENCE_BRAKE_SEC &&
+			if (endgame_idle && s > (uint64_t)ENDGAME_STUCK_SEC) {
+				/* Endgame stuck-straggler reap (captured-level
+				 * log so we can actually observe it fire). */
+				if (getenv("HPN_BUNDLE_TIMING") != NULL)
+					logit("HPN ENDGAME-REAP worker=%d "
+					    "silence=%llus - reaping stuck "
+					    "endgame straggler", w->id,
+					    (unsigned long long)s);
+				next = WORKER_DEAD;
+				doom_reason = "endgame_straggler";
+			} else if (s > (uint64_t)WORKER_SILENCE_BRAKE_SEC &&
 			    p->cfg.tput_path_healthy_kbps > 0 &&
 			    w->tput_ema_warmup_ticks >= TPUT_EMA_WARMUP_TICKS &&
 			    w->tput_ema_kbps <
@@ -3260,6 +3363,29 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 
 	inactivity_checks_done:
 		/*
+		 * ENDGAME-TRACE (HPN_BUNDLE_TIMING): one captured line per
+		 * endgame-straggler tick at the convergence point - reached on
+		 * EVERY path (including the pause-goto skip) - showing every
+		 * decision input and the final outcome, so we can see exactly
+		 * why the reaper does or does not fire.
+		 */
+		if (endgame_idle && in_flight > 0 &&
+		    getenv("HPN_BUNDLE_TIMING") != NULL) {
+			uint64_t pu =
+			    sftp_conn_watchdog_pause_until_ns(w->conn);
+			logit("HPN ENDGAME-TRACE worker=%d egi=%d qhw=%d "
+			    "inflight=%llu silence=%llus bytes=%llu "
+			    "paused=%llds next=%d reason=%s", w->id,
+			    endgame_idle, queue_has_work,
+			    (unsigned long long)in_flight,
+			    (unsigned long long)
+			        (effective_silence_ns / 1000000000ULL),
+			    (unsigned long long)w_bytes_total,
+			    (pu > now)
+			        ? (long long)((pu - now) / 1000000000ULL) : 0LL,
+			    (int)next, doom_reason ? doom_reason : "(none)");
+		}
+		/*
 		 * Past this point: state-transition logging, doom (SIGTERM),
 		 * and SIGKILL escalation.  All three honor whatever value
 		 * `next` has now (whether set by an inactivity heuristic
@@ -3316,6 +3442,28 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 				debug_ft("worker %d: sent SIGTERM to ssh "
 				    "child (pid %ld)", w->id,
 				    (long)w->ssh_pid);
+				/*
+				 * Endgame straggler: count it (for stats /
+				 * debug) and log at DEBUG level only - it is an
+				 * internal optimization (reap a stuck bundle and
+				 * re-bundle on idle capacity), not something the
+				 * user needs to act on, so it stays out of the
+				 * default output.  Counted at the doom site so it
+				 * is once-per-death (the SIGTERM is a signal
+				 * death, not an HPN exit code, so the reap-time
+				 * exit-code counters below would miss it).
+				 */
+				if (doom_reason != NULL && strcmp(doom_reason,
+				    "endgame_straggler") == 0) {
+					p->endgame_straggler_reaps++;
+					debug_ft("worker %d: endgame straggler "
+					    "(no progress %llus at end of "
+					    "transfer) - reaping, re-bundling on "
+					    "a fresh worker", w->id,
+					    (unsigned long long)
+					    (effective_silence_ns /
+					    1000000000ULL));
+				}
 			}
 		}
 
@@ -3357,6 +3505,22 @@ watchdog_check_workers(struct sftp_parallel *p)
 
 	pthread_mutex_lock(&p->workers_mu);
 
+	/* Endgame-idle gate: walker done, queue drained, and >=1 worker holds
+	 * no in-flight unit (idle in pop, free to take over).  Only then does
+	 * the per-worker isolation branch fast-reap a stuck straggler. */
+	int walker_done = (__atomic_load_n(&p->walker_phase,
+	    __ATOMIC_RELAXED) == SFTP_WKP_DONE);
+	int n_idle = 0;
+	for (int i = 0; i < p->num_workers; i++) {
+		struct sftp_worker *iw = p->workers[i];
+		pthread_mutex_lock(&iw->mu);
+		if (iw->units_started - iw->units_completed -
+		    iw->units_failed == 0)
+			n_idle++;
+		pthread_mutex_unlock(&iw->mu);
+	}
+	int endgame_idle = (walker_done && !queue_has_work && n_idle > 0);
+
 	/* Adaptive throughput sample for outlier detection (no-op if
 	 * cfg.tput_path_healthy_kbps == 0).  Sets w->tput_outlier_ticks. */
 	watchdog_sample_throughput(p, now);
@@ -3367,7 +3531,7 @@ watchdog_check_workers(struct sftp_parallel *p)
 
 	for (int i = 0; i < p->num_workers; i++) {
 		if (watchdog_check_one_worker(p, p->workers[i], now,
-		    queue_has_work, &tput_dead_this_tick))
+		    queue_has_work, endgame_idle, &tput_dead_this_tick))
 			any_dead = 1;
 	}
 	pthread_mutex_unlock(&p->workers_mu);
@@ -3973,6 +4137,55 @@ reporter_flare(struct sftp_parallel *p)
 	}
 }
 
+/*
+ * ENV-VAR HPN_BUNDLE_TIMING per-tick fleet sample (2026-06-05 midstream-freeze
+ * probe).  One line: absolute time, work-queue depth, walker phase, then each
+ * worker's phase + cumulative bytes + ssh child pid, plus the fleet total.
+ * Per-worker and total bytes are cumulative, so consecutive samples give the
+ * per-worker and fleet throughput series.  The pid lets us correlate a worker
+ * with its transport's HPN TCPSAMPLE lines (which carry getpid()).
+ */
+static void
+reporter_emit_fleetsample(struct sftp_parallel *p)
+{
+	static int on = -1;
+	char line[4096];
+	size_t off;
+	uint64_t total = 0;
+	int i;
+
+	if (on < 0)
+		on = (getenv("HPN_BUNDLE_TIMING") != NULL);
+	if (!on)
+		return;
+
+	off = (size_t)snprintf(line, sizeof(line),
+	    "HPN FLEETSAMPLE t=%.3f qdepth=%zu walker=%s",
+	    monotime_double(), sftp_workqueue_depth(p->q),
+	    walker_phase_name(__atomic_load_n(&p->walker_phase,
+	        __ATOMIC_RELAXED)));
+
+	pthread_mutex_lock(&p->workers_mu);
+	for (i = 0; i < p->num_workers && off < sizeof(line) - 64; i++) {
+		struct sftp_worker *w = p->workers[i];
+		uint64_t wb;
+		pthread_mutex_lock(&w->mu);
+		wb = w->bytes_total +
+		    __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
+		pthread_mutex_unlock(&w->mu);
+		total += wb;
+		off += (size_t)snprintf(line + off, sizeof(line) - off,
+		    " w%d:%s:%llu:%ld", w->id,
+		    worker_phase_name(__atomic_load_n(&w->phase,
+		        __ATOMIC_RELAXED)),
+		    (unsigned long long)wb, (long)w->ssh_pid);
+	}
+	total += p->retired_bytes;
+	pthread_mutex_unlock(&p->workers_mu);
+
+	logit("%s total_bytes=%llu", line, (unsigned long long)total);
+}
+
 static void *
 reporter_thread(void *arg)
 {
@@ -4008,6 +4221,7 @@ reporter_thread(void *arg)
 			slow_tick_counter = 0;
 
 			reporter_emit_stats_csv(p);
+			reporter_emit_fleetsample(p);
 
 			/* Watchdog classifies workers HEALTHY/STALLED/DEAD
 			 * and SIGTERMs newly DEAD ones. We don't abort here;
@@ -5207,6 +5421,7 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	out->total_respawns      = p->total_respawns;
 	out->wedge_terminations  = p->wedge_terminations;
 	out->peer_stall_terminations = p->peer_stall_terminations;
+	out->endgame_straggler_reaps = p->endgame_straggler_reaps;
 	for (int i = 0; i < p->num_workers; i++) {
 		struct sftp_worker *w = p->workers[i];
 		pthread_mutex_lock(&w->mu);

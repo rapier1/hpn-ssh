@@ -328,13 +328,22 @@ struct sftp_hpn_bundle_upload_entry {
  * fsync_flag: when non-zero, request the server fsync each extracted
  *   file before the bundle is closed.
  *
- * Returns 0 on success (all entries[].result == 0).  Returns -1 if the
- * bundle failed; all entries[].result are set to -1 in that case (the
- * protocol does not return per-record status - whole-bundle re-queue).
- *
- * Returns -1 immediately if conn does not advertise hpn-bundle support.
- * Caller must detect this and fall back to per-file mode.
+ * Returns one of enum sftp_hpn_bundle_result.  On any non-OK return all
+ * entries[].result are set to -1 (the protocol does not return per-record
+ * status - whole-bundle re-queue).  The caller MUST distinguish the cause:
+ * SERVER_CANT is a permanent, connection-agnostic reason (the server refused
+ * the bundle or lacks the extension) and the units should be marked
+ * bundle_ineligible (single-file fallback); TRANSPORT_FAILED means only THIS
+ * worker's connection died mid-bundle - the units bundle fine on a healthy
+ * worker, so they stay bundle-eligible and are simply re-queued.  Failure
+ * values are negative so legacy `!= 0` / `< 0` checks still see failure.
  */
+enum sftp_hpn_bundle_result {
+	SFTP_HPN_BUNDLE_OK               =  0,
+	SFTP_HPN_BUNDLE_SERVER_CANT      = -1, /* permanent: refused / no ext */
+	SFTP_HPN_BUNDLE_TRANSPORT_FAILED = -2, /* transient: this conn died */
+};
+
 int sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n,

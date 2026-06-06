@@ -262,14 +262,29 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 	sshbuf_reset(m);
 	if ((r = sshbuf_reserve(m, 4, &p)) != 0)
 		fatal_fr(r, "reserve");
-	if (atomicio6(read, conn->fd_in, p, 4, sftpio,
-	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL) != 4) {
-		if (errno == EPIPE || errno == ECONNRESET)
+	{
+	size_t got = atomicio6(read, conn->fd_in, p, 4, sftpio,
+	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL);
+	if (got != 4) {
+		int e = errno;
+		if (e == EPIPE || e == ECONNRESET)
 			debug("sftp: connection closed");
 		else
-			debug("sftp: read: %s", strerror(errno));
+			debug("sftp: read: %s", strerror(e));
+		/*
+		 * ENV-VAR HPN_BUNDLE_TIMING: surface who closed the transport
+		 * pipe.  got=0 between messages = clean peer EOF (transport
+		 * exited / server closed the channel); a partial read = peer
+		 * vanished mid-message.  The pipe to the ssh child is local,
+		 * so this is almost always EOF, not a TCP errno.
+		 */
+		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+			logit("sftp CONN-DIAG: get_msg hdr-read got=%zu/4 "
+			    "errno=%d(%s)", got, e,
+			    e == 0 ? "EOF" : strerror(e));
 		conn->hpn->dead = 1; /* HPN */
 		return -1;
+	}
 	}
 
 	if ((r = sshbuf_get_u32(m, &msg_len)) != 0)
@@ -283,15 +298,22 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 
 	if ((r = sshbuf_reserve(m, msg_len, &p)) != 0)
 		fatal_fr(r, "reserve");
-	if (atomicio6(read, conn->fd_in, p, msg_len, sftpio,
-	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL)
-	    != msg_len) {
-		if (errno == EPIPE)
+	{
+	size_t gotb = atomicio6(read, conn->fd_in, p, msg_len, sftpio,
+	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL);
+	if (gotb != msg_len) {
+		int e = errno;
+		if (e == EPIPE)
 			debug("sftp: connection closed");
 		else
-			debug("sftp: read: %s", strerror(errno));
+			debug("sftp: read: %s", strerror(e));
+		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+			logit("sftp CONN-DIAG: get_msg body-read got=%zu/%u "
+			    "errno=%d(%s)", gotb, msg_len, e,
+			    e == 0 ? "EOF" : strerror(e));
 		conn->hpn->dead = 1; /* HPN */
 		return -1;
+	}
 	}
 	return 0;
 }

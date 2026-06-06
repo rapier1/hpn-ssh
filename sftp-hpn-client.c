@@ -1194,7 +1194,7 @@ out:
  */
 int
 sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
-    u_int32_t stripe_count, u_int32_t dom_size, u_int32_t *applied_out,
+    u_int32_t stripe_count, u_int32_t small_threshold, u_int32_t *applied_out,
     u_int32_t *layout_kind_out)
 {
 	struct sshbuf	*msg = NULL;
@@ -1227,14 +1227,14 @@ sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
 	}
 
 	id = sftp_conn_alloc_msg_id(conn);
-	debug3_f("sending hpn-file-layout \"%s\" stripe_count=%u dom_size=%u id=%u",
-	    path, stripe_count, dom_size, id);
+	debug3_f("sending hpn-file-layout \"%s\" stripe_count=%u small_threshold=%u id=%u",
+	    path, stripe_count, small_threshold, id);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, HPN_EXT_FILE_LAYOUT)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
 	    (r = sshbuf_put_u32(msg, stripe_count)) != 0 ||
-	    (r = sshbuf_put_u32(msg, dom_size)) != 0)
+	    (r = sshbuf_put_u32(msg, small_threshold)) != 0)
 		fatal_fr(r, "compose hpn-file-layout request");
 	if (send_msg(conn, msg) != 0) {
 		logit_f("hpn-file-layout \"%s\": transport send failed", path);

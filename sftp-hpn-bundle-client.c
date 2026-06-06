@@ -581,10 +581,10 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 		entries[i].result = -1;
 
 	if (n <= 0)
-		return 0;
+		return SFTP_HPN_BUNDLE_OK;
 	if (!sftp_conn_has_hpn_bundle_fetch(conn)) {
 		debug_f("hpn-bundle-fetch: server does not advertise extension");
-		return -1;
+		return SFTP_HPN_BUNDLE_SERVER_CANT;  /* permanent */
 	}
 
 	debug_f("hpn-bundle-fetch: n=%d preserve=%d", n, preserve_flag);
@@ -718,6 +718,13 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	}
 	if (msg != NULL)
 		sshbuf_free(msg);
+	/* Same cause-scoping as the upload path: dead conn => this worker's
+	 * transport failed (keep units bundle-eligible); live conn => server
+	 * refused / lacks the extension (permanent single-file fallback). */
+	if (rc != 0)
+		rc = sftp_conn_is_dead(conn)
+		    ? SFTP_HPN_BUNDLE_TRANSPORT_FAILED
+		    : SFTP_HPN_BUNDLE_SERVER_CANT;
 	return rc;
 }
 
@@ -768,6 +775,16 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 #define BUNDLE_MAX_INFLIGHT     4096
 
 /*
+ * Drain-stall instrumentation (the 2026-06-05 fleet-freeze investigation).
+ * A STATUS read that blocks longer than DRAIN_SLOW_GAP_SEC is "slow"; the
+ * recent inter-STATUS gaps are kept in a small ring so a stuck/failed drain
+ * can be classified dead (sudden silence after fast acks) vs alive-but-slow
+ * (gaps trickling throughout) - the discriminator for fail-fast vs decouple.
+ */
+#define DRAIN_SLOW_GAP_SEC      0.5
+#define DRAIN_GAP_RING          48
+
+/*
  * Context for libarchive's write callback.  WRITEs are pipelined: each
  * callback invocation sends one SSH_FXP_WRITE without blocking on the
  * server's STATUS reply.  STATUSes accumulate in the SSH channel; they
@@ -798,6 +815,18 @@ struct bundle_write_ctx {
 	 */
 	uint32_t     *wsizes;
 	uint32_t      wsizes_cap;
+
+	/*
+	 * ENV-VAR HPN_BUNDLE_TIMING drain-stall timeline (per-bundle; ctx is
+	 * zeroed per upload).  drain_last_ok_s is the monotime of the most
+	 * recent good STATUS; drain_gap_ring holds the last DRAIN_GAP_RING
+	 * inter-STATUS waits so a stuck drain's shape can be reconstructed.
+	 */
+	double        drain_last_ok_s;
+	double        drain_max_gap_s;
+	uint32_t      drain_slow_count;
+	uint32_t      drain_gap_n;
+	double        drain_gap_ring[DRAIN_GAP_RING];
 };
 
 /*
@@ -842,6 +871,41 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
 		 * subsequently backs up. */
 		t_status_start = monotime_double();
 		if (get_msg(ctx->conn, msg) != 0) {
+			/*
+			 * Always-on drain-stall record (the fleet-freeze
+			 * discriminator).  fail_block is how long THIS final
+			 * read blocked before EOF/error; last_ok_age is the
+			 * silence since the last good STATUS.  Small gaps then
+			 * a long silence => sudden death (dead); large gaps
+			 * throughout => alive-but-slow (peer-stall).
+			 */
+			double now = monotime_double();
+			double fail_block = now - t_status_start;
+			double last_ok_age = (ctx->drain_last_ok_s > 0.0)
+			    ? now - ctx->drain_last_ok_s : fail_block;
+			char gaps[512];
+			size_t gp = 0;
+			uint32_t gi, gstart =
+			    (ctx->drain_gap_n > DRAIN_GAP_RING)
+			    ? ctx->drain_gap_n - DRAIN_GAP_RING : 0;
+			gaps[0] = '\0';
+			for (gi = gstart; gi < ctx->drain_gap_n &&
+			    gp < sizeof(gaps) - 8; gi++) {
+				int w = snprintf(gaps + gp, sizeof(gaps) - gp,
+				    "%.2f ",
+				    ctx->drain_gap_ring[gi % DRAIN_GAP_RING]);
+				if (w < 0)
+					break;
+				gp += (size_t)w;
+			}
+			logit("bundle DRAIN-FAIL conn=%p drained=%llu/%llu "
+			    "fail_block=%.2fs last_ok_age=%.2fs max_gap=%.2fs "
+			    "slow=%u gaps=[ %s]",
+			    (void *)ctx->conn,
+			    (unsigned long long)ctx->n_drained,
+			    (unsigned long long)ctx->n_sent,
+			    fail_block, last_ok_age, ctx->drain_max_gap_s,
+			    ctx->drain_slow_count, gaps);
 			error_f("bundle drain: connection closed waiting "
 			    "for WRITE STATUS (drained %llu/%llu)",
 			    (unsigned long long)ctx->n_drained,
@@ -850,9 +914,20 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
 			rc = -1;
 			break;
 		}
-		if (monotime_double() - t_status_start >
-		    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
-			sftp_conn_rdahead_backpressure_signal(ctx->conn);
+		{
+			double t_now = monotime_double();
+			double gap = t_now - t_status_start;
+			ctx->drain_gap_ring[ctx->drain_gap_n % DRAIN_GAP_RING]
+			    = gap;
+			ctx->drain_gap_n++;
+			if (gap > ctx->drain_max_gap_s)
+				ctx->drain_max_gap_s = gap;
+			if (gap > DRAIN_SLOW_GAP_SEC)
+				ctx->drain_slow_count++;
+			ctx->drain_last_ok_s = t_now;
+			if (gap > SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+				sftp_conn_rdahead_backpressure_signal(ctx->conn);
+		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &reply_rid)) != 0 ||
 		    type != SSH2_FXP_STATUS ||
@@ -979,16 +1054,22 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	struct bundle_write_ctx ctx = { 0 };
 	u_char  outbuf[HPN_BUNDLE_BLOCK_BYTES];  /* per-WRITE payload buf */
 	int i, r;
-	int rc = -1;
+	int rc = -1;   /* generic failure; reclassified to SERVER_CANT vs
+			* TRANSPORT_FAILED at cleanup.  0 = success (OK). */
+	/* ENV-VAR HPN_BUNDLE_TIMING per-bundle timing breakdown (seconds). */
+	double t_enter = 0, t_open_done = 0, t_send_start = 0;
+	double t_send_done = 0, t_drain_done = 0, t_close_done = 0;
+	uint64_t bytes_total = 0;
+	int files_queued = 0;
 
 	for (i = 0; i < n; i++)
 		entries[i].result = -1;   /* pessimistic; flip to 0 on success */
 
 	if (n <= 0)
-		return 0;
+		return SFTP_HPN_BUNDLE_OK;
 	if (!sftp_conn_has_hpn_bundle(conn)) {
 		debug_f("hpn-bundle: server does not advertise extension");
-		return -1;
+		return SFTP_HPN_BUNDLE_SERVER_CANT;  /* permanent */
 	}
 
 	/* Per-WRITE size ring for the adaptive read-ahead controller.
@@ -1002,6 +1083,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 
 	debug_f("hpn-bundle upload: n=%d dest=\"%s\" preserve=%d fsync=%d",
 	    n, remote_dest_dir, preserve_flag, fsync_flag);
+	t_enter = monotime_double();
 
 	/* ── Send hpn-bundle-open@hpnssh.org and collect HANDLE ─────────── */
 	if ((msg = sshbuf_new()) == NULL)
@@ -1024,6 +1106,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		debug_f("hpn-bundle: server refused open");
 		goto cleanup;
 	}
+	t_open_done = monotime_double();
 
 	/* ── Build the tar writer ────────────────────────────────────────── */
 	ctx.conn       = conn;
@@ -1073,10 +1156,12 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		}
 		entries[i].result = 0;	/* mark queued; flipped back to -1
 					 * if a later pack/drain fails */
+		files_queued++;
 	}
 	sftp_hpn_tar_writer_finish(writer);
 
 	/* ── Pack/send loop ─────────────────────────────────────────────── */
+	t_send_start = monotime_double();
 	for (;;) {
 		ssize_t produced = sftp_hpn_tar_writer_pack_next(writer,
 		    outbuf, sizeof(outbuf));
@@ -1087,9 +1172,11 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		}
 		if (produced == 0)
 			break;	/* EOA reached - all bytes sent */
+		bytes_total += (uint64_t)produced;
 		if (bundle_ul_send_write(&ctx, outbuf, (size_t)produced) != 0)
 			goto cleanup;
 	}
+	t_send_done = monotime_double();
 
 	/* Drain the deferred WRITE STATUSes before SSH_FXP_CLOSE. */
 	if (bundle_drain_n(&ctx, SIZE_MAX) < 0) {
@@ -1100,6 +1187,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		debug_f("hpn-bundle: WRITE phase reported failure");
 		goto cleanup;
 	}
+	t_drain_done = monotime_double();
 
 	/* ── Close the bundle handle, collect overall STATUS ────────────── */
 	{
@@ -1135,6 +1223,31 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		}
 	}
 
+	t_close_done = monotime_double();
+	if (getenv("HPN_BUNDLE_TIMING") != NULL) {
+		uint32_t cap_final =
+		    sftp_conn_rdahead_cap(conn, BUNDLE_MAX_INFLIGHT);
+		/*
+		 * ENV-VAR HPN_BUNDLE_TIMING: developer-only per-bundle timing
+		 * breakdown.  `enter` is absolute monotonic seconds, so the
+		 * inter-bundle idle for a given worker (conn) in post-
+		 * processing is enter[k+1] - (enter[k] + total[k]).  open/
+		 * drain/close are the three serialized RTT-bound handshakes;
+		 * send is the data phase (includes any mid-bundle drains).
+		 * Never required for normal operation.
+		 */
+		logit("hpn-bundle TIMING conn=%p enter=%.3f files=%d "
+		    "nwrite=%llu bytes=%llu cap=%u open=%.3f send=%.3f "
+		    "drain=%.3f close=%.3f total=%.3f dmaxgap=%.3f dslow=%u",
+		    (void *)conn, t_enter, files_queued,
+		    (unsigned long long)ctx.n_sent,
+		    (unsigned long long)bytes_total, cap_final,
+		    t_open_done - t_enter, t_send_done - t_send_start,
+		    t_drain_done - t_send_done, t_close_done - t_drain_done,
+		    t_close_done - t_enter,
+		    ctx.drain_max_gap_s, ctx.drain_slow_count);
+	}
+
 	rc = 0;   /* success - entries[].result already set to 0 above */
 
  cleanup:
@@ -1158,6 +1271,18 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	free(ctx.wsizes);
 	if (msg != NULL)
 		sshbuf_free(msg);
+	/*
+	 * Classify the failure for the caller's bundle-eligibility decision.
+	 * Done here (after the cleanup re-drain may have marked the conn dead)
+	 * so it reflects the final connection state: a dead conn means THIS
+	 * worker's transport died mid-bundle (the units bundle fine on a
+	 * healthy worker - keep them eligible); a live conn means the server
+	 * refused / lacks the extension (permanent - mark ineligible).
+	 */
+	if (rc != 0)
+		rc = sftp_conn_is_dead(conn)
+		    ? SFTP_HPN_BUNDLE_TRANSPORT_FAILED
+		    : SFTP_HPN_BUNDLE_SERVER_CANT;
 	return rc;
 }
 

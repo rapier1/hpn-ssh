@@ -33,20 +33,23 @@
  *
  *   request:  string path
  *             uint32 stripe_count   (0 = "use all available" per Lustre lfs -c 0)
- *             uint32 dom_size       (rev 2; 0 = plain stripe.  >0 requests a
- *                                    Data-on-MDT composite layout: [0,dom_size)
- *                                    on the MDT, [dom_size,EOF) striped across
+ *             uint32 small_threshold (rev 2; 0 = plain stripe.  >0 requests a
+ *                                    tiered composite layout: [0,small_threshold)
+ *                                    on a single OST (stripe_count=1),
+ *                                    [small_threshold,EOF) striped across
  *                                    stripe_count OSTs.  A rev-1 client omits
- *                                    this; the server defaults it to 0.)
+ *                                    this; the server defaults it to 0.  Before
+ *                                    19.0 this field was the Data-on-MDT
+ *                                    component size; same wire u32.)
  *
  *   reply:    uint32 status         (0 = applied, non-zero = error code; see below)
  *             uint32 applied_count  (what the server actually set; may be
  *                                    clamped below the requested value if the
  *                                    filesystem has fewer OSTs than requested,
  *                                    zero on any error)
- *             uint32 layout_kind    (rev 2; 0 = plain stripe, 1 = Data-on-MDT.
- *                                    Absent from a rev-1 server; client treats
- *                                    a missing field as 0.)
+ *             uint32 layout_kind    (rev 2; 0 = plain stripe, 1 = tiered
+ *                                    composite.  Absent from a rev-1 server;
+ *                                    client treats a missing field as 0.)
  *
  * Status values:
  *   0                          - applied successfully; applied_count valid

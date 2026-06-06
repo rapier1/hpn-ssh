@@ -65,26 +65,25 @@
 #define PARALLEL_MAX_DIR_DEPTH 64
 
 /*
- * Data-on-MDT component size for the auto layout (see maybe_apply_lustre_layout).
- * 1 MiB covers the vast majority of "small" files; the server clamps it to the
- * MDT's dom_stripesize if smaller, or falls back to a plain stripe if DoM is
- * off.
- *
- * TODO: may want to expose this as a config knob (e.g. HPNLustreDomSize)
- * eventually - 1 MiB is a sensible default but the right value is site-dependent
- * (MDT capacity, typical small-file size).
+ * Fallback small/large boundary for the tiered auto layout (see
+ * maybe_apply_lustre_layout).  The threshold is normally derived from the
+ * destination filesystem's actual OST stripe size (a file smaller than one
+ * stripe gains nothing from striping); this constant is used only when the
+ * server does not report a stripe size (old server, or a query miss).  1 MiB
+ * matches the common Lustre default stripe size.
  */
-#define DOM_DEFAULT_SIZE  (1u * 1024u * 1024u)   /* 1 MiB */
+#define LUSTRE_SMALL_THRESHOLD_FALLBACK  (1u * 1024u * 1024u)   /* 1 MiB */
 
 /*
  * HPNLustreStripeCount (EXPERIMENTAL): one-shot helper run at the top of
  * the upload walker.  Queries the destination directory's filesystem via
  * hpn-fs-info; if it's Lustre, asks the server to set the directory's default
- * layout via hpn-file-layout.  Default/auto requests a Data-on-MDT layout
- * (small files entirely on the MDT - no per-file OST object - large files
- * striped past the DoM component); an explicit HPNLustreStripeCount=N requests
- * a plain N-wide stripe instead.  Subsequent files created in the directory
- * (including those extracted from bundles) inherit the layout.
+ * layout via hpn-file-layout.  Default/auto requests a tiered composite layout
+ * (small files on a single OST below the stripe-size threshold - one OST object,
+ * no over-striping, no MDT data - large files striped across n_workers OSTs);
+ * an explicit HPNLustreStripeCount=N requests a plain N-wide stripe instead.
+ * Subsequent files created in the directory (including those extracted from
+ * bundles) inherit the layout.
  *
  * Silent on every non-Lustre destination - operators of non-Lustre sites
  * see nothing change.  On Lustre destinations the actual stripe-set
@@ -103,8 +102,8 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	int desired;
 	int configured;
 	int n_workers;
-	int use_dom;
-	uint32_t dom_size;
+	int use_tiered;
+	uint32_t small_threshold = 0;
 	uint32_t applied = 0;
 	uint32_t layout_kind = 0;
 	int rc;
@@ -126,37 +125,51 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 		return;  /* server is too old or built without it */
 
 	/*
-	 * Default/auto (HPNLustreStripeCount unset = -1): Data-on-MDT, with the
-	 * overflow striped across n_workers OSTs for large files.  Explicit
-	 * HPNLustreStripeCount=N: plain N-wide stripe (DoM off, pre-DoM behaviour).
+	 * Default/auto (HPNLustreStripeCount unset = -1): tiered composite -
+	 * small files on a single OST, large files striped across n_workers OSTs.
+	 * Explicit HPNLustreStripeCount=N: plain N-wide stripe.
 	 */
-	use_dom  = (configured < 0);
-	dom_size = use_dom ? DOM_DEFAULT_SIZE : 0;
-	desired  = use_dom ? n_workers : configured;
+	use_tiered = (configured < 0);
+	desired    = use_tiered ? n_workers : configured;
 
+	sftp_parallel_set_walker_phase(p, SFTP_WKP_FSINFO);
 	if (sftp_fs_info(conn, dst, &info) != 0)
 		return;  /* server lacks hpn-fs-info, or query failed */
 	if (strcmp(info.fs_type, "lustre") != 0)
 		return;  /* not a Lustre destination */
 	/*
-	 * Plain-stripe path: skip if the dir is already striped wide enough.
-	 * The DoM path always (re)applies - the current stripe_count can't
-	 * distinguish a DoM layout from a plain one, and re-setting the dir
-	 * default is cheap and idempotent.
+	 * Tiered small/large boundary: derive it from the filesystem's actual
+	 * OST stripe size (a file smaller than one stripe gains nothing from
+	 * striping).  Fall back to the 1 MiB constant when the server reports no
+	 * size.  0 for the explicit plain-stripe path (no tiering).
 	 */
-	if (!use_dom && info.stripe_count >= (uint32_t)desired) {
+	small_threshold = use_tiered
+	    ? (info.stripe_size > 0
+	        ? (uint32_t)info.stripe_size : LUSTRE_SMALL_THRESHOLD_FALLBACK)
+	    : 0;
+	/*
+	 * Plain-stripe path: HPNLustreStripeCount=N is authoritative, so apply
+	 * unless the dir is already at exactly N.  The guard must honour a
+	 * request to NARROW a wider inherited default (e.g. an offset=-1
+	 * stripe-8 project root) just as well as widen - a ">=" test silently
+	 * dropped every narrowing request.  The tiered path always (re)applies:
+	 * the current stripe_count can't distinguish a tiered composite from a
+	 * plain layout, and re-setting the dir default is cheap and idempotent.
+	 */
+	if (!use_tiered && info.stripe_count == (uint32_t)desired) {
 		debug_f("Lustre auto-stripe: \"%s\" already at stripe_count=%u "
 		    "(desired %d); no change", dst, info.stripe_count, desired);
 		return;
 	}
 
-	rc = sftp_hpn_set_file_layout(conn, dst, (u_int32_t)desired, dom_size,
-	    &applied, &layout_kind);
+	sftp_parallel_set_walker_phase(p, SFTP_WKP_LAYOUT);
+	rc = sftp_hpn_set_file_layout(conn, dst, (u_int32_t)desired,
+	    small_threshold, &applied, &layout_kind);
 	switch (rc) {
 	case HPN_FILE_LAYOUT_OK:
 		logit("Lustre auto-stripe (experimental): \"%s\" -> %s "
 		    "(stripe_count %u)", dst,
-		    layout_kind ? "Data-on-MDT" : "plain stripe", applied);
+		    layout_kind ? "tiered composite" : "plain stripe", applied);
 		break;
 	case HPN_FILE_LAYOUT_NOT_FS:
 		debug_f("Lustre auto-stripe: \"%s\" reports not on a "
@@ -218,6 +231,7 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 	saved_perm = a.perm;
 	a.perm |= (S_IWUSR|S_IXUSR);
+	sftp_parallel_set_walker_phase(p, SFTP_WKP_MKDIR);
 	if (sftp_mkdir(conn, dst, &a, 0) == 0) {
 		created = 1;
 	} else {
@@ -248,9 +262,11 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		sftp_parallel_walker_record_failure(p, src, strerror(errno));
 		return -1;
 	}
+	sftp_parallel_set_walker_phase(p, SFTP_WKP_ENUM);
 	while (((dp = readdir(dirp)) != NULL) &&
 	    !sftp_parallel_is_aborting(p)) {
 		const char *filename = dp->d_name;
+		sftp_parallel_set_walker_phase(p, SFTP_WKP_ENUM);
 		if (dp->d_ino == 0) {
 			/* Filesystem race / oddity (entry marked in-use but
 			 * has no inode).  Skip; not user data. */
@@ -293,6 +309,7 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			    depth + 1, resume, verify) == -1)
 				ret = -1;
 		} else if (S_ISREG(sb.st_mode)) {
+			sftp_parallel_set_walker_phase(p, SFTP_WKP_SUBMIT);
 			if (sftp_parallel_submit_upload(p, conn, new_src,
 			    new_dst, sb.st_size, sb.st_mode, resume,
 			    verify) != 0) {
@@ -329,7 +346,12 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Entering %s\n", src);
-	return parallel_upload_walk(p, conn, src, dst, 0, resume, verify);
+	{
+		int rc = parallel_upload_walk(p, conn, src, dst, 0, resume,
+		    verify);
+		sftp_parallel_set_walker_phase(p, SFTP_WKP_DONE);
+		return rc;
+	}
 }
 
 static int
@@ -466,5 +488,10 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Retrieving %s\n", src);
-	return parallel_download_walk(p, conn, src, dst, 0, NULL, resume, verify);
+	{
+		int rc = parallel_download_walk(p, conn, src, dst, 0, NULL,
+		    resume, verify);
+		sftp_parallel_set_walker_phase(p, SFTP_WKP_DONE);
+		return rc;
+	}
 }

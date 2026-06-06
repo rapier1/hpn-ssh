@@ -275,6 +275,24 @@ void sftp_parallel_walker_record_failure(struct sftp_parallel *p,
     const char *path, const char *err);
 
 /*
+ * ENV-VAR HPN_BUNDLE_TIMING midstream-freeze probe (2026-06-05): the walker
+ * publishes its current phase so the reporter's per-second FLEETSAMPLE can
+ * show whether a producer stall (blocked mkdir/fsinfo/layout, or blocked
+ * pushing to a full queue) is what starves the fleet.  Set via the accessor
+ * since struct sftp_parallel is private to sftp-parallel.c.
+ */
+enum sftp_walker_phase {
+	SFTP_WKP_INIT = 0,
+	SFTP_WKP_ENUM,    /* local readdir/stat enumeration */
+	SFTP_WKP_MKDIR,   /* blocked in sftp_mkdir (server round-trip) */
+	SFTP_WKP_FSINFO,  /* blocked in sftp_fs_info */
+	SFTP_WKP_LAYOUT,  /* blocked in sftp_hpn_set_file_layout */
+	SFTP_WKP_SUBMIT,  /* pushing units (blocks if the queue is full) */
+	SFTP_WKP_DONE,    /* enumeration complete */
+};
+void sftp_parallel_set_walker_phase(struct sftp_parallel *p, int phase);
+
+/*
  * Default minimum file size at which a single file is split across workers
  * by byte range.  Below this threshold the file is treated as a whole-file
  * work unit.
@@ -415,6 +433,7 @@ struct sftp_parallel_stats {
 	 * total_respawns), surfaced in the end-of-transfer summary. */
 	int      wedge_terminations;
 	int      peer_stall_terminations;
+	int      endgame_straggler_reaps;  /* stuck-at-endgame reaps */
 	/* Wall-clock duration of the parallel-streams session in
 	 * milliseconds.  start_ns is captured in sftp_parallel_start();
 	 * elapsed_ms is computed against the monotonic clock at
