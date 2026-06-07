@@ -321,7 +321,7 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 
 
 /* ──────────────────────────────────────────────────────────────────────────
- * O_DIRECT aligned-write helper (EXPERIMENTAL - HPN_ODIRECT_WRITE).
+ * O_DIRECT aligned-write helper.
  *
  * Lustre serializes buffered writes from N processes into one inode on the
  * client's per-inode write lock (i_rwsem) and throttles them through the page

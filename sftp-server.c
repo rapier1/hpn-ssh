@@ -340,8 +340,8 @@ struct Handle {
 	/* Phase 5: opaque ptr to struct hpn_bundle_state when use==HANDLE_BUNDLE.
 	 * NULL for HANDLE_FILE / HANDLE_DIR.  Owned by sftp-hpn-server.c. */
 	void *bundle_opaque;
-	/* EXPERIMENTAL (HPN_ODIRECT_WRITE): opaque ptr to struct
-	 * sftp_lustre_odirect for a write handle opened O_DIRECT; NULL otherwise.
+	/* HPN: opaque ptr to struct sftp_lustre_odirect for a write handle
+	 * opened O_DIRECT; NULL otherwise (read handles, or O_DIRECT fallback).
 	 * Owned by sftp-lustre.c.  Flushed and freed in handle_close. */
 	void *odirect_opaque;
 };
@@ -489,7 +489,7 @@ handle_to_fd(int handle)
 	return -1;
 }
 
-/* EXPERIMENTAL (HPN_ODIRECT_WRITE): O_DIRECT write state for a file handle. */
+/* HPN: O_DIRECT aligned-write state for a file handle (NULL if buffered). */
 static void *
 handle_to_odirect(int handle)
 {
@@ -891,20 +891,25 @@ process_open(uint32_t id)
 		int oflags = flags;
 		int want_odirect = 0;
 #ifdef O_DIRECT
-		/* EXPERIMENTAL: HPN_ODIRECT_WRITE routes write-intent opens
-		 * through O_DIRECT + the sftp-lustre aligned-write helper, to
-		 * bypass the per-inode buffered-write serialization that
-		 * throttles parallel range-split writes into one Lustre file.
-		 * Off by default (env unset) - then this is the stock path. */
-		if (getenv("HPN_ODIRECT_WRITE") != NULL &&
-		    (flags & O_ACCMODE) != O_RDONLY) {
+		/* HPN: route every write-intent open through O_DIRECT + the
+		 * sftp-lustre aligned-write helper, to bypass the per-inode
+		 * buffered-write serialization that throttles parallel
+		 * range-split writes into one Lustre file.  Always on (no env
+		 * gate, so it cannot be silently disabled by a dropped
+		 * environment variable); if the target filesystem rejects
+		 * O_DIRECT we fall back to a buffered open just below, so this
+		 * is safe on any filesystem. */
+		if ((flags & O_ACCMODE) != O_RDONLY) {
 			want_odirect = 1;
 			oflags |= O_DIRECT;
 		}
 #endif
 		fd = open(name, oflags, mode);
 		if (fd == -1 && want_odirect && errno == EINVAL) {
-			/* O_DIRECT unsupported on this target; retry buffered. */
+			/* Target rejects O_DIRECT; log it (so a silent buffered
+			 * fallback is visible) and retry buffered. */
+			logit("O_DIRECT open \"%s\" rejected (EINVAL); "
+			    "using buffered writes", name);
 			want_odirect = 0;
 			fd = open(name, flags, mode);
 		}

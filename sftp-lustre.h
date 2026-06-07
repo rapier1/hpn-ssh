@@ -46,9 +46,10 @@ int lustre_get_stripe(const char *path, uint64_t *stripe_size,
     uint32_t *stripe_count);
 
 /*
- * O_DIRECT aligned-write helper (EXPERIMENTAL, gated by HPN_ODIRECT_WRITE).
- * Bypasses the per-inode buffered-write serialization that throttles parallel
- * range-split writes into one Lustre file.  The state is opaque; the server
+ * O_DIRECT aligned-write helper.  Bypasses the per-inode buffered-write
+ * serialization that throttles parallel range-split writes into one Lustre
+ * file.  Used for all write-intent opens (with a buffered fallback when the
+ * target rejects O_DIRECT).  The state is opaque; the server
  * attaches one per write handle.  _new() returns NULL on allocation failure
  * (caller must then keep the fd buffered).  _write() write-combines into a
  * page-aligned buffer and flushes aligned chunks via O_DIRECT; _close() flushes
