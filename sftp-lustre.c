@@ -22,9 +22,13 @@
 #include <sys/ioctl.h>
 #include <sys/xattr.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 
+#include "log.h"
 #include "sftp-hpn-server.h"	/* HPN_FILE_LAYOUT_* */
 #include "sftp-lustre.h"
 
@@ -313,4 +317,195 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 	}
 
 	return *stripe_size > 0 && *stripe_count > 0;
+}
+
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * O_DIRECT aligned-write helper (EXPERIMENTAL - HPN_ODIRECT_WRITE).
+ *
+ * Lustre serializes buffered writes from N processes into one inode on the
+ * client's per-inode write lock (i_rwsem) and throttles them through the page
+ * cache write-back path.  O_DIRECT bypasses both, letting non-overlapping
+ * extent writes from parallel range-split workers proceed concurrently - the
+ * Lustre-recommended way to do parallel writes into a single file.
+ *
+ * O_DIRECT requires the file offset, the length, AND the user buffer to be
+ * aligned (page granularity, HPN_ODIRECT_ALIGN).  The SFTP server receives
+ * writes at arbitrary (off,len) from an unaligned sshbuf, so this helper
+ * write-combines: it copies incoming bytes into a page-aligned bounce buffer
+ * and flushes only aligned multiples via pwrite() on the O_DIRECT fd.  The
+ * first write of a range-split handle lands on a 2 GiB-aligned range_offset and
+ * subsequent writes are sequential, so the running flush offset stays aligned.
+ * The unaligned tail at close (and any non-sequential write) falls back to a
+ * plain buffered pwrite after clearing O_DIRECT with fcntl().
+ *
+ * Upload-only for now (server-side writer); the download path (client writes a
+ * local Lustre dest) needs the same helper linked client-side - see
+ * project_odirect_lustre_writes memo.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+#ifndef O_DIRECT
+# define O_DIRECT 0
+#endif
+
+#define HPN_ODIRECT_ALIGN   4096u             /* page = Lustre O_DIRECT minimum */
+#define HPN_ODIRECT_BUFSZ   (4u * 1024 * 1024) /* 4 MiB flush unit (4 stripes) */
+
+struct sftp_lustre_odirect {
+	int             fd;
+	unsigned char  *buf;       /* page-aligned bounce buffer, BUFSZ bytes */
+	size_t          fill;      /* valid bytes at head of buf */
+	uint64_t        flush_off; /* file offset where buf[0] will be written */
+	uint64_t        next_off;  /* expected file offset of the next write */
+	int             started;   /* 0 until the first write is seen */
+	int             fallback;  /* 1 => O_DIRECT abandoned, plain pwrite */
+};
+
+/* pwrite the whole [data,n) at off, looping over short writes. 0 ok, -1 err. */
+static int
+odirect_pwrite_all(int fd, const unsigned char *data, size_t n, uint64_t off)
+{
+	while (n > 0) {
+		ssize_t w = pwrite(fd, data, n, (off_t)off);
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (w == 0) {
+			errno = EIO;
+			return -1;
+		}
+		data += w;
+		n    -= (size_t)w;
+		off  += (uint64_t)w;
+	}
+	return 0;
+}
+
+/* Drop O_DIRECT from the fd so unaligned buffered writes are legal. */
+static void
+odirect_disable(struct sftp_lustre_odirect *od)
+{
+	int fl = fcntl(od->fd, F_GETFL);
+	if (fl != -1)
+		(void)fcntl(od->fd, F_SETFL, fl & ~O_DIRECT);
+	od->fallback = 1;
+}
+
+/* Flush the aligned prefix of buf via O_DIRECT; keep the sub-block remainder. */
+static int
+odirect_flush_aligned(struct sftp_lustre_odirect *od)
+{
+	size_t aligned = od->fill & ~((size_t)HPN_ODIRECT_ALIGN - 1);
+
+	if (aligned == 0)
+		return 0;
+	if (odirect_pwrite_all(od->fd, od->buf, aligned, od->flush_off) != 0) {
+		error_f("O_DIRECT pwrite %zu@%llu: %s", aligned,
+		    (unsigned long long)od->flush_off, strerror(errno));
+		return -1;
+	}
+	od->flush_off += aligned;
+	od->fill      -= aligned;
+	if (od->fill > 0)
+		memmove(od->buf, od->buf + aligned, od->fill);
+	return 0;
+}
+
+struct sftp_lustre_odirect *
+sftp_lustre_odirect_new(int fd)
+{
+	struct sftp_lustre_odirect *od = calloc(1, sizeof(*od));
+	void *buf = NULL;
+
+	if (od == NULL)
+		return NULL;
+	if (posix_memalign(&buf, HPN_ODIRECT_ALIGN, HPN_ODIRECT_BUFSZ) != 0) {
+		free(od);
+		return NULL;
+	}
+	od->fd  = fd;
+	od->buf = buf;
+	return od;
+}
+
+int
+sftp_lustre_odirect_write(struct sftp_lustre_odirect *od, uint64_t off,
+    const void *vdata, size_t len)
+{
+	const unsigned char *data = vdata;
+
+	if (od == NULL)
+		return -1;
+
+	if (od->fallback)
+		return odirect_pwrite_all(od->fd, data, len, off);
+
+	if (!od->started) {
+		od->started = 1;
+		/* First offset must be page-aligned to anchor the flush stream;
+		 * range_offset is 2 GiB-aligned so this holds for range-split. */
+		if ((off & (HPN_ODIRECT_ALIGN - 1)) != 0) {
+			odirect_disable(od);
+			return odirect_pwrite_all(od->fd, data, len, off);
+		}
+		od->flush_off = off;
+		od->next_off  = off;
+	}
+
+	/* Non-sequential write: drain what we have, then fall back. */
+	if (off != od->next_off) {
+		if (odirect_flush_aligned(od) != 0)
+			return -1;
+		odirect_disable(od);
+		if (od->fill > 0 &&
+		    odirect_pwrite_all(od->fd, od->buf, od->fill,
+		    od->flush_off) != 0)
+			return -1;
+		od->fill = 0;
+		return odirect_pwrite_all(od->fd, data, len, off);
+	}
+
+	while (len > 0) {
+		size_t space = HPN_ODIRECT_BUFSZ - od->fill;
+		size_t n = len < space ? len : space;
+
+		memcpy(od->buf + od->fill, data, n);
+		od->fill += n;
+		data     += n;
+		len      -= n;
+		if (od->fill == HPN_ODIRECT_BUFSZ &&
+		    odirect_flush_aligned(od) != 0)
+			return -1;
+	}
+	od->next_off = off + (uint64_t)(data - (const unsigned char *)vdata);
+	return 0;
+}
+
+int
+sftp_lustre_odirect_close(struct sftp_lustre_odirect *od)
+{
+	int ret = 0;
+
+	if (od == NULL)
+		return 0;
+	if (!od->fallback && od->fill > 0) {
+		/* Aligned bulk via O_DIRECT, then the sub-block tail buffered. */
+		if (odirect_flush_aligned(od) != 0)
+			ret = -1;
+		else if (od->fill > 0) {
+			odirect_disable(od);
+			if (odirect_pwrite_all(od->fd, od->buf, od->fill,
+			    od->flush_off) != 0) {
+				error_f("O_DIRECT tail pwrite %zu@%llu: %s",
+				    od->fill, (unsigned long long)od->flush_off,
+				    strerror(errno));
+				ret = -1;
+			}
+		}
+	}
+	free(od->buf);
+	free(od);
+	return ret;
 }

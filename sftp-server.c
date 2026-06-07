@@ -49,6 +49,7 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-hpn-server.h"
+#include "sftp-lustre.h"
 #include "sftp-hpn-bundle-server.h"	/* HPN_EXT_BUNDLE_* + bundle dispatch */
 
 #define XXH_INLINE_ALL
@@ -339,6 +340,10 @@ struct Handle {
 	/* Phase 5: opaque ptr to struct hpn_bundle_state when use==HANDLE_BUNDLE.
 	 * NULL for HANDLE_FILE / HANDLE_DIR.  Owned by sftp-hpn-server.c. */
 	void *bundle_opaque;
+	/* EXPERIMENTAL (HPN_ODIRECT_WRITE): opaque ptr to struct
+	 * sftp_lustre_odirect for a write handle opened O_DIRECT; NULL otherwise.
+	 * Owned by sftp-lustre.c.  Flushed and freed in handle_close. */
+	void *odirect_opaque;
 };
 
 enum {
@@ -382,6 +387,7 @@ handle_new(int use, const char *name, int fd, int flags, DIR *dirp)
 	handles[i].name = xstrdup(name);
 	handles[i].bytes_read = handles[i].bytes_write = 0;
 	handles[i].bundle_opaque = NULL;
+	handles[i].odirect_opaque = NULL;
 
 	return i;
 }
@@ -483,6 +489,15 @@ handle_to_fd(int handle)
 	return -1;
 }
 
+/* EXPERIMENTAL (HPN_ODIRECT_WRITE): O_DIRECT write state for a file handle. */
+static void *
+handle_to_odirect(int handle)
+{
+	if (handle_is_ok(handle, HANDLE_FILE))
+		return handles[handle].odirect_opaque;
+	return NULL;
+}
+
 static int
 handle_to_flags(int handle)
 {
@@ -527,7 +542,20 @@ handle_close(int handle)
 	int ret = -1;
 
 	if (handle_is_ok(handle, HANDLE_FILE)) {
+		int flush_err = 0;
+		/* EXPERIMENTAL: flush the O_DIRECT helper's tail (uses the still-
+		 * open fd) and free it before closing.  A flush failure must
+		 * surface as a close failure so the client sees the write lost. */
+		if (handles[handle].odirect_opaque != NULL) {
+			flush_err = sftp_lustre_odirect_close(
+			    handles[handle].odirect_opaque);
+			handles[handle].odirect_opaque = NULL;
+		}
 		ret = close(handles[handle].fd);
+		if (flush_err != 0 && ret == 0) {
+			errno = EIO;
+			ret = -1;
+		}
 		free(handles[handle].name);
 		handle_unused(handle);
 	} else if (handle_is_ok(handle, HANDLE_DIR)) {
@@ -860,7 +888,26 @@ process_open(uint32_t id)
 		verbose("Refusing open request in read-only mode");
 		status = SSH2_FX_PERMISSION_DENIED;
 	} else {
-		fd = open(name, flags, mode);
+		int oflags = flags;
+		int want_odirect = 0;
+#ifdef O_DIRECT
+		/* EXPERIMENTAL: HPN_ODIRECT_WRITE routes write-intent opens
+		 * through O_DIRECT + the sftp-lustre aligned-write helper, to
+		 * bypass the per-inode buffered-write serialization that
+		 * throttles parallel range-split writes into one Lustre file.
+		 * Off by default (env unset) - then this is the stock path. */
+		if (getenv("HPN_ODIRECT_WRITE") != NULL &&
+		    (flags & O_ACCMODE) != O_RDONLY) {
+			want_odirect = 1;
+			oflags |= O_DIRECT;
+		}
+#endif
+		fd = open(name, oflags, mode);
+		if (fd == -1 && want_odirect && errno == EINVAL) {
+			/* O_DIRECT unsupported on this target; retry buffered. */
+			want_odirect = 0;
+			fd = open(name, flags, mode);
+		}
 		if (fd == -1) {
 			status = errno_to_portable(errno);
 		} else {
@@ -868,6 +915,16 @@ process_open(uint32_t id)
 			if (handle < 0) {
 				close(fd);
 			} else {
+				if (want_odirect) {
+					void *od = sftp_lustre_odirect_new(fd);
+					if (od != NULL)
+						handles[handle].odirect_opaque =
+						    od;
+					else
+						/* alloc failed: drop O_DIRECT
+						 * so buffered writes stay legal */
+						(void)fcntl(fd, F_SETFL, flags);
+				}
 				send_handle(id, handle);
 				status = SSH2_FX_OK;
 			}
@@ -1005,7 +1062,19 @@ process_write(uint32_t id)
 
 	if (fd < 0)
 		status = SSH2_FX_FAILURE;
-	else {
+	else if (handle_to_odirect(handle) != NULL) {
+		/* EXPERIMENTAL: route through the O_DIRECT aligned-write helper
+		 * (write-combines, flushes aligned chunks, buffers the tail). */
+		if (sftp_lustre_odirect_write(handle_to_odirect(handle),
+		    off, data, len) == 0) {
+			status = SSH2_FX_OK;
+			handle_update_write(handle, len);
+		} else {
+			status = errno_to_portable(errno);
+			error_f("O_DIRECT write \"%.100s\": %s",
+			    handle_to_name(handle), strerror(errno));
+		}
+	} else {
 		if (!(handle_to_flags(handle) & O_APPEND) &&
 		    lseek(fd, off, SEEK_SET) == -1) {
 			status = errno_to_portable(errno);

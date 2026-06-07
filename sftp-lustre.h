@@ -14,6 +14,7 @@
 #define _SFTP_LUSTRE_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /*
  * Apply a simple RAID0 stripe to an open directory or freshly-created file FD.
@@ -43,5 +44,22 @@ uint32_t lustre_set_tiered_layout_fd(int fd, uint32_t small_threshold,
  */
 int lustre_get_stripe(const char *path, uint64_t *stripe_size,
     uint32_t *stripe_count);
+
+/*
+ * O_DIRECT aligned-write helper (EXPERIMENTAL, gated by HPN_ODIRECT_WRITE).
+ * Bypasses the per-inode buffered-write serialization that throttles parallel
+ * range-split writes into one Lustre file.  The state is opaque; the server
+ * attaches one per write handle.  _new() returns NULL on allocation failure
+ * (caller must then keep the fd buffered).  _write() write-combines into a
+ * page-aligned buffer and flushes aligned chunks via O_DIRECT; _close() flushes
+ * the unaligned tail buffered, frees the state, and does NOT close the fd.
+ * Both _write and _close return 0 on success, -1 on I/O error (errno set).
+ * Upload-only for now; see project_odirect_lustre_writes for the download side.
+ */
+struct sftp_lustre_odirect;
+struct sftp_lustre_odirect *sftp_lustre_odirect_new(int fd);
+int sftp_lustre_odirect_write(struct sftp_lustre_odirect *od, uint64_t off,
+    const void *data, size_t len);
+int sftp_lustre_odirect_close(struct sftp_lustre_odirect *od);
 
 #endif /* _SFTP_LUSTRE_H */
