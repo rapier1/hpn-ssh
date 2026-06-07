@@ -422,14 +422,15 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
 #define HPN_WORKER_CHURN_NOTICE   3
 
 /*
- * Range-split chunk multiplier.  Each large file is split into
- * RANGE_CHUNK_MULTIPLIER × num_workers chunks rather than 1 per worker.
- * Fast workers that finish early pick up additional chunks from the queue,
- * naturally absorbing the tail cost of a slow OST without any detection
- * or respawn machinery.  Ranges align to stripe_size boundaries regardless
- * of this multiplier - no simultaneous OST contention results.
+ * (Removed 2026-06-07: RANGE_CHUNK_MULTIPLIER.  It fed a per-file range-count
+ * ceiling, min(file/floor, num_streams*4), whose stated job was tail-balancing
+ * oversubscription.  In practice it acted as a cap that forced absurdly large
+ * ranges on big files - a 1.5 TB file became 32 x 46 GB - and the
+ * oversubscription premise is contradicted by measurement (more/smaller ranges
+ * = throughput fade; see project_range_fade_2rtt_campaign).  Range size is now
+ * governed solely by the floor in range_split_min_size_for(); tail-balancing is
+ * to be handled at the endgame instead (project_endgame_range_split).)
  */
-#define RANGE_CHUNK_MULTIPLIER    4
 
 /*
  * Range-split minimum: static default (RANGE_SPLIT_MIN_SIZE_DEFAULT,
@@ -5239,18 +5240,12 @@ submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
 			goto whole_file;
 	}
 
-	/* Each file is split into RANGE_CHUNK_MULTIPLIER × num_streams chunks.
-	 * Bounded by file_size / effective_min so chunks stay above
-	 * the splitting floor.  Fast workers absorbing additional chunks
-	 * naturally limits the tail-straggler impact of a slow OST. */
-	int base = p->cfg.num_streams;
-	if (base < 1) base = 1;
-	if (base > SFTP_PARALLEL_MAX_WORKERS)
-		base = SFTP_PARALLEL_MAX_WORKERS;
-	int by_size = (int)(file_size /
-	    range_split_min_size_for(p));
-	int want = base * RANGE_CHUNK_MULTIPLIER;
-	max_ranges = (by_size < want) ? by_size : want;
+	/* Range COUNT = file_size / floor.  The floor (range_split_min_size_for,
+	 * default 2 GiB, -M override) is the single knob and governs range SIZE.
+	 * No count cap: the old min(by_size, num_streams*RANGE_CHUNK_MULTIPLIER)
+	 * ceiling forced absurd ranges on big files (a 1.5 TB file became 32 x
+	 * 46 GB), so it's removed - let the floor decide. */
+	max_ranges = (int)(file_size / range_split_min_size_for(p));
 	if (max_ranges < 2)
 		goto whole_file;
 
@@ -5325,16 +5320,10 @@ submit_upload_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
 			goto whole_file;
 	}
 
-	/* Same rationale as submit_upload_maybe_split: RANGE_CHUNK_MULTIPLIER ×
-	 * num_streams chunks, bounded by file_size / effective_min. */
-	int base = p->cfg.num_streams;
-	if (base < 1) base = 1;
-	if (base > SFTP_PARALLEL_MAX_WORKERS)
-		base = SFTP_PARALLEL_MAX_WORKERS;
-	int by_size = (int)(file_size /
-	    range_split_min_size_for(p));
-	int want = base * RANGE_CHUNK_MULTIPLIER;
-	max_ranges = (by_size < want) ? by_size : want;
+	/* Range count = file_size / floor; no count cap (see submit_upload_maybe_
+	 * split for the rationale - the old num_streams*RANGE_CHUNK_MULTIPLIER
+	 * ceiling forced absurd ranges on big files).  Floor is the single knob. */
+	max_ranges = (int)(file_size / range_split_min_size_for(p));
 	if (max_ranges < 2)
 		goto whole_file;
 
