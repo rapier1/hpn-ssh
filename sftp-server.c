@@ -905,13 +905,16 @@ process_open(uint32_t id)
 		}
 #endif
 		fd = open(name, oflags, mode);
-		if (fd == -1 && want_odirect && errno == EINVAL) {
-			/* Target rejects O_DIRECT; log it (so a silent buffered
-			 * fallback is visible) and retry buffered. */
-			logit("O_DIRECT open \"%s\" rejected (EINVAL); "
-			    "using buffered writes", name);
-			want_odirect = 0;
-			fd = open(name, flags, mode);
+		if (fd == -1 && want_odirect) {
+			/* DEBUG/diagnostic: O_DIRECT was requested but open
+			 * failed.  Crash loudly instead of falling back to
+			 * buffered, so a no-log environment still gets an
+			 * unambiguous signal that O_DIRECT is unavailable on
+			 * this target.  (Revert to a buffered fallback once the
+			 * O_DIRECT path is validated.) */
+			fatal_f("O_DIRECT open \"%s\" FAILED: %s "
+			    "(O_DIRECT unsupported on this target)",
+			    name, strerror(errno));
 		}
 		if (fd == -1) {
 			status = errno_to_portable(errno);
@@ -922,13 +925,10 @@ process_open(uint32_t id)
 			} else {
 				if (want_odirect) {
 					void *od = sftp_lustre_odirect_new(fd);
-					if (od != NULL)
-						handles[handle].odirect_opaque =
-						    od;
-					else
-						/* alloc failed: drop O_DIRECT
-						 * so buffered writes stay legal */
-						(void)fcntl(fd, F_SETFL, flags);
+					if (od == NULL)
+						fatal_f("sftp_lustre_odirect_new"
+						    " failed");
+					handles[handle].odirect_opaque = od;
 				}
 				send_handle(id, handle);
 				status = SSH2_FX_OK;
@@ -1075,9 +1075,12 @@ process_write(uint32_t id)
 			status = SSH2_FX_OK;
 			handle_update_write(handle, len);
 		} else {
-			status = errno_to_portable(errno);
-			error_f("O_DIRECT write \"%.100s\": %s",
-			    handle_to_name(handle), strerror(errno));
+			/* DEBUG/diagnostic: crash loudly on an O_DIRECT write
+			 * failure (e.g. alignment EINVAL) rather than returning
+			 * a soft error, for an unambiguous no-log signal. */
+			fatal_f("O_DIRECT write \"%.100s\" off %llu len %zu: %s",
+			    handle_to_name(handle), (unsigned long long)off,
+			    len, strerror(errno));
 		}
 	} else {
 		if (!(handle_to_flags(handle) & O_APPEND) &&
