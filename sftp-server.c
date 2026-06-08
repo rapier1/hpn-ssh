@@ -894,12 +894,15 @@ process_open(uint32_t id)
 		/* HPN: route every write-intent open through O_DIRECT + the
 		 * sftp-lustre aligned-write helper, to bypass the per-inode
 		 * buffered-write serialization that throttles parallel
-		 * range-split writes into one Lustre file.  Always on (no env
-		 * gate, so it cannot be silently disabled by a dropped
-		 * environment variable); if the target filesystem rejects
-		 * O_DIRECT we fall back to a buffered open just below, so this
-		 * is safe on any filesystem. */
-		if ((flags & O_ACCMODE) != O_RDONLY) {
+		 * range-split writes into one Lustre file.  ON BY DEFAULT (the
+		 * secure default - it can't be silently lost by a dropped env
+		 * var).  ENV-VAR HPN_ODIRECT_DISABLE (developer/test only):
+		 * when set, skip O_DIRECT and use the stock buffered path, so
+		 * O_DIRECT-vs-buffered can be A/B'd without two builds.  Self-
+		 * verifying: with it set, cur_dirty_bytes returns to the
+		 * buffered ~hundreds-of-MB level. */
+		if ((flags & O_ACCMODE) != O_RDONLY &&
+		    getenv("HPN_ODIRECT_DISABLE") == NULL) {
 			want_odirect = 1;
 			oflags |= O_DIRECT;
 		}
