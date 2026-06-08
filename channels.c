@@ -103,6 +103,15 @@
  * throughput. This is not a great solution. */
 #define NON_HPN_WINDOW_MAX (15 * 1024 * 1024)
 
+/* Channel output-buffer backpressure bounds.  The output buffer may grow
+ * freely up to the high-water mark with NO window throttle, so a healthy
+ * transfer (consumer merely slower than the wire) never gets throttled and
+ * does not fade.  Throttling only engages as the buffer approaches the hard
+ * cap, which bounds memory (prevents the buffer from exploding when the
+ * consumer is persistently too slow). */
+#define CHANNEL_OUTPUT_CAP (64 * 1024 * 1024)              /* hard stall point */
+#define CHANNEL_OUTPUT_HWM ((CHANNEL_OUTPUT_CAP / 4) * 3)  /* 48 MB: taper start */
+
 /* Per-channel callback for pre/post IO actions */
 typedef void chan_fn(struct ssh *, Channel *c);
 
@@ -2680,7 +2689,7 @@ channel_check_window(struct ssh *ssh, Channel *c)
 	    c->local_consumed > 0) {
 		int addition = 0;
 		u_int32_t tcpwinsz = channel_tcpwinsz(ssh, c);
-		u_int output_len, full_grant, grant, headroom;
+		u_int output_len, full_grant, grant, band, over;
 
 
 		/* adjust max window size if we are in a dynamic environment
@@ -2693,41 +2702,38 @@ channel_check_window(struct ssh *ssh, Channel *c)
 		}
 
 		/*
-		 * Throttle the window grant proportionally to output buffer
-		 * occupancy. When c->output fills due to a slow consumer,
-		 * fewer credits are returned to the sender, naturally reducing
-		 * its transmission rate. local_consumed is always reset to zero
-		 * so unconsumed credits are discarded rather than deferred.
-		 * Deferral caused burst-after-stall oscillations: accumulated
-		 * debt was released as a single large grant when the buffer
-		 * drained, causing the sender to flood the receiver and refill
-		 * the buffer rapidly. Without deferral the window shrinks
-		 * gradually under backpressure and recovers proportionally as
-		 * the buffer drains - no burst, no oscillation. When output is
-		 * empty the scale factor is 1.0 and behaviour is identical to
-		 * before.
+		 * Backpressure the sender by output-buffer occupancy, but only
+		 * once the buffer is genuinely large - decoupled from the SSH
+		 * window so a healthy transfer (consumer merely slower than the
+		 * wire) is never throttled and does not fade.  Below
+		 * CHANNEL_OUTPUT_HWM the grant is full; in [HWM, CAP] it tapers
+		 * full -> 0; at CAP we withhold all credits, bounding memory.
+		 * Credits are not deferred (deferral caused burst-after-stall
+		 * oscillation): the window shrinks gradually under backpressure
+		 * and recovers as the buffer drains.  (The previous version
+		 * scaled against c->local_window_max, so the buffer hit "one
+		 * window" almost immediately whenever the consumer lagged and
+		 * the grant collapsed to ~0 - the chronic throttle / fade.)
 		 */
 		output_len = (u_int)sshbuf_len(c->output);
 		full_grant = c->local_consumed + (u_int)addition;
 
-		if (output_len == 0 || c->local_window_max == 0) {
-			/* Fast path: output buffer empty, no backpressure.
-			 * Scale factor is 1.0; behaviour identical to before. */
+		if (output_len <= CHANNEL_OUTPUT_HWM) {
+			/* Headroom: full grant, behaviour identical to before. */
 			grant = full_grant;
-		} else if (output_len >= c->local_window_max) {
-			/* Buffer fully saturated: issue no credits this round.
-			 * Window shrinks; sender slows. Recovery begins once
-			 * the consumer drains the buffer and output_len drops. */
+		} else if (output_len >= CHANNEL_OUTPUT_CAP) {
+			/* At the cap: issue no credits this round - bounds
+			 * memory.  Recovery begins once the consumer drains. */
 			grant = 0;
 		} else {
-			/* Partial occupancy: grant credits proportional to
-			 * remaining headroom.  At 50% full the sender gets
-			 * half the normal credits; the rate tapers smoothly
-			 * rather than stopping abruptly.  uint64_t prevents
-			 * overflow at large window sizes. */
-			headroom = c->local_window_max - output_len;
-			grant = (u_int)((uint64_t)full_grant * headroom /
-			    c->local_window_max);
+			/* Taper full -> 0 linearly across the [HWM, CAP] band
+			 * so the sender eases off as the buffer nears the cap
+			 * rather than slamming shut.  uint64_t prevents
+			 * overflow at large grants. */
+			band = CHANNEL_OUTPUT_CAP - CHANNEL_OUTPUT_HWM;
+			over = output_len - CHANNEL_OUTPUT_HWM;
+			grant = (u_int)((uint64_t)full_grant *
+			    (band - over) / band);
 		}
 
 		/* Always reset local_consumed - no deferral. */
