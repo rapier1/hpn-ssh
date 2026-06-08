@@ -5262,7 +5262,14 @@ submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
 			off_t stripe = (off_t)info.stripe_size;
 			range_size = ((per_range + stripe - 1) / stripe) * stripe;
 		} else {
-			range_size = per_range;
+			/* TEMP (pending fs-info stripe fix): fs-info returned no
+			 * stripe, but the Lustre stripe here is 1 MiB - align
+			 * ranges to it so range offsets stay page-aligned and the
+			 * server's O_DIRECT helper engages instead of silently
+			 * falling back to buffered.  Revert to plain per_range
+			 * once fs-info reports stripe geometry (have_stripe). */
+			off_t stripe = 1048576;
+			range_size = ((per_range + stripe - 1) / stripe) * stripe;
 		}
 	}
 
@@ -5348,7 +5355,14 @@ submit_upload_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
 			off_t stripe = (off_t)info.stripe_size;
 			range_size = ((per_range + stripe - 1) / stripe) * stripe;
 		} else {
-			range_size = per_range;
+			/* TEMP (pending fs-info stripe fix): fs-info returned no
+			 * stripe, but the Lustre stripe here is 1 MiB - align
+			 * ranges to it so range offsets stay page-aligned and the
+			 * server's O_DIRECT helper engages instead of silently
+			 * falling back to buffered.  Revert to plain per_range
+			 * once fs-info reports stripe geometry (have_stripe). */
+			off_t stripe = 1048576;
+			range_size = ((per_range + stripe - 1) / stripe) * stripe;
 		}
 	}
 

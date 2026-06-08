@@ -444,27 +444,28 @@ sftp_lustre_odirect_write(struct sftp_lustre_odirect *od, uint64_t off,
 
 	if (!od->started) {
 		od->started = 1;
-		/* First offset must be page-aligned to anchor the flush stream;
-		 * range_offset is 2 GiB-aligned so this holds for range-split. */
+		/* First offset must be page-aligned to anchor the flush stream.
+		 * Range offsets are stripe-aligned (1 MiB) so this holds for
+		 * range-split.  If it is NOT aligned, fail LOUD rather than
+		 * silently falling back to buffered - we want to KNOW O_DIRECT
+		 * did not engage, not hide it. */
 		if ((off & (HPN_ODIRECT_ALIGN - 1)) != 0) {
-			odirect_disable(od);
-			return odirect_pwrite_all(od->fd, data, len, off);
+			error_f("O_DIRECT: unaligned start offset %llu "
+			    "(O_DIRECT not engaged)", (unsigned long long)off);
+			errno = EINVAL;
+			return -1;
 		}
 		od->flush_off = off;
 		od->next_off  = off;
 	}
 
-	/* Non-sequential write: drain what we have, then fall back. */
+	/* Non-sequential write: fail LOUD rather than silently buffering.
+	 * Writes within a range arrive in order; if they don't, surface it. */
 	if (off != od->next_off) {
-		if (odirect_flush_aligned(od) != 0)
-			return -1;
-		odirect_disable(od);
-		if (od->fill > 0 &&
-		    odirect_pwrite_all(od->fd, od->buf, od->fill,
-		    od->flush_off) != 0)
-			return -1;
-		od->fill = 0;
-		return odirect_pwrite_all(od->fd, data, len, off);
+		error_f("O_DIRECT: non-sequential write off=%llu expected=%llu",
+		    (unsigned long long)off, (unsigned long long)od->next_off);
+		errno = EINVAL;
+		return -1;
 	}
 
 	while (len > 0) {
