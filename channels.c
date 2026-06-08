@@ -103,14 +103,18 @@
  * throughput. This is not a great solution. */
 #define NON_HPN_WINDOW_MAX (15 * 1024 * 1024)
 
-/* Channel output-buffer backpressure bounds.  The output buffer may grow
- * freely up to the high-water mark with NO window throttle, so a healthy
- * transfer (consumer merely slower than the wire) never gets throttled and
- * does not fade.  Throttling only engages as the buffer approaches the hard
- * cap, which bounds memory (prevents the buffer from exploding when the
- * consumer is persistently too slow). */
-#define CHANNEL_OUTPUT_CAP (64 * 1024 * 1024)              /* hard stall point */
-#define CHANNEL_OUTPUT_HWM ((CHANNEL_OUTPUT_CAP / 4) * 3)  /* 48 MB: taper start */
+/* Channel output-buffer backpressure, sized to the path BDP.  The advertised
+ * window (c->local_window_max) tracks the TCP receive buffer, which the kernel
+ * autotunes to ~the bandwidth-delay product - so it is our per-path BDP estimate
+ * (and is already clamped to HPNMemoryLimit, which therefore bounds the buffer
+ * automatically).  The output buffer may hold ~one BDP with NO throttle, so a
+ * healthy transfer always keeps a full window in flight (no fade).  Throttling
+ * engages only as the buffer grows past one BDP toward CHANNEL_OUTPUT_CAP_MULT
+ * BDPs, bounding memory to a small multiple of the BDP on every path - cheap on
+ * a LAN, generous on a high-BDP WAN, no fixed number to mistune.  The floor
+ * keeps a small/early window (before autotune grows it) from throttling. */
+#define CHANNEL_OUTPUT_HWM_FLOOR (8 * 1024 * 1024)  /* min no-throttle headroom */
+#define CHANNEL_OUTPUT_CAP_MULT  2u                  /* CAP = MULT x HWM (=BDP) */
 
 /* Per-channel callback for pre/post IO actions */
 typedef void chan_fn(struct ssh *, Channel *c);
@@ -2689,7 +2693,7 @@ channel_check_window(struct ssh *ssh, Channel *c)
 	    c->local_consumed > 0) {
 		int addition = 0;
 		u_int32_t tcpwinsz = channel_tcpwinsz(ssh, c);
-		u_int output_len, full_grant, grant, band, over;
+		u_int output_len, full_grant, grant, hwm, cap, band, over;
 
 
 		/* adjust max window size if we are in a dynamic environment
@@ -2702,26 +2706,33 @@ channel_check_window(struct ssh *ssh, Channel *c)
 		}
 
 		/*
-		 * Backpressure the sender by output-buffer occupancy, but only
-		 * once the buffer is genuinely large - decoupled from the SSH
-		 * window so a healthy transfer (consumer merely slower than the
-		 * wire) is never throttled and does not fade.  Below
-		 * CHANNEL_OUTPUT_HWM the grant is full; in [HWM, CAP] it tapers
-		 * full -> 0; at CAP we withhold all credits, bounding memory.
-		 * Credits are not deferred (deferral caused burst-after-stall
-		 * oscillation): the window shrinks gradually under backpressure
-		 * and recovers as the buffer drains.  (The previous version
-		 * scaled against c->local_window_max, so the buffer hit "one
-		 * window" almost immediately whenever the consumer lagged and
-		 * the grant collapsed to ~0 - the chronic throttle / fade.)
+		 * Backpressure the sender by output-buffer occupancy, sized to
+		 * the path BDP: the no-throttle high-water mark is one window
+		 * (c->local_window_max ~= the autotuned recv buffer ~= BDP), so
+		 * a healthy transfer keeps a full window in flight and does not
+		 * fade.  We only throttle as the buffer grows past one BDP
+		 * toward CAP (= MULT BDPs), tapering to 0 at CAP - which bounds
+		 * memory to a small multiple of the BDP automatically (cheap on
+		 * a LAN, generous on a high-BDP WAN), and local_window_max is
+		 * already clamped to HPNMemoryLimit so that bounds it too.  A
+		 * floor keeps an early/small window from throttling.  Credits
+		 * are not deferred (deferral caused burst-after-stall
+		 * oscillation).  (The earlier version threw the grant to ~0 at
+		 * one window with NO headroom, which is why it throttled
+		 * chronically and faded.)
 		 */
 		output_len = (u_int)sshbuf_len(c->output);
 		full_grant = c->local_consumed + (u_int)addition;
 
-		if (output_len <= CHANNEL_OUTPUT_HWM) {
-			/* Headroom: full grant, behaviour identical to before. */
+		hwm = c->local_window_max;
+		if (hwm < CHANNEL_OUTPUT_HWM_FLOOR)
+			hwm = CHANNEL_OUTPUT_HWM_FLOOR;
+		cap = hwm * CHANNEL_OUTPUT_CAP_MULT;
+
+		if (output_len <= hwm) {
+			/* Within one BDP of headroom: full grant, no throttle. */
 			grant = full_grant;
-		} else if (output_len >= CHANNEL_OUTPUT_CAP) {
+		} else if (output_len >= cap) {
 			/* At the cap: issue no credits this round - bounds
 			 * memory.  Recovery begins once the consumer drains. */
 			grant = 0;
@@ -2730,8 +2741,8 @@ channel_check_window(struct ssh *ssh, Channel *c)
 			 * so the sender eases off as the buffer nears the cap
 			 * rather than slamming shut.  uint64_t prevents
 			 * overflow at large grants. */
-			band = CHANNEL_OUTPUT_CAP - CHANNEL_OUTPUT_HWM;
-			over = output_len - CHANNEL_OUTPUT_HWM;
+			band = cap - hwm;
+			over = output_len - hwm;
 			grant = (u_int)((uint64_t)full_grant *
 			    (band - over) / band);
 		}
