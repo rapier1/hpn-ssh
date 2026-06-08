@@ -116,6 +116,14 @@
 #define CHANNEL_OUTPUT_HWM_FLOOR (8 * 1024 * 1024)  /* min no-throttle headroom */
 #define CHANNEL_OUTPUT_CAP_MULT  2u                  /* CAP = MULT x HWM (=BDP) */
 
+/* Cap the advertised window at this multiple of tcpi_rcv_space (the kernel's
+ * UN-doubled receiver BDP estimate) instead of letting it grow to SO_RCVBUF.
+ * SO_RCVBUF over-reports ~2x (kernel doubles it for skb overhead) on top of
+ * autotune's ~2-4x-BDP over-allocation, so growing the window to it
+ * over-advertises several-fold and just lets c->output over-fill on a slow
+ * consumer.  rcv_space tracks the real BDP and scales with the path. */
+#define CHANNEL_WINDOW_RCVSPACE_MULT 2u
+
 /* Per-channel callback for pre/post IO actions */
 typedef void chan_fn(struct ssh *, Channel *c);
 
@@ -1531,6 +1539,32 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 		u_int32_t rescued = channel_rescue_rcvbuf(sockfd, tcpwinsz);
 		if (rescued > tcpwinsz)
 			tcpwinsz = rescued;
+	}
+
+	/* Cap the window at a small multiple of tcpi_rcv_space - the kernel's
+	 * un-doubled receiver BDP estimate - rather than SO_RCVBUF (which
+	 * over-reports ~2x for skb overhead on top of autotune's over-
+	 * allocation).  Growing the window to SO_RCVBUF over-advertises
+	 * several-fold and lets c->output over-fill on a slow consumer; capping
+	 * to ~BDP tracks the path and bounds memory.  Logged so we can see the
+	 * SO_RCVBUF-vs-rcv_space gap and tune the multiplier. */
+	{
+		struct tcp_info ti;
+		socklen_t tilen = sizeof(ti);
+
+		if (getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &ti, &tilen) == 0 &&
+		    ti.tcpi_rcv_space > 0) {
+			u_int32_t bdp_cap = (u_int32_t)MINIMUM(
+			    (uint64_t)ti.tcpi_rcv_space *
+			    CHANNEL_WINDOW_RCVSPACE_MULT, (uint64_t)0xffffffffU);
+			if (bdp_cap < CHANNEL_OUTPUT_HWM_FLOOR)
+				bdp_cap = CHANNEL_OUTPUT_HWM_FLOOR;
+			debug_f("Channel %d: rcvbuf=%u rcv_space=%u bdp_cap=%u",
+			    c != NULL ? c->self : -1, tcpwinsz,
+			    ti.tcpi_rcv_space, bdp_cap);
+			if (tcpwinsz > bdp_cap)
+				tcpwinsz = bdp_cap;
+		}
 	}
 #endif
 
