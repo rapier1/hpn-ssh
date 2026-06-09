@@ -122,7 +122,7 @@
  * autotune's ~2-4x-BDP over-allocation, so growing the window to it
  * over-advertises several-fold and just lets c->output over-fill on a slow
  * consumer.  rcv_space tracks the real BDP and scales with the path. */
-#define CHANNEL_WINDOW_RCVSPACE_MULT 2u
+#define CHANNEL_WINDOW_RCVSPACE_MULT 1u
 
 /* Per-channel callback for pre/post IO actions */
 typedef void chan_fn(struct ssh *, Channel *c);
