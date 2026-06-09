@@ -1,4 +1,4 @@
-/* $OpenBSD: cipher.c,v 1.125 2025/09/02 11:08:34 djm Exp $ */
+/* $OpenBSD: cipher.c,v 1.126 2026/02/14 00:18:34 jsg Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -582,10 +582,12 @@ cipher_free(struct sshcipher_ctx *cc)
 	 * the ctx it is a part of it doesn't get freed. So...
 	 * cjr 2/7/2023
 	 */
+#if !defined(WITH_OPENSSL3)
 	if (cc->meth_ptr != NULL) {
 		EVP_CIPHER_meth_free((void *)(EVP_CIPHER *)cc->meth_ptr);
 		cc->meth_ptr = NULL;
 	}
+#endif
 #endif
 	freezero(cc, sizeof(*cc));
 }

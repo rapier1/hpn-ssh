@@ -1,4 +1,4 @@
-/* $OpenBSD: compat.c,v 1.126 2023/03/06 12:14:48 dtucker Exp $ */
+/* $OpenBSD: compat.c,v 1.128 2026/03/02 02:40:15 djm Exp $ */
 /*
  * Copyright (c) 1999, 2000, 2001, 2002 Markus Friedl.  All rights reserved.
  *
@@ -27,6 +27,7 @@
 
 #include <sys/types.h>
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
@@ -44,7 +45,7 @@ compat_banner(struct ssh *ssh, const char *version)
 	int i;
 	static struct {
 		char	*pat;
-		int	bugs;
+		uint32_t bugs;
 	} check[] = {
 		{ "OpenSSH_2.*,"
 		  "OpenSSH_3.0*,"
@@ -134,30 +135,29 @@ compat_banner(struct ssh *ssh, const char *version)
 			/* Check to see if the remote side is OpenSSH and not HPN */
 			/* TODO: See if we can work this into the new method for bug checks */
 			if (strstr(version, "OpenSSH") != NULL) {
-				if (strstr(version, "hpn")) {
+				/* check if the remote is hpn and if the version
+				 * uses hpn prefixed binaries */
+				const char *op;
+				if ((op = strstr(version, "hpn")) != NULL) {
+					int hpnver = 0;
 					ssh->compat |= SSH_HPNSSH;
 					debug("Remote is HPN enabled");
+					if (sscanf(op, "hpn%d", &hpnver) == 1 &&
+					    hpnver >= 16) {
+						ssh->compat |= SSH_HPNSSH_PREFIX;
+						debug("Remote uses HPNSSH prefixes.");
+					}
 				}
-				/* this checks to see if the remote
-				 * version string indicates that we
-				 * have access to hpn prefixed binaries
-				 * You'll need to change this to include
-				 * new major version numbers. Which is
-				 * why we should figure out how to make
-				 * the match pattern list work
-				 */
-				if ((strstr(version, "hpn16") != NULL) ||
-				    (strstr(version, "hpn17") != NULL) ||
-				    (strstr(version, "hpn18") != NULL)) {
-					ssh->compat |= SSH_HPNSSH_PREFIX;
-					debug("Remote uses HPNSSH prefixes.");
-					break;
-				}
-				/* if it's openssh and not hpn */
-				if ((strstr(version, "OpenSSH_8.9") != NULL) ||
-				    (strstr(version, "OpenSSH_9") != NULL)) {
-					ssh->compat |= SSH_RESTRICT_WINDOW;
-					debug("Restricting adverstised window size.");
+				/* Restrict advertised window for non-HPN OpenSSH >= 8.9. */
+				if (!(ssh->compat & SSH_HPNSSH)) {
+					const char *op;
+					int omaj = 0, omin = 0;
+					if ((op = strstr(version, "OpenSSH_")) != NULL &&
+					    sscanf(op, "OpenSSH_%d.%d", &omaj, &omin) == 2 &&
+					    (omaj >= 9 || (omaj == 8 && omin >= 9))) {
+						ssh->compat |= SSH_RESTRICT_WINDOW;
+						debug("Restricting advertised window size.");
+					}
 				}
 			}
 			debug("ssh->compat is %u", ssh->compat);

@@ -44,6 +44,7 @@ jobs:
           - ubuntu-24.04-arm
           - macos-14
           - macos-15
+          - macos-15-intel
           - windows-2022
           - windows-2025
         config: [default]
@@ -58,6 +59,7 @@ jobs:
           - { target: ubuntu-22.04, config: valgrind-6 }
           - { target: ubuntu-22.04, config: valgrind-7 }
           - { target: ubuntu-22.04, config: valgrind-unit }
+          - { target: ubuntu-22.04, config: valgrind-pam-1 }
           - { target: windows-2022, config: cygwin-release }
           - { target: windows-2025, config: cygwin-release }
 # binn no longer supports c89 so skip.
@@ -99,8 +101,9 @@ jobs:
           - { target: ubuntu-latest, config: libressl-3.7.3 }
           - { target: ubuntu-latest, config: libressl-3.8.4 }
           - { target: ubuntu-latest, config: libressl-3.9.2 }
-          - { target: ubuntu-latest, config: libressl-4.0.0 }
-          - { target: ubuntu-latest, config: libressl-4.1.0 }
+          - { target: ubuntu-latest, config: libressl-4.0.1 }
+          - { target: ubuntu-latest, config: libressl-4.1.1 }
+          - { target: ubuntu-latest, config: libressl-4.2.0 }
           - { target: ubuntu-latest, config: openssl-master }
           - { target: ubuntu-latest, config: openssl-noec }
           - { target: ubuntu-latest, config: openssl-1.1.1 }
