@@ -49,7 +49,6 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-hpn-server.h"
-#include "sftp-lustre.h"
 #include "sftp-hpn-bundle-server.h"	/* HPN_EXT_BUNDLE_* + bundle dispatch */
 
 #define XXH_INLINE_ALL
@@ -340,10 +339,6 @@ struct Handle {
 	/* Phase 5: opaque ptr to struct hpn_bundle_state when use==HANDLE_BUNDLE.
 	 * NULL for HANDLE_FILE / HANDLE_DIR.  Owned by sftp-hpn-server.c. */
 	void *bundle_opaque;
-	/* HPN: opaque ptr to struct sftp_lustre_odirect for a write handle
-	 * opened O_DIRECT; NULL otherwise (read handles, or O_DIRECT fallback).
-	 * Owned by sftp-lustre.c.  Flushed and freed in handle_close. */
-	void *odirect_opaque;
 };
 
 enum {
@@ -387,7 +382,6 @@ handle_new(int use, const char *name, int fd, int flags, DIR *dirp)
 	handles[i].name = xstrdup(name);
 	handles[i].bytes_read = handles[i].bytes_write = 0;
 	handles[i].bundle_opaque = NULL;
-	handles[i].odirect_opaque = NULL;
 
 	return i;
 }
@@ -489,15 +483,6 @@ handle_to_fd(int handle)
 	return -1;
 }
 
-/* HPN: O_DIRECT aligned-write state for a file handle (NULL if buffered). */
-static void *
-handle_to_odirect(int handle)
-{
-	if (handle_is_ok(handle, HANDLE_FILE))
-		return handles[handle].odirect_opaque;
-	return NULL;
-}
-
 static int
 handle_to_flags(int handle)
 {
@@ -542,20 +527,7 @@ handle_close(int handle)
 	int ret = -1;
 
 	if (handle_is_ok(handle, HANDLE_FILE)) {
-		int flush_err = 0;
-		/* EXPERIMENTAL: flush the O_DIRECT helper's tail (uses the still-
-		 * open fd) and free it before closing.  A flush failure must
-		 * surface as a close failure so the client sees the write lost. */
-		if (handles[handle].odirect_opaque != NULL) {
-			flush_err = sftp_lustre_odirect_close(
-			    handles[handle].odirect_opaque);
-			handles[handle].odirect_opaque = NULL;
-		}
 		ret = close(handles[handle].fd);
-		if (flush_err != 0 && ret == 0) {
-			errno = EIO;
-			ret = -1;
-		}
 		free(handles[handle].name);
 		handle_unused(handle);
 	} else if (handle_is_ok(handle, HANDLE_DIR)) {
@@ -888,37 +860,7 @@ process_open(uint32_t id)
 		verbose("Refusing open request in read-only mode");
 		status = SSH2_FX_PERMISSION_DENIED;
 	} else {
-		int oflags = flags;
-		int want_odirect = 0;
-#ifdef O_DIRECT
-		/* HPN: route every write-intent open through O_DIRECT + the
-		 * sftp-lustre aligned-write helper, to bypass the per-inode
-		 * buffered-write serialization that throttles parallel
-		 * range-split writes into one Lustre file.  ON BY DEFAULT (the
-		 * secure default - it can't be silently lost by a dropped env
-		 * var).  ENV-VAR HPN_ODIRECT_DISABLE (developer/test only):
-		 * when set, skip O_DIRECT and use the stock buffered path, so
-		 * O_DIRECT-vs-buffered can be A/B'd without two builds.  Self-
-		 * verifying: with it set, cur_dirty_bytes returns to the
-		 * buffered ~hundreds-of-MB level. */
-		if ((flags & O_ACCMODE) != O_RDONLY &&
-		    getenv("HPN_ODIRECT_DISABLE") == NULL) {
-			want_odirect = 1;
-			oflags |= O_DIRECT;
-		}
-#endif
-		fd = open(name, oflags, mode);
-		if (fd == -1 && want_odirect) {
-			/* DEBUG/diagnostic: O_DIRECT was requested but open
-			 * failed.  Crash loudly instead of falling back to
-			 * buffered, so a no-log environment still gets an
-			 * unambiguous signal that O_DIRECT is unavailable on
-			 * this target.  (Revert to a buffered fallback once the
-			 * O_DIRECT path is validated.) */
-			fatal_f("O_DIRECT open \"%s\" FAILED: %s "
-			    "(O_DIRECT unsupported on this target)",
-			    name, strerror(errno));
-		}
+		fd = open(name, flags, mode);
 		if (fd == -1) {
 			status = errno_to_portable(errno);
 		} else {
@@ -926,13 +868,6 @@ process_open(uint32_t id)
 			if (handle < 0) {
 				close(fd);
 			} else {
-				if (want_odirect) {
-					void *od = sftp_lustre_odirect_new(fd);
-					if (od == NULL)
-						fatal_f("sftp_lustre_odirect_new"
-						    " failed");
-					handles[handle].odirect_opaque = od;
-				}
 				send_handle(id, handle);
 				status = SSH2_FX_OK;
 			}
@@ -1070,22 +1005,7 @@ process_write(uint32_t id)
 
 	if (fd < 0)
 		status = SSH2_FX_FAILURE;
-	else if (handle_to_odirect(handle) != NULL) {
-		/* EXPERIMENTAL: route through the O_DIRECT aligned-write helper
-		 * (write-combines, flushes aligned chunks, buffers the tail). */
-		if (sftp_lustre_odirect_write(handle_to_odirect(handle),
-		    off, data, len) == 0) {
-			status = SSH2_FX_OK;
-			handle_update_write(handle, len);
-		} else {
-			/* DEBUG/diagnostic: crash loudly on an O_DIRECT write
-			 * failure (e.g. alignment EINVAL) rather than returning
-			 * a soft error, for an unambiguous no-log signal. */
-			fatal_f("O_DIRECT write \"%.100s\" off %llu len %zu: %s",
-			    handle_to_name(handle), (unsigned long long)off,
-			    len, strerror(errno));
-		}
-	} else {
+	else {
 		if (!(handle_to_flags(handle) & O_APPEND) &&
 		    lseek(fd, off, SEEK_SET) == -1) {
 			status = errno_to_portable(errno);
