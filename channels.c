@@ -116,13 +116,19 @@
 #define CHANNEL_OUTPUT_HWM_FLOOR (8 * 1024 * 1024)  /* min no-throttle headroom */
 #define CHANNEL_OUTPUT_CAP_MULT  2u                  /* CAP = MULT x HWM (=BDP) */
 
-/* Cap the advertised window at this multiple of tcpi_rcv_space (the kernel's
+/* Cap the advertised window at this PERCENT of tcpi_rcv_space (the kernel's
  * UN-doubled receiver BDP estimate) instead of letting it grow to SO_RCVBUF.
  * SO_RCVBUF over-reports ~2x (kernel doubles it for skb overhead) on top of
  * autotune's ~2-4x-BDP over-allocation, so growing the window to it
  * over-advertises several-fold and just lets c->output over-fill on a slow
- * consumer.  rcv_space tracks the real BDP and scales with the path. */
-#define CHANNEL_WINDOW_RCVSPACE_MULT 1u
+ * consumer.  rcv_space tracks the real BDP and scales with the path.
+ *
+ * 110% (1.1x) is the measured knee: the window needs a little headroom over
+ * rcv_space to lead it as it converges (1.0x strangles the ramp ~5x and never
+ * reaches full speed); 1.1x keeps full throughput with a ~5s ramp and bounds
+ * memory near 18.8 levels (~130 MB).  Looser (e.g. 150%) ramps faster (~2.5s)
+ * but costs memory (~225 MB) - a memory-vs-ramp trade. */
+#define CHANNEL_WINDOW_RCVSPACE_PCT 110u
 
 /* Per-channel callback for pre/post IO actions */
 typedef void chan_fn(struct ssh *, Channel *c);
@@ -1541,13 +1547,12 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 			tcpwinsz = rescued;
 	}
 
-	/* Cap the window at a small multiple of tcpi_rcv_space - the kernel's
-	 * un-doubled receiver BDP estimate - rather than SO_RCVBUF (which
-	 * over-reports ~2x for skb overhead on top of autotune's over-
+	/* Cap the window at CHANNEL_WINDOW_RCVSPACE_PCT% of tcpi_rcv_space - the
+	 * kernel's un-doubled receiver BDP estimate - rather than SO_RCVBUF
+	 * (which over-reports ~2x for skb overhead on top of autotune's over-
 	 * allocation).  Growing the window to SO_RCVBUF over-advertises
 	 * several-fold and lets c->output over-fill on a slow consumer; capping
-	 * to ~BDP tracks the path and bounds memory.  Logged so we can see the
-	 * SO_RCVBUF-vs-rcv_space gap and tune the multiplier. */
+	 * to ~BDP tracks the path and bounds memory. */
 	{
 		struct tcp_info ti;
 		socklen_t tilen = sizeof(ti);
@@ -1556,12 +1561,10 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 		    ti.tcpi_rcv_space > 0) {
 			u_int32_t bdp_cap = (u_int32_t)MINIMUM(
 			    (uint64_t)ti.tcpi_rcv_space *
-			    CHANNEL_WINDOW_RCVSPACE_MULT, (uint64_t)0xffffffffU);
+			    CHANNEL_WINDOW_RCVSPACE_PCT / 100,
+			    (uint64_t)0xffffffffU);
 			if (bdp_cap < CHANNEL_OUTPUT_HWM_FLOOR)
 				bdp_cap = CHANNEL_OUTPUT_HWM_FLOOR;
-			debug_f("Channel %d: rcvbuf=%u rcv_space=%u bdp_cap=%u",
-			    c != NULL ? c->self : -1, tcpwinsz,
-			    ti.tcpi_rcv_space, bdp_cap);
 			if (tcpwinsz > bdp_cap)
 				tcpwinsz = bdp_cap;
 		}
