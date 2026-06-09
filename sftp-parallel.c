@@ -647,6 +647,17 @@ enum sftp_range_target {
 	SFTP_RANGE_TARGET_REMOTE,  /* sftp_rm()  at finalize via worker conn */
 };
 
+/*
+ * HPN per-inode concurrent-writer cap.  All range units of one file share a
+ * range_tracker; this bounds how many of them write the inode at once.  Piling
+ * all -j workers onto a single inode is slower than fewer, because buffered
+ * writes serialise on the per-inode write lock (measured on Lustre: 8 writers
+ * to one inode < 1 plain stream).  Whole-file/bundle units have no tracker and
+ * are never gated.  4 is the starting default; storage-dependent, may become a
+ * config knob / adaptive later.
+ */
+#define HPN_RANGE_WRITERS_PER_INODE_CAP 4
+
 struct sftp_range_tracker {
 	pthread_mutex_t        mu;         /* serialises decrement + cleanup */
 	int                    total;      /* original range count (immutable
@@ -656,6 +667,12 @@ struct sftp_range_tracker {
 	enum sftp_range_target target;
 	char                  *path;       /* local OR remote path of corrupt
 					    * file (xstrdup'd in new) */
+	/* HPN concurrent-writer cap (guarded by mu above): active_writers is
+	 * the in-flight range count for this file; writer_cap is the ceiling.
+	 * Acquired in worker_thread's dispatch gate, released in
+	 * worker_process_result - exactly once per executed unit. */
+	int                    active_writers;
+	int                    writer_cap;
 };
 
 struct sftp_work_unit {
@@ -1508,7 +1525,44 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path)
 	t->any_failed = 0;
 	t->target     = target;
 	t->path       = xstrdup(path);
+	t->active_writers = 0;
+	t->writer_cap     = HPN_RANGE_WRITERS_PER_INODE_CAP;
 	return t;
+}
+
+/*
+ * Concurrent-writer cap (HPN).  Try to claim a writer slot on this file's
+ * tracker: succeeds (returns 1, active_writers bumped) only while below the
+ * cap.  NULL tracker (non-range unit) always succeeds with no accounting.
+ * Paired 1:1 with range_writer_slot_release per executed unit.
+ */
+static int
+range_writer_slot_acquire(struct sftp_range_tracker *t)
+{
+	int ok = 1;
+
+	if (t == NULL)
+		return 1;
+	pthread_mutex_lock(&t->mu);
+	if (t->active_writers < t->writer_cap)
+		t->active_writers++;
+	else
+		ok = 0;
+	pthread_mutex_unlock(&t->mu);
+	return ok;
+}
+
+/* Release a writer slot claimed by range_writer_slot_acquire.  NULL-safe;
+ * clamped so a stray release can never drive the count negative. */
+static void
+range_writer_slot_release(struct sftp_range_tracker *t)
+{
+	if (t == NULL)
+		return;
+	pthread_mutex_lock(&t->mu);
+	if (t->active_writers > 0)
+		t->active_writers--;
+	pthread_mutex_unlock(&t->mu);
 }
 
 /*
@@ -1824,6 +1878,12 @@ static void
 worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 {
 	struct sftp_parallel *p = w->parent;
+
+	/* HPN: free the per-inode writer slot claimed in worker_thread's
+	 * dispatch gate.  Reached exactly once per executed unit on every
+	 * path (success, retry-requeue, give-up), so retries release here and
+	 * re-acquire when re-dispatched.  NULL tracker (non-range) = no-op. */
+	range_writer_slot_release(u->range_tracker);
 
 	if (rc == 0) {
 		worker_record_completion(w, u->size, 1);
@@ -2367,6 +2427,11 @@ worker_thread(void *arg)
 {
 	struct sftp_worker *w = arg;
 	struct sftp_parallel *p = w->parent;
+	/* HPN writer-cap gate: counts consecutive range units requeued because
+	 * their file is at its concurrent-writer cap.  Once a full pass over
+	 * the queue finds only capped units, the worker sleeps briefly instead
+	 * of busy-looping (see the gate below). */
+	int capped_passes = 0;
 
 	worker_thread_init(w);
 
@@ -2413,6 +2478,30 @@ worker_thread(void *arg)
 			    __ATOMIC_RELEASE);
 			continue;
 		}
+		/*
+		 * HPN per-inode concurrent-writer cap.  Range units of one file
+		 * share a tracker; only writer_cap of them may run at once.  If
+		 * this file is already at its cap, return the unit to the queue
+		 * and look for other work (e.g. another file's ranges).  queued_
+		 * bytes is not adjusted here: it is decremented below only on the
+		 * path that actually dispatches the unit, so a requeue leaves the
+		 * accounting untouched.  Bounded spin: after one full pass over
+		 * the queue turns up nothing but capped units (a single-file
+		 * transfer), sleep ~2 ms so the surplus workers idle cheaply
+		 * until an active writer finishes and frees a slot.  Whole-file
+		 * and bundle units have no tracker and always pass. */
+		if (!range_writer_slot_acquire(u0->range_tracker)) {
+			(void)sftp_workqueue_push(p->q, u0);
+			__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
+			if (++capped_passes >=
+			    (int)sftp_workqueue_depth(p->q) + 1) {
+				const struct timespec ts = { 0, 2L*1000*1000 };
+				nanosleep(&ts, NULL);
+				capped_passes = 0;
+			}
+			continue;
+		}
+		capped_passes = 0;
 		__atomic_store_n(&w->phase, WPH_ASSEMBLE, __ATOMIC_RELAXED);
 
 		/* DISPATCH-DIAG: worker pulled a unit off the queue.  If
@@ -2594,9 +2683,29 @@ worker_thread(void *arg)
 				worker_run_batch_pipelined(w, batch, bn);
 			}
 
-			/* Process the leftover non-batch unit (if any). */
-			if (leftover != NULL)
-				worker_execute_single(w, leftover);
+			/* Process the leftover non-batch unit (if any).  It was
+			 * popped inside the batch loop, bypassing the dispatch
+			 * gate at the top of the loop, so a range leftover must
+			 * claim its per-inode writer slot here too - or requeue
+			 * if the file is at cap - to keep acquire/release
+			 * balanced (worker_process_result always releases).
+			 * queued_bytes was decremented when it was popped, so a
+			 * requeue re-adds it.  NULL-tracker leftovers (whole-file
+			 * uploads) acquire trivially and release as a no-op. */
+			if (leftover != NULL) {
+				if (range_writer_slot_acquire(
+				    leftover->range_tracker))
+					worker_execute_single(w, leftover);
+				else {
+					if (leftover->size > 0)
+						__atomic_fetch_add(
+						    &p->queued_bytes,
+						    (uint64_t)leftover->size,
+						    __ATOMIC_RELAXED);
+					(void)sftp_workqueue_push(p->q,
+					    leftover);
+				}
+			}
 			free(batch);	/* heap batch; bundle mode can exceed UPLOAD_BATCH_SIZE */
 		} else {
 			/* Download (no bundle) or any range op - all bypass
