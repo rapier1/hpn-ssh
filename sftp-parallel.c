@@ -653,10 +653,10 @@ enum sftp_range_target {
  * all -j workers onto a single inode is slower than fewer, because buffered
  * writes serialise on the per-inode write lock (measured on Lustre: 8 writers
  * to one inode < 1 plain stream).  Whole-file/bundle units have no tracker and
- * are never gated.  4 is the starting default; storage-dependent, may become a
- * config knob / adaptive later.
+ * are never gated.  The live value is per-transfer (-w flag), carried in
+ * cfg.writers_per_inode_cap into each tracker's writer_cap below; the
+ * default/floor/max constants (HPN_RANGE_WRITERS_CAP_*) live in sftp-parallel.h.
  */
-#define HPN_RANGE_WRITERS_PER_INODE_CAP 4
 
 struct sftp_range_tracker {
 	pthread_mutex_t        mu;         /* serialises decrement + cleanup */
@@ -1516,7 +1516,8 @@ hpn_strlist_drain(struct hpn_strlist *l, char ***out, size_t *out_used)
  * frees the tracker.
  */
 static struct sftp_range_tracker *
-range_tracker_new(int total, enum sftp_range_target target, const char *path)
+range_tracker_new(int total, enum sftp_range_target target, const char *path,
+    int writer_cap)
 {
 	struct sftp_range_tracker *t = xcalloc(1, sizeof(*t));
 	pthread_mutex_init(&t->mu, NULL);
@@ -1526,7 +1527,12 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path)
 	t->target     = target;
 	t->path       = xstrdup(path);
 	t->active_writers = 0;
-	t->writer_cap     = HPN_RANGE_WRITERS_PER_INODE_CAP;
+	/* writer_cap comes from cfg.writers_per_inode_cap (-w); guard against an
+	 * unset (0) or out-of-range config by falling back to the default. */
+	if (writer_cap < HPN_RANGE_WRITERS_CAP_FLOOR ||
+	    writer_cap > HPN_RANGE_WRITERS_CAP_MAX)
+		writer_cap = HPN_RANGE_WRITERS_CAP_DEFAULT;
+	t->writer_cap     = writer_cap;
 	return t;
 }
 
@@ -5056,7 +5062,7 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 		return -1;
 
 	tracker = range_tracker_new(effective_ranges,
-	    SFTP_RANGE_TARGET_REMOTE, remote_path);
+	    SFTP_RANGE_TARGET_REMOTE, remote_path, p->cfg.writers_per_inode_cap);
 
 	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
 	for (i = 0; i < effective_ranges; i++) {
@@ -5268,7 +5274,7 @@ submit_download_ranges(struct sftp_parallel *p,
 		return -1;
 
 	tracker = range_tracker_new(effective_ranges,
-	    SFTP_RANGE_TARGET_LOCAL, local_path);
+	    SFTP_RANGE_TARGET_LOCAL, local_path, p->cfg.writers_per_inode_cap);
 
 	for (i = 0; i < effective_ranges; i++) {
 		off_t offset = (off_t)i * range_size;

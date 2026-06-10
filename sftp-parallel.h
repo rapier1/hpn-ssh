@@ -33,6 +33,18 @@
 struct sftp_parallel;
 struct sftp_conn;	/* opaque; defined in sftp-client.c */
 
+/*
+ * Per-inode concurrent range-writer cap (-w).  Bounds how many range-split
+ * workers write one file's inode at once: buffered multi-writer into a single
+ * inode serialises on the per-inode write lock (measured on Lustre - 8 writers
+ * to one inode runs slower than 1 plain stream; 4 is the throughput knee).
+ * The effective cap is always min(this, num_streams).  DEFAULT is the built-in
+ * used when -w is absent; FLOOR/MAX bound the -w argument.
+ */
+#define HPN_RANGE_WRITERS_CAP_DEFAULT	4
+#define HPN_RANGE_WRITERS_CAP_FLOOR	1
+#define HPN_RANGE_WRITERS_CAP_MAX	10
+
 struct sftp_parallel_config {
 	int          num_streams;       /* N - must be >= 1 */
 
@@ -55,6 +67,13 @@ struct sftp_parallel_config {
 	 * applies).  Set by -M flag in sftp.c; bounded [64, 10240] at parse
 	 * time. */
 	int          range_split_min_mb;
+
+	/* Max concurrent range-writers per inode, set by -w flag in sftp.c.
+	 * Bounds how many range units of one file write its inode at once;
+	 * effective cap is min(this, num_streams).  Set to
+	 * HPN_RANGE_WRITERS_CAP_DEFAULT when -w is absent; -w validates to
+	 * [HPN_RANGE_WRITERS_CAP_FLOOR, HPN_RANGE_WRITERS_CAP_MAX]. */
+	int          writers_per_inode_cap;
 
 	/* Per-worker SSH stderr capture directory, set by -W flag in sftp.c.
 	 * NULL = off (production default - worker stderr is inherited so

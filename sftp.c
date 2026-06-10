@@ -78,6 +78,11 @@ static int parallel_user_opt_in = 0;
  * [64, 10240] MiB at parse time. */
 static int range_split_min_mb_user = 0;
 
+/* User-facing per-inode concurrent range-writer cap.  0 = unset (orchestrator
+ * uses HPN_RANGE_WRITERS_CAP_DEFAULT).  Set by -w flag; bounded to
+ * [HPN_RANGE_WRITERS_CAP_FLOOR, HPN_RANGE_WRITERS_CAP_MAX] at parse time. */
+static int writers_cap_user = 0;
+
 /* Directory for per-worker SSH stderr capture, set by -W flag.  NULL = off
  * (production default - worker stderr is inherited so connection errors
  * reach the user's terminal).  When set, each parallel worker writes its
@@ -3017,7 +3022,7 @@ usage(void)
 	    "          [-D sftp_server_command] [-F ssh_config] [-i identity_file]\n"
 	    "          [-J destination] [-j parallel_streams] [-l limit]\n"
 	    "          [-M range_split_min_mb] [-o ssh_option] [-P port]\n"
-	    "          [-R num_requests] [-S program]\n"
+	    "          [-R num_requests] [-S program] [-w writers_per_file]\n"
 	    "          [-s subsystem | sftp_server] [-X sftp_option]\n"
 	    "          [--bundle-size N[KMG]] destination\n",
 	    __progname);
@@ -3159,7 +3164,7 @@ main(int argc, char **argv)
 	}
 
 	while ((ch = getopt(argc, argv,
-	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:X:")) != -1) {
+	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:w:X:")) != -1) {
 		switch (ch) {
 		/* Passed through to ssh(1) */
 		case 'A':
@@ -3285,6 +3290,21 @@ main(int argc, char **argv)
 				fatal("Range-split minimum (-M) must be between "
 				    "64 and 10240 MiB: \"%s\": %s",
 				    optarg, errstr);
+			break;
+		case 'w':
+			/* Max concurrent range-writers per inode.  Caps how many
+			 * range-split workers write one file at once; buffered
+			 * multi-writer into a single inode serialises on the
+			 * per-inode lock (4 is the measured throughput knee).
+			 * Effective cap is min(this, -j). */
+			writers_cap_user = (int)strtonum(optarg,
+			    HPN_RANGE_WRITERS_CAP_FLOOR,
+			    HPN_RANGE_WRITERS_CAP_MAX, &errstr);
+			if (errstr != NULL)
+				fatal("Concurrent range-writers per inode (-w) "
+				    "must be between %d and %d: \"%s\": %s",
+				    HPN_RANGE_WRITERS_CAP_FLOOR,
+				    HPN_RANGE_WRITERS_CAP_MAX, optarg, errstr);
 			break;
 		case 'l':
 			limit_kbps = strtonum(optarg, 1, 100 * 1024 * 1024,
@@ -3502,6 +3522,8 @@ main(int argc, char **argv)
 		pcfg.num_requests     = (unsigned int)num_requests;
 		pcfg.limit_kbps       = limit_kbps;
 		pcfg.range_split_min_mb = range_split_min_mb_user;
+		pcfg.writers_per_inode_cap = writers_cap_user ?
+		    writers_cap_user : HPN_RANGE_WRITERS_CAP_DEFAULT;
 		pcfg.worker_log_dir     = worker_log_dir;
 		pcfg.verbose_level      = debug_level;
 		/* Resolve HPNUseBundle and any other ssh_config-derived

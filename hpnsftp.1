@@ -289,8 +289,7 @@ multiple workers cooperate on the same file.
 Must be in the range
 .Bq 64, 10240
 MiB.
-The default is 2048 MiB (2 GiB), empirically chosen to minimise both wall
-time and run-to-run variance across the tested Lustre and ext4 destinations.
+The default is 2048 MiB (2 GiB).
 Lowering this value increases per-file parallelism at the cost of additional
 open/close round-trips per chunk; raising it favours whole-file uploads,
 which trade per-file parallelism for fewer round-trips and lower
@@ -489,6 +488,30 @@ This is the default and intended behaviour in normal operation; the
 .Fl W
 log directory is only useful when capturing logs for a developer to
 inspect.
+.It Fl w Ar writers_per_file
+Set the maximum number of parallel workers that may write byte ranges into
+the same file at the same time.
+When a large file is split into byte ranges
+.Pq see Fl M ,
+several workers would otherwise write to it concurrently; because writes into a
+single file serialise on a per-file lock, splitting a file across too many
+workers can be slower than using fewer.
+This option bounds that concurrency per file; the effective limit is always the
+smaller of this value and
+.Fl j .
+Must be in the range
+.Bq 1, 10 .
+The default is 4.
+Lowering it reduces per-file write contention and run-to-run variance at the
+cost of single-file throughput; raising it allows more concurrent writers per
+file, which can re-introduce the contention this option exists to avoid.
+In a multi-file transfer, workers not permitted to write a file that is at its
+cap are not idle: they pick up byte ranges of other files.
+This flag only takes effect together with
+.Fl j .
+Without
+.Fl j
+the parallel-streams orchestrator is not engaged and the option is a no-op.
 .It Fl X Ar sftp_option
 Specify an option that controls aspects of SFTP protocol behaviour.
 The valid options are:
