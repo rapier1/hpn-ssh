@@ -1025,6 +1025,31 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 				err = -1;
 		} else if (parallel_orch != NULL) {
 			/*
+			 * Download parity for HPNLustreStripeCount: mirror of
+			 * the upload-side parent-dir hook below (process_put),
+			 * but the destination is LOCAL, so the layout is
+			 * applied directly instead of via the wire extension.
+			 * A single-file -j N get into an un-striped local
+			 * Lustre directory then fans out across OSTs too.
+			 */
+			{
+				const char *slash = strrchr(abs_dst, '/');
+				char *parent;
+				if (slash == NULL) {
+					parent = xstrdup(".");
+				} else if (slash == abs_dst) {
+					parent = xstrdup("/");
+				} else {
+					size_t plen = (size_t)(slash - abs_dst);
+					parent = xmalloc(plen + 1);
+					memcpy(parent, abs_dst, plen);
+					parent[plen] = '\0';
+				}
+				maybe_apply_lustre_layout_local(parallel_orch,
+				    conn, parent);
+				free(parent);
+			}
+			/*
 			 * Recover size and mode from the glob attrib cache so
 			 * maybe_submit_download can decide whether to range-
 			 * split this file.  sftp_glob already paid an RTT for

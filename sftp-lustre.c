@@ -22,8 +22,10 @@
 #include <sys/ioctl.h>
 #include <sys/xattr.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 
 #include "sftp-hpn-server.h"	/* HPN_FILE_LAYOUT_* */
 #include "sftp-lustre.h"
@@ -313,4 +315,39 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 	}
 
 	return *stripe_size > 0 && *stripe_count > 0;
+}
+
+/*
+ * Path wrappers over the fd setters, for the CLIENT side (download parity).
+ * The download orchestrator writes the local destination itself, so it
+ * applies layout directly to the just-created local directory - no wire
+ * extension involved.  O_DIRECTORY makes a non-directory path fail at open
+ * rather than inside the xattr call.
+ */
+uint32_t
+lustre_set_stripe_path(const char *dir, uint32_t requested_count,
+    uint32_t *applied_count)
+{
+	uint32_t rc;
+	int fd = open(dir, O_RDONLY | O_DIRECTORY);
+
+	if (fd == -1)
+		return HPN_FILE_LAYOUT_FAIL;
+	rc = lustre_set_stripe_fd(fd, requested_count, applied_count);
+	close(fd);
+	return rc;
+}
+
+uint32_t
+lustre_set_tiered_layout_path(const char *dir, uint32_t small_threshold,
+    uint32_t overflow_count)
+{
+	uint32_t rc;
+	int fd = open(dir, O_RDONLY | O_DIRECTORY);
+
+	if (fd == -1)
+		return HPN_FILE_LAYOUT_FAIL;
+	rc = lustre_set_tiered_layout_fd(fd, small_threshold, overflow_count);
+	close(fd);
+	return rc;
 }
