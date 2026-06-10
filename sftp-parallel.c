@@ -282,6 +282,20 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
 #define ENDGAME_STUCK_SEC            15
 
 /*
+ * Endgame range split.  When the worker that pops the LAST queued unit
+ * (walker done, queue empty after the pop) is holding a large byte-range,
+ * it splits that range into N pieces so idle workers help drain it instead
+ * of one worker grinding the final range solo (the measured ~12% fixed
+ * tail).  One-shot per transfer; N defaults to the file's writer cap (-w)
+ * so exactly one wave of writers fits under the per-inode gate.  This is
+ * FS-agnostic scheduler logic: pieces keep the generic 1 MiB alignment,
+ * stripe knowledge stays in the submit path / FS modules.
+ */
+#define ENDGAME_SPLIT_MIN_LEN	(256 * 1024 * 1024) /* split only above this */
+#define ENDGAME_SPLIT_MIN_PIECE	 (64 * 1024 * 1024) /* clamp N: pieces >= this */
+#define ENDGAME_SPLIT_ALIGN	      (1024 * 1024) /* piece alignment */
+
+/*
  * Number of watchdog ticks (~1 s each) to wait before a worker becomes
  * eligible for throughput-outlier classification.  During this window the
  * worker's EMA is still warming up from its cold-start seed, so any
@@ -935,6 +949,10 @@ struct sftp_parallel {
 	int                         peer_stall_terminations; /* ditto, PEER_STALL */
 	int                         endgame_straggler_reaps; /* endgame stuck-
 							 * straggler reaps (orchestrator-doomed) */
+	int                         endgame_split_fired; /* one-shot gate for the
+							 * endgame range split;
+							 * set only when a split
+							 * actually happens */
 	uint64_t                    session_start_ns;  /* monotime_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in
@@ -2289,6 +2307,109 @@ worker_execute_single(struct sftp_worker *w, struct sftp_work_unit *u)
 	worker_process_result(w, u, rc);
 }
 
+static int submit(struct sftp_parallel *p, struct sftp_work_unit *u);
+
+/*
+ * Endgame range split: called by a worker holding a just-popped unit u when
+ * that pop may have emptied the queue.  If the walker is done, the queue is
+ * empty, and u is a large byte-range - i.e. u is the transfer's last
+ * un-started unit - shrink u in place to its first piece and submit the
+ * remaining pieces as sibling range units (same tracker) so idle workers
+ * drain the tail in parallel instead of this worker grinding the whole
+ * range solo.  One-shot per transfer (the gate is set only when a split
+ * actually fires, so a final whole-file or bundle unit does not burn it).
+ *
+ * Tracker accounting: each piece owes exactly one finalize, so total and
+ * remaining grow by the added piece count under the tracker mutex BEFORE
+ * any piece is visible to other workers.  remaining >= 1 holds throughout
+ * (u itself is still un-finalized), so last-completer cleanup cannot race
+ * the split.  On a submit failure the unsent pieces are finalized-as-failed,
+ * the same synthesis submit_upload_ranges uses; the file then surfaces as
+ * INCOMPLETE/resumable.
+ *
+ * Accounting context: the caller has already subtracted u's full original
+ * size from queued_bytes (dispatch path), so submitting pieces 1..n-1 via
+ * submit() re-adds exactly the bytes that are genuinely queued again, and
+ * pending grows by one per piece - both consistent.
+ *
+ * ENV-VAR HPN_ENDGAME_SPLIT_N - developer-only: override the piece count
+ * for tail-length sweeps; unset/0 = the file's writer cap (-w), which fits
+ * exactly one wave of writers under the per-inode gate.
+ */
+static void
+maybe_endgame_split(struct sftp_parallel *p, struct sftp_worker *w,
+    struct sftp_work_unit *u)
+{
+	struct sftp_range_tracker *t = u->range_tracker;
+	off_t piece, end;
+	int n, i;
+
+	if (__atomic_load_n(&p->endgame_split_fired, __ATOMIC_RELAXED))
+		return;
+	if (u->op != SFTP_OP_UPLOAD_RANGE && u->op != SFTP_OP_DOWNLOAD_RANGE)
+		return;
+	if (t == NULL || u->range_length < ENDGAME_SPLIT_MIN_LEN)
+		return;
+	if (__atomic_load_n(&p->walker_phase, __ATOMIC_RELAXED) !=
+	    SFTP_WKP_DONE)
+		return;
+	if (p->abort_flag || p->stopped || sftp_workqueue_depth(p->q) != 0)
+		return;
+
+	{
+		const char *e = getenv("HPN_ENDGAME_SPLIT_N");
+		n = (e && *e) ? atoi(e) : 0;
+	}
+	if (n <= 0)
+		n = t->writer_cap;
+	if ((off_t)n > u->range_length / ENDGAME_SPLIT_MIN_PIECE)
+		n = (int)(u->range_length / ENDGAME_SPLIT_MIN_PIECE);
+	if (n < 2)
+		return;
+
+	/* Aligned piece size; recompute the real piece count since the
+	 * alignment round-up can swallow the last fractional piece. */
+	piece = (u->range_length / n + ENDGAME_SPLIT_ALIGN - 1) /
+	    ENDGAME_SPLIT_ALIGN * ENDGAME_SPLIT_ALIGN;
+	end = u->range_offset + u->range_length;
+	n = (int)((u->range_length + piece - 1) / piece);
+	if (n < 2)
+		return;
+
+	__atomic_store_n(&p->endgame_split_fired, 1, __ATOMIC_RELAXED);
+
+	pthread_mutex_lock(&t->mu);
+	t->total     += n - 1;
+	t->remaining += n - 1;
+	pthread_mutex_unlock(&t->mu);
+
+	debug_f("endgame split: \"%s\" range %lld+%lld -> %d pieces of %lld",
+	    u->dst_path, (long long)u->range_offset,
+	    (long long)u->range_length, n, (long long)piece);
+	if (getenv("HPN_BUNDLE_TIMING") != NULL)
+		logit("HPN ENDGAME-SPLIT worker=%d len=%lld pieces=%d "
+		    "piece=%lld", w->id, (long long)u->range_length, n,
+		    (long long)piece);
+
+	/* Shrink the held unit to piece 0; submit pieces 1..n-1. */
+	u->range_length = piece;
+	u->size         = piece;
+	for (i = 1; i < n; i++) {
+		off_t poff = u->range_offset + (off_t)i * piece;
+		off_t plen = end - poff < piece ? end - poff : piece;
+		struct sftp_work_unit *nu = make_range_unit(u->src_path,
+		    u->dst_path, poff, plen, t);
+		nu->op = u->op;	/* download pieces inherit DOWNLOAD_RANGE */
+		if (submit(p, nu) != 0) {
+			error_f("endgame split: submit piece %d of \"%s\" "
+			    "failed", i, u->dst_path);
+			for (; i < n; i++)
+				(void)range_tracker_finalize(t, 1, NULL);
+			return;
+		}
+	}
+}
+
 /*
  * One-time worker setup: signal mask, env-var parsing for the bundle
  * and batch-pipeline kill switches, and per-worker bundle target.
@@ -2528,6 +2649,14 @@ worker_thread(void *arg)
 			__atomic_fetch_sub(&p->queued_bytes,
 			    (uint64_t)u0->size, __ATOMIC_RELAXED);
 
+		/* Endgame range split: u0 may be the transfer's last
+		 * un-started unit (walker done + queue emptied by this pop).
+		 * All conditions are checked inside; no-op for non-range
+		 * units and after the one-shot gate fires.  Runs after the
+		 * full-size queued_bytes subtraction above so the pieces'
+		 * submit() re-adds exactly the re-queued bytes. */
+		maybe_endgame_split(p, w, u0);
+
 		/*
 		 * Batch-open optimisation for uploads: accumulate up to
 		 * UPLOAD_BATCH_SIZE upload units using non-blocking trypop,
@@ -2700,9 +2829,14 @@ worker_thread(void *arg)
 			 * uploads) acquire trivially and release as a no-op. */
 			if (leftover != NULL) {
 				if (range_writer_slot_acquire(
-				    leftover->range_tracker))
+				    leftover->range_tracker)) {
+					/* Endgame range split: a range
+					 * leftover can also be the last
+					 * un-started unit (see the main
+					 * dispatch site). */
+					maybe_endgame_split(p, w, leftover);
 					worker_execute_single(w, leftover);
-				else {
+				} else {
 					if (leftover->size > 0)
 						__atomic_fetch_add(
 						    &p->queued_bytes,
@@ -4728,6 +4862,12 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode,
     int resume, int verify)
 {
+	/* New command submitting: re-gate the endgame machinery (see the
+	 * DONE-at-wait note in sftp_parallel_wait).  Main thread only. */
+	if (p != NULL && __atomic_load_n(&p->walker_phase,
+	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
+		__atomic_store_n(&p->walker_phase, SFTP_WKP_SUBMIT,
+		    __ATOMIC_RELAXED);
 	if (resume || verify)
 		return submit_resume_whole_file(p, conn, SFTP_OP_UPLOAD,
 		    local_path, remote_path, remote_path, size, mode,
@@ -4749,6 +4889,12 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
     const char *remote_path, const char *local_path, off_t size, mode_t mode,
     int resume, int verify)
 {
+	/* New command submitting: re-gate the endgame machinery (see the
+	 * DONE-at-wait note in sftp_parallel_wait).  Main thread only. */
+	if (p != NULL && __atomic_load_n(&p->walker_phase,
+	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
+		__atomic_store_n(&p->walker_phase, SFTP_WKP_SUBMIT,
+		    __ATOMIC_RELAXED);
 	if (resume || verify)
 		return submit_resume_whole_file(p, conn, SFTP_OP_DOWNLOAD,
 		    remote_path, local_path, remote_path, size, mode,
@@ -4764,6 +4910,17 @@ void
 sftp_parallel_wait(struct sftp_parallel *p)
 {
 	if (p == NULL) return;
+	/* The caller drains only after a command has finished submitting, so
+	 * entering wait IS the "no more units coming" signal.  Publish it as
+	 * walker-phase DONE: for direct (non-walker) puts/gets nothing else
+	 * ever sets DONE, leaving the endgame machinery (range split,
+	 * straggler reaper) permanently gated off.  The walker's own DONE at
+	 * the end of a directory walk makes this a no-op there.  The public
+	 * submit entry points demote DONE back to SUBMIT, so the next
+	 * interactive command re-gates correctly; the internal submit() does
+	 * NOT demote, because endgame-split pieces are submitted from a
+	 * worker thread mid-drain and must not un-arm the endgame state. */
+	__atomic_store_n(&p->walker_phase, SFTP_WKP_DONE, __ATOMIC_RELAXED);
 	pthread_mutex_lock(&p->pending_mu);
 	while (p->pending > 0 && !p->abort_flag)
 		pthread_cond_wait(&p->pending_cv, &p->pending_mu);
