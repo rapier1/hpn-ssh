@@ -285,6 +285,18 @@ void maybe_apply_lustre_layout(struct sftp_parallel *p,
     struct sftp_conn *conn, const char *dst);
 
 /*
+ * Local twin of maybe_apply_lustre_layout for DOWNLOADS: dst is a LOCAL
+ * destination directory and this process is the writer, so the layout is
+ * applied directly via sftp-lustre.c instead of the wire extension.  Same
+ * HPNLustreStripeCount policy (0=off, unset=tiered composite sized to the
+ * worker count, N=plain N-stripe with an exact-match skip).  Non-Lustre
+ * destinations are skipped silently.  conn supplies only the resolved
+ * config value.
+ */
+void maybe_apply_lustre_layout_local(struct sftp_parallel *p,
+    struct sftp_conn *conn, const char *dst);
+
+/*
  * Walker-side failure recorder.  Bumps the orchestrator's
  * walker_failures counter and appends "path: err" (or just "path"
  * when err is NULL) to the failed-paths list.  Used by every walker

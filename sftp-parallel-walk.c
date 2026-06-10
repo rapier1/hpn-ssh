@@ -56,6 +56,7 @@
 #include "sftp-client-internal.h"  /* sftp_conn_{lustre_stripe_count,layout_set_declined} */
 #include "sftp-hpn-client.h"        /* sftp_hpn_set_file_layout */
 #include "sftp-hpn-server.h"        /* HPN_FILE_LAYOUT_* */
+#include "sftp-lustre.h"            /* local layout apply (download parity) */
 #include "sftp-parallel.h"
 
 /*
@@ -188,6 +189,92 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 		    "failed (status %d); layout will not be set for the rest "
 		    "of this transfer.", dst, rc);
 		sftp_conn_set_layout_set_declined(conn, 1);
+		break;
+	}
+}
+
+/*
+ * Local twin of maybe_apply_lustre_layout for DOWNLOADS.  The destination
+ * directory is on a LOCAL filesystem and this process is the writer, so the
+ * layout is applied directly (sftp-lustre.c path wrappers) instead of via
+ * the hpn-file-layout wire extension.  The policy block mirrors the upload
+ * side exactly: HPNLustreStripeCount 0=disabled, unset(<0)=tiered composite
+ * sized to n_workers, explicit N=plain N-stripe with the exact-match skip
+ * (narrowing honored, same as upload).  The tiered small/large boundary
+ * comes from the local dir's existing stripe geometry when present, else
+ * the 1 MiB fallback.
+ *
+ * Differences from the wire version, both deliberate:
+ *  - No declined-latch: the latch exists to save wire round-trips on a
+ *    server that refused; locally one open+xattr attempt per created
+ *    directory is negligible next to the mkdir itself, and a NOT_FS
+ *    (ext4/xfs dest) just returns quietly each time.
+ *  - No fs-info gate: the setter's own NOT_FS result is the detection.
+ */
+void
+maybe_apply_lustre_layout_local(struct sftp_parallel *p,
+    struct sftp_conn *conn, const char *dst)
+{
+	uint64_t l_ssize = 0;
+	uint32_t l_scount = 0;
+	uint32_t small_threshold;
+	uint32_t applied = 0;
+	uint32_t rc;
+	int configured;
+	int n_workers;
+	int use_tiered;
+	int desired;
+
+	if (p == NULL || conn == NULL || dst == NULL)
+		return;
+	configured = sftp_conn_lustre_stripe_count(conn);
+	if (configured == 0)
+		return;  /* HPNLustreStripeCount=0 -> feature disabled */
+	n_workers = sftp_parallel_num_streams(p);
+	if (n_workers < 2)
+		return;  /* not in parallel mode */
+
+	use_tiered = (configured < 0);
+	desired    = use_tiered ? n_workers : configured;
+
+	/* Local stripe geometry feeds the tiered boundary and the plain-path
+	 * exact-match skip.  A failed read means "no default set, or not
+	 * Lustre" - proceed and let the setter's NOT_FS decide. */
+	(void)lustre_get_stripe(dst, &l_ssize, &l_scount);
+	if (!use_tiered && l_scount == (uint32_t)desired) {
+		debug_f("Lustre auto-stripe (local): \"%s\" already at "
+		    "stripe_count=%u (desired %d); no change",
+		    dst, l_scount, desired);
+		return;
+	}
+	small_threshold = use_tiered
+	    ? (l_ssize > 0
+	        ? (uint32_t)l_ssize : LUSTRE_SMALL_THRESHOLD_FALLBACK)
+	    : 0;
+
+	rc = use_tiered
+	    ? lustre_set_tiered_layout_path(dst, small_threshold,
+	        (uint32_t)desired)
+	    : lustre_set_stripe_path(dst, (uint32_t)desired, &applied);
+	switch (rc) {
+	case HPN_FILE_LAYOUT_OK:
+		logit("Lustre auto-stripe (experimental): local \"%s\" -> %s "
+		    "(stripe_count %u)", dst,
+		    use_tiered ? "tiered composite" : "plain stripe",
+		    use_tiered ? (uint32_t)desired : applied);
+		break;
+	case HPN_FILE_LAYOUT_NOT_FS:
+		debug_f("Lustre auto-stripe (local): \"%s\" not on a "
+		    "layout-capable filesystem; skipping", dst);
+		break;
+	case HPN_FILE_LAYOUT_PERM:
+		logit("Lustre auto-stripe (experimental): local \"%s\": "
+		    "permission denied; layout not set.  Disable with "
+		    "HPNLustreStripeCount=0.", dst);
+		break;
+	default:
+		debug_f("Lustre auto-stripe (local): \"%s\" layout set "
+		    "failed (status %u)", dst, rc);
 		break;
 	}
 }
@@ -396,6 +483,10 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		sftp_parallel_walker_record_failure(p, dst, strerror(errno));
 		return -1;
 	}
+	/* Download parity: give the local destination directory the same
+	 * Lustre default layout uploads get on the remote side, so files
+	 * created under it inherit a parallel-friendly stripe. */
+	maybe_apply_lustre_layout_local(p, conn, dst);
 	if (sftp_readdir(conn, src, &dir_entries) == -1) {
 		error("remote readdir \"%s\" failed", src);
 		sftp_parallel_walker_record_failure(p, src,

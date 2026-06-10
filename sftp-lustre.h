@@ -1,10 +1,12 @@
 /*
- * sftp-lustre.h - Lustre layout mechanism for HPN-SSH server-side SFTP.
+ * sftp-lustre.h - Lustre layout mechanism for HPN-SSH SFTP.
  *
  * Part of HPN-SSH, NOT upstream OpenSSH.  Public interface to the Lustre layout
- * helpers extracted from sftp-hpn-server.c.  The layout ABI structs/constants
- * are private to sftp-lustre.c; callers only need these prototypes.  All three
- * return HPN_FILE_LAYOUT_* codes (defined in sftp-hpn-server.h).
+ * helpers extracted from sftp-hpn-server.c.  Linked into BOTH the server (which
+ * applies layout for uploads via the hpn-file-layout extension) and the client
+ * (which applies layout to LOCAL destinations for downloads).  The layout ABI
+ * structs/constants are private to sftp-lustre.c; callers only need these
+ * prototypes.  Setters return HPN_FILE_LAYOUT_* codes (sftp-hpn-server.h).
  *
  * Copyright (c) 2024-2026 Pittsburgh Supercomputing Center / HPN-SSH project.
  * See LICENCE for redistribution terms.
@@ -43,5 +45,18 @@ uint32_t lustre_set_tiered_layout_fd(int fd, uint32_t small_threshold,
  */
 int lustre_get_stripe(const char *path, uint64_t *stripe_size,
     uint32_t *stripe_count);
+
+/*
+ * Path conveniences over the fd variants above, for the CLIENT side
+ * (download parity): the orchestrator writes the local destination itself,
+ * so it applies layout directly to a just-created local directory instead of
+ * asking a server over the wire.  Open the directory read-only, delegate to
+ * the fd variant, close.  Return the fd variant's HPN_FILE_LAYOUT_* code;
+ * an unopenable path maps to HPN_FILE_LAYOUT_FAIL.
+ */
+uint32_t lustre_set_stripe_path(const char *dir, uint32_t requested_count,
+    uint32_t *applied_count);
+uint32_t lustre_set_tiered_layout_path(const char *dir,
+    uint32_t small_threshold, uint32_t overflow_count);
 
 #endif /* _SFTP_LUSTRE_H */
