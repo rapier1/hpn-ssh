@@ -466,6 +466,15 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		w->last_progress_ns = now;
 		w->last_progress_bytes = cur_progress_bytes;
 	}
+	/* Starting a new unit counts as progress: byte counters freeze
+	 * while the fleet idles at the prompt between commands, so without
+	 * this a worker dispatching the FIRST unit of the next transfer
+	 * carries the whole idle gap as accrued silence - and the endgame
+	 * reaper fires at 0% of a fresh put on a warm fleet.  (Sibling of
+	 * the paused-tick re-seed below: silence is measured from the most
+	 * recent of byte-progress / held lease / unit dispatch.) */
+	if (unit_start > w->last_progress_ns)
+		w->last_progress_ns = unit_start;
 	uint64_t effective_silence_ns =
 	    (w->last_progress_ns > 0 && now > w->last_progress_ns)
 	    ? (now - w->last_progress_ns) : 0;
