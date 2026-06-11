@@ -1099,6 +1099,10 @@ struct spawn_ctx {
 	int                   succeeded;
 };
 
+/* sftp-parallel-watchdog.c - worker health policy */
+int	 parallel_watchdog_check(struct sftp_parallel *);
+void	 parallel_watchdog_sync_check(struct sftp_parallel *);
+
 /* sftp-parallel-worker.c export (moves there in a later step) */
 void	*parallel_worker_thread(void *);
 
