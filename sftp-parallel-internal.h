@@ -1103,6 +1103,11 @@ struct spawn_ctx {
 int	 parallel_watchdog_check(struct sftp_parallel *);
 void	 parallel_watchdog_sync_check(struct sftp_parallel *);
 
+/* sftp-parallel-reporter.c - reporter thread (reap/respawn/observe) */
+void	*parallel_reporter_thread(void *);
+void	 parallel_stats_snapshot(struct sftp_parallel *, uint64_t *,
+	    uint64_t *, uint64_t *);
+
 /* sftp-parallel-worker.c export (moves there in a later step) */
 void	*parallel_worker_thread(void *);
 
