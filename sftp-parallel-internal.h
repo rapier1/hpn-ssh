@@ -1108,6 +1108,12 @@ void	*parallel_reporter_thread(void *);
 void	 parallel_stats_snapshot(struct sftp_parallel *, uint64_t *,
 	    uint64_t *, uint64_t *);
 
+/* hpn_strlist - small string-list utility (lives in sftp-parallel.c) */
+void	 hpn_strlist_init(struct hpn_strlist *, size_t);
+void	 hpn_strlist_free(struct hpn_strlist *);
+void	 hpn_strlist_append(struct hpn_strlist *, const char *);
+uint64_t hpn_strlist_drain(struct hpn_strlist *, char ***, size_t *);
+
 /* sftp-parallel-unit.c - work units, trackers, pending, submission */
 void	 parallel_unit_free(struct sftp_work_unit *);
 struct sftp_work_unit *parallel_unit_make_range(const char *, const char *,
