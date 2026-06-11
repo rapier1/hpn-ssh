@@ -143,6 +143,56 @@ parallel_unit_writer_release(struct sftp_range_tracker *t)
 }
 
 /*
+ * Lazy first-writer file creation.  Called by the worker before it
+ * dispatches the first range of a unit; the tracker mutex makes it
+ * exactly-once per file.  create-if-absent ONLY: layout-created files
+ * (Lustre auto-stripe creates with layout before data) and existing
+ * partials (reput onto a previous attempt) pass through untouched -
+ * never truncated, never re-laid-out.  No size is pinned: the file
+ * grows with the pwrite highwater, so interrupted transfers show
+ * honest sizes and verified resume hashes only what exists.
+ * Permanent failures (permission class) set u->no_retry so the unit
+ * gives up instead of burning retries on an error that cannot clear.
+ */
+int
+parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
+{
+	struct sftp_range_tracker *t = u->range_tracker;
+	int r = 0, permanent = 0;
+
+	if (t == NULL)
+		return 0;
+	pthread_mutex_lock(&t->mu);
+	if (t->file_ensured) {
+		pthread_mutex_unlock(&t->mu);
+		return 0;
+	}
+	if (t->target == SFTP_RANGE_TARGET_REMOTE) {
+		r = sftp_create_file(conn, t->path,
+		    u->mode != 0 ? u->mode : 0644, &permanent);
+	} else {
+		int fd = open(t->path, O_WRONLY | O_CREAT,
+		    u->mode != 0 ? u->mode : 0644);
+		if (fd >= 0)
+			close(fd);
+		else {
+			r = -1;
+			if (errno == EACCES || errno == EROFS ||
+			    errno == EDQUOT || errno == ENOSPC)
+				permanent = 1;
+			error("create local \"%s\": %s", t->path,
+			    strerror(errno));
+		}
+	}
+	if (r == 0)
+		t->file_ensured = 1;
+	else if (permanent)
+		u->no_retry = 1;
+	pthread_mutex_unlock(&t->mu);
+	return r;
+}
+
+/*
  * One range's final completion: `failed` = 1 on permanent give-up
  * (after MAX_RETRIES) or 0 on success.  Must be called exactly once
  * per range unit, on its final outcome only - see invariants (I1)
@@ -207,13 +257,13 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 			    t->target == SFTP_RANGE_TARGET_LOCAL ?
 			    "local" : "remote", t->path);
 		} else {
-			error("range-split: %s file \"%s\" is INCOMPLETE - at "
-			    "least one byte-range failed permanently after "
-			    "retries. The file is left in place and is "
-			    "resumable: re-run with verified resume "
-			    "(reputv / regetv) to refill the missing ranges.",
+			error("range-split: %s file \"%s\" is INCOMPLETE. "
+			    "The file is left in place and is resumable with "
+			    "reputv or regetv.",
 			    t->target == SFTP_RANGE_TARGET_LOCAL ?
 			    "local" : "remote", t->path);
+			debug("range-split: \"%s\": at least one byte-range "
+			    "failed permanently after retries", t->path);
 		}
 	}
 	pthread_mutex_destroy(&t->mu);
@@ -532,33 +582,6 @@ parallel_unit_split_min_size(struct sftp_parallel *p)
 	return bytes;
 }
 
-/*
- * Pre-create a local file at exactly size bytes so that parallel range-download
- * workers can open it O_WRONLY and write their ranges concurrently without
- * racing on creation.
- */
-static int
-precreate_local(const char *local_path, off_t size, mode_t mode)
-{
-	int fd;
-
-	if (mode == 0)
-		mode = 0644;
-	fd = open(local_path, O_WRONLY | O_CREAT | O_TRUNC, mode | S_IWUSR);
-	if (fd < 0) {
-		error("local pre-create \"%s\": %s", local_path,
-		    strerror(errno));
-		return -1;
-	}
-	if (ftruncate(fd, size) < 0) {
-		error("local ftruncate \"%s\" to %lld: %s",
-		    local_path, (long long)size, strerror(errno));
-		close(fd);
-		return -1;
-	}
-	close(fd);
-	return 0;
-}
 
 static struct sftp_work_unit *
 make_download_range_unit(const char *remote_path, const char *local_path,
@@ -598,10 +621,22 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 	int i, effective_ranges = 0;
 	struct sftp_range_tracker *tracker = NULL;
 
-	/* Pre-create remote file with O_CREAT|O_TRUNC at the correct size. */
-	if (sftp_precreate(conn, remote_path, file_size) != 0) {
-		error("pre-create \"%s\" failed", remote_path);
-		return -1;
+	/* Lazy creation: the file is created by the first worker that
+	 * dispatches a range for it (parallel_unit_ensure_file), so an
+	 * interrupted transfer leaves no empty placeholders.  Fail fast
+	 * here on an unusable destination: stat the target DIRECTORY so a
+	 * bad path/permissions surfaces at submit, not as per-unit retry
+	 * churn at first write. */
+	{
+		char *dcopy = xstrdup(remote_path);
+		Attrib da;
+		int dret = sftp_stat(conn, dirname(dcopy), 1, &da);
+		free(dcopy);
+		if (dret != 0) {
+			error("destination directory for \"%s\" is not "
+			    "accessible", remote_path);
+			return -1;
+		}
 	}
 
 	debug("range-split upload \"%s\": %d ranges of %lld bytes "
@@ -676,9 +711,17 @@ submit_download_ranges(struct sftp_parallel *p,
 	int i, effective_ranges = 0;
 	struct sftp_range_tracker *tracker = NULL;
 
-	if (precreate_local(local_path, file_size, mode) != 0) {
-		error("local pre-create \"%s\" failed", local_path);
-		return -1;
+	/* Lazy creation (see submit_upload_ranges): fail fast on an
+	 * unwritable local destination directory. */
+	{
+		char *dcopy = xstrdup(local_path);
+		if (access(dirname(dcopy), W_OK) != 0) {
+			error("local destination directory for \"%s\": %s",
+			    local_path, strerror(errno));
+			free(dcopy);
+			return -1;
+		}
+		free(dcopy);
 	}
 
 	debug("range-split download \"%s\": %d ranges of %lld bytes "

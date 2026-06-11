@@ -459,7 +459,8 @@ int sftp_fs_info(struct sftp_conn *, const char *path, struct sftp_fs_info *info
  * O_WRONLY and write their byte ranges concurrently without racing on creation.
  * Returns 0 on success, -1 on error.
  */
-int sftp_precreate(struct sftp_conn *, const char *remote_path, off_t size);
+int sftp_create_file(struct sftp_conn *, const char *remote_path, mode_t,
+    int *permanent_out);
 
 /*
  * Upload a byte range of a local file to the corresponding byte range of a

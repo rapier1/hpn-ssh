@@ -80,6 +80,9 @@ extern int showprogress;
  */
 #include "sftp-parallel-internal.h"
 
+/* Single definition; declared extern in sftp-parallel-internal.h. */
+volatile sig_atomic_t parallel_user_abort_flag;
+
 
 static size_t
 work_queue_depth(const struct sftp_parallel_config *cfg)

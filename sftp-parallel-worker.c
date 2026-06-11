@@ -131,6 +131,14 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	struct sftp_parallel *p = w->parent;
 	int rc = -1;
 
+	/* Lazy file creation: first range dispatched for a tracked file
+	 * creates it (exactly-once via the tracker mutex; no-op for
+	 * untracked ops and existing files).  A permanent create failure
+	 * sets u->no_retry and fails the unit immediately. */
+	if (u->range_tracker != NULL &&
+	    parallel_unit_ensure_file(w->conn, u) != 0)
+		return -1;
+
 	switch (u->op) {
 	case SFTP_OP_UPLOAD:
 		/*
@@ -277,7 +285,8 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		 *     the transient condition time to clear before the retry.
 		 */
 		int transient = sftp_conn_is_dead(w->conn);
-		if (transient || ++u->attempt < parallel_unit_max_retries(p)) {
+		if (!u->no_retry &&
+		    (transient || ++u->attempt < parallel_unit_max_retries(p))) {
 			if (u->size > 0)
 				__atomic_fetch_add(&p->queued_bytes,
 				    (uint64_t)u->size, __ATOMIC_RELAXED);
@@ -305,7 +314,8 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 		return;
 	}
 	int transient = sftp_conn_is_dead(w->conn);
-	if (transient || ++u->attempt < parallel_unit_max_retries(p)) {
+	if (!u->no_retry &&
+	    (transient || ++u->attempt < parallel_unit_max_retries(p))) {
 		/*
 		 * Transient (dead-conn) failures re-queue WITHOUT charging
 		 * u->attempt and jump to the FRONT so the partial file finishes

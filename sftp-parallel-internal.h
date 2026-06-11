@@ -571,7 +571,11 @@ enum sftp_range_target {
  * fleet (the post-interrupt rebuild).  sftp.c runs one orchestrator at a
  * time, so a single process-wide flag is faithful.
  */
-static volatile sig_atomic_t parallel_user_abort_flag;
+/* Set by the reporter when an abort was USER-initiated (Ctrl-C): lets
+ * p-less sites (tracker finalize) tell interrupt fallout from genuine
+ * failure.  extern - exactly one definition (sftp-parallel.c); a static
+ * here would silently give every module its own dead copy. */
+extern volatile sig_atomic_t parallel_user_abort_flag;
 
 struct sftp_range_tracker {
 	pthread_mutex_t        mu;         /* serialises decrement + cleanup */
@@ -588,6 +592,12 @@ struct sftp_range_tracker {
 	 * worker_process_result - exactly once per executed unit. */
 	int                    active_writers;
 	int                    writer_cap;
+	/* Lazy file creation: first writer to dispatch a range for this
+	 * file creates it (if absent - layout-created files pass through)
+	 * under mu.  Until then the file does not exist on the target, so
+	 * an interrupted transfer leaves no empty full-size placeholders
+	 * and verified resume only ever hashes files that hold data. */
+	int                    file_ensured;
 };
 
 struct sftp_work_unit {
@@ -596,6 +606,8 @@ struct sftp_work_unit {
 	char    *dst_path;
 	off_t    size;
 	mode_t   mode;
+	int      no_retry;   /* permanent failure (EACCES/EDQUOT/EROFS/
+			      * ENOSPC class): give up without retries */
 	int      attempt;
 	/* Per-unit resume/verify (whole-file units only - set by the public
 	 * submit entry points).  Carries the originating command's intent
@@ -1131,6 +1143,8 @@ void	 parallel_unit_pending_dec(struct sftp_parallel *);
 void	 parallel_unit_pending_dec_traced(struct sftp_parallel *,
 	    const struct sftp_work_unit *, int, const char *);
 uint64_t parallel_unit_split_min_size(struct sftp_parallel *);
+int	 parallel_unit_ensure_file(struct sftp_conn *,
+	    struct sftp_work_unit *);
 
 /* sftp-parallel-worker.c export (moves there in a later step) */
 void	*parallel_worker_thread(void *);

@@ -116,6 +116,9 @@ extern int showprogress;
 #endif /* HAVE_CYGWIN */
 
 struct sftp_conn {
+	u_int last_status;	/* most recent SSH2_FXP_STATUS code seen by
+				 * get_status/get_handle; lets callers
+				 * classify permanent failures (HPN) */
 	int fd_in;
 	int fd_out;
 	struct sftp_hpn_conn *hpn;  /* HPN: per-connection extensions (dead flag,
@@ -407,6 +410,7 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 
 	debug3("SSH2_FXP_STATUS %u", status);
 
+	conn->last_status = status; /* HPN: permanent-failure classification */
 	return status;
 }
 
@@ -443,6 +447,7 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 	if (type == SSH2_FXP_STATUS) {
 		if ((r = sshbuf_get_u32(msg, &status)) != 0)
 			fatal_fr(r, "parse status");
+		conn->last_status = status; /* HPN */
 		if (errfmt != NULL)
 			error("%s: %s", errmsg, fx2txt(status));
 		return NULL;
@@ -1977,6 +1982,26 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				skip_ret = 2; /* target larger than source */
 				goto resume_fail;
 			} else if (st.st_size > 0) {
+				/*
+				 * Chunked verify FIRST (mirrors the upload
+				 * side): a lazily-created range-split local
+				 * partial grows to its pwrite highwater and
+				 * may hold interior holes below that size -
+				 * prefix resume would append past them and
+				 * corrupt.  Chunks past local EOF hash as
+				 * absent and re-fetch.  Declines fall through
+				 * to prefix resume (sequential partials,
+				 * sub-threshold files).
+				 */
+				int dchunked =
+				    sftp_hpn_try_chunked_resume_download(
+				        conn, local_fd, local_path,
+				        remote_path, (off_t)size);
+				if (dchunked >= 0) {
+					skip_ret = dchunked == 1 ? 1 : 0;
+					goto resume_fail;
+				}
+
 				uint64_t local_hash, remote_hash;
 				int lret, rret;
 
@@ -2821,6 +2846,26 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			} else {
 				/*
 				 * c.size < sb.st_size: partial remote file.
+				 * Chunked verify FIRST: a lazily-created
+				 * range-split partial grows to its pwrite
+				 * highwater and may hold interior holes below
+				 * that size - prefix resume would append past
+				 * them and corrupt.  The server clamps ranges
+				 * at remote EOF, so interior holes and the
+				 * missing tail all hash-mismatch and re-send.
+				 * Declines (-1) fall through to prefix
+				 * resume, reached only for sequentially
+				 * written partials and files below the chunk
+				 * threshold.
+				 */
+				int chunked = sftp_hpn_try_chunked_resume_upload(
+				    conn, local_fd, local_path, remote_path,
+				    sb.st_size);
+				if (chunked >= 0) {
+					close(local_fd);
+					return chunked; /* 1=skip, 0=success */
+				}
+				/*
 				 * Hash the overlapping prefix to decide whether
 				 * we can safely resume (append) or must restart.
 				 */
@@ -3153,60 +3198,40 @@ sftp_fs_info(struct sftp_conn *conn, const char *path, struct sftp_fs_info *info
 }
 
 /*
- * Pre-create a remote file at size bytes (O_CREAT|O_TRUNC) so that parallel
- * range-upload workers can open it with O_WRONLY and write their byte ranges
- * concurrently without racing on file creation.
+ * sftp_create_file - create the remote file if absent, WITHOUT truncating
+ * an existing one and WITHOUT pinning a logical size.  Used by the lazy
+ * first-writer gate of range-split transfers: the file appears on the
+ * remote only once data is actually about to flow, and its size then
+ * grows with the pwrite highwater (honest sizes for interrupted
+ * transfers; verified resume handles the short file via chunk clamping).
+ * Sets *permanent_out on failures that retrying cannot cure
+ * (SSH2_FX_PERMISSION_DENIED).
  */
 int
-sftp_precreate(struct sftp_conn *conn, const char *remote_path, off_t size)
+sftp_create_file(struct sftp_conn *conn, const char *remote_path, mode_t mode,
+    int *permanent_out)
 {
 	u_char *handle = NULL;
-	u_int   handle_len_u;
 	size_t  handle_len;
 	Attrib  a;
-	int     r;
 
-	/*
-	 * Open the file empty.  We pass NULL attrs because the standard SFTP
-	 * server's process_open silently drops SSH2_FILEXFER_ATTR_SIZE on
-	 * open (it only honors permissions); relying on it there leaves the
-	 * file at logical size 0 even after this function returns.
-	 */
-	if (send_open(conn, remote_path, "precreate",
-	    SSH2_FXF_WRITE | SSH2_FXF_CREAT | SSH2_FXF_TRUNC,
-	    NULL, &handle, &handle_len) != 0)
-		return -1;
-
-	/*
-	 * Set the logical EOF to `size` via FSETSTAT.  The server's
-	 * process_fsetstat honors ATTR_SIZE via ftruncate(fd, size), which
-	 * extends the file's logical EOF to size and produces a true sparse
-	 * extent (no blocks allocated until pwrites land there).  Without
-	 * this, the file's stat-size grows only as workers extend it via
-	 * pwrite - and an interrupt before all workers finish their ranges
-	 * leaves the file at the highwater of pwrite offsets rather than at
-	 * size, which (a) breaks the documented contract of this function and
-	 * (b) prevents the size-match-content-different recovery path
-	 * (verified-resume chunked rehash) from engaging on an interrupted
-	 * range-split upload - the very state it was built to handle.
-	 *
-	 * The change is base-protocol SFTP; every compliant server supports it.
-	 * One extra round trip per precreate call; negligible vs. the parallel
-	 * range-split transfer that follows.
-	 */
-	handle_len_u = (u_int)handle_len;
+	if (permanent_out != NULL)
+		*permanent_out = 0;
 	attrib_clear(&a);
-	a.flags = SSH2_FILEXFER_ATTR_SIZE;
-	a.size  = (uint64_t)size;
-	if ((r = sftp_fsetstat(conn, handle, handle_len_u, &a)) != 0) {
-		(void)sftp_close(conn, handle, handle_len);
-		free(handle);
-		return r;
+	a.flags = SSH2_FILEXFER_ATTR_PERMISSIONS;
+	a.perm = mode & 07777;
+	if (send_open(conn, remote_path, "lazy-create",
+	    SSH2_FXF_WRITE | SSH2_FXF_CREAT, &a, &handle, &handle_len) != 0) {
+		/* send_open already logged; classify permission failures so
+		 * the unit gives up instead of retrying a permanent error. */
+		if (permanent_out != NULL &&
+		    conn->last_status == SSH2_FX_PERMISSION_DENIED)
+			*permanent_out = 1;
+		return -1;
 	}
-
-	r = sftp_close(conn, handle, handle_len);
+	(void)sftp_close(conn, handle, handle_len);
 	free(handle);
-	return r;
+	return 0;
 }
 
 int
