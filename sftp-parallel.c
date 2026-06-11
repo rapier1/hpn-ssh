@@ -3391,6 +3391,17 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 
 	pthread_mutex_lock(&w->mu);
 	prev = w->health;
+	/* Already doomed: the kill was sent and the worker is draining
+	 * toward reap - nothing the inactivity heuristics decide matters
+	 * anymore, and re-evaluating them re-triggers the doom branches
+	 * every tick (observed: one ENDGAME-REAP log line per second
+	 * against a worker that cannot die mid-phase).  Doom is
+	 * once-per-death; only the SIGKILL escalation below still runs. */
+	if (w->doomed) {
+		pthread_mutex_unlock(&w->mu);
+		next = prev;
+		goto sigkill_escalation;
+	}
 	uint64_t in_flight = w->units_started - w->units_completed -
 	    w->units_failed;
 	uint64_t w_bytes_total = w->bytes_total;
@@ -3792,6 +3803,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			}
 		}
 
+ sigkill_escalation:
 	/* SIGKILL escalation: if a doomed worker hasn't exited within
 	 * SIGKILL_ESCALATION_SEC, the SSH child is hung in its clean-
 	 * shutdown path (broken socket) and the worker thread is blocked
