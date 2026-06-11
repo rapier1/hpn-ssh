@@ -3468,8 +3468,22 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		if (next != WORKER_DEAD) {
 			uint64_t paused_until =
 			    sftp_conn_watchdog_pause_until_ns(w->conn);
-			if (paused_until > now)
+			if (paused_until > now) {
+				/* A held lease counts as progress: re-seed
+				 * the silence clock so that when the lease
+				 * ends, silence is measured from lease END,
+				 * not from the last byte moved BEFORE the
+				 * quiet phase.  Without this, a verify that
+				 * hashes for minutes carries a minutes-stale
+				 * clock into its first post-hash tick - the
+				 * suppression vanishes with the lease, the
+				 * clock reads the whole hash phase as
+				 * silence, and one slow first write-ack gets
+				 * the worker reaped as an endgame straggler
+				 * (then the verify restarts from scratch). */
+				w->last_progress_ns = now;
 				goto inactivity_checks_done;
+			}
 		}
 
 		/*
