@@ -1,0 +1,1083 @@
+/*
+ * sftp-parallel-internal.h - shared internal state for the parallel
+ * SFTP orchestrator module family (sftp-parallel*.c).
+ *
+ * Everything here was previously file-static in sftp-parallel.c; it is
+ * internal to the module family and must not be included elsewhere.
+ */
+
+#ifndef SFTP_PARALLEL_INTERNAL_H
+#define SFTP_PARALLEL_INTERNAL_H
+
+#include <sys/types.h>
+
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "sftp-parallel.h"	/* struct sftp_parallel_config (embedded) */
+
+struct sftp_conn;
+struct sftp_workqueue;
+
+#define HPN_MAX_RETRIES_DEFAULT 3
+#define HPN_MAX_RETRIES_MIN     1
+#define HPN_MAX_RETRIES_MAX     20
+
+/* hpn_max_retries() definition is later in this file - struct
+ * sftp_parallel is opaque here.  Forward declaration so callers
+ * earlier than the struct definition can still resolve the symbol. */
+struct sftp_parallel;
+
+#define REPORTER_TICK_MS        200
+#define DEFAULT_TRANSFER_BUFLEN 131072	/* 128 KB; matches sftp-client.c */
+#define DEFAULT_NUM_REQUESTS    1024	/* 128 KB * 1024 = 128 MB in-flight per stream */
+
+/*
+ * Maximum files to pipeline in one open+write+close batch.  Sending N opens
+ * before waiting for any handle reduces per-file open overhead from 1 RTT
+ * each to 1 RTT total; same for closes.  64 is chosen to keep the burst
+ * small enough that SSH channel window pressure is negligible while still
+ * amortising RTT cost over a large group of small files.
+ */
+#define UPLOAD_BATCH_SIZE       64
+
+/*
+ * Bundle mode caps a batch by BYTES (bundle_target_bytes, default 8 MiB),
+ * not by file count.  UPLOAD_BATCH_SIZE's 64-file cap is a per-file-path
+ * constraint (SSH channel-window pressure from N concurrent file handles)
+ * that does NOT apply to a bundle: a bundle is one tar stream over one
+ * handle with its own BUNDLE_MAX_INFLIGHT write window.  This is just a high
+ * safety ceiling so a pathological stream of tiny files cannot grow a single
+ * batch without bound; the 8 MiB byte cap binds first for any file >= ~1 KiB.
+ */
+#define BUNDLE_BATCH_MAX_FILES  8192
+
+/*
+ * Soft byte cap on the size of a single upload batch.  Once a worker's
+ * batch crosses this many bytes it stops grabbing additional units, even
+ * if UPLOAD_BATCH_SIZE units have not been collected.  This is a SOFT cap
+ * - the first unit is always added to the batch even if its size already
+ * exceeds the cap (so a single huge file is never orphaned), and the cap
+ * is checked AFTER each addition (so the actual batch may end up larger
+ * than the cap by one unit's worth).
+ *
+ * Without this cap, a worker that finds many medium-to-large files in the
+ * queue would grab UPLOAD_BATCH_SIZE of them in one batch.  With four
+ * workers and 200x500 MiB files, all 200 files would be claimed in
+ * batches of 50 within the first second of the transfer; the queue then
+ * sits empty, the scaler has nothing to react to, and end-of-transfer
+ * tail dominates throughput as workers drain different-sized piles.
+ *
+ * 256 MiB is a balance: small enough that workers don't pre-claim large
+ * fractions of the workload, large enough that small-file batches still
+ * amortise per-batch open/close RTT cost.  Many-small workloads (1 MiB
+ * files) hit UPLOAD_BATCH_SIZE first; medium-to-large files hit this
+ * byte cap first.
+ */
+#define UPLOAD_BATCH_BYTE_CAP   ((uint64_t)256 * 1024 * 1024)
+
+/*
+ * -- Phase 5: bundle-mode (hpn-bundle@hpnssh.org) tunables ----------------
+ *
+ * When a worker has the bundle path enabled (HPNUseBundle yes in
+ * ssh_config AND the server advertised hpn-bundle support), the worker
+ * collects upload batches up to BUNDLE_TARGET_BYTES_DEFAULT instead of
+ * UPLOAD_BATCH_BYTE_CAP, then dispatches them as a single tar stream via
+ * sftp_hpn_bundle_upload.  The smaller target produces many small bundles
+ * that compose well with parallel streams - each worker can have a
+ * different bundle in flight, the way each worker has a different batch
+ * in flight in the non-bundle path.
+ *
+ * 8 MiB default (raised from 4 MiB on 2026-05-31 after libarchive removal
+ * decoupled server memory from bundle size).  Override with HPNBundleSize
+ * in ssh_config, --bundle-size on hpnsftp, or -o HPNBundleSize=N.  Range
+ * clamped to [BUNDLE_TARGET_BYTES_MIN, BUNDLE_TARGET_BYTES_MAX].
+ *
+ * Files larger than BUNDLE_TARGET_BYTES / BUNDLE_MIN_FILES_PER_BUNDLE
+ * are excluded from the bundle path: bundling a single large file
+ * doesn't amortise the OPEN/CLOSE round-trip cost the way many small
+ * files do, and would just block the worker that picked it up while
+ * other workers run dry.  The excluded files go through the regular
+ * single-file SFTP path (which may further split via range-split).
+ */
+#define BUNDLE_TARGET_BYTES_DEFAULT  ((uint64_t)8 * 1024 * 1024)
+#define BUNDLE_TARGET_BYTES_MIN      ((uint64_t)1 * 1024 * 1024)
+#define BUNDLE_TARGET_BYTES_MAX      ((uint64_t)64 * 1024 * 1024)
+#define BUNDLE_MIN_FILES_PER_BUNDLE  4u
+
+/* Maximum size of a single file the walker is willing to place in a
+ * bundle.  Computed from the worker's bundle_target_bytes.  Files at
+ * or above this size go through the non-bundle path. */
+#define BUNDLE_FILE_MAX_BYTES(target) \
+    ((target) / BUNDLE_MIN_FILES_PER_BUNDLE)
+
+/* Back-compat: some sites still reference the old un-suffixed name. */
+#define BUNDLE_TARGET_BYTES BUNDLE_TARGET_BYTES_DEFAULT
+
+/*
+ * Work-queue (ring) depth.
+ *
+ * Non-bundle: the historical N*UPLOAD_BATCH_SIZE*4 + one extra batch - deep
+ * enough to feed the 64-file OPEN/CLOSE pipelining.
+ *
+ * Bundle mode needs far more.  A worker assembles a batch up to
+ * bundle_target_bytes using NON-BLOCKING trypop and flushes whatever is queued
+ * the instant the queue runs dry (sftp-parallel.c bundle batch loop).  So to
+ * let all num_streams workers actually reach a full bundle, the queue must
+ * hold roughly num_streams full bundles' worth of small files at once, plus
+ * headroom for the walker to refill during a concurrent grab - otherwise the
+ * queue starves and bundles flush at a fraction of the target (the old depth,
+ * N*64*4, capped 8 workers at ~queue/8 files => ~4-6 MiB bundles regardless of
+ * --bundle-size).  Sized for a representative small file (BUNDLE_QUEUE_FILE_HINT;
+ * files larger than that just need fewer units, so the queue over-provisions
+ * harmlessly; files smaller still under-fill, tunable via the hint).  Capped at
+ * WORK_QUEUE_DEPTH_MAX to bound pre-claimed work-unit memory.  The ring itself
+ * is pointers; the cost is the queued units the walker pre-enumerates.
+ */
+#define BUNDLE_QUEUE_FILE_HINT   ((uint64_t)16 * 1024)  /* representative small file */
+#define WORK_QUEUE_DEPTH_MAX     ((size_t)65536)        /* hard cap on queued units */
+
+
+/*
+ * Maximum number of failed-path entries the orchestrator retains for
+ * the end-of-transfer summary.  Beyond this, the count keeps growing
+ * (so the user knows N files failed) but the per-path strings are
+ * dropped to bound memory on pathological cases (e.g. permission-
+ * denied across a 100k-file tree).  ~25 KiB at the default with
+ * typical path lengths.  Touched by hpn_strlist_init in orchestrator
+ * init; surfaced by parallel_flush's "Failed paths:" block.
+ */
+#define HPN_FAILED_PATHS_MAX    100
+
+/* Watchdog thresholds.  STALL: warn (status only, NO kill) if a worker has had
+ * work available but made no bytes-level progress (bytes_total + live_bytes
+ * flat) for this long.  The progress signal is bytes-based (live_bytes climbs
+ * continuously during a healthy transfer regardless of unit size), so it
+ * reflects "no client-side bytes in N seconds" rather than "no unit completed
+ * in N seconds".
+ *
+ * Mid-stream silence is the TRANSPORT's lane.  A worker that was producing and
+ * goes quiet is exactly when the connection's TCP_INFO classifier fires: WEDGE
+ * reaps it (~10 s) or PEER_STALL waits and brakes at PEER_STALL_BRAKE_SECS
+ * (300 s, sftp-hpn-congestion.c) - and on any of those the child exits, so the
+ * child-gone check reaps it immediately with the precise cause.  The
+ * orchestrator therefore only needs a backstop ABOVE the brake, for the cases
+ * the transport CANNOT classify (no TCP_INFO, a LAN path, or a genuinely hung
+ * worker): WORKER_SILENCE_BRAKE_SEC.  Keeping it above 300 s lets the
+ * transport's wait-not-kill lead rather than the orchestrator pre-empting it at
+ * 15-120 s (which re-manufactured the churn the wait was built to avoid).
+ * Start-of-unit zero-bytes is a separate lane the transport is usually blind to
+ * (e.g. a download worker waiting on a server disk read - the server is not
+ * rwnd-limited, so no PEER_STALL), so the born-dead fast-kill (5-40 s,
+ * RTT-scaled) stays responsive.
+ *
+ * 2026-06-05: born-dead stays fast; the mid-stream silence reaps (dead /
+ * isolation) were raised from 60/120/15 s to the single backstop below. */
+#define STALL_THRESHOLD_SEC          60  /* STALLED warn status (no kill) */
+#define WORKER_SILENCE_BRAKE_SEC    330  /* reap a still-connected, byte-silent
+                                          * worker only after this - above the
+                                          * 300 s transport peer-stall brake so
+                                          * the transport self-terminates first */
+/*
+ * Endgame stuck-straggler reap threshold.  At the endgame (walker done, queue
+ * drained, idle capacity) a worker that has made zero progress for this long
+ * is reaped so its bundle re-queues (the #1 TRANSPORT_FAILED path) and an idle
+ * worker re-bundles it on a fresh connection.  15s sits comfortably above the
+ * ~9s worst-case normal bundle, so only genuine stragglers are caught; it caps
+ * the endgame tail at ~15s vs. the ~90s+ seen unguarded under heavy loss.
+ */
+/*
+ * Endgame stuck-straggler reap threshold (validated for the 8 MiB default; well
+ * above the ~9-10s worst-case normal 8 MiB bundle).  NOTE: a 2026-06-06 sweep
+ * showed normal bundle duration scales ~linearly with bundle size (RTT-
+ * independent), so this should eventually become size-derived (~0.5*bundle_MiB
+ * + 10) once bundle sizing is finalized - see project_bundle_size_rtt_and_
+ * endgame_threshold.  Fixed 15 is correct while the default is 8 MiB.
+ */
+#define ENDGAME_STUCK_SEC            15
+
+/*
+ * Endgame range split.  When the worker that pops the LAST queued unit
+ * (walker done, queue empty after the pop) is holding a large byte-range,
+ * it splits that range into N pieces so idle workers help drain it instead
+ * of one worker grinding the final range solo (the measured ~12% fixed
+ * tail).  One-shot per transfer; N defaults to the file's writer cap (-w)
+ * so exactly one wave of writers fits under the per-inode gate.  This is
+ * FS-agnostic scheduler logic: pieces keep the generic 1 MiB alignment,
+ * stripe knowledge stays in the submit path / FS modules.
+ */
+#define ENDGAME_SPLIT_MIN_LEN	(256 * 1024 * 1024) /* split only above this */
+#define ENDGAME_SPLIT_MIN_PIECE	 (64 * 1024 * 1024) /* clamp N: pieces >= this */
+#define ENDGAME_SPLIT_ALIGN	      (1024 * 1024) /* piece alignment */
+
+/*
+ * Number of watchdog ticks (~1 s each) to wait before a worker becomes
+ * eligible for throughput-outlier classification.  During this window the
+ * worker's EMA is still warming up from its cold-start seed, so any
+ * comparison against the peer-max threshold would be unreliable.
+ *
+ * 5 ticks covers TCP slow-start ramp-up at RTTs up to ~50 ms.  At higher
+ * RTTs (100–200 ms) slow-start takes proportionally longer in wall-clock
+ * time, but the EMA warmup window still covers it because both the worker's
+ * EMA and the threshold EMA are climbing together - neither side is "warm"
+ * before the other.
+ *
+ * NOTE: an alternative approach is to measure the actual per-worker RTT
+ * (e.g. via a timed SFTP extension round-trip immediately after sftp_init,
+ * or by reading tcpi_rtt from TCP_INFO on the worker's socket) and compute
+ * a RTT-proportional grace period.  That would be more accurate on highly
+ * variable paths.  The fixed-tick approach is sufficient for the current
+ * use case and avoids the complexity of per-worker RTT measurement.
+ */
+#define TPUT_EMA_WARMUP_TICKS   5
+
+/*
+ * Outlier-detection ramp gate.  A worker's tput EMA cannot be fairly
+ * compared against the path max until the worker's TCP connection has had
+ * time to ramp through slow-start.  Number of RTTs we wait for that ramp
+ * before applying the outlier check.  log2(BDP / initial_cwnd) ≈ 7-9 on
+ * typical Gbps/50ms paths; doubling that for safety gives ~RAMP_RTTS = 20.
+ * Multiplied by the path RTT and peer throughput, this becomes a per-worker
+ * "minimum bytes transferred" threshold (see watchdog_sample_throughput).
+ *
+ * RAMP_WARMUP_BYTES_MIN/MAX clamp the computed threshold so warmup never
+ * dips below a useful floor or blows up on a high-BDP path where the EMA
+ * may itself be misleading early on.
+ */
+#define RAMP_RTTS                 20
+#define RAMP_WARMUP_BYTES_MIN     (16ULL * 1024 * 1024)    /* 16 MiB */
+#define RAMP_WARMUP_BYTES_MAX     (256ULL * 1024 * 1024)   /* 256 MiB */
+/*
+ * Hard wall-clock cap on the bytes-based warmup gate.  At 30 Mbps a
+ * worker needs ~60 s to transfer 256 MiB, so without this cap a
+ * genuinely-slow respawned worker stays protected from outlier detection
+ * for its entire slow lifetime.  After RAMP_MAX_WARMUP_SEC seconds from
+ * unit_start_ns the gate lifts unconditionally - a healthy TCP slow-start
+ * always completes in well under this.
+ */
+#define RAMP_MAX_WARMUP_SEC       15
+
+/*
+ * Born-dead fast-kill threshold.  A worker that has popped a unit but
+ * has zero progress (bytes_total + live_bytes + units_completed all 0)
+ * for this many seconds is killed and respawned.  The server-side path
+ * for that SSH session is wedged - usually a Lustre OST stall that
+ * froze the SSH channel window.  Waiting the full WORKER_SILENCE_BRAKE_SEC
+ * backstop wastes capacity here: we know after a few seconds that no bytes
+ * have arrived, and zero is unambiguous - no peer comparison or EMA warmup
+ * needed.  This is the start-of-unit lane the transport can't classify, so it
+ * stays responsive while the mid-stream silence reaps were relaxed.
+ *
+ * Set conservatively: 5 seconds is well above SSH auth completion
+ * (~1 RTT after the worker enters the main loop) and the first OPEN
+ * round-trip (~1 RTT on a 50ms path).  Anything faster risks killing
+ * workers whose first chunk happens to span a slow OST.
+ *
+ * RTT-dependent (br008 A/B, 2026-06-04): the *right* tolerance is ~100
+ * round-trips, not a fixed 5s.  At 51ms RTT 5s was correct; at 151ms a
+ * transient backend stall takes longer to clear (it's the same recoverable
+ * rwnd-pin as peer-stall, just caught at the start of a unit), so 5s
+ * over-fired and ~15s held throughput.  The effective threshold is therefore
+ * derived from the measured path RTT: born_dead_sec = clamp(rtt_ms/10,
+ * BORN_DEAD_KILL_SEC, BORN_DEAD_SEC_MAX) (integer, mantissa dropped), set in
+ * sftp_parallel_set_path_rtt.
+ */
+#define BORN_DEAD_KILL_SEC        5    /* floor (RTT <= ~59ms) */
+#define BORN_DEAD_SEC_MAX        40    /* cap (RTT >= ~400ms) */
+
+/*
+ * Born-slow fast-kill threshold.  A worker that has completed at least one
+ * unit (so NOT born-dead) but whose EMA throughput is persistently below
+ * BORN_SLOW_FLOOR_FRAC × cfg.tput_path_healthy_kbps for BORN_SLOW_TICKS
+ * consecutive throughput samples is killed, in the hope that the respawn
+ * lands a TCP connection in a better state.
+ *
+ * Two gates keep this from thrashing (it has no budget of its own - the
+ * shared respawn cooldown is its budget; see reporter_dispatch_respawns):
+ *
+ *   1. Fleet-state gate: fire only when a healthy peer exists
+ *      (tput_last_raw_max_kbps >= the floor), i.e. this worker is a TRUE
+ *      outlier.  When the WHOLE fleet is slow (no healthy reference -
+ *      backend saturation) born-slow is suppressed; a respawn would land on
+ *      the same saturated path and just burn churn while re-queuing the
+ *      worker's unit.  That all-slow case is the cooldown/probe machinery's
+ *      job, not born-slow's.
+ *
+ *   2. Cooldown gate: suppressed while a respawn cooldown is active
+ *      (respawn_resume_s != 0).  A born-slow kill is a respawn, so repeated
+ *      born-slow kills push respawn_epoch_count and trip the epoch ceiling,
+ *      which enters the escalating/decaying cooldown.  Once in cooldown we
+ *      stop killing slow-but-working workers and accept them (best-effort);
+ *      the cooldown's decay-on-health restores born-slow when the path
+ *      recovers.  Born-slow and peer-stall are two views of the same
+ *      backend-pressure problem at different timescales, so they share one
+ *      back-off mechanism rather than each carrying its own counter.
+ *
+ * Tuning:
+ *   BORN_SLOW_TICKS=6        × ~5 s/sample = ~30 s window
+ *   BORN_SLOW_FLOOR_FRAC=0.25 below 25% of the configured healthy floor
+ *                            (e.g. < 500 kbps when healthy=2000) is "born
+ *                            slow" - much lower than legitimate slow paths
+ */
+#define BORN_SLOW_TICKS           6
+#define BORN_SLOW_FLOOR_FRAC      0.25
+
+/*
+ * Operator flare cadence (reporter_flare).  A "degraded episode" is any
+ * contiguous stretch where the orchestrator is backing off respawns
+ * (cooldown active) or accepting slow-but-working workers (born-slow gated
+ * off).  We emit ONE edge-triggered notice when an episode opens, periodic
+ * reminders while it persists, and a recovery notice on the falling edge.
+ * The reminder interval uses the same multiplicative back-off as the cooldown
+ * itself: it starts at FLARE_REMINDER_BASE_SEC and doubles per reminder up to
+ * FLARE_REMINDER_CAP_SEC, so the user learns quickly that a stall is
+ * sustained without a long episode spamming the log.  Reminders escalate from
+ * notice to warning wording once the episode has lasted FLARE_WARN_SEC.  All
+ * of this is suppressed under -q / -b (quiet stays quiet); it replaces
+ * per-event log spam with episode-level framing, with the per-worker detail
+ * left at debug level.  Never implies failure - a degraded episode is
+ * best-effort-in-progress, not a lost transfer.
+ */
+#define FLARE_REMINDER_BASE_SEC  60   /* first reminder this far into an episode */
+#define FLARE_REMINDER_CAP_SEC  600   /* reminder interval doubles, capped here */
+#define FLARE_WARN_SEC          300   /* escalate notice -> warning after this */
+
+/*
+ * After a worker has reconnected this many times, emit a one-time
+ * user-visible notice that the path may be unreliable.  The cause of each
+ * individual respawn is already reported as it happens; this is the
+ * cumulative "churn" signal.
+ */
+#define HPN_WORKER_CHURN_NOTICE   3
+
+/*
+ * (Removed 2026-06-07: RANGE_CHUNK_MULTIPLIER.  It fed a per-file range-count
+ * ceiling, min(file/floor, num_streams*4), whose stated job was tail-balancing
+ * oversubscription.  In practice it acted as a cap that forced absurdly large
+ * ranges on big files - a 1.5 TB file became 32 x 46 GB - and the
+ * oversubscription premise is contradicted by measurement (more/smaller ranges
+ * = throughput fade; see project_range_fade_2rtt_campaign).  Range size is now
+ * governed solely by the floor in range_split_min_size_for(); tail-balancing is
+ * to be handled at the endgame instead (project_endgame_range_split).)
+ */
+
+/*
+ * Range-split minimum: static default (RANGE_SPLIT_MIN_SIZE_DEFAULT,
+ * 2 GiB) overridable via -M on the command line.  Resolved per
+ * orchestrator in range_split_min_size_for() below.  See
+ * benchmark/range-split-tuning-analysis.md for the empirical sweep that
+ * picked 2 GiB and for the formula-driven scheme that preceded it.
+ */
+
+/*
+ * Synchronous-stall observer.  Each reporter slow-tick (~1 s) checks whether
+ * aggregate bytes transferred across all workers is zero while at least one
+ * worker has a unit in flight - a Lustre/storage writeback-stall signature.
+ * SYNC_STALL_WINDOW is the rolling window length in slow-ticks; the stall
+ * fraction is logged when the window closes.  Observation-only.
+ */
+#define SYNC_STALL_WINDOW     20    /* ~20 s window */
+#define SYNC_STALL_THRESHOLD  0.20  /* fraction at which the log line warns */
+
+/*
+ * Fleet abort.  Give up on the whole transfer only when no worker is alive and
+ * the fleet cannot re-establish a working connection - never while any single
+ * worker is still moving data OR heart-beating (a long verify/hash holds the
+ * watchdog pause; see HPN_HEARTBEAT_* in sftp-hpn-server.h).  The window below
+ * is how long aggregate fleet progress must be zero; the multiplier sets how
+ * many consecutive respawns must die without producing a byte (this multiplier
+ * times num_streams) before we conclude reconnects are not taking hold.
+ */
+#define FLEET_ABORT_NOPROGRESS_SEC    60  /* default zero-progress window (s) */
+#define FLEET_ABORT_UNPRODUCTIVE_MULT  2  /* abort after this * num_streams worker
+                                           * deaths that never produced a byte */
+
+/*
+ * Escalation timeout: how long we let a SIGTERMed SSH child clean up before
+ * promoting to SIGKILL.  When the receiving TCP socket is hung (the worker's
+ * I/O is stalled - exactly when we declare DEAD), SSH's clean-shutdown path
+ * tries to send SSH_MSG_DISCONNECT on the same broken socket and blocks
+ * indefinitely.  The worker thread is meanwhile blocked reading the ssh
+ * child's now-frozen stdout pipe, so it never sets exited=1, so reap (which
+ * runs the SIGKILL belt-and-suspenders) never fires.  5 seconds is generous
+ * for a healthy SSH disconnect and short enough to keep zombie workers from
+ * holding their in-flight unit hostage.
+ */
+#define SIGKILL_ESCALATION_SEC  5
+
+#define RESPAWN_MULTIPLIER      2  /* epoch ceiling = this * num_streams;
+				    * each worker slot gets one retry before
+				    * triggering a cooldown pause.  Cause-
+				    * agnostic backstop alongside the peer-
+				    * stall systemic trigger below. */
+
+/*
+ * Respawn cooldown is escalating + decaying, not count-capped.  On each
+ * entry (a systemic peer-stall burst or epoch-ceiling churn) the orchestrator
+ * pauses RESPAWNS ONLY - live workers keep running - for the current level,
+ * starting at BASE and doubling per burst up to CAP.  Sustained healthy
+ * throughput decays the level back toward BASE (halve per DECAY_SEC) and ends
+ * an active pause early.  There is no cooldown-count abort: under a transient
+ * backend stall the tool backs off and retries indefinitely (best-effort),
+ * surfacing the condition rather than dropping the transfer.  The only
+ * automatic abort remains a genuine dead-end (all workers gone and a respawn
+ * probe cannot even be launched).
+ */
+#define RESPAWN_COOLDOWN_BASE_SEC   30   /* initial pause length */
+#define RESPAWN_COOLDOWN_CAP_SEC    3600 /* escalation ceiling (~8 doublings) */
+#define RESPAWN_COOLDOWN_DECAY_SEC  30   /* halve the level per this much
+					  * sustained-healthy throughput, and
+					  * end an active pause early after this
+					  * long a continuous healthy streak */
+
+/*
+ * Systemic peer-stall detector.  Each slow-tick the reporter pushes the
+ * per-tick delta of peer-stall worker DEATHS (p->peer_stall_terminations)
+ * into a rolling window; when the window sum reaches the systemic threshold
+ * the backend is saturated fleet-wide and we enter/escalate a cooldown.
+ * Below the threshold a death is localized - the unit is just re-queued and
+ * work-stolen, no cooldown.  Threshold is a fraction of num_streams with an
+ * absolute floor so small -j is not tripped by a single coincidental death.
+ * The cost asymmetry is lopsided (over-trigger is cheap, self-correcting, and
+ * never touches live workers; under-trigger keeps loading a saturated
+ * backend), so err toward backing off.
+ */
+#define PEER_STALL_WINDOW            10  /* slow-ticks (~10 s) */
+#define PEER_STALL_SYSTEMIC_FRAC_PCT 50  /* >= this % of num_streams ... */
+#define PEER_STALL_SYSTEMIC_MIN       2  /* ... AND >= this many absolute */
+
+enum worker_health {
+	WORKER_HEALTHY = 0,
+	WORKER_STALLED,
+	WORKER_DEAD,
+};
+
+/*
+ * ENV-VAR HPN_BUNDLE_TIMING midstream-freeze probe (2026-06-05).  Each worker
+ * publishes its current phase (relaxed atomic) so the reporter's per-second
+ * FLEETSAMPLE shows WHERE all workers are at the instant of a freeze: blocked
+ * waiting for work (popwait) vs assembling a batch vs inside a transfer.
+ * Combined with the queue depth and the walker phase, a freeze becomes fully
+ * attributable instead of inferred.
+ */
+enum worker_phase {
+	WPH_INIT = 0,
+	WPH_POP_WAIT,    /* blocked in sftp_workqueue_pop (queue empty) */
+	WPH_ASSEMBLE,    /* collecting a batch via non-blocking trypop */
+	WPH_RUN,         /* inside a bundle / single-file transfer */
+	WPH_FINALIZE,    /* finalizing entries / draining deferred batch */
+	WPH_EXIT,
+};
+
+
+enum sftp_op {
+	SFTP_OP_UPLOAD,
+	SFTP_OP_DOWNLOAD,
+	SFTP_OP_UPLOAD_RANGE,	/* upload a byte range of a large file */
+	SFTP_OP_DOWNLOAD_RANGE,	/* download a byte range of a large file */
+};
+
+/* -- Per-file range-completion tracker --------------------------------
+ *
+ * Shared across the N range work units that make up a single
+ * SFTP_OP_DOWNLOAD_RANGE or SFTP_OP_UPLOAD_RANGE transfer.  Detects
+ * partial-range failure: if even one range gives up permanently after
+ * retries, the pre-allocated file is full-size with HOLES (some range
+ * offsets contain the just-written bytes, others are still zeros from
+ * the pre-allocation).  The tracker does NOT delete such a file - it
+ * is left in place, resumable via verified resume (reputv / regetv,
+ * which refills only the mismatched ranges) - and reports it loudly so
+ * the user and automation know it is incomplete rather than finding a
+ * full-size file with no error indicator.
+ *
+ * Protocol (last-completer-frees):
+ *   range_tracker_new returns a heap-allocated tracker with
+ *   remaining=total and any_failed=0.  Caller stores its pointer on
+ *   each of the N range work units' u->range_tracker field at submit
+ *   time.
+ *
+ *   range_tracker_finalize is called EXACTLY ONCE per range unit on
+ *   the unit's FINAL completion - success OR permanent give-up.
+ *   NEVER on a retry (the unit isn't done yet).  The function takes
+ *   the mutex, sets any_failed on give-up, decrements remaining.
+ *   Exactly one caller sees remaining transition to 0; that caller
+ *   does the post-mortem cleanup (report the incomplete file if
+ *   any_failed - leaving it in place, resumable - then destroy the
+ *   mutex and free the tracker) and is the LAST owner.
+ *
+ *   Other callers see remaining > 0 after their decrement and return
+ *   without touching the struct further - by design, they cannot
+ *   race with the last completer's cleanup because the mutex was
+ *   released before any of them returned.
+ *
+ * Invariants the caller MUST uphold:
+ *
+ *   (I1) Exactly `total` finalize calls per tracker, no more, no less.
+ *        Over-calling drives remaining negative (undefined: free-after-
+ *        free, double-free).  Under-calling leaks the tracker AND
+ *        suppresses the incomplete-file report.
+ *
+ *   (I2) Finalize fires on FINAL completion only.  On retry, the
+ *        unit goes back on the workqueue and finalize must NOT be
+ *        called yet - wait until the next attempt resolves.
+ *
+ *   (I3) After ANY thread's finalize returns 0, that thread must
+ *        treat its u->range_tracker pointer as dead - another caller
+ *        may have been the last completer in the meantime and freed
+ *        the struct.  Don't deref.  (In practice this is automatic:
+ *        the work unit itself is freed right after finalize in
+ *        worker_process_result / worker_give_up_unit, so the dead
+ *        pointer is unreachable.)
+ *
+ *   (I4) Worker context `w` is retained in the signature but is no
+ *        longer dereferenced: finalize used to need w->conn to sftp_rm
+ *        a corrupt remote file, but incomplete files are now left in
+ *        place for resume instead of removed.  Passing NULL is always
+ *        safe (e.g., synthesised finalize during a submit failure in
+ *        submit_*_ranges).
+ *
+ *   (I5) range_tracker_finalize(NULL, ...) is a no-op.  Non-range
+ *        work units have u->range_tracker == NULL; that's the
+ *        intended representation.
+ *
+ * Memory:
+ *   - tracker struct itself: xcalloc'd in new, freed by last completer
+ *   - t->path: xstrdup'd in new, freed alongside the struct
+ *   - t->mu: pthread_mutex_init'd in new, destroyed by last completer
+ */
+enum sftp_range_target {
+	SFTP_RANGE_TARGET_LOCAL,   /* unlink() at finalize */
+	SFTP_RANGE_TARGET_REMOTE,  /* sftp_rm()  at finalize via worker conn */
+};
+
+/*
+ * HPN per-inode concurrent-writer cap.  All range units of one file share a
+ * range_tracker; this bounds how many of them write the inode at once.  Piling
+ * all -j workers onto a single inode is slower than fewer, because buffered
+ * writes serialise on the per-inode write lock (measured on Lustre: 8 writers
+ * to one inode < 1 plain stream).  Whole-file/bundle units have no tracker and
+ * are never gated.  The live value is per-transfer (-w flag), carried in
+ * cfg.writers_per_inode_cap into each tracker's writer_cap below; the
+ * default/floor/max constants (HPN_RANGE_WRITERS_CAP_*) live in sftp-parallel.h.
+ */
+
+/*
+ * Process-wide mirror of the current orchestrator's abort_user flag, for the
+ * few message sites that have no path to the orchestrator (range-tracker
+ * finalize may run with a NULL worker).  Set by the reporter when a USER
+ * interrupt triggers the abort; cleared by sftp_parallel_start for the next
+ * fleet (the post-interrupt rebuild).  sftp.c runs one orchestrator at a
+ * time, so a single process-wide flag is faithful.
+ */
+static volatile sig_atomic_t parallel_user_abort_flag;
+
+struct sftp_range_tracker {
+	pthread_mutex_t        mu;         /* serialises decrement + cleanup */
+	int                    total;      /* original range count (immutable
+					    * after new; for diagnostics) */
+	int                    remaining;  /* finalize calls still owed */
+	int                    any_failed; /* sticky: 1 if any range failed */
+	enum sftp_range_target target;
+	char                  *path;       /* local OR remote path of corrupt
+					    * file (xstrdup'd in new) */
+	/* HPN concurrent-writer cap (guarded by mu above): active_writers is
+	 * the in-flight range count for this file; writer_cap is the ceiling.
+	 * Acquired in worker_thread's dispatch gate, released in
+	 * worker_process_result - exactly once per executed unit. */
+	int                    active_writers;
+	int                    writer_cap;
+};
+
+struct sftp_work_unit {
+	enum sftp_op op;
+	char    *src_path;
+	char    *dst_path;
+	off_t    size;
+	mode_t   mode;
+	int      attempt;
+	/* Per-unit resume/verify (whole-file units only - set by the public
+	 * submit entry points).  Carries the originating command's intent
+	 * (reget vs regetv, scp -Z) into the worker, replacing the dormant
+	 * session-global cfg.resume_flag.  Range units never resume; see
+	 * the resume⇒whole-file rule in sftp_parallel_submit_upload. */
+	int      resume;
+	int      verify;
+	/* Phase 5: set to 1 after a bundle wire failure (server refused open,
+	 * mid-stream error).  The worker batch loop refuses to bundle units
+	 * with this flag set and dispatches them through the per-file path
+	 * instead - so a server-side cap rejection (or any other bundle
+	 * wire failure) does not strand the user's files.  Reset only by
+	 * re-creation via make_unit on a fresh submit. */
+	int      bundle_ineligible;
+	/* Range fields: used only for SFTP_OP_UPLOAD_RANGE / DOWNLOAD_RANGE. */
+	off_t    range_offset;
+	off_t    range_length;
+	/* Shared across all range units of one file.  NULL for non-range
+	 * units.  See struct sftp_range_tracker above. */
+	struct sftp_range_tracker *range_tracker;
+};
+
+struct sftp_worker {
+	int                id;
+	pthread_t          tid;
+	struct sftp_parallel *parent;
+
+	pid_t              ssh_pid;
+	int                fd_in;
+	int                fd_out;
+	struct sftp_conn  *conn;
+
+	/* Per-worker progress (mutex-protected for portability across
+	 * platforms where 64-bit reads are not naturally atomic). The
+	 * reporter snapshots all workers under their respective mutexes;
+	 * workers update their own. Contention is negligible - the worker
+	 * holds the lock only while bumping counters. */
+	pthread_mutex_t    mu;
+	uint64_t           bytes_total;
+	volatile uint64_t  live_bytes;        /* incremental bytes for current
+					       * in-progress file; reset to 0
+					       * when file completes */
+	volatile int       phase;             /* enum worker_phase; relaxed
+					       * atomic, reporter reads for the
+					       * HPN_BUNDLE_TIMING FLEETSAMPLE */
+	uint64_t           units_started;     /* dispatched, may be in flight */
+	uint64_t           units_completed;
+	uint64_t           units_failed;
+	uint64_t           reconnect_count;
+	uint64_t           last_completion_ns; /* monotonic ns of last finish */
+
+	/*
+	 * Per-worker respawn timing - observability only, no gating decision
+	 * is made on these.  Respawn limits today are session-wide (see the
+	 * comment block at the respawn dispatch site).  These fields exist
+	 * so post-mortem forensics on a stats CSV can answer "which worker
+	 * respawned and when," which we wanted while debugging the 2026-05-30
+	 * br008 Pattern 2 wedges.  Set under w->mu at the same site as
+	 * reconnect_count++.  Zero values mean "never respawned this session."
+	 *
+	 * If we ever discover one persistently-bad worker is starving healthy
+	 * workers of the session's respawn budget, the right answer is a
+	 * per-worker time-windowed thrash detector (sliding window, cooldown
+	 * on burst) - see the design discussion at the respawn dispatch site.
+	 * Until then these are read-only stats fields.
+	 */
+	uint64_t           first_reconnect_ns;  /* ns of this worker's first respawn */
+	uint64_t           last_reconnect_ns;   /* ns of this worker's most recent respawn */
+
+	/* Adaptive throughput-based stall detection state.  See
+	 * cfg.tput_path_healthy_kbps in sftp-parallel.h for the algorithm.
+	 * Updated at each watchdog tick. */
+	/*
+	 * Bytes-based progress signal for the watchdog.  last_progress_ns is
+	 * updated by the watchdog every tick that (bytes_total + live_bytes)
+	 * increases; the silence threshold (STALL/DEAD) is measured against
+	 * this timestamp rather than against last_completion_ns.  Lets us
+	 * detect actually-stalled workers without misfiring on long-running
+	 * units (a whole-file upload of a multi-GiB file may run for minutes
+	 * without a completion event, but live_bytes climbs throughout).
+	 *
+	 * Only touched by the reporter/watchdog thread - no locking needed.
+	 */
+	uint64_t           last_progress_ns;
+	uint64_t           last_progress_bytes;
+
+	uint64_t           tput_check_bytes;     /* bytes_total at last check */
+	uint64_t           tput_check_ns;        /* monotime of last check */
+	uint64_t           tput_current_kbps;    /* most recent raw estimate */
+	uint64_t           tput_ema_kbps;        /* EMA-smoothed estimate */
+	int                tput_ema_warmup_ticks; /* ticks since EMA cold-start */
+	int                tput_outlier_ticks;   /* consecutive outlier ticks */
+	int                tput_below_floor_ticks; /* consecutive ticks where
+	                                          * EMA < BORN_SLOW_FLOOR_FRAC ×
+	                                          * cfg.tput_path_healthy_kbps;
+	                                          * drives born-slow fast-kill */
+	uint64_t           tput_last_unit_start_ns; /* unit_start_ns at last tick;
+	                                         * used to detect new-unit starts
+	                                         * and reset EMA so stale frozen
+	                                         * values don't suppress outlier
+	                                         * detection on the new unit */
+
+	uint64_t           idle_ns;            /* ns blocked on workqueue pop,
+					        * for completed pops only */
+	uint64_t           work_ns;            /* ns actively processing */
+	/* Set to monotime_ns() immediately before each blocking pop call,
+	 * cleared to 0 immediately after.  The reporter adds (now -
+	 * pop_start_ns) to idle_ns when computing idle fraction so that
+	 * an in-progress blocking wait is included even though the pop has
+	 * not yet returned.  Written/read with relaxed atomics - a brief
+	 * race between clearing and the accounting update causes at most
+	 * a single-tick undercount, which is harmless for a 35% threshold. */
+	uint64_t           pop_start_ns;
+	/* Set to monotime_ns() when a unit is popped off the workqueue
+	 * (after pop_start_ns is cleared), reset to 0 when the unit's
+	 * execute_unit returns.  Lets the watchdog measure how long the
+	 * worker has been holding its current unit even when
+	 * last_completion_ns is still 0 (worker wedged on its very first
+	 * unit - last_completion_ns never gets set, so the existing
+	 * since_completion_ns gate misses this case).  Atomic ACQUIRE/
+	 * RELEASE so the reporter sees a coherent value. */
+	uint64_t           unit_start_ns;
+	/* -- Worker state lattice ----------------------------------------
+	 *
+	 * Three orthogonal state machines.  Each flag below tracks ONE of
+	 * them; the combinations encode the full worker lifecycle.
+	 *
+	 * (A) Liveness classification (watchdog-owned, watchdog-written):
+	 *       HEALTHY -→ STALLED -→ DEAD
+	 *     De-escalation (DEAD → HEALTHY) never happens; once the
+	 *     watchdog declares DEAD, that worker is doomed and reaped.
+	 *     Set by reporter under workers_mu; mostly diagnostic.
+	 *
+	 * (B) Doom progression (watchdog-owned):
+	 *       not_doomed -→ doomed (SIGTERM sent) -→ [SIGKILL escalation
+	 *                                                if not yet exited]
+	 *     The `doomed` flag prevents double-SIGTERM across ticks.
+	 *     `doom_ns` is the SIGTERM timestamp, consulted by the
+	 *     SIGKILL-escalation deadline.
+	 *
+	 * (C) Exit lifecycle (worker-owned):
+	 *       alive -→ exited
+	 *     Set by the worker thread itself just before pthread_exit;
+	 *     read by reporter for pthread_join + reap.  Every reap is
+	 *     followed by a respawn - there is no "voluntary exit" path
+	 *     in the current codebase.
+	 *
+	 * Valid combinations:
+	 *   (HEALTHY,  ¬doomed, ¬exited)            - normal running
+	 *   (STALLED,  ¬doomed, ¬exited)            - silent but not killed
+	 *   (DEAD,      doomed, ¬exited)            - SIGTERMed, awaiting
+	 *                                             thread exit
+	 *   (DEAD,      doomed,  exited)            - ready to reap + respawn
+	 *
+	 * Brief race window after the watchdog's transition: (DEAD,
+	 * ¬doomed, ¬exited) holds for a few lines until SIGTERM is sent;
+	 * no other thread observes it (the transition + SIGTERM happen in
+	 * the same workers_mu critical section).
+	 */
+	enum worker_health health;             /* (A) HEALTHY/STALLED/DEAD;
+						* set by reporter, read for
+						* logging + transition gating */
+
+	int                started;
+	int                exited;             /* (C) set by worker on
+						* self-exit; read by reporter
+						* for reaping */
+	int                doomed;             /* (B) set by watchdog before
+						* SIGTERM; prevents double-kill */
+	const char        *doom_reason;        /* (B) which watchdog path doomed
+						* it (born_dead/isolation/stall/
+						* dead/tput_outlier/born_slow);
+						* emitted in the reap trace */
+	uint64_t           doom_ns;            /* (B) monotonic ns when
+						* SIGTERM was sent; consulted by
+						* SIGKILL-escalation deadline when
+						* SSH hangs in its clean-shutdown
+						* path (worker thread otherwise
+						* blocks on unresponsive pipes
+						* forever) */
+
+	/* -- Phase 4 gap 1: pipelined-batch state --------------------
+	 * The previous batch's phase-5 (CLOSE-collection) is deferred
+	 * across the call to sftp_upload_batch_send for the NEXT batch.
+	 * These fields hold the carry-over state.  Set during a
+	 * pipelined send call, cleared by worker_drain_pipeline().
+	 * All NULL/0 means "no deferred batch in flight." */
+	struct sftp_upload_batch_pending *batch_prev_pending;
+	struct sftp_work_unit           **batch_prev_units;
+	struct sftp_upload_batch_entry   *batch_prev_entries;
+	int                               batch_prev_n;
+	int                               batch_pipe_disabled; /* per-worker
+	                                                        * HPN_NO_BATCH_PIPELINE */
+
+	/* -- Phase 5: bundle-mode state (hpn-bundle@hpnssh.org) -----
+	 * bundle_enabled is set once at worker startup when
+	 *   ssh_config HPNUseBundle yes (the default) AND
+	 *   sftp_conn_has_hpn_bundle(w->conn) is true.
+	 * When set, the worker collects upload batches to bundle_target_bytes
+	 * and dispatches them via sftp_hpn_bundle_upload instead of
+	 * sftp_upload_batch / sftp_upload_batch_send.  No interaction with
+	 * the pipelined-batch state above - bundle and pipelined paths are
+	 * mutually exclusive per worker. */
+	int      bundle_enabled;
+	uint64_t bundle_target_bytes;
+};
+
+/*
+ * Bounded thread-safe string list.  Append-only with a hard cap; the
+ * `total` counter keeps growing past the cap so callers can report
+ * "showing first N of TOTAL".  Drain transfers ownership of the held
+ * strings to the caller.
+ *
+ * Failures (and other rare events we accumulate) are infrequent enough
+ * that the per-append mutex acquire is uncontended in practice.  The
+ * cap bounds memory on pathological inputs (e.g. a permission-denied
+ * walk over a 100k-file tree) without losing the overall count.
+ *
+ * Generic shape so future "things-the-user-needs-to-see" accumulators
+ * can reuse it without inventing a parallel struct.
+ */
+struct hpn_strlist {
+	pthread_mutex_t  mu;
+	char           **items;     /* xstrdup'd entries; NULL until init */
+	size_t           used;      /* entries actually held */
+	size_t           cap;       /* array capacity */
+	uint64_t         total;     /* total appends seen (may exceed cap) */
+};
+
+struct sftp_parallel {
+	struct sftp_parallel_config cfg;
+	char                        cfg_port_buf[16]; /* owns cfg.port string */
+	struct sftp_workqueue      *q;
+
+	/* Workers held as an array of pointers so add/remove can mutate
+	 * the array without invalidating pointers held by worker threads
+	 * via w->parent->workers[...]. workers_mu serializes structural
+	 * changes (add/remove/reap); the per-worker mu still serializes
+	 * counter updates. Lock ordering: workers_mu BEFORE w->mu. */
+	pthread_mutex_t             workers_mu;
+	struct sftp_worker        **workers;
+	int                         num_workers;
+	int                         workers_cap;
+	int                         next_worker_id;
+	int                         pending_respawns; /* detached respawn threads
+						       * not yet in workers[];
+						       * guards premature abort */
+	int                         total_respawns;  /* lifetime respawn count */
+	uint64_t                    death_ordinal;	/* Nth involuntary worker
+						 * loss this transfer; numbers
+						 * the user-facing heartbeat
+						 * so it matches the summary
+						 * count (reporter thread
+						 * only) */
+	int                         wedge_terminations;	/* workers reaped with
+							 * HPN_EXIT_TCP_WEDGE */
+	int                         peer_stall_terminations; /* ditto, PEER_STALL */
+	int                         endgame_straggler_reaps; /* endgame stuck-
+							 * straggler reaps (orchestrator-doomed) */
+	int                         endgame_split_fired; /* one-shot gate for the
+							 * endgame range split;
+							 * set only when a split
+							 * actually happens */
+	uint64_t                    session_start_ns;  /* monotime_ns() at
+						       * sftp_parallel_start;
+						       * elapsed surfaced in
+						       * stats for the
+						       * end-of-transfer
+						       * summary */
+	int                         respawn_epoch_count;   /* respawns in current
+							    * epoch; reset when a
+							    * cooldown ends */
+	time_t                      respawn_cooldown_dur_s; /* escalating cooldown
+							    * level in SECONDS; lazy-
+							    * init to BASE, x2 per
+							    * burst (cap CAP), decays
+							    * /2 per DECAY_SEC of
+							    * sustained health */
+	time_t                      respawn_healthy_since_s; /* monotime() seconds
+							    * when the current
+							    * sustained-healthy streak
+							    * began; 0 = unhealthy */
+	time_t                      respawn_decay_anchor_s; /* last second the level
+							    * was decayed (or the
+							    * health streak began) */
+	int                         peer_stall_window[PEER_STALL_WINDOW]; /* per-
+							    * slow-tick deltas of
+							    * peer-stall deaths */
+	int                         peer_stall_window_pos; /* rolling index */
+	int                         peer_stall_prev_sample; /* peer_stall_
+							    * terminations at the
+							    * previous slow-tick */
+	time_t                      respawn_resume_s;  /* monotime() seconds when
+							* cooldown ends; 0 = not
+							* in cooldown */
+	uint64_t                    tput_last_raw_max_kbps;  /* freshest raw max
+							       * from watchdog; used
+							       * by throughput gate */
+	int                         respawn_owed;  /* involuntary deaths reaped
+						    * but not yet replaced; carries
+						    * across cooldowns + pthread
+						    * failures so a long-lived
+						    * transfer doesn't drift below
+						    * num_streams over time */
+	int                         protocol_violations; /* under workers_mu;
+						       * abort if any non-zero;
+						       * exposed via stats for
+						       * post-mortem inspection */
+
+	/* Files the walker dropped before they could become work units
+	 * (stat() failed, symlink resolution failed, etc.).  These are NOT
+	 * worker failures - they happen on the main thread inside the
+	 * recursive walkers (sftp-parallel-walk.c) - so they aren't
+	 * captured by per-worker units_failed.  parallel_flush surfaces
+	 * this so the user can't mistake a non-zero walker-loss for a
+	 * clean transfer.  Bumped via __atomic_fetch_add from any thread.
+	 */
+	uint64_t                    walker_failures;
+
+	/* enum sftp_walker_phase; relaxed atomic, set by the walker via
+	 * sftp_parallel_set_walker_phase, read by the reporter FLEETSAMPLE. */
+	volatile int                walker_phase;
+
+	/* Bounded list of paths that could not be delivered, populated at
+	 * every give-up site (worker MAX_RETRIES, workqueue push-fail,
+	 * walker skip-on-error).  Surfaced inline in parallel_flush's
+	 * TRANSFER INCOMPLETE message so users don't have to grep a
+	 * potentially huge log for per-file errors.  Uses the reusable
+	 * hpn_strlist below - same shape for any future "things-the-user-
+	 * needs-to-see" accumulation across threads. */
+	struct hpn_strlist          failed_paths;
+
+	/* HPNVerifyTransfer: files whose post-transfer XXH3 hash did NOT
+	 * match the source.  The transfer is NOT aborted on a mismatch; the
+	 * path is recorded here (thread-safe append from workers) and the
+	 * end-of-transfer summary prints them.  A non-empty list makes
+	 * hpnsftp exit SFTP_EX_VERIFY_FAILED. */
+	struct hpn_strlist          verify_failed_paths;
+
+	pthread_t                   reporter_tid;
+	int                         reporter_started;
+
+	/* Pending counter for sftp_parallel_wait. */
+	pthread_mutex_t             pending_mu;
+	pthread_cond_t              pending_cv;
+	uint64_t                    pending;
+
+	/*
+	 * Sum of u->size across units currently in the workqueue (waiting to
+	 * be popped - does NOT include in-flight work being processed by a
+	 * worker).  Updated atomically by submit/pop sites.  Brief overcounts
+	 * are possible during the gap between increment and queue push (or
+	 * decrement and queue pop), but never undercounts - the order of
+	 * operations ensures the counter leads the queue state.
+	 *
+	 * The watchdog uses this to distinguish "worker stalled with work
+	 * pending" from "worker idle, queue empty."
+	 */
+	volatile uint64_t           queued_bytes;
+
+	/*
+	 * Bytes carried by workers that have exited (fault / shutdown).
+	 * snapshot_workers iterates only the live workers[] array, so an
+	 * exiting worker would otherwise erase its bytes_total from the
+	 * aggregate.  Captured under workers_mu just before the worker is
+	 * removed from the array; read by snapshot_workers under the same
+	 * lock.  Keeps aggregate_bytes_for_meter monotonic.
+	 */
+	/* ssh child PIDs of IN-FLIGHT spawn attempts (registered between fork
+	 * and sftp_init completion), so abort/stop can SIGTERM them instead
+	 * of waiting out a full connect timeout - the unbounded wait held the
+	 * user's exit hostage for minutes on a slow/penalizing server.
+	 * Guarded by workers_mu. */
+	pid_t                       spawning_pids[SFTP_PARALLEL_MAX_WORKERS];
+	int                         n_spawning;
+
+	uint64_t                    retired_bytes;
+	/* Companions to retired_bytes: counters that previously DIED with the
+	 * reaped worker struct, silently undercounting every post-respawn
+	 * aggregate (end-of-transfer report, failure counts).  Accumulated at
+	 * the same reap site, added back in sftp_parallel_get_stats. */
+	uint64_t                    retired_wired;
+	uint64_t                    retired_units_completed;
+	uint64_t                    retired_units_failed;
+
+	/*
+	 * Cached result of sftp_fs_info() on the destination filesystem.
+	 * Without caching, the walker queries fs-info synchronously on the
+	 * control connection for every large file - at high RTT this stalls
+	 * the walker and prevents queued_bytes from rising fast enough for
+	 * the scale-up trigger to fire while there is still work to do.
+	 * Updated by submit_upload_maybe_split on the first invocation; read by
+	 * subsequent invocations.  Single-threaded access (the walker is the
+	 * only caller path that uses this).
+	 */
+	int                         fs_info_cached;
+	struct sftp_fs_info         fs_info_cache;
+
+	/* Set by sftp_parallel_abort, read by workers between units. */
+	volatile sig_atomic_t       abort_flag;
+
+	/* Abort CAUSE: 1 when the abort came from the user's interrupt
+	 * (Ctrl-C via ext_interrupt_flag) rather than a fleet failure.
+	 * Read by the interrupt-aware messaging - a user who hit Ctrl-C
+	 * gets one calm summary instead of error theater. */
+	volatile sig_atomic_t       abort_user;
+
+	/* Optional pointer to caller's interrupt flag (e.g. sftp.c's
+	 * `interrupted`).  When non-NULL, the reporter thread calls
+	 * sftp_parallel_abort() as soon as *ext_interrupt_flag becomes
+	 * non-zero, which wakes sftp_parallel_wait() within one reporter
+	 * tick (~200ms) rather than waiting for workers to finish naturally. */
+	volatile sig_atomic_t      *ext_interrupt_flag;
+
+	/*
+	 * App-layer RTT measured on the control connection at startup
+	 * (microseconds; 0 = not measured).  Used to size the per-worker
+	 * outlier-detection warmup so newly-respawned workers in TCP
+	 * slow-start aren't killed before their cwnd has had ~RAMP_RTTS
+	 * round-trips to ramp.  Set once via sftp_parallel_set_path_rtt;
+	 * read by the reporter thread.
+	 */
+	uint64_t                    path_rtt_us;
+
+	int                         saved_showprogress;
+	int                         progress_meter_started;
+	uint64_t                    aggregate_bytes_for_meter;
+	uint64_t                    progress_bytes_baseline;    /* bytes already
+								   * done when meter
+								   * started; delta
+								   * gives this-xfer */
+	off_t                       aggregate_progress_counter; /* meter ctr */
+	char                        progress_label[128];        /* stable storage
+								   * for the meter
+								   * label string */
+
+	int                         started;
+	int                         stopped;
+
+	/*
+	 * Synchronous-stall detector state.  Touched only by the reporter's
+	 * slow-tick path (no lock needed).
+	 */
+	uint32_t sync_stall_ticks;      /* stall slow-ticks in current window */
+	uint32_t sync_stall_window_pos; /* slow-ticks elapsed in current window */
+	uint64_t sync_stall_prev_bytes; /* aggregate bytes at previous slow-tick */
+
+	/* Operator flare episode tracking (reporter_flare).  See FLARE_*. */
+	int      flare_in_episode;       /* currently inside a degraded episode */
+	time_t   flare_episode_start_s;  /* monotime() when it opened */
+	time_t   flare_last_reminder_s;  /* last periodic reminder emitted */
+	time_t   flare_reminder_interval_s; /* current reminder gap; x2 per
+	                                  * reminder, capped, reset per episode */
+	int      born_slow_accepting;    /* slow workers accepted (born-slow gated
+	                                  * off) this watchdog tick; reset each
+	                                  * pass, read by reporter_flare */
+
+	/*
+	 * Fleet abort (see the FLEET_ABORT_* comment): give up on the whole
+	 * transfer only when no worker is alive and the fleet cannot reconnect -
+	 * never while one worker is still moving data or heart-beating.  Fires
+	 * only when ALL hold: zero aggregate progress for noprogress_abort_s,
+	 * no worker watchdog-paused, unproductive_deaths >= FLEET_ABORT_UNPRODUCTIVE_MULT
+	 * * num_streams, and units pending.  HPN_NOPROGRESS_ABORT_SEC overrides the
+	 * window; 0 disables the abort entirely.
+	 */
+	int      noprogress_abort_s;     /* zero-progress window (s); 0 = abort off */
+	int      noprogress_consec_ticks;/* consecutive whole-fleet zero-progress ticks */
+	int      unproductive_deaths;    /* consecutive worker deaths that produced 0
+	                                  * lifetime bytes; reset on any fleet progress
+	                                  * or heartbeat (a sign of life) */
+	int      last_worker_exit_code;  /* last reaped worker's exit code, -1 if
+	                                  * signaled/unknown; for the abort message */
+	int      born_dead_sec;          /* 0-bytes kill threshold; RTT-derived in
+	                                  * sftp_parallel_set_path_rtt */
+
+	/* Optional per-worker stats CSV (enabled via HPN_WORKER_STATS_CSV env).
+	 * Opened lazily by the reporter on first tick; closed at orchestrator
+	 * stop.  Touched only by the reporter thread. */
+	FILE    *stats_csv;
+	uint64_t stats_csv_start_ns;
+};
+
+#endif /* SFTP_PARALLEL_INTERNAL_H */
