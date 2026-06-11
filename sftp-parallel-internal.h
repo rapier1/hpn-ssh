@@ -584,7 +584,7 @@ struct sftp_range_tracker {
 					    * file (xstrdup'd in new) */
 	/* HPN concurrent-writer cap (guarded by mu above): active_writers is
 	 * the in-flight range count for this file; writer_cap is the ceiling.
-	 * Acquired in worker_thread's dispatch gate, released in
+	 * Acquired in parallel_worker_thread's dispatch gate, released in
 	 * worker_process_result - exactly once per executed unit. */
 	int                    active_writers;
 	int                    writer_cap;
@@ -1079,5 +1079,32 @@ struct sftp_parallel {
 	FILE    *stats_csv;
 	uint64_t stats_csv_start_ns;
 };
+
+/*
+ * Concurrency limiter for the auth phase: at most max_in_flight workers
+ * hold an unauthenticated SSH connection open simultaneously.  This keeps
+ * us well under the server's MaxStartups limit (default 10:30:100) even
+ * when spawning many workers.  A fixed sleep-based stagger is not used
+ * because the right limit depends on actual handshake duration, which
+ * varies with RTT and any tc-netem delay in effect.
+ */
+struct spawn_ctx {
+	struct sftp_parallel *p;
+	pthread_mutex_t      *auth_mu;
+	pthread_cond_t       *auth_cv;
+	int                  *auth_in_flight;
+	int                  *started;		/* workers that have begun connecting */
+	int                   total;		/* cfg->num_streams */
+	int                   max_in_flight;
+	int                   succeeded;
+};
+
+/* sftp-parallel-worker.c export (moves there in a later step) */
+void	*parallel_worker_thread(void *);
+
+/* sftp-parallel-respawn.c - spawn/respawn lifecycle */
+void	 parallel_respawn_teardown_ssh(struct sftp_worker *);
+int	 parallel_respawn_dispatch(struct sftp_parallel *, int);
+void	*parallel_respawn_spawn_thread(void *);
 
 #endif /* SFTP_PARALLEL_INTERNAL_H */
