@@ -694,6 +694,297 @@ sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
 	return 0;
 }
 
+/*
+ * Hash the first 'length' bytes of an already-open local file using
+ * XXH3_64bits (streaming API).  Seeks to offset 0 before reading.
+ * Returns 0 and writes the hash to *hash_out on success, -1 on error.
+ */
+int
+sftp_hpn_xxhash_local_fd(struct sftp_conn *conn, int fd, uint64_t length,
+    uint64_t *hash_out)
+{
+	XXH3_state_t *state;
+	XXH64_hash_t hash;
+	u_char buf[65536];
+	uint64_t remaining = length;
+	ssize_t nread;
+	off_t pos_before;
+
+	pos_before = lseek(fd, 0, SEEK_CUR);
+	debug3_f("local fd=%d length=%llu fd_pos_before=%lld",
+	    fd, (unsigned long long)length, (long long)pos_before);
+
+	if (lseek(fd, 0, SEEK_SET) == -1) {
+		error_f("lseek failed: %s", strerror(errno));
+		return -1;
+	}
+
+	if ((state = XXH3_createState()) == NULL) {
+		error_f("XXH3_createState failed");
+		return -1;
+	}
+	if (XXH3_64bits_reset(state) == XXH_ERROR) {
+		error_f("XXH3_64bits_reset failed");
+		XXH3_freeState(state);
+		return -1;
+	}
+
+	uint64_t since_refresh = 0;
+
+	while (remaining > 0) {
+		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
+
+		/* Hashing a large file is minutes of byte-silence; a single
+		 * pause window before the call expires mid-hash and the
+		 * watchdog/endgame reaper kills a worker that is working.
+		 * Refresh every 64 MiB hashed (the helper is cheap). */
+		since_refresh += toread;
+		if (conn != NULL && since_refresh >= (64ULL << 20)) {
+			sftp_conn_watchdog_pause(conn,
+			    HPN_HEARTBEAT_REFRESH_SEC);
+			since_refresh = 0;
+		}
+		nread = read(fd, buf, toread);
+		if (nread == 0)
+			break; /* EOF before length bytes */
+		if (nread < 0) {
+			error_f("read failed: %s", strerror(errno));
+			XXH3_freeState(state);
+			(void)lseek(fd, pos_before, SEEK_SET);
+			return -1;
+		}
+		if (XXH3_64bits_update(state, buf, (size_t)nread) == XXH_ERROR) {
+			error_f("XXH3_64bits_update failed");
+			XXH3_freeState(state);
+			(void)lseek(fd, pos_before, SEEK_SET);
+			return -1;
+		}
+		remaining -= (uint64_t)nread;
+	}
+	hash = XXH3_64bits_digest(state);
+	XXH3_freeState(state);
+	*hash_out = (uint64_t)hash;
+	debug3_f("local hash of first %llu bytes: %016llx",
+	    (unsigned long long)length, (unsigned long long)*hash_out);
+	if (lseek(fd, pos_before, SEEK_SET) == -1)
+		error_f("lseek restore failed: %s", strerror(errno));
+	return 0;
+}
+
+/*
+ * Request that the sender's sftp-server compute a XXH3_64bits hash of the
+ * first 'length' bytes of 'path' using the hpn-check-file@hpnssh.org
+ * extension.  Returns 0 and writes the hash value to *hash_out on success,
+ * or -1 if the extension is unavailable or an error occurred.
+ */
+int
+sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
+    uint64_t length, uint32_t flags, uint64_t *hash_out)
+{
+	struct sshbuf *msg;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	u_int id, rid;
+	u_char type;
+	int r;
+
+	if (!sftp_conn_has_hpn_check_file(conn)) {
+		debug_f("server does not support hpn-check-file extension");
+		return -1;
+	}
+
+	id = sftp_conn_alloc_msg_id(conn);
+	debug3_f("sending hpn-check-file for \"%s\" length=%llu flags=0x%x id=%u",
+	    path, (unsigned long long)length, flags, id);
+	sshbuf_reset(msg);
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, "hpn-check-file@hpnssh.org")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
+	    (r = sshbuf_put_u64(msg, length)) != 0 ||
+	    (r = sshbuf_put_u32(msg, flags)) != 0)
+		fatal_fr(r, "compose");
+	send_msg(conn, msg);
+
+	/*
+	 * Initial watchdog grace covers worker time spent here before the
+	 * first server heartbeat lands.  Each heartbeat received below
+	 * refreshes the pause for another HPN_HEARTBEAT_REFRESH_SEC, so the
+	 * orchestrator never kills us while the server is making forward
+	 * progress.  See sftp-hpn-server.h for the protocol.
+	 */
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+
+	/* Heartbeats renew the lease (liveness) but carry a progress
+	 * figure precisely because liveness is not enough: a stalled
+	 * backend can heartbeat forever.  No advance for the threshold
+	 * means the connection is treated as failed. */
+	uint64_t hb_prog_last = 0;
+	time_t hb_advance_sec = monotime();
+
+	for (;;) {
+		if (get_msg(conn, msg) != 0) {
+			sftp_conn_watchdog_resume(conn);
+			sshbuf_free(msg);
+		return -1;
+		}
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &rid)) != 0)
+			fatal_fr(r, "parse");
+		debug3_f("got response type=%u rid=%u (expected id=%u)",
+		    type, rid, id);
+		if (rid != id) {
+			/* Was fatal("ID mismatch (%u != %u)", rid, id); -
+			 * would crash the entire orchestrator if this
+			 * worker is one of N in a parallel-streams
+			 * transfer.  Mark the connection dead and let the
+			 * caller's resume / verify path observe -1. */
+			sftp_conn_die(conn,
+			    "hpn-check-file ID mismatch (%u != %u)",
+			    rid, id);
+			sftp_conn_watchdog_resume(conn);
+			sshbuf_free(msg);
+		return -1;
+		}
+
+		if (type == SSH2_FXP_STATUS) {
+			u_int status;
+			char *errmsg = NULL;
+
+			if ((r = sshbuf_get_u32(msg, &status)) != 0)
+				fatal_fr(r, "parse status");
+			/* consume error-message and language-tag to leave
+			 * msg clean */
+			(void)sshbuf_get_cstring(msg, &errmsg, NULL);
+			(void)sshbuf_get_cstring(msg, NULL, NULL);
+			error("hpn-check-file \"%s\": %s", path,
+			    (errmsg != NULL && *errmsg != '\0')
+			    ? errmsg : fx2txt(status));
+			debug3_f("server returned status %u for \"%s\"",
+			    status, path);
+			free(errmsg);
+			sftp_conn_watchdog_resume(conn);
+			sshbuf_free(msg);
+		return -1;
+		} else if (type != SSH2_FXP_EXTENDED_REPLY) {
+			/* Was fatal("Expected SSH2_FXP_EXTENDED_REPLY ...");
+			 * - would crash the entire orchestrator if this
+			 * worker is one of N in a parallel-streams
+			 * transfer.  Mark the connection dead and let the
+			 * caller's resume / verify path observe -1. */
+			sftp_conn_die(conn,
+			    "hpn-check-file: expected "
+			    "SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
+			    SSH2_FXP_EXTENDED_REPLY, type);
+			sftp_conn_watchdog_resume(conn);
+			sshbuf_free(msg);
+		return -1;
+		}
+
+		if ((r = sshbuf_get_u64(msg, hash_out)) != 0)
+			fatal_fr(r, "parse hash");
+
+		/*
+		 * Heartbeat reply: refresh the watchdog pause and wait for
+		 * the next message.  Real hash values never collide with
+		 * the sentinel (probability 1/2^64).
+		 */
+		if (*hash_out == HPN_HASH_CHECK_FILE_HEARTBEAT) {
+			uint64_t hb_prog = 0;
+			time_t hb_now = monotime();
+
+			if ((r = sshbuf_get_u64(msg, &hb_prog)) != 0)
+				hb_prog = hb_prog_last; /* treat as no advance */
+			debug3_f("hpn-check-file heartbeat for \"%s\" id=%u "
+			    "progress=%llu", path, id,
+			    (unsigned long long)hb_prog);
+			if (hb_prog > hb_prog_last) {
+				hb_prog_last = hb_prog;
+				hb_advance_sec = hb_now;
+			} else if (hb_now - hb_advance_sec >=
+			    (time_t)HPN_VERIFY_PROGRESS_STALL_SEC) {
+				sftp_conn_die(conn, "hpn-check-file \"%s\": "
+				    "server hash made no progress for %d "
+				    "seconds (stalled backend); treating "
+				    "connection as failed",
+				    path, (int)HPN_VERIFY_PROGRESS_STALL_SEC);
+				sftp_conn_watchdog_resume(conn);
+				sshbuf_free(msg);
+		return -1;
+			}
+			sftp_conn_watchdog_pause(conn,
+			    HPN_HEARTBEAT_REFRESH_SEC);
+			continue;
+		}
+
+		debug3_f("remote hash of \"%s\" first %llu bytes: %016llx",
+		    path, (unsigned long long)length,
+		    (unsigned long long)*hash_out);
+		sftp_conn_watchdog_resume(conn);
+		sshbuf_free(msg);
+		return 0;
+	}
+}
+
+/*
+ * Post-transfer integrity check (HPNVerifyTransfer): XXH3 the full local
+ * file and the full remote file and compare.  Used by both single-stream
+ * (sftp/scp) and parallel paths to confirm a completed transfer matches
+ * end-to-end - catches client/server disk corruption, range-offset bugs,
+ * and crash-resume sparse-zero holes that the SSH MAC and size checks miss.
+ *
+ * Returns:
+ *    0  hashes match (transfer verified good)
+ *    1  hashes differ (CORRUPTION - caller warns + exits SFTP_EX_VERIFY_FAILED)
+ *   -1  could not verify (server lacks hpn-check-file, open/hash error) -
+ *       caller should warn that verification was skipped, but this is NOT
+ *       a content-mismatch failure.
+ */
+int
+sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path)
+{
+	int fd, r = -1;
+	struct stat sb;
+	uint64_t local_hash, remote_hash;
+
+	if (!sftp_conn_has_hpn_check_file(conn)) {
+		debug_f("cannot verify \"%s\": server lacks "
+		    "hpn-check-file@hpnssh.org", remote_path);
+		return -1;
+	}
+	if ((fd = open(local_path, O_RDONLY)) == -1) {
+		error("verify: open local \"%s\": %s",
+		    local_path, strerror(errno));
+		return -1;
+	}
+	if (fstat(fd, &sb) == -1) {
+		error("verify: fstat local \"%s\": %s",
+		    local_path, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	/*
+	 * Post-transfer integrity check: ALWAYS require the real XXH3, no
+	 * sparse-skip trust shortcut.  The purpose of this function is to
+	 * verify what actually transferred, not to trust allocation
+	 * metadata.  Pass HPN_CHECK_FILE_STRICT unconditionally.
+	 */
+	if (sftp_hpn_xxhash_local_fd(conn, fd, (uint64_t)sb.st_size,
+	    &local_hash) == 0 &&
+	    sftp_hpn_hash_remote_file(conn, remote_path, (uint64_t)sb.st_size,
+	    HPN_CHECK_FILE_STRICT, &remote_hash) == 0)
+		r = (local_hash == remote_hash) ? 0 : 1;
+	sftp_conn_watchdog_resume(conn);
+	close(fd);
+	debug3_f("verify \"%s\": local=%016llx remote=%016llx result=%d",
+	    remote_path, (unsigned long long)local_hash,
+	    (unsigned long long)remote_hash, r);
+	return r;
+}
+
 int
 sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
     const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out)

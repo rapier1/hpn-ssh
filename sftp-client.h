@@ -227,8 +227,6 @@ int sftp_upload(struct sftp_conn *, const char *, const char *,
  * remote file and compare.  Returns 0 = match, 1 = mismatch (corruption),
  * -1 = could not verify (server lacks hpn-check-file or I/O error).
  */
-int sftp_verify_transfer(struct sftp_conn *, const char *local_path,
-    const char *remote_path);
 
 /*
  * Per-file descriptor for sftp_upload_batch.  Caller fills local_path and

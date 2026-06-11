@@ -944,7 +944,7 @@ static void
 verify_one(struct sftp_conn *conn, const char *local_path,
     const char *remote_path)
 {
-	int r = sftp_verify_transfer(conn, local_path, remote_path);
+	int r = sftp_hpn_verify_transfer(conn, local_path, remote_path);
 
 	if (r == 0) {
 		debug("verify: \"%s\" OK", remote_path);

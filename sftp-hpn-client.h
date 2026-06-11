@@ -388,6 +388,10 @@ void sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn);
  * Returns 0 on success and writes the hash to *hash_out; -1 on any I/O
  * or hash-state error.
  */
+int sftp_hpn_xxhash_local_fd(struct sftp_conn *, int, uint64_t, uint64_t *);
+int sftp_hpn_hash_remote_file(struct sftp_conn *, const char *, uint64_t,
+    uint32_t, uint64_t *);
+int sftp_hpn_verify_transfer(struct sftp_conn *, const char *, const char *);
 int sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
     u_int64_t *hash_out);
 

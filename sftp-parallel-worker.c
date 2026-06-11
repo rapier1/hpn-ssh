@@ -109,7 +109,7 @@ parallel_verify_one(struct sftp_worker *w, const char *local_path,
     const char *remote_path)
 {
 	struct sftp_parallel *p = w->parent;
-	int r = sftp_verify_transfer(w->conn, local_path, remote_path);
+	int r = sftp_hpn_verify_transfer(w->conn, local_path, remote_path);
 
 	if (r == 0)
 		return;	/* verified good */
