@@ -797,8 +797,18 @@ sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
 void
 sftp_parallel_progress_stop(struct sftp_parallel *p)
 {
+	uint64_t bytes = 0;
+
 	if (p == NULL || !p->progress_meter_started)
 		return;
+	/* The reporter advances the aggregate counter only on its tick, so
+	 * a transfer's final bytes land between ticks and the meter's
+	 * forced last refresh paints a stale 99%.  Snapshot once more here
+	 * so stop_progress_meter's completion refresh shows true 100%. */
+	parallel_stats_snapshot(p, &bytes, NULL, NULL);
+	if (bytes >= p->progress_bytes_baseline)
+		p->aggregate_progress_counter =
+		    (off_t)(bytes - p->progress_bytes_baseline);
 	p->progress_meter_started = 0;
 	stop_progress_meter();
 }

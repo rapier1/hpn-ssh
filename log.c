@@ -62,6 +62,18 @@
 static LogLevel log_level = SYSLOG_LEVEL_INFO;
 static int log_on_stderr = 1;
 static int log_stderr_fd = STDERR_FILENO;
+/* HPN: optional guard pair bracketing stderr log writes, registered by
+ * the progress meter so log lines and meter redraws never interleave on
+ * the terminal.  NULL (the default) means no guard. */
+static void (*log_output_guard_enter)(void);
+static void (*log_output_guard_exit)(void);
+
+void
+log_set_output_guard(void (*enter)(void), void (*exit_fn)(void))
+{
+	log_output_guard_enter = enter;
+	log_output_guard_exit = exit_fn;
+}
 static int log_facility = LOG_AUTH;
 static const char *argv0;
 static log_handler_fn *log_handler;
@@ -424,7 +436,16 @@ do_log(LogLevel level, int force, const char *suffix, const char *fmt,
 		    (log_on_stderr > 1) ? progname : "",
 		    (log_on_stderr > 1) ? ": " : "",
 		    (int)sizeof msgbuf - 3, fmtbuf);
+		/* HPN: when a progress meter owns the terminal line, clear
+		 * it first so this message lands whole at column 0 instead
+		 * of appending to (or interleaving with) the meter text.
+		 * No-ops when no guard is registered (sshd links log.c
+		 * without progressmeter.o). */
+		if (log_output_guard_enter != NULL)
+			log_output_guard_enter();
 		(void)write(log_stderr_fd, msgbuf, strlen(msgbuf));
+		if (log_output_guard_exit != NULL)
+			log_output_guard_exit();
 	} else {
 #if defined(HAVE_OPENLOG_R) && defined(SYSLOG_DATA_INIT)
 		openlog_r(progname, LOG_PID, log_facility, &sdata);

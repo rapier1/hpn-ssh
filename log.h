@@ -56,6 +56,8 @@ LogLevel log_level_get(void);
 int      log_change_level(LogLevel);
 int      log_is_on_stderr(void);
 void     log_redirect_stderr_to(const char *);
+/* HPN: progress-meter interleave guard (see progressmeter.c). */
+void	 log_set_output_guard(void (*)(void), void (*)(void));
 void	 log_verbose_add(const char *);
 void	 log_verbose_reset(void);
 

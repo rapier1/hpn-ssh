@@ -31,6 +31,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -66,6 +67,9 @@ static off_t start_pos;		/* initial position of transfer */
 static off_t end_pos;		/* ending position of transfer */
 static off_t cur_pos;		/* transfer position as of last refresh */
 static off_t last_pos;
+/* HPN log/meter interleave guard state (see meter_log_enter below). */
+static pthread_mutex_t meter_mu = PTHREAD_MUTEX_INITIALIZER;
+static int meter_active;
 static off_t max_delta_pos = 0;
 static volatile off_t *counter;	/* progress counter */
 static long stalled;		/* how long we have been stalled */
@@ -258,11 +262,37 @@ refresh_progress_meter(int force_update)
 	asmprintf(&obuf, INT_MAX, &cols, " %s", buf);
 	if (obuf != NULL) {
 		*obuf = '\r'; /* must insert as asmprintf() would escape it */
+		/* HPN: serialise against log output (meter_log_enter) so a
+		 * redraw never interleaves with a log line mid-write. */
+		pthread_mutex_lock(&meter_mu);
 		atomicio(vwrite, STDOUT_FILENO, obuf, strlen(obuf));
+		pthread_mutex_unlock(&meter_mu);
 	}
 	free(buf);
 	free(obuf);
 	last_pos = cur_pos;
+}
+
+/*
+ * HPN log/meter interleave guard.  Registered with log.c whenever a
+ * meter is running: before a log line is written, take the lock and
+ * clear the meter's line so the message lands whole at column 0; the
+ * meter repaints on its next refresh.  Redraws are never driven from
+ * signal context (sig_alarm only sets a flag), so a plain mutex is
+ * safe here.
+ */
+static void
+meter_log_enter(void)
+{
+	pthread_mutex_lock(&meter_mu);
+	if (meter_active)
+		atomicio(vwrite, STDOUT_FILENO, "\r\033[K", 4);
+}
+
+static void
+meter_log_exit(void)
+{
+	pthread_mutex_unlock(&meter_mu);
 }
 
 static void
@@ -284,6 +314,11 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 	stalled = 0;
 	bytes_per_second = 0;
 
+	pthread_mutex_lock(&meter_mu);
+	meter_active = 1;
+	pthread_mutex_unlock(&meter_mu);
+	log_set_output_guard(meter_log_enter, meter_log_exit);
+
 	setscreensize();
 	refresh_progress_meter(1);
 
@@ -296,6 +331,10 @@ void
 stop_progress_meter(void)
 {
 	alarm(0);
+
+	pthread_mutex_lock(&meter_mu);
+	meter_active = 0;
+	pthread_mutex_unlock(&meter_mu);
 
 	if (!can_output())
 		return;
