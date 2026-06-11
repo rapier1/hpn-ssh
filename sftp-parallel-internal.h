@@ -1108,6 +1108,24 @@ void	*parallel_reporter_thread(void *);
 void	 parallel_stats_snapshot(struct sftp_parallel *, uint64_t *,
 	    uint64_t *, uint64_t *);
 
+/* sftp-parallel-unit.c - work units, trackers, pending, submission */
+void	 parallel_unit_free(struct sftp_work_unit *);
+struct sftp_work_unit *parallel_unit_make_range(const char *, const char *,
+	    off_t, off_t, struct sftp_range_tracker *);
+int	 parallel_unit_tracker_finalize(struct sftp_range_tracker *, int,
+	    struct sftp_worker *);
+int	 parallel_unit_writer_acquire(struct sftp_range_tracker *);
+void	 parallel_unit_writer_release(struct sftp_range_tracker *);
+int	 parallel_unit_max_retries(struct sftp_parallel *);
+void	 parallel_unit_pending_trace(const char *, struct sftp_parallel *,
+	    const struct sftp_work_unit *, int, const char *);
+int	 parallel_unit_pending_trace_on(void);
+int	 parallel_unit_submit(struct sftp_parallel *, struct sftp_work_unit *);
+void	 parallel_unit_pending_dec(struct sftp_parallel *);
+void	 parallel_unit_pending_dec_traced(struct sftp_parallel *,
+	    const struct sftp_work_unit *, int, const char *);
+uint64_t parallel_unit_split_min_size(struct sftp_parallel *);
+
 /* sftp-parallel-worker.c export (moves there in a later step) */
 void	*parallel_worker_thread(void *);
 
