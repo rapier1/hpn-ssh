@@ -592,9 +592,22 @@ tcp_health_tick(void)
 	static int ps_waiting = 0;
 	switch (sftp_hpn_classify(&tcp_health, &h)) {
 	case SFTP_HPN_WEDGE_TCP_WEDGE:
-		logit("HPN: worker TCP connection wedged (cwnd=%u rtt=%uus "
-		    "retrans=%llu) - self-terminating", h.raw.snd_cwnd,
-		    h.raw.rtt, (unsigned long long)h.raw.total_retrans);
+		/* The orchestrator announces this event in plain language
+		 * ("worker N: connection wedged, reconnecting"), so the
+		 * transport-side stats line is developer telemetry - debug
+		 * unless a harness asked for it.  The peer-stall / brake /
+		 * path-degraded cases below stay loud: they have no
+		 * orchestrator-side twin. */
+		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+			logit("HPN: worker TCP connection wedged (cwnd=%u "
+			    "rtt=%uus retrans=%llu) - self-terminating",
+			    h.raw.snd_cwnd, h.raw.rtt,
+			    (unsigned long long)h.raw.total_retrans);
+		else
+			debug("HPN: worker TCP connection wedged (cwnd=%u "
+			    "rtt=%uus retrans=%llu) - self-terminating",
+			    h.raw.snd_cwnd, h.raw.rtt,
+			    (unsigned long long)h.raw.total_retrans);
 		cleanup_exit(HPN_EXIT_TCP_WEDGE);
 		break;
 	case SFTP_HPN_WEDGE_PEER_STALL:
@@ -3332,8 +3345,11 @@ cleanup_exit(int i)
 	 * collapsed) from a peer-stall (receive window pinned) at death.
 	 * Only meaningful for parallel workers (health monitor armed).
 	 */
-	if (hpn_have_last_health)
-		logit("HPN transport exit: code=%d last_health_age=%llds "
+	if (hpn_have_last_health) {
+		char hbuf[256];
+
+		snprintf(hbuf, sizeof(hbuf),
+		    "HPN transport exit: code=%d last_health_age=%llds "
 		    "cwnd=%u rtt=%uus rcv_space=%u retrans=%llu notsent=%u "
 		    "rto_time=%u", i,
 		    (long long)(monotime() - hpn_last_health_s),
@@ -3342,6 +3358,18 @@ cleanup_exit(int i)
 		    (unsigned long long)hpn_last_health.raw.total_retrans,
 		    hpn_last_health.raw.notsent_bytes,
 		    hpn_last_health.raw.total_rto_time);
+		/* Developer telemetry: the orchestrator already gives the user
+		 * a single plain-language line per worker death/respawn, so
+		 * the exit stats stay at debug - even for self-diagnosed TCP
+		 * exits (the diagnosis reaches the user via the orchestrator
+		 * heartbeat; the numbers are for developers).  ENV-VAR
+		 * HPN_BUNDLE_TIMING (developer-only) re-promotes it for
+		 * harness runs whose log analysis greps these lines. */
+		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+			logit("%s", hbuf);
+		else
+			debug("%s", hbuf);
+	}
 	leave_raw_mode(options.request_tty == REQUEST_TTY_FORCE);
 	if (options.control_path != NULL && muxserver_sock != -1)
 		unlink(options.control_path);

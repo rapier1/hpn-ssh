@@ -66,6 +66,13 @@ int sftp_workqueue_pop(struct sftp_workqueue *q, void **itemp);
 int sftp_workqueue_trypop(struct sftp_workqueue *q, void **itemp);
 
 /*
+ * Pop remaining items from a SHUT-DOWN queue (trypop refuses once shutdown
+ * is set).  Owner's final drain so undispatched items don't leak; returns
+ * -1 only when the queue is empty.
+ */
+int sftp_workqueue_drain(struct sftp_workqueue *q, void **itemp);
+
+/*
  * Signal shutdown. Wakes every thread currently blocked in push or pop.
  * Subsequent push calls fail immediately; pop calls drain remaining items
  * then fail. Idempotent.

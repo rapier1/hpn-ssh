@@ -168,7 +168,9 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	    small_threshold, &applied, &layout_kind);
 	switch (rc) {
 	case HPN_FILE_LAYOUT_OK:
-		logit("Lustre auto-stripe (experimental): \"%s\" -> %s "
+		/* Success is silent at default verbosity (like the rest of the
+		 * auto-tuning); -v recovers it.  PERM/FAIL below stay loud. */
+		debug("Lustre auto-stripe (experimental): \"%s\" -> %s "
 		    "(stripe_count %u)", dst,
 		    layout_kind ? "tiered composite" : "plain stripe", applied);
 		break;
@@ -258,7 +260,9 @@ maybe_apply_lustre_layout_local(struct sftp_parallel *p,
 	    : lustre_set_stripe_path(dst, (uint32_t)desired, &applied);
 	switch (rc) {
 	case HPN_FILE_LAYOUT_OK:
-		logit("Lustre auto-stripe (experimental): local \"%s\" -> %s "
+		/* Success is silent at default verbosity, mirroring the wire
+		 * variant above; PERM stays loud. */
+		debug("Lustre auto-stripe (experimental): local \"%s\" -> %s "
 		    "(stripe_count %u)", dst,
 		    use_tiered ? "tiered composite" : "plain stripe",
 		    use_tiered ? (uint32_t)desired : applied);
@@ -400,10 +404,20 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			if (sftp_parallel_submit_upload(p, conn, new_src,
 			    new_dst, sb.st_size, sb.st_mode, resume,
 			    verify) != 0) {
-				error("submit \"%s\" -> \"%s\" failed",
-				    new_src, new_dst);
-				sftp_parallel_walker_record_failure(p, new_src,
-				    "submit failed");
+				/* An aborting fleet refuses submissions by
+				 * design; record the honest cause and stay
+				 * quiet - flush prints the interrupt summary. */
+				if (sftp_parallel_is_aborting(p)) {
+					debug("submit \"%s\" refused "
+					    "(abort in progress)", new_src);
+					sftp_parallel_walker_record_failure(p,
+					    new_src, "interrupted");
+				} else {
+					error("submit \"%s\" -> \"%s\" failed",
+					    new_src, new_dst);
+					sftp_parallel_walker_record_failure(p,
+					    new_src, "submit failed");
+				}
 				ret = -1;
 			}
 		} else {
@@ -536,10 +550,19 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			if (sftp_parallel_submit_download(p, conn,
 			    new_src, new_dst, fsize, fmode, resume,
 			    verify) != 0) {
-				error("submit download \"%s\" -> \"%s\" failed",
-				    new_src, new_dst);
-				sftp_parallel_walker_record_failure(p, new_src,
-				    "submit failed");
+				/* Mirror of the upload walker: an aborting
+				 * fleet refuses submissions by design. */
+				if (sftp_parallel_is_aborting(p)) {
+					debug("submit download \"%s\" refused "
+					    "(abort in progress)", new_src);
+					sftp_parallel_walker_record_failure(p,
+					    new_src, "interrupted");
+				} else {
+					error("submit download \"%s\" -> "
+					    "\"%s\" failed", new_src, new_dst);
+					sftp_parallel_walker_record_failure(p,
+					    new_src, "submit failed");
+				}
 				ret = -1;
 			}
 		} else {

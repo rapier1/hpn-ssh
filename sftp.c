@@ -775,8 +775,6 @@ parallel_flush(void)
 		 * via resume" beat so the savings are visible.  No beat is
 		 * emitted for fresh transfers where nothing was skippable.
 		 */
-		double mibps  = wired > 0
-		    ? wired / (1024.0 * 1024.0) / secs : 0.0;
 		uint64_t skipped_b =
 		    pstats.bytes_total_aggregate > pstats.bytes_wired_aggregate
 		    ? pstats.bytes_total_aggregate - pstats.bytes_wired_aggregate
@@ -815,24 +813,42 @@ parallel_flush(void)
 		    (pstats.total_respawns >= respawn_hint_threshold &&
 		     respawn_hint_threshold > 0)
 		    ? " - consider lowering -j" : "";
+		/* No rate figure: elapsed runs from orchestrator start, so
+		 * in an interactive session it includes idle time between
+		 * commands and the average reads artificially low.  Health
+		 * breakdown (wedge/peer-stall) folds in here; only nonzero
+		 * parts are shown.  The old separate "parallel transfer
+		 * health" line said the respawn count twice. */
+		char brk[64] = "";
+		if (pstats.wedge_terminations > 0 &&
+		    pstats.peer_stall_terminations > 0)
+			snprintf(brk, sizeof(brk), " (%d wedge, %d peer-stall)",
+			    pstats.wedge_terminations,
+			    pstats.peer_stall_terminations);
+		else if (pstats.wedge_terminations > 0)
+			snprintf(brk, sizeof(brk), " (%d wedge)",
+			    pstats.wedge_terminations);
+		else if (pstats.peer_stall_terminations > 0)
+			snprintf(brk, sizeof(brk), " (%d peer-stall)",
+			    pstats.peer_stall_terminations);
 		if (pstats.total_respawns > 0) {
-			logit("Parallel streams: %.2f %s transferred in %.1fs "
-			    "(%.0f MiB/s)%s; %d worker respawn%s%s",
-			    wired_val, wired_unit, secs, mibps,
+			logit("Parallel streams: %.2f %s transferred in %.1fs"
+			    "%s; %d worker respawn%s%s%s",
+			    wired_val, wired_unit, secs,
 			    skipped_str,
 			    pstats.total_respawns,
 			    pstats.total_respawns == 1 ? "" : "s",
-			    churn_hint);
+			    brk, churn_hint);
 		} else {
-			logit("Parallel streams: %.2f %s transferred in %.1fs "
-			    "(%.0f MiB/s)%s",
-			    wired_val, wired_unit, secs, mibps, skipped_str);
+			logit("Parallel streams: %.2f %s transferred in %.1fs"
+			    "%s",
+			    wired_val, wired_unit, secs, skipped_str);
 		}
 	}
 
 	if (pstats.total_respawns > 0 || pstats.wedge_terminations > 0 ||
 	    pstats.peer_stall_terminations > 0) {
-		logit("parallel transfer health: %d worker respawn(s) "
+		debug("parallel transfer health: %d worker respawn(s) "
 		    "(%d wedge, %d peer-stall)",
 		    pstats.total_respawns, pstats.wedge_terminations,
 		    pstats.peer_stall_terminations);
@@ -843,31 +859,60 @@ parallel_flush(void)
 		    "this recurs across transfers",
 		    pstats.protocol_violations);
 	}
-	if (pstats.units_failed_aggregate > 0) {
-		error("TRANSFER INCOMPLETE: %llu file(s) could not be "
-		    "delivered after retries",
-		    (unsigned long long)pstats.units_failed_aggregate);
-		rc = -1;
-	}
-	if (pstats.walker_failures_aggregate > 0) {
-		error("TRANSFER INCOMPLETE: %llu file(s) or director(y/ies) "
-		    "were skipped during the directory walk "
-		    "(stat/readdir/symlink errors)",
-		    (unsigned long long)pstats.walker_failures_aggregate);
-		rc = -1;
+	/* A USER interrupt is not an error: the casualties below are
+	 * consequences of the Ctrl-C, so they get one calm summary line
+	 * (what is incomplete + how to resume) instead of error theater,
+	 * and the path inventory drops to debug.  Genuine failures keep
+	 * the loud framing. */
+	int user_int = sftp_parallel_user_abort(parallel_orch);
+
+	if (user_int) {
+		/* Mid-transfer interrupts usually record NO failures - the
+		 * in-flight/queued work is simply abandoned (units_pending) -
+		 * so key the summary on both. */
+		uint64_t n = pstats.units_failed_aggregate +
+		    pstats.walker_failures_aggregate;
+		if (n > 0) {
+			logit("Transfer interrupted: %llu file(s) incomplete; "
+			    "partials left in place (resume with "
+			    "reputv / regetv).", (unsigned long long)n);
+			rc = -1;
+		} else if (pstats.units_pending > 0) {
+			logit("Transfer interrupted; partial file(s) left in "
+			    "place (resume with reputv / regetv).");
+			rc = -1;
+		}
+	} else {
+		if (pstats.units_failed_aggregate > 0) {
+			error("TRANSFER INCOMPLETE: %llu file(s) could not be "
+			    "delivered after retries",
+			    (unsigned long long)pstats.units_failed_aggregate);
+			rc = -1;
+		}
+		if (pstats.walker_failures_aggregate > 0) {
+			error("TRANSFER INCOMPLETE: %llu file(s) or director(y/ies) "
+			    "were skipped during the directory walk "
+			    "(stat/readdir/symlink errors)",
+			    (unsigned long long)pstats.walker_failures_aggregate);
+			rc = -1;
+		}
 	}
 
 	/* Drain the failed-paths list and print it.  This is the
 	 * user-facing inventory of what didn't make it - separate from
 	 * the per-aggregate counts above because a path can show up via
-	 * the worker-failure or walker-failure code path. */
+	 * the worker-failure or walker-failure code path.  Always drained
+	 * (it owns the memory); printed at debug after a user interrupt. */
 	{
 		char  **paths     = NULL;
 		size_t  paths_used = 0;
 		uint64_t total = sftp_parallel_drain_failed_paths(
 		    parallel_orch, &paths, &paths_used);
 		if (total > 0) {
-			if (paths_used >= total) {
+			if (user_int) {
+				debug("  Incomplete paths (%llu total):",
+				    (unsigned long long)total);
+			} else if (paths_used >= total) {
 				error("  Failed paths (%llu total):",
 				    (unsigned long long)total);
 			} else {
@@ -876,7 +921,10 @@ parallel_flush(void)
 				    paths_used, paths_used);
 			}
 			for (size_t i = 0; i < paths_used; i++) {
-				error("    %s", paths[i]);
+				if (user_int)
+					debug("    %s", paths[i]);
+				else
+					error("    %s", paths[i]);
 				free(paths[i]);
 			}
 			free(paths);
@@ -934,6 +982,210 @@ verify_print_summary(void)
 	return verify_fail_count;
 }
 
+/*
+ * Captured launch inputs for the parallel orchestrator, so the fleet can be
+ * re-created after an interrupt tears it down (parallel_orch_ensure_alive).
+ * Filled once in main() before the first launch; the pointers reference
+ * main()'s storage, which lives for the whole session.
+ */
+static struct {
+	char        *host;
+	char        *user;
+	int          port;
+	char        *ssh_program;
+	const char  *identity;
+	const char  *config_file;
+	char       **extra_o;
+	size_t       buflen;
+	size_t       num_requests;
+	long long    limit_kbps;
+	int          debug_level;
+	int          valid;
+} parallel_launch;
+
+/*
+ * Build and start the parallel orchestrator from the captured launch
+ * parameters.  Factored out of main() so the post-interrupt rebuild can call
+ * it again; behaviour is identical to the original inline block.  On failure
+ * leaves parallel_orch NULL and falls back to single-stream mode.
+ */
+static void
+parallel_orch_launch(struct sftp_conn *conn)
+{
+	struct sftp_parallel_config pcfg;
+	char portbuf[16] = "";
+
+	if (!parallel_launch.valid)
+		return;
+	memset(&pcfg, 0, sizeof(pcfg));
+	pcfg.num_streams      = parallel_num_streams;
+	pcfg.host             = parallel_launch.host;
+	pcfg.user             = parallel_launch.user;
+	if (parallel_launch.port > 0) {
+		snprintf(portbuf, sizeof(portbuf), "%d", parallel_launch.port);
+		pcfg.port = portbuf;
+	}
+	pcfg.ssh_binary       = parallel_launch.ssh_program;
+	pcfg.identity         = parallel_launch.identity;
+	pcfg.config_file      = parallel_launch.config_file;
+	pcfg.extra_argv       = parallel_launch.extra_o;
+	pcfg.transfer_buflen  = (unsigned int)parallel_launch.buflen;
+	pcfg.num_requests     = (unsigned int)parallel_launch.num_requests;
+	pcfg.limit_kbps       = parallel_launch.limit_kbps;
+	pcfg.range_split_min_mb = range_split_min_mb_user;
+	pcfg.writers_per_inode_cap = writers_cap_user ?
+	    writers_cap_user : HPN_RANGE_WRITERS_CAP_DEFAULT;
+	pcfg.worker_log_dir     = worker_log_dir;
+	pcfg.verbose_level      = parallel_launch.debug_level;
+	/* Resolve HPNUseBundle and any other ssh_config-derived
+	 * pcfg fields.  Sets pcfg.use_bundle; defaults to 1 (yes)
+	 * if parsing fails or the option isn't set. */
+	(void)sftp_parallel_apply_ssh_config(&pcfg, parallel_launch.host,
+	    parallel_launch.config_file, parallel_launch.extra_o);
+	pcfg.preserve_flag    = global_pflag;
+	pcfg.fsync_flag       = global_fflag;
+	pcfg.print_flag       = quiet ? 0 : 1;
+
+	/*
+	 * Adaptive throughput-outlier stall detection.  On by default
+	 * in parallel mode with conservative settings suited to WAN
+	 * bulk transfer.  Override or disable via env vars:
+	 *
+	 *   SFTP_TPUT_HEALTHY_KBPS=N  override minimum path rate (kbps)
+	 *                             that must be seen before outlier
+	 *                             classification fires; set to 0 to
+	 *                             disable the feature entirely
+	 *   SFTP_TPUT_FRACTION=F      worker is outlier if its kbps
+	 *                             is less than F * max_kbps
+	 *                             (default 0.25)
+	 *   SFTP_TPUT_CONSEC=N        consecutive outlier ticks before
+	 *                             STALLED (default 5); DEAD at 2N
+	 *   SFTP_TPUT_EMA_ALPHA=F     EMA smoothing factor (default 0.2)
+	 */
+	{
+		/* ENV-VAR SFTP_TPUT_HEALTHY_KBPS - developer-only:
+		 * adaptive stall detector path-health floor (kbps).
+		 * Tuning knob for the throughput-outlier detector; not
+		 * meaningful to end users. */
+		const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
+		/* ENV-VAR SFTP_TPUT_FRACTION - developer-only:
+		 * adaptive stall detector outlier fraction (0-1). */
+		const char *e_f = getenv("SFTP_TPUT_FRACTION");
+		/* ENV-VAR SFTP_TPUT_CONSEC - developer-only:
+		 * adaptive stall detector consecutive-tick count. */
+		const char *e_c = getenv("SFTP_TPUT_CONSEC");
+		/* ENV-VAR SFTP_TPUT_EMA_ALPHA - developer-only:
+		 * adaptive stall detector EMA smoothing factor. */
+		const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
+		pcfg.tput_path_healthy_kbps =
+		    (e_h && *e_h) ? strtoull(e_h, NULL, 10) : 2000;
+		pcfg.tput_outlier_fraction =
+		    (e_f && *e_f) ? strtod(e_f, NULL) : 0.25;
+		pcfg.tput_consec_required =
+		    (e_c && *e_c) ? atoi(e_c) : 5;
+		pcfg.tput_ema_alpha =
+		    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
+	}
+
+	if (!quiet)
+		logit("Parallel streams: -j %d",
+		    parallel_num_streams);
+	/* Mirror to debug for batch-mode runs (quiet=1). */
+	debug_f("parallel mode: -j %d defer_parallel_wait=%d",
+	    parallel_num_streams, defer_parallel_wait);
+	if (pcfg.tput_path_healthy_kbps > 0) {
+		double eff_alpha = pcfg.tput_ema_alpha > 0.0
+		    ? pcfg.tput_ema_alpha : 0.2;
+		debug_f("tput-outlier detection: healthy_kbps=%llu "
+		    "frac=%.2f consec=%d ema_alpha=%.2f",
+		    (unsigned long long)pcfg.tput_path_healthy_kbps,
+		    pcfg.tput_outlier_fraction,
+		    pcfg.tput_consec_required,
+		    eff_alpha);
+	}
+	parallel_orch = sftp_parallel_start(&pcfg);
+	if (parallel_orch == NULL) {
+		logit("Parallel-streams setup failed; "
+		    "falling back to single-stream mode.");
+		parallel_num_streams = 1;
+	} else {
+		sftp_parallel_set_interrupt_flag(parallel_orch,
+		    &interrupted);
+
+		/*
+		 * Sample app-layer path RTT on the control connection.
+		 * sftp_realpath does one SSH2_FXP_REALPATH round trip,
+		 * which is the cheapest small request available after
+		 * do_init has run.  Median of a few samples filters
+		 * jitter from a single noisy round-trip without paying
+		 * many extra RTTs at startup.  Passed to the orchestrator
+		 * so the reporter can size its outlier-warmup correctly
+		 * (see RAMP_RTTS in sftp-parallel.c).
+		 */
+		{
+			uint64_t samples[3] = {0, 0, 0};
+			int got = 0;
+			for (int i = 0; i < 3; i++) {
+				double t0 = monotime_double();
+				char *r = sftp_realpath(conn, ".");
+				double t1 = monotime_double();
+				if (r == NULL)
+					break;
+				free(r);
+				samples[got++] = (uint64_t)
+				    ((t1 - t0) * 1e6);
+			}
+			if (got > 0) {
+				/* Simple insertion sort + median. */
+				for (int i = 1; i < got; i++) {
+					uint64_t v = samples[i];
+					int j = i - 1;
+					while (j >= 0 &&
+					    samples[j] > v) {
+						samples[j+1] =
+						    samples[j];
+						j--;
+					}
+					samples[j+1] = v;
+				}
+				uint64_t rtt_us = samples[got / 2];
+				sftp_parallel_set_path_rtt(
+				    parallel_orch, rtt_us);
+				debug_f("control-path RTT: "
+				    "%llu us (median of %d samples)",
+				    (unsigned long long)rtt_us, got);
+			}
+		}
+	}
+}
+
+/*
+ * Post-interrupt fleet rebuild.  A SIGINT during a parallel transfer makes
+ * the orchestrator abort: abort_flag latches, the work queue shuts down, and
+ * every worker connection is closed.  That state is terminal by design
+ * ("abort means abort"), but it used to leak into the NEXT command: submit()
+ * refuses units while abort_flag is set, so a subsequent put/get failed
+ * instantly ("submit range N failed") and the file was reported INCOMPLETE
+ * despite never starting.  Tear the dead orchestrator down and launch a
+ * fresh fleet instead - a few seconds of reconnects, fresh TCP state,
+ * correct by construction.  No-op when the orchestrator is healthy or
+ * parallel mode is off.
+ */
+static void
+parallel_orch_ensure_alive(struct sftp_conn *conn)
+{
+	if (parallel_orch == NULL || !sftp_parallel_is_aborting(parallel_orch))
+		return;
+	logit("Parallel workers were shut down by an interrupt; "
+	    "rebuilding the worker fleet.");
+	sftp_parallel_stop(parallel_orch);
+	parallel_orch = NULL;
+	parallel_orch_launch(conn);
+	if (parallel_orch == NULL)
+		logit("Worker fleet rebuild failed; this transfer will run "
+		    "single-stream.");
+}
+
 static int
 process_get(struct sftp_conn *conn, const char *src, const char *dst,
     const char *pwd, int pflag, int rflag, int resume, int fflag, int verify)
@@ -941,6 +1193,9 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 	char *filename, *abs_src = NULL, *abs_dst = NULL, *tmp = NULL;
 	glob_t g;
 	int i, r, err = 0;
+
+	/* Rebuild the worker fleet if a prior interrupt tore it down. */
+	parallel_orch_ensure_alive(conn);
 
 	abs_src = make_absolute_pwd_glob(xstrdup(src), pwd);
 	memset(&g, 0, sizeof(g));
@@ -1128,6 +1383,9 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 	int err = 0;
 	int i, dst_is_dir = 1;
 	struct stat sb;
+
+	/* Rebuild the worker fleet if a prior interrupt tore it down. */
+	parallel_orch_ensure_alive(conn);
 
 	if (dst) {
 		tmp_dst = xstrdup(dst);
@@ -3528,150 +3786,25 @@ main(int argc, char **argv)
 	 * The master and workers honor the same -i / -F / -o options the
 	 * user gave the main connection (captured during getopt above).
 	 */
-	if (parallel_user_opt_in && sftp_direct == NULL) {
-		struct sftp_parallel_config pcfg;
-		char portbuf[16] = "";
-		memset(&pcfg, 0, sizeof(pcfg));
-		pcfg.num_streams      = parallel_num_streams;
-		pcfg.host             = host;
-		pcfg.user             = user;
-		if (port > 0) {
-			snprintf(portbuf, sizeof(portbuf), "%d", port);
-			pcfg.port = portbuf;
-		}
-		pcfg.ssh_binary       = ssh_program;
-		pcfg.identity         = parallel_identity;
-		pcfg.config_file      = parallel_config_file;
-		pcfg.extra_argv       = parallel_extra_o;
-		pcfg.transfer_buflen  = (unsigned int)copy_buffer_len;
-		pcfg.num_requests     = (unsigned int)num_requests;
-		pcfg.limit_kbps       = limit_kbps;
-		pcfg.range_split_min_mb = range_split_min_mb_user;
-		pcfg.writers_per_inode_cap = writers_cap_user ?
-		    writers_cap_user : HPN_RANGE_WRITERS_CAP_DEFAULT;
-		pcfg.worker_log_dir     = worker_log_dir;
-		pcfg.verbose_level      = debug_level;
-		/* Resolve HPNUseBundle and any other ssh_config-derived
-		 * pcfg fields.  Sets pcfg.use_bundle; defaults to 1 (yes)
-		 * if parsing fails or the option isn't set. */
-		(void)sftp_parallel_apply_ssh_config(&pcfg, host,
-		    parallel_config_file, parallel_extra_o);
-		pcfg.preserve_flag    = global_pflag;
-		pcfg.fsync_flag       = global_fflag;
-		pcfg.print_flag       = quiet ? 0 : 1;
-
-		/*
-		 * Adaptive throughput-outlier stall detection.  On by default
-		 * in parallel mode with conservative settings suited to WAN
-		 * bulk transfer.  Override or disable via env vars:
-		 *
-		 *   SFTP_TPUT_HEALTHY_KBPS=N  override minimum path rate (kbps)
-		 *                             that must be seen before outlier
-		 *                             classification fires; set to 0 to
-		 *                             disable the feature entirely
-		 *   SFTP_TPUT_FRACTION=F      worker is outlier if its kbps
-		 *                             is less than F * max_kbps
-		 *                             (default 0.25)
-		 *   SFTP_TPUT_CONSEC=N        consecutive outlier ticks before
-		 *                             STALLED (default 5); DEAD at 2N
-		 *   SFTP_TPUT_EMA_ALPHA=F     EMA smoothing factor (default 0.2)
-		 */
-		{
-			/* ENV-VAR SFTP_TPUT_HEALTHY_KBPS - developer-only:
-			 * adaptive stall detector path-health floor (kbps).
-			 * Tuning knob for the throughput-outlier detector; not
-			 * meaningful to end users. */
-			const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
-			/* ENV-VAR SFTP_TPUT_FRACTION - developer-only:
-			 * adaptive stall detector outlier fraction (0–1). */
-			const char *e_f = getenv("SFTP_TPUT_FRACTION");
-			/* ENV-VAR SFTP_TPUT_CONSEC - developer-only:
-			 * adaptive stall detector consecutive-tick count. */
-			const char *e_c = getenv("SFTP_TPUT_CONSEC");
-			/* ENV-VAR SFTP_TPUT_EMA_ALPHA - developer-only:
-			 * adaptive stall detector EMA smoothing factor. */
-			const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
-			pcfg.tput_path_healthy_kbps =
-			    (e_h && *e_h) ? strtoull(e_h, NULL, 10) : 2000;
-			pcfg.tput_outlier_fraction =
-			    (e_f && *e_f) ? strtod(e_f, NULL) : 0.25;
-			pcfg.tput_consec_required =
-			    (e_c && *e_c) ? atoi(e_c) : 5;
-			pcfg.tput_ema_alpha =
-			    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
-		}
-
-		if (!quiet)
-			logit("Parallel streams: -j %d",
-			    parallel_num_streams);
-		/* Mirror to debug for batch-mode runs (quiet=1). */
-		debug_f("parallel mode: -j %d defer_parallel_wait=%d",
-		    parallel_num_streams, defer_parallel_wait);
-		if (pcfg.tput_path_healthy_kbps > 0) {
-			double eff_alpha = pcfg.tput_ema_alpha > 0.0
-			    ? pcfg.tput_ema_alpha : 0.2;
-			debug_f("tput-outlier detection: healthy_kbps=%llu "
-			    "frac=%.2f consec=%d ema_alpha=%.2f",
-			    (unsigned long long)pcfg.tput_path_healthy_kbps,
-			    pcfg.tput_outlier_fraction,
-			    pcfg.tput_consec_required,
-			    eff_alpha);
-		}
-		parallel_orch = sftp_parallel_start(&pcfg);
-		if (parallel_orch == NULL) {
-			logit("Parallel-streams setup failed; "
-			    "falling back to single-stream mode.");
-			parallel_num_streams = 1;
-		} else {
-			sftp_parallel_set_interrupt_flag(parallel_orch,
-			    &interrupted);
-
-			/*
-			 * Sample app-layer path RTT on the control connection.
-			 * sftp_realpath does one SSH2_FXP_REALPATH round trip,
-			 * which is the cheapest small request available after
-			 * do_init has run.  Median of a few samples filters
-			 * jitter from a single noisy round-trip without paying
-			 * many extra RTTs at startup.  Passed to the orchestrator
-			 * so the reporter can size its outlier-warmup correctly
-			 * (see RAMP_RTTS in sftp-parallel.c).
-			 */
-			{
-				uint64_t samples[3] = {0, 0, 0};
-				int got = 0;
-				for (int i = 0; i < 3; i++) {
-					double t0 = monotime_double();
-					char *r = sftp_realpath(conn, ".");
-					double t1 = monotime_double();
-					if (r == NULL)
-						break;
-					free(r);
-					samples[got++] = (uint64_t)
-					    ((t1 - t0) * 1e6);
-				}
-				if (got > 0) {
-					/* Simple insertion sort + median. */
-					for (int i = 1; i < got; i++) {
-						uint64_t v = samples[i];
-						int j = i - 1;
-						while (j >= 0 &&
-						    samples[j] > v) {
-							samples[j+1] =
-							    samples[j];
-							j--;
-						}
-						samples[j+1] = v;
-					}
-					uint64_t rtt_us = samples[got / 2];
-					sftp_parallel_set_path_rtt(
-					    parallel_orch, rtt_us);
-					debug_f("control-path RTT: "
-					    "%llu us (median of %d samples)",
-					    (unsigned long long)rtt_us, got);
-				}
-			}
-		}
-	}
+	/*
+	 * Capture the orchestrator launch inputs so the fleet can be
+	 * re-created after an interrupt (parallel_orch_ensure_alive),
+	 * then launch via the shared helper.
+	 */
+	parallel_launch.host         = host;
+	parallel_launch.user         = user;
+	parallel_launch.port         = port;
+	parallel_launch.ssh_program  = ssh_program;
+	parallel_launch.identity     = parallel_identity;
+	parallel_launch.config_file  = parallel_config_file;
+	parallel_launch.extra_o      = parallel_extra_o;
+	parallel_launch.buflen       = copy_buffer_len;
+	parallel_launch.num_requests = num_requests;
+	parallel_launch.limit_kbps   = limit_kbps;
+	parallel_launch.debug_level  = debug_level;
+	parallel_launch.valid        = 1;
+	if (parallel_user_opt_in && sftp_direct == NULL)
+		parallel_orch_launch(conn);
 
 	/*
 	 * Resolve HPNVerifyTransfer from ssh_config for the single-stream

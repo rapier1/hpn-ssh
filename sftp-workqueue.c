@@ -158,6 +158,28 @@ sftp_workqueue_trypop(struct sftp_workqueue *q, void **itemp)
 	return 0;
 }
 
+/*
+ * Like trypop but works on a SHUT-DOWN queue: pops while items remain,
+ * -1 only when empty.  For the owner's final drain - after an abort the
+ * undispatched items are still in the ring (trypop refuses them once
+ * shutdown is set) and would otherwise leak with their payloads.
+ */
+int
+sftp_workqueue_drain(struct sftp_workqueue *q, void **itemp)
+{
+	pthread_mutex_lock(&q->mu);
+	if (q->count == 0) {
+		pthread_mutex_unlock(&q->mu);
+		return -1;
+	}
+	*itemp = q->ring[q->head];
+	q->ring[q->head] = NULL;
+	q->head = (q->head + 1) % q->capacity;
+	q->count--;
+	pthread_mutex_unlock(&q->mu);
+	return 0;
+}
+
 void
 sftp_workqueue_shutdown(struct sftp_workqueue *q)
 {

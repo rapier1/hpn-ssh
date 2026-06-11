@@ -161,7 +161,8 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
     const char *errfmt, ...) __attribute__((format(printf, 4, 5)));
 
 /* Forward declarations for hash helpers used by sftp_download (verified resume) */
-static int sftp_xxhash_local_fd(int, uint64_t, uint64_t *);
+static int sftp_xxhash_local_fd(struct sftp_hpn_conn *, int, uint64_t,
+    uint64_t *);
 static int sftp_hash_remote_file(struct sftp_conn *, const char *,
     uint64_t, uint32_t, uint64_t *);
 
@@ -229,7 +230,16 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 	if (atomiciov6(writev, conn->fd_out, iov, 2, sftpio,
 	    conn->limit_kbps > 0 ? &conn->bwlimit_out : NULL) !=
 	    msg_len + sizeof(mlen)) {
-		error("sftp: send: %s", strerror(errno));
+		/* EPIPE/EBADF mean the connection is simply GONE - the ssh
+		 * child died, or the orchestrator's abort closed the fd under
+		 * us (every worker hits this at once on a user interrupt).
+		 * That condition is always surfaced better elsewhere (respawn
+		 * notice, transfer-health summary), so keep it out of the
+		 * user's face; anything else is a real send error. */
+		if (errno == EPIPE || errno == EBADF)
+			debug("sftp: send: %s", strerror(errno));
+		else
+			error("sftp: send: %s", strerror(errno));
 		conn->hpn->dead = 1; /* HPN */
 		sshbuf_reset(m);
 		return -1;
@@ -1945,7 +1955,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					skip_ret = 1; /* identical */
 					goto resume_fail;
 				}
-				lret = sftp_xxhash_local_fd(local_fd,
+				lret = sftp_xxhash_local_fd(conn->hpn, local_fd,
 				    size, &local_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
@@ -1993,7 +2003,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
-				lret = sftp_xxhash_local_fd(local_fd,
+				lret = sftp_xxhash_local_fd(conn->hpn, local_fd,
 				    (uint64_t)st.st_size, &local_hash);
 				rret = sftp_hash_remote_file(conn,
 				    remote_path, (uint64_t)st.st_size,
@@ -2472,7 +2482,8 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
  * Returns 0 and writes the hash to *hash_out on success, -1 on error.
  */
 static int
-sftp_xxhash_local_fd(int fd, uint64_t length, uint64_t *hash_out)
+sftp_xxhash_local_fd(struct sftp_hpn_conn *hpn, int fd, uint64_t length,
+    uint64_t *hash_out)
 {
 	XXH3_state_t *state;
 	XXH64_hash_t hash;
@@ -2500,9 +2511,21 @@ sftp_xxhash_local_fd(int fd, uint64_t length, uint64_t *hash_out)
 		return -1;
 	}
 
+	uint64_t since_refresh = 0;
+
 	while (remaining > 0) {
 		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
 
+		/* Hashing a large file is minutes of byte-silence; a single
+		 * pause window before the call expires mid-hash and the
+		 * watchdog/endgame reaper kills a worker that is working.
+		 * Refresh every 64 MiB hashed (the helper is cheap). */
+		since_refresh += toread;
+		if (hpn != NULL && since_refresh >= (64ULL << 20)) {
+			sftp_hpn_watchdog_pause(hpn,
+			    HPN_HEARTBEAT_REFRESH_SEC);
+			since_refresh = 0;
+		}
 		nread = read(fd, buf, toread);
 		if (nread == 0)
 			break; /* EOF before length bytes */
@@ -2696,7 +2719,8 @@ sftp_verify_transfer(struct sftp_conn *conn, const char *local_path,
 	 * verify what actually transferred, not to trust allocation
 	 * metadata.  Pass HPN_CHECK_FILE_STRICT unconditionally.
 	 */
-	if (sftp_xxhash_local_fd(fd, (uint64_t)sb.st_size, &local_hash) == 0 &&
+	if (sftp_xxhash_local_fd(conn->hpn, fd, (uint64_t)sb.st_size,
+	    &local_hash) == 0 &&
 	    sftp_hash_remote_file(conn, remote_path, (uint64_t)sb.st_size,
 	    HPN_CHECK_FILE_STRICT, &remote_hash) == 0)
 		r = (local_hash == remote_hash) ? 0 : 1;
@@ -3035,7 +3059,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 					close(local_fd);
 					return 1; /* identical */
 				}
-				lret = sftp_xxhash_local_fd(local_fd,
+				lret = sftp_xxhash_local_fd(conn->hpn, local_fd,
 				    sb.st_size, &local_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
@@ -3065,8 +3089,8 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
-				lret = sftp_xxhash_local_fd(local_fd, c.size,
-				    &local_hash);
+				lret = sftp_xxhash_local_fd(conn->hpn, local_fd,
+				    c.size, &local_hash);
 				/*
 				 * Must pass HPN_CHECK_FILE_STRICT here: the
 				 * server's sparse-skip optimisation triggers

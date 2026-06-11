@@ -265,6 +265,9 @@ int sftp_parallel_submit_download(struct sftp_parallel *p,
 int sftp_parallel_preserve_flag(const struct sftp_parallel *p);
 int sftp_parallel_follow_link_flag(const struct sftp_parallel *p);
 int sftp_parallel_is_aborting(const struct sftp_parallel *p);
+/* 1 iff the abort was caused by the user's interrupt (Ctrl-C) rather than a
+ * fleet failure; drives interrupt-aware (calm) messaging in flush/walker. */
+int sftp_parallel_user_abort(const struct sftp_parallel *p);
 /* Number of parallel worker streams configured (-j N).  Returns 1 when
  * `p` is NULL (i.e. parallel mode is not engaged). */
 int sftp_parallel_num_streams(const struct sftp_parallel *p);
@@ -445,6 +448,11 @@ struct sftp_parallel_stats {
 	uint64_t bytes_wired_aggregate;
 	uint64_t units_completed_aggregate;
 	uint64_t units_failed_aggregate;
+	/* Work units submitted but not yet finalized at snapshot time.
+	 * Nonzero after an abort = work abandoned in flight/queue (the
+	 * interrupt summary keys on it; nothing "failed", so the failure
+	 * aggregates stay zero in that case). */
+	uint64_t units_pending;
 	/* Files the recursive walker dropped before submission
 	 * (lstat / readdir / symlink-stat failures, etc.).  Counted
 	 * separately from units_failed_aggregate because they happen on

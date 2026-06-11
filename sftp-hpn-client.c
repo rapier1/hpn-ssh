@@ -741,7 +741,9 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 			fatal_fr(r, "compose range %u", i);
 	}
 	if (send_msg(conn, msg) != 0) {
-		logit_f("sftp-hash-range \"%s\": transport send failed; "
+		/* Connection died (worker churn) - the fallback handles it and
+		 * the death already produced its own heartbeat; debug only. */
+		debug_f("sftp-hash-range \"%s\": transport send failed; "
 		    "falling back to whole-file hash", path);
 		goto out;
 	}
@@ -759,7 +761,8 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 		sshbuf_reset(msg);
 
 		if (get_msg(conn, msg) != 0) {
-			logit_f("sftp-hash-range \"%s\": transport receive "
+			/* Same as the send-side: handled fallback, debug only. */
+			debug_f("sftp-hash-range \"%s\": transport receive "
 			    "failed; falling back to whole-file hash", path);
 			break;
 		}
@@ -950,6 +953,13 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 	 * fall through to existing whole-file path (which will rediscover
 	 * the same error and report it to the user). */
 	for (i = 0; i < n_chunks; i++) {
+		/* Refresh the pause EVERY chunk: hashing a large file locally
+		 * takes minutes of byte-silence, far past one pause window,
+		 * and the watchdog/endgame reaper would otherwise kill a
+		 * worker that is working hard - then the requeued unit
+		 * re-hashes from scratch (churn, or a livelock for a
+		 * single-file reputv). */
+		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
 		    ranges[i].len, &local_hashes[i]) != 0) {
 			error_f("local hash failed at chunk %u offset %llu "
@@ -1015,9 +1025,17 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 		    (unsigned long long)run_len, local_path);
 		if (sftp_upload_range(conn, local_path, remote_path,
 		    (off_t)run_off, (off_t)run_len) != 0) {
-			error_f("re-transfer of chunks [%u, %u) failed for "
-			    "\"%s\"; falling back to full-file path",
-			    run_start, i, local_path);
+			/* A dead connection (worker churn) is handled fallout -
+			 * the full-file path retries it; only a failure on a
+			 * live connection deserves the user's attention. */
+			if (sftp_conn_is_dead(conn))
+				debug_f("re-transfer of chunks [%u, %u) failed "
+				    "for \"%s\"; falling back to full-file "
+				    "path", run_start, i, local_path);
+			else
+				error_f("re-transfer of chunks [%u, %u) failed "
+				    "for \"%s\"; falling back to full-file "
+				    "path", run_start, i, local_path);
 			goto out;
 		}
 		bytes_retransferred += run_len;
@@ -1099,6 +1117,13 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 
 	/* Local hashing: the destination's current state (partial / sparse). */
 	for (i = 0; i < n_chunks; i++) {
+		/* Refresh the pause EVERY chunk: hashing a large file locally
+		 * takes minutes of byte-silence, far past one pause window,
+		 * and the watchdog/endgame reaper would otherwise kill a
+		 * worker that is working hard - then the requeued unit
+		 * re-hashes from scratch (churn, or a livelock for a
+		 * single-file reputv). */
+		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
 		    ranges[i].len, &local_hashes[i]) != 0) {
 			error_f("local hash failed at chunk %u offset %llu "

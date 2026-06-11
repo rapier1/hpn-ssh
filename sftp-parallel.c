@@ -672,6 +672,16 @@ enum sftp_range_target {
  * default/floor/max constants (HPN_RANGE_WRITERS_CAP_*) live in sftp-parallel.h.
  */
 
+/*
+ * Process-wide mirror of the current orchestrator's abort_user flag, for the
+ * few message sites that have no path to the orchestrator (range-tracker
+ * finalize may run with a NULL worker).  Set by the reporter when a USER
+ * interrupt triggers the abort; cleared by sftp_parallel_start for the next
+ * fleet (the post-interrupt rebuild).  sftp.c runs one orchestrator at a
+ * time, so a single process-wide flag is faithful.
+ */
+static volatile sig_atomic_t parallel_user_abort_flag;
+
 struct sftp_range_tracker {
 	pthread_mutex_t        mu;         /* serialises decrement + cleanup */
 	int                    total;      /* original range count (immutable
@@ -944,6 +954,12 @@ struct sftp_parallel {
 						       * not yet in workers[];
 						       * guards premature abort */
 	int                         total_respawns;  /* lifetime respawn count */
+	uint64_t                    death_ordinal;	/* Nth involuntary worker
+						 * loss this transfer; numbers
+						 * the user-facing heartbeat
+						 * so it matches the summary
+						 * count (reporter thread
+						 * only) */
 	int                         wedge_terminations;	/* workers reaped with
 							 * HPN_EXIT_TCP_WEDGE */
 	int                         peer_stall_terminations; /* ditto, PEER_STALL */
@@ -1058,7 +1074,22 @@ struct sftp_parallel {
 	 * removed from the array; read by snapshot_workers under the same
 	 * lock.  Keeps aggregate_bytes_for_meter monotonic.
 	 */
+	/* ssh child PIDs of IN-FLIGHT spawn attempts (registered between fork
+	 * and sftp_init completion), so abort/stop can SIGTERM them instead
+	 * of waiting out a full connect timeout - the unbounded wait held the
+	 * user's exit hostage for minutes on a slow/penalizing server.
+	 * Guarded by workers_mu. */
+	pid_t                       spawning_pids[SFTP_PARALLEL_MAX_WORKERS];
+	int                         n_spawning;
+
 	uint64_t                    retired_bytes;
+	/* Companions to retired_bytes: counters that previously DIED with the
+	 * reaped worker struct, silently undercounting every post-respawn
+	 * aggregate (end-of-transfer report, failure counts).  Accumulated at
+	 * the same reap site, added back in sftp_parallel_get_stats. */
+	uint64_t                    retired_wired;
+	uint64_t                    retired_units_completed;
+	uint64_t                    retired_units_failed;
 
 	/*
 	 * Cached result of sftp_fs_info() on the destination filesystem.
@@ -1075,6 +1106,12 @@ struct sftp_parallel {
 
 	/* Set by sftp_parallel_abort, read by workers between units. */
 	volatile sig_atomic_t       abort_flag;
+
+	/* Abort CAUSE: 1 when the abort came from the user's interrupt
+	 * (Ctrl-C via ext_interrupt_flag) rather than a fleet failure.
+	 * Read by the interrupt-aware messaging - a user who hit Ctrl-C
+	 * gets one calm summary instead of error theater. */
+	volatile sig_atomic_t       abort_user;
 
 	/* Optional pointer to caller's interrupt flag (e.g. sftp.c's
 	 * `interrupted`).  When non-NULL, the reporter thread calls
@@ -1644,13 +1681,24 @@ range_tracker_finalize(struct sftp_range_tracker *t, int failed,
 		 * process exit comes from the failed-path accounting at the
 		 * give-up site (worker_record_failed_path).
 		 */
-		error("range-split: %s file \"%s\" is INCOMPLETE - at least "
-		    "one byte-range failed permanently after retries. The "
-		    "file is left in place and is resumable: re-run with "
-		    "verified resume (reputv / regetv) to refill the "
-		    "missing ranges.",
-		    t->target == SFTP_RANGE_TARGET_LOCAL ? "local" : "remote",
-		    t->path);
+		if (parallel_user_abort_flag) {
+			/* The "failure" is the user's own interrupt - the
+			 * per-file detail goes to debug and the flush prints
+			 * one calm interrupt summary instead. */
+			debug("range-split: %s file \"%s\" incomplete after "
+			    "interrupt; left in place, resumable "
+			    "(reputv / regetv)",
+			    t->target == SFTP_RANGE_TARGET_LOCAL ?
+			    "local" : "remote", t->path);
+		} else {
+			error("range-split: %s file \"%s\" is INCOMPLETE - at "
+			    "least one byte-range failed permanently after "
+			    "retries. The file is left in place and is "
+			    "resumable: re-run with verified resume "
+			    "(reputv / regetv) to refill the missing ranges.",
+			    t->target == SFTP_RANGE_TARGET_LOCAL ?
+			    "local" : "remote", t->path);
+		}
 	}
 	pthread_mutex_destroy(&t->mu);
 	free(t->path);
@@ -2618,7 +2666,14 @@ worker_thread(void *arg)
 		 * until an active writer finishes and frees a slot.  Whole-file
 		 * and bundle units have no tracker and always pass. */
 		if (!range_writer_slot_acquire(u0->range_tracker)) {
-			(void)sftp_workqueue_push(p->q, u0);
+			/* Push-fail = the queue shut down under us (abort).
+			 * The unit can never run: do the full give-up
+			 * bookkeeping (pending, queued_bytes, tracker
+			 * finalize, free) - silently dropping it stranded
+			 * the tracker and leaked the unit. */
+			if (sftp_workqueue_push(p->q, u0) != 0)
+				worker_give_up_pushfail(p, w, u0,
+				    "capgate/pushfail");
 			__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
 			if (++capped_passes >=
 			    (int)sftp_workqueue_depth(p->q) + 1) {
@@ -2842,8 +2897,14 @@ worker_thread(void *arg)
 						    &p->queued_bytes,
 						    (uint64_t)leftover->size,
 						    __ATOMIC_RELAXED);
-					(void)sftp_workqueue_push(p->q,
-					    leftover);
+					/* Queue shut down under us: full
+					 * give-up bookkeeping, not a silent
+					 * drop (see the cap-gate site). */
+					if (sftp_workqueue_push(p->q,
+					    leftover) != 0)
+						worker_give_up_pushfail(p, w,
+						    leftover,
+						    "leftover/pushfail");
 				}
 			}
 			free(batch);	/* heap batch; bundle mode can exceed UPLOAD_BATCH_SIZE */
@@ -3824,9 +3885,27 @@ respawn_worker_thread(void *arg)
 		}
 	}
 
+	/* The orchestrator may have been told to abort/stop while we slept
+	 * (user interrupt, fleet abort, session teardown).  Bail WITHOUT
+	 * spawning: a replacement would join a dead fleet.  This check is
+	 * also what makes the detached-thread lifetime safe - stop() drains
+	 * pending_respawns before freeing p, and that drain returns promptly
+	 * only because we exit here instead of attempting a connection. */
+	if (p->abort_flag || p->stopped) {
+		pthread_mutex_lock(&p->workers_mu);
+		p->pending_respawns--;
+		pthread_mutex_unlock(&p->workers_mu);
+		return NULL;
+	}
+
 	struct sftp_worker *w = spawn_one_worker(p);
 	if (w == NULL) {
-		error_ft("worker respawn failed");
+		/* Under an abort the failure is manufactured (we killed the
+		 * spawn ourselves) - expected fallout, not news. */
+		if (p->abort_flag || p->stopped)
+			debug_ft("worker respawn abandoned (abort)");
+		else
+			error_ft("worker respawn failed");
 	} else {
 		uint64_t now = monotime_ns();
 		pthread_mutex_lock(&w->mu);
@@ -3935,56 +4014,112 @@ reporter_emit_stats_csv(struct sftp_parallel *p)
 static void
 classify_worker_death(const struct sftp_worker *w, int have_status, int status)
 {
+	struct sftp_parallel *p = w->parent;
+	const char *cause = NULL;
+	uint64_t n = 0;
+	int quiet = 0;
+
+	/*
+	 * One plain-language heartbeat per involuntary worker loss,
+	 * numbered by a transfer-global ordinal so the running count the
+	 * user sees adds up to the end-of-transfer respawn summary.
+	 * (Previously only wedge/peer-stall printed - numbered by the
+	 * dying worker's PRIVATE lineage count - so silent born-dead
+	 * respawns made the first visible notice arrive pre-numbered and
+	 * labeled with a worker id beyond the fleet size.)  Full forensic
+	 * detail (worker id, exit code, doom reason) stays at debug.
+	 *
+	 * `quiet` causes (high-frequency churn the fleet absorbs on its
+	 * own: startup deaths, dropped connections, slow-worker cycling)
+	 * heartbeat at debug only - they still count toward the ordinal
+	 * and the end-of-transfer summary, which remains the complete
+	 * record.  Rare/meaningful causes (wedge, peer-stall brake,
+	 * endgame stall, crashes) stay user-visible.
+	 */
 	if (w->doomed) {
-		debug_ft("worker %d: reaped after orchestrator termination (%s)",
-		    w->id, w->doom_reason ? w->doom_reason : "doomed");
-		return;
-	}
-	if (!have_status) {
+		const char *r = w->doom_reason ? w->doom_reason : "doomed";
+
+		if (strcmp(r, "born_dead") == 0) {
+			cause = "worker unresponsive at startup";
+			quiet = 1;
+		}
+		else if (strcmp(r, "endgame_straggler") == 0)
+			cause = "worker stalled at the endgame";
+		else if (strcmp(r, "tput_outlier") == 0 ||
+		    strcmp(r, "born_slow") == 0) {
+			cause = "worker persistently slow";
+			quiet = 1;
+		}
+		else if (strcmp(r, "dead") == 0 ||
+		    strcmp(r, "iso_stall") == 0 ||
+		    strcmp(r, "isolation") == 0)
+			cause = "worker stalled (no progress)";
+		else if (strcmp(r, "child_gone") == 0) {
+			cause = "worker connection lost";
+			quiet = 1;
+		}
+		else
+			cause = "worker terminated by watchdog";
+		debug_ft("worker %d: reaped after orchestrator termination "
+		    "(%s)", w->id, r);
+	} else if (!have_status) {
+		cause = "worker lost";
 		debug_ft("worker %d: died (no wait status)", w->id);
-		return;
-	}
-	if (WIFEXITED(status)) {
+	} else if (WIFEXITED(status)) {
 		int code = WEXITSTATUS(status);
-		struct sftp_parallel *p = w->parent;
 
 		if (code == HPN_EXIT_TCP_WEDGE) {
-			/* Default-visible: explains the slowdown to the user. */
 			if (p != NULL)
 				p->wedge_terminations++;
-			logit("worker %d: connection wedged, reconnecting "
-			    "(reconnect #%llu)", w->id,
-			    (unsigned long long)(w->reconnect_count + 1));
+			cause = "worker connection wedged";
+			debug_ft("worker %d: self-terminated: TCP wedge",
+			    w->id);
 		} else if (code == HPN_EXIT_TCP_PEER_STALL) {
 			if (p != NULL)
 				p->peer_stall_terminations++;
-			logit("worker %d: remote not draining (peer stall), "
-			    "reconnecting (reconnect #%llu)", w->id,
-			    (unsigned long long)(w->reconnect_count + 1));
+			cause = "worker remote stopped draining";
+			debug_ft("worker %d: self-terminated: peer stall",
+			    w->id);
 		} else if (HPN_EXIT_IS_TCP(code)) {
+			cause = "worker transport self-check failed";
 			debug_ft("worker %d: self-terminated: transport "
 			    "(exit %d)", w->id, code);
 		} else if (code == 255) {
+			cause = "worker connection lost";
+			quiet = 1;
 			debug_ft("worker %d: ssh transport error / dropped "
 			    "connection (exit 255)", w->id);
 		} else if (code == 0) {
+			cause = "worker exited unexpectedly";
 			debug_ft("worker %d: exited cleanly (watchdog had not "
 			    "doomed it)", w->id);
 		} else {
+			cause = "worker exited unexpectedly";
 			debug_ft("worker %d: exited with status %d",
 			    w->id, code);
 		}
 	} else if (WIFSIGNALED(status)) {
-		int sig = WTERMSIG(status);
-		if (sig == SIGKILL)
-			debug_ft("worker %d: force-reaped (SIGKILL), no clean "
-			    "exit", w->id);
-		else
-			debug_ft("worker %d: killed by signal %d (likely "
-			    "crash)", w->id, sig);
+		cause = "worker terminated unexpectedly";
+		debug_ft("worker %d: killed by signal %d", w->id,
+		    WTERMSIG(status));
 	} else {
-		debug_ft("worker %d: reaped (unrecognized wait status)", w->id);
+		cause = "worker lost";
+		debug_ft("worker %d: reaped (unrecognized wait status)",
+		    w->id);
 	}
+
+	if (p != NULL)
+		n = ++p->death_ordinal;
+	/* During teardown the deaths are manufactured and nothing is
+	 * reconnecting - keep it out of the user's face. */
+	if (p == NULL || p->abort_flag || p->stopped)
+		debug("%s (teardown)", cause);
+	else if (quiet)
+		debug("%s; reconnecting (respawn %llu)", cause,
+		    (unsigned long long)n);
+	else
+		logit("%s; reconnecting (respawn %llu)", cause,
+		    (unsigned long long)n);
 }
 
 /*
@@ -4015,9 +4150,17 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 		/* Capture bytes_total before the worker leaves the array
 		 * so the aggregate stays monotonic.  live_bytes was reset
 		 * to 0 at the worker's last completion so it is not
-		 * double-counted. */
-		if (exited)
+		 * double-counted.  Same for the wired/unit counters - they
+		 * used to die with the struct, undercounting every
+		 * post-respawn aggregate. */
+		if (exited) {
 			p->retired_bytes += bt;
+			if (w->conn)
+				p->retired_wired +=
+				    sftp_conn_bytes_wired(w->conn);
+			p->retired_units_completed += w->units_completed;
+			p->retired_units_failed   += w->units_failed;
+		}
 		pthread_mutex_unlock(&w->mu);
 		if (exited) {
 			to_reap[n_reap++] = w;
@@ -4453,9 +4596,13 @@ reporter_thread(void *arg)
 
 		/* Propagate caller's interrupt signal (e.g. SIGINT / Ctrl+C).
 		 * sftp_parallel_abort is idempotent; calling it every tick while
-		 * the flag stays set is harmless. */
-		if (p->ext_interrupt_flag != NULL && *p->ext_interrupt_flag)
+		 * the flag stays set is harmless.  Record the CAUSE first so
+		 * the abort fallout is reported as an interrupt, not errors. */
+		if (p->ext_interrupt_flag != NULL && *p->ext_interrupt_flag) {
+			p->abort_user = 1;
+			parallel_user_abort_flag = 1;
 			sftp_parallel_abort(p);
+		}
 
 		uint64_t bytes;
 		snapshot_workers(p, &bytes, NULL, NULL);
@@ -4510,9 +4657,41 @@ reporter_thread(void *arg)
  * Used by sftp_parallel_start (during initial bring-up) and by the
  * reporter's respawn dispatch when a worker has died.
  */
+/* Register/deregister an in-flight spawn's ssh child so abort/stop can
+ * SIGTERM it out of a blocking connect instead of waiting it out. */
+static void
+spawning_pid_register(struct sftp_parallel *p, pid_t pid)
+{
+	pthread_mutex_lock(&p->workers_mu);
+	if (p->n_spawning < SFTP_PARALLEL_MAX_WORKERS)
+		p->spawning_pids[p->n_spawning++] = pid;
+	pthread_mutex_unlock(&p->workers_mu);
+}
+
+static void
+spawning_pid_deregister(struct sftp_parallel *p, pid_t pid)
+{
+	pthread_mutex_lock(&p->workers_mu);
+	for (int i = 0; i < p->n_spawning; i++) {
+		if (p->spawning_pids[i] == pid) {
+			p->spawning_pids[i] =
+			    p->spawning_pids[--p->n_spawning];
+			break;
+		}
+	}
+	pthread_mutex_unlock(&p->workers_mu);
+}
+
 static struct sftp_worker *
 spawn_one_worker(struct sftp_parallel *p)
 {
+	int registered = 0;
+
+	/* A dying/dead fleet takes no recruits - and a spawn that starts
+	 * after abort/stop would block the teardown drain on its connect. */
+	if (p->abort_flag || p->stopped)
+		return NULL;
+
 	struct sftp_worker *w = xcalloc(1, sizeof(*w));
 	w->parent = p;
 	w->fd_in = w->fd_out = -1;
@@ -4529,10 +4708,28 @@ spawn_one_worker(struct sftp_parallel *p)
 		error_ft("ssh spawn failed");
 		goto fail;
 	}
+	/* From here until sftp_init returns we may block for a full connect
+	 * timeout inside the child.  Register the child so abort/stop can
+	 * SIGTERM it (the pipe EOF fails sftp_init within ms), and re-check
+	 * the flags AFTER registering: a teardown that swept the registry
+	 * just before our registration is caught here and we self-kill. */
+	spawning_pid_register(p, w->ssh_pid);
+	registered = 1;
+	if (p->abort_flag || p->stopped) {
+		(void)kill(w->ssh_pid, SIGTERM);
+		goto fail;
+	}
 	w->conn = sftp_init(w->fd_in, w->fd_out, buflen, nreq,
 	    p->cfg.limit_kbps);
+	spawning_pid_deregister(p, w->ssh_pid);
+	registered = 0;
 	if (w->conn == NULL) {
-		error_ft("sftp_init failed");
+		/* Quiet when the teardown killed our child out of the
+		 * connect; loud for a genuine init failure. */
+		if (p->abort_flag || p->stopped)
+			debug_ft("sftp_init abandoned (abort)");
+		else
+			error_ft("sftp_init failed");
 		goto fail;
 	}
 	sftp_set_live_counter(w->conn, &w->live_bytes);
@@ -4575,6 +4772,8 @@ spawn_one_worker(struct sftp_parallel *p)
 	return w;
 
  fail:
+	if (registered)
+		spawning_pid_deregister(p, w->ssh_pid);
 	if (w->conn) sftp_free(w->conn);
 	if (w->fd_in >= 0) close(w->fd_in);
 	if (w->fd_out >= 0) close(w->fd_out);
@@ -4646,6 +4845,10 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		errno = EINVAL;
 		return NULL;
 	}
+
+	/* Fresh fleet: clear the process-wide user-abort mirror left by a
+	 * previous orchestrator's interrupt (the post-interrupt rebuild). */
+	parallel_user_abort_flag = 0;
 
 	struct sftp_parallel *p = xcalloc(1, sizeof(*p));
 	p->cfg = *cfg;
@@ -4932,6 +5135,10 @@ sftp_parallel_abort(struct sftp_parallel *p)
 {
 	if (p == NULL) return;
 	p->abort_flag = 1;
+	/* Kill the progress meter FIRST: with the fleet dying, further
+	 * redraws are stale frames with garbage rates, and a redraw racing
+	 * the abort messages clobbers their first characters. */
+	sftp_parallel_progress_stop(p);
 	if (p->q)
 		sftp_workqueue_shutdown(p->q);
 
@@ -4966,6 +5173,26 @@ sftp_parallel_abort(struct sftp_parallel *p)
 			(void)close(w->fd_out);
 			w->fd_out = -1;
 		}
+		/* Closing the fds does NOT wake a worker thread already
+		 * blocked in writev on a full pipe (Linux pins the struct
+		 * file under the in-flight syscall): if the ssh child is
+		 * alive but not draining - a stalled connection that
+		 * survived the terminal's SIGINT - that worker hangs in
+		 * pipe_write until the child dies naturally, holding
+		 * stop()'s join (and the user's exit) hostage for the
+		 * server's grace timeout.  Kill the child: the broken pipe
+		 * fails the write immediately and the worker unwinds. */
+		if (w->ssh_pid > 0)
+			(void)kill(w->ssh_pid, SIGTERM);
+	}
+	/* Also SIGTERM any IN-FLIGHT spawn attempts: their ssh children may
+	 * sit in a connect for minutes, and "abort means abort" applies to
+	 * recruits too.  The spawner's blocked sftp_init fails within ms of
+	 * the child dying; its post-register flag re-check covers the race
+	 * where a spawn registers after this sweep. */
+	for (int i = 0; i < p->n_spawning; i++) {
+		if (p->spawning_pids[i] > 0)
+			(void)kill(p->spawning_pids[i], SIGTERM);
 	}
 	pthread_mutex_unlock(&p->workers_mu);
 
@@ -5033,13 +5260,79 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	if (p->reporter_started)
 		pthread_join(p->reporter_tid, NULL);
 
+	/* Drain detached respawn threads before touching the workers array or
+	 * freeing p - they hold p across a ~2s nanosleep.  With the reporter
+	 * joined, no NEW respawns can be scheduled, and the bail-on-stopped
+	 * check in respawn_worker_thread (p->stopped is set above) makes each
+	 * pending one exit shortly after its sleep without spawning.  A thread
+	 * already past the check finishes its spawn attempt and decrements on
+	 * completion; either way this loop is bounded.  Without the drain, a
+	 * sleeping respawn thread would wake to a freed p (use-after-free) -
+	 * previously a narrow quit-after-churn window, now a likely one since
+	 * the post-interrupt fleet rebuild calls stop() seconds after an abort
+	 * that has typically just scheduled respawns. */
+	pthread_mutex_lock(&p->workers_mu);
+	/* SIGKILL in-flight spawn attempts so the wait below resolves in
+	 * milliseconds instead of a connect timeout (stop() may run without
+	 * a preceding abort, e.g. session end after a clean transfer).
+	 * KILL, not TERM: ssh catches SIGTERM for an orderly shutdown that
+	 * can itself block on the very stall we are escaping. */
+	for (int i = 0; i < p->n_spawning; i++) {
+		if (p->spawning_pids[i] > 0)
+			(void)kill(p->spawning_pids[i], SIGKILL);
+	}
+	while (p->pending_respawns > 0) {
+		pthread_mutex_unlock(&p->workers_mu);
+		struct timespec drain_ts = { 0, 50L * 1000 * 1000 };
+		nanosleep(&drain_ts, NULL);
+		pthread_mutex_lock(&p->workers_mu);
+	}
+	pthread_mutex_unlock(&p->workers_mu);
+
 	if (p->workers) {
+		/* SIGKILL any worker ssh children that survived the abort's
+		 * SIGTERM.  ssh CATCHES SIGTERM and attempts an orderly
+		 * shutdown - which itself blocks on a stalled connection
+		 * (observed: a TERMed child surviving ~a minute while its
+		 * worker thread sat in pipe_write and this join sat behind
+		 * it).  KILL cannot be caught; the pipe breaks, the blocked
+		 * write fails, the worker unwinds, the join below returns. */
+		pthread_mutex_lock(&p->workers_mu);
+		for (int i = 0; i < p->num_workers; i++) {
+			struct sftp_worker *w = p->workers[i];
+			if (w != NULL && w->ssh_pid > 0)
+				(void)kill(w->ssh_pid, SIGKILL);
+		}
+		pthread_mutex_unlock(&p->workers_mu);
+
 		/* Reporter is gone - no concurrent reaping.  Join any worker
 		 * threads it had not already reaped. */
 		for (int i = 0; i < p->num_workers; i++) {
 			struct sftp_worker *w = p->workers[i];
 			if (w != NULL && w->started)
 				pthread_join(w->tid, NULL);
+		}
+	}
+
+	/* Drain undispatched work units left in the queue by an abort.  All
+	 * workers are joined, so nothing pops or requeues concurrently.  Each
+	 * unit owes its tracker exactly one finalize (invariant I1) and owns
+	 * its path strings - without this sweep both leaked on every abort,
+	 * which the post-interrupt rebuild turned from a once-per-session
+	 * leak into a recurring one (and leaked paths can be sensitive).
+	 * In-flight units were already finalized by their dying workers via
+	 * the push-fail give-up path; finalize's user-abort gate keeps these
+	 * quiet after a Ctrl-C. */
+	if (p->q) {
+		void *item;
+		while (sftp_workqueue_drain(p->q, &item) == 0) {
+			struct sftp_work_unit *u = item;
+			pthread_mutex_lock(&p->pending_mu);
+			if (p->pending > 0)
+				p->pending--;
+			pthread_mutex_unlock(&p->pending_mu);
+			(void)range_tracker_finalize(u->range_tracker, 1, NULL);
+			free_unit(u);
 		}
 	}
 
@@ -5228,8 +5521,14 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 		    (file_size - offset) : range_size;
 		if (submit(p, make_range_unit(local_path, remote_path,
 		    offset, length, tracker)) != 0) {
-			error("submit range %d of \"%s\" failed",
-			    i, local_path);
+			/* Under an abort the refusal is expected fallout
+			 * (queue is shut), not a fault - keep it quiet. */
+			if (p->abort_flag)
+				debug("submit range %d of \"%s\" refused "
+				    "(abort in progress)", i, local_path);
+			else
+				error("submit range %d of \"%s\" failed",
+				    i, local_path);
 			/* Synthesise failures for ranges we never submitted
 			 * so the tracker reaches remaining=0 and removes the
 			 * (now-corrupt) remote file.  NULL worker is fine -
@@ -5337,7 +5636,8 @@ range_split_min_size_for(struct sftp_parallel *p)
 
 	static struct sftp_parallel *logged_for;
 	if (logged_for != p) {
-		logit("range-split threshold = %llu MiB (source: %s)",
+		/* Config echo - debug only; the user set (or defaulted) this. */
+		debug("range-split threshold = %llu MiB (source: %s)",
 		    (unsigned long long)(bytes / (1024ULL*1024ULL)),
 		    source);
 		logged_for = p;
@@ -5439,8 +5739,15 @@ submit_download_ranges(struct sftp_parallel *p,
 		    (file_size - offset) : range_size;
 		if (submit(p, make_download_range_unit(remote_path, local_path,
 		    offset, length, tracker)) != 0) {
-			error("submit download range %d of \"%s\" failed",
-			    i, remote_path);
+			/* Under an abort the refusal is expected fallout
+			 * (queue is shut), not a fault - keep it quiet. */
+			if (p->abort_flag)
+				debug("submit download range %d of \"%s\" "
+				    "refused (abort in progress)",
+				    i, remote_path);
+			else
+				error("submit download range %d of \"%s\" "
+				    "failed", i, remote_path);
 			/* Synthesise failures for ranges we never submitted
 			 * so the tracker reaches remaining=0 and unlinks the
 			 * corrupt local file.  Without this the tracker
@@ -5679,6 +5986,14 @@ sftp_parallel_is_aborting(const struct sftp_parallel *p)
 	return (p != NULL) ? p->abort_flag : 0;
 }
 
+/* 1 iff the abort was caused by the user's interrupt (Ctrl-C), as opposed
+ * to a fleet failure.  Drives the interrupt-aware messaging. */
+int
+sftp_parallel_user_abort(const struct sftp_parallel *p)
+{
+	return (p != NULL) ? p->abort_user : 0;
+}
+
 /* ---------- Stats accessor (programmatic observability) ---------- */
 
 void
@@ -5710,6 +6025,16 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 		w_bytes_wired += sftp_conn_bytes_wired(w->conn);
 		pthread_mutex_unlock(&w->mu);
 	}
+	/* Add back what reaped (respawned/dead) workers contributed - their
+	 * per-worker counters die with the struct.  Without this the end-of-
+	 * transfer report raced the reaper: stats taken after a reap (always,
+	 * post-abort; sometimes, post-respawn) silently undercounted or
+	 * vanished entirely (the bytes>0 gate failed).  Read under workers_mu,
+	 * which the reap site holds while accumulating. */
+	b             += p->retired_bytes;
+	w_bytes_wired += p->retired_wired;
+	c             += p->retired_units_completed;
+	f             += p->retired_units_failed;
 	pthread_mutex_unlock(&p->workers_mu);
 
 	out->bytes_total_aggregate = b;
@@ -5718,6 +6043,9 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	out->units_failed_aggregate = f;
 	out->walker_failures_aggregate =
 	    __atomic_load_n(&p->walker_failures, __ATOMIC_RELAXED);
+	pthread_mutex_lock(&p->pending_mu);
+	out->units_pending = (uint64_t)p->pending;
+	pthread_mutex_unlock(&p->pending_mu);
 
 	if (p->session_start_ns != 0)
 		out->elapsed_ms =

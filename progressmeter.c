@@ -146,11 +146,21 @@ refresh_progress_meter(int force_update)
 	}
 
 	transferred = *counter - (cur_pos ? cur_pos : start_pos);
+	/* HPN: the parallel aggregate can step BACKWARD - a worker dying
+	 * mid-unit takes its in-progress bytes out of the aggregate until
+	 * the requeued unit re-transfers them.  A negative step poisons the
+	 * rate math (the EMA explodes through format_rate's cast - 81.3TB/s -
+	 * or prints negative garbage).  Clamp: the meter pauses through the
+	 * dip instead of exploding. */
+	if (transferred < 0)
+		transferred = 0;
 	cur_pos = *counter;
 	now = monotime_double();
 	bytes_left = end_pos - cur_pos;
 
 	delta_pos = cur_pos - last_pos;
+	if (delta_pos < 0)
+		delta_pos = 0;
 	if (delta_pos > max_delta_pos)
 		max_delta_pos = delta_pos;
 
@@ -163,11 +173,15 @@ refresh_progress_meter(int force_update)
 		bytes_per_second = 0;
 	}
 
-	/* calculate speed */
-	if (elapsed != 0)
+	/* calculate speed.  HPN: require a measurable window - back-to-back
+	 * refreshes (alarm + forced update) give elapsed ~1 microsecond,
+	 * which passes a !=0 test and explodes the division by 10^6 (the
+	 * 984.6TB/s artifact); the poisoned EMA then decays for many ticks.
+	 * Under 1ms there is nothing meaningful to measure: hold the EMA. */
+	if (elapsed >= 0.001)
 		cur_speed = (transferred / elapsed);
 	else
-		cur_speed = transferred;
+		cur_speed = bytes_per_second;
 
 #define AGE_FACTOR 0.9
 	if (bytes_per_second != 0) {
