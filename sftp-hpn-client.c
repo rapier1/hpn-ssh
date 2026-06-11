@@ -757,6 +757,21 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 	 */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 
+	/* Heartbeats renew the lease (liveness) but carry a progress
+	 * figure precisely because liveness is not enough: a stalled
+	 * backend can heartbeat forever.  No advance for the threshold
+	 * means the connection is treated as failed. */
+	u_int64_t hb_prog_last = 0;
+	time_t hb_advance_sec = monotime();
+	int verify_stall_sec = (int)HPN_VERIFY_PROGRESS_STALL_SEC;
+	/* TESTING ONLY - REMOVE BEFORE RELEASE: stall threshold override. */
+	{
+		const char *vs = getenv("HPN_VERIFY_STALL_SEC");
+
+		if (vs != NULL && *vs != '\0')
+			verify_stall_sec = atoi(vs);
+	}
+
 	for (;;) {
 		sshbuf_reset(msg);
 
@@ -823,8 +838,26 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 		 * sentinel.
 		 */
 		if (num_hashes == HPN_NUM_HASHES_HEARTBEAT) {
-			debug3_f("sftp-hash-range \"%s\" id=%u heartbeat",
-			    path, id);
+			u_int64_t hb_prog = 0;
+			time_t hb_now = monotime();
+
+			if ((r = sshbuf_get_u64(msg, &hb_prog)) != 0)
+				hb_prog = hb_prog_last; /* treat as no advance */
+			debug3_f("sftp-hash-range \"%s\" id=%u heartbeat "
+			    "progress=%llu", path, id,
+			    (unsigned long long)hb_prog);
+			if (hb_prog > hb_prog_last) {
+				hb_prog_last = hb_prog;
+				hb_advance_sec = hb_now;
+			} else if (hb_now - hb_advance_sec >=
+			    (time_t)verify_stall_sec) {
+				sftp_conn_die(conn, "sftp-hash-range "
+				    "\"%s\": server hash made no progress "
+				    "for %d seconds (stalled backend); "
+				    "treating connection as failed",
+				    path, verify_stall_sec);
+				break;
+			}
 			sftp_conn_watchdog_pause(conn,
 			    HPN_HEARTBEAT_REFRESH_SEC);
 			continue;

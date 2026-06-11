@@ -226,13 +226,16 @@ flush_oqueue_blocking(struct sshbuf *oqueue)
  * Emit an sftp-hash-range heartbeat into oqueue, then synchronously
  * drain.  Wire shape matches the final reply prefix
  * (type | id | num_hashes) but with the reserved sentinel
- * HPN_NUM_HASHES_HEARTBEAT in num_hashes.  Called from the inner read
+ * HPN_NUM_HASHES_HEARTBEAT in num_hashes, followed by a u64
+ * bytes-hashed-so-far figure so the client can distinguish a slow
+ * backend from a stalled one.  Called from the inner read
  * loop every HPN_HEARTBEAT_EMIT_INTERVAL_SEC seconds; lets the client
  * refresh its watchdog-pause window so the parallel orchestrator doesn't
  * kill the worker mid-hash on a slow / contended disk.
  */
 static void
-send_hpn_hash_range_heartbeat(u_int id, struct sshbuf *oqueue)
+send_hpn_hash_range_heartbeat(u_int id, struct sshbuf *oqueue,
+    u_int64_t progress)
 {
 	struct sshbuf	*msg;
 	int		 r;
@@ -242,7 +245,8 @@ send_hpn_hash_range_heartbeat(u_int id, struct sshbuf *oqueue)
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_u32(msg,
-	        (u_int32_t)HPN_NUM_HASHES_HEARTBEAT)) != 0)
+	        (u_int32_t)HPN_NUM_HASHES_HEARTBEAT)) != 0 ||
+	    (r = sshbuf_put_u64(msg, progress)) != 0)
 		fatal_fr(r, "compose heartbeat");
 	debug3("sftp-hash-range: heartbeat id=%u", id);
 	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
@@ -263,6 +267,7 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	struct stat		 st;
 	u_char			 buf[65536];
 	u_int64_t		 fsize = 0;
+	u_int64_t		 hashed_total = 0;
 	time_t			 last_hb_sec;
 	u_int32_t		 i;
 	int			 fd = -1;
@@ -385,6 +390,7 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 					goto fail_status;
 				}
 				remaining -= (u_int64_t)nread;
+				hashed_total += (u_int64_t)nread;
 
 				/* Time-keyed heartbeat (see comment above). */
 				{
@@ -395,7 +401,7 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 					    (time_t)
 					    HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
 						send_hpn_hash_range_heartbeat(
-						    id, oqueue);
+						    id, oqueue, hashed_total);
 						last_hb_sec = now;
 					}
 				}

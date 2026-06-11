@@ -1947,7 +1947,7 @@ flush_oqueue_blocking(void)
  * the process during the handler (the main poll loop is blocked here).
  */
 static void
-send_hpn_check_file_heartbeat(uint32_t id)
+send_hpn_check_file_heartbeat(uint32_t id, uint64_t progress)
 {
 	struct sshbuf *msg;
 	int r;
@@ -1957,7 +1957,8 @@ send_hpn_check_file_heartbeat(uint32_t id)
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_u64(msg,
-	        (uint64_t)HPN_HASH_CHECK_FILE_HEARTBEAT)) != 0)
+	        (uint64_t)HPN_HASH_CHECK_FILE_HEARTBEAT)) != 0 ||
+	    (r = sshbuf_put_u64(msg, progress)) != 0)
 		fatal_fr(r, "compose heartbeat");
 	debug3("hpn-check-file: heartbeat id=%u", id);
 	send_msg(msg);
@@ -2071,7 +2072,8 @@ process_extended_hpn_check_file(uint32_t id)
 			if (now != 0 && last_hb_sec != 0 &&
 			    (now - last_hb_sec) >=
 			    (time_t)HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
-				send_hpn_check_file_heartbeat(id);
+				send_hpn_check_file_heartbeat(id,
+				    length - remaining);
 				last_hb_sec = now;
 			}
 		}

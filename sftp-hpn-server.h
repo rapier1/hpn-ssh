@@ -142,6 +142,16 @@
  * Within 19.0 both ends always speak heartbeats; no negotiation needed.
  */
 #define HPN_HEARTBEAT_EMIT_INTERVAL_SEC	5u
+
+/*
+ * Heartbeats prove liveness, not progress: each one carries a u64
+ * bytes-hashed-so-far figure, and a client seeing no advance for this
+ * many seconds treats the connection as failed (a backend so stalled
+ * it heartbeats forever would otherwise hang the verify eternally).
+ * The op cannot be abandoned on a live connection - a late reply would
+ * desync it - so the bail is a connection death.
+ */
+#define HPN_VERIFY_PROGRESS_STALL_SEC	120u
 #define HPN_HEARTBEAT_REFRESH_SEC	30u
 #define HPN_HASH_CHECK_FILE_HEARTBEAT \
 	((u_int64_t)0xC0FFEEDEADBEEF42ULL)
