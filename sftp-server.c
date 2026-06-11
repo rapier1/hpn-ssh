@@ -51,8 +51,6 @@
 #include "sftp-hpn-server.h"
 #include "sftp-hpn-bundle-server.h"	/* HPN_EXT_BUNDLE_* + bundle dispatch */
 
-#define XXH_INLINE_ALL
-#include "xxhash.h"
 
 char *sftp_realpath(const char *, char *); /* sftp-realpath.c */
 
@@ -1936,170 +1934,14 @@ flush_oqueue_blocking(void)
 }
 
 /*
- * Emit an hpn-check-file heartbeat reply (EXTENDED_REPLY with the reserved
- * HPN_HASH_CHECK_FILE_HEARTBEAT sentinel in the hash field).  Called from
- * the inner read+hash loop every HPN_HEARTBEAT_EMIT_INTERVAL_SEC seconds;
- * lets the client refresh its watchdog-pause window so the parallel
- * orchestrator doesn't kill the worker mid-hash on a slow / contended
- * disk.  Wire shape matches the final reply; only the hash value differs.
- *
- * Append to oqueue then synchronously drain so the bytes actually leave
- * the process during the handler (the main poll loop is blocked here).
+ * hpn-check-file@hpnssh.org dispatch wrapper.  The real implementation
+ * lives in sftp-hpn-server.c so sftp-server.c carries a minimal diff
+ * against upstream OpenSSH.
  */
-static void
-send_hpn_check_file_heartbeat(uint32_t id, uint64_t progress)
-{
-	struct sshbuf *msg;
-	int r;
-
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u64(msg,
-	        (uint64_t)HPN_HASH_CHECK_FILE_HEARTBEAT)) != 0 ||
-	    (r = sshbuf_put_u64(msg, progress)) != 0)
-		fatal_fr(r, "compose heartbeat");
-	debug3("hpn-check-file: heartbeat id=%u", id);
-	send_msg(msg);
-	sshbuf_free(msg);
-	flush_oqueue_blocking();
-}
-
 static void
 process_extended_hpn_check_file(uint32_t id)
 {
-	char *path = NULL;
-	uint64_t length;
-	uint32_t flags;
-	int r;
-	int fd = -1;
-	XXH3_state_t *state = NULL;
-	XXH64_hash_t hash;
-	u_char buf[65536];
-	uint64_t remaining;
-	time_t last_hb_sec;
-	ssize_t nread;
-	struct sshbuf *msg;
-	struct stat st;
-
-	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0 ||
-	    (r = sshbuf_get_u64(iqueue, &length)) != 0 ||
-	    (r = sshbuf_get_u32(iqueue, &flags)) != 0)
-		fatal_fr(r, "parse");
-
-	debug3("request %u: hpn-check-file \"%s\" length %llu flags=0x%x",
-	    id, path, (unsigned long long)length, flags);
-	logit("hpn-check-file \"%s\" length %llu flags=0x%x", path,
-	    (unsigned long long)length, flags);
-
-	if ((fd = open(path, O_RDONLY|O_NOFOLLOW)) == -1) {
-		send_status(id, errno_to_portable(errno));
-		goto out;
-	}
-
-	if (fstat(fd, &st) == -1) {
-		send_status(id, errno_to_portable(errno));
-		goto out;
-	}
-	/* Clamp to actual file size to prevent a malicious client from
-	 * requesting a hash of UINT64_MAX bytes and causing unbounded I/O. */
-	if (length > (uint64_t)st.st_size)
-		length = (uint64_t)st.st_size;
-
-	/*
-	 * Sparse-skip optimisation: when the client asks about the WHOLE
-	 * file (length == st_size) AND the file is fully allocated
-	 * (st_blocks*512 >= 95% of st_size, with the 5% margin covering
-	 * filesystem metadata blocks + minor legitimate sparseness) AND
-	 * the client did NOT set HPN_CHECK_FILE_STRICT, short-circuit:
-	 * return HPN_HASH_FULLY_ALLOCATED_SENTINEL without doing any
-	 * read+hash work.  Saves bilateral disk I/O + CPU on multi-file
-	 * resumes where most files completed before the interrupt.
-	 *
-	 * Strict mode (set by client when HPNVerifyTransfer is enabled)
-	 * skips this short-circuit so the user gets full-hash verification
-	 * even for fully-allocated files.
-	 */
-	if ((flags & HPN_CHECK_FILE_STRICT) == 0 &&
-	    length == (uint64_t)st.st_size &&
-	    (uint64_t)st.st_blocks * 512 >=
-	        (uint64_t)st.st_size * 95 / 100) {
-		hash = (XXH64_hash_t)HPN_HASH_FULLY_ALLOCATED_SENTINEL;
-		debug3("hpn-check-file: sparse-skip short-circuit, sending "
-		    "sentinel for \"%s\" (st_size=%lld st_blocks=%lld)",
-		    path, (long long)st.st_size, (long long)st.st_blocks);
-		goto sentinel_reply;
-	}
-
-	if ((state = XXH3_createState()) == NULL) {
-		send_status(id, SSH2_FX_FAILURE);
-		goto out;
-	}
-	if (XXH3_64bits_reset(state) == XXH_ERROR) {
-		error_f("XXH3_64bits_reset failed");
-		send_status(id, SSH2_FX_FAILURE);
-		goto out;
-	}
-
-	remaining = length;
-	last_hb_sec = monotime();
-	while (remaining > 0) {
-		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
-
-		nread = read(fd, buf, toread);
-		if (nread == 0)
-			break; /* EOF before length bytes - hash what we have */
-		if (nread < 0) {
-			send_status(id, errno_to_portable(errno));
-			goto out;
-		}
-		if (XXH3_64bits_update(state, buf, (size_t)nread) == XXH_ERROR) {
-			error_f("XXH3_64bits_update failed");
-			send_status(id, SSH2_FX_FAILURE);
-			goto out;
-		}
-		remaining -= (uint64_t)nread;
-
-		/*
-		 * Emit a heartbeat every HPN_HEARTBEAT_EMIT_INTERVAL_SEC so the
-		 * client's watchdog-pause stays refreshed.  Cheap monotonic-sec
-		 * check per 64KB read iteration; the actual reply build/send
-		 * only runs every ~5 s of elapsed wall time.
-		 */
-		{
-			time_t now = monotime();
-			if (now != 0 && last_hb_sec != 0 &&
-			    (now - last_hb_sec) >=
-			    (time_t)HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
-				send_hpn_check_file_heartbeat(id,
-				    length - remaining);
-				last_hb_sec = now;
-			}
-		}
-	}
-	hash = XXH3_64bits_digest(state);
-	debug3("hpn-check-file: computed hash %016llx for \"%s\" "
-	    "length %llu", (unsigned long long)hash, path,
-	    (unsigned long long)length);
-
- sentinel_reply:
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u64(msg, (uint64_t)hash)) != 0)
-		fatal_fr(r, "compose");
-	debug3("hpn-check-file: sending EXTENDED_REPLY id=%u hash=%016llx",
-	    id, (unsigned long long)hash);
-	send_msg(msg);
-	sshbuf_free(msg);
-out:
-	if (state != NULL)
-		XXH3_freeState(state);
-	if (fd != -1)
-		close(fd);
-	free(path);
+	sftp_hpn_server_dispatch(id, HPN_EXT_CHECK_FILE, iqueue, oqueue);
 }
 
 /*

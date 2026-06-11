@@ -25,6 +25,7 @@
  * _MAX_SIZE) moved to sftp-hpn-bundle-server.h on 2026-05-31 alongside
  * the bundle code itself. */
 #define HPN_EXT_FS_INFO      "hpn-fs-info@hpnssh.org"
+#define HPN_EXT_CHECK_FILE	"hpn-check-file@hpnssh.org"
 #define HPN_EXT_HASH_RANGE   "sftp-hash-range@hpnssh.org"   /* chunked-resume ranged hashing */
 #define HPN_EXT_FILE_LAYOUT  "hpn-file-layout@hpnssh.org"   /* filesystem layout (Lustre stripe today) */
 
