@@ -2601,14 +2601,6 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 	 * means the connection is treated as failed. */
 	uint64_t hb_prog_last = 0;
 	time_t hb_advance_sec = monotime();
-	int verify_stall_sec = (int)HPN_VERIFY_PROGRESS_STALL_SEC;
-	/* TESTING ONLY - REMOVE BEFORE RELEASE: stall threshold override. */
-	{
-		const char *vs = getenv("HPN_VERIFY_STALL_SEC");
-
-		if (vs != NULL && *vs != '\0')
-			verify_stall_sec = atoi(vs);
-	}
 
 	for (;;) {
 		if (get_msg(conn, msg) != 0) {
@@ -2686,12 +2678,12 @@ sftp_hash_remote_file(struct sftp_conn *conn, const char *path,
 				hb_prog_last = hb_prog;
 				hb_advance_sec = hb_now;
 			} else if (hb_now - hb_advance_sec >=
-			    (time_t)verify_stall_sec) {
+			    (time_t)HPN_VERIFY_PROGRESS_STALL_SEC) {
 				sftp_conn_die(conn, "hpn-check-file \"%s\": "
 				    "server hash made no progress for %d "
 				    "seconds (stalled backend); treating "
 				    "connection as failed",
-				    path, verify_stall_sec);
+				    path, (int)HPN_VERIFY_PROGRESS_STALL_SEC);
 				sftp_conn_watchdog_resume(conn);
 				return -1;
 			}
