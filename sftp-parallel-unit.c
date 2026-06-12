@@ -416,6 +416,12 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 		parallel_unit_free(u);
 		return -1;
 	}
+	/* Genuinely NEW work: wake any workers parked in the cap-gate's
+	 * activity wait.  Deliberately NOT done inside the queue's push -
+	 * the cap-gate's own requeue pushes there, and kicking from push
+	 * created a wake->pass->requeue->kick feedback storm (measured:
+	 * denials 6M -> 109M, four cores burned). */
+	sftp_workqueue_kick(p->q);
 	return 0;
 }
 

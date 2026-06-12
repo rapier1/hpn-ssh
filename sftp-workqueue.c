@@ -9,6 +9,8 @@
  */
 
 #include <errno.h>
+#include <stdint.h>
+#include <time.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,13 @@ struct sftp_workqueue {
 	pthread_mutex_t  mu;
 	pthread_cond_t   not_empty;
 	pthread_cond_t   not_full;
+	/* Activity kick channel (sftp_workqueue_kick/wait_activity): wakes
+	 * workers whose only available work is externally gated (writer-cap
+	 * slots) without the queue ever going empty.  kick_seq orders kicks
+	 * so a waiter never sleeps through one that fired just before it
+	 * parked. */
+	pthread_cond_t   kick_cv;
+	uint64_t         kick_seq;
 };
 
 struct sftp_workqueue *
@@ -48,6 +57,10 @@ sftp_workqueue_new(size_t capacity)
 		goto fail_mu;
 	if (pthread_cond_init(&q->not_full, NULL) != 0)
 		goto fail_ne;
+	if (pthread_cond_init(&q->kick_cv, NULL) != 0) {
+		pthread_cond_destroy(&q->not_full);
+		goto fail_ne;
+	}
 	return q;
 
  fail_ne:
@@ -65,6 +78,7 @@ sftp_workqueue_free(struct sftp_workqueue *q)
 {
 	if (q == NULL)
 		return;
+	pthread_cond_destroy(&q->kick_cv);
 	pthread_cond_destroy(&q->not_full);
 	pthread_cond_destroy(&q->not_empty);
 	pthread_mutex_destroy(&q->mu);
@@ -187,6 +201,40 @@ sftp_workqueue_shutdown(struct sftp_workqueue *q)
 	q->shutdown = 1;
 	pthread_cond_broadcast(&q->not_empty);
 	pthread_cond_broadcast(&q->not_full);
+	q->kick_seq++;
+	pthread_cond_broadcast(&q->kick_cv);
+	pthread_mutex_unlock(&q->mu);
+}
+
+void
+sftp_workqueue_kick(struct sftp_workqueue *q)
+{
+	pthread_mutex_lock(&q->mu);
+	q->kick_seq++;
+	pthread_cond_broadcast(&q->kick_cv);
+	pthread_mutex_unlock(&q->mu);
+}
+
+void
+sftp_workqueue_wait_activity(struct sftp_workqueue *q, int timeout_ms)
+{
+	struct timespec deadline;
+	uint64_t seen;
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec  += timeout_ms / 1000;
+	deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+	pthread_mutex_lock(&q->mu);
+	seen = q->kick_seq;
+	while (q->kick_seq == seen && !q->shutdown) {
+		if (pthread_cond_timedwait(&q->kick_cv, &q->mu,
+		    &deadline) == ETIMEDOUT)
+			break;
+	}
 	pthread_mutex_unlock(&q->mu);
 }
 

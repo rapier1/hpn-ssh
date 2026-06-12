@@ -261,8 +261,13 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 	/* HPN: free the per-inode writer slot claimed in parallel_worker_thread's
 	 * dispatch gate.  Reached exactly once per executed unit on every
 	 * path (success, retry-requeue, give-up), so retries release here and
-	 * re-acquire when re-dispatched.  NULL tracker (non-range) = no-op. */
-	parallel_unit_writer_release(u->range_tracker);
+	 * re-acquire when re-dispatched.  NULL tracker (non-range) = no-op.
+	 * The kick wakes workers parked in the cap-gate's wait_activity so a
+	 * freed slot is picked up immediately instead of on the timeout. */
+	if (u->range_tracker != NULL) {
+		parallel_unit_writer_release(u->range_tracker);
+		sftp_workqueue_kick(p->q);
+	}
 
 	if (rc == 0) {
 		worker_record_completion(w, u->size, 1);
@@ -997,14 +1002,19 @@ parallel_worker_thread(void *arg)
 				worker_give_up_pushfail(p, w, u0,
 				    "capgate/pushfail");
 			__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
-			/* Availability intent: cap-gate spin = available for
+			/* Availability intent: cap-gate parking = available for
 			 * OTHER files, blocked on this one's writer cap. */
 			__atomic_store_n(&w->avail, WORKER_AVAIL_CAPPED,
 			    __ATOMIC_RELAXED);
+			/* A full pass over the queue found only capped units:
+			 * park on the queue's activity channel instead of
+			 * spinning pop/requeue (measured: ~6M futile cycles
+			 * per large single-file transfer).  Exact wakeup on
+			 * slot release or any push; the 100ms timeout is a
+			 * backstop, never the path. */
 			if (++capped_passes >=
 			    (int)sftp_workqueue_depth(p->q) + 1) {
-				const struct timespec ts = { 0, 2L*1000*1000 };
-				nanosleep(&ts, NULL);
+				sftp_workqueue_wait_activity(p->q, 250);
 				capped_passes = 0;
 			}
 			continue;

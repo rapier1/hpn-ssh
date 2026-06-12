@@ -79,6 +79,23 @@ int sftp_workqueue_drain(struct sftp_workqueue *q, void **itemp);
  */
 void sftp_workqueue_shutdown(struct sftp_workqueue *q);
 
+/*
+ * Activity kick: wake threads parked in sftp_workqueue_wait_activity.
+ * Called when external state that gates queued work changes (a per-file
+ * writer-cap slot freeing) - the queue itself may be non-empty the whole
+ * time, so the not-empty condition cannot serve as the wait point.
+ * Cheap: bump a sequence number and broadcast.
+ */
+void sftp_workqueue_kick(struct sftp_workqueue *q);
+
+/*
+ * Park until the next activity kick, a push, shutdown, or timeout_ms -
+ * whichever comes first.  Used by workers whose only available work is
+ * gated (all queued units capped): replaces a pop/requeue spin with an
+ * exact wakeup on slot release plus a bounded-staleness backstop.
+ */
+void sftp_workqueue_wait_activity(struct sftp_workqueue *q, int timeout_ms);
+
 /* Current number of items in the queue. Snapshot - may be stale by the
  * time the caller reads it, which is fine for telemetry. */
 size_t sftp_workqueue_depth(struct sftp_workqueue *q);
