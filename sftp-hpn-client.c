@@ -45,69 +45,7 @@
 #include "sftp-hpn-server.h"	/* hpn-file-layout wire format + status codes */
 #include "sftp-hpn-client.h"
 #include "sftp-hpn-bundle.h"	/* HPN_EXT_HASH_RANGE etc. wire names */
-
-#ifdef HPN_FAULT_INJECTION
-static struct {
-	uint64_t       threshold;  /* byte threshold; 0 = disabled */
-	int            kills_left; /* remaining kill slots; INT_MAX = unlimited */
-	pthread_once_t once;
-} fi_state = { 0, 0, PTHREAD_ONCE_INIT };
-
-/* Parallel struct for SFTP_FAULT_PROTOCOL - triggers protocol violation. */
-static struct {
-	uint64_t       threshold;
-	int            kills_left;
-	pthread_once_t once;
-} fi_pv_state = { 0, 0, PTHREAD_ONCE_INIT };
-
-/*
- * ENV-VAR SFTP_FAULT_INJECT - compile-gated (HPN_FAULT_INJECTION):
- * fault-injection knob.  Parsed once from
- * SFTP_FAULT_INJECT=<bytes>[:<max_kills>] :
- *   bytes     - worker connection dies after sending this many bytes.
- *   max_kills - optional; at most this many workers are killed (default: all).
- * Example: SFTP_FAULT_INJECT=150000:2  kills at most 2 out of N workers.
- * See benchmark/env-vars-reference.md.
- */
-static void
-fi_state_init(void)
-{
-	const char *ev = getenv("SFTP_FAULT_INJECT");
-	if (ev == NULL)
-		return;
-	char *ep;
-	uint64_t bytes = strtoull(ev, &ep, 10);
-	if (bytes == 0)
-		return;
-	fi_state.threshold  = bytes;
-	fi_state.kills_left = (*ep == ':') ? (int)strtol(ep + 1, NULL, 10)
-	                                   : INT_MAX;
-}
-
-/*
- * ENV-VAR SFTP_FAULT_PROTOCOL - compile-gated (HPN_FAULT_INJECTION):
- * fault-injection knob.  Parsed once from
- * SFTP_FAULT_PROTOCOL=<bytes>[:<max_kills>] :
- *   bytes     - worker fires a protocol violation after sending this many bytes.
- *   max_kills - optional; at most this many workers trigger the fault.
- * Example: SFTP_FAULT_PROTOCOL=150000:1  triggers one protocol violation.
- * See benchmark/env-vars-reference.md.
- */
-static void
-fi_pv_state_init(void)
-{
-	const char *ev = getenv("SFTP_FAULT_PROTOCOL");
-	if (ev == NULL)
-		return;
-	char *ep;
-	uint64_t bytes = strtoull(ev, &ep, 10);
-	if (bytes == 0)
-		return;
-	fi_pv_state.threshold  = bytes;
-	fi_pv_state.kills_left = (*ep == ':') ? (int)strtol(ep + 1, NULL, 10)
-	                                      : INT_MAX;
-}
-#endif /* HPN_FAULT_INJECTION */
+#include "sftp-fault-inject.h"	/* FAULT-INJ: test scaffolding */
 
 struct sftp_hpn_conn *
 sftp_hpn_conn_init(void)
@@ -187,22 +125,9 @@ sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
 		return;
 	hpn->live_counter = counter;
 
-#ifdef HPN_FAULT_INJECTION
-	pthread_once(&fi_state.once, fi_state_init);
-	if (fi_state.threshold > 0) {
-		hpn->fault_after_bytes = fi_state.threshold;
-		error("sftp: fault injection enabled: "
-		    "connection will die after %llu bytes sent",
-		    (unsigned long long)fi_state.threshold);
-	}
-	pthread_once(&fi_pv_state.once, fi_pv_state_init);
-	if (fi_pv_state.threshold > 0) {
-		hpn->fault_pv_after_bytes = fi_pv_state.threshold;
-		error("sftp: protocol-violation fault injection enabled: "
-		    "connection will report protocol violation after %llu bytes sent",
-		    (unsigned long long)fi_pv_state.threshold);
-	}
-#endif /* HPN_FAULT_INJECTION */
+	/* FAULT-INJ: test-scaffolding hook; no-op unless built with
+	 * -DHPN_FAULT_INJECTION.  See sftp-fault-inject.c. */
+	fault_inj_arm_conn(hpn);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -552,68 +477,6 @@ sftp_hpn_rdahead_window(struct sftp_hpn_conn *hpn, size_t nbytes,
 	return (cur < cap) ? cur + 1 : cur;	/* legacy +1 ramp (disabled) */
 }
 
-#ifdef HPN_FAULT_INJECTION
-/*
- * Called by send_msg after each successful write.  Accumulates bytes sent
- * and fires the first armed fault trigger whose threshold is reached.
- * Protocol-violation fault (SFTP_FAULT_PROTOCOL) is checked first; connection-
- * death fault (SFTP_FAULT_INJECT) is checked second.  Each uses an independent
- * atomic kill-slot counter so exactly max_kills workers trigger the fault.
- *
- * Returns 0 normally.
- * Returns -1 and sets hpn->dead (and hpn->protocol_violation if applicable)
- * when a fault fires; the caller must close the connection file descriptors.
- */
-int
-sftp_hpn_check_fault(struct sftp_hpn_conn *hpn, size_t bytes)
-{
-	if (hpn == NULL)
-		return 0;
-
-	/* Only accumulate if at least one fault type is armed. */
-	if (hpn->fault_after_bytes == 0 && hpn->fault_pv_after_bytes == 0)
-		return 0;
-
-	hpn->fault_bytes_sent += bytes;
-
-	/* Check protocol-violation fault first (higher priority signal). */
-	if (hpn->fault_pv_after_bytes > 0 &&
-	    hpn->fault_bytes_sent >= hpn->fault_pv_after_bytes) {
-		int prev = __atomic_fetch_sub(&fi_pv_state.kills_left, 1,
-		    __ATOMIC_SEQ_CST);
-		if (prev > 0) {
-			error("sftp: fault injection: simulating protocol "
-			    "violation after %llu bytes sent",
-			    (unsigned long long)hpn->fault_bytes_sent);
-			sftp_hpn_set_protocol_violation(hpn);
-			return -1;
-		}
-		/* No slot - restore and disarm for this connection. */
-		__atomic_fetch_add(&fi_pv_state.kills_left, 1,
-		    __ATOMIC_SEQ_CST);
-		hpn->fault_pv_after_bytes = 0;
-	}
-
-	/* Check connection-death fault. */
-	if (hpn->fault_after_bytes > 0 &&
-	    hpn->fault_bytes_sent >= hpn->fault_after_bytes) {
-		int prev = __atomic_fetch_sub(&fi_state.kills_left, 1,
-		    __ATOMIC_SEQ_CST);
-		if (prev > 0) {
-			error("sftp: fault injection: simulating connection "
-			    "death after %llu bytes sent",
-			    (unsigned long long)hpn->fault_bytes_sent);
-			hpn->dead = 1;
-			return -1;
-		}
-		/* No slot - restore and disarm for this connection. */
-		__atomic_fetch_add(&fi_state.kills_left, 1, __ATOMIC_SEQ_CST);
-		hpn->fault_after_bytes = 0;
-	}
-
-	return 0;
-}
-#endif /* HPN_FAULT_INJECTION */
 
 
 

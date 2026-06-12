@@ -1,0 +1,37 @@
+/*
+ * sftp-fault-inject.h - fault-injection test scaffolding (HPN).
+ *
+ * TEST/DEBUG ONLY.  Everything here is compile-gated behind
+ * -DHPN_FAULT_INJECTION and is a no-op in normal builds.  All functions
+ * are prefixed fault_inj_ and every hook site in regular code is tagged
+ * with a FAULT-INJ comment so the entire mechanism can be located (and,
+ * if ever desired, removed) with a single grep.
+ *
+ * Knobs (parsed once per process):
+ *   ENV-VAR SFTP_FAULT_INJECT=<bytes>[:<max_kills>]
+ *       a connection is marked dead (exactly like a real EPIPE - no fds
+ *       are closed at this layer) after sending <bytes> wire bytes; at
+ *       most <max_kills> connections die (default unlimited).
+ *   ENV-VAR SFTP_FAULT_PROTOCOL=<bytes>[:<max_kills>]
+ *       a connection reports a protocol violation after <bytes>.
+ */
+
+#ifndef SFTP_FAULT_INJECT_H
+#define SFTP_FAULT_INJECT_H
+
+struct sftp_hpn_conn;
+
+#ifdef HPN_FAULT_INJECTION
+/* Arm a new connection from the env knobs (called at conn setup). */
+void	fault_inj_arm_conn(struct sftp_hpn_conn *);
+/* Per-send hook: accounts wire bytes, fires armed faults.  Returns -1
+ * when this send should fail (connection has been marked dead or a
+ * protocol violation has been raised), 0 otherwise. */
+int	fault_inj_check_send(struct sftp_hpn_conn *, size_t);
+#else
+/* Normal builds: hooks compile to nothing. */
+#define fault_inj_arm_conn(hpn)		do { } while (0)
+#define fault_inj_check_send(hpn, n)	(0)
+#endif
+
+#endif /* SFTP_FAULT_INJECT_H */

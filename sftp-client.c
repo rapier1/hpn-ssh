@@ -56,6 +56,7 @@
 #include "sftp-hpn-client.h" /* HPN */
 #include "sftp-hpn-server.h" /* HPN_CHECK_FILE_STRICT, HPN_HASH_FULLY_ALLOCATED_SENTINEL */
 #include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
+#include "sftp-fault-inject.h"	/* FAULT-INJ: test scaffolding */
 
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -246,19 +247,10 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 
 	sshbuf_reset(m);
 
-#ifdef HPN_FAULT_INJECTION
-	if (sftp_hpn_check_fault(conn->hpn, msg_len + sizeof(mlen)) != 0) {
-		/* Mark dead exactly like the real EPIPE path above - do NOT
-		 * close the fds here.  Production deaths never close at this
-		 * layer (teardown happens via the orchestrator's accounted
-		 * paths); closing here freed the numbers early, the kernel
-		 * recycled them to other threads' files, and the reaper's
-		 * later by-number close killed innocent fds (EBADF storms,
-		 * silent short ranges - the 2026-06-12 hunt). */
-		conn->hpn->dead = 1;
+	/* FAULT-INJ: test-scaffolding hook; no-op unless built with
+	 * -DHPN_FAULT_INJECTION.  See sftp-fault-inject.c. */
+	if (fault_inj_check_send(conn->hpn, msg_len + sizeof(mlen)) != 0)
 		return -1;
-	}
-#endif /* HPN_FAULT_INJECTION */
 
 	return 0;
 }

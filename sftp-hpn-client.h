@@ -154,6 +154,8 @@ struct sftp_hpn_conn {
 #ifdef HPN_FAULT_INJECTION
 	/* SFTP_FAULT_INJECT=bytes[:max_kills]   - simulates connection death.
 	 * SFTP_FAULT_PROTOCOL=bytes[:max_kills] - simulates protocol violation. */
+	/* FAULT-INJ: test-scaffolding state (sftp-fault-inject.c); inert
+	 * in normal builds. */
 	uint64_t fault_after_bytes;    /* die after N bytes sent (0=off) */
 	uint64_t fault_pv_after_bytes; /* protocol violation after N bytes (0=off) */
 	uint64_t fault_bytes_sent;     /* bytes sent so far on this connection */
@@ -290,7 +292,6 @@ void sftp_hpn_conn_die(struct sftp_hpn_conn *, const char *fmt, ...)
  * Returns 0 normally; returns -1 and sets hpn->dead when a fault fires.
  * The caller is responsible for closing the file descriptors.
  */
-int sftp_hpn_check_fault(struct sftp_hpn_conn *, size_t bytes);
 #endif /* HPN_FAULT_INJECTION */
 
 
