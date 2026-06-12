@@ -455,6 +455,58 @@ enum worker_health {
 };
 
 /*
+ * Worker availability INTENT, written by the worker itself at its
+ * voluntary transitions (relaxed atomic).  Distinguishes purposefully
+ * idle workers (healthy, ready for work) from busy ones - and from
+ * wedged workers, which by definition never reach a voluntary
+ * transition and therefore keep claiming BUSY while the watchdog's
+ * byte-progress heuristics expose them.  Consumers always read this
+ * TOGETHER with worker_health; avail never overrides health.
+ *
+ * READY  - blocking in pop: queue empty for this worker, fully
+ *          available (e.g. the cap-surplus workers of a single-file
+ *          transfer under -w).
+ * CAPPED - cycling the cap-gate requeue: available for OTHER files,
+ *          blocked on this file's writer cap.  Excluded from "idle
+ *          capacity" for the file whose tail is being judged.
+ * BUSY   - holds a dispatched unit.
+ *
+ * First consumers (2026-06-12, tail phase B): the fleet-rate median
+ * (BUSY+HEALTHY only - idle workers must not deflate it) and the
+ * tail detector's idle-capacity gate (READY+HEALTHY).  Also a hook
+ * for the respawn-policy redesign and watchdog refinements.
+ */
+enum worker_avail {
+	WORKER_AVAIL_BUSY = 0,
+	WORKER_AVAIL_READY,
+	WORKER_AVAIL_CAPPED,
+};
+
+/*
+ * Tail trend detector (phase B, 2026-06-12): TELEMETRY ONLY - detects
+ * the condition a human watching the meter flags (sustained aggregate
+ * decline / an imminent long crawl) and logs would-arm episodes under
+ * HPN_BUNDLE_TIMING for tuning.  No actuation; the endgame split stays
+ * env-gated off.  ALL FOUR CONSTANTS ARE TUNING CANDIDATES - the
+ * telemetry campaign exists to validate them (acceptance gate: zero
+ * episodes across clean S and M runs).
+ *
+ * The trend alone CANNOT decide: every healthy transfer ends with
+ * aggregate decline as workers exhaust the queue.  The deciding
+ * conjunction is structural (queue empty + walker done + READY
+ * capacity) AND holder-relative (the holder is SLOW versus the
+ * still-busy fleet median - a healthy last worker runs at full
+ * personal rate and never matches).
+ */
+#define TAIL_RING_TICKS        25   /* ~5s of 200ms reporter ticks */
+#define TAIL_RING_QUARTER      (TAIL_RING_TICKS / 4)
+#define TAIL_DECLINE_PCT       25   /* newest-quarter median below
+				     * oldest-quarter median by this % */
+#define TAIL_PROJECT_SEC       10   /* projected solo-tail threshold */
+#define TAIL_HOLDER_LAG_PCT    70   /* holder EMA below this % of the
+				     * busy-fleet median = lagging */
+
+/*
  * ENV-VAR HPN_BUNDLE_TIMING midstream-freeze probe (2026-06-05).  Each worker
  * publishes its current phase (relaxed atomic) so the reporter's per-second
  * FLEETSAMPLE shows WHERE all workers are at the instant of a freeze: blocked
@@ -592,6 +644,13 @@ struct sftp_range_tracker {
 	 * worker_process_result - exactly once per executed unit. */
 	int                    active_writers;
 	int                    writer_cap;
+	/* Writer-slot grant/denial counters (under mu): answer the
+	 * dispatch-path model question from the 2026-06-11 pacing
+	 * post-mortem (predicted ~5 grants per single-file transfer;
+	 * observed behavior implied far more).  Emitted at last-finalize
+	 * under HPN_BUNDLE_TIMING. */
+	uint64_t               cap_grants;
+	uint64_t               cap_denials;
 	/* Lazy file creation: first writer to dispatch a range for this
 	 * file creates it (if absent - layout-created files pass through)
 	 * under mu.  Until then the file does not exist on the target, so
@@ -776,6 +835,17 @@ struct sftp_worker {
 	enum worker_health health;             /* (A) HEALTHY/STALLED/DEAD;
 						* set by reporter, read for
 						* logging + transition gating */
+	int                avail;              /* enum worker_avail; relaxed
+						* atomic, written by the worker
+						* at voluntary transitions (see
+						* enum comment); read with
+						* health by the tail detector
+						* and fleet-median computation */
+	uint64_t           unit_size;          /* relaxed atomic; size of the
+						* currently-held unit (set at
+						* dispatch beside unit_start_ns,
+						* 0 when idle); feeds the tail
+						* detector's projected-tail */
 
 	int                started;
 	int                exited;             /* (C) set by worker on
@@ -877,6 +947,18 @@ struct sftp_parallel {
 							 * endgame range split;
 							 * set only when a split
 							 * actually happens */
+	/* Tail trend detector state (phase B, reporter thread only - no
+	 * locking).  rate_ring holds per-tick aggregate-rate samples
+	 * (bytes/sec); the detector compares oldest- vs newest-quarter
+	 * medians and latches would-arm EPISODES for telemetry. */
+	uint64_t                    tail_rate_ring[TAIL_RING_TICKS];
+	int                         tail_ring_idx;
+	int                         tail_ring_count;
+	uint64_t                    tail_prev_bytes;
+	uint64_t                    tail_prev_ns;
+	int                         tail_episode;      /* latch: in episode */
+	uint64_t                    tail_episode_ns;   /* episode start */
+	int                         tail_episodes_total; /* per-transfer count */
 	uint64_t                    session_start_ns;  /* monotime_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in

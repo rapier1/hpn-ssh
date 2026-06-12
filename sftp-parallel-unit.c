@@ -121,10 +121,13 @@ parallel_unit_writer_acquire(struct sftp_range_tracker *t)
 	if (t == NULL)
 		return 1;
 	pthread_mutex_lock(&t->mu);
-	if (t->active_writers < t->writer_cap)
+	if (t->active_writers < t->writer_cap) {
 		t->active_writers++;
-	else
+		t->cap_grants++;
+	} else {
 		ok = 0;
+		t->cap_denials++;
+	}
 	pthread_mutex_unlock(&t->mu);
 	return ok;
 }
@@ -226,6 +229,12 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 	t->remaining--;
 	was_last   = (t->remaining == 0);
 	incomplete = was_last && t->any_failed;
+	if (was_last && getenv("HPN_BUNDLE_TIMING") != NULL)
+		logit("HPN CAP-COUNTERS \"%s\": grants=%llu denials=%llu "
+		    "(cap=%d total_ranges=%d)", t->path,
+		    (unsigned long long)t->cap_grants,
+		    (unsigned long long)t->cap_denials,
+		    t->writer_cap, t->total);
 	pthread_mutex_unlock(&t->mu);
 
 	if (!was_last)

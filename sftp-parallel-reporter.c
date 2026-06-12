@@ -458,6 +458,185 @@ reporter_flare(struct sftp_parallel *p)
 }
 
 /*
+ * Tail trend detector - phase B of the tail-elimination design
+ * (2026-06-12): TELEMETRY ONLY.  Samples the fleet aggregate rate once
+ * per reporter tick into a small ring; a would-arm EPISODE opens when
+ * the decline/projection signals AND the structural conjunction hold
+ * (queue empty, walker done, READY capacity, holder lagging the
+ * busy-fleet median), and closes when any condition clears.  Episode
+ * boundaries are logged under HPN_BUNDLE_TIMING for tuning; nothing is
+ * actuated.  Constants and rationale: sftp-parallel-internal.h.
+ */
+static uint64_t
+tail_quarter_median(const uint64_t *ring, int count, int idx, int newest)
+{
+	uint64_t q[TAIL_RING_QUARTER];
+	int i, j, n = TAIL_RING_QUARTER;
+
+	/* Copy the oldest or newest quarter of the (full) ring. */
+	for (i = 0; i < n; i++) {
+		int pos = newest ?
+		    (idx - 1 - i + 2 * TAIL_RING_TICKS) % TAIL_RING_TICKS :
+		    (idx + i + TAIL_RING_TICKS - count + 2 * TAIL_RING_TICKS)
+		    % TAIL_RING_TICKS;
+		q[i] = ring[pos];
+	}
+	/* Insertion sort; n is 6. */
+	for (i = 1; i < n; i++) {
+		uint64_t v = q[i];
+		for (j = i; j > 0 && q[j - 1] > v; j--)
+			q[j] = q[j - 1];
+		q[j] = v;
+	}
+	return q[n / 2];
+}
+
+static void
+tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
+{
+	uint64_t now = monotime_ns();
+	uint64_t rate = 0;
+	int would_arm = 0;
+
+	/* Per-tick rate sample into the ring. */
+	if (p->tail_prev_ns != 0 && now > p->tail_prev_ns &&
+	    bytes_now >= p->tail_prev_bytes) {
+		rate = (bytes_now - p->tail_prev_bytes) * 1000000000ULL /
+		    (now - p->tail_prev_ns);
+		p->tail_rate_ring[p->tail_ring_idx] = rate;
+		p->tail_ring_idx = (p->tail_ring_idx + 1) % TAIL_RING_TICKS;
+		if (p->tail_ring_count < TAIL_RING_TICKS)
+			p->tail_ring_count++;
+	}
+	p->tail_prev_bytes = bytes_now;
+	p->tail_prev_ns = now;
+
+	if (p->tail_ring_count < TAIL_RING_TICKS)
+		return;	/* window not full yet */
+
+	/* Structural conjunction first (cheap, and required for an arm). */
+	int walker_done = (__atomic_load_n(&p->walker_phase,
+	    __ATOMIC_RELAXED) == SFTP_WKP_DONE);
+	if (!walker_done || sftp_workqueue_depth(p->q) != 0)
+		goto resolve;
+
+	{
+		int n_ready = 0, n_busy = 0, lagging = 0;
+		uint64_t busy_rates[SFTP_PARALLEL_MAX_WORKERS];
+		uint64_t worst_proj_sec = 0;
+
+		pthread_mutex_lock(&p->workers_mu);
+		for (int i = 0; i < p->num_workers; i++) {
+			struct sftp_worker *w = p->workers[i];
+			int av = __atomic_load_n(&w->avail, __ATOMIC_RELAXED);
+
+			pthread_mutex_lock(&w->mu);
+			int healthy = (w->health == WORKER_HEALTHY);
+			uint64_t ema = w->tput_ema_kbps;
+			int warm = (w->tput_ema_warmup_ticks >=
+			    TPUT_EMA_WARMUP_TICKS);
+			pthread_mutex_unlock(&w->mu);
+
+			if (!healthy)
+				continue;
+			if (av == WORKER_AVAIL_READY)
+				n_ready++;
+			else if (av == WORKER_AVAIL_BUSY && warm && ema > 0)
+				busy_rates[n_busy++] = ema;
+		}
+		/* Projected solo-tail for each busy holder. */
+		uint64_t median = 0;
+		if (n_busy > 0) {
+			/* insertion sort the busy EMAs for the median */
+			for (int i = 1; i < n_busy; i++) {
+				uint64_t v = busy_rates[i];
+				int j;
+				for (j = i; j > 0 && busy_rates[j-1] > v; j--)
+					busy_rates[j] = busy_rates[j-1];
+				busy_rates[j] = v;
+			}
+			median = busy_rates[n_busy / 2];
+		}
+		for (int i = 0; i < p->num_workers && median > 0; i++) {
+			struct sftp_worker *w = p->workers[i];
+			int av = __atomic_load_n(&w->avail, __ATOMIC_RELAXED);
+
+			if (av != WORKER_AVAIL_BUSY)
+				continue;
+			pthread_mutex_lock(&w->mu);
+			int healthy = (w->health == WORKER_HEALTHY);
+			uint64_t ema = w->tput_ema_kbps;
+			int warm = (w->tput_ema_warmup_ticks >=
+			    TPUT_EMA_WARMUP_TICKS);
+			pthread_mutex_unlock(&w->mu);
+			if (!healthy || !warm || ema == 0)
+				continue;
+			if (ema * 100 < median * TAIL_HOLDER_LAG_PCT) {
+				lagging++;
+				uint64_t usz = __atomic_load_n(&w->unit_size,
+				    __ATOMIC_RELAXED);
+				uint64_t done = __atomic_load_n(&w->live_bytes,
+				    __ATOMIC_RELAXED);
+				if (usz > done) {
+					/* ema is kbps -> bytes/sec = *125 */
+					uint64_t bps = ema * 125;
+					uint64_t proj = bps ?
+					    (usz - done) / bps : 0;
+					if (proj > worst_proj_sec)
+						worst_proj_sec = proj;
+				}
+			}
+		}
+		pthread_mutex_unlock(&p->workers_mu);
+
+		if (n_ready > 0 && lagging > 0) {
+			uint64_t med_old = tail_quarter_median(
+			    p->tail_rate_ring, p->tail_ring_count,
+			    p->tail_ring_idx, 0);
+			uint64_t med_new = tail_quarter_median(
+			    p->tail_rate_ring, p->tail_ring_count,
+			    p->tail_ring_idx, 1);
+			int trend = (med_old > 0 && med_new <
+			    med_old * (100 - TAIL_DECLINE_PCT) / 100);
+			int project = (worst_proj_sec > TAIL_PROJECT_SEC);
+
+			if (trend || project) {
+				would_arm = 1;
+				if (!p->tail_episode &&
+				    getenv("HPN_BUNDLE_TIMING") != NULL)
+					logit("HPN TAIL-DETECT t=%.3f "
+					    "trend=%d proj=%llus "
+					    "agg_old=%llu agg_new=%llu "
+					    "ready=%d lagging=%d "
+					    "busy_median_kbps=%llu",
+					    (double)now / 1e9, trend,
+					    (unsigned long long)worst_proj_sec,
+					    (unsigned long long)med_old,
+					    (unsigned long long)med_new,
+					    n_ready, lagging,
+					    (unsigned long long)median);
+				if (!p->tail_episode) {
+					p->tail_episode = 1;
+					p->tail_episode_ns = now;
+					p->tail_episodes_total++;
+				}
+			}
+		}
+	}
+
+ resolve:
+	if (p->tail_episode && !would_arm) {
+		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+			logit("HPN TAIL-EPISODE-END t=%.3f dur=%.1fs "
+			    "pending=%llu",
+			    (double)now / 1e9,
+			    (double)(now - p->tail_episode_ns) / 1e9,
+			    (unsigned long long)p->pending);
+		p->tail_episode = 0;
+	}
+}
+
+/*
  * ENV-VAR HPN_BUNDLE_TIMING per-tick fleet sample (2026-06-05 midstream-freeze
  * probe).  One line: absolute time, work-queue depth, walker phase, then each
  * worker's phase + cumulative bytes + ssh child pid, plus the fleet total.
@@ -538,6 +717,9 @@ parallel_reporter_thread(void *arg)
 		    (off_t)(bytes - p->progress_bytes_baseline);
 		if (p->progress_meter_started)
 			refresh_progress_meter(0);
+
+		/* Tail trend detector (phase B: telemetry only). */
+		tail_detector_tick(p, bytes);
 
 		/* Liveness checks on a slower cadence (every 5 ticks ≈ 1s):
 		 * cheaper and watchdog timing doesn't need 200ms granularity. */

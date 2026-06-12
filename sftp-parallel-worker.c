@@ -951,6 +951,10 @@ parallel_worker_thread(void *arg)
 				item = NULL;
 			}
 		}
+		/* Availability intent: about to block in pop = purposefully
+		 * idle, healthy, ready for work (see enum worker_avail). */
+		__atomic_store_n(&w->avail, WORKER_AVAIL_READY,
+		    __ATOMIC_RELAXED);
 		if (item == NULL && sftp_workqueue_pop(p->q, &item) != 0) {
 			__atomic_store_n(&w->pop_start_ns, 0,
 			    __ATOMIC_RELEASE);
@@ -993,6 +997,10 @@ parallel_worker_thread(void *arg)
 				worker_give_up_pushfail(p, w, u0,
 				    "capgate/pushfail");
 			__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
+			/* Availability intent: cap-gate spin = available for
+			 * OTHER files, blocked on this one's writer cap. */
+			__atomic_store_n(&w->avail, WORKER_AVAIL_CAPPED,
+			    __ATOMIC_RELAXED);
 			if (++capped_passes >=
 			    (int)sftp_workqueue_depth(p->q) + 1) {
 				const struct timespec ts = { 0, 2L*1000*1000 };
@@ -1003,6 +1011,12 @@ parallel_worker_thread(void *arg)
 		}
 		capped_passes = 0;
 		__atomic_store_n(&w->phase, WPH_ASSEMBLE, __ATOMIC_RELAXED);
+		/* Availability intent + unit size for the tail detector's
+		 * projected-tail (size published beside unit_start_ns). */
+		__atomic_store_n(&w->avail, WORKER_AVAIL_BUSY,
+		    __ATOMIC_RELAXED);
+		__atomic_store_n(&w->unit_size, (uint64_t)u0->size,
+		    __ATOMIC_RELAXED);
 
 		/* DISPATCH-DIAG: worker pulled a unit off the queue.  If
 		 * "entered main loop" appears for a worker but no "popped"
@@ -1245,6 +1259,7 @@ parallel_worker_thread(void *arg)
 		 * timestamp so the watchdog only ever counts time spent
 		 * actually holding work. */
 		__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&w->unit_size, 0, __ATOMIC_RELAXED);
 
 		if (worker_should_terminate(w))
 			break;
