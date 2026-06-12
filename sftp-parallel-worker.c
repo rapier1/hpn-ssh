@@ -641,6 +641,24 @@ maybe_endgame_split(struct sftp_parallel *p, struct sftp_worker *w,
 	off_t piece, end;
 	int n, i;
 
+	/*
+	 * Default OFF pending re-evaluation (2026-06-11).  The split's
+	 * measured record: throughput benefit inside noise on large files
+	 * (06-10 campaign), actively harmful on files with fewer ranges
+	 * than workers (5x10GB campaigns: synchronized piece launches
+	 * inflated path RTT 101->312ms; 17s transfers became 40-88s), and
+	 * its rescue scenario - a wedged worker holding the tail - is
+	 * already covered by the watchdog's straggler reap + requeue.
+	 * ENV-VAR HPN_ENDGAME_SPLIT - developer-only: set to 1 to enable
+	 * for clean-window evaluation.
+	 */
+	{
+		const char *en = getenv("HPN_ENDGAME_SPLIT");
+
+		if (en == NULL || *en != '1')
+			return;
+	}
+
 	if (__atomic_load_n(&p->endgame_split_fired, __ATOMIC_RELAXED))
 		return;
 	if (u->op != SFTP_OP_UPLOAD_RANGE && u->op != SFTP_OP_DOWNLOAD_RANGE)
@@ -652,6 +670,21 @@ maybe_endgame_split(struct sftp_parallel *p, struct sftp_worker *w,
 		return;
 	if (p->abort_flag || p->stopped || sftp_workqueue_depth(p->q) != 0)
 		return;
+
+	/* Maturity gate: the split exists to drain the TAIL of a transfer.
+	 * On a file with fewer ranges than workers, every endgame condition
+	 * above is already true at t=0 (queue drains instantly, walker done,
+	 * idle workers), so the split fired before a byte had moved - and
+	 * the writer cap then released every piece in one synchronized
+	 * multi-connection burst when the originals finished, inflating path
+	 * RTT ~2.5x (measured 101->312ms) and dragging the tail.  Require at
+	 * least one completed range on this tracker before arming. */
+	pthread_mutex_lock(&t->mu);
+	if (t->remaining >= t->total) {
+		pthread_mutex_unlock(&t->mu);
+		return;
+	}
+	pthread_mutex_unlock(&t->mu);
 
 	{
 		const char *e = getenv("HPN_ENDGAME_SPLIT_N");
