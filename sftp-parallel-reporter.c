@@ -467,6 +467,28 @@ reporter_flare(struct sftp_parallel *p)
  * boundaries are logged under HPN_BUNDLE_TIMING for tuning; nothing is
  * actuated.  Constants and rationale: sftp-parallel-internal.h.
  */
+/* Median over a worker's personal rate window (all valid samples).
+ * Returns 0 when the worker lacks WORKER_RATE_MIN_SAMPLES of history -
+ * callers treat 0 as "no evidence, contributes nothing either way". */
+static uint64_t
+worker_window_median(const struct sftp_worker *w)
+{
+	uint64_t q[WORKER_RATE_RING];
+	int n = w->rate_ring_count, i, j;
+
+	if (n < WORKER_RATE_MIN_SAMPLES)
+		return 0;
+	for (i = 0; i < n; i++)
+		q[i] = w->rate_ring[i];
+	for (i = 1; i < n; i++) {
+		uint64_t v = q[i];
+		for (j = i; j > 0 && q[j - 1] > v; j--)
+			q[j] = q[j - 1];
+		q[j] = v;
+	}
+	return q[n / 2];
+}
+
 static uint64_t
 tail_quarter_median(const uint64_t *ring, int count, int idx, int newest)
 {
@@ -521,10 +543,22 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 		goto resolve;
 
 	{
-		int n_ready = 0, n_busy = 0, lagging = 0;
-		uint64_t busy_rates[SFTP_PARALLEL_MAX_WORKERS];
+		int n_ready = 0, n_ready_hist = 0, lagging = 0;
+		uint64_t ready_medians[SFTP_PARALLEL_MAX_WORKERS];
 		uint64_t worst_proj_sec = 0;
+		uint64_t baseline = 0, worst_holder_med = 0;
 
+		/*
+		 * Per-worker evidence (predicate rework): sample every BUSY
+		 * worker's personal rate into its window, then ask the only
+		 * question redistribution cares about - would the READY
+		 * workers, judged by their own demonstrated window medians,
+		 * do the holder's remaining work materially faster?  Workers
+		 * without WORKER_RATE_MIN_SAMPLES of history contribute
+		 * nothing on either side (a respawn's warmup can neither
+		 * accuse nor be accused - the measured source of the old
+		 * predicate's false positives).
+		 */
 		pthread_mutex_lock(&p->workers_mu);
 		for (int i = 0; i < p->num_workers; i++) {
 			struct sftp_worker *w = p->workers[i];
@@ -532,32 +566,56 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 
 			pthread_mutex_lock(&w->mu);
 			int healthy = (w->health == WORKER_HEALTHY);
-			uint64_t ema = w->tput_ema_kbps;
-			int warm = (w->tput_ema_warmup_ticks >=
-			    TPUT_EMA_WARMUP_TICKS);
+			uint64_t bt = w->bytes_total;
 			pthread_mutex_unlock(&w->mu);
+			uint64_t cur = bt + __atomic_load_n(&w->live_bytes,
+			    __ATOMIC_RELAXED);
+
+			/* Window sampling: BUSY workers only; idle workers
+			 * keep their last demonstrated samples. */
+			if (av == WORKER_AVAIL_BUSY) {
+				if (w->rate_prev_ns != 0 &&
+				    now > w->rate_prev_ns &&
+				    cur >= w->rate_prev_bytes) {
+					uint64_t r = (cur - w->rate_prev_bytes)
+					    * 1000000000ULL /
+					    (now - w->rate_prev_ns);
+					w->rate_ring[w->rate_ring_idx] = r;
+					w->rate_ring_idx =
+					    (w->rate_ring_idx + 1) %
+					    WORKER_RATE_RING;
+					if (w->rate_ring_count <
+					    WORKER_RATE_RING)
+						w->rate_ring_count++;
+				}
+				w->rate_prev_bytes = cur;
+				w->rate_prev_ns = now;
+			} else {
+				w->rate_prev_ns = 0; /* re-baseline on next BUSY */
+			}
 
 			if (!healthy)
 				continue;
-			if (av == WORKER_AVAIL_READY)
+			if (av == WORKER_AVAIL_READY) {
+				uint64_t m = worker_window_median(w);
 				n_ready++;
-			else if (av == WORKER_AVAIL_BUSY && warm && ema > 0)
-				busy_rates[n_busy++] = ema;
-		}
-		/* Projected solo-tail for each busy holder. */
-		uint64_t median = 0;
-		if (n_busy > 0) {
-			/* insertion sort the busy EMAs for the median */
-			for (int i = 1; i < n_busy; i++) {
-				uint64_t v = busy_rates[i];
-				int j;
-				for (j = i; j > 0 && busy_rates[j-1] > v; j--)
-					busy_rates[j] = busy_rates[j-1];
-				busy_rates[j] = v;
+				if (m > 0)
+					ready_medians[n_ready_hist++] = m;
 			}
-			median = busy_rates[n_busy / 2];
 		}
-		for (int i = 0; i < p->num_workers && median > 0; i++) {
+		/* Baseline = median of READY workers' demonstrated medians. */
+		if (n_ready_hist > 0) {
+			for (int i = 1; i < n_ready_hist; i++) {
+				uint64_t v = ready_medians[i];
+				int j;
+				for (j = i; j > 0 && ready_medians[j-1] > v;
+				    j--)
+					ready_medians[j] = ready_medians[j-1];
+				ready_medians[j] = v;
+			}
+			baseline = ready_medians[n_ready_hist / 2];
+		}
+		for (int i = 0; i < p->num_workers && baseline > 0; i++) {
 			struct sftp_worker *w = p->workers[i];
 			int av = __atomic_load_n(&w->avail, __ATOMIC_RELAXED);
 
@@ -565,23 +623,23 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 				continue;
 			pthread_mutex_lock(&w->mu);
 			int healthy = (w->health == WORKER_HEALTHY);
-			uint64_t ema = w->tput_ema_kbps;
-			int warm = (w->tput_ema_warmup_ticks >=
-			    TPUT_EMA_WARMUP_TICKS);
 			pthread_mutex_unlock(&w->mu);
-			if (!healthy || !warm || ema == 0)
+			if (!healthy)
 				continue;
-			if (ema * 100 < median * TAIL_HOLDER_LAG_PCT) {
+			uint64_t hmed = worker_window_median(w);
+			if (hmed == 0)
+				continue;	/* no evidence: cannot accuse */
+			if (hmed * 100 < baseline * TAIL_HOLDER_LAG_PCT) {
 				lagging++;
+				if (hmed > worst_holder_med ||
+				    worst_holder_med == 0)
+					worst_holder_med = hmed;
 				uint64_t usz = __atomic_load_n(&w->unit_size,
 				    __ATOMIC_RELAXED);
 				uint64_t done = __atomic_load_n(&w->live_bytes,
 				    __ATOMIC_RELAXED);
-				if (usz > done) {
-					/* ema is kbps -> bytes/sec = *125 */
-					uint64_t bps = ema * 125;
-					uint64_t proj = bps ?
-					    (usz - done) / bps : 0;
+				if (usz > done && hmed > 0) {
+					uint64_t proj = (usz - done) / hmed;
 					if (proj > worst_proj_sec)
 						worst_proj_sec = proj;
 				}
@@ -602,22 +660,39 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 
 			if (trend || project) {
 				would_arm = 1;
+				/*
+				 * Persistence gate: contention reshuffles
+				 * and post-respawn ramps look identical to
+				 * a straggler for a few seconds; only a
+				 * condition that HOLDS is actionable.  The
+				 * episode start backdates to when the lag
+				 * began, so reported durations stay true.
+				 */
+				if (p->tail_lag_start_ns == 0)
+					p->tail_lag_start_ns = now;
 				if (!p->tail_episode &&
-				    getenv("HPN_BUNDLE_TIMING") != NULL)
-					logit("HPN TAIL-DETECT t=%.3f "
-					    "trend=%d proj=%llus "
-					    "agg_old=%llu agg_new=%llu "
-					    "ready=%d lagging=%d "
-					    "busy_median_kbps=%llu",
-					    (double)now / 1e9, trend,
-					    (unsigned long long)worst_proj_sec,
-					    (unsigned long long)med_old,
-					    (unsigned long long)med_new,
-					    n_ready, lagging,
-					    (unsigned long long)median);
-				if (!p->tail_episode) {
+				    now - p->tail_lag_start_ns >=
+				    TAIL_CONFIRM_SEC * 1000000000ULL) {
+					if (getenv("HPN_BUNDLE_TIMING") != NULL)
+						logit("HPN TAIL-DETECT t=%.3f "
+						    "confirm=%.1fs trend=%d "
+						    "proj=%llus "
+						    "agg_old=%llu agg_new=%llu "
+						    "ready=%d ready_hist=%d "
+						    "lagging=%d holder_med=%llu "
+						    "ready_baseline=%llu",
+						    (double)now / 1e9,
+						    (double)(now -
+						    p->tail_lag_start_ns) / 1e9,
+						    trend,
+						    (unsigned long long)worst_proj_sec,
+						    (unsigned long long)med_old,
+						    (unsigned long long)med_new,
+						    n_ready, n_ready_hist, lagging,
+						    (unsigned long long)worst_holder_med,
+						    (unsigned long long)baseline);
 					p->tail_episode = 1;
-					p->tail_episode_ns = now;
+					p->tail_episode_ns = p->tail_lag_start_ns;
 					p->tail_episodes_total++;
 				}
 			}
@@ -625,6 +700,8 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 	}
 
  resolve:
+	if (!would_arm)
+		p->tail_lag_start_ns = 0;	/* condition broke: re-confirm */
 	if (p->tail_episode && !would_arm) {
 		if (getenv("HPN_BUNDLE_TIMING") != NULL)
 			logit("HPN TAIL-EPISODE-END t=%.3f dur=%.1fs "

@@ -503,8 +503,40 @@ enum worker_avail {
 #define TAIL_DECLINE_PCT       25   /* newest-quarter median below
 				     * oldest-quarter median by this % */
 #define TAIL_PROJECT_SEC       10   /* projected solo-tail threshold */
-#define TAIL_HOLDER_LAG_PCT    70   /* holder EMA below this % of the
-				     * busy-fleet median = lagging */
+#define TAIL_HOLDER_LAG_PCT    70   /* holder's window median below this
+				     * % of the READY baseline = lagging */
+#define TAIL_CONFIRM_SEC        8   /* arm condition must hold continuously
+				     * this long (wall clock) before an
+				     * episode latches.  Measured basis
+				     * (2026-06-12 campaign): every clean-run
+				     * false positive self-resolved in 2-5s
+				     * (contention reshuffle / post-respawn
+				     * ramp - on a shared bottleneck one
+				     * worker's fast IS another's slow), the
+				     * genuine throttled straggler lagged
+				     * 36s continuously.  Persistence is the
+				     * discriminator; instantaneous lag
+				     * ratios overlap.  Mirrors the design
+				     * spec: humans tolerate brief variance
+				     * and react to SUSTAINED decline. */
+
+/*
+ * Per-worker rate windows (predicate rework, 2026-06-12).  The reporter
+ * samples each BUSY worker's personal rate into a small per-worker ring;
+ * idle workers keep their last demonstrated samples.  The lagging test
+ * becomes "holder's window median < READY workers' demonstrated medians
+ * x LAG_PCT" - i.e. would the available workers demonstrably do this
+ * faster?  Fixes three measured failures of the fleet-median predicate:
+ * the self-referential collapse when only the straggler stays busy
+ * (151842 -> 23807 kbps as the busy set shrank), idle-worker deflation,
+ * and respawn-warmup false positives (episodes in ~2/3 of churny clean
+ * runs: a fresh worker's warming EMA read as "lagging" - here a worker
+ * with fewer than WORKER_RATE_MIN_SAMPLES contributes nothing in either
+ * role).
+ */
+#define WORKER_RATE_RING        25  /* ~5s of BUSY-time samples */
+#define WORKER_RATE_MIN_SAMPLES 12  /* ~2.4s of history before a worker's
+				     * median counts (either side) */
 
 /*
  * ENV-VAR HPN_BUNDLE_TIMING midstream-freeze probe (2026-06-05).  Each worker
@@ -846,6 +878,15 @@ struct sftp_worker {
 						* dispatch beside unit_start_ns,
 						* 0 when idle); feeds the tail
 						* detector's projected-tail */
+	/* Per-worker rate window (reporter thread only): personal rate
+	 * samples taken each tick while BUSY; retained while idle so a
+	 * READY worker's demonstrated capability stays in evidence.  See
+	 * WORKER_RATE_RING in the tail-detector constants. */
+	uint64_t           rate_ring[WORKER_RATE_RING];
+	int                rate_ring_idx;
+	int                rate_ring_count;
+	uint64_t           rate_prev_bytes;
+	uint64_t           rate_prev_ns;
 
 	int                started;
 	int                exited;             /* (C) set by worker on
@@ -959,6 +1000,11 @@ struct sftp_parallel {
 	int                         tail_episode;      /* latch: in episode */
 	uint64_t                    tail_episode_ns;   /* episode start */
 	int                         tail_episodes_total; /* per-transfer count */
+	uint64_t                    tail_lag_start_ns; /* when the arm condition
+						         * became continuously
+						         * true; episode latches
+						         * only after it holds
+						         * TAIL_CONFIRM_SEC */
 	uint64_t                    session_start_ns;  /* monotime_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in
