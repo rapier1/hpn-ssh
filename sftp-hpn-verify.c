@@ -761,7 +761,7 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 		    (unsigned long long)run_off,
 		    (unsigned long long)run_len, local_path);
 		if (sftp_upload_range(conn, local_path, remote_path,
-		    (off_t)run_off, (off_t)run_len) != 0) {
+		    (off_t)run_off, (off_t)run_len, NULL) != 0) {
 			/* A dead connection (worker churn) is handled fallout -
 			 * the full-file path retries it; only a failure on a
 			 * live connection deserves the user's attention. */
@@ -920,7 +920,7 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 		    (unsigned long long)run_off,
 		    (unsigned long long)run_len, local_path);
 		if (sftp_download_range(conn, remote_path, local_path,
-		    (off_t)run_off, (off_t)run_len) != 0) {
+		    (off_t)run_off, (off_t)run_len, NULL) != 0) {
 			error_f("re-fetch of chunks [%u, %u) failed for "
 			    "\"%s\"; falling back to full-file path",
 			    run_start, i, local_path);

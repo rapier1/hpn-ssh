@@ -163,11 +163,19 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		 * the orchestrator/finalize level, not per-range; see
 		 * project_parallel_resume_verify_design (Phase 1 follow-up). */
 		rc = sftp_upload_range(w->conn, u->src_path, u->dst_path,
-		    u->range_offset, u->range_length);
+		    u->range_offset, u->range_length, &u->acked_bytes);
+		debug("unit-exec: worker %d UPLOAD_RANGE [%lld+%lld) rc=%d "
+		    "acked=%lld attempt=%d", w->id,
+		    (long long)u->range_offset, (long long)u->range_length,
+		    rc, (long long)u->acked_bytes, u->attempt);
 		break;
 	case SFTP_OP_DOWNLOAD_RANGE:
 		rc = sftp_download_range(w->conn, u->src_path, u->dst_path,
-		    u->range_offset, u->range_length);
+		    u->range_offset, u->range_length, &u->acked_bytes);
+		debug("unit-exec: worker %d DOWNLOAD_RANGE [%lld+%lld) rc=%d "
+		    "acked=%lld attempt=%d", w->id,
+		    (long long)u->range_offset, (long long)u->range_length,
+		    rc, (long long)u->acked_bytes, u->attempt);
 		break;
 	case SFTP_OP_DOWNLOAD:
 		rc = sftp_download(w->conn, u->src_path, u->dst_path,
@@ -285,6 +293,34 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		 *     the transient condition time to clear before the retry.
 		 */
 		int transient = sftp_conn_is_dead(w->conn);
+
+		/*
+		 * Highwater resume (HPN): the failed attempt confirmed
+		 * acked_bytes contiguous bytes on the target, so the unit
+		 * requeues as just its unlanded remainder - worker death
+		 * costs the in-flight window, not the whole range.  Progress
+		 * also RESETS the retry budget: attempts only count when
+		 * they were fruitless, so a flaky-but-advancing range cannot
+		 * exhaust retries and give up at 90% transferred.  The
+		 * tracker is untouched: same unit, same single finalize.
+		 */
+		if ((u->op == SFTP_OP_UPLOAD_RANGE ||
+		    u->op == SFTP_OP_DOWNLOAD_RANGE) &&
+		    u->acked_bytes > 0 &&
+		    u->acked_bytes < u->range_length) {
+			debug("worker %d: range \"%s\" [%lld+%lld) resumes "
+			    "past %lld acked bytes", w->id,
+			    u->dst_path ? u->dst_path : u->src_path,
+			    (long long)u->range_offset,
+			    (long long)u->range_length,
+			    (long long)u->acked_bytes);
+			u->range_offset += u->acked_bytes;
+			u->range_length -= u->acked_bytes;
+			u->size = u->range_length;
+			u->attempt = 0;
+			u->acked_bytes = 0;
+		}
+
 		if (!u->no_retry &&
 		    (transient || ++u->attempt < parallel_unit_max_retries(p))) {
 			if (u->size > 0)

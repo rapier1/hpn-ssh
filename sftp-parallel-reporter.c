@@ -312,12 +312,18 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 		 * used to die with the struct, undercounting every
 		 * post-respawn aggregate. */
 		if (exited) {
+			uint64_t cw = w->conn ?
+			    sftp_conn_bytes_wired(w->conn) : 0;
+
 			p->retired_bytes += bt;
-			if (w->conn)
-				p->retired_wired +=
-				    sftp_conn_bytes_wired(w->conn);
+			p->retired_wired += cw;
 			p->retired_units_completed += w->units_completed;
 			p->retired_units_failed   += w->units_failed;
+			debug("reap-capture: worker %d conn=%p wired=%llu "
+			    "bt=%llu retired_wired_now=%llu", w->id,
+			    (void *)w->conn, (unsigned long long)cw,
+			    (unsigned long long)bt,
+			    (unsigned long long)p->retired_wired);
 		}
 		pthread_mutex_unlock(&w->mu);
 		if (exited) {

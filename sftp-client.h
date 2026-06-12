@@ -476,7 +476,8 @@ int sftp_create_file(struct sftp_conn *, const char *remote_path, mode_t,
  * Returns 0 on success, -1 on error.
  */
 int sftp_upload_range(struct sftp_conn *, const char *local_path,
-    const char *remote_path, off_t range_offset, off_t range_length);
+    const char *remote_path, off_t range_offset, off_t range_length,
+    off_t *acked_out);
 
 /*
  * Download a byte range of a remote file into the corresponding byte range
@@ -493,7 +494,8 @@ int sftp_upload_range(struct sftp_conn *, const char *local_path,
  * Returns 0 on success, -1 on error.
  */
 int sftp_download_range(struct sftp_conn *, const char *remote_path,
-    const char *local_path, off_t range_offset, off_t range_length);
+    const char *local_path, off_t range_offset, off_t range_length,
+    off_t *acked_out);
 
 /* Concatenate paths, taking care of slashes. Caller must free result. */
 char *sftp_path_append(const char *, const char *);

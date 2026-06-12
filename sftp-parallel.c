@@ -897,6 +897,10 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 		 * worker, so reading under the worker mutex is fine and we
 		 * already hold it. */
 		w_bytes_wired += sftp_conn_bytes_wired(w->conn);
+		debug("stats-sum: worker %d conn=%p wired=%llu bt=%llu",
+		    w->id, (void *)w->conn,
+		    (unsigned long long)sftp_conn_bytes_wired(w->conn),
+		    (unsigned long long)w->bytes_total);
 		pthread_mutex_unlock(&w->mu);
 	}
 	/* Add back what reaped (respawned/dead) workers contributed - their
@@ -909,6 +913,11 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	w_bytes_wired += p->retired_wired;
 	c             += p->retired_units_completed;
 	f             += p->retired_units_failed;
+	debug("stats-sum: retired_wired=%llu retired_bytes=%llu -> "
+	    "aggregate wired=%llu bt=%llu",
+	    (unsigned long long)p->retired_wired,
+	    (unsigned long long)p->retired_bytes,
+	    (unsigned long long)w_bytes_wired, (unsigned long long)b);
 	pthread_mutex_unlock(&p->workers_mu);
 
 	out->bytes_total_aggregate = b;

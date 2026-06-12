@@ -248,9 +248,14 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 
 #ifdef HPN_FAULT_INJECTION
 	if (sftp_hpn_check_fault(conn->hpn, msg_len + sizeof(mlen)) != 0) {
-		close(conn->fd_in);
-		close(conn->fd_out);
-		conn->fd_in = conn->fd_out = -1;
+		/* Mark dead exactly like the real EPIPE path above - do NOT
+		 * close the fds here.  Production deaths never close at this
+		 * layer (teardown happens via the orchestrator's accounted
+		 * paths); closing here freed the numbers early, the kernel
+		 * recycled them to other threads' files, and the reaper's
+		 * later by-number close killed innocent fds (EBADF storms,
+		 * silent short ranges - the 2026-06-12 hunt). */
+		conn->hpn->dead = 1;
 		return -1;
 	}
 #endif /* HPN_FAULT_INJECTION */
@@ -3236,7 +3241,8 @@ sftp_create_file(struct sftp_conn *conn, const char *remote_path, mode_t mode,
 
 int
 sftp_upload_range(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, off_t range_offset, off_t range_length)
+    const char *remote_path, off_t range_offset, off_t range_length,
+    off_t *acked_out)
 {
 	struct sshbuf *msg;
 	struct request {
@@ -3251,9 +3257,12 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	size_t handle_len;
 	u_int id, ackid;
 	uint32_t status = SSH2_FX_OK;
-	off_t offset, bytes_left;
+	off_t offset = range_offset, bytes_left;
+	off_t first_fail_off = -1;
 	int local_fd = -1, ret = -1, r;
 
+	if (acked_out != NULL)
+		*acked_out = 0;
 	TAILQ_INIT(&acks);
 
 	if ((local_fd = open(local_path, O_RDONLY)) < 0) {
@@ -3297,8 +3306,22 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			while (len == -1 &&
 			    (errno == EINTR || errno == EAGAIN ||
 			     errno == EWOULDBLOCK));
-			if (len <= 0)
+			if (len <= 0) {
+				/* Mid-range EOF/read-error: should be
+				 * impossible on an intact source (length is
+				 * clamped at submit).  Loudly diagnose - the
+				 * silent break here masked partial sends as
+				 * success until 2026-06-12. */
+				error("read local \"%s\" at offset %lld: "
+				    "len=%d errno=%s (range [%lld+%lld), "
+				    "%lld left)", local_path,
+				    (long long)offset, len,
+				    len < 0 ? strerror(errno) : "EOF",
+				    (long long)range_offset,
+				    (long long)range_length,
+				    (long long)bytes_left);
 				break;
+			}
 
 			ack = xcalloc(1, sizeof(*ack));
 			ack->id     = ++id;
@@ -3361,6 +3384,13 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			error("write remote \"%s\" at offset %llu: %s",
 			    remote_path, (unsigned long long)ack->offset,
 			    fx2txt(status));
+			/* Highwater clamp: acks are processed in order, but
+			 * the loop keeps draining after a failed write, so
+			 * later OK acks would advance the head past a HOLE.
+			 * Contiguous progress ends at the first failure. */
+			if (first_fail_off < 0 ||
+			    (off_t)ack->offset < first_fail_off)
+				first_fail_off = (off_t)ack->offset;
 		} else {
 			/* HPN adaptive read-ahead: feed acked bytes. */
 			sftp_hpn_rdahead_account(conn->hpn, ack->len);
@@ -3381,8 +3411,43 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	if (sftp_close(conn, handle, handle_len) != 0)
 		status = SSH2_FX_FAILURE;
 
+	/* GUARD: a range that did not send every byte is NOT a success,
+	 * whatever the status says - the send loop can exit early (local
+	 * read failure, future logic changes) and silently finalizing a
+	 * short range as complete is data loss.  Fail it; the caller's
+	 * retry/highwater-resume machinery finishes the remainder. */
+	if (status == SSH2_FX_OK && bytes_left > 0) {
+		error("range [%lld+%lld) of \"%s\" incomplete at success "
+		    "exit (%lld bytes unsent) - failing the unit for retry",
+		    (long long)range_offset, (long long)range_length,
+		    local_path, (long long)bytes_left);
+		status = SSH2_FX_FAILURE;
+	}
+
 	ret = (status == SSH2_FX_OK) ? 0 : -1;
  out:
+	debug("upload-range-exit: [%lld+%lld) ret=%d status=%u "
+	    "final_offset=%lld bytes_left=%lld outstanding=%s",
+	    (long long)range_offset, (long long)range_length, ret, status,
+	    (long long)offset, (long long)bytes_left,
+	    TAILQ_EMPTY(&acks) ? "none" : "some");
+	/*
+	 * Contiguous-acked highwater for resume-on-requeue (HPN).  Acks are
+	 * processed strictly in order, so everything below the head of the
+	 * outstanding list is acknowledged; with the list empty, everything
+	 * sent is.  Clamped at the first failed write offset (a hole ends
+	 * contiguity).  On success the caller does not need it; on failure
+	 * the worker requeues only [range_offset + acked, end).
+	 */
+	if (acked_out != NULL) {
+		off_t hw = TAILQ_EMPTY(&acks) ?
+		    offset : (off_t)TAILQ_FIRST(&acks)->offset;
+
+		if (first_fail_off >= 0 && first_fail_off < hw)
+			hw = first_fail_off;
+		if (hw > range_offset)
+			*acked_out = hw - range_offset;
+	}
 	while ((ack = TAILQ_FIRST(&acks)) != NULL) {
 		TAILQ_REMOVE(&acks, ack, tq);
 		free(ack);
@@ -3393,9 +3458,26 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	return ret;
 }
 
+/* Lowest outstanding read offset (HPN highwater helper): everything below
+ * the floor of the in-flight request set has been received and written.
+ * With nothing outstanding, contiguity extends to next_off. */
+static off_t
+dl_outstanding_floor(struct requests *q, uint64_t next_off)
+{
+	struct request *r2;
+	off_t hw = (off_t)next_off;
+
+	TAILQ_FOREACH(r2, q, tq) {
+		if ((off_t)r2->offset < hw)
+			hw = (off_t)r2->offset;
+	}
+	return hw;
+}
+
 int
 sftp_download_range(struct sftp_conn *conn, const char *remote_path,
-    const char *local_path, off_t range_offset, off_t range_length)
+    const char *local_path, off_t range_offset, off_t range_length,
+    off_t *acked_out)
 {
 	struct sshbuf *msg;
 	struct requests requests;
@@ -3407,7 +3489,10 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	off_t bytes_left;
 	int local_fd = -1, read_error = 0, write_error = 0, write_errno = 0;
 	int ret = -1, r;
+	off_t contig_hw = -1;	/* HPN: min over failure-site floors/clamps */
 
+	if (acked_out != NULL)
+		*acked_out = 0;
 	TAILQ_INIT(&requests);
 
 	/* Open remote file for reading. */
@@ -3453,6 +3538,12 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 		double t_data_start = monotime_double();
 		if (get_msg_extended(conn, msg, 0) != 0) {
 			read_error = 1;
+			if (acked_out != NULL) {
+				off_t f = dl_outstanding_floor(&requests,
+				    remote_offset);
+				if (contig_hw < 0 || f < contig_hw)
+					contig_hw = f;
+			}
 			while ((req = TAILQ_FIRST(&requests)) != NULL) {
 				TAILQ_REMOVE(&requests, req, tq);
 				free(req);
@@ -3480,6 +3571,15 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				error("read remote \"%s\": %s",
 				    remote_path, fx2txt(status));
 			read_error = 1;
+			/* The failing read's own offset bounds contiguity. */
+			if (contig_hw < 0 || (off_t)req->offset < contig_hw)
+				contig_hw = (off_t)req->offset;
+			if (acked_out != NULL) {
+				off_t f = dl_outstanding_floor(&requests,
+				    remote_offset);
+				if (contig_hw < 0 || f < contig_hw)
+					contig_hw = f;
+			}
 			TAILQ_REMOVE(&requests, req, tq);
 			free(req);
 			while ((req = TAILQ_FIRST(&requests)) != NULL) {
@@ -3504,6 +3604,11 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				write_errno = errno;
 				write_error = 1;
 				max_req = 0;
+				/* Data past this point may be received but
+				 * is not on disk; bound contiguity here. */
+				if (contig_hw < 0 ||
+				    (off_t)req->offset < contig_hw)
+					contig_hw = (off_t)req->offset;
 			} else if (conn->hpn->live_counter != NULL) {
 				__atomic_fetch_add(conn->hpn->live_counter,
 				    (uint64_t)len, __ATOMIC_RELAXED);
@@ -3533,6 +3638,12 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			    SSH2_FXP_DATA, type);
 			sftp_hpn_set_protocol_violation(conn->hpn);
 			read_error = 1;
+			if (acked_out != NULL) {
+				off_t f = dl_outstanding_floor(&requests,
+				    remote_offset);
+				if (contig_hw < 0 || f < contig_hw)
+					contig_hw = f;
+			}
 			while ((req = TAILQ_FIRST(&requests)) != NULL) {
 				TAILQ_REMOVE(&requests, req, tq);
 				free(req);
@@ -3553,10 +3664,40 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			sftp_conn_die(conn, "range download of \"%s\" ended "
 			    "with requests still in flight (connection lost)",
 			    remote_path);
+		if (acked_out != NULL) {
+			off_t f = dl_outstanding_floor(&requests,
+			    remote_offset);
+			if (contig_hw < 0 || f < contig_hw)
+				contig_hw = f;
+		}
 		while ((req = TAILQ_FIRST(&requests)) != NULL) {
 			TAILQ_REMOVE(&requests, req, tq);
 			free(req);
 		}
+		read_error = 1;
+	}
+
+	/* HPN highwater out: contiguous bytes received AND written from the
+	 * range start.  contig_hw < 0 means no failure bounded it (clean
+	 * completion or nothing in flight): everything requested landed. */
+	if (acked_out != NULL) {
+		off_t hw = (contig_hw >= 0) ? contig_hw : (off_t)remote_offset;
+
+		if (hw > range_offset)
+			*acked_out = hw - range_offset;
+	}
+
+	/* GUARD (twin of upload_range's): a range that did not request and
+	 * receive every byte is NOT a success, whatever the error flags say -
+	 * the request loop can exit early (max_req collapse, future logic
+	 * changes) and silently finalizing a short range as complete is data
+	 * loss.  bytes_left counts the unrequested remainder; with no
+	 * outstanding requests it must be zero at a genuine completion. */
+	if (!read_error && !write_error && bytes_left > 0) {
+		error("range [%lld+%lld) of \"%s\" incomplete at success "
+		    "exit (%lld bytes unrequested) - failing the unit for "
+		    "retry", (long long)range_offset, (long long)range_length,
+		    remote_path, (long long)bytes_left);
 		read_error = 1;
 	}
 

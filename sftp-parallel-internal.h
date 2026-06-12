@@ -608,6 +608,11 @@ struct sftp_work_unit {
 	mode_t   mode;
 	int      no_retry;   /* permanent failure (EACCES/EDQUOT/EROFS/
 			      * ENOSPC class): give up without retries */
+	off_t    acked_bytes; /* highwater resume (HPN): contiguous bytes
+			       * confirmed transferred by the last execution
+			       * attempt of this RANGE unit.  On requeue the
+			       * unit advances past them instead of
+			       * re-sending the whole range. */
 	int      attempt;
 	/* Per-unit resume/verify (whole-file units only - set by the public
 	 * submit entry points).  Carries the originating command's intent
