@@ -321,6 +321,13 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 		return -1;
 	}
 	}
+
+	/* FAULT-INJ: test-scaffolding hook; no-op unless built with
+	 * -DHPN_FAULT_INJECTION.  Delaying here backpressures the local ssh
+	 * child's pipe and thus the SSH channel window - a manufactured
+	 * slow DOWNLOAD stream.  See sftp-fault-inject.c. */
+	fault_inj_check_recv(conn->hpn, msg_len + 4);
+
 	return 0;
 }
 

@@ -35,6 +35,15 @@ static struct {
 	pthread_once_t once;
 } fault_inj_throttle_state = { 0, 0, 0, PTHREAD_ONCE_INIT };
 
+/* Throttle state for SFTP_FAULT_THROTTLE_RECV - manufactured download
+ * stragglers (slow stream as observed by every client instrument). */
+static struct {
+	uint64_t       threshold;   /* start throttling after N recvd bytes */
+	uint64_t       delay_ms;    /* sleep per receive once throttled */
+	int            slots_left;  /* connections allowed to throttle */
+	pthread_once_t once;
+} fault_inj_rthrottle_state = { 0, 0, 0, PTHREAD_ONCE_INIT };
+
 /* Parallel state for SFTP_FAULT_PROTOCOL - protocol violations. */
 static struct {
 	uint64_t       threshold;
@@ -97,6 +106,27 @@ fault_inj_throttle_state_init(void)
 	    (int)strtol(ep + 1, NULL, 10) : 1;
 }
 
+static void
+fault_inj_rthrottle_state_init(void)
+{
+	const char *ev = getenv("SFTP_FAULT_THROTTLE_RECV");
+	char *ep;
+	uint64_t bytes, delay;
+
+	if (ev == NULL)
+		return;
+	bytes = strtoull(ev, &ep, 10);
+	if (bytes == 0 || *ep != ':')
+		return;
+	delay = strtoull(ep + 1, &ep, 10);
+	if (delay == 0)
+		return;
+	fault_inj_rthrottle_state.threshold  = bytes;
+	fault_inj_rthrottle_state.delay_ms   = delay;
+	fault_inj_rthrottle_state.slots_left = (*ep == ':') ?
+	    (int)strtol(ep + 1, NULL, 10) : 1;
+}
+
 void
 fault_inj_arm_conn(struct sftp_hpn_conn *hpn)
 {
@@ -118,6 +148,16 @@ fault_inj_arm_conn(struct sftp_hpn_conn *hpn)
 		    "will slow to %llums/send after %llu bytes sent",
 		    (unsigned long long)fault_inj_throttle_state.delay_ms,
 		    (unsigned long long)fault_inj_throttle_state.threshold);
+	}
+	pthread_once(&fault_inj_rthrottle_state.once,
+	    fault_inj_rthrottle_state_init);
+	if (fault_inj_rthrottle_state.threshold > 0) {
+		hpn->fault_recv_throttle_after_bytes =
+		    fault_inj_rthrottle_state.threshold;
+		error("sftp: recv-throttle fault injection enabled: connection "
+		    "will slow to %llums/recv after %llu bytes received",
+		    (unsigned long long)fault_inj_rthrottle_state.delay_ms,
+		    (unsigned long long)fault_inj_rthrottle_state.threshold);
 	}
 	pthread_once(&fault_inj_pv_state.once, fault_inj_pv_state_init);
 	if (fault_inj_pv_state.threshold > 0) {
@@ -216,6 +256,47 @@ fault_inj_check_send(struct sftp_hpn_conn *hpn, size_t bytes)
 	}
 
 	return 0;
+}
+
+void
+fault_inj_check_recv(struct sftp_hpn_conn *hpn, size_t bytes)
+{
+	if (hpn == NULL || hpn->fault_recv_throttle_after_bytes == 0)
+		return;
+
+	hpn->fault_bytes_recvd += bytes;
+	if (hpn->fault_bytes_recvd < hpn->fault_recv_throttle_after_bytes)
+		return;
+
+	/* Same slot discipline as the send throttle: claim once, or disarm
+	 * this connection if the slots are taken.  Never kills - a live,
+	 * progressing, SLOW stream. */
+	if (!hpn->fault_recv_throttling) {
+		int prev = __atomic_fetch_sub(
+		    &fault_inj_rthrottle_state.slots_left, 1,
+		    __ATOMIC_SEQ_CST);
+		if (prev > 0) {
+			hpn->fault_recv_throttling = 1;
+			error("sftp: fault injection: recv-throttling "
+			    "connection (%llums/recv) after %llu "
+			    "bytes received",
+			    (unsigned long long)
+			    fault_inj_rthrottle_state.delay_ms,
+			    (unsigned long long)hpn->fault_bytes_recvd);
+		} else {
+			__atomic_fetch_add(
+			    &fault_inj_rthrottle_state.slots_left, 1,
+			    __ATOMIC_SEQ_CST);
+			hpn->fault_recv_throttle_after_bytes = 0;
+		}
+	}
+	if (hpn->fault_recv_throttling) {
+		struct timespec ts = {
+		    (time_t)(fault_inj_rthrottle_state.delay_ms / 1000),
+		    (long)(fault_inj_rthrottle_state.delay_ms % 1000) *
+		    1000000L };
+		nanosleep(&ts, NULL);
+	}
 }
 
 #else /* !HPN_FAULT_INJECTION */
