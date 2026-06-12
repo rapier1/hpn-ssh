@@ -14,6 +14,11 @@
  *       most <max_kills> connections die (default unlimited).
  *   ENV-VAR SFTP_FAULT_PROTOCOL=<bytes>[:<max_kills>]
  *       a connection reports a protocol violation after <bytes>.
+ *   ENV-VAR SFTP_FAULT_THROTTLE=<bytes>:<delay_ms>[:<max_conns>]
+ *       after <bytes> sent, every further send on the connection sleeps
+ *       <delay_ms> - a manufactured STRAGGLER (degraded path / slow
+ *       peer), not a death.  At most <max_conns> connections throttle
+ *       (default 1).  Built for tuning the tail trend detector.
  */
 
 #ifndef SFTP_FAULT_INJECT_H

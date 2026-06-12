@@ -159,6 +159,8 @@ struct sftp_hpn_conn {
 	uint64_t fault_after_bytes;    /* die after N bytes sent (0=off) */
 	uint64_t fault_pv_after_bytes; /* protocol violation after N bytes (0=off) */
 	uint64_t fault_bytes_sent;     /* bytes sent so far on this connection */
+	uint64_t fault_throttle_after_bytes; /* throttle after N bytes (0=off) */
+	int      fault_throttling;     /* this conn holds a throttle slot */
 #endif
 };
 

@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "log.h"
 #include "sftp.h"
@@ -25,6 +26,14 @@ static struct {
 	int            kills_left; /* remaining kill slots; INT_MAX = unlimited */
 	pthread_once_t once;
 } fault_inj_state = { 0, 0, PTHREAD_ONCE_INIT };
+
+/* Throttle state for SFTP_FAULT_THROTTLE - manufactured stragglers. */
+static struct {
+	uint64_t       threshold;   /* start throttling after N sent bytes */
+	uint64_t       delay_ms;    /* sleep per send once throttled */
+	int            slots_left;  /* connections allowed to throttle */
+	pthread_once_t once;
+} fault_inj_throttle_state = { 0, 0, 0, PTHREAD_ONCE_INIT };
 
 /* Parallel state for SFTP_FAULT_PROTOCOL - protocol violations. */
 static struct {
@@ -67,6 +76,27 @@ fault_inj_pv_state_init(void)
 	    (int)strtol(ep + 1, NULL, 10) : INT_MAX;
 }
 
+static void
+fault_inj_throttle_state_init(void)
+{
+	const char *ev = getenv("SFTP_FAULT_THROTTLE");
+	char *ep;
+	uint64_t bytes, delay;
+
+	if (ev == NULL)
+		return;
+	bytes = strtoull(ev, &ep, 10);
+	if (bytes == 0 || *ep != ':')
+		return;
+	delay = strtoull(ep + 1, &ep, 10);
+	if (delay == 0)
+		return;
+	fault_inj_throttle_state.threshold  = bytes;
+	fault_inj_throttle_state.delay_ms   = delay;
+	fault_inj_throttle_state.slots_left = (*ep == ':') ?
+	    (int)strtol(ep + 1, NULL, 10) : 1;
+}
+
 void
 fault_inj_arm_conn(struct sftp_hpn_conn *hpn)
 {
@@ -78,6 +108,16 @@ fault_inj_arm_conn(struct sftp_hpn_conn *hpn)
 		error("sftp: fault injection enabled: "
 		    "connection will die after %llu bytes sent",
 		    (unsigned long long)fault_inj_state.threshold);
+	}
+	pthread_once(&fault_inj_throttle_state.once,
+	    fault_inj_throttle_state_init);
+	if (fault_inj_throttle_state.threshold > 0) {
+		hpn->fault_throttle_after_bytes =
+		    fault_inj_throttle_state.threshold;
+		error("sftp: throttle fault injection enabled: connection "
+		    "will slow to %llums/send after %llu bytes sent",
+		    (unsigned long long)fault_inj_throttle_state.delay_ms,
+		    (unsigned long long)fault_inj_throttle_state.threshold);
 	}
 	pthread_once(&fault_inj_pv_state.once, fault_inj_pv_state_init);
 	if (fault_inj_pv_state.threshold > 0) {
@@ -96,10 +136,44 @@ fault_inj_check_send(struct sftp_hpn_conn *hpn, size_t bytes)
 		return 0;
 
 	/* Only accumulate if at least one fault type is armed. */
-	if (hpn->fault_after_bytes == 0 && hpn->fault_pv_after_bytes == 0)
+	if (hpn->fault_after_bytes == 0 && hpn->fault_pv_after_bytes == 0 &&
+	    hpn->fault_throttle_after_bytes == 0)
 		return 0;
 
 	hpn->fault_bytes_sent += bytes;
+
+	/* Throttle: once over the threshold (and holding a slot), sleep per
+	 * send - a live, progressing, SLOW connection.  Never kills. */
+	if (hpn->fault_throttle_after_bytes > 0 &&
+	    hpn->fault_bytes_sent >= hpn->fault_throttle_after_bytes) {
+		if (!hpn->fault_throttling) {
+			int prev = __atomic_fetch_sub(
+			    &fault_inj_throttle_state.slots_left, 1,
+			    __ATOMIC_SEQ_CST);
+			if (prev > 0) {
+				hpn->fault_throttling = 1;
+				error("sftp: fault injection: throttling "
+				    "connection (%llums/send) after %llu "
+				    "bytes sent",
+				    (unsigned long long)
+				    fault_inj_throttle_state.delay_ms,
+				    (unsigned long long)
+				    hpn->fault_bytes_sent);
+			} else {
+				__atomic_fetch_add(
+				    &fault_inj_throttle_state.slots_left, 1,
+				    __ATOMIC_SEQ_CST);
+				hpn->fault_throttle_after_bytes = 0;
+			}
+		}
+		if (hpn->fault_throttling) {
+			struct timespec ts = {
+			    (time_t)(fault_inj_throttle_state.delay_ms / 1000),
+			    (long)(fault_inj_throttle_state.delay_ms % 1000) *
+			    1000000L };
+			nanosleep(&ts, NULL);
+		}
+	}
 
 	/* Check protocol-violation fault first (higher priority signal). */
 	if (hpn->fault_pv_after_bytes > 0 &&
