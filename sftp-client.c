@@ -827,6 +827,22 @@ sftp_set_live_counter(struct sftp_conn *conn, volatile uint64_t *counter)
 }
 
 void
+sftp_set_yield_flag(struct sftp_conn *conn, volatile int *flag)
+{
+	if (conn != NULL)
+		sftp_hpn_set_yield_flag(conn->hpn, flag);
+}
+
+/* Cooperative yield requested for this connection (tail redistribution)?
+ * Checked once per loop iteration by the range transfer paths. */
+static int
+yield_requested(struct sftp_conn *conn)
+{
+	return conn->hpn->yield_flag != NULL &&
+	    __atomic_load_n(conn->hpn->yield_flag, __ATOMIC_RELAXED);
+}
+
+void
 sftp_conn_die(struct sftp_conn *conn, const char *fmt, ...)
 {
 	char buf[1024];
@@ -3258,7 +3274,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	uint32_t status = SSH2_FX_OK;
 	off_t offset = range_offset, bytes_left;
 	off_t first_fail_off = -1;
-	int local_fd = -1, ret = -1, r;
+	int local_fd = -1, ret = -1, r, yielded = 0;
 
 	if (acked_out != NULL)
 		*acked_out = 0;
@@ -3291,10 +3307,18 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		int len = 0;
 		size_t outstanding = id - ackid + 1;
 
+		/* Cooperative yield (HPN tail redistribution): stop sending
+		 * NEW writes; the in-order ack drain below runs to completion,
+		 * so the contiguous-acked highwater lands exactly at the end
+		 * of the last write already sent - the caller requeues only
+		 * the untouched remainder. */
+		if (!yielded && yield_requested(conn))
+			yielded = 1;
+
 		/* Send new requests while there is data and pipeline capacity.
 		 * HPN adaptive read-ahead caps the depth (num_requests when
 		 * disabled). */
-		while (bytes_left > 0 &&
+		while (!yielded && bytes_left > 0 &&
 		    outstanding < sftp_hpn_rdahead_cap(conn->hpn,
 		    conn->num_requests) && status == SSH2_FX_OK) {
 			size_t want = conn->upload_buflen;
@@ -3414,12 +3438,22 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	 * whatever the status says - the send loop can exit early (local
 	 * read failure, future logic changes) and silently finalizing a
 	 * short range as complete is data loss.  Fail it; the caller's
-	 * retry/highwater-resume machinery finishes the remainder. */
+	 * retry/highwater-resume machinery finishes the remainder.  A
+	 * cooperative yield takes this path deliberately (quietly): the
+	 * non-success return routes the remainder through the same requeue
+	 * machinery, and the caller reclassifies it as voluntary. */
 	if (status == SSH2_FX_OK && bytes_left > 0) {
-		error("range [%lld+%lld) of \"%s\" incomplete at success "
-		    "exit (%lld bytes unsent) - failing the unit for retry",
-		    (long long)range_offset, (long long)range_length,
-		    local_path, (long long)bytes_left);
+		if (yielded)
+			debug("range [%lld+%lld) of \"%s\" yielded with %lld "
+			    "bytes unsent", (long long)range_offset,
+			    (long long)range_length, local_path,
+			    (long long)bytes_left);
+		else
+			error("range [%lld+%lld) of \"%s\" incomplete at "
+			    "success exit (%lld bytes unsent) - failing the "
+			    "unit for retry", (long long)range_offset,
+			    (long long)range_length, local_path,
+			    (long long)bytes_left);
 		status = SSH2_FX_FAILURE;
 	}
 
@@ -3487,7 +3521,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	uint64_t remote_offset;
 	off_t bytes_left;
 	int local_fd = -1, read_error = 0, write_error = 0, write_errno = 0;
-	int ret = -1, r;
+	int ret = -1, r, yielded = 0;
 	off_t contig_hw = -1;	/* HPN: min over failure-site floors/clamps */
 
 	if (acked_out != NULL)
@@ -3516,6 +3550,17 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 		fatal_f("sshbuf_new failed");
 
 	while (num_req > 0 || (bytes_left > 0 && max_req > 0)) {
+		/* Cooperative yield (HPN tail redistribution): stop issuing
+		 * NEW read requests; the loop drains everything already in
+		 * flight (those bytes were the most expensive to earn on a
+		 * slow stream - keep them), then exits with remote_offset at
+		 * the end of the last issued request, which is exactly the
+		 * highwater the clean-drain math below reports. */
+		if (!yielded && yield_requested(conn)) {
+			yielded = 1;
+			max_req = 0;
+		}
+
 		/* Fill the pipeline with read requests. */
 		while (bytes_left > 0 && num_req < max_req) {
 			size_t want = buflen;
@@ -3691,12 +3736,22 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	 * the request loop can exit early (max_req collapse, future logic
 	 * changes) and silently finalizing a short range as complete is data
 	 * loss.  bytes_left counts the unrequested remainder; with no
-	 * outstanding requests it must be zero at a genuine completion. */
+	 * outstanding requests it must be zero at a genuine completion.  A
+	 * cooperative yield takes this path deliberately (quietly): the
+	 * non-success return routes the remainder through the same requeue
+	 * machinery, and the caller reclassifies it as voluntary. */
 	if (!read_error && !write_error && bytes_left > 0) {
-		error("range [%lld+%lld) of \"%s\" incomplete at success "
-		    "exit (%lld bytes unrequested) - failing the unit for "
-		    "retry", (long long)range_offset, (long long)range_length,
-		    remote_path, (long long)bytes_left);
+		if (yielded)
+			debug("range [%lld+%lld) of \"%s\" yielded with %lld "
+			    "bytes unrequested", (long long)range_offset,
+			    (long long)range_length, remote_path,
+			    (long long)bytes_left);
+		else
+			error("range [%lld+%lld) of \"%s\" incomplete at "
+			    "success exit (%lld bytes unrequested) - failing "
+			    "the unit for retry", (long long)range_offset,
+			    (long long)range_length, remote_path,
+			    (long long)bytes_left);
 		read_error = 1;
 	}
 

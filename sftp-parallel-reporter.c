@@ -513,6 +513,31 @@ tail_quarter_median(const uint64_t *ring, int count, int idx, int newest)
 	return q[n / 2];
 }
 
+/*
+ * Phase C (HPN_TAIL_REDISTRIBUTE): a confirmed episode asks the slowest
+ * lagging holder to cooperatively yield its unstarted remainder for
+ * redistribution.  One yield per episode latch; fires only when the
+ * holder's own projected remaining tail is long enough to be worth the
+ * handoff.  No-op unless the env gate armed it at parallel start.
+ */
+static void
+tail_fire_yield(struct sftp_parallel *p, struct sftp_worker *tgt,
+    uint64_t tgt_med, uint64_t tgt_proj)
+{
+	if (!p->tail_redistribute || p->tail_yield_fired || tgt == NULL ||
+	    tgt_proj <= TAIL_PROJECT_SEC)
+		return;
+	__atomic_store_n(&tgt->yield_req, 1, __ATOMIC_RELAXED);
+	p->tail_yield_fired = 1;
+	if (getenv("HPN_BUNDLE_TIMING") != NULL)
+		logit("HPN TAIL-YIELD worker=%d holder_med=%llu proj=%llus",
+		    tgt->id, (unsigned long long)tgt_med,
+		    (unsigned long long)tgt_proj);
+	else
+		debug("tail yield: worker %d asked to yield remainder",
+		    tgt->id);
+}
+
 static void
 tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 {
@@ -547,6 +572,11 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 		uint64_t ready_medians[SFTP_PARALLEL_MAX_WORKERS];
 		uint64_t worst_proj_sec = 0;
 		uint64_t baseline = 0, worst_holder_med = 0;
+		/* Phase C yield target: the SLOWEST lagging holder (and its
+		 * own projection).  Captured under workers_mu; safe to use
+		 * after unlock because reaping runs on this same thread. */
+		struct sftp_worker *yield_tgt = NULL;
+		uint64_t yield_tgt_med = 0, yield_tgt_proj = 0;
 
 		/*
 		 * Per-worker evidence (predicate rework): sample every BUSY
@@ -630,6 +660,8 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 			if (hmed == 0)
 				continue;	/* no evidence: cannot accuse */
 			if (hmed * 100 < baseline * TAIL_HOLDER_LAG_PCT) {
+				uint64_t proj = 0;
+
 				lagging++;
 				if (hmed > worst_holder_med ||
 				    worst_holder_med == 0)
@@ -639,9 +671,14 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 				uint64_t done = __atomic_load_n(&w->live_bytes,
 				    __ATOMIC_RELAXED);
 				if (usz > done && hmed > 0) {
-					uint64_t proj = (usz - done) / hmed;
+					proj = (usz - done) / hmed;
 					if (proj > worst_proj_sec)
 						worst_proj_sec = proj;
+				}
+				if (yield_tgt == NULL || hmed < yield_tgt_med) {
+					yield_tgt = w;
+					yield_tgt_med = hmed;
+					yield_tgt_proj = proj;
 				}
 			}
 		}
@@ -694,6 +731,8 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 					p->tail_episode = 1;
 					p->tail_episode_ns = p->tail_lag_start_ns;
 					p->tail_episodes_total++;
+					tail_fire_yield(p, yield_tgt,
+					    yield_tgt_med, yield_tgt_proj);
 				}
 			}
 		}
@@ -710,6 +749,7 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 			    (double)(now - p->tail_episode_ns) / 1e9,
 			    (unsigned long long)p->pending);
 		p->tail_episode = 0;
+		p->tail_yield_fired = 0;	/* re-arm for the next episode */
 	}
 }
 

@@ -373,6 +373,14 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		    : FLEET_ABORT_NOPROGRESS_SEC;
 		if (p->noprogress_abort_s < 0) p->noprogress_abort_s = 0;
 	}
+
+	/* ENV-VAR HPN_TAIL_REDISTRIBUTE=1: arm phase C tail redistribution
+	 * (cooperative yield of a confirmed-lagging endgame holder).  Default
+	 * off: the tail detector stays telemetry-only. */
+	{
+		const char *e = getenv("HPN_TAIL_REDISTRIBUTE");
+		p->tail_redistribute = (e != NULL && *e == '1');
+	}
 	p->last_worker_exit_code = -1;	/* no worker reaped yet */
 	/* Born-dead 0-bytes kill threshold.  RTT-derived once the path RTT is
 	 * registered (sftp_parallel_set_path_rtt); BORN_DEAD_KILL_SEC until then. */

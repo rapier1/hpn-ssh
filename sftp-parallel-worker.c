@@ -258,6 +258,13 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 {
 	struct sftp_parallel *p = w->parent;
 
+	/* Cooperative yield (phase C): consume+clear the request whatever
+	 * the outcome - a unit that completed despite the flag (race with
+	 * its own finish) must not poison the next dispatch.  A yielded
+	 * non-success on a LIVE connection is voluntary: requeue the
+	 * remainder without charging the retry budget. */
+	int yielded = __atomic_exchange_n(&w->yield_req, 0, __ATOMIC_RELAXED);
+
 	/* HPN: free the per-inode writer slot claimed in parallel_worker_thread's
 	 * dispatch gate.  Reached exactly once per executed unit on every
 	 * path (success, retry-requeue, give-up), so retries release here and
@@ -299,6 +306,12 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		 */
 		int transient = sftp_conn_is_dead(w->conn);
 
+		/* A yield on a connection that DIED during the wind-down is
+		 * not a yield - it is an ordinary death; the transient path
+		 * already handles it (and the respawned worker can't defer). */
+		if (transient)
+			yielded = 0;
+
 		/*
 		 * Highwater resume (HPN): the failed attempt confirmed
 		 * acked_bytes contiguous bytes on the target, so the unit
@@ -314,11 +327,12 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		    u->acked_bytes > 0 &&
 		    u->acked_bytes < u->range_length) {
 			debug("worker %d: range \"%s\" [%lld+%lld) resumes "
-			    "past %lld acked bytes", w->id,
+			    "past %lld acked bytes%s", w->id,
 			    u->dst_path ? u->dst_path : u->src_path,
 			    (long long)u->range_offset,
 			    (long long)u->range_length,
-			    (long long)u->acked_bytes);
+			    (long long)u->acked_bytes,
+			    yielded ? " (cooperative yield)" : "");
 			u->range_offset += u->acked_bytes;
 			u->range_length -= u->acked_bytes;
 			u->size = u->range_length;
@@ -326,18 +340,28 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 			u->acked_bytes = 0;
 		}
 
+		/* Yield handoff: mark the remainder so dispatch gives a
+		 * DIFFERENT worker first crack at it (one courtesy defer). */
+		u->yield_from = yielded ? w->id + 1 : 0;
+
 		if (!u->no_retry &&
-		    (transient || ++u->attempt < parallel_unit_max_retries(p))) {
+		    (transient || yielded ||
+		    ++u->attempt < parallel_unit_max_retries(p))) {
 			if (u->size > 0)
 				__atomic_fetch_add(&p->queued_bytes,
 				    (uint64_t)u->size, __ATOMIC_RELAXED);
 			if (parallel_unit_pending_trace_on())
 				parallel_unit_pending_trace("REQUEUE", p, u, w->id,
+				    yielded ? "wpr/yield" :
 				    transient ? "wpr/transient" : "wpr/retry");
-			if ((transient
+			/* Yields jump the queue like transients: the parked
+			 * READY fleet should pick the remainder up NOW. */
+			if (((transient || yielded)
 			    ? sftp_workqueue_push_front(p->q, u)
 			    : sftp_workqueue_push(p->q, u)) != 0)
 				worker_give_up_pushfail(p, w, u, "wpr/pushfail");
+			else if (yielded)
+				sftp_workqueue_kick(p->q);
 		} else {
 			worker_give_up_unit(p, w, u, "unit", "wpr/maxretries");
 		}
@@ -980,6 +1004,31 @@ parallel_worker_thread(void *arg)
 			    __ATOMIC_RELEASE);
 			continue;
 		}
+		/*
+		 * Cooperative-yield handoff (phase C): the worker that just
+		 * yielded this remainder must not immediately re-pop its own
+		 * handoff - that would defeat the redistribution.  One
+		 * courtesy defer: push it back, clear the marker (so a lone
+		 * worker can never deadlock on its own yield), park briefly
+		 * to give a READY worker the race.  Any other worker runs it
+		 * immediately (and clears the marker by dispatching).
+		 */
+		if (u0->yield_from == w->id + 1) {
+			u0->yield_from = 0;
+			if (sftp_workqueue_push_front(p->q, u0) != 0) {
+				worker_give_up_pushfail(p, w, u0,
+				    "yield/pushfail");
+				__atomic_store_n(&w->unit_start_ns, 0,
+				    __ATOMIC_RELEASE);
+				continue;
+			}
+			__atomic_store_n(&w->unit_start_ns, 0,
+			    __ATOMIC_RELEASE);
+			sftp_workqueue_kick(p->q);
+			sftp_workqueue_wait_activity(p->q, 250);
+			continue;
+		}
+		u0->yield_from = 0;
 		/*
 		 * HPN per-inode concurrent-writer cap.  Range units of one file
 		 * share a tracker; only writer_cap of them may run at once.  If

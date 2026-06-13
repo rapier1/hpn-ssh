@@ -130,6 +130,20 @@ sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
 	fault_inj_arm_conn(hpn);
 }
 
+/*
+ * Internal helper called by sftp_set_yield_flag() in sftp-client.c.
+ * Registers the parallel orchestrator's cooperative-yield flag for this
+ * connection (tail redistribution, phase C); see the field comment in
+ * sftp-hpn-client.h.
+ */
+void
+sftp_hpn_set_yield_flag(struct sftp_hpn_conn *hpn, volatile int *flag)
+{
+	if (hpn == NULL)
+		return;
+	hpn->yield_flag = flag;
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
  * Watchdog pause primitive (HPN).  Lets a worker tell the parallel
  * orchestrator's watchdog that it's about to be busy with legitimate

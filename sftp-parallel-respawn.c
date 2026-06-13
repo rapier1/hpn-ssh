@@ -278,6 +278,8 @@ spawn_one_worker(struct sftp_parallel *p)
 		goto fail;
 	}
 	sftp_set_live_counter(w->conn, &w->live_bytes);
+	__atomic_store_n(&w->yield_req, 0, __ATOMIC_RELAXED);
+	sftp_set_yield_flag(w->conn, &w->yield_req);
 
 	/* Insert into workers array under lock. */
 	pthread_mutex_lock(&p->workers_mu);

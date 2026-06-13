@@ -90,6 +90,16 @@ struct sftp_hpn_conn {
 	 * (non-parallel) mode. */
 	volatile uint64_t *live_counter;
 
+	/* Cooperative-yield hook for the parallel orchestrator's tail
+	 * redistribution (phase C).  When the detector confirms this
+	 * worker is the lagging endgame holder, the reporter sets the
+	 * flag; the range transfer loops stop issuing NEW requests/writes,
+	 * drain what is already in flight, and return with acked_out at
+	 * the yield line so the caller requeues only the untouched
+	 * remainder.  Voluntary wind-down only - never a kill; NULL in
+	 * normal (non-parallel) mode. */
+	volatile int *yield_flag;
+
 	/* Watchdog pause: monotonic-ns deadline before which the parallel
 	 * orchestrator's inactivity-based heuristics (born-dead, silence,
 	 * isolation, throughput-outlier, born-slow) suppress for this
@@ -198,6 +208,7 @@ int  sftp_hpn_is_dead(struct sftp_hpn_conn *);
 int  sftp_hpn_is_protocol_violation(struct sftp_hpn_conn *);
 void sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *);
 void sftp_hpn_set_live_counter(struct sftp_hpn_conn *, volatile uint64_t *);
+void sftp_hpn_set_yield_flag(struct sftp_hpn_conn *, volatile int *);
 
 /*
  * Adaptive read-ahead (HPN).  init() seeds the controller from the

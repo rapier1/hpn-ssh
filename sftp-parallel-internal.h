@@ -705,6 +705,13 @@ struct sftp_work_unit {
 			       * unit advances past them instead of
 			       * re-sending the whole range. */
 	int      attempt;
+	int      yield_from;  /* cooperative yield (phase C): worker id + 1
+			       * of the holder that yielded this remainder
+			       * (0 = none).  The dispatch loop gives one
+			       * courtesy defer so a DIFFERENT worker picks
+			       * it up; cleared on that defer so a lone
+			       * worker can never deadlock on its own
+			       * yield. */
 	/* Per-unit resume/verify (whole-file units only - set by the public
 	 * submit entry points).  Carries the originating command's intent
 	 * (reget vs regetv, scp -Z) into the worker, replacing the dormant
@@ -887,6 +894,15 @@ struct sftp_worker {
 	int                rate_ring_count;
 	uint64_t           rate_prev_bytes;
 	uint64_t           rate_prev_ns;
+	/* Cooperative yield request (phase C tail redistribution).  Set to 1
+	 * by the reporter when the detector confirms this worker is the
+	 * lagging endgame holder (HPN_TAIL_REDISTRIBUTE only); the range
+	 * transfer loop polls it via conn->hpn->yield_flag, winds down, and
+	 * worker_process_result consumes+clears it to classify the non-
+	 * success return as voluntary (requeue remainder, no retry charge).
+	 * Relaxed atomics; never set on a worker without rate-window
+	 * evidence. */
+	int                yield_req;
 
 	int                started;
 	int                exited;             /* (C) set by worker on
@@ -1005,6 +1021,14 @@ struct sftp_parallel {
 						         * true; episode latches
 						         * only after it holds
 						         * TAIL_CONFIRM_SEC */
+	/* ENV-VAR HPN_TAIL_REDISTRIBUTE=1: arm phase C - on episode latch,
+	 * ask the slowest lagging holder to cooperatively yield its
+	 * unstarted remainder for redistribution to a proven READY worker.
+	 * Default off: the detector stays telemetry-only.  Parsed once at
+	 * parallel start. */
+	int                         tail_redistribute;
+	int                         tail_yield_fired;  /* one yield per
+						         * episode latch */
 	uint64_t                    session_start_ns;  /* monotime_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in
