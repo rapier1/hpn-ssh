@@ -52,6 +52,13 @@ LD=@LD@
 CFLAGS= @CFLAGS@
 CFLAGS_NOPIE=@CFLAGS_NOPIE@
 CPPFLAGS=-I. -I$(srcdir) -I$(COMPATINCLUDES) @CPPFLAGS@ $(PATHS) @DEFS@
+# DEV-ONLY build identifier (commit hash + dirty marker).  Enable with
+# `make GITVERSION=1`; git is invoked ONLY then, so plain/release builds are
+# untouched.  See SSH_HPN_EXTRA in version.h.
+GITVERSION=
+ifneq ($(GITVERSION),)
+GITVERSIONFLAG=-DSSH_HPN_EXTRA='"-g$(shell git rev-parse --short=8 HEAD 2>/dev/null)$(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)"'
+endif
 PICFLAG=@PICFLAG@
 LIBS=@LIBS@ -lpthread
 CHANNELLIBS=@CHANNELLIBS@
@@ -215,7 +222,7 @@ $(SSHOBJS): Makefile.in config.h
 $(SSHDOBJS): Makefile.in config.h
 
 .c.o:
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(GITVERSIONFLAG) -c $< -o $@
 
 LIBCOMPAT=openbsd-compat/libopenbsd-compat.a
 $(LIBCOMPAT): always
