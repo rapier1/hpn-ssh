@@ -381,10 +381,19 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		const char *e = getenv("HPN_TAIL_REDISTRIBUTE");
 		p->tail_redistribute = (e != NULL && *e == '1');
 	}
+
+	/* ENV-VAR HPN_RESPAWN_SCAN_IDLE=1: defer fleet-restoring respawns
+	 * while READY healthy workers cover the queued demand.  Default off;
+	 * see parallel_respawn_dispatch. */
+	{
+		const char *e = getenv("HPN_RESPAWN_SCAN_IDLE");
+		p->respawn_scan_idle = (e != NULL && *e == '1');
+	}
 	p->last_worker_exit_code = -1;	/* no worker reaped yet */
 	/* Born-dead 0-bytes kill threshold.  RTT-derived once the path RTT is
 	 * registered (sftp_parallel_set_path_rtt); BORN_DEAD_KILL_SEC until then. */
 	p->born_dead_sec = BORN_DEAD_KILL_SEC;
+	p->born_dead_stuck_offset = -1;	/* 0 is a valid range_offset */
 
 	/* Cap chosen so the worst-case allocation is bounded but the
 	 * "show me what failed" list is still useful for moderately

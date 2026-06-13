@@ -827,6 +827,10 @@ worker_thread_init(struct sftp_worker *w)
 	 * parallel_worker_thread itself never got scheduled / never started. */
 	debug_ft("dispatch-diag: worker %d entered main loop", w->id);
 
+	/* -1 = "holds no range" (0 is a valid range_offset); the watchdog's
+	 * stuck-range detector compares against this. */
+	__atomic_store_n(&w->unit_offset, (int64_t)-1, __ATOMIC_RELAXED);
+
 	/* Phase 4 gap 1: read the HPN_NO_BATCH_PIPELINE env once per worker.
 	 * Disables the pipelined batch path; falls back to legacy
 	 * sftp_upload_batch.  Useful for A/B testing and bisecting. */
@@ -1076,6 +1080,11 @@ parallel_worker_thread(void *arg)
 		    __ATOMIC_RELAXED);
 		__atomic_store_n(&w->unit_size, (uint64_t)u0->size,
 		    __ATOMIC_RELAXED);
+		__atomic_store_n(&w->unit_offset,
+		    (u0->op == SFTP_OP_UPLOAD_RANGE ||
+		     u0->op == SFTP_OP_DOWNLOAD_RANGE)
+		    ? (int64_t)u0->range_offset : (int64_t)-1,
+		    __ATOMIC_RELAXED);
 
 		/* DISPATCH-DIAG: worker pulled a unit off the queue.  If
 		 * "entered main loop" appears for a worker but no "popped"
@@ -1319,6 +1328,7 @@ parallel_worker_thread(void *arg)
 		 * actually holding work. */
 		__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
 		__atomic_store_n(&w->unit_size, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&w->unit_offset, (int64_t)-1, __ATOMIC_RELAXED);
 
 		if (worker_should_terminate(w))
 			break;

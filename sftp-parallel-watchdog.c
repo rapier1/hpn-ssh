@@ -537,6 +537,26 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		}
 
 		/*
+		 * Stuck-range reset: if the worker holding the offset we
+		 * flagged stuck is now making progress ON THIS UNIT, the range
+		 * unstuck - clear the flag so a later born-dead on the same
+		 * numeric offset (e.g. a different file in a -r transfer) is
+		 * judged fresh rather than wrongly suppressed.  Key on
+		 * w_live_bytes (current-unit progress) ONLY: w_bytes_total is
+		 * lifetime, and a PROVEN worker handed the stuck range always
+		 * has it > 0 from its earlier range, which would clear the
+		 * flag the instant scan-idle reassigns - defeating the whole
+		 * fix (the proven holder never becomes born-dead-eligible).
+		 */
+		if (p->born_dead_stuck_offset >= 0 &&
+		    __atomic_load_n(&w->unit_offset, __ATOMIC_RELAXED) ==
+		        p->born_dead_stuck_offset &&
+		    w_live_bytes > 0) {
+			p->born_dead_stuck_offset = -1;
+			p->born_dead_stuck_count = 0;
+		}
+
+		/*
 		 * Born-dead fast-kill.  Worker popped a unit but has zero
 		 * forward progress (no completions, no bytes ever, no live
 		 * bytes on the current unit) for BORN_DEAD_KILL_SEC.  This is
@@ -558,18 +578,60 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 *  - since_unit_start > BORN_DEAD_KILL_SEC : enough time
 		 *    has passed that auth + first OPEN should have completed
 		 */
+		/*
+		 * Born-dead eligibility.  A FRESH worker (never moved a byte)
+		 * is the classic case.  But a PROVEN worker that took over an
+		 * already-flagged stuck range is the case scan-idle creates:
+		 * the deferred respawn routes the requeued stuck range onto an
+		 * idle proven worker (bytes_total > 0), which is otherwise
+		 * born-dead-immune - so the same-offset cascade never forms
+		 * and the suppression never fires.  Make such a worker
+		 * eligible too (zero progress on the CURRENT unit, on the
+		 * known-stuck offset), without touching any byte counter.
+		 */
+		int64_t off = __atomic_load_n(&w->unit_offset, __ATOMIC_RELAXED);
+		int bd_fresh = (w_units_completed == 0 && w_bytes_total == 0);
+		int bd_on_stuck = (off >= 0 && off == p->born_dead_stuck_offset);
 		if (next != WORKER_DEAD && in_flight > 0
-		    && w_units_completed == 0 && w_bytes_total == 0
 		    && w_live_bytes == 0
+		    && (bd_fresh || bd_on_stuck)
 		    && since_unit_start_ns > (uint64_t)p->born_dead_sec
 		        * 1000000000ULL) {
-			debug_ft("worker %d: born-dead fast-kill "
-			    "(unit_start=%llus, 0 bytes, 0 completions)",
-			    w->id,
-			    (unsigned long long)
-			    (since_unit_start_ns / 1000000000ULL));
-			next = WORKER_DEAD;
-			doom_reason = "born_dead";
+			/*
+			 * Stuck-range guard: a prior born-dead reap already
+			 * landed on this exact range_offset, so the range is
+			 * stuck server-side, not the connection - killing
+			 * again (and reassigning to yet another worker) just
+			 * feeds the cascade.  Suppress the fast-kill and WAIT;
+			 * the silence/isolation brake below stays the backstop
+			 * if the connection really is dead.
+			 */
+			int stuck = (bd_on_stuck &&
+			    p->born_dead_stuck_count >= BORN_DEAD_STUCK_KILLS);
+
+			if (stuck) {
+				debug_ft("worker %d: born-dead SUPPRESSED at "
+				    "offset %lld - stuck range (%d prior "
+				    "reaps), waiting not killing", w->id,
+				    (long long)off, p->born_dead_stuck_count);
+			} else {
+				if (bd_on_stuck)
+					p->born_dead_stuck_count++;
+				else {
+					p->born_dead_stuck_offset = off;
+					p->born_dead_stuck_count = 1;
+				}
+				debug_ft("worker %d: born-dead fast-kill "
+				    "(unit_start=%llus, 0 bytes, 0 "
+				    "completions, offset=%lld, hit %d)",
+				    w->id,
+				    (unsigned long long)
+				    (since_unit_start_ns / 1000000000ULL),
+				    (long long)off,
+				    p->born_dead_stuck_count);
+				next = WORKER_DEAD;
+				doom_reason = "born_dead";
+			}
 		}
 
 		if (next != WORKER_DEAD && queue_has_work && in_flight > 0 &&

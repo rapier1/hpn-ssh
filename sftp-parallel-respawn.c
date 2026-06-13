@@ -460,6 +460,25 @@ parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
 	pthread_mutex_lock(&p->workers_mu);
 	int cur_workers  = p->num_workers;
 	int respawn_ceil = p->cfg.num_streams * RESPAWN_MULTIPLIER;
+	/* Scan-idle-first (HPN_RESPAWN_SCAN_IDLE): count READY healthy
+	 * workers so the spawn decision below can defer fleet restoration
+	 * while existing idle capacity covers the queued demand.  One pass
+	 * over a small array, only when the gate is armed. */
+	int n_ready_healthy = 0;
+	if (p->respawn_scan_idle) {
+		for (int i = 0; i < p->num_workers; i++) {
+			struct sftp_worker *w = p->workers[i];
+			int av = __atomic_load_n(&w->avail,
+			    __ATOMIC_RELAXED);
+
+			pthread_mutex_lock(&w->mu);
+			int healthy = (w->health == WORKER_HEALTHY);
+			pthread_mutex_unlock(&w->mu);
+			if (av == WORKER_AVAIL_READY && healthy &&
+			    !w->doomed && !w->exited)
+				n_ready_healthy++;
+		}
+	}
 	pthread_mutex_unlock(&p->workers_mu);
 
 	pthread_mutex_lock(&p->pending_mu);
@@ -589,6 +608,44 @@ parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
 		to_spawn = (p->respawn_owed > 0 && slots > 0)
 		    ? ((p->respawn_owed < slots) ? p->respawn_owed : slots)
 		    : 0;
+		/*
+		 * Scan-idle-first (ENV-VAR HPN_RESPAWN_SCAN_IDLE=1): a
+		 * respawn is a NEW connection into a possibly penalty-
+		 * counting server - the born-dead candidate that feeds
+		 * freeze storms.  If READY healthy workers already cover
+		 * everything waiting in the queue, restoring fleet size
+		 * buys nothing now: defer.  respawn_owed persists, so the
+		 * moment queued demand outgrows the idle pool the deferred
+		 * respawns fire on a later tick.  With no idle capacity
+		 * (j == active writers) the gate never engages.
+		 *
+		 * PROGRESS GUARD (the fix for the measured regression): only
+		 * defer while the fleet is actually MOVING BYTES.  qdepth==0
+		 * with idle workers means "capacity covers demand" ONLY if
+		 * work is flowing; during a freeze it instead means the lone
+		 * remaining unit is wedged on a stalled worker and the fleet
+		 * is short-handed - deferring there prolonged the freeze
+		 * (measured: 65 defers across one stall).  noprogress_consec_
+		 * ticks (maintained by parallel_watchdog_sync_check, which
+		 * runs earlier this same tick) is 0 while the fleet advances
+		 * and climbs the instant it stalls.  Stalled => do NOT defer;
+		 * let the owed respawn fire.
+		 */
+		if (to_spawn > 0 && n_ready_healthy > 0 &&
+		    p->noprogress_consec_ticks == 0 &&
+		    sftp_workqueue_depth(p->q) <= (size_t)n_ready_healthy) {
+			p->respawn_defers++;
+			if (getenv("HPN_BUNDLE_TIMING") != NULL)
+				logit("HPN RESPAWN-DEFER owed=%d ready=%d "
+				    "qdepth=%zu", p->respawn_owed,
+				    n_ready_healthy,
+				    sftp_workqueue_depth(p->q));
+			else
+				debug_ft("respawn deferred: %d ready healthy "
+				    "worker(s) cover the queue (owed=%d)",
+				    n_ready_healthy, p->respawn_owed);
+			to_spawn = 0;
+		}
 	}
 	if (to_spawn > 0) {
 		debug_ft("initiating respawn for %d worker(s) (current=%d "

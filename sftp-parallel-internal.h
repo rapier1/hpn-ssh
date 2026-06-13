@@ -286,6 +286,17 @@ struct sftp_parallel;
  */
 #define BORN_DEAD_KILL_SEC        5    /* floor (RTT <= ~59ms) */
 #define BORN_DEAD_SEC_MAX        40    /* cap (RTT >= ~400ms) */
+#define BORN_DEAD_STUCK_KILLS     1    /* born-dead reaps tolerated on one
+				       * range_offset before it is ruled a
+				       * server-side stuck range and the fast-
+				       * kill is suppressed.  1 = the first
+				       * freeze kills (tests the connection-
+				       * stall hypothesis via respawn/reassign);
+				       * if the NEXT worker freezes on the same
+				       * offset, moving the block did not help -
+				       * the range is stuck, wait.  Key tuning
+				       * knob: a false stuck verdict costs up to
+				       * WORKER_SILENCE_BRAKE_SEC of waiting. */
 
 /*
  * Born-slow fast-kill threshold.  A worker that has completed at least one
@@ -885,6 +896,14 @@ struct sftp_worker {
 						* dispatch beside unit_start_ns,
 						* 0 when idle); feeds the tail
 						* detector's projected-tail */
+	int64_t            unit_offset;        /* relaxed atomic; range_offset
+						* of the currently-held RANGE
+						* unit (-1 when idle or non-
+						* range); lets the watchdog
+						* recognise successive born-dead
+						* reaps on the SAME offset = a
+						* server-side stuck range, not a
+						* dead connection */
 	/* Per-worker rate window (reporter thread only): personal rate
 	 * samples taken each tick while BUSY; retained while idle so a
 	 * READY worker's demonstrated capability stays in evidence.  See
@@ -1029,6 +1048,15 @@ struct sftp_parallel {
 	int                         tail_redistribute;
 	int                         tail_yield_fired;  /* one yield per
 						         * episode latch */
+	/* ENV-VAR HPN_RESPAWN_SCAN_IDLE=1: defer fleet-restoring respawns
+	 * while READY healthy workers cover the queued demand (a respawn is
+	 * a fresh connection into a possibly penalty-counting server; idle
+	 * capacity restarts work instantly with no penalty exposure).
+	 * respawn_owed persists, so deferred respawns fire when demand
+	 * outgrows the idle pool.  Default off.  respawn_defers counts
+	 * deferral ticks for telemetry. */
+	int                         respawn_scan_idle;
+	uint64_t                    respawn_defers;
 	uint64_t                    session_start_ns;  /* monotime_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in
@@ -1241,6 +1269,18 @@ struct sftp_parallel {
 	                                  * signaled/unknown; for the abort message */
 	int      born_dead_sec;          /* 0-bytes kill threshold; RTT-derived in
 	                                  * sftp_parallel_set_path_rtt */
+	/* Stuck-range detector (reporter/watchdog thread only).  born_dead's
+	 * "kill fast, the respawn lands on a healthier path" assumption is
+	 * false when the stall is a server-side STUCK RANGE (e.g. a Lustre OST
+	 * frozen in the server's read() syscall): a fresh worker handed the
+	 * same range born-dies too.  When successive born-dead reaps land on
+	 * the SAME range_offset, the range is stuck server-side, not the
+	 * connection - stop the fast-kill cascade and WAIT (the silence brake
+	 * remains the backstop if it is genuinely dead). */
+	int64_t  born_dead_stuck_offset; /* range_offset of the last born-dead
+	                                  * reap (-1 = none) */
+	int      born_dead_stuck_count;  /* consecutive born-dead reaps on that
+	                                  * offset */
 
 	/* Optional per-worker stats CSV (enabled via HPN_WORKER_STATS_CSV env).
 	 * Opened lazily by the reporter on first tick; closed at orchestrator
