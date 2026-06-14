@@ -211,6 +211,11 @@ struct sftp_parallel;
 #define ENDGAME_SPLIT_MIN_LEN	(256 * 1024 * 1024) /* split only above this */
 #define ENDGAME_SPLIT_MIN_PIECE	 (64 * 1024 * 1024) /* clamp N: pieces >= this */
 #define ENDGAME_SPLIT_ALIGN	      (1024 * 1024) /* piece alignment */
+/* Default per-piece launch gap for the endgame split, in milliseconds.
+ * ENV-VAR HPN_ENDGAME_SPLIT_STAGGER_MS overrides; 0 = legacy simultaneous
+ * launch (the synchronized burst that inflated path RTT ~2.5x and induced
+ * cwnd-collapse wedges). */
+#define ENDGAME_SPLIT_STAGGER_MS	25
 
 /*
  * Number of watchdog ticks (~1 s each) to wait before a worker becomes

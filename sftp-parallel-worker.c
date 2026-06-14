@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "xmalloc.h"
@@ -743,6 +744,7 @@ maybe_endgame_split(struct sftp_parallel *p, struct sftp_worker *w,
 	struct sftp_range_tracker *t = u->range_tracker;
 	off_t piece, end;
 	int n, i;
+	int stagger_ms;
 
 	/*
 	 * Default OFF pending re-evaluation (2026-06-11).  The split's
@@ -774,16 +776,18 @@ maybe_endgame_split(struct sftp_parallel *p, struct sftp_worker *w,
 	if (p->abort_flag || p->stopped || sftp_workqueue_depth(p->q) != 0)
 		return;
 
-	/* Maturity gate: the split exists to drain the TAIL of a transfer.
-	 * On a file with fewer ranges than workers, every endgame condition
-	 * above is already true at t=0 (queue drains instantly, walker done,
-	 * idle workers), so the split fired before a byte had moved - and
-	 * the writer cap then released every piece in one synchronized
-	 * multi-connection burst when the originals finished, inflating path
-	 * RTT ~2.5x (measured 101->312ms) and dragging the tail.  Require at
-	 * least one completed range on this tracker before arming. */
+	/*
+	 * No-tail gate: when the file has no more ranges than the per-inode
+	 * writer cap (total <= writer_cap), every range starts at once, the
+	 * queue drains instantly, and there is NO tail to drain.  Firing the
+	 * split here only re-injects a synchronized multi-connection writer
+	 * burst (measured inflating path RTT ~2.5x, 101->312ms) for no gain -
+	 * a net loss on such files.  (No separate maturity check needed: the
+	 * qdepth==0 gate above means every range is already dispatched, so on
+	 * a real tail some have completed by the time we reach here.)
+	 */
 	pthread_mutex_lock(&t->mu);
-	if (t->remaining >= t->total) {
+	if (t->total <= t->writer_cap) {
 		pthread_mutex_unlock(&t->mu);
 		return;
 	}
@@ -824,7 +828,22 @@ maybe_endgame_split(struct sftp_parallel *p, struct sftp_worker *w,
 		    "piece=%lld", w->id, (long long)u->range_length, n,
 		    (long long)piece);
 
-	/* Shrink the held unit to piece 0; submit pieces 1..n-1. */
+	{
+		const char *sv = getenv("HPN_ENDGAME_SPLIT_STAGGER_MS");
+
+		stagger_ms = (sv != NULL && *sv != '\0') ?
+		    atoi(sv) : ENDGAME_SPLIT_STAGGER_MS;
+	}
+
+	/* Shrink the held unit to piece 0; submit pieces 1..n-1.  De-sync the
+	 * launches: a fixed gap after each submit keeps the N connections from
+	 * ramping in lockstep into the shared path - the synchronized burst was
+	 * measured inflating RTT ~2.5x and tripping cwnd-collapse wedges.  The
+	 * gap after the LAST submit also spaces piece 0, which this worker runs
+	 * on return.  HPN_ENDGAME_SPLIT_STAGGER_MS=0 restores the old
+	 * simultaneous launch.  The submit loop holds no lock (tracker mu was
+	 * released above; parallel_unit_submit takes the workqueue lock only
+	 * internally), so the sleep does not stall the fleet. */
 	u->range_length = piece;
 	u->size         = piece;
 	for (i = 1; i < n; i++) {
@@ -839,6 +858,12 @@ maybe_endgame_split(struct sftp_parallel *p, struct sftp_worker *w,
 			for (; i < n; i++)
 				(void)parallel_unit_tracker_finalize(t, 1, NULL);
 			return;
+		}
+		if (stagger_ms > 0) {
+			struct timespec ts;
+
+			ms_to_timespec(&ts, stagger_ms);
+			nanosleep(&ts, NULL);
 		}
 	}
 }
