@@ -125,11 +125,36 @@ parallel_verify_one(struct sftp_worker *w, const char *local_path,
 	hpn_strlist_append(&p->verify_failed_paths, remote_path);
 }
 
+/* Close and clear the worker's warm remote handle (held open across same-
+ * file range writes to skip the boundary close/reopen).  Skips the wire
+ * close on a dead connection; always frees the cached handle + path. */
+static void
+parallel_worker_close_warm(struct sftp_worker *w)
+{
+	if (w->warm_handle == NULL)
+		return;
+	if (!sftp_conn_is_dead(w->conn))
+		(void)sftp_close(w->conn, w->warm_handle, w->warm_handle_len);
+	free(w->warm_handle);
+	free(w->warm_dst_path);
+	w->warm_handle = NULL;
+	w->warm_handle_len = 0;
+	w->warm_dst_path = NULL;
+}
+
 static int
 execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 {
 	struct sftp_parallel *p = w->parent;
 	int rc = -1;
+
+	/* The warm handle is only valid as a same-file UPLOAD_RANGE
+	 * continuation; any other op, or a different file, closes it first. */
+	if (w->warm_handle != NULL &&
+	    (u->op != SFTP_OP_UPLOAD_RANGE || w->warm_dst_path == NULL ||
+	     u->dst_path == NULL ||
+	     strcmp(w->warm_dst_path, u->dst_path) != 0))
+		parallel_worker_close_warm(w);
 
 	/* Lazy file creation: first range dispatched for a tracked file
 	 * creates it (exactly-once via the tracker mutex; no-op for
@@ -158,17 +183,30 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		if (rc == 1 || rc == 2)
 			rc = 0;	/* identical / target-larger: complete */
 		break;
-	case SFTP_OP_UPLOAD_RANGE:
+	case SFTP_OP_UPLOAD_RANGE: {
 		/* Range-split resume gate + post-transfer verify happen at
 		 * the orchestrator/finalize level, not per-range; see
-		 * project_parallel_resume_verify_design (Phase 1 follow-up). */
+		 * project_parallel_resume_verify_design (Phase 1 follow-up).
+		 * The warm handle (built from the worker's cache) is reused
+		 * across consecutive same-file ranges and synced back. */
+		struct sftp_range_warm warm = {
+			w->warm_handle, w->warm_handle_len, w->warm_dst_path
+		};
+		/* HPN_NO_RANGE_WARM kill switch: NULL disables the warm cache
+		 * (open+close every range, the pre-warm-handle behaviour). */
+		struct sftp_range_warm *warmp =
+		    w->range_warm_disabled ? NULL : &warm;
 		rc = sftp_upload_range(w->conn, u->src_path, u->dst_path,
-		    u->range_offset, u->range_length, &u->acked_bytes);
+		    u->range_offset, u->range_length, &u->acked_bytes, warmp);
+		w->warm_handle = warm.handle;
+		w->warm_handle_len = warm.handle_len;
+		w->warm_dst_path = warm.path;
 		debug("unit-exec: worker %d UPLOAD_RANGE [%lld+%lld) rc=%d "
 		    "acked=%lld attempt=%d", w->id,
 		    (long long)u->range_offset, (long long)u->range_length,
 		    rc, (long long)u->acked_bytes, u->attempt);
 		break;
+	}
 	case SFTP_OP_DOWNLOAD_RANGE:
 		rc = sftp_download_range(w->conn, u->src_path, u->dst_path,
 		    u->range_offset, u->range_length, &u->acked_bytes);
@@ -842,6 +880,15 @@ worker_thread_init(struct sftp_worker *w)
 		if (e != NULL && *e != '\0' && *e != '0')
 			w->batch_pipe_disabled = 1;
 	}
+	{
+		/* ENV-VAR HPN_NO_RANGE_WARM - developer-only: kill switch for
+		 * the warm range handle (reuse across same-file ranges).  When
+		 * set, execute_unit passes a NULL warm cache so sftp_upload_range
+		 * opens+closes every range as before.  For A/B testing. */
+		const char *e = getenv("HPN_NO_RANGE_WARM");
+		if (e != NULL && *e != '\0' && *e != '0')
+			w->range_warm_disabled = 1;
+	}
 
 	/* Phase 5 bundle-mode: ON by default when the server advertises
 	 * hpn-bundle@hpnssh.org.  Disabled when:
@@ -1338,6 +1385,11 @@ parallel_worker_thread(void *arg)
 	 * (sftp_upload_batch_finish handles a dead conn by marking entries
 	 * failed and freeing). */
 	worker_drain_pipeline(w);
+
+	/* Close any warm range handle still held (last same-file range's
+	 * handle, or one carried through an idle wait).  Best-effort on a
+	 * dead connection. */
+	parallel_worker_close_warm(w);
 
 	/* Mark exited so the reporter thread can reap us (join + free). */
 	pthread_mutex_lock(&w->mu);

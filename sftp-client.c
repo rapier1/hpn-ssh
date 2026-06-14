@@ -3257,7 +3257,7 @@ sftp_create_file(struct sftp_conn *conn, const char *remote_path, mode_t mode,
 int
 sftp_upload_range(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, off_t range_offset, off_t range_length,
-    off_t *acked_out)
+    off_t *acked_out, struct sftp_range_warm *warm)
 {
 	struct sshbuf *msg;
 	struct request {
@@ -3289,8 +3289,17 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		    (long long)range_offset, strerror(errno));
 		goto out;
 	}
-	/* Open remote without O_CREAT/O_TRUNC - file was pre-created. */
-	if (send_open(conn, remote_path, "range-dest",
+	/*
+	 * Warm handle: reuse the open remote handle across consecutive same-
+	 * file ranges (skips the close/reopen + cold-window dip at the range
+	 * boundary).  The caller guarantees warm->handle is for THIS
+	 * remote_path (it closes a stale one on file change).  Otherwise open
+	 * fresh, without O_CREAT/O_TRUNC - the file was pre-created.
+	 */
+	if (warm != NULL && warm->handle != NULL) {
+		handle = warm->handle;
+		handle_len = warm->handle_len;
+	} else if (send_open(conn, remote_path, "range-dest",
 	    SSH2_FXF_WRITE, NULL, &handle, &handle_len) != 0)
 		goto out;
 
@@ -3431,17 +3440,14 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	}
 	sshbuf_free(msg);
 
-	if (sftp_close(conn, handle, handle_len) != 0)
-		status = SSH2_FX_FAILURE;
-
-	/* GUARD: a range that did not send every byte is NOT a success,
-	 * whatever the status says - the send loop can exit early (local
-	 * read failure, future logic changes) and silently finalizing a
-	 * short range as complete is data loss.  Fail it; the caller's
-	 * retry/highwater-resume machinery finishes the remainder.  A
-	 * cooperative yield takes this path deliberately (quietly): the
-	 * non-success return routes the remainder through the same requeue
-	 * machinery, and the caller reclassifies it as voluntary. */
+	/* GUARD (run BEFORE the close decision so 'status' is final): a range
+	 * that did not send every byte is NOT a success, whatever the status
+	 * says - the send loop can exit early (local read failure, future
+	 * logic changes) and silently finalizing a short range as complete is
+	 * data loss.  Fail it; the caller's retry/highwater-resume machinery
+	 * finishes the remainder.  A cooperative yield takes this path
+	 * deliberately (quietly): the non-success return routes the remainder
+	 * through the same requeue machinery, reclassified as voluntary. */
 	if (status == SSH2_FX_OK && bytes_left > 0) {
 		if (yielded)
 			debug("range [%lld+%lld) of \"%s\" yielded with %lld "
@@ -3457,7 +3463,34 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		status = SSH2_FX_FAILURE;
 	}
 
-	ret = (status == SSH2_FX_OK) ? 0 : -1;
+	/*
+	 * Warm-handle close decision: leave the handle OPEN for the next same-
+	 * file range ONLY on a clean success; otherwise close it now (a
+	 * failed, yielded, or wedged handle must never be reused).  On the
+	 * leave-open path, ownership of `handle` passes to *warm and we NULL
+	 * the local so the out: free does not touch it.
+	 */
+	if (status == SSH2_FX_OK && warm != NULL) {
+		if (warm->handle != handle) {
+			/* freshly opened this call - take ownership into *warm */
+			free(warm->path);
+			warm->handle = handle;
+			warm->handle_len = handle_len;
+			warm->path = xstrdup(remote_path);
+		}
+		handle = NULL;
+		ret = 0;
+	} else {
+		if (sftp_close(conn, handle, handle_len) != 0)
+			status = SSH2_FX_FAILURE;
+		if (warm != NULL && warm->handle == handle) {
+			free(warm->path);
+			warm->path = NULL;
+			warm->handle = NULL;
+			warm->handle_len = 0;
+		}
+		ret = (status == SSH2_FX_OK) ? 0 : -1;
+	}
  out:
 	debug("upload-range-exit: [%lld+%lld) ret=%d status=%u "
 	    "final_offset=%lld bytes_left=%lld outstanding=%s",

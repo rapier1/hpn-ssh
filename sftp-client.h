@@ -473,12 +473,28 @@ int sftp_create_file(struct sftp_conn *, const char *remote_path, mode_t,
  * remote_path   - destination file on the remote server
  * range_offset  - byte offset in both files where this range starts
  * range_length  - number of bytes to transfer
+ * acked_out     - highwater (contiguous acked bytes) for resume-on-requeue
+ * warm          - optional warm-handle cache (NULL = open+close every call,
+ *                 the original behaviour).  When non-NULL and warm->handle is
+ *                 already set, the open remote handle is REUSED (the caller
+ *                 guarantees it is for THIS remote_path); on a clean success
+ *                 the handle is left OPEN and stored back in *warm so the next
+ *                 same-file range skips the close/reopen + cold-window dip at
+ *                 the boundary.  On any error/yield the handle is closed and
+ *                 *warm cleared.  The caller owns *warm and must close it
+ *                 (sftp_close + free) when it moves to a different file or
+ *                 goes idle.
  *
  * Returns 0 on success, -1 on error.
  */
+struct sftp_range_warm {
+	u_char *handle;       /* open remote handle, or NULL */
+	size_t  handle_len;
+	char   *path;         /* strdup of the remote path it is open on */
+};
 int sftp_upload_range(struct sftp_conn *, const char *local_path,
     const char *remote_path, off_t range_offset, off_t range_length,
-    off_t *acked_out);
+    off_t *acked_out, struct sftp_range_warm *warm);
 
 /*
  * Download a byte range of a remote file into the corresponding byte range

@@ -904,6 +904,14 @@ struct sftp_worker {
 						* reaps on the SAME offset = a
 						* server-side stuck range, not a
 						* dead connection */
+	/* Warm remote handle held across consecutive same-file range writes
+	 * (kills the close/reopen + cold-window dip at range boundaries).
+	 * Worker thread only.  Closed on file change (execute_unit), before a
+	 * blocking idle pop, and on worker exit.  Passed to sftp_upload_range
+	 * as a struct sftp_range_warm built from these three fields. */
+	u_char            *warm_handle;        /* open remote handle, or NULL */
+	size_t             warm_handle_len;
+	char              *warm_dst_path;      /* file warm_handle is open on */
 	/* Per-worker rate window (reporter thread only): personal rate
 	 * samples taken each tick while BUSY; retained while idle so a
 	 * READY worker's demonstrated capability stays in evidence.  See
@@ -953,6 +961,11 @@ struct sftp_worker {
 	int                               batch_prev_n;
 	int                               batch_pipe_disabled; /* per-worker
 	                                                        * HPN_NO_BATCH_PIPELINE */
+	int                               range_warm_disabled; /* per-worker
+	                                                        * HPN_NO_RANGE_WARM
+	                                                        * (A/B kill switch
+	                                                        * for the warm range
+	                                                        * handle) */
 
 	/* -- Phase 5: bundle-mode state (hpn-bundle@hpnssh.org) -----
 	 * bundle_enabled is set once at worker startup when
