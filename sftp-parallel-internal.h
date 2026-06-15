@@ -521,6 +521,16 @@ enum worker_avail {
 #define TAIL_PROJECT_SEC       10   /* projected solo-tail threshold */
 #define TAIL_HOLDER_LAG_PCT    70   /* holder's window median below this
 				     * % of the READY baseline = lagging */
+/* Mid-transfer worker substitution (HPN_MIDSTREAM_SUB - PoC, default off). */
+#define MIDSTREAM_SUB_CONTRAST_PCT  15  /* a BUSY worker whose EMA is below this
+				     * % of the fleet median is an extreme,
+				     * unambiguous straggler */
+#define MIDSTREAM_SUB_CONFIRM_TICKS  3  /* reporter ticks the contrast must
+				     * hold before asking it to yield */
+#define MIDSTREAM_BENCH_COOLDOWN_SEC 10 /* a subbed worker stays benched this
+				     * long, then re-enters the pool; if still
+				     * slow it gets re-subbed, so it is never
+				     * permanently lost */
 #define TAIL_CONFIRM_SEC        8   /* arm condition must hold continuously
 				     * this long (wall clock) before an
 				     * episode latches.  Measured basis
@@ -824,6 +834,17 @@ struct sftp_worker {
 	                                          * EMA < BORN_SLOW_FLOOR_FRAC ×
 	                                          * cfg.tput_path_healthy_kbps;
 	                                          * drives born-slow fast-kill */
+	int                midstream_slow_ticks;  /* consecutive reporter ticks a
+	                                          * BUSY worker's EMA sat far
+	                                          * below the fleet median; drives
+	                                          * HPN_MIDSTREAM_SUB */
+	time_t             midstream_benched_s;   /* if nonzero and still in the
+	                                          * future (monotime seconds), this
+	                                          * worker was subbed out and stays
+	                                          * out of the pool until then
+	                                          * (cooldown un-bench), so it cannot
+	                                          * re-grab+re-dribble yet the pool
+	                                          * never bleeds dry */
 	uint64_t           tput_last_unit_start_ns; /* unit_start_ns at last tick;
 	                                         * used to detect new-unit starts
 	                                         * and reset EMA so stale frozen

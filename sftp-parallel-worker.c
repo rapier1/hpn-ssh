@@ -1036,6 +1036,32 @@ parallel_worker_thread(void *arg)
 	while (1) {
 		if (p->abort_flag)
 			break;
+		/* Midstream-substitution bench: a worker subbed out as an extreme
+		 * straggler stays parked until its cooldown expires, then re-enters
+		 * the pool (if still slow it is re-subbed).  Keeps it from
+		 * re-grabbing its own yielded remainder without permanently
+		 * shrinking the writer pool. */
+		{
+			time_t bench = __atomic_load_n(&w->midstream_benched_s,
+			    __ATOMIC_RELAXED);
+			if (bench != 0) {
+				if (monotime() < bench) {
+					__atomic_store_n(&w->avail,
+					    WORKER_AVAIL_CAPPED, __ATOMIC_RELAXED);
+					sftp_workqueue_wait_activity(p->q, 250);
+					continue;
+				}
+				__atomic_store_n(&w->midstream_benched_s, 0,
+				    __ATOMIC_RELAXED);	/* cooldown over: re-enter */
+				/* Re-arm the EMA warmup so the detector gives this
+				 * worker a fresh window to prove its throughput
+				 * before it is eligible to be re-benched: its EMA
+				 * froze while parked, and judging it on that stale
+				 * value would re-bench it instantly.  Mirrors the
+				 * watchdog's new-unit cold-start. */
+				w->tput_ema_warmup_ticks = 0;
+			}
+		}
 		void *item = NULL;
 		uint64_t t_idle_start = monotime_ns();
 		__atomic_store_n(&w->phase, WPH_POP_WAIT, __ATOMIC_RELAXED);
@@ -1103,6 +1129,21 @@ parallel_worker_thread(void *arg)
 			sftp_workqueue_kick(p->q);
 			sftp_workqueue_wait_activity(p->q, 250);
 			continue;
+		}
+		if (u0->yield_from != 0) {
+			/* A DIFFERENT worker reached this yielded remainder before
+			 * the holder could re-pop it: the cooperative handoff
+			 * actually moved the work off the straggler onto a peer.
+			 * Trace it so MIDSTREAM / tail-redistribute effectiveness
+			 * is observable (the holder-defer case above clears the
+			 * marker first, so this counts direct handoffs only). */
+			if (getenv("HPN_BUNDLE_TIMING") != NULL)
+				logit("HPN YIELD-HANDOFF \"%s\" [%lld+%lld) "
+				    "yielded_by=%d taken_by=%d",
+				    u0->dst_path ? u0->dst_path : u0->src_path,
+				    (long long)u0->range_offset,
+				    (long long)u0->range_length,
+				    u0->yield_from - 1, w->id);
 		}
 		u0->yield_from = 0;
 		/*

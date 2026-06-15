@@ -538,12 +538,116 @@ tail_fire_yield(struct sftp_parallel *p, struct sftp_worker *tgt,
 		    tgt->id);
 }
 
+/*
+ * Mid-transfer worker substitution (HPN_MIDSTREAM_SUB; PoC, default off).
+ * Runs every reporter tick, NOT gated to the endgame.  When one BUSY worker's
+ * EMA rate has sat far below the fleet median for a few ticks (an extreme,
+ * unambiguous straggler), ask it to yield AND bench it: it winds down and
+ * requeues its remainder, then steps out of the pool (for a cooldown) so it
+ * cannot re-grab and re-dribble.  A faster worker takes the remainder - an idle
+ * reserve immediately, or an active writer as it frees a slot - so no reserve
+ * is required.  The nbusy>=3 guard floors the active set (benching one always
+ * leaves >=2 writing); the cooldown re-admits the worker so the pool never
+ * bleeds dry.  Byte-rate only (tput_ema_kbps from the watchdog) - no TCP_INFO,
+ * no cross-process channel.  Extreme contrast keeps it clear of the marginal /
+ * fleet-wide cases the wait-not-kill policy protects.
+ */
+static void
+midstream_sub_tick(struct sftp_parallel *p)
+{
+	static int enabled = -1;
+	uint64_t busy_ema[SFTP_PARALLEL_MAX_WORKERS];
+	uint64_t ema[SFTP_PARALLEL_MAX_WORKERS];
+	int av[SFTP_PARALLEL_MAX_WORKERS], healthy[SFTP_PARALLEL_MAX_WORKERS];
+	int i, nbusy = 0, slow_i = -1;
+	uint64_t median, slow_ema = 0;
+
+	if (enabled < 0) {
+		const char *e = getenv("HPN_MIDSTREAM_SUB");
+		enabled = (e != NULL && *e == '1');
+	}
+	if (!enabled)
+		return;
+
+	/* One snapshot pass: avail/health/EMA per worker; collect BUSY EMAs. */
+	for (i = 0; i < p->num_workers; i++) {
+		struct sftp_worker *w = p->workers[i];
+
+		av[i] = __atomic_load_n(&w->avail, __ATOMIC_RELAXED);
+		pthread_mutex_lock(&w->mu);
+		healthy[i] = (w->health == WORKER_HEALTHY);
+		pthread_mutex_unlock(&w->mu);
+		/* tput_ema_kbps is written non-atomically by the watchdog; a
+		 * slightly stale read is harmless for a multi-tick heuristic. */
+		ema[i] = __atomic_load_n(&w->tput_ema_kbps, __ATOMIC_RELAXED);
+		if (av[i] == WORKER_AVAIL_BUSY && healthy[i] && ema[i] > 0)
+			busy_ema[nbusy++] = ema[i];
+	}
+	if (nbusy < 3)		/* need a fleet to judge an outlier against */
+		return;
+
+	/* Median of the BUSY/HEALTHY EMAs (insertion sort, tiny array). */
+	for (i = 1; i < nbusy; i++) {
+		uint64_t v = busy_ema[i];
+		int j;
+
+		for (j = i; j > 0 && busy_ema[j - 1] > v; j--)
+			busy_ema[j] = busy_ema[j - 1];
+		busy_ema[j] = v;
+	}
+	median = busy_ema[nbusy / 2];
+	if (median == 0)
+		return;
+
+	/* Advance/reset each BUSY worker's slow-tick counter; note the slowest
+	 * outlier. */
+	for (i = 0; i < p->num_workers; i++) {
+		struct sftp_worker *w = p->workers[i];
+
+		if (av[i] == WORKER_AVAIL_BUSY && healthy[i] && ema[i] > 0 &&
+		    w->tput_ema_warmup_ticks >= TPUT_EMA_WARMUP_TICKS &&
+		    ema[i] * 100 < median * MIDSTREAM_SUB_CONTRAST_PCT) {
+			w->midstream_slow_ticks++;
+			if (slow_i < 0 || ema[i] < slow_ema) {
+				slow_i = i;
+				slow_ema = ema[i];
+			}
+		} else {
+			w->midstream_slow_ticks = 0;
+		}
+	}
+	if (slow_i < 0)
+		return;
+
+	struct sftp_worker *sw = p->workers[slow_i];
+
+	if (sw->midstream_slow_ticks < MIDSTREAM_SUB_CONFIRM_TICKS ||
+	    __atomic_load_n(&sw->yield_req, __ATOMIC_RELAXED) != 0 ||
+	    __atomic_load_n(&sw->midstream_benched_s, __ATOMIC_RELAXED) != 0)
+		return;
+
+	__atomic_store_n(&sw->yield_req, 1, __ATOMIC_RELAXED);
+	__atomic_store_n(&sw->midstream_benched_s,
+	    monotime() + MIDSTREAM_BENCH_COOLDOWN_SEC, __ATOMIC_RELAXED);
+	sw->midstream_slow_ticks = 0;
+	if (getenv("HPN_BUNDLE_TIMING") != NULL)
+		logit("HPN MIDSTREAM-SUB worker=%d ema=%lluKB/s "
+		    "fleet_median=%lluKB/s (<%d%%) benched=%ds", sw->id,
+		    (unsigned long long)slow_ema,
+		    (unsigned long long)median, MIDSTREAM_SUB_CONTRAST_PCT,
+		    MIDSTREAM_BENCH_COOLDOWN_SEC);
+}
+
 static void
 tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 {
 	uint64_t now = monotime_ns();
 	uint64_t rate = 0;
 	int would_arm = 0;
+
+	/* Mid-transfer substitution runs every tick, independent of the
+	 * endgame gate below. */
+	midstream_sub_tick(p);
 
 	/* Per-tick rate sample into the ring. */
 	if (p->tail_prev_ns != 0 && now > p->tail_prev_ns &&
