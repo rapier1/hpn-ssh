@@ -1134,16 +1134,17 @@ parallel_worker_thread(void *arg)
 			/* A DIFFERENT worker reached this yielded remainder before
 			 * the holder could re-pop it: the cooperative handoff
 			 * actually moved the work off the straggler onto a peer.
-			 * Trace it so MIDSTREAM / tail-redistribute effectiveness
-			 * is observable (the holder-defer case above clears the
-			 * marker first, so this counts direct handoffs only). */
-			if (getenv("HPN_BUNDLE_TIMING") != NULL)
-				logit("HPN YIELD-HANDOFF \"%s\" [%lld+%lld) "
-				    "yielded_by=%d taken_by=%d",
-				    u0->dst_path ? u0->dst_path : u0->src_path,
-				    (long long)u0->range_offset,
-				    (long long)u0->range_length,
-				    u0->yield_from - 1, w->id);
+			 * Covers both yield sources (tail-redistribute and
+			 * MIDSTREAM); debug level - midstream visibility during its
+			 * verification comes from the separate MIDSTREAM-SUB bench
+			 * line.  The holder-defer case above clears the marker
+			 * first, so this counts direct handoffs only. */
+			debug("HPN YIELD-HANDOFF \"%s\" [%lld+%lld) "
+			    "yielded_by=%d taken_by=%d",
+			    u0->dst_path ? u0->dst_path : u0->src_path,
+			    (long long)u0->range_offset,
+			    (long long)u0->range_length,
+			    u0->yield_from - 1, w->id);
 		}
 		u0->yield_from = 0;
 		/*
