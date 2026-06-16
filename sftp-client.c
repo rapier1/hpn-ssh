@@ -3378,6 +3378,13 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 				break;
 			}
 
+			/* FAULT-INJ: corrupt one byte of this range's outgoing
+			 * data (range-split mirror of the do_upload_body hook);
+			 * the on-disk source stays clean, so a verified
+			 * transfer's source hash holds and the written range
+			 * diverges - exercises the range-split finalize verify. */
+			fault_inj_corrupt(offset, data, (size_t)len);
+
 			ack = xcalloc(1, sizeof(*ack));
 			ack->id     = ++id;
 			ack->len    = (size_t)len;

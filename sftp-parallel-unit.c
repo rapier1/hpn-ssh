@@ -88,7 +88,7 @@ parallel_unit_free(struct sftp_work_unit *u)
  */
 static struct sftp_range_tracker *
 range_tracker_new(int total, enum sftp_range_target target, const char *path,
-    int writer_cap)
+    const char *src_path, int verify, int writer_cap)
 {
 	struct sftp_range_tracker *t = xcalloc(1, sizeof(*t));
 	pthread_mutex_init(&t->mu, NULL);
@@ -97,6 +97,8 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path,
 	t->any_failed = 0;
 	t->target     = target;
 	t->path       = xstrdup(path);
+	t->src_path   = (src_path != NULL) ? xstrdup(src_path) : NULL;
+	t->verify     = verify;
 	t->active_writers = 0;
 	/* writer_cap comes from cfg.writers_per_inode_cap (-w); guard against an
 	 * unset (0) or out-of-range config by falling back to the default. */
@@ -274,9 +276,26 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 			debug("range-split: \"%s\": at least one byte-range "
 			    "failed permanently after retries", t->path);
 		}
+	} else if (t->verify && w != NULL) {
+		/*
+		 * HPNVerifyTransfer: the file's last range just finished
+		 * cleanly.  Run the whole-file post-transfer verify here, on
+		 * the finalizing worker's own live conn (safe from the
+		 * teardown reaper - this thread owns the worker).  target ==
+		 * LOCAL means a download (the local file we wrote is the
+		 * target); REMOTE means an upload (the remote file is the
+		 * target, local is the source).
+		 */
+		if (t->target == SFTP_RANGE_TARGET_LOCAL)
+			parallel_verify_one(w, t->path, t->src_path,
+			    /*local_is_target=*/1);
+		else
+			parallel_verify_one(w, t->src_path, t->path,
+			    /*local_is_target=*/0);
 	}
 	pthread_mutex_destroy(&t->mu);
 	free(t->path);
+	free(t->src_path);
 	free(t);
 	return incomplete;
 }
@@ -672,8 +691,13 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (effective_ranges == 0)
 		return -1;
 
+	/* Upload: remote file is the target, local file is the source.  Tag the
+	 * tracker for post-transfer verify when HPNVerifyTransfer is on, so the
+	 * last range to finalize runs the whole-file integrity check (range
+	 * units do not pass through execute_unit's whole-file verify). */
 	tracker = range_tracker_new(effective_ranges,
-	    SFTP_RANGE_TARGET_REMOTE, remote_path, p->cfg.writers_per_inode_cap);
+	    SFTP_RANGE_TARGET_REMOTE, remote_path, /*src=*/local_path,
+	    /*verify=*/p->cfg.verify_transfer, p->cfg.writers_per_inode_cap);
 
 	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
 	for (i = 0; i < effective_ranges; i++) {
@@ -758,8 +782,10 @@ submit_download_ranges(struct sftp_parallel *p,
 	if (effective_ranges == 0)
 		return -1;
 
+	/* Download: local file is the target, remote file is the source. */
 	tracker = range_tracker_new(effective_ranges,
-	    SFTP_RANGE_TARGET_LOCAL, local_path, p->cfg.writers_per_inode_cap);
+	    SFTP_RANGE_TARGET_LOCAL, local_path, /*src=*/remote_path,
+	    /*verify=*/p->cfg.verify_transfer, p->cfg.writers_per_inode_cap);
 
 	for (i = 0; i < effective_ranges; i++) {
 		off_t offset = (off_t)i * range_size;

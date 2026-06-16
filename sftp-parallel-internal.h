@@ -694,8 +694,15 @@ struct sftp_range_tracker {
 	int                    remaining;  /* finalize calls still owed */
 	int                    any_failed; /* sticky: 1 if any range failed */
 	enum sftp_range_target target;
-	char                  *path;       /* local OR remote path of corrupt
-					    * file (xstrdup'd in new) */
+	char                  *path;       /* TARGET path (the file written):
+					    * local on download, remote on
+					    * upload (xstrdup'd in new) */
+	/* HPNVerifyTransfer: when verify is set, the source path (the file
+	 * read - remote on download, local on upload) and a flag so the last
+	 * range to finalize runs a whole-file post-transfer verify on the
+	 * finalizing worker's live conn.  src_path xstrdup'd in new. */
+	char                  *src_path;
+	int                    verify;
 	/* HPN concurrent-writer cap (guarded by mu above): active_writers is
 	 * the in-flight range count for this file; writer_cap is the ceiling.
 	 * Acquired in parallel_worker_thread's dispatch gate, released in
@@ -1384,6 +1391,13 @@ int	 parallel_unit_ensure_file(struct sftp_conn *,
 
 /* sftp-parallel-worker.c export (moves there in a later step) */
 void	*parallel_worker_thread(void *);
+/* Post-transfer whole-file verify of one completed file, recording any
+ * mismatch in the orchestrator's verify_failed_paths.  local_is_target=1
+ * when the local file is the one this host wrote (download).  Runs on the
+ * caller's (live) worker conn.  Used by the whole-file path and the
+ * range-split finalize. */
+void	 parallel_verify_one(struct sftp_worker *, const char *local_path,
+	    const char *remote_path, int local_is_target);
 
 /* sftp-parallel-respawn.c - spawn/respawn lifecycle */
 void	 parallel_respawn_teardown_ssh(struct sftp_worker *);

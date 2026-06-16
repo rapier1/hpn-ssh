@@ -29,6 +29,7 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"
+#include "sftp-hpn-verify.h"		/* sftp_hpn_verify_transfer */
 #include "sftp-workqueue.h"
 #include "sftp-parallel.h"
 #include "sftp-parallel-internal.h"
@@ -105,7 +106,7 @@ worker_record_completion(struct sftp_worker *w, off_t bytes, int success)
  * orchestrator's thread-safe verify_failed_paths list.  Never fails the
  * unit - a mismatch is surfaced in the summary + exit code, not retried.
  */
-static void
+void
 parallel_verify_one(struct sftp_worker *w, const char *local_path,
     const char *remote_path, int local_is_target)
 {
@@ -320,10 +321,20 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 
 	if (rc == 0) {
 		worker_record_completion(w, u->size, 1);
-		parallel_unit_pending_dec_traced(p, u, w->id, "wpr/success");
-		/* Range tracker: this range finished cleanly.  Last
-		 * completer for the file frees the tracker. */
+		/*
+		 * Range tracker: this range finished cleanly.  Finalize BEFORE
+		 * decrementing pending.  For the last range of a verified file,
+		 * finalize runs the whole-file post-transfer verify on this
+		 * worker's own live conn; dropping pending to 0 first would wake
+		 * sftp_parallel_wait and let the main thread tear the conn down
+		 * mid-verify (a broken pipe on the hpn-check-file send).  The
+		 * unit is not truly complete until verified, so it stays pending
+		 * across the verify.  Last completer for the file frees the
+		 * tracker.  (Verify-off: finalize is the same fast bookkeeping,
+		 * so the reorder is a no-op in timing.)
+		 */
 		(void)parallel_unit_tracker_finalize(u->range_tracker, 0, w);
+		parallel_unit_pending_dec_traced(p, u, w->id, "wpr/success");
 		parallel_unit_free(u);
 	} else {
 		/*
