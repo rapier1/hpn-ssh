@@ -731,11 +731,11 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 /* ── BEGIN Phase 5: hpn-bundle upload ──────────────────────────────────────
  *
  * Implements the client side of `hpn-bundle-open@hpnssh.org`.  Many small
- * files are packed into a tar (ustar) byte stream by libarchive and
- * delivered to the server through a single OPEN, multiple WRITEs, and a
- * CLOSE on the SFTP connection.  Server-side handler (in sftp-hpn-server.c
- * process_hpn_bundle_open) feeds the bytes back through libarchive to
- * recreate the file tree.
+ * files are packed into a tar (ustar) byte stream by the hand-rolled tar
+ * codec and delivered to the server through a single OPEN, multiple WRITEs,
+ * and a CLOSE on the SFTP connection.  Server-side handler (in
+ * sftp-hpn-server.c process_hpn_bundle_open) feeds the bytes back through
+ * the tar codec to recreate the file tree.
  *
  * Wire format:
  *   client -> server:
@@ -785,7 +785,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 #define DRAIN_GAP_RING          48
 
 /*
- * Context for libarchive's write callback.  WRITEs are pipelined: each
+ * Context for the tar codec's write path.  WRITEs are pipelined: each
  * callback invocation sends one SSH_FXP_WRITE without blocking on the
  * server's STATUS reply.  STATUSes accumulate in the SSH channel; they
  * are drained in bulk before SSH_FXP_CLOSE.

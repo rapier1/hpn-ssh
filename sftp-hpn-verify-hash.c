@@ -1,11 +1,17 @@
 /*
- * sftp-hpn-readback.c - on-disk read-back hashing for HPNVerifyTransfer.
+ * sftp-hpn-verify-hash.c - shared verify hashing primitives for
+ * HPNVerifyTransfer, linked into both the client and the server.
  *
- * See sftp-hpn-readback.h.  The fsync + posix_fadvise(DONTNEED) + O_DIRECT
- * read-back is what makes a verified transfer's guarantee about bytes on the
- * platter rather than bytes in the page cache; it falls back to a buffered
- * read where O_DIRECT is unavailable.  Self-contained (libc + xxhash + log)
- * so it can link into both the client and the server.
+ * Two complementary primitives live here:
+ *   - sftp_hpn_hash_file_ondisk: fsync + posix_fadvise(DONTNEED) + O_DIRECT
+ *     read-back of a file, so a verified transfer's guarantee is about bytes
+ *     on the platter rather than bytes in the page cache (buffered fallback
+ *     where O_DIRECT is unavailable).  The TARGET side of the check.
+ *   - sftp_hpn_src_hashset: a per-entry source-hash accumulator implementing
+ *     the tar writer's data tap (XXH3 each bundled file's source bytes as
+ *     they are packed, keyed by archive_path).  The SOURCE side.
+ *
+ * Self-contained (libc + xxhash + log) so it links into both binaries.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  * Copyright (c) 2024-2026 Pittsburgh Supercomputing Center / HPN-SSH project.
@@ -20,11 +26,12 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "xmalloc.h"		/* xcalloc / xstrdup */
 #include "log.h"
 #include "misc.h"		/* MINIMUM */
 #define XXH_INLINE_ALL		/* xxhash is header-only; inline the XXH3 API */
 #include "xxhash.h"
-#include "sftp-hpn-readback.h"
+#include "sftp-hpn-verify-hash.h"
 
 /*
  * On-disk read-back buffer.  4 MiB matches the measured large-filesystem
@@ -134,4 +141,97 @@ sftp_hpn_hash_file_ondisk(const char *path, uint64_t length, int ondisk,
 		close(fd);
 	free(buf);
 	return rc;
+}
+
+/* ── Source-hash accumulator (bundle pack-time source side) ───────────────
+ *
+ * Implements struct sftp_hpn_tar_data_tap's on_data: the tar writer feeds
+ * each entry's source bytes here as it packs them; we XXH3 them per entry,
+ * keyed by archive_path, and stash the digest.  The caller looks results up
+ * by path after packing (the source hash to compare against the server's
+ * O_DIRECT read-back of what landed).  The codec stays hash-agnostic.
+ */
+struct src_hash_node {
+	char    *archive_path;
+	uint64_t hash;
+	struct src_hash_node *next;
+};
+
+struct sftp_hpn_src_hashset {
+	XXH3_state_t *cur;		/* in-progress entry hash, or NULL */
+	struct src_hash_node *head, *tail;
+};
+
+struct sftp_hpn_src_hashset *
+sftp_hpn_src_hashset_new(void)
+{
+	return xcalloc(1, sizeof(struct sftp_hpn_src_hashset));
+}
+
+void
+sftp_hpn_src_hashset_free(struct sftp_hpn_src_hashset *s)
+{
+	struct src_hash_node *n, *nn;
+
+	if (s == NULL)
+		return;
+	for (n = s->head; n != NULL; n = nn) {
+		nn = n->next;
+		free(n->archive_path);
+		free(n);
+	}
+	if (s->cur != NULL)
+		XXH3_freeState(s->cur);
+	free(s);
+}
+
+void
+sftp_hpn_src_hashset_tap(void *arg, const char *archive_path,
+    const u_char *data, size_t len, int final)
+{
+	struct sftp_hpn_src_hashset *s = arg;
+	struct src_hash_node *n;
+
+	if (s == NULL)
+		return;
+	/* The codec emits an entry's chunks contiguously, so a NULL cur means
+	 * a new entry is starting. */
+	if (s->cur == NULL) {
+		s->cur = XXH3_createState();
+		if (s->cur != NULL)
+			(void)XXH3_64bits_reset(s->cur);
+	}
+	if (s->cur != NULL && len > 0)
+		(void)XXH3_64bits_update(s->cur, data, len);
+	if (!final)
+		return;
+	n = xcalloc(1, sizeof(*n));
+	n->archive_path = xstrdup(archive_path);
+	n->hash = (s->cur != NULL) ? (uint64_t)XXH3_64bits_digest(s->cur) : 0;
+	if (s->tail != NULL)
+		s->tail->next = n;
+	else
+		s->head = n;
+	s->tail = n;
+	if (s->cur != NULL) {
+		XXH3_freeState(s->cur);
+		s->cur = NULL;
+	}
+}
+
+int
+sftp_hpn_src_hashset_get(struct sftp_hpn_src_hashset *s, const char *archive_path,
+    uint64_t *hash_out)
+{
+	struct src_hash_node *n;
+
+	if (s == NULL || archive_path == NULL || hash_out == NULL)
+		return -1;
+	for (n = s->head; n != NULL; n = n->next) {
+		if (strcmp(n->archive_path, archive_path) == 0) {
+			*hash_out = n->hash;
+			return 0;
+		}
+	}
+	return -1;
 }

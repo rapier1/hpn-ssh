@@ -56,7 +56,7 @@
 #include "sftp-common.h"
 #include "sftp-hpn-bundle.h"
 #include "sftp-hpn-server.h"
-#include "sftp-hpn-readback.h"		/* sftp_hpn_hash_file_ondisk */
+#include "sftp-hpn-verify-hash.h"		/* sftp_hpn_hash_file_ondisk */
 #include "sftp-hpn-bundle-server.h"	/* process_hpn_bundle_open / _fetch */
 #include "sftp-lustre.h"		/* lustre_set_stripe_fd / _tiered_layout_fd / _get_stripe */
 #define XXH_INLINE_ALL

@@ -29,7 +29,7 @@
 #define HPN_BUNDLE_FLAG_FSYNC      0x00000002U
 
 /*
- * libarchive output block size.  Each block becomes one SSH_FXP_WRITE
+ * Tar codec output block size.  Each block becomes one SSH_FXP_WRITE
  * message on the upload path; on the download path it's the chunk
  * size for reading the packed tar buffer.  128 KiB matches
  * DEFAULT_TRANSFER_BUFLEN.  Both ends use the same value so block

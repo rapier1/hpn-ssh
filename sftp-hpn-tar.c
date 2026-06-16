@@ -257,6 +257,10 @@ struct sftp_hpn_tar_writer {
 	struct writer_file *q_tail;
 	int   finish_signalled;
 
+	/* Optional per-entry data observer.  The verify layer taps source
+	 * bytes here to hash them; the codec itself stays hash-agnostic. */
+	const struct sftp_hpn_tar_data_tap *tap;
+
 	/* Current entry state. */
 	struct writer_file *cur;	/* the entry currently being emitted */
 	int      cur_fd;		/* open() result for cur->src_path */
@@ -317,6 +321,15 @@ sftp_hpn_tar_writer_free(struct sftp_hpn_tar_writer *w)
 	}
 	free(w->err);
 	free(w);
+}
+
+/* Register an optional per-entry data observer (the verify source tap). */
+void
+sftp_hpn_tar_writer_set_data_tap(struct sftp_hpn_tar_writer *w,
+    const struct sftp_hpn_tar_data_tap *tap)
+{
+	if (w != NULL)
+		w->tap = tap;
 }
 
 int
@@ -492,8 +505,12 @@ sftp_hpn_tar_writer_pack_next(struct sftp_hpn_tar_writer *w,
 				w->hdr_pos = 0;
 				if (w->cur->size == 0) {
 					/* Empty file: no data, no padding
-					 * (data is 0 bytes, already aligned).
-					 * Free the entry and advance. */
+					 * (already aligned).  Emit one empty
+					 * data-tap call, then free and advance. */
+					if (w->tap != NULL)
+						w->tap->on_data(w->tap->arg,
+						    w->cur->archive_path,
+						    NULL, 0, 1);
 					free(w->cur->src_path);
 					free(w->cur->archive_path);
 					free(w->cur);
@@ -543,6 +560,12 @@ sftp_hpn_tar_writer_pack_next(struct sftp_hpn_tar_writer *w,
 				    (unsigned long long)w->cur->size);
 				return -1;
 			}
+			if (w->tap != NULL)
+				w->tap->on_data(w->tap->arg,
+				    w->cur->archive_path, out + written,
+				    (size_t)n,
+				    w->cur_data_emitted + (uint64_t)n
+				    >= w->cur->size);
 			written             += (size_t)n;
 			w->cur_data_emitted += (uint64_t)n;
 			if (w->cur_data_emitted < w->cur->size)

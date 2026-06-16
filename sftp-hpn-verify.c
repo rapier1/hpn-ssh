@@ -36,7 +36,7 @@
 #include "sftp-client-internal.h"
 #include "sftp-hpn-client.h"
 #include "sftp-hpn-verify.h"
-#include "sftp-hpn-readback.h"	/* fsync+O_DIRECT on-disk read-back hashing */
+#include "sftp-hpn-verify-hash.h"	/* fsync+O_DIRECT on-disk read-back hashing */
 #include "sftp-hpn-server.h"	/* heartbeat protocol + wire-name macros */
 #define XXH_INLINE_ALL
 #include "xxhash.h"
