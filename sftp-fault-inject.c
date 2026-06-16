@@ -51,6 +51,14 @@ static struct {
 	pthread_once_t once;
 } fault_inj_pv_state = { 0, 0, PTHREAD_ONCE_INIT };
 
+/* Corruption state for SFTP_FAULT_CORRUPT - flips one sent byte, once. */
+static struct {
+	uint64_t       offset;     /* absolute file offset to corrupt */
+	int            armed;      /* env knob was set */
+	int            done;       /* fired (atomic, single flip) */
+	pthread_once_t once;
+} fault_inj_corrupt_state = { 0, 0, 0, PTHREAD_ONCE_INIT };
+
 static void
 fault_inj_state_init(void)
 {
@@ -297,6 +305,41 @@ fault_inj_check_recv(struct sftp_hpn_conn *hpn, size_t bytes)
 		    1000000L };
 		nanosleep(&ts, NULL);
 	}
+}
+
+static void
+fault_inj_corrupt_state_init(void)
+{
+	const char *ev = getenv("SFTP_FAULT_CORRUPT");
+
+	if (ev == NULL)
+		return;
+	fault_inj_corrupt_state.offset = strtoull(ev, NULL, 10);
+	fault_inj_corrupt_state.armed  = 1;
+}
+
+void
+fault_inj_corrupt(off_t chunk_off, u_char *buf, size_t len)
+{
+	uint64_t target;
+
+	pthread_once(&fault_inj_corrupt_state.once,
+	    fault_inj_corrupt_state_init);
+	if (!fault_inj_corrupt_state.armed || buf == NULL || len == 0)
+		return;
+	if (__atomic_load_n(&fault_inj_corrupt_state.done, __ATOMIC_SEQ_CST))
+		return;
+	target = fault_inj_corrupt_state.offset;
+	if (target < (uint64_t)chunk_off ||
+	    target >= (uint64_t)chunk_off + (uint64_t)len)
+		return;
+	/* Claim the single flip; if we lose the race another send did it. */
+	if (__atomic_exchange_n(&fault_inj_corrupt_state.done, 1,
+	    __ATOMIC_SEQ_CST) != 0)
+		return;
+	buf[target - (uint64_t)chunk_off] ^= 0xFFU;
+	error("sftp: fault injection: corrupted byte at file offset %llu",
+	    (unsigned long long)target);
 }
 
 #else /* !HPN_FAULT_INJECTION */

@@ -28,6 +28,12 @@
  *       view this is indistinguishable from a slow server, with no
  *       server-side scaffolding needed.  At most <max_conns>
  *       connections throttle (default 1).  Never kills.
+ *   ENV-VAR SFTP_FAULT_CORRUPT=<offset>
+ *       flips one byte at absolute file <offset> in the data SENT, once,
+ *       then disarms.  The on-disk source is left clean, so a verified
+ *       transfer's source hash stays good and the target hash diverges - a
+ *       manufactured transfer/write corruption for exercising the integrity
+ *       verify (HPNVerifyTransfer).
  */
 
 #ifndef SFTP_FAULT_INJECT_H
@@ -45,11 +51,17 @@ int	fault_inj_check_send(struct sftp_hpn_conn *, size_t);
 /* Per-receive hook: accounts received wire bytes, fires the armed
  * receive throttle.  Never fails the receive. */
 void	fault_inj_check_recv(struct sftp_hpn_conn *, size_t);
+/* Per-write-chunk hook: if SFTP_FAULT_CORRUPT=<offset> is set, flips one byte
+ * in the outgoing data buffer at that absolute file offset, once.  Corrupts
+ * the bytes sent while leaving the on-disk source clean, so a verified
+ * transfer's source hash holds and the target diverges. */
+void	fault_inj_corrupt(off_t chunk_off, u_char *buf, size_t len);
 #else
 /* Normal builds: hooks compile to nothing. */
 #define fault_inj_arm_conn(hpn)		do { } while (0)
 #define fault_inj_check_send(hpn, n)	(0)
 #define fault_inj_check_recv(hpn, n)	do { } while (0)
+#define fault_inj_corrupt(off, buf, len)	do { } while (0)
 #endif
 
 #endif /* SFTP_FAULT_INJECT_H */

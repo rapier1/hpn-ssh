@@ -46,7 +46,14 @@ int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 int sftp_hpn_xxhash_local_fd(struct sftp_conn *, int, uint64_t, uint64_t *);
 int sftp_hpn_hash_remote_file(struct sftp_conn *, const char *, uint64_t,
     uint32_t, uint64_t *);
-int sftp_hpn_verify_transfer(struct sftp_conn *, const char *, const char *);
+/*
+ * Post-transfer integrity check.  local_is_target is 1 when the local file is
+ * one this host just wrote (a download): its hash is taken as a fsync+O_DIRECT
+ * read-back of what landed on disk.  0 when the local file is the source (an
+ * upload): the hash comes from the inline accumulator or a buffered re-read.
+ */
+int sftp_hpn_verify_transfer(struct sftp_conn *, const char *, const char *,
+    int local_is_target);
 int sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
     u_int64_t *hash_out);
 

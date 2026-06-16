@@ -58,6 +58,7 @@ sftp_hpn_conn_free(struct sftp_hpn_conn *hpn)
 {
 	if (hpn == NULL)
 		return;
+	sftp_hpn_src_dispose(hpn);	/* free any in-flight inline-hash state */
 	freezero(hpn, sizeof(*hpn));
 }
 

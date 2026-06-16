@@ -2557,6 +2557,15 @@ do_upload_body(struct sftp_conn *conn,
 		    local_size, &progress_counter);
 	}
 
+	/*
+	 * HPN 1b: when post-transfer verify is enabled and this is a whole-
+	 * file upload (offset 0), tee the source bytes into a streaming XXH3
+	 * as we read them, so the verify step need not re-read the source.
+	 */
+	if (conn->hpn != NULL && conn->hpn->verify_transfer_enabled &&
+	    resume_offset == 0)
+		sftp_hpn_src_arm(conn->hpn);
+
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	for (;;) {
@@ -2579,6 +2588,14 @@ do_upload_body(struct sftp_conn *conn,
 			fatal("read local \"%s\": %s",
 			    local_path, strerror(errno));
 		} else if (len != 0) {
+			/* HPN 1b: hash the source bytes as read, BEFORE any
+			 * fault injection, so the inline source hash reflects
+			 * the true on-disk source rather than what is sent. */
+			sftp_hpn_src_feed(conn->hpn, data, (size_t)len);
+			/* FAULT-INJ: corrupt one byte of the data we are about to
+			 * send; the on-disk source stays clean, so a verified
+			 * transfer's source hash holds and the target diverges. */
+			fault_inj_corrupt(offset, data, (size_t)len);
 			ack = request_enqueue(&acks, ++id, len, offset);
 			sshbuf_reset(msg);
 			if ((r = sshbuf_put_u8(msg, SSH2_FXP_WRITE)) != 0 ||
@@ -2691,8 +2708,14 @@ do_upload_body(struct sftp_conn *conn,
 		stop_progress_meter();
 	free(data);
 
-	if (status == SSH2_FX_OK && !interrupted)
+	if (status == SSH2_FX_OK && !interrupted) {
 		highwater = maxack;
+		/* HPN 1b: whole file read cleanly - finalize the inline hash. */
+		sftp_hpn_src_finish(conn->hpn);
+	} else {
+		/* partial/aborted upload: discard so verify re-reads the source. */
+		sftp_hpn_src_dispose(conn->hpn);
+	}
 	if (status != SSH2_FX_OK) {
 		error("write remote \"%s\": %s", remote_path, fx2txt(status));
 		status = SSH2_FX_FAILURE;
@@ -4469,6 +4492,16 @@ sftp_conn_verify_transfer_enabled(struct sftp_conn *conn)
 {
 	return conn != NULL && conn->hpn != NULL &&
 	    conn->hpn->verify_transfer_enabled;
+}
+
+/* HPNVerifyTransfer (1b): bridge conn -> conn->hpn for the verify module. */
+int
+sftp_conn_verify_src_take(struct sftp_conn *conn, uint64_t expect_bytes,
+    uint64_t *hash_out)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return -1;
+	return sftp_hpn_src_take(conn->hpn, expect_bytes, hash_out);
 }
 
 uint64_t

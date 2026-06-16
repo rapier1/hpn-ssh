@@ -176,7 +176,37 @@ struct sftp_hpn_conn {
 	uint64_t fault_bytes_recvd;    /* bytes received so far on this conn */
 	int      fault_recv_throttling; /* this conn holds a recv-throttle slot */
 #endif
+
+	/* HPNVerifyTransfer (1b): inline source-hash accumulator.  When the
+	 * upload computes the source XXH3 as it reads (post-transfer verify
+	 * enabled, whole-file upload), the result lands here so the verify
+	 * step consumes it instead of re-reading the source.  state is the
+	 * streaming XXH3 handle (void* to keep this header xxhash-free; NULL
+	 * when inactive); valid is set once finished cleanly. */
+	void     *verify_src_state;
+	uint64_t  verify_src_bytes;
+	uint64_t  verify_src_hash;
+	int       verify_src_valid;
+	int       verify_src_failed;
 };
+
+/*
+ * HPNVerifyTransfer (1b) inline source-hash accumulator (sftp-hpn-verify.c).
+ * arm:     begin a streaming XXH3 over the source bytes.
+ * feed:    add bytes - call BEFORE any fault injection so the hash reflects
+ *          the true on-disk source, not what is sent.
+ * finish:  digest + mark valid; frees the streaming state.
+ * dispose: abort with no result (partial/failed transfer); frees the state.
+ * take:    consume the result iff it covers expect_bytes; 0 + *hash_out on
+ *          success, -1 otherwise (caller re-reads the source).
+ * All are no-ops when not armed / hpn==NULL.
+ */
+void sftp_hpn_src_arm(struct sftp_hpn_conn *hpn);
+void sftp_hpn_src_feed(struct sftp_hpn_conn *hpn, const u_char *buf, size_t len);
+void sftp_hpn_src_finish(struct sftp_hpn_conn *hpn);
+void sftp_hpn_src_dispose(struct sftp_hpn_conn *hpn);
+int  sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
+	uint64_t *hash_out);
 
 /*
  * Account `n` payload bytes that just left this connection on a

@@ -58,6 +58,7 @@ typedef void EditLine;
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
+#include "sftp-hpn-verify.h"		/* sftp_hpn_verify_transfer */
 #include "sftp-usergroup.h"
 #include "sftp-parallel.h"
 
@@ -942,9 +943,10 @@ parallel_flush(void)
  */
 static void
 verify_one(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path)
+    const char *remote_path, int local_is_target)
 {
-	int r = sftp_hpn_verify_transfer(conn, local_path, remote_path);
+	int r = sftp_hpn_verify_transfer(conn, local_path, remote_path,
+	    local_is_target);
 
 	if (r == 0) {
 		debug("verify: \"%s\" OK", remote_path);
@@ -1347,7 +1349,8 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 				mprintf("File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
 			else if (hpn_verify_transfer)	/* dr==0: downloaded */
-				verify_one(conn, abs_dst, g.gl_pathv[i]);
+				verify_one(conn, abs_dst, g.gl_pathv[i],
+				    /*local_is_target=*/1);
 		}
 		free(abs_dst);
 		abs_dst = NULL;
@@ -1527,7 +1530,8 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 				mprintf("File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
 			else if (hpn_verify_transfer)	/* ur==0: uploaded */
-				verify_one(conn, g.gl_pathv[i], abs_dst);
+				verify_one(conn, g.gl_pathv[i], abs_dst,
+				    /*local_is_target=*/0);
 		}
 	}
 

@@ -107,10 +107,11 @@ worker_record_completion(struct sftp_worker *w, off_t bytes, int success)
  */
 static void
 parallel_verify_one(struct sftp_worker *w, const char *local_path,
-    const char *remote_path)
+    const char *remote_path, int local_is_target)
 {
 	struct sftp_parallel *p = w->parent;
-	int r = sftp_hpn_verify_transfer(w->conn, local_path, remote_path);
+	int r = sftp_hpn_verify_transfer(w->conn, local_path, remote_path,
+	    local_is_target);
 
 	if (r == 0)
 		return;	/* verified good */
@@ -180,7 +181,8 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		    p->cfg.preserve_flag, u->resume, /*verify=*/u->verify,
 		    p->cfg.fsync_flag, p->cfg.inplace_flag);
 		if (rc == 0 && p->cfg.verify_transfer)
-			parallel_verify_one(w, u->src_path, u->dst_path);
+			parallel_verify_one(w, u->src_path, u->dst_path,
+			    /*local_is_target=*/0);	/* local = source */
 		if (rc == 1 || rc == 2)
 			rc = 0;	/* identical / target-larger: complete */
 		break;
@@ -222,7 +224,8 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		    u->resume, p->cfg.fsync_flag,
 		    p->cfg.inplace_flag, /*verify=*/u->verify);
 		if (rc == 0 && p->cfg.verify_transfer)
-			parallel_verify_one(w, u->dst_path, u->src_path);
+			parallel_verify_one(w, u->dst_path, u->src_path,
+			    /*local_is_target=*/1);	/* local = downloaded file */
 		if (rc == 1 || rc == 2)
 			rc = 0;	/* identical / target-larger: complete */
 		break;

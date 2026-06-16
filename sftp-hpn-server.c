@@ -56,6 +56,7 @@
 #include "sftp-common.h"
 #include "sftp-hpn-bundle.h"
 #include "sftp-hpn-server.h"
+#include "sftp-hpn-readback.h"		/* sftp_hpn_hash_file_ondisk */
 #include "sftp-hpn-bundle-server.h"	/* process_hpn_bundle_open / _fetch */
 #include "sftp-lustre.h"		/* lustre_set_stripe_fd / _tiered_layout_fd / _get_stripe */
 #define XXH_INLINE_ALL
@@ -480,6 +481,31 @@ send_hpn_check_file_heartbeat(uint32_t id, uint64_t progress,
 	flush_oqueue_blocking(oqueue);
 }
 
+/*
+ * Heartbeat context for the hpn-check-file read-back hash.  The shared
+ * read-back helper invokes this per chunk; we throttle the actual heartbeat
+ * emission to HPN_HEARTBEAT_EMIT_INTERVAL_SEC so the client's watchdog-pause
+ * stays refreshed during a long hash.
+ */
+struct hpn_check_file_hb {
+	u_int          id;
+	struct sshbuf *oqueue;
+	time_t         last_hb_sec;
+};
+
+static void
+hpn_check_file_hb_progress(void *arg, uint64_t done)
+{
+	struct hpn_check_file_hb *c = arg;
+	time_t now = monotime();
+
+	if (now != 0 && c->last_hb_sec != 0 &&
+	    (now - c->last_hb_sec) >= (time_t)HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
+		send_hpn_check_file_heartbeat(c->id, done, c->oqueue);
+		c->last_hb_sec = now;
+	}
+}
+
 void
 process_hpn_check_file(u_int id, struct sshbuf *iqueue,
     struct sshbuf *oqueue)
@@ -489,12 +515,8 @@ process_hpn_check_file(u_int id, struct sshbuf *iqueue,
 	uint32_t flags;
 	int r;
 	int fd = -1;
-	XXH3_state_t *state = NULL;
-	XXH64_hash_t hash;
-	u_char buf[65536];
-	uint64_t remaining;
-	time_t last_hb_sec;
-	ssize_t nread;
+	uint64_t hash = 0;
+	struct hpn_check_file_hb hb;
 	struct sshbuf *msg;
 	struct stat st;
 
@@ -547,56 +569,27 @@ process_hpn_check_file(u_int id, struct sshbuf *iqueue,
 		goto sentinel_reply;
 	}
 
-	if ((state = XXH3_createState()) == NULL) {
+	/*
+	 * Hash the file via the shared on-disk read-back helper.  Strict mode
+	 * (HPNVerifyTransfer) gets fsync + O_DIRECT so the hash reflects the
+	 * platter; plain (non-strict) resume check-file stays buffered.  The
+	 * helper opens its own fd, so release ours first; the heartbeat
+	 * callback keeps the client's watchdog-pause refreshed during a long
+	 * hash.
+	 */
+	close(fd);
+	fd = -1;
+	hb.id = id;
+	hb.oqueue = oqueue;
+	hb.last_hb_sec = monotime();
+	if (sftp_hpn_hash_file_ondisk(path, length,
+	    (flags & HPN_CHECK_FILE_STRICT) != 0, &hash,
+	    hpn_check_file_hb_progress, &hb) != 0) {
 		send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
 		goto out;
 	}
-	if (XXH3_64bits_reset(state) == XXH_ERROR) {
-		error_f("XXH3_64bits_reset failed");
-		send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
-		goto out;
-	}
-
-	remaining = length;
-	last_hb_sec = monotime();
-	while (remaining > 0) {
-		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
-
-		nread = read(fd, buf, toread);
-		if (nread == 0)
-			break; /* EOF before length bytes - hash what we have */
-		if (nread < 0) {
-			send_status_oqueue(oqueue, id, errno_to_sftp_status(errno));
-			goto out;
-		}
-		if (XXH3_64bits_update(state, buf, (size_t)nread) == XXH_ERROR) {
-			error_f("XXH3_64bits_update failed");
-			send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
-			goto out;
-		}
-		remaining -= (uint64_t)nread;
-
-		/*
-		 * Emit a heartbeat every HPN_HEARTBEAT_EMIT_INTERVAL_SEC so the
-		 * client's watchdog-pause stays refreshed.  Cheap monotonic-sec
-		 * check per 64KB read iteration; the actual reply build/send
-		 * only runs every ~5 s of elapsed wall time.
-		 */
-		{
-			time_t now = monotime();
-			if (now != 0 && last_hb_sec != 0 &&
-			    (now - last_hb_sec) >=
-			    (time_t)HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
-				send_hpn_check_file_heartbeat(id,
-				    length - remaining, oqueue);
-				last_hb_sec = now;
-			}
-		}
-	}
-	hash = XXH3_64bits_digest(state);
-	debug3("hpn-check-file: computed hash %016llx for \"%s\" "
-	    "length %llu", (unsigned long long)hash, path,
-	    (unsigned long long)length);
+	debug3("hpn-check-file: computed hash %016llx for \"%s\" length %llu",
+	    (unsigned long long)hash, path, (unsigned long long)length);
 
  sentinel_reply:
 	if ((msg = sshbuf_new()) == NULL)
@@ -611,8 +604,6 @@ process_hpn_check_file(u_int id, struct sshbuf *iqueue,
 		fatal_fr(r, "enqueue reply");
 	sshbuf_free(msg);
 out:
-	if (state != NULL)
-		XXH3_freeState(state);
 	if (fd != -1)
 		close(fd);
 	free(path);

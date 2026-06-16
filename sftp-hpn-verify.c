@@ -36,6 +36,7 @@
 #include "sftp-client-internal.h"
 #include "sftp-hpn-client.h"
 #include "sftp-hpn-verify.h"
+#include "sftp-hpn-readback.h"	/* fsync+O_DIRECT on-disk read-back hashing */
 #include "sftp-hpn-server.h"	/* heartbeat protocol + wire-name macros */
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -377,6 +378,88 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 }
 
 /*
+ * ── Inline source-hash accumulator (HPNVerifyTransfer 1b) ────────────────
+ * The upload reads the whole source to send it; rather than re-read the
+ * source a second time at verify, we tee those bytes into a streaming XXH3
+ * as they are read.  State lives on conn->hpn so it survives from the upload
+ * call to the separate post-transfer verify call.  All entry points are
+ * no-ops when not armed or hpn==NULL, so the disabled hot path is untouched.
+ */
+void
+sftp_hpn_src_arm(struct sftp_hpn_conn *hpn)
+{
+	XXH3_state_t *st;
+
+	if (hpn == NULL)
+		return;
+	sftp_hpn_src_dispose(hpn);	/* clear any stale state first */
+	if ((st = XXH3_createState()) == NULL ||
+	    XXH3_64bits_reset(st) == XXH_ERROR) {
+		if (st != NULL)
+			XXH3_freeState(st);
+		return;			/* leave disarmed; verify re-reads */
+	}
+	hpn->verify_src_state = st;
+	hpn->verify_src_bytes = 0;
+	hpn->verify_src_valid = 0;
+	hpn->verify_src_failed = 0;
+}
+
+void
+sftp_hpn_src_feed(struct sftp_hpn_conn *hpn, const u_char *buf, size_t len)
+{
+	if (hpn == NULL || hpn->verify_src_state == NULL || hpn->verify_src_failed)
+		return;
+	if (XXH3_64bits_update((XXH3_state_t *)hpn->verify_src_state,
+	    buf, len) == XXH_ERROR) {
+		hpn->verify_src_failed = 1;
+		return;
+	}
+	hpn->verify_src_bytes += (uint64_t)len;
+}
+
+void
+sftp_hpn_src_finish(struct sftp_hpn_conn *hpn)
+{
+	if (hpn == NULL || hpn->verify_src_state == NULL)
+		return;
+	if (!hpn->verify_src_failed) {
+		hpn->verify_src_hash = (uint64_t)XXH3_64bits_digest(
+		    (XXH3_state_t *)hpn->verify_src_state);
+		hpn->verify_src_valid = 1;
+	}
+	XXH3_freeState((XXH3_state_t *)hpn->verify_src_state);
+	hpn->verify_src_state = NULL;
+}
+
+void
+sftp_hpn_src_dispose(struct sftp_hpn_conn *hpn)
+{
+	if (hpn == NULL)
+		return;
+	if (hpn->verify_src_state != NULL) {
+		XXH3_freeState((XXH3_state_t *)hpn->verify_src_state);
+		hpn->verify_src_state = NULL;
+	}
+	hpn->verify_src_valid = 0;
+	hpn->verify_src_failed = 0;
+	hpn->verify_src_bytes = 0;
+}
+
+int
+sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
+    uint64_t *hash_out)
+{
+	if (hpn == NULL || !hpn->verify_src_valid)
+		return -1;
+	hpn->verify_src_valid = 0;		/* consume once */
+	if (hpn->verify_src_bytes != expect_bytes)
+		return -1;			/* did not cover the whole file */
+	*hash_out = hpn->verify_src_hash;
+	return 0;
+}
+
+/*
  * Post-transfer integrity check (HPNVerifyTransfer): XXH3 the full local
  * file and the full remote file and compare.  Used by both single-stream
  * (sftp/scp) and parallel paths to confirm a completed transfer matches
@@ -390,47 +473,91 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
  *       caller should warn that verification was skipped, but this is NOT
  *       a content-mismatch failure.
  */
+/* Keep the connection watchdog paused while a long on-disk read-back runs. */
+static void
+verify_readback_progress(void *arg, uint64_t bytes)
+{
+	(void)bytes;
+	sftp_conn_watchdog_pause((struct sftp_conn *)arg,
+	    HPN_HEARTBEAT_REFRESH_SEC);
+}
+
 int
 sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path)
+    const char *remote_path, int local_is_target)
 {
 	int fd, r = -1;
 	struct stat sb;
 	uint64_t local_hash, remote_hash;
+	const char *mode;
 
 	if (!sftp_conn_has_hpn_check_file(conn)) {
 		debug_f("cannot verify \"%s\": server lacks "
 		    "hpn-check-file@hpnssh.org", remote_path);
 		return -1;
 	}
-	if ((fd = open(local_path, O_RDONLY)) == -1) {
-		error("verify: open local \"%s\": %s",
+	if (stat(local_path, &sb) == -1) {
+		error("verify: stat local \"%s\": %s",
 		    local_path, strerror(errno));
 		return -1;
 	}
-	if (fstat(fd, &sb) == -1) {
-		error("verify: fstat local \"%s\": %s",
-		    local_path, strerror(errno));
+
+	if (local_is_target) {
+		/*
+		 * Download: this host just wrote local_path.  Hash it as a
+		 * fsync+O_DIRECT read-back so we verify what landed on disk,
+		 * not what sits in the page cache - the download-side mirror of
+		 * the server's upload-target read-back.
+		 */
+		mode = "readback";
+		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+		if (sftp_hpn_hash_file_ondisk(local_path, (uint64_t)sb.st_size,
+		    /*ondisk=*/1, &local_hash, verify_readback_progress,
+		    conn) != 0) {
+			sftp_conn_watchdog_resume(conn);
+			return -1;
+		}
+		sftp_conn_watchdog_resume(conn);
+	} else if (sftp_conn_verify_src_take(conn, (uint64_t)sb.st_size,
+	    &local_hash) == 0) {
+		/*
+		 * Upload: the source hash was accumulated inline during the
+		 * read-to-send (1b); no second read of the source.
+		 */
+		mode = "inline";
+	} else {
+		/* Upload, inline unavailable: buffered re-read of the source. */
+		mode = "reread";
+		if ((fd = open(local_path, O_RDONLY)) == -1) {
+			error("verify: open local \"%s\": %s",
+			    local_path, strerror(errno));
+			return -1;
+		}
+		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+		if (sftp_hpn_xxhash_local_fd(conn, fd, (uint64_t)sb.st_size,
+		    &local_hash) != 0) {
+			sftp_conn_watchdog_resume(conn);
+			close(fd);
+			return -1;
+		}
+		sftp_conn_watchdog_resume(conn);
 		close(fd);
-		return -1;
 	}
-	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+
 	/*
 	 * Post-transfer integrity check: ALWAYS require the real XXH3, no
 	 * sparse-skip trust shortcut.  The purpose of this function is to
 	 * verify what actually transferred, not to trust allocation
 	 * metadata.  Pass HPN_CHECK_FILE_STRICT unconditionally.
 	 */
-	if (sftp_hpn_xxhash_local_fd(conn, fd, (uint64_t)sb.st_size,
-	    &local_hash) == 0 &&
-	    sftp_hpn_hash_remote_file(conn, remote_path, (uint64_t)sb.st_size,
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	if (sftp_hpn_hash_remote_file(conn, remote_path, (uint64_t)sb.st_size,
 	    HPN_CHECK_FILE_STRICT, &remote_hash) == 0)
 		r = (local_hash == remote_hash) ? 0 : 1;
 	sftp_conn_watchdog_resume(conn);
-	close(fd);
-	debug3_f("verify \"%s\": local=%016llx remote=%016llx result=%d",
+	debug3_f("verify \"%s\": local=%016llx remote=%016llx result=%d (%s)",
 	    remote_path, (unsigned long long)local_hash,
-	    (unsigned long long)remote_hash, r);
+	    (unsigned long long)remote_hash, r, mode);
 	return r;
 }
 
