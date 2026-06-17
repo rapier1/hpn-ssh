@@ -887,8 +887,11 @@ process_close(uint32_t id)
 	debug3("request %u: close handle %u", id, handle);
 	/* Phase 5: bundle handles run libarchive extraction at close. */
 	if (sftp_hpn_server_is_bundle_handle(handle)) {
-		status = sftp_hpn_server_bundle_close(handle);
-		send_status(id, status);
+		status = sftp_hpn_server_bundle_close(handle, id, oqueue);
+		/* When verify is on the handler already sent the per-file hash
+		 * reply itself; only send a STATUS otherwise. */
+		if (status != SFTP_HPN_BUNDLE_REPLY_SENT)
+			send_status(id, status);
 		return;
 	}
 	handle_log_close(handle, NULL);

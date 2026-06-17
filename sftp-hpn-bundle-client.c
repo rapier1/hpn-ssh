@@ -67,6 +67,8 @@
 #include "sftp-hpn-bundle.h"
 #include "sftp-hpn-bundle-client.h"
 #include "sftp-hpn-tar.h"
+#include "sftp-hpn-verify-hash.h"	/* src-hash accumulator (bundle verify) */
+#include "sftp-fault-inject.h"		/* SFTP_FAULT_CORRUPT (test only) */
 
 /* ── BEGIN Phase 5: hpn-bundle-fetch download ─────────────────────────────
  *
@@ -1061,9 +1063,14 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	double t_send_done = 0, t_drain_done = 0, t_close_done = 0;
 	uint64_t bytes_total = 0;
 	int files_queued = 0;
+	int verify = sftp_conn_verify_transfer_enabled(conn);
+	struct sftp_hpn_src_hashset *hashset = NULL;
+	struct sftp_hpn_tar_data_tap tap;
 
-	for (i = 0; i < n; i++)
+	for (i = 0; i < n; i++) {
 		entries[i].result = -1;   /* pessimistic; flip to 0 on success */
+		entries[i].verify_failed = 0;
+	}
 
 	if (n <= 0)
 		return SFTP_HPN_BUNDLE_OK;
@@ -1088,9 +1095,19 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	/* ── Send hpn-bundle-open@hpnssh.org and collect HANDLE ─────────── */
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
+	/* HPNVerifyTransfer: accumulate per-file source hashes as we pack, and
+	 * ask the server (VERIFY flag) to read each extracted file back and
+	 * return its on-disk hash in the CLOSE reply. */
+	if (verify) {
+		hashset = sftp_hpn_src_hashset_new();
+		if (hashset == NULL)
+			verify = 0;	/* can't hash; degrade to no verify */
+	}
+
 	open_id = sftp_conn_alloc_msg_id(conn);
 	flags = (preserve_flag ? HPN_BUNDLE_FLAG_PRESERVE : 0)
-	      | (fsync_flag    ? HPN_BUNDLE_FLAG_FSYNC    : 0);
+	      | (fsync_flag    ? HPN_BUNDLE_FLAG_FSYNC    : 0)
+	      | (verify        ? HPN_BUNDLE_FLAG_VERIFY   : 0);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, open_id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, "hpn-bundle-open@hpnssh.org")) != 0 ||
@@ -1117,6 +1134,13 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	if (writer == NULL) {
 		error_f("sftp_hpn_tar_writer_new failed");
 		goto cleanup;
+	}
+	if (verify) {
+		/* Tap source bytes into the per-file hash accumulator as the
+		 * codec packs them (codec stays hash-agnostic). */
+		tap.on_data = sftp_hpn_src_hashset_tap;
+		tap.arg = hashset;
+		sftp_hpn_tar_writer_set_data_tap(writer, &tap);
 	}
 
 	/* Queue every requested entry.  Per-entry stat() failures are
@@ -1172,6 +1196,11 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		}
 		if (produced == 0)
 			break;	/* EOA reached - all bytes sent */
+		/* FAULT-INJ: corrupt one byte of the outgoing tar stream at
+		 * this stream offset; the per-file source hashes (teed clean
+		 * during pack) hold and the written target diverges -
+		 * exercises the bundle verify. */
+		fault_inj_corrupt((off_t)bytes_total, outbuf, (size_t)produced);
 		bytes_total += (uint64_t)produced;
 		if (bundle_ul_send_write(&ctx, outbuf, (size_t)produced) != 0)
 			goto cleanup;
@@ -1209,17 +1238,69 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 			goto cleanup;
 		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &reply_rid)) != 0 ||
-		    type != SSH2_FXP_STATUS ||
-		    (r = sshbuf_get_u32(msg, &status)) != 0) {
+		    (r = sshbuf_get_u32(msg, &reply_rid)) != 0) {
 			error_f("hpn-bundle: malformed CLOSE reply");
 			goto cleanup;
 		}
-		if (reply_rid != close_id || status != SSH2_FX_OK) {
-			error_f("hpn-bundle: CLOSE failed status=%u "
-			    "(rid=%u expected %u)",
-			    status, reply_rid, close_id);
+		if (reply_rid != close_id) {
+			error_f("hpn-bundle: CLOSE reply rid=%u expected %u",
+			    reply_rid, close_id);
 			goto cleanup;
+		}
+		if (verify) {
+			/* EXTENDED_REPLY { u32 status, u32 n,
+			 *                  [ string rel_path, u64 hash ] x n }.
+			 * Compare each server on-disk hash to the source hash
+			 * teed during pack; record per-file mismatches. */
+			u_int nhash, k;
+			if (type != SSH2_FXP_EXTENDED_REPLY ||
+			    (r = sshbuf_get_u32(msg, &status)) != 0 ||
+			    (r = sshbuf_get_u32(msg, &nhash)) != 0) {
+				error_f("hpn-bundle: malformed verify reply");
+				goto cleanup;
+			}
+			if (status != SSH2_FX_OK) {
+				error_f("hpn-bundle: CLOSE failed status=%u", status);
+				goto cleanup;
+			}
+			for (k = 0; k < nhash; k++) {
+				char *rpath = NULL;
+				u_int64_t thash, shash;
+
+				if ((r = sshbuf_get_cstring(msg, &rpath, NULL)) != 0 ||
+				    (r = sshbuf_get_u64(msg, &thash)) != 0) {
+					error_f("hpn-bundle: malformed verify entry");
+					free(rpath);
+					goto cleanup;
+				}
+				if (sftp_hpn_src_hashset_get(hashset, rpath, &shash) == 0 &&
+				    shash != thash) {
+					/* mark the matching entry verify-failed */
+					for (i = 0; i < n; i++) {
+						if (entries[i].remote_path != NULL &&
+						    strcmp(entries[i].remote_path, rpath) == 0) {
+							entries[i].verify_failed = 1;
+							break;
+						}
+					}
+					error_f("hpn-bundle: VERIFY FAILED \"%s\" "
+					    "src=%016llx dst=%016llx", rpath,
+					    (unsigned long long)shash, (unsigned long long)thash);
+				}
+				free(rpath);
+			}
+		} else {
+			if (type != SSH2_FXP_STATUS ||
+			    (r = sshbuf_get_u32(msg, &status)) != 0) {
+				error_f("hpn-bundle: malformed CLOSE reply");
+				goto cleanup;
+			}
+			if (status != SSH2_FX_OK) {
+				error_f("hpn-bundle: CLOSE failed status=%u "
+				    "(rid=%u expected %u)",
+				    status, reply_rid, close_id);
+				goto cleanup;
+			}
 		}
 	}
 
@@ -1267,6 +1348,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	}
 	if (writer != NULL)
 		sftp_hpn_tar_writer_free(writer);
+	sftp_hpn_src_hashset_free(hashset);
 	free(handle);
 	free(ctx.wsizes);
 	if (msg != NULL)

@@ -595,6 +595,18 @@ worker_run_bundle(struct sftp_worker *w,
 	for (i = 0; i < bn; i++)
 		if (entries[i].result == 0)
 			ok_count++;
+	/* HPNVerifyTransfer: record per-file bundle verify mismatches into the
+	 * orchestrator's thread-safe list (folded into exit 57), the bundle
+	 * counterpart of parallel_verify_one. */
+	for (i = 0; i < bn; i++) {
+		if (entries[i].verify_failed) {
+			error_f("worker %d BUNDLE VERIFY FAILED: \"%s\" "
+			    "post-transfer hash mismatch", w->id,
+			    entries[i].remote_path);
+			hpn_strlist_append(&p->verify_failed_paths,
+			    entries[i].remote_path);
+		}
+	}
 	{
 		double mibps = 0.0;
 		if (elapsed_us > 0)

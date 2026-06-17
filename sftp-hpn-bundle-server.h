@@ -93,12 +93,22 @@ int sftp_hpn_server_bundle_write(int handle, uint64_t off,
     const u_char *data, size_t len);
 
 /*
+ * Sentinel return from sftp_hpn_server_bundle_close: the handler has already
+ * sent the reply itself (the HPNVerifyTransfer EXTENDED_REPLY with per-file
+ * hashes), so the caller must NOT send a STATUS.  Distinct from any SSH2_FX_*.
+ */
+#define SFTP_HPN_BUNDLE_REPLY_SENT	(-1)
+
+/*
  * Close a bundle handle: for UPLOAD, the streaming extract already
  * happened during the WRITE sequence - close just verifies parser
  * state and frees.  For FETCH, close releases the writer and any
- * still-open input file.  Always frees the handle.
+ * still-open input file.  Always frees the handle.  When the bundle was
+ * opened with HPN_BUNDLE_FLAG_VERIFY, it sends the per-file hash reply
+ * itself (using id + oqueue) and returns SFTP_HPN_BUNDLE_REPLY_SENT;
+ * otherwise it returns the SSH2_FX_* status for the caller to send.
  */
-int sftp_hpn_server_bundle_close(int handle);
+int sftp_hpn_server_bundle_close(int handle, u_int id, struct sshbuf *oqueue);
 
 /*
  * Produce up to `len` bytes of tar stream for a fetch-mode bundle

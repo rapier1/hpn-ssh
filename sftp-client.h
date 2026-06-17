@@ -314,6 +314,9 @@ struct sftp_hpn_bundle_upload_entry {
 	const char *local_path;
 	const char *remote_path;   /* relative path inside the bundle dest */
 	int         result;        /* 0 = ok; -1 = failed (set by function) */
+	int         verify_failed; /* HPNVerifyTransfer: set by the function when
+				    * this file's on-disk hash mismatched the
+				    * source (caller records it / exits 57) */
 };
 
 /*
