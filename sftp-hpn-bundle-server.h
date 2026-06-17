@@ -160,6 +160,15 @@ void sftp_hpn_server_set_bundle_caps(const char *per_arg,
 int sftp_hpn_server_bundle_enabled(void);
 
 /*
+ * Number of upload bundle handles currently open (created, not yet closed).
+ * The server main loop consults this on a client disconnect (POLLHUP/
+ * POLLRDHUP): a nonzero count means the connection died mid-bundle, so the
+ * extraction is aborted rather than drained - otherwise a stale partial from
+ * the dead connection lands after the re-queued re-send and truncates it.
+ */
+int sftp_hpn_server_bundle_upload_inflight(void);
+
+/*
  * The per-bundle byte ceiling the server is currently enforcing,
  * derived from sshd_config's HPNMaxBundleSize (or the -B CLI default
  * if no sshd_config value was supplied).  Used by sftp-server.c's

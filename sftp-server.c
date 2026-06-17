@@ -2304,6 +2304,12 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 		    SFTP_MAX_MSG_LENGTH)) == 0) {
 			pfd[0].fd = in;
 			pfd[0].events = POLLIN;
+#ifdef POLLRDHUP
+			/* Detect a peer half-close (FIN) even with buffered
+			 * data still readable - lets us abort an abandoned
+			 * bundle before draining it (see below). */
+			pfd[0].events |= POLLRDHUP;
+#endif
 		}
 		else if (r != SSH_ERR_NO_BUFFER_SPACE)
 			fatal_fr(r, "reserve");
@@ -2319,6 +2325,28 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 				continue;
 			error("poll: %s", strerror(errno));
 			sftp_server_cleanup_exit(2);
+		}
+
+		/*
+		 * HPN: the client closed its end while an upload bundle is
+		 * still open (no CLOSE) - the connection died mid-bundle.
+		 * Abort now instead of draining the buffered tar and writing
+		 * its files: a stale partial from this dead connection would
+		 * otherwise land after the re-queued re-send and truncate it.
+		 * POLLHUP (pipe write-end closed) / POLLRDHUP (socket peer
+		 * half-close) fire with data still buffered, so this fires
+		 * before the drain.  Gated on an in-flight upload bundle, so
+		 * normal session teardown (nothing mid-bundle) drains and
+		 * replies as usual.
+		 */
+		if ((pfd[0].revents & (POLLHUP
+#ifdef POLLRDHUP
+		    | POLLRDHUP
+#endif
+		    )) != 0 && sftp_hpn_server_bundle_upload_inflight() > 0) {
+			logit("hpn-bundle: client disconnected mid-upload "
+			    "bundle; aborting extraction (abandoned)");
+			sftp_server_cleanup_exit(0);
 		}
 
 		/* copy stdin to iqueue */

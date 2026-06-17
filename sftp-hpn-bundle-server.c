@@ -367,6 +367,19 @@ static const struct sftp_hpn_tar_callbacks bundle_upload_callbacks = {
 	.entry_end_cb = bundle_upload_entry_end_cb,
 };
 
+/* Count of open upload bundle handles (created, not yet freed).  The server's
+ * main loop checks this on a client disconnect (POLLHUP/POLLRDHUP): if an
+ * upload bundle is still mid-extraction the connection died mid-bundle, so the
+ * extraction is aborted rather than drained - a stale partial from this dead
+ * connection would otherwise land after the re-queued re-send and truncate it. */
+static int upload_bundles_inflight;
+
+int
+sftp_hpn_server_bundle_upload_inflight(void)
+{
+	return upload_bundles_inflight;
+}
+
 static struct hpn_bundle_state *
 bundle_state_new(const char *dest_dir, uint32_t flags)
 {
@@ -387,6 +400,7 @@ bundle_state_new(const char *dest_dir, uint32_t flags)
 		free(s);
 		return NULL;
 	}
+	upload_bundles_inflight++;
 	return s;
 }
 
@@ -425,6 +439,8 @@ bundle_state_free(struct hpn_bundle_state *s)
 {
 	if (s == NULL)
 		return;
+	if (s->mode == HPN_BUNDLE_MODE_UPLOAD && upload_bundles_inflight > 0)
+		upload_bundles_inflight--;
 	/* Release total-cap accounting: subtract the larger of declared-
 	 * total (FETCH) or bytes-received (UPLOAD) - whichever this bundle
 	 * contributed to the running counter. */
@@ -437,8 +453,18 @@ bundle_state_free(struct hpn_bundle_state *s)
 		else
 			bundle_total_bytes = 0;
 	}
-	if (s->cur_fd >= 0)
+	if (s->cur_fd >= 0) {
+		/* TEST SCAFFOLDING (strip before release): abandoned-partial trace. */
+		{ struct stat _bst; struct timespec _bt;
+		  clock_gettime(CLOCK_MONOTONIC, &_bt);
+		  if (fstat(s->cur_fd, &_bst) == 0)
+			logit("BUNDLEDIAG pid=%d ABANDON \"%s\" wrote=%lld "
+			    "t=%lld.%09ld", (int)getpid(),
+			    s->cur_full_path ? s->cur_full_path : "(null)",
+			    (long long)_bst.st_size,
+			    (long long)_bt.tv_sec, _bt.tv_nsec); }
 		(void)close(s->cur_fd);
+	}
 	free(s->cur_full_path);
 	free(s->cur_rel_path);
 	free(s->last_mkdir_dir);
@@ -576,6 +602,11 @@ bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
 		    s->cur_full_path, strerror(errno));
 		return -1;
 	}
+	/* TEST SCAFFOLDING (strip before release): per-PID extraction trace. */
+	{ struct timespec _bt; clock_gettime(CLOCK_MONOTONIC, &_bt);
+	  logit("BUNDLEDIAG pid=%d OPEN \"%s\" declared=%llu t=%lld.%09ld",
+	      (int)getpid(), s->cur_full_path, (unsigned long long)size,
+	      (long long)_bt.tv_sec, _bt.tv_nsec); }
 #ifdef HAVE_POSIX_FALLOCATE
 	/* (E) Pre-allocate extents for fewer fragments + faster sequential
 	 * writes on extents-based FS (ext4 / xfs / lustre).  Failure is
@@ -594,6 +625,12 @@ bundle_upload_data_cb(void *ctx, const u_char *data, size_t len)
 {
 	struct hpn_bundle_state *s = ctx;
 	size_t remaining = len;
+
+	/* TEST SCAFFOLDING (strip before release): slow extraction so a
+	 * transient-killed connection's lagging re-extraction can be forced to
+	 * land after the re-send (the truncation race).  No-op unless set. */
+	{ const char *_sl = getenv("HPN_BUNDLE_SLEEP_US");
+	  if (_sl != NULL) { int _u = atoi(_sl); if (_u > 0) usleep((useconds_t)_u); } }
 
 	if (s->cur_fd < 0)
 		return -1;	/* shouldn't happen - parser always pairs */
@@ -622,6 +659,15 @@ bundle_upload_entry_end_cb(void *ctx)
 	int rc       = 0;
 
 	if (s->cur_fd >= 0) {
+		/* TEST SCAFFOLDING (strip before release): completed-file trace. */
+		{ struct stat _bst; struct timespec _bt;
+		  clock_gettime(CLOCK_MONOTONIC, &_bt);
+		  if (fstat(s->cur_fd, &_bst) == 0)
+			logit("BUNDLEDIAG pid=%d DONE \"%s\" wrote=%lld "
+			    "declared=%llu t=%lld.%09ld", (int)getpid(),
+			    s->cur_full_path, (long long)_bst.st_size,
+			    (unsigned long long)s->cur_size,
+			    (long long)_bt.tv_sec, _bt.tv_nsec); }
 		if (preserve) {
 			struct timespec ts[2];
 			ts[0].tv_sec = s->cur_mtime; ts[0].tv_nsec = 0;
