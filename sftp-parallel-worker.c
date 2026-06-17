@@ -768,6 +768,19 @@ worker_dispatch_bundle_container(struct sftp_worker *w,
 static void
 worker_execute_single(struct sftp_worker *w, struct sftp_work_unit *u)
 {
+	/*
+	 * A bundle container can reach the single-file path as an accumulate-
+	 * loop "leftover": once a transient bundle failure re-queues its members
+	 * as individual units, the queue mixes containers with individuals, and
+	 * a worker accumulating individuals can trypop a container (off-op ->
+	 * leftover).  Dispatch it as a bundle, not through execute_unit (which
+	 * fatals on a container op).  Its queued_bytes was already subtracted at
+	 * pickup, so worker_dispatch_bundle_container does no further accounting.
+	 */
+	if (u->op == SFTP_OP_BUNDLE_UPLOAD || u->op == SFTP_OP_BUNDLE_DOWNLOAD) {
+		worker_dispatch_bundle_container(w, u);
+		return;
+	}
 	worker_drain_pipeline(w);
 	worker_record_start(w);
 	int rc = execute_unit(w, u);
