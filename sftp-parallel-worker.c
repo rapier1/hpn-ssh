@@ -683,6 +683,17 @@ worker_run_bundle_download(struct sftp_worker *w,
 	for (i = 0; i < bn; i++)
 		if (entries[i].result == 0)
 			ok_count++;
+	/* HPNVerifyTransfer: record per-file download bundle verify mismatches
+	 * (mirror of the upload-bundle path). */
+	for (i = 0; i < bn; i++) {
+		if (entries[i].verify_failed) {
+			error_f("worker %d BUNDLE VERIFY FAILED: \"%s\" "
+			    "post-transfer hash mismatch", w->id,
+			    entries[i].local_path);
+			hpn_strlist_append(&p->verify_failed_paths,
+			    entries[i].local_path);
+		}
+	}
 	{
 		double mibps = 0.0;
 		if (elapsed_us > 0)

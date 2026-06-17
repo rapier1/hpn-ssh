@@ -198,6 +198,8 @@ struct bundle_dl_stream {
 	const char *cur_local;	/* local_path for current entry (entries[]
 				 * owns the storage; we just point at it) */
 	time_t   cur_mtime;	/* used by entry_end_cb */
+	uint64_t cur_written;	/* bytes written for the current entry (the
+				 * within-file offset; FAULT-INJ uses it) */
 
 	/* (D) Most-recently-mkdir_p'd parent dir - skip repeats. */
 	char    *last_mkdir_dir;
@@ -282,6 +284,7 @@ bundle_dl_entry_cb(void *ctx, const char *path, uint64_t size,
 	}
 	s->cur_local = s->entries[idx].local_path;
 	s->cur_mtime = mtime;
+	s->cur_written = 0;
 
 	/* (D) pre-create parent dir, skipping the call if it matches the
 	 * most-recent dir we already created. */
@@ -334,6 +337,15 @@ bundle_dl_data_cb(void *ctx, const u_char *data, size_t len)
 	}
 	if (s->cur_fd < 0)
 		return -1;
+
+	/*
+	 * FAULT-INJ: flip one byte of this file's extracted data at its
+	 * within-file offset before it is written.  The server's source hash
+	 * (teed during pack) holds, so the written target diverges and the
+	 * download bundle read-back catches it.  No-op in normal builds.
+	 */
+	fault_inj_corrupt((off_t)s->cur_written, (u_char *)data, len);
+	s->cur_written += (uint64_t)len;
 
 	remaining = len;
 	while (remaining > 0) {
@@ -559,6 +571,56 @@ bundle_dl_stream_drain_inflight(struct bundle_dl_stream *s)
 	return 0;
 }
 
+/*
+ * HPNVerifyTransfer (download): parse the server's fetch-close EXTENDED_REPLY
+ * { id, status, n, [tar_path, source_hash] x n } and, for each entry, read the
+ * just-extracted local file back via O_DIRECT and compare its hash to the
+ * server's source hash.  Mismatch (or read-back failure) flags the entry.
+ */
+static void
+bundle_dl_verify_reply(struct sshbuf *msg, u_int close_id,
+    struct sftp_hpn_bundle_download_entry *entries, int n)
+{
+	u_char type;
+	u_int rid, status, nhash, k;
+	int r;
+
+	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+	    (r = sshbuf_get_u32(msg, &rid)) != 0 ||
+	    type != SSH2_FXP_EXTENDED_REPLY || rid != close_id ||
+	    (r = sshbuf_get_u32(msg, &status)) != 0 ||
+	    (r = sshbuf_get_u32(msg, &nhash)) != 0) {
+		error_f("hpn-bundle-fetch: malformed verify reply");
+		return;
+	}
+	if (status != SSH2_FX_OK) {
+		error_f("hpn-bundle-fetch: server verify status=%u", status);
+		return;
+	}
+	for (k = 0; k < nhash; k++) {
+		char *tpath = NULL;
+		u_int64_t shash, thash = 0;
+		int idx;
+
+		if ((r = sshbuf_get_cstring(msg, &tpath, NULL)) != 0 ||
+		    (r = sshbuf_get_u64(msg, &shash)) != 0) {
+			error_f("hpn-bundle-fetch: malformed verify entry");
+			free(tpath);
+			return;
+		}
+		idx = bundle_dl_lookup_entry(entries, n, tpath);
+		if (idx >= 0 && entries[idx].local_path != NULL &&
+		    (sftp_hpn_hash_file_ondisk(entries[idx].local_path, UINT64_MAX,
+		    /*ondisk=*/1, &thash, NULL, NULL) != 0 || thash != shash)) {
+			entries[idx].verify_failed = 1;
+			error_f("hpn-bundle-fetch: VERIFY FAILED \"%s\" "
+			    "src=%016llx dst=%016llx", tpath,
+			    (unsigned long long)shash, (unsigned long long)thash);
+		}
+		free(tpath);
+	}
+}
+
 /* ── Public entry point ─────────────────────────────────────────────── */
 
 int
@@ -574,13 +636,16 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	struct  sftp_hpn_tar_parser *parser = NULL;
 	int     i, r, rc = -1;
 	int     done = 0;
+	int     verify = sftp_conn_verify_transfer_enabled(conn);
 
 	memset(&stream, 0, sizeof(stream));
 	stream.cur_idx = -1;
 	stream.cur_fd  = -1;
 
-	for (i = 0; i < n; i++)
+	for (i = 0; i < n; i++) {
 		entries[i].result = -1;
+		entries[i].verify_failed = 0;
+	}
 
 	if (n <= 0)
 		return SFTP_HPN_BUNDLE_OK;
@@ -595,7 +660,8 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	open_id = sftp_conn_alloc_msg_id(conn);
-	flags = preserve_flag ? HPN_BUNDLE_FLAG_PRESERVE : 0;
+	flags = (preserve_flag ? HPN_BUNDLE_FLAG_PRESERVE : 0)
+	      | (verify ? HPN_BUNDLE_FLAG_VERIFY : 0);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, open_id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg,
@@ -715,7 +781,11 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 		    sshbuf_put_string(msg, handle, handle_len) == 0)
 			(void)send_msg(conn, msg);
 		sshbuf_reset(msg);
-		(void)get_msg(conn, msg);
+		/* The CLOSE reply carries per-file source hashes when verify
+		 * is on (EXTENDED_REPLY); otherwise it is a STATUS we consume
+		 * and ignore, as before. */
+		if (get_msg(conn, msg) == 0 && verify && rc == 0)
+			bundle_dl_verify_reply(msg, close_id, entries, n);
 		free(handle);
 	}
 	if (msg != NULL)

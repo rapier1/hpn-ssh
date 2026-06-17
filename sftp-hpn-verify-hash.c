@@ -235,3 +235,15 @@ sftp_hpn_src_hashset_get(struct sftp_hpn_src_hashset *s, const char *archive_pat
 	}
 	return -1;
 }
+
+void
+sftp_hpn_src_hashset_foreach(struct sftp_hpn_src_hashset *s,
+    void (*cb)(void *arg, const char *archive_path, uint64_t hash), void *arg)
+{
+	struct src_hash_node *n;
+
+	if (s == NULL || cb == NULL)
+		return;
+	for (n = s->head; n != NULL; n = n->next)
+		cb(arg, n->archive_path, n->hash);
+}

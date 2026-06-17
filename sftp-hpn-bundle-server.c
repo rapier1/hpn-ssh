@@ -143,6 +143,11 @@ struct hpn_bundle_state {
 	uint64_t bytes_produced;    /* cumulative pack_next bytes returned */
 	uint64_t next_read_off;     /* expected SSH_FXP_READ offset */
 	uint64_t fetch_total_size;  /* sum of declared file sizes (cap check) */
+	/* HPNVerifyTransfer (FETCH): server tees per-file SOURCE hashes as it
+	 * packs (tap on `writer`), returned in the close reply for the client
+	 * to compare against its O_DIRECT read-back of the extracted targets. */
+	struct sftp_hpn_src_hashset *fetch_src_set;
+	struct sftp_hpn_tar_data_tap fetch_tap;
 };
 
 /* Flag constants and HPN_BUNDLE_BLOCK_BYTES live in sftp-hpn-bundle.h, the
@@ -402,6 +407,16 @@ bundle_state_new_fetch(uint32_t flags)
 		free(s);
 		return NULL;
 	}
+	if ((flags & HPN_BUNDLE_FLAG_VERIFY) != 0) {
+		/* HPNVerifyTransfer: tee per-file source hashes as we pack;
+		 * returned in the close reply for the client to compare. */
+		s->fetch_src_set = sftp_hpn_src_hashset_new();
+		if (s->fetch_src_set != NULL) {
+			s->fetch_tap.on_data = sftp_hpn_src_hashset_tap;
+			s->fetch_tap.arg     = s->fetch_src_set;
+			sftp_hpn_tar_writer_set_data_tap(s->writer, &s->fetch_tap);
+		}
+	}
 	return s;
 }
 
@@ -434,6 +449,7 @@ bundle_state_free(struct hpn_bundle_state *s)
 		free(ve->full_path);
 		free(ve);
 	}
+	sftp_hpn_src_hashset_free(s->fetch_src_set);
 	if (s->parser != NULL)
 		sftp_hpn_tar_parser_free(s->parser);
 	if (s->writer != NULL)
@@ -827,6 +843,61 @@ bundle_send_verify_reply(struct sshbuf *oqueue, u_int id, int status,
 	sshbuf_free(msg);
 }
 
+struct fetch_verify_emit {
+	struct sshbuf *ents;
+	u_int n;
+	int err;
+};
+
+static void
+fetch_verify_emit_cb(void *arg, const char *archive_path, uint64_t hash)
+{
+	struct fetch_verify_emit *e = arg;
+	int r;
+
+	if (e->err != 0)
+		return;
+	if ((r = sshbuf_put_cstring(e->ents, archive_path)) != 0 ||
+	    (r = sshbuf_put_u64(e->ents, hash)) != 0)
+		e->err = r;
+	else
+		e->n++;
+}
+
+/*
+ * FETCH (download) verify reply: the per-file SOURCE hashes the server teed
+ * while packing.  Same EXTENDED_REPLY shape as the upload close reply; the
+ * client reads back its extracted targets and compares against these.
+ */
+static void
+bundle_send_fetch_verify_reply(struct sshbuf *oqueue, u_int id, int status,
+    struct hpn_bundle_state *s)
+{
+	struct sshbuf *msg, *ents;
+	struct fetch_verify_emit e = { NULL, 0, 0 };
+	int r;
+
+	if ((msg = sshbuf_new()) == NULL || (ents = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	e.ents = ents;
+	if (status == SSH2_FX_OK && s->fetch_src_set != NULL)
+		sftp_hpn_src_hashset_foreach(s->fetch_src_set,
+		    fetch_verify_emit_cb, &e);
+	if (e.err != 0)
+		status = SSH2_FX_FAILURE;
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_u32(msg, (u_int)status)) != 0 ||
+	    (r = sshbuf_put_u32(msg, status == SSH2_FX_OK ? e.n : 0)) != 0)
+		fatal_fr(r, "compose fetch verify reply");
+	if (status == SSH2_FX_OK && (r = sshbuf_putb(msg, ents)) != 0)
+		fatal_fr(r, "append fetch verify entries");
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue fetch verify reply");
+	sshbuf_free(ents);
+	sshbuf_free(msg);
+}
+
 int
 sftp_hpn_server_bundle_close(int handle, u_int id, struct sshbuf *oqueue)
 {
@@ -839,8 +910,19 @@ sftp_hpn_server_bundle_close(int handle, u_int id, struct sshbuf *oqueue)
 	 * a resource release; the writer's destructor closes any open input
 	 * file and discards the queue. */
 	if (s->mode == HPN_BUNDLE_MODE_FETCH) {
-		debug_f("hpn-bundle close (fetch): handle=%d produced=%llu",
-		    handle, (unsigned long long)s->bytes_produced);
+		int fverify = (s->flags & HPN_BUNDLE_FLAG_VERIFY) != 0;
+
+		debug_f("hpn-bundle close (fetch): handle=%d produced=%llu "
+		    "verify=%d", handle,
+		    (unsigned long long)s->bytes_produced, fverify);
+		if (fverify) {
+			/* Reply with the source hashes teed during pack; the
+			 * client compares against its target read-back. */
+			bundle_send_fetch_verify_reply(oqueue, id, SSH2_FX_OK, s);
+			bundle_state_free(s);
+			handle_free_bundle(handle);
+			return SFTP_HPN_BUNDLE_REPLY_SENT;
+		}
 		bundle_state_free(s);
 		handle_free_bundle(handle);
 		return SSH2_FX_OK;

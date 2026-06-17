@@ -51,5 +51,8 @@ void sftp_hpn_src_hashset_tap(void *arg, const char *archive_path,
     const u_char *data, size_t len, int final);
 int  sftp_hpn_src_hashset_get(struct sftp_hpn_src_hashset *s,
     const char *archive_path, uint64_t *hash_out);
+/* Iterate every (archive_path, hash) pair in insertion order. */
+void sftp_hpn_src_hashset_foreach(struct sftp_hpn_src_hashset *s,
+    void (*cb)(void *arg, const char *archive_path, uint64_t hash), void *arg);
 
 #endif /* SFTP_HPN_VERIFY_HASH_H */
