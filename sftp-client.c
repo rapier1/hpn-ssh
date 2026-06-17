@@ -2189,6 +2189,11 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				    "%zu > %zu", len, req->len);
 			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
 			lmodified = 1;
+			/* FAULT-INJ: corrupt one received byte before it is
+			 * written to the local target; the server's source hash
+			 * holds and the written file diverges, so the download
+			 * read-back catches it. */
+			fault_inj_corrupt((off_t)req->offset, data, len);
 			if ((lseek(local_fd, req->offset, SEEK_SET) == -1 ||
 			    atomicio(vwrite, local_fd, data, len) != len) &&
 			    !write_error) {
@@ -3704,6 +3709,10 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				fatal("received more data than requested "
 				    "%zu > %zu", len, req->len);
 			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
+			/* FAULT-INJ: corrupt one received byte before the local
+			 * write; the server source hash holds and the written
+			 * range diverges, caught by the download read-back. */
+			fault_inj_corrupt((off_t)req->offset, data, len);
 			if ((lseek(local_fd, (off_t)req->offset,
 			    SEEK_SET) == -1 ||
 			    atomicio(vwrite, local_fd, data, len) != len) &&

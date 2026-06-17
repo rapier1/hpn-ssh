@@ -117,6 +117,16 @@ struct sftp_parallel;
 #define BUNDLE_TARGET_BYTES BUNDLE_TARGET_BYTES_DEFAULT
 
 /*
+ * Wire framing of one file inside a tar bundle: a 512-byte USTAR header plus
+ * the file data padded up to a 512-byte boundary (SFTP_HPN_TAR_BLOCK).  The
+ * producer grouper sizes bundles by this framed cost rather than raw payload,
+ * so header/padding overhead - which dominates for tiny files - can't let a
+ * bundle balloon past the byte cap on the wire.
+ */
+#define BUNDLE_TAR_FRAME_BYTES(sz) \
+    (512ULL + (((uint64_t)(sz) + 511ULL) / 512ULL) * 512ULL)
+
+/*
  * Work-queue (ring) depth.
  *
  * Non-bundle: the historical N*UPLOAD_BATCH_SIZE*4 + one extra batch - deep
@@ -587,6 +597,8 @@ enum sftp_op {
 	SFTP_OP_DOWNLOAD,
 	SFTP_OP_UPLOAD_RANGE,	/* upload a byte range of a large file */
 	SFTP_OP_DOWNLOAD_RANGE,	/* download a byte range of a large file */
+	SFTP_OP_BUNDLE_UPLOAD,	/* container: members[] packed as one tar stream */
+	SFTP_OP_BUNDLE_DOWNLOAD,/* container: members[] fetched as one tar stream */
 };
 
 /* -- Per-file range-completion tracker --------------------------------
@@ -765,6 +777,14 @@ struct sftp_work_unit {
 	/* Shared across all range units of one file.  NULL for non-range
 	 * units.  See struct sftp_range_tracker above. */
 	struct sftp_range_tracker *range_tracker;
+	/* Bundle container (SFTP_OP_BUNDLE_*) only: the small-file member units
+	 * this bundle carries.  Grouped producer-side (sftp-parallel-unit.c) so
+	 * workers pull a whole bundle instead of racing to accumulate one.  The
+	 * worker detaches members before dispatch and worker_run_bundle frees
+	 * each via worker_finalize_one_entry; parallel_unit_free frees any still
+	 * attached (abort/drain).  NULL / 0 for ordinary units. */
+	struct sftp_work_unit **members;
+	int                     n_members;
 };
 
 struct sftp_worker {
@@ -1201,6 +1221,25 @@ struct sftp_parallel {
 	volatile uint64_t           queued_bytes;
 
 	/*
+	 * Producer-side bundle accumulator (sftp-parallel-unit.c).  Bundle-
+	 * eligible small files are grouped HERE by the single submit thread
+	 * into whole bundles, instead of being pushed individually and raced
+	 * over by workers - the startup thundering-herd that stranded a
+	 * transfer's first files as un-bundled single round-trips.  Flushed
+	 * into a SFTP_OP_BUNDLE_* container at the framed-byte / file-count
+	 * cap (parallel_bundle_add) and at sftp_parallel_wait (the tail).
+	 * bundle_mu is defensive: bundle-eligible adds are main-thread-only
+	 * (worker re-submits are always bundle_ineligible, so they bypass
+	 * this and push individually).
+	 */
+	pthread_mutex_t             bundle_mu;
+	struct sftp_work_unit     **bundle_pending;    /* member units, grown */
+	int                         bundle_pending_n;
+	int                         bundle_pending_cap;
+	uint64_t                    bundle_pending_framed;  /* sum framed bytes */
+	enum sftp_op                bundle_pending_op;   /* UPLOAD | DOWNLOAD */
+
+	/*
 	 * Bytes carried by workers that have exited (fault / shutdown).
 	 * snapshot_workers iterates only the live workers[] array, so an
 	 * exiting worker would otherwise erase its bytes_total from the
@@ -1382,6 +1421,9 @@ void	 parallel_unit_pending_trace(const char *, struct sftp_parallel *,
 	    const struct sftp_work_unit *, int, const char *);
 int	 parallel_unit_pending_trace_on(void);
 int	 parallel_unit_submit(struct sftp_parallel *, struct sftp_work_unit *);
+/* Flush any partially-filled producer-side bundle (the tail); called from
+ * sftp_parallel_wait once a command has finished submitting. */
+void	 parallel_bundle_flush_pending(struct sftp_parallel *);
 void	 parallel_unit_pending_dec(struct sftp_parallel *);
 void	 parallel_unit_pending_dec_traced(struct sftp_parallel *,
 	    const struct sftp_work_unit *, int, const char *);

@@ -72,6 +72,15 @@ void
 parallel_unit_free(struct sftp_work_unit *u)
 {
 	if (u == NULL) return;
+	/* Bundle container: free any still-attached member units.  The worker
+	 * detaches members (sets ->members = NULL) before dispatch, so this
+	 * only fires on the abort/drain path where the bundle was never run. */
+	if (u->members != NULL) {
+		int i;
+		for (i = 0; i < u->n_members; i++)
+			parallel_unit_free(u->members[i]);
+		free(u->members);
+	}
 	free(u->src_path);
 	free(u->dst_path);
 	/* range_tracker is shared across sibling range units; never freed
@@ -396,6 +405,126 @@ static int submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn
     const char *remote_path, const char *local_path,
     off_t file_size, mode_t mode);
 
+/*
+ * Roll back one bundle member's submit accounting and free it.  Used when a
+ * flush can't push (queue shut down) - mirrors parallel_unit_submit's own
+ * push-fail backout so pending / queued_bytes stay balanced.
+ */
+static void
+parallel_bundle_member_pushfail(struct sftp_parallel *p,
+    struct sftp_work_unit *u)
+{
+	pthread_mutex_lock(&p->pending_mu);
+	if (p->pending > 0) p->pending--;
+	pthread_mutex_unlock(&p->pending_mu);
+	if (parallel_unit_pending_trace_on())
+		parallel_unit_pending_trace("DEC_PUSHFAIL", p, u, -1,
+		    "bundle/pushfail");
+	if (u->size > 0)
+		__atomic_fetch_sub(&p->queued_bytes, (uint64_t)u->size,
+		    __ATOMIC_RELAXED);
+	parallel_unit_free(u);
+}
+
+/*
+ * Flush the producer-side bundle accumulator (caller holds bundle_mu).
+ *   n == 0  -> nothing to do.
+ *   n == 1  -> push the lone member as an ordinary unit (a bundle of one is
+ *              pointless; it still transfers, just un-bundled).
+ *   n >= 2  -> wrap the members in a SFTP_OP_BUNDLE_* container and push that.
+ * Members keep the pending / queued_bytes accounting they took at add time;
+ * the container is a transport shell (its ->size = sum of member bytes drives
+ * the single pickup subtraction at worker dispatch).
+ */
+static void
+parallel_bundle_flush_locked(struct sftp_parallel *p)
+{
+	int n = p->bundle_pending_n, i;
+
+	if (n == 0)
+		return;
+	p->bundle_pending_n = 0;
+	p->bundle_pending_framed = 0;
+
+	if (n == 1) {
+		struct sftp_work_unit *u = p->bundle_pending[0];
+		if (sftp_workqueue_push(p->q, u) != 0)
+			parallel_bundle_member_pushfail(p, u);
+		return;
+	}
+
+	struct sftp_work_unit *c = xcalloc(1, sizeof(*c));
+	c->op = (p->bundle_pending_op == SFTP_OP_DOWNLOAD)
+	    ? SFTP_OP_BUNDLE_DOWNLOAD : SFTP_OP_BUNDLE_UPLOAD;
+	c->members = xreallocarray(NULL, (size_t)n, sizeof(*c->members));
+	c->n_members = n;
+	for (i = 0; i < n; i++) {
+		c->members[i] = p->bundle_pending[i];
+		if (p->bundle_pending[i]->size > 0)
+			c->size += p->bundle_pending[i]->size;
+	}
+	if (sftp_workqueue_push(p->q, c) != 0) {
+		for (i = 0; i < n; i++)
+			parallel_bundle_member_pushfail(p, c->members[i]);
+		free(c->members);
+		free(c);
+	}
+}
+
+/*
+ * Add a bundle-eligible small file to the accumulator.  It takes the same
+ * pending / queued_bytes accounting as an individual unit (members are real
+ * work units; the bundle just transports them), then accumulates under
+ * bundle_mu and flushes a full bundle at the framed-byte or file-count cap.
+ */
+static int
+parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
+{
+	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
+	uint64_t target = (p->cfg.bundle_size > 0)
+	    ? p->cfg.bundle_size : BUNDLE_TARGET_BYTES_DEFAULT;
+
+	pthread_mutex_lock(&p->pending_mu);
+	p->pending++;
+	pthread_mutex_unlock(&p->pending_mu);
+	if (parallel_unit_pending_trace_on())
+		parallel_unit_pending_trace("INC", p, u, -1, "bundle-add");
+	if (add_bytes)
+		__atomic_fetch_add(&p->queued_bytes, add_bytes,
+		    __ATOMIC_RELAXED);
+
+	pthread_mutex_lock(&p->bundle_mu);
+	/* A bundle carries one direction; flush a pending one of the other op. */
+	if (p->bundle_pending_n > 0 && p->bundle_pending_op != u->op)
+		parallel_bundle_flush_locked(p);
+	if (p->bundle_pending_n == p->bundle_pending_cap) {
+		int ncap = p->bundle_pending_cap ? p->bundle_pending_cap * 2 : 64;
+		p->bundle_pending = xreallocarray(p->bundle_pending,
+		    (size_t)ncap, sizeof(*p->bundle_pending));
+		p->bundle_pending_cap = ncap;
+	}
+	p->bundle_pending[p->bundle_pending_n++] = u;
+	p->bundle_pending_op = u->op;
+	p->bundle_pending_framed += BUNDLE_TAR_FRAME_BYTES(u->size);
+	if (p->bundle_pending_framed >= target ||
+	    p->bundle_pending_n >= BUNDLE_BATCH_MAX_FILES)
+		parallel_bundle_flush_locked(p);
+	pthread_mutex_unlock(&p->bundle_mu);
+	sftp_workqueue_kick(p->q);
+	return 0;
+}
+
+void
+parallel_bundle_flush_pending(struct sftp_parallel *p)
+{
+	if (p == NULL)
+		return;
+	pthread_mutex_lock(&p->bundle_mu);
+	parallel_bundle_flush_locked(p);
+	pthread_mutex_unlock(&p->bundle_mu);
+	sftp_workqueue_kick(p->q);
+}
+
 int
 parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 {
@@ -413,6 +542,14 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 	    (uint64_t)u->size > bundle_file_size_max_for(p)) {
 		u->bundle_ineligible = 1;
 	}
+	/* Producer-side bundle assembly: group eligible small files into whole
+	 * bundles here (single submit thread) so workers pull a complete bundle
+	 * rather than racing to accumulate one.  Everything else - large/range/
+	 * resume units, and worker re-submits (always bundle_ineligible) - takes
+	 * the individual path below. */
+	if (u != NULL && p->cfg.use_bundle && !u->bundle_ineligible &&
+	    (u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_DOWNLOAD))
+		return parallel_bundle_add(p, u);
 	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
 	pthread_mutex_lock(&p->pending_mu);
 	p->pending++;

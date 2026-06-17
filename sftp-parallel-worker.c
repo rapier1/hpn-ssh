@@ -230,6 +230,13 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		if (rc == 1 || rc == 2)
 			rc = 0;	/* identical / target-larger: complete */
 		break;
+	case SFTP_OP_BUNDLE_UPLOAD:
+	case SFTP_OP_BUNDLE_DOWNLOAD:
+		/* Bundle containers are dispatched directly in the worker loop
+		 * (worker_dispatch_bundle_container) and never reach here. */
+		fatal_f("bundle container reached execute_unit (op=%d)",
+		    (int)u->op);
+		break;
 	}
 	return rc;
 }
@@ -719,6 +726,31 @@ worker_run_bundle_download(struct sftp_worker *w,
 		worker_finalize_one_entry(p, w, batch[i], entries[i].result);
 
 	free(entries);
+}
+
+/*
+ * Dispatch a pre-formed bundle container (SFTP_OP_BUNDLE_*).  The producer
+ * grouped the members, so there is no accumulation race here: detach the
+ * member array, run it through the existing array-based bundle path (which
+ * finalises and frees each member via worker_finalize_one_entry), then free
+ * the now-memberless shell.  queued_bytes for the whole bundle was already
+ * subtracted at pickup (the container's ->size = sum of member bytes).
+ */
+static void
+worker_dispatch_bundle_container(struct sftp_worker *w,
+    struct sftp_work_unit *u0)
+{
+	struct sftp_work_unit **members = u0->members;
+	int n = u0->n_members;
+
+	u0->members = NULL;	/* detach: shell free must not touch members */
+	u0->n_members = 0;
+	if (u0->op == SFTP_OP_BUNDLE_DOWNLOAD)
+		worker_run_bundle_download(w, members, n);
+	else
+		worker_run_bundle(w, members, n);
+	free(members);
+	parallel_unit_free(u0);
 }
 
 /*
@@ -1297,8 +1329,15 @@ parallel_worker_thread(void *arg)
 			 * the unit straight to the outer single-unit path. */
 		}
 
-		if ((u0->op == SFTP_OP_UPLOAD && !u0->bundle_ineligible) ||
-		    batch_eligible_download) {
+		if (u0->op == SFTP_OP_BUNDLE_UPLOAD ||
+		    u0->op == SFTP_OP_BUNDLE_DOWNLOAD) {
+			/* Producer-assembled bundle: dispatch the whole
+			 * container directly - no worker-side accumulation,
+			 * no startup grab race. */
+			__atomic_store_n(&w->phase, WPH_RUN, __ATOMIC_RELAXED);
+			worker_dispatch_bundle_container(w, u0);
+		} else if ((u0->op == SFTP_OP_UPLOAD &&
+		    !u0->bundle_ineligible) || batch_eligible_download) {
 			/* Bundle mode is byte-capped (bundle_target_bytes), so allow
 			 * many more than UPLOAD_BATCH_SIZE files per batch; heap-
 			 * allocate since the bundle ceiling is large. */

@@ -358,6 +358,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_mutex_init(&p->pending_mu, NULL);
 	pthread_cond_init(&p->pending_cv, NULL);
 	pthread_mutex_init(&p->workers_mu, NULL);
+	pthread_mutex_init(&p->bundle_mu, NULL);
 
 	p->session_start_ns = monotime_ns();
 
@@ -484,6 +485,11 @@ void
 sftp_parallel_wait(struct sftp_parallel *p)
 {
 	if (p == NULL) return;
+	/* Push the last partially-filled bundle (the tail) before waiting.
+	 * Entering wait is the universal "done submitting" point for every
+	 * command - directory walks and direct (non-walker) put/get alike -
+	 * so the tail bundle can't be left stranded in the accumulator. */
+	parallel_bundle_flush_pending(p);
 	/* The caller drains only after a command has finished submitting, so
 	 * entering wait IS the "no more units coming" signal.  Publish it as
 	 * walker-phase DONE: for direct (non-walker) puts/gets nothing else
@@ -740,6 +746,17 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	/* Restore the user's progress preference. */
 	showprogress = p->saved_showprogress;
 
+	/* Bundle accumulator: normally drained by parallel_bundle_flush_pending
+	 * at wait.  Free any leftover (e.g. aborted before wait) so the member
+	 * units and the array don't leak. */
+	{
+		int i;
+		for (i = 0; i < p->bundle_pending_n; i++)
+			parallel_unit_free(p->bundle_pending[i]);
+		free(p->bundle_pending);
+		p->bundle_pending = NULL;
+	}
+	pthread_mutex_destroy(&p->bundle_mu);
 	pthread_mutex_destroy(&p->pending_mu);
 	pthread_cond_destroy(&p->pending_cv);
 	pthread_mutex_destroy(&p->workers_mu);
