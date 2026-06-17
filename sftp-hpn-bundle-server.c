@@ -596,7 +596,16 @@ bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
 	}
 
 	mode_t perm = preserve ? (mode & 07777) : 0644;
-	s->cur_fd = open(s->cur_full_path, O_WRONLY | O_CREAT | O_TRUNC, perm);
+	/*
+	 * HPN bundle-truncation fix (#4): open WITHOUT O_TRUNC.  A connection
+	 * that dies mid-bundle leaves a lagging server still draining buffered
+	 * tar; an O_TRUNC open by that dead writer would truncate the file the
+	 * re-send has already written.  Without O_TRUNC the dead writer can only
+	 * overwrite a prefix with identical bytes and can never shrink the file;
+	 * the authoritative size is set by ftruncate() in entry_end_cb, which
+	 * only a writer that COMPLETES the entry reaches.
+	 */
+	s->cur_fd = open(s->cur_full_path, O_WRONLY | O_CREAT, perm);
 	if (s->cur_fd < 0) {
 		error_f("hpn-bundle: open \"%s\": %s",
 		    s->cur_full_path, strerror(errno));
@@ -673,6 +682,19 @@ bundle_upload_entry_end_cb(void *ctx)
 			ts[0].tv_sec = s->cur_mtime; ts[0].tv_nsec = 0;
 			ts[1].tv_sec = s->cur_mtime; ts[1].tv_nsec = 0;
 			(void)futimens(s->cur_fd, ts);
+		}
+		/*
+		 * HPN bundle-truncation fix (#4): set the authoritative file size
+		 * here, at entry completion (replaces the open-time O_TRUNC dropped
+		 * in bundle_upload_entry_cb).  Only a writer that finished the entry
+		 * reaches this point, so a dead connection's abandoned partial never
+		 * shrinks the file; also clears any stale tail left when overwriting
+		 * a larger pre-existing file.
+		 */
+		if (ftruncate(s->cur_fd, (off_t)s->cur_size) != 0) {
+			error_f("hpn-bundle: ftruncate \"%s\": %s",
+			    s->cur_full_path, strerror(errno));
+			rc = -1;
 		}
 		if (do_fsync && fsync(s->cur_fd) != 0) {
 			error_f("hpn-bundle: fsync \"%s\": %s",

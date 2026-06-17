@@ -136,7 +136,7 @@ struct sftp_parallel;
  * so the latency cost is negligible.  (The alive-but-slow case uses the
  * abort+ack handshake instead; this pause is for the no-channel-left case.)
  */
-#define HPN_BUNDLE_DEATH_REQUEUE_WAIT  3
+#define HPN_BUNDLE_DEATH_REQUEUE_WAIT  15
 
 /*
  * Work-queue (ring) depth.

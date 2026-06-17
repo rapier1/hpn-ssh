@@ -655,6 +655,14 @@ worker_run_bundle(struct sftp_worker *w,
 	 *     (in-flight-cap-bounded) residual drain finishes - the stale partial
 	 *     then can't clobber the re-sent file.  Failure-path only; rare.
 	 */
+	/*
+	 * DISABLED for #4 isolation test: the truncation fix now lives server-side
+	 * (ftruncate-at-completion, no O_TRUNC), which makes write ordering
+	 * irrelevant.  Testing whether this client-side prompt-close + pause is
+	 * still needed.  fd_out is closed by the respawn teardown either way
+	 * (sftp-parallel-respawn.c).
+	 */
+#if 0
 	if (sftp_conn_is_dead(w->conn)) {
 		if (w->fd_out >= 0) {
 			close(w->fd_out);
@@ -662,6 +670,7 @@ worker_run_bundle(struct sftp_worker *w,
 		}
 		sleep(HPN_BUNDLE_DEATH_REQUEUE_WAIT);
 	}
+#endif
 
 	for (i = 0; i < bn; i++)
 		worker_finalize_one_entry(p, w, batch[i], entries[i].result);

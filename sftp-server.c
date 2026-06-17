@@ -2339,6 +2339,14 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 		 * normal session teardown (nothing mid-bundle) drains and
 		 * replies as usual.
 		 */
+		/*
+		 * DISABLED for #4 isolation test: replaced by the server-side
+		 * ftruncate-at-completion fix (no O_TRUNC), which makes a stale
+		 * drain harmless regardless of when it happens.  This POLLHUP-abort
+		 * was also ineffective here - on a pipe POLLHUP is not delivered
+		 * until sshd has already flushed the buffered tar to us.
+		 */
+#if 0
 		if ((pfd[0].revents & (POLLHUP
 #ifdef POLLRDHUP
 		    | POLLRDHUP
@@ -2348,6 +2356,7 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 			    "bundle; aborting extraction (abandoned)");
 			sftp_server_cleanup_exit(0);
 		}
+#endif
 
 		/* copy stdin to iqueue */
 		if (pfd[0].revents & (POLLIN|POLLHUP)) {
