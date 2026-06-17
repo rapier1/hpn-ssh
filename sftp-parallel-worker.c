@@ -643,35 +643,6 @@ worker_run_bundle(struct sftp_worker *w,
 			batch[i]->bundle_ineligible = 1;
 	}
 
-	/*
-	 * HPN bundle-truncation guard (death path).  This bundle was abandoned
-	 * with the connection dead, so the re-send must be the sole final writer.
-	 * Two steps:
-	 *  1. Close our write pipe so the transport tears the SSH connection
-	 *     down NOW; the server sees the disconnect (POLLHUP) and aborts the
-	 *     abandoned extraction instead of draining its whole buffer.  fd_out
-	 *     is cleared so the later respawn teardown does not double-close.
-	 *  2. Pause before re-queuing, so the re-send lands AFTER the server's
-	 *     (in-flight-cap-bounded) residual drain finishes - the stale partial
-	 *     then can't clobber the re-sent file.  Failure-path only; rare.
-	 */
-	/*
-	 * DISABLED for #4 isolation test: the truncation fix now lives server-side
-	 * (ftruncate-at-completion, no O_TRUNC), which makes write ordering
-	 * irrelevant.  Testing whether this client-side prompt-close + pause is
-	 * still needed.  fd_out is closed by the respawn teardown either way
-	 * (sftp-parallel-respawn.c).
-	 */
-#if 0
-	if (sftp_conn_is_dead(w->conn)) {
-		if (w->fd_out >= 0) {
-			close(w->fd_out);
-			w->fd_out = -1;
-		}
-		sleep(HPN_BUNDLE_DEATH_REQUEUE_WAIT);
-	}
-#endif
-
 	for (i = 0; i < bn; i++)
 		worker_finalize_one_entry(p, w, batch[i], entries[i].result);
 

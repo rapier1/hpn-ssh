@@ -1914,29 +1914,6 @@ process_extended_get_users_groups_by_id(uint32_t id)
 }
 
 /*
- * Drain the entire oqueue to STDOUT_FILENO via atomicio() - blocking until
- * the kernel has accepted every byte.  Used by the heartbeat path inside
- * long-running handlers so the heartbeat actually reaches the wire mid-
- * handler instead of sitting in oqueue until the handler returns (the main
- * poll loop does not iterate while a handler is running).  Order is
- * preserved: any pending pre-handler bytes go out first, the heartbeat
- * follows.
- */
-static void
-flush_oqueue_blocking(void)
-{
-	size_t len, wrote;
-
-	len = sshbuf_len(oqueue);
-	if (len == 0)
-		return;
-	wrote = atomicio(vwrite, STDOUT_FILENO,
-	    (void *)sshbuf_ptr(oqueue), len);
-	if (wrote > 0)
-		(void)sshbuf_consume(oqueue, wrote);
-}
-
-/*
  * hpn-check-file@hpnssh.org dispatch wrapper.  The real implementation
  * lives in sftp-hpn-server.c so sftp-server.c carries a minimal diff
  * against upstream OpenSSH.
@@ -2304,12 +2281,6 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 		    SFTP_MAX_MSG_LENGTH)) == 0) {
 			pfd[0].fd = in;
 			pfd[0].events = POLLIN;
-#ifdef POLLRDHUP
-			/* Detect a peer half-close (FIN) even with buffered
-			 * data still readable - lets us abort an abandoned
-			 * bundle before draining it (see below). */
-			pfd[0].events |= POLLRDHUP;
-#endif
 		}
 		else if (r != SSH_ERR_NO_BUFFER_SPACE)
 			fatal_fr(r, "reserve");
@@ -2326,37 +2297,6 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 			error("poll: %s", strerror(errno));
 			sftp_server_cleanup_exit(2);
 		}
-
-		/*
-		 * HPN: the client closed its end while an upload bundle is
-		 * still open (no CLOSE) - the connection died mid-bundle.
-		 * Abort now instead of draining the buffered tar and writing
-		 * its files: a stale partial from this dead connection would
-		 * otherwise land after the re-queued re-send and truncate it.
-		 * POLLHUP (pipe write-end closed) / POLLRDHUP (socket peer
-		 * half-close) fire with data still buffered, so this fires
-		 * before the drain.  Gated on an in-flight upload bundle, so
-		 * normal session teardown (nothing mid-bundle) drains and
-		 * replies as usual.
-		 */
-		/*
-		 * DISABLED for #4 isolation test: replaced by the server-side
-		 * ftruncate-at-completion fix (no O_TRUNC), which makes a stale
-		 * drain harmless regardless of when it happens.  This POLLHUP-abort
-		 * was also ineffective here - on a pipe POLLHUP is not delivered
-		 * until sshd has already flushed the buffered tar to us.
-		 */
-#if 0
-		if ((pfd[0].revents & (POLLHUP
-#ifdef POLLRDHUP
-		    | POLLRDHUP
-#endif
-		    )) != 0 && sftp_hpn_server_bundle_upload_inflight() > 0) {
-			logit("hpn-bundle: client disconnected mid-upload "
-			    "bundle; aborting extraction (abandoned)");
-			sftp_server_cleanup_exit(0);
-		}
-#endif
 
 		/* copy stdin to iqueue */
 		if (pfd[0].revents & (POLLIN|POLLHUP)) {

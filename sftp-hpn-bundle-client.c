@@ -310,7 +310,14 @@ bundle_dl_entry_cb(void *ctx, const char *path, uint64_t size,
 	}
 
 	mode_t perm = s->preserve_flag ? (mode & 07777) : 0644;
-	s->cur_fd = open(s->cur_local, O_WRONLY | O_CREAT | O_TRUNC, perm);
+	/*
+	 * HPN bundle-truncation fix (#4), download side: open WITHOUT O_TRUNC,
+	 * mirroring the upload extractor.  The authoritative size is set by
+	 * ftruncate() in bundle_dl_entry_end_cb (only a completed entry reaches
+	 * it), so a never-completed partial can only overwrite a prefix with
+	 * identical bytes and can never shrink the file.
+	 */
+	s->cur_fd = open(s->cur_local, O_WRONLY | O_CREAT, perm);
 	if (s->cur_fd < 0) {
 		error_f("open \"%s\": %s", s->cur_local, strerror(errno));
 		return -1;
@@ -375,6 +382,18 @@ bundle_dl_entry_end_cb(void *ctx)
 			ts[0].tv_sec = s->cur_mtime; ts[0].tv_nsec = 0;
 			ts[1].tv_sec = s->cur_mtime; ts[1].tv_nsec = 0;
 			(void)futimens(s->cur_fd, ts);
+		}
+		/*
+		 * HPN bundle-truncation fix (#4), download side: set the
+		 * authoritative size at entry completion (replaces the open-time
+		 * O_TRUNC dropped in bundle_dl_entry_cb).  cur_written == the
+		 * declared entry size here; this also clears any stale tail when
+		 * overwriting a larger pre-existing file.
+		 */
+		if (ftruncate(s->cur_fd, (off_t)s->cur_written) != 0) {
+			error_f("ftruncate \"%s\": %s",
+			    s->cur_local, strerror(errno));
+			rc = -1;
 		}
 		if (close(s->cur_fd) != 0) {
 			error_f("close \"%s\": %s",

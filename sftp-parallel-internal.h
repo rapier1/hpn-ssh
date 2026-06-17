@@ -127,18 +127,6 @@ struct sftp_parallel;
     (512ULL + (((uint64_t)(sz) + 511ULL) / 512ULL) * 512ULL)
 
 /*
- * Death-path bundle re-queue pause (seconds).  When a bundle is abandoned on a
- * DEAD connection, that connection's server may still be draining buffered tar
- * and writing files; the client pauses this long before re-queuing so the
- * re-send lands AFTER that drain and is the sole final writer (no stale-partial
- * clobber).  The drain is bounded by the bundle in-flight cap, so a few seconds
- * covers even a full ~8 MiB bundle on slow storage.  Failure-path only (rare),
- * so the latency cost is negligible.  (The alive-but-slow case uses the
- * abort+ack handshake instead; this pause is for the no-channel-left case.)
- */
-#define HPN_BUNDLE_DEATH_REQUEUE_WAIT  15
-
-/*
  * Work-queue (ring) depth.
  *
  * Non-bundle: the historical N*UPLOAD_BATCH_SIZE*4 + one extra batch - deep
