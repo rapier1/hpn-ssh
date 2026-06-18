@@ -1662,7 +1662,7 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		if (scan_scaled(arg, &val64) == -1)
 			fatal("%.200s line %d: Bad %s number '%s': %s",
 			    filename, linenum, keyword, arg, strerror(errno));
-		/* Clamp to [1 MiB, 64 MiB] matching the client-side
+		/* Clamp to [1 MiB, 256 MiB] matching the client-side
 		 * HPNBundleSize bounds.  Operator gets a stderr warning if
 		 * their value was adjusted. */
 		if (val64 < (int64_t)(1 * 1024 * 1024)) {
@@ -1670,11 +1670,11 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 			    "below the minimum (1 MiB); clamping to 1 MiB.\n",
 			    filename, linenum, (long long)val64);
 			val64 = 1 * 1024 * 1024;
-		} else if (val64 > (int64_t)(64 * 1024 * 1024)) {
+		} else if (val64 > (int64_t)(256 * 1024 * 1024)) {
 			fprintf(stderr, "%s line %d: HPNBundleSize %lld is "
 			    "above the maximum (64 MiB); clamping to 64 MiB.\n",
 			    filename, linenum, (long long)val64);
-			val64 = 64 * 1024 * 1024;
+			val64 = 256 * 1024 * 1024;
 		}
 		if (*activep && options->hpn_bundle_size == -1)
 			options->hpn_bundle_size = val64;
@@ -1693,11 +1693,11 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 			    "below the minimum (1 MiB); clamping to 1 MiB.\n",
 			    filename, linenum, (long long)val64);
 			val64 = 1 * 1024 * 1024;
-		} else if (val64 > (int64_t)(512 * 1024 * 1024)) {
+		} else if (val64 > (int64_t)(256 * 1024 * 1024)) {
 			fprintf(stderr, "%s line %d: HPNMaxBundleSize %lld is "
 			    "above the maximum (512 MiB); clamping to 512 MiB.\n",
 			    filename, linenum, (long long)val64);
-			val64 = 512 * 1024 * 1024;
+			val64 = 256 * 1024 * 1024;
 		}
 		if (*activep && options->hpn_max_bundle_size == -1)
 			options->hpn_max_bundle_size = val64;
