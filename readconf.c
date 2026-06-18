@@ -1431,11 +1431,11 @@ parse_time:
 			    "minimum (1048576 bytes / 1 MiB); clamping to "
 			    "1 MiB.\n", (long long)val64);
 			val64 = 1 * 1024 * 1024;
-		} else if (val64 > (int64_t)(64 * 1024 * 1024)) {
+		} else if (val64 > (int64_t)(512 * 1024 * 1024)) {
 			fprintf(stderr, "HPNBundleSize %lld is above the "
-			    "maximum (67108864 bytes / 64 MiB); clamping to "
-			    "64 MiB.\n", (long long)val64);
-			val64 = 64 * 1024 * 1024;
+			    "maximum (536870912 bytes / 512 MiB); clamping to "
+			    "512 MiB.\n", (long long)val64);
+			val64 = 512 * 1024 * 1024;
 		}
 		if (*activep && options->hpn_bundle_size == -1)
 			options->hpn_bundle_size = val64;

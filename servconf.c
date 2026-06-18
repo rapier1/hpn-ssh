@@ -1693,11 +1693,11 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 			    "below the minimum (1 MiB); clamping to 1 MiB.\n",
 			    filename, linenum, (long long)val64);
 			val64 = 1 * 1024 * 1024;
-		} else if (val64 > (int64_t)(64 * 1024 * 1024)) {
+		} else if (val64 > (int64_t)(512 * 1024 * 1024)) {
 			fprintf(stderr, "%s line %d: HPNMaxBundleSize %lld is "
-			    "above the maximum (64 MiB); clamping to 64 MiB.\n",
+			    "above the maximum (512 MiB); clamping to 512 MiB.\n",
 			    filename, linenum, (long long)val64);
-			val64 = 64 * 1024 * 1024;
+			val64 = 512 * 1024 * 1024;
 		}
 		if (*activep && options->hpn_max_bundle_size == -1)
 			options->hpn_max_bundle_size = val64;
