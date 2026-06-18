@@ -67,10 +67,24 @@ sftp_hpn_hash_file_ondisk(const char *path, uint64_t length, int ondisk,
 		 * copy (best-effort), then read via O_DIRECT so the hash
 		 * reflects the device, not the page cache.  Buffered fallback
 		 * where O_DIRECT is unavailable.
+		 *
+		 * fdatasync, not fsync: the read-back only needs the file DATA
+		 * durable, not the inode metadata (mtime/ctime), so we skip the
+		 * metadata flush.  On a networked filesystem (e.g. Lustre) that
+		 * avoids an extra MDS round-trip - a real per-file cost and a
+		 * separate stall risk.  fsync is the fallback where fdatasync is
+		 * absent (e.g. macOS); a configure HAVE_FDATASYNC check would
+		 * extend the fast path to the BSDs too.
 		 */
+#if defined(HAVE_FDATASYNC) || defined(__linux__)
+		if (fdatasync(fd) == -1)
+			debug_f("fdatasync \"%s\": %s (read-back may reflect "
+			    "cache)", path, strerror(errno));
+#else
 		if (fsync(fd) == -1)
 			debug_f("fsync \"%s\": %s (read-back may reflect cache)",
 			    path, strerror(errno));
+#endif
 #ifdef POSIX_FADV_DONTNEED
 		(void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 #endif
