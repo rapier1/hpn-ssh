@@ -85,6 +85,11 @@ parallel_unit_free(struct sftp_work_unit *u)
 	free(u->dst_path);
 	/* range_tracker is shared across sibling range units; never freed
 	 * by parallel_unit_free.  See parallel_unit_tracker_finalize for ownership rules. */
+	/* A verify unit owns its parked tracker.  The verify handler NULLs this
+	 * after freeing it, so a still-set pointer means the unit was dropped
+	 * before any worker ran it (abort / queue shutdown): free it here. */
+	if (u->verify_tracker != NULL)
+		parallel_verify_and_free(NULL, u->verify_tracker);
 	free(u);
 }
 
@@ -322,11 +327,14 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 	} else if (t->verify && w != NULL) {
 		/*
 		 * HPNVerifyTransfer: the file's last range just finished
-		 * cleanly.  Run the post-transfer verify HERE, on the finalizing
-		 * worker's own live conn (safe from the teardown reaper - this
-		 * thread owns the worker), then free.
+		 * cleanly.  Park the completed tracker for the post-transfer
+		 * verify phase rather than verifying here - keeping verify off
+		 * the transfer path so an in-flight transfer never blocks on a
+		 * server read-back.  sftp_parallel_wait submits it as an
+		 * SFTP_OP_VERIFY unit once the transfer queue drains; the verify
+		 * handler frees the tracker.
 		 */
-		parallel_verify_and_free(w, t);
+		parallel_verify_park(w->parent, t);
 		return incomplete;
 	}
 	pthread_mutex_destroy(&t->mu);
@@ -339,10 +347,11 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 
 /*
  * Run the post-transfer verify for a completed range tracker on worker w's
- * connection, then free the tracker.  Called from the finalize path.
- * Download (target LOCAL) keeps the whole-file readback verify; upload (REMOTE)
+ * connection, then free the tracker.  Called from the SFTP_OP_VERIFY worker
+ * path; with w == NULL it frees the tracker without verifying (drop path).
+ * Download (target LOCAL) uses the whole-file readback verify; upload (REMOTE)
  * uses the per-range verify off the teed source hashes when slots are present,
- * else the whole-file fallback (pre-19 server path).
+ * else the whole-file fallback (pre-19 server path, and all whole-file units).
  */
 void
 parallel_verify_and_free(struct sftp_worker *w, struct sftp_range_tracker *t)
@@ -362,6 +371,89 @@ parallel_verify_and_free(struct sftp_worker *w, struct sftp_range_tracker *t)
 	free(t->path);
 	free(t->src_path);
 	free(t);
+}
+
+/*
+ * Park a completed range-split tracker for the post-transfer verify phase.
+ * Called from finalize in place of an inline verify; the tracker (with its
+ * teed per-range source hashes) is held until sftp_parallel_wait submits it.
+ */
+void
+parallel_verify_park(struct sftp_parallel *p, struct sftp_range_tracker *t)
+{
+	pthread_mutex_lock(&p->verify_pending_mu);
+	if (p->verify_pending_n == p->verify_pending_cap) {
+		int ncap = p->verify_pending_cap ? p->verify_pending_cap * 2 : 16;
+		p->verify_pending = xreallocarray(p->verify_pending,
+		    (size_t)ncap, sizeof(*p->verify_pending));
+		p->verify_pending_cap = ncap;
+	}
+	p->verify_pending[p->verify_pending_n++] = t;
+	pthread_mutex_unlock(&p->verify_pending_mu);
+}
+
+/*
+ * Park a completed whole-file (non-range-split) transfer for the verify phase.
+ * Builds a lightweight tracker carrying just the paths + direction; with no
+ * vslots, parallel_verify_and_free runs the whole-file readback verify.  The
+ * path/src_path convention matches parallel_verify_and_free's dispatch:
+ * download (local is target) hashes t->path locally vs t->src_path remote;
+ * upload reads t->src_path locally vs the server's hash of t->path.
+ */
+void
+parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
+    const char *remote_path, int local_is_target)
+{
+	struct sftp_range_tracker *t = xcalloc(1, sizeof(*t));
+
+	pthread_mutex_init(&t->mu, NULL);
+	t->verify = 1;
+	if (local_is_target) {
+		t->target = SFTP_RANGE_TARGET_LOCAL;
+		t->path = xstrdup(local_path);
+		t->src_path = xstrdup(remote_path);
+	} else {
+		t->target = SFTP_RANGE_TARGET_REMOTE;
+		t->path = xstrdup(remote_path);
+		t->src_path = xstrdup(local_path);
+	}
+	parallel_verify_park(p, t);
+}
+
+/*
+ * Submit every parked tracker as an SFTP_OP_VERIFY work unit.  Called from
+ * sftp_parallel_wait once the transfer queue has drained: the now idle workers
+ * pull the verify units off the same queue and run each verify on their own
+ * connection (across-file parallel).  The verify handler frees the tracker;
+ * a submit the queue rejects (abort/shutdown) frees it via parallel_unit_free
+ * (it owns the tracker through u->verify_tracker).
+ */
+void
+parallel_verify_phase_submit(struct sftp_parallel *p)
+{
+	struct sftp_range_tracker **arr;
+	int i, n;
+
+	pthread_mutex_lock(&p->verify_pending_mu);
+	arr = p->verify_pending;
+	n = p->verify_pending_n;
+	p->verify_pending = NULL;
+	p->verify_pending_n = 0;
+	p->verify_pending_cap = 0;
+	pthread_mutex_unlock(&p->verify_pending_mu);
+
+	for (i = 0; i < n; i++) {
+		struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
+
+		u->op = SFTP_OP_VERIFY;
+		u->verify_tracker = arr[i];
+		/* range_tracker NULL: skips the writer-cap gate + ensure-file.
+		 * size 0: no throughput double-count.  paths NULL: the tracker
+		 * carries them.  On submit failure parallel_unit_free frees the
+		 * tracker via u->verify_tracker. */
+		(void)parallel_unit_submit(p, u);
+	}
+	free(arr);
 }
 
 /*

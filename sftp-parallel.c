@@ -359,6 +359,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_cond_init(&p->pending_cv, NULL);
 	pthread_mutex_init(&p->workers_mu, NULL);
 	pthread_mutex_init(&p->bundle_mu, NULL);
+	pthread_mutex_init(&p->verify_pending_mu, NULL);
 
 	p->session_start_ns = monotime_ns();
 
@@ -505,6 +506,19 @@ sftp_parallel_wait(struct sftp_parallel *p)
 	while (p->pending > 0 && !p->abort_flag)
 		pthread_cond_wait(&p->pending_cv, &p->pending_mu);
 	pthread_mutex_unlock(&p->pending_mu);
+
+	/* Transfers drained: run the post-transfer verify phase.  Every
+	 * completed verified file (whole-file or range-split) parked its tracker
+	 * at completion; submit them now as SFTP_OP_VERIFY units so the idle
+	 * workers verify them in parallel on their own conns - off the transfer
+	 * path - then wait for those units to drain before returning. */
+	if (!p->abort_flag) {
+		parallel_verify_phase_submit(p);
+		pthread_mutex_lock(&p->pending_mu);
+		while (p->pending > 0 && !p->abort_flag)
+			pthread_cond_wait(&p->pending_cv, &p->pending_mu);
+		pthread_mutex_unlock(&p->pending_mu);
+	}
 }
 
 void
@@ -756,6 +770,17 @@ sftp_parallel_stop(struct sftp_parallel *p)
 		free(p->bundle_pending);
 		p->bundle_pending = NULL;
 	}
+	/* Verify-pending: trackers parked at completion but never submitted as
+	 * verify units (e.g. aborted before wait's verify phase).  Free them and
+	 * the array so neither leaks. */
+	{
+		int i;
+		for (i = 0; i < p->verify_pending_n; i++)
+			parallel_verify_and_free(NULL, p->verify_pending[i]);
+		free(p->verify_pending);
+		p->verify_pending = NULL;
+	}
+	pthread_mutex_destroy(&p->verify_pending_mu);
 	pthread_mutex_destroy(&p->bundle_mu);
 	pthread_mutex_destroy(&p->pending_mu);
 	pthread_cond_destroy(&p->pending_cv);

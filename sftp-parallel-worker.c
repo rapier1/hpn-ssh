@@ -228,6 +228,17 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	    parallel_unit_ensure_file(w->conn, u) != 0)
 		return -1;
 
+	/* Post-transfer verify: the parked tracker is verified on this worker's
+	 * own conn and freed by the handler (which NULLs verify_tracker so
+	 * parallel_unit_free won't double-free).  Verify never fails the unit -
+	 * a mismatch goes to verify_failed_paths, not a retry - so it always
+	 * returns 0 and worker_process_result just dec-pendings and frees it. */
+	if (u->op == SFTP_OP_VERIFY) {
+		parallel_verify_and_free(w, u->verify_tracker);
+		u->verify_tracker = NULL;
+		return 0;
+	}
+
 	switch (u->op) {
 	case SFTP_OP_UPLOAD:
 		/*
@@ -243,8 +254,8 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		    p->cfg.preserve_flag, u->resume, /*verify=*/u->verify,
 		    p->cfg.fsync_flag, p->cfg.inplace_flag);
 		if (rc == 0 && p->cfg.verify_transfer)
-			parallel_verify_one(w, u->src_path, u->dst_path,
-			    /*local_is_target=*/0);	/* local = source */
+			parallel_verify_park_whole_file(p, u->src_path,
+			    u->dst_path, /*local_is_target=*/0);  /* local = source */
 		if (rc == 1 || rc == 2)
 			rc = 0;	/* identical / target-larger: complete */
 		break;
@@ -301,10 +312,16 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		    u->resume, p->cfg.fsync_flag,
 		    p->cfg.inplace_flag, /*verify=*/u->verify);
 		if (rc == 0 && p->cfg.verify_transfer)
-			parallel_verify_one(w, u->dst_path, u->src_path,
-			    /*local_is_target=*/1);	/* local = downloaded file */
+			parallel_verify_park_whole_file(p, u->dst_path,
+			    u->src_path, /*local_is_target=*/1);  /* local = downloaded */
 		if (rc == 1 || rc == 2)
 			rc = 0;	/* identical / target-larger: complete */
+		break;
+	case SFTP_OP_VERIFY:
+		/* Handled before the switch via an early return; reaching the
+		 * switch with a verify op is a bug. */
+		fatal_f("verify unit reached execute_unit switch (op=%d)",
+		    (int)u->op);
 		break;
 	case SFTP_OP_BUNDLE_UPLOAD:
 	case SFTP_OP_BUNDLE_DOWNLOAD:
