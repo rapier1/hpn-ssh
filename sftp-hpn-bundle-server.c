@@ -26,14 +26,12 @@
  * Contents:
  *   - struct hpn_bundle_state + lifecycle (UPLOAD parser-driven,
  *     FETCH writer-driven)
- *   - Per-bundle and total-process byte caps + env-driven init
- *     (HPN_USE_BUNDLE / HPN_MAX_BUNDLE_SIZE from sshd-session)
+ *   - Env-driven enable toggle (HPN_USE_BUNDLE from sshd-session)
  *   - Parser callbacks (entry_cb opens output fd + (D) mkdir cache +
  *     (E) fallocate; data_cb writes inline; entry_end_cb closes +
  *     applies metadata)
  *   - sftp_hpn_server_bundle_write / _read / _close handlers
- *   - sftp_hpn_server_is_bundle_handle / _enabled / _per_cap accessors
- *   - sftp_hpn_server_set_bundle_caps  (sftp-server.c CLI -B / -T)
+ *   - sftp_hpn_server_is_bundle_handle / _enabled accessors
  *   - process_hpn_bundle_open / _fetch RPC handlers (called via the
  *     dispatcher in sftp-hpn-server.c)
  *
@@ -97,14 +95,7 @@ enum hpn_bundle_mode {
  * FETCH path (hpn-bundle-fetch):
  *   bundle_state holds a writer with all paths queued (finish() called
  *   at OPEN time).  sftp_hpn_server_bundle_read drives pack_next() to
- *   produce bytes on demand into the SFTP DATA reply.
- *
- * Per-bundle and total-process byte caps still apply (see bundle_per_cap
- * / bundle_total_cap), but enforcement shifts: instead of capping the
- * accumulator's allocation, we track total bytes that have flowed
- * through this bundle and trip the cap if exceeded.  The total cap is
- * sized via fetch_total_size (FETCH: sum of declared file sizes)
- * and bytes_received (UPLOAD: bytes parsed). */
+ *   produce bytes on demand into the SFTP DATA reply. */
 /*
  * HPNVerifyTransfer: one extracted file to read back and hash at close.
  * Accumulated as each entry finishes; rel_path keys the reply (matches the
@@ -142,7 +133,7 @@ struct hpn_bundle_state {
 	struct sftp_hpn_tar_writer *writer;
 	uint64_t bytes_produced;    /* cumulative pack_next bytes returned */
 	uint64_t next_read_off;     /* expected SSH_FXP_READ offset */
-	uint64_t fetch_total_size;  /* sum of declared file sizes (cap check) */
+	uint64_t fetch_total_size;  /* sum of declared file sizes (logged) */
 	/* HPNVerifyTransfer (FETCH): server tees per-file SOURCE hashes as it
 	 * packs (tap on `writer`), returned in the close reply for the client
 	 * to compare against its O_DIRECT read-back of the extracted targets. */
@@ -152,44 +143,6 @@ struct hpn_bundle_state {
 
 /* Flag constants and HPN_BUNDLE_BLOCK_BYTES live in sftp-hpn-bundle.h, the
  * shared HPN-only header.  Single source of truth for client + server. */
-
-/* ── Server-side bundle accumulator caps ─────────────────────────────────
- *
- * SFTP is normally bounded by SFTP_MAX_MSG_LENGTH (256 KiB per message).
- * Bundle handles break that invariant: an upload bundle accepts a long
- * sequence of WRITEs into a malloc'd accumulator, and a download bundle
- * pre-allocates a tar buffer sized by the client's path list.  Without a
- * server-side cap a malicious or misconfigured client can drive the
- * server to OOM.
- *
- * Caps are process-local - sftp-server is forked per user connection by
- * sshd, so the "total across handles" cap is per-connection.  Per-system
- * memory protection (RLIMIT_AS, sshd's MaxStartups) is the OS's
- * responsibility.
- *
- * Default per-bundle cap is 64 MiB; default total cap is 1.5 GiB.
- *
- * Both are tunable via the sftp-server -B (per-bundle) and -T (total)
- * CLI flags, which the operator sets on the sshd_config Subsystem line:
- *
- *   Subsystem  sftp  /usr/libexec/hpnsftp-server -B 64M -T 1500M
- *
- * sftp-server.c parses the flags and calls sftp_hpn_server_set_bundle_caps
- * before the SFTP main loop runs.  Unset flags leave the compiled
- * defaults in place.  Additionally, sshd_config's HPNMaxBundleSize
- * propagates through the HPN_MAX_BUNDLE_SIZE env var that sshd-session
- * sets, and bundle_caps_init merges it with the -B path.
- */
-#define HPN_BUNDLE_PER_CAP_DEFAULT   ((size_t)64   * 1024 * 1024)        /* 64 MiB */
-#define HPN_BUNDLE_PER_CAP_MIN       ((size_t)1    * 1024 * 1024)        /* 1 MiB */
-#define HPN_BUNDLE_PER_CAP_MAX       ((size_t)1024 * 1024 * 1024)        /* 1 GiB */
-#define HPN_BUNDLE_TOTAL_CAP_DEFAULT ((size_t)1536 * 1024 * 1024)        /* 1.5 GiB */
-#define HPN_BUNDLE_TOTAL_CAP_MIN     ((size_t)16   * 1024 * 1024)        /* 16 MiB */
-#define HPN_BUNDLE_TOTAL_CAP_MAX     ((size_t)16ULL * 1024 * 1024 * 1024) /* 16 GiB */
-
-static size_t bundle_per_cap   = 0;   /* 0 = uninitialised */
-static size_t bundle_total_cap = 0;
-static size_t bundle_total_bytes = 0; /* sum of accum_cap across open handles */
 
 /*
  * Operator master toggle (sshd_config: HPNUseBundle).  When 0, the
@@ -203,31 +156,6 @@ static size_t bundle_total_bytes = 0; /* sum of accum_cap across open handles */
  * Cached after the first lookup so the hot path is a simple read.
  */
 static int    bundle_enabled    = -1;   /* -1 = uninitialised */
-
-/*
- * Parse a K/M/G-suffixed byte count via the openbsd-compat helper
- * scan_scaled().  Returns the parsed value on success, or 0 if spec
- * is NULL/empty/unparseable/negative or would overflow size_t.
- * Callers treat 0 as "no value supplied" - 0 itself is never a
- * valid cap.  Thin wrapper kept here so the call sites stay clean
- * (cast + bounds check live in one place).  The previous in-module
- * parse_bytes_arg was deduplicated against bundle-client.c's
- * bundle_dl_parse_bytes by routing both through scan_scaled
- * (2026-05-31 cleanup).
- */
-static size_t
-bundle_parse_scaled(const char *spec)
-{
-	long long llv;
-
-	if (spec == NULL || *spec == '\0')
-		return 0;
-	if (scan_scaled((char *)spec, &llv) != 0)
-		return 0;
-	if (llv <= 0 || (unsigned long long)llv > SIZE_MAX)
-		return 0;
-	return (size_t)llv;
-}
 
 /*
  * Compose and enqueue an SSH_FXP_STATUS failure reply on oqueue.
@@ -256,74 +184,14 @@ bundle_send_status_failure(struct sshbuf *oqueue, u_int id, int status,
 	sshbuf_free(msg);
 }
 
-/*
- * Clamp value into [lo, hi], warning to stderr on either boundary so
- * the operator notices that their request was adjusted.
- */
-static size_t
-clamp_cap(const char *flag, size_t v, size_t lo, size_t hi)
-{
-	if (v < lo) {
-		fprintf(stderr,
-		    "%s %zu bytes is below minimum %zu MiB; clamping.\n",
-		    flag, v, lo / (1024 * 1024));
-		return lo;
-	}
-	if (v > hi) {
-		fprintf(stderr,
-		    "%s %zu bytes is above maximum %zu MiB; clamping.\n",
-		    flag, v, hi / (1024 * 1024));
-		return hi;
-	}
-	return v;
-}
-
-void
-sftp_hpn_server_set_bundle_caps(const char *per_arg, const char *total_arg)
-{
-	if (per_arg != NULL && *per_arg != '\0') {
-		size_t v = bundle_parse_scaled(per_arg);
-		if (v == 0)
-			fatal("Invalid -B value \"%s\"", per_arg);
-		bundle_per_cap = clamp_cap("-B", v,
-		    HPN_BUNDLE_PER_CAP_MIN, HPN_BUNDLE_PER_CAP_MAX);
-	}
-	if (total_arg != NULL && *total_arg != '\0') {
-		size_t v = bundle_parse_scaled(total_arg);
-		if (v == 0)
-			fatal("Invalid -T value \"%s\"", total_arg);
-		bundle_total_cap = clamp_cap("-T", v,
-		    HPN_BUNDLE_TOTAL_CAP_MIN, HPN_BUNDLE_TOTAL_CAP_MAX);
-	}
-}
-
 static void
-bundle_caps_init(void)
+bundle_enabled_init(void)
 {
 	static int initialised = 0;
 	const char *ev;
 
 	if (initialised)
 		return;
-
-	/* HPN_MAX_BUNDLE_SIZE (sshd_config: HPNMaxBundleSize) - server-
-	 * side hard cap on per-bundle accumulator.  Overrides the -B
-	 * CLI default if the env var is set and the operator did not
-	 * already pass -B explicitly (CLI -B takes precedence). */
-	if (bundle_per_cap == 0) {
-		ev = getenv("HPN_MAX_BUNDLE_SIZE");
-		if (ev != NULL && *ev != '\0') {
-			size_t v = bundle_parse_scaled(ev);
-			if (v > 0)
-				bundle_per_cap = clamp_cap("HPNMaxBundleSize",
-				    v, HPN_BUNDLE_PER_CAP_MIN,
-				    HPN_BUNDLE_PER_CAP_MAX);
-		}
-	}
-	if (bundle_per_cap == 0)
-		bundle_per_cap = HPN_BUNDLE_PER_CAP_DEFAULT;
-	if (bundle_total_cap == 0)
-		bundle_total_cap = HPN_BUNDLE_TOTAL_CAP_DEFAULT;
 
 	/* HPN_USE_BUNDLE (sshd_config: HPNUseBundle) - master toggle.
 	 * Absent / unparseable defaults to 1 (enabled). */
@@ -340,10 +208,7 @@ bundle_caps_init(void)
 	}
 
 	initialised = 1;
-	debug_f("hpn-bundle: enabled=%d per_cap=%zu MiB total_cap=%zu MiB",
-	    bundle_enabled,
-	    bundle_per_cap   / (1024*1024),
-	    bundle_total_cap / (1024*1024));
+	debug_f("hpn-bundle: enabled=%d", bundle_enabled);
 }
 
 /* These callbacks live in sftp-server.c so this module doesn't need
@@ -425,18 +290,6 @@ bundle_state_free(struct hpn_bundle_state *s)
 {
 	if (s == NULL)
 		return;
-	/* Release total-cap accounting: subtract the larger of declared-
-	 * total (FETCH) or bytes-received (UPLOAD) - whichever this bundle
-	 * contributed to the running counter. */
-	uint64_t contributed = (s->mode == HPN_BUNDLE_MODE_FETCH)
-	    ? s->fetch_total_size
-	    : s->bytes_received;
-	if (contributed > 0) {
-		if (bundle_total_bytes >= contributed)
-			bundle_total_bytes -= (size_t)contributed;
-		else
-			bundle_total_bytes = 0;
-	}
 	if (s->cur_fd >= 0)
 		(void)close(s->cur_fd);
 	free(s->cur_full_path);
@@ -467,17 +320,8 @@ sftp_hpn_server_is_bundle_handle(int handle)
 int
 sftp_hpn_server_bundle_enabled(void)
 {
-	bundle_caps_init();	/* ensures bundle_enabled is populated */
+	bundle_enabled_init();	/* ensures bundle_enabled is populated */
 	return bundle_enabled;
-}
-
-size_t
-sftp_hpn_server_bundle_per_cap(void)
-{
-	bundle_caps_init();
-	if (!bundle_enabled)
-		return 0;
-	return bundle_per_cap;
 }
 
 /* Compose the full destination path for one tar entry.  Returns a
@@ -521,20 +365,6 @@ bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
 	struct hpn_bundle_state *s = ctx;
 	int    safe;
 	int    preserve = (s->flags & HPN_BUNDLE_FLAG_PRESERVE) != 0;
-
-	/* Per-bundle cap: bytes_received + new entry size must stay in
-	 * bounds.  Using uint64 arithmetic; overflow check first. */
-	bundle_caps_init();
-	if (size > UINT64_MAX - s->bytes_received ||
-	    s->bytes_received + size > bundle_per_cap) {
-		error_f("hpn-bundle: entry \"%s\" would exceed per-bundle cap "
-		    "(have %llu, +size %llu > cap %zu)",
-		    path,
-		    (unsigned long long)s->bytes_received,
-		    (unsigned long long)size,
-		    bundle_per_cap);
-		return -1;
-	}
 
 	s->cur_full_path = bundle_compose_path(s->dest_dir, path, &safe);
 	if (!safe) {
@@ -1147,7 +977,7 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 
-	bundle_caps_init();
+	bundle_enabled_init();
 	for (i = 0; i < n_paths; i++) {
 		struct stat sb;
 		int fd = open(paths[i], O_RDONLY);
@@ -1169,14 +999,6 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 			continue;
 		}
 		uint64_t fsize = (uint64_t)sb.st_size;
-		if (fsize > UINT64_MAX - s->fetch_total_size ||
-		    s->fetch_total_size + fsize > bundle_per_cap) {
-			error_f("hpn-bundle-fetch: total size would exceed "
-			    "per-bundle cap (have %llu, +%llu > cap %zu)",
-			    (unsigned long long)s->fetch_total_size,
-			    (unsigned long long)fsize, bundle_per_cap);
-			goto fail;
-		}
 		if (sftp_hpn_tar_writer_add_file(s->writer,
 		    paths[i], paths[i],
 		    sb.st_mode, fsize, sb.st_mtime) < 0) {
@@ -1187,18 +1009,6 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		s->fetch_total_size += fsize;
 	}
 	sftp_hpn_tar_writer_finish(s->writer);
-
-	if (s->fetch_total_size > SIZE_MAX - bundle_total_bytes ||
-	    bundle_total_bytes + (size_t)s->fetch_total_size >
-	    bundle_total_cap) {
-		error_f("hpn-bundle-fetch: would exceed total-across-handles "
-		    "cap (have %zu, +%llu > cap %zu)",
-		    bundle_total_bytes,
-		    (unsigned long long)s->fetch_total_size,
-		    bundle_total_cap);
-		goto fail;
-	}
-	bundle_total_bytes += (size_t)s->fetch_total_size;
 
 	handle = handle_new_bundle(s);
 	if (handle < 0) {

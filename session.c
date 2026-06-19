@@ -1048,12 +1048,6 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 		char tmp[64];
 		snprintf(tmp, sizeof(tmp), "%d", options.hpn_use_bundle);
 		child_set_env(&env, &envsize, "HPN_USE_BUNDLE", tmp);
-		snprintf(tmp, sizeof(tmp), "%lld",
-		    (long long)options.hpn_bundle_size);
-		child_set_env(&env, &envsize, "HPN_BUNDLE_SIZE", tmp);
-		snprintf(tmp, sizeof(tmp), "%lld",
-		    (long long)options.hpn_max_bundle_size);
-		child_set_env(&env, &envsize, "HPN_MAX_BUNDLE_SIZE", tmp);
 		snprintf(tmp, sizeof(tmp), "%d",
 		    options.hpn_max_concurrent_workers);
 		child_set_env(&env, &envsize,

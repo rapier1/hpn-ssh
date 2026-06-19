@@ -236,23 +236,6 @@ typedef struct {
 	 *                                 SSH2_FX_OP_UNSUPPORTED.
 	 *                                 -1 (unset) → defaults to 1 (yes).
 	 *
-	 *   hpn_bundle_size             - operator's preferred default bundle
-	 *                                 target in bytes.  Informational on
-	 *                                 the server today (the client picks
-	 *                                 the actual size via its own
-	 *                                 HPNBundleSize); will be advertised
-	 *                                 to clients via a future EXT_INFO
-	 *                                 mechanism so they can clamp
-	 *                                 proactively.  -1 (unset) → 8 MiB.
-	 *
-	 *   hpn_max_bundle_size         - hard server-side ceiling on the
-	 *                                 client-requested bundle size.  When
-	 *                                 a bundle-open / bundle-fetch
-	 *                                 carries a target above this value,
-	 *                                 the server clamps to this limit and
-	 *                                 emits one INFO log line.  -1 (unset)
-	 *                                 → 64 MiB.
-	 *
 	 *   hpn_max_concurrent_workers  - hard per-user cap on the number of
 	 *                                 concurrent SFTP-subsystem channels
 	 *                                 (parallel-streams workers) from one
@@ -262,8 +245,6 @@ typedef struct {
 	 *                                 → no cap.
 	 */
 	int	hpn_use_bundle;
-	int64_t	hpn_bundle_size;
-	int64_t	hpn_max_bundle_size;
 	int	hpn_max_concurrent_workers;
 	int	none_enabled;		/* Enable NONE cipher switch */
 	int     nonemac_enabled;        /* Enable NONE MAC switch */

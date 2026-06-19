@@ -127,14 +127,6 @@ Subsystem	sftp	/usr/libexec/hpnsftp-server
 # Master toggle for the SFTP bundle path
 #HPNUseBundle yes
 
-# Server's preferred default SFTP bundle target size in bytes (K/M/G)
-# Range [1M, 256M].
-#HPNBundleSize 32M
-
-# Hard server-side ceiling on the client-requested SFTP bundle size.
-# Range [1M, 64M].
-#HPNMaxBundleSize 64M
-
 # Per-user hard cap on concurrent SFTP-subsystem channels.
 # Also see MaxSessions and MaxStartups.
 #HPNMaxConcurrentWorkers 0

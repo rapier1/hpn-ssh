@@ -358,18 +358,6 @@ int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
 int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
 
 /*
- * Server-advertised HPNMaxBundleSize (from sshd_config) parsed out of
- * the hpn-bundle-max-size@hpnssh.org extension in SSH_FXP_VERSION.
- * Returns 0 if absent - caller treats as "no cap advertised" and
- * relies on the server's defensive bundle_per_cap rejection if any.
- *
- * The parallel worker init uses this to clamp bundle_target_bytes
- * proactively so we never generate a bundle the server would reject
- * mid-stream.
- */
-uint64_t sftp_conn_server_max_bundle_size(struct sftp_conn *conn);
-
-/*
  * True iff the server advertised hpn-check-file@hpnssh.org, i.e. it can
  * answer the XXH3 hash queries that verified resume depends on.  Lets the
  * parallel submit path (which sees struct sftp_conn only as opaque) make

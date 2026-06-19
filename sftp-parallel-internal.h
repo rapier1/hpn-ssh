@@ -90,9 +90,10 @@ struct sftp_parallel;
  * different bundle in flight, the way each worker has a different batch
  * in flight in the non-bundle path.
  *
- * 32 MiB default Override with HPNBundleSize
- * in ssh_config, --bundle-size on hpnsftp, or -o HPNBundleSize=N.  Range
- * clamped to [BUNDLE_TARGET_BYTES_MIN, BUNDLE_TARGET_BYTES_MAX].
+ * 32 MiB default (HPN_BUNDLE_SIZE_DEFAULT in defines.h).  Override with
+ * HPNBundleSize in ssh_config, --bundle-size on hpnsftp, or -o
+ * HPNBundleSize=N.  Range clamped to
+ * [BUNDLE_TARGET_BYTES_MIN, BUNDLE_TARGET_BYTES_MAX].
  *
  * Files larger than BUNDLE_TARGET_BYTES / BUNDLE_MIN_FILES_PER_BUNDLE
  * are excluded from the bundle path: bundling a single large file
@@ -101,9 +102,9 @@ struct sftp_parallel;
  * other workers run dry.  The excluded files go through the regular
  * single-file SFTP path (which may further split via range-split).
  */
-#define BUNDLE_TARGET_BYTES_DEFAULT  (32 * 1024 * 1024)
-#define BUNDLE_TARGET_BYTES_MIN      (1 * 1024 * 1024)
-#define BUNDLE_TARGET_BYTES_MAX      (256 * 1024 * 1024)
+#define BUNDLE_TARGET_BYTES_DEFAULT  HPN_BUNDLE_SIZE_DEFAULT
+#define BUNDLE_TARGET_BYTES_MIN      HPN_BUNDLE_SIZE_MIN
+#define BUNDLE_TARGET_BYTES_MAX      HPN_BUNDLE_SIZE_MAX
 #define BUNDLE_MIN_FILES_PER_BUNDLE  4
 
 /* Maximum size of a single file the walker is willing to place in a

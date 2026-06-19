@@ -1161,13 +1161,13 @@ and
 .Pq GiB
 suffixes.
 Values outside the range
-.Cm 64K
+.Cm 1M
 through
-.Cm 64M
+.Cm 256M
 inclusive are clamped and a warning is emitted on standard error.
 The default is
-.Cm 4M
-which empirical tuning has shown to perform well on typical paths.
+.Cm 32M
+which testing has shown to perform well across a range of path RTTs.
 Consulted only by
 .Xr hpnsftp 1 ;
 .Xr hpnssh 1

@@ -1003,6 +1003,17 @@ struct winsize {
 # endif
 #endif
 
+/*
+ * HPN SFTP bundle-mode size bounds and default, in bytes.  Single source of
+ * truth shared by the client HPNBundleSize config clamp (readconf.c) and the
+ * parallel-transfer accumulator target (BUNDLE_TARGET_BYTES_* in
+ * sftp-parallel-internal.h).  When changed, update the ssh_config sample and
+ * hpnssh_config.5 to match.
+ */
+#define HPN_BUNDLE_SIZE_MIN		(1 * 1024 * 1024)	/* 1 MiB */
+#define HPN_BUNDLE_SIZE_MAX		(256 * 1024 * 1024)	/* 256 MiB */
+#define HPN_BUNDLE_SIZE_DEFAULT		(32 * 1024 * 1024)	/* 32 MiB */
+
 #endif /* _DEFINES_H */
 
 /* used to enable checking linux kernel versions */

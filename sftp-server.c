@@ -124,7 +124,6 @@ static void process_extended_sftp_hash_range(uint32_t id);
 static void process_extended_hpn_fs_info(uint32_t id);
 static void process_extended_hpn_bundle_open(uint32_t id);
 static void process_extended_hpn_bundle_cap(uint32_t id);
-static void process_extended_hpn_bundle_max_size_advert(uint32_t id);
 static void process_extended_hpn_bundle_fetch(uint32_t id);
 static void process_extended_hpn_file_layout(uint32_t id);
 static void process_extended(uint32_t id);
@@ -189,8 +188,6 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_hpn_bundle_open, 1 },
 	{ "hpn-bundle-fetch", HPN_EXT_BUNDLE_FETCH, 0,
 	    process_extended_hpn_bundle_fetch, 0 },
-	{ "hpn-bundle-max-size", HPN_EXT_BUNDLE_MAX_SIZE, 0,
-	    process_extended_hpn_bundle_max_size_advert, 0 },
 	{ "hpn-file-layout", HPN_EXT_FILE_LAYOUT, 0,
 	    process_extended_hpn_file_layout, 1 },
 	{ NULL, NULL, 0, NULL, 0 }
@@ -807,26 +804,8 @@ process_init(void)
 	 * see no advertisement and use the per-file path.  Dispatchers
 	 * also refuse the ops defensively in case a client somehow tries. */
 	if (sftp_hpn_server_bundle_enabled()) {
-		size_t cap = sftp_hpn_server_bundle_per_cap();
-		char   cap_buf[32];
-
 		compose_extension(msg, HPN_EXT_BUNDLE, "1");
 		compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
-
-		/* hpn-bundle-max-size: server-advertised hard cap on per-
-		 * bundle bytes (sshd_config: HPNMaxBundleSize).  Clients
-		 * use this to clamp their bundle target proactively so they
-		 * don't generate bundles the server would reject mid-stream.
-		 * Backward-compat: old clients ignore unknown extension
-		 * names; old servers don't advertise → new clients treat
-		 * absence as "no cap" and rely on the server's defensive
-		 * enforcement (bundle_per_cap on the upload accumulator
-		 * + fetch declared-size check). */
-		if (cap > 0) {
-			snprintf(cap_buf, sizeof(cap_buf), "%zu", cap);
-			compose_extension(msg, HPN_EXT_BUNDLE_MAX_SIZE,
-			    cap_buf);
-		}
 	}
 	compose_extension(msg, HPN_EXT_FILE_LAYOUT, "1");
 
@@ -1961,18 +1940,6 @@ process_extended_hpn_bundle_cap(uint32_t id)
 	send_status(id, SSH2_FX_OP_UNSUPPORTED);
 }
 
-/* Stub: hpn-bundle-max-size@hpnssh.org is a server-to-client advert
- * only.  Clients should never send it as a request.  This handler
- * exists so compose_extension's handler-lookup-or-fatal can find a
- * registration when advertising the cap in process_init(). */
-static void
-process_extended_hpn_bundle_max_size_advert(uint32_t id)
-{
-	error("hpn-bundle-max-size@hpnssh.org received as a request; "
-	    "this extension is server→client advertisement only");
-	send_status(id, SSH2_FX_OP_UNSUPPORTED);
-}
-
 /* Phase 5 (download side): hpn-bundle-fetch@hpnssh.org dispatch wrapper.
  * Client supplies a list of remote paths + base_dir; server reads them,
  * packs into a tar buffer via libarchive write, allocates a bundle handle
@@ -2109,7 +2076,7 @@ sftp_server_usage(void)
 	extern char *__progname;
 
 	fprintf(stderr,
-	    "usage: %s [-ehR] [-B per_bundle_cap] [-T total_bundle_cap]\n"
+	    "usage: %s [-ehR]\n"
 	    "\t[-d start_directory] [-f log_facility] "
 	    "[-l log_level]\n\t[-P denied_requests] "
 	    "[-p allowed_requests] [-u umask]\n"
@@ -2126,8 +2093,6 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 	SyslogFacility log_facility = SYSLOG_FACILITY_AUTH;
 	char *cp, *homedir = NULL, uidstr[32], buf[4*4096];
 	long mask;
-	const char *bundle_per_arg = NULL;
-	const char *bundle_total_arg = NULL;
 
 	extern char *optarg;
 	extern char *__progname;
@@ -2138,7 +2103,7 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 	pw = pwcopy(user_pw);
 
 	while (!skipargs && (ch = getopt(argc, argv,
-	    "B:T:d:f:l:P:p:Q:u:cehR")) != -1) {
+	    "d:f:l:P:p:Q:u:cehR")) != -1) {
 		switch (ch) {
 		case 'Q':
 			if (strcasecmp(optarg, "requests") != 0) {
@@ -2200,23 +2165,11 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 				fatal("Invalid umask \"%s\"", optarg);
 			(void)umask((mode_t)mask);
 			break;
-		case 'B':
-			/* hpn-bundle per-bundle accumulator cap; parsed
-			 * + clamped below by sftp_hpn_server_set_bundle_caps. */
-			bundle_per_arg = optarg;
-			break;
-		case 'T':
-			/* hpn-bundle total accumulator cap across all
-			 * concurrent bundle handles in this server process. */
-			bundle_total_arg = optarg;
-			break;
 		case 'h':
 		default:
 			sftp_server_usage();
 		}
 	}
-
-	sftp_hpn_server_set_bundle_caps(bundle_per_arg, bundle_total_arg);
 
 	log_init(__progname, log_level, log_facility, log_stderr);
 

@@ -176,9 +176,8 @@ void sftp_hpn_server_dispatch(u_int id, const char *name,
     struct sshbuf *iqueue, struct sshbuf *oqueue);
 
 /* Bundle handle dispatch (sftp_hpn_server_bundle_*, _is_bundle_handle,
- * _enabled, _per_cap, _set_bundle_caps) moved to
- * sftp-hpn-bundle-server.h on 2026-05-31 alongside the bundle code
- * itself.  sftp-server.c now includes both this header (for the
+ * _enabled) moved to sftp-hpn-bundle-server.h on 2026-05-31 alongside the
+ * bundle code itself.  sftp-server.c now includes both this header (for the
  * dispatcher + hash-range / file-layout decls) and
  * sftp-hpn-bundle-server.h (for the bundle ones). */
 

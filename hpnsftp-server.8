@@ -32,8 +32,6 @@
 .Nm hpnsftp-server
 .Bk -words
 .Op Fl ehR
-.Op Fl B Ar per_bundle_cap
-.Op Fl T Ar total_bundle_cap
 .Op Fl d Ar start_directory
 .Op Fl f Ar log_facility
 .Op Fl l Ar log_level
@@ -65,22 +63,6 @@ for more information.
 .Pp
 Valid options are:
 .Bl -tag -width Ds
-.It Fl B Ar per_bundle_cap
-Sets the maximum memory the server will accumulate for a single
-.Sy hpn-bundle@hpnssh.org
-upload or download bundle.
-Requests that would push a bundle past this limit are rejected with
-.Sy SSH_FX_NO_SPACE_ON_FILESYSTEM .
-Accepts a plain byte count or a value with a
-.Sq K ,
-.Sq M ,
-or
-.Sq G
-suffix (e.g.
-.Sq 64M ) .
-Permitted range is 1 MiB to 1 GiB; values outside this range are
-clamped to the nearest bound and a warning is written to stderr.
-The default is 64 MiB.
 .It Fl d Ar start_directory
 Specifies an alternate starting directory for users.
 The pathname may contain the following tokens that are expanded at runtime:
@@ -151,20 +133,6 @@ Places this instance of
 into a read-only mode.
 Attempts to open files for writing, as well as other operations that change
 the state of the filesystem, will be denied.
-.It Fl T Ar total_bundle_cap
-Sets the maximum aggregate memory the server will accumulate across all
-concurrent
-.Sy hpn-bundle@hpnssh.org
-handles in this server process.
-New bundle opens or growth that would push the total past this limit are
-rejected with
-.Sy SSH_FX_NO_SPACE_ON_FILESYSTEM ,
-preventing a runaway parallel client from exhausting server memory.
-Accepts the same byte-count syntax as
-.Fl B .
-Permitted range is 16 MiB to 16 GiB; out-of-range values are clamped to
-the nearest bound and a warning is written to stderr.
-The default is 1.5 GiB.
 .It Fl u Ar umask
 Sets an explicit
 .Xr umask 2
@@ -240,12 +208,7 @@ to stripe boundaries on the destination.
 .It Sy hpn-bundle@hpnssh.org
 Capability advertisement for tar-stream bundling of small files; the
 actual bundle upload is driven by SSH_FXP_OPEN with bundle-specific
-attributes and accumulates per-bundle and total-bundle data subject to
-the
-.Fl B
-and
-.Fl T
-caps documented above.
+attributes.
 .It Sy hpn-bundle-fetch@hpnssh.org
 Server-side bundling of small files for download: the server tar-streams
 a set of files into a single bundle handle that the client then drains
