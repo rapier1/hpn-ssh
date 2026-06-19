@@ -322,20 +322,10 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 	} else if (t->verify && w != NULL) {
 		/*
 		 * HPNVerifyTransfer: the file's last range just finished
-		 * cleanly.  Default path: run the post-transfer verify HERE, on
-		 * the finalizing worker's own live conn (safe from the teardown
-		 * reaper - this thread owns the worker), then free.
-		 *
-		 * HPN_ASYNC_VERIFY (on by default, =0 disables): instead hand the tracker
-		 * to the dedicated verify worker, which runs the identical verify
-		 * on its OWN connection and frees the tracker - so this transfer
-		 * worker does not block on the server read-back.  Ownership of t
-		 * transfers to the verify worker; do NOT free here.
+		 * cleanly.  Run the post-transfer verify HERE, on the finalizing
+		 * worker's own live conn (safe from the teardown reaper - this
+		 * thread owns the worker), then free.
 		 */
-		if (__atomic_load_n(&w->parent->async_verify, __ATOMIC_RELAXED)) {
-			parallel_verify_q_push(w->parent, t);
-			return incomplete;
-		}
 		parallel_verify_and_free(w, t);
 		return incomplete;
 	}
@@ -349,8 +339,7 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 
 /*
  * Run the post-transfer verify for a completed range tracker on worker w's
- * connection, then free the tracker.  Shared by the inline finalize path and
- * the async verify worker (HPN_ASYNC_VERIFY) so both verify identically.
+ * connection, then free the tracker.  Called from the finalize path.
  * Download (target LOCAL) keeps the whole-file readback verify; upload (REMOTE)
  * uses the per-range verify off the teed source hashes when slots are present,
  * else the whole-file fallback (pre-19 server path).
