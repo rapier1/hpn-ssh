@@ -128,6 +128,76 @@ parallel_verify_one(struct sftp_worker *w, const char *local_path,
 	hpn_strlist_append(&p->verify_failed_paths, remote_path);
 }
 
+/*
+ * HPNVerifyTransfer (range-split upload): per-range verify off the tracker's
+ * teed source hashes - no whole-file source re-read.  Builds the range arrays
+ * from the slots and compares against the server's per-range dest hashes.  A
+ * -1 (server lacks sftp-hash-range, or a local read failed) falls back to the
+ * whole-file verify so integrity is still checked.
+ */
+void
+parallel_verify_one_ranges(struct sftp_worker *w, struct sftp_range_tracker *t)
+{
+	struct sftp_parallel	*p = w->parent;
+	struct sftp_hash_range	*ranges;
+	uint64_t		*local_hashes;
+	int			*valid;
+	u_int			 i, n;
+	int			 r;
+
+	if (t->vslots == NULL || t->vslots_n <= 0) {
+		parallel_verify_one(w, t->src_path, t->path,
+		    /*local_is_target=*/0);
+		return;
+	}
+	/*
+	 * Bound by vslots_n (the allocation), NOT t->total: the endgame split
+	 * grows total with sub-range pieces but never resizes vslots.  Those
+	 * pieces tile a slot whose original range was left valid=0 (the held
+	 * unit shrank, so its hash was not stored), so re-reading that slot's
+	 * full [off, len) at finalize already covers every piece - the extra
+	 * grown slots neither exist nor are needed.
+	 */
+	n = (u_int)t->vslots_n;
+	ranges       = xcalloc(n, sizeof(*ranges));
+	local_hashes = xcalloc(n, sizeof(*local_hashes));
+	valid        = xcalloc(n, sizeof(*valid));
+	for (i = 0; i < n; i++) {
+		ranges[i].off   = t->vslots[i].off;
+		ranges[i].len   = t->vslots[i].len;
+		local_hashes[i] = t->vslots[i].hash;
+		valid[i]        = t->vslots[i].valid;
+	}
+	r = sftp_hpn_verify_transfer_ranges(w->conn, t->src_path, t->path,
+	    ranges, local_hashes, valid, n);
+	{
+		u_int j, reread = 0;
+		for (j = 0; j < n; j++)
+			if (!valid[j])
+				reread++;
+		logit("DIAG range-verify \"%s\": r=%d n=%u reread=%u "
+		    "valid0=%d valid_last=%d", t->path, r, n, reread,
+		    valid[0], valid[n - 1]);
+	}
+	free(ranges);
+	free(local_hashes);
+	free(valid);
+
+	if (r == 0)
+		return;	/* verified good */
+	if (r < 0) {
+		/* Per-range path unavailable - re-check whole-file (re-reads
+		 * the source but still proves integrity). */
+		parallel_verify_one(w, t->src_path, t->path,
+		    /*local_is_target=*/0);
+		return;
+	}
+	error_f("worker %d VERIFY FAILED: \"%s\" post-transfer hash "
+	    "mismatch - transferred file does NOT match source",
+	    w->id, t->path);
+	hpn_strlist_append(&p->verify_failed_paths, t->path);
+}
+
 /* Close and clear the worker's warm remote handle (held open across same-
  * file range writes to skip the boundary close/reopen).  Skips the wire
  * close on a dead connection; always frees the cached handle + path. */
@@ -201,7 +271,9 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		struct sftp_range_warm *warmp =
 		    w->range_warm_disabled ? NULL : &warm;
 		rc = sftp_upload_range(w->conn, u->src_path, u->dst_path,
-		    u->range_offset, u->range_length, &u->acked_bytes, warmp);
+		    u->range_offset, u->range_length, &u->acked_bytes, warmp,
+		    (u->range_tracker != NULL && u->range_tracker->verify)
+		    ? &u->range_hash : NULL);
 		w->warm_handle = warm.handle;
 		w->warm_handle_len = warm.handle_len;
 		w->warm_dst_path = warm.path;
@@ -209,6 +281,19 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		    "acked=%lld attempt=%d", w->id,
 		    (long long)u->range_offset, (long long)u->range_length,
 		    rc, (long long)u->acked_bytes, u->attempt);
+		/* HPNVerifyTransfer: a range that transferred in one clean pass
+		 * (first attempt, fully acked) has a teed source hash good for
+		 * the whole original range - record it so finalize skips the
+		 * source re-read.  Pass the span actually covered: store_range_hash
+		 * keeps the hash only if it still equals the slot's original
+		 * [off, len), so a highwater-resumed remainder (which reaches here
+		 * with attempt reset to 0) leaves the slot unset and is re-read per
+		 * range at finalize. */
+		if (rc == 0 && u->attempt == 0 && u->range_tracker != NULL &&
+		    u->acked_bytes == u->range_length)
+			parallel_unit_store_range_hash(u->range_tracker,
+			    u->range_index, (uint64_t)u->range_offset,
+			    (uint64_t)u->range_length, u->range_hash);
 		break;
 	}
 	case SFTP_OP_DOWNLOAD_RANGE:

@@ -108,6 +108,11 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path,
 	t->path       = xstrdup(path);
 	t->src_path   = (src_path != NULL) ? xstrdup(src_path) : NULL;
 	t->verify     = verify;
+	/* Per-range verify slots: upload (REMOTE target) + verify only; the
+	 * download path keeps the whole-file readback verify. */
+	t->vslots = (verify && target == SFTP_RANGE_TARGET_REMOTE && total > 0)
+	    ? xcalloc((size_t)total, sizeof(*t->vslots)) : NULL;
+	t->vslots_n = (t->vslots != NULL) ? total : 0;
 	t->active_writers = 0;
 	/* writer_cap comes from cfg.writers_per_inode_cap (-w); guard against an
 	 * unset (0) or out-of-range config by falling back to the default. */
@@ -116,6 +121,35 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path,
 		writer_cap = HPN_RANGE_WRITERS_CAP_DEFAULT;
 	t->writer_cap     = writer_cap;
 	return t;
+}
+
+/*
+ * HPNVerifyTransfer: record a range's teed source hash into its tracker slot.
+ * The teed hash covers exactly the byte span the unit transferred in this
+ * pass.  It is authoritative for the slot ONLY when that span still equals the
+ * slot's original [off, len) - i.e. the range was never split.  The caller's
+ * own attempt==0 guard is NOT sufficient: the highwater-resume requeue
+ * (worker_process_result) resets attempt to 0 and shrinks the unit to its
+ * remainder, so a resumed range reaches here looking "first-attempt clean"
+ * while its teed hash covers only the tail.  The endgame split likewise shrinks
+ * the held unit and spawns pieces.  So the authoritative guard lives here:
+ * store only when (off, len) match the slot; any split leaves valid=0 and the
+ * range is re-read in full from the source at finalize.  NULL-safe; a no-op
+ * unless this is a verified upload.
+ */
+void
+parallel_unit_store_range_hash(struct sftp_range_tracker *t, int index,
+    uint64_t off, uint64_t len, uint64_t hash)
+{
+	if (t == NULL || t->vslots == NULL)
+		return;
+	pthread_mutex_lock(&t->mu);
+	if (index >= 0 && index < t->vslots_n &&
+	    off == t->vslots[index].off && len == t->vslots[index].len) {
+		t->vslots[index].hash  = hash;
+		t->vslots[index].valid = 1;
+	}
+	pthread_mutex_unlock(&t->mu);
 }
 
 /*
@@ -288,21 +322,26 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 	} else if (t->verify && w != NULL) {
 		/*
 		 * HPNVerifyTransfer: the file's last range just finished
-		 * cleanly.  Run the whole-file post-transfer verify here, on
-		 * the finalizing worker's own live conn (safe from the
-		 * teardown reaper - this thread owns the worker).  target ==
-		 * LOCAL means a download (the local file we wrote is the
-		 * target); REMOTE means an upload (the remote file is the
-		 * target, local is the source).
+		 * cleanly.  Run the post-transfer verify here, on the
+		 * finalizing worker's own live conn (safe from the teardown
+		 * reaper - this thread owns the worker).  Download (target ==
+		 * LOCAL) keeps the whole-file readback verify.  Upload (target
+		 * == REMOTE) uses the per-range verify off the teed source
+		 * hashes - no whole-file source re-read - when slots are
+		 * present; vslots == NULL only on a pre-19 server path, which
+		 * the per-range wrapper handles by falling back to whole-file.
 		 */
 		if (t->target == SFTP_RANGE_TARGET_LOCAL)
 			parallel_verify_one(w, t->path, t->src_path,
 			    /*local_is_target=*/1);
+		else if (t->vslots != NULL)
+			parallel_verify_one_ranges(w, t);
 		else
 			parallel_verify_one(w, t->src_path, t->path,
 			    /*local_is_target=*/0);
 	}
 	pthread_mutex_destroy(&t->mu);
+	free(t->vslots);
 	free(t->path);
 	free(t->src_path);
 	free(t);
@@ -841,8 +880,16 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 		off_t offset = (off_t)i * range_size;
 		off_t length = (i == effective_ranges - 1) ?
 		    (file_size - offset) : range_size;
-		if (parallel_unit_submit(p, parallel_unit_make_range(local_path, remote_path,
-		    offset, length, tracker)) != 0) {
+		struct sftp_work_unit *ru = parallel_unit_make_range(local_path,
+		    remote_path, offset, length, tracker);
+		if (ru != NULL) {
+			ru->range_index = i;
+			if (tracker->vslots != NULL) {
+				tracker->vslots[i].off = (u_int64_t)offset;
+				tracker->vslots[i].len = (u_int64_t)length;
+			}
+		}
+		if (parallel_unit_submit(p, ru) != 0) {
 			/* Under an abort the refusal is expected fallout
 			 * (queue is shut), not a fault - keep it quiet. */
 			if (p->abort_flag)

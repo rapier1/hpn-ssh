@@ -3266,7 +3266,7 @@ sftp_create_file(struct sftp_conn *conn, const char *remote_path, mode_t mode,
 int
 sftp_upload_range(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, off_t range_offset, off_t range_length,
-    off_t *acked_out, struct sftp_range_warm *warm)
+    off_t *acked_out, struct sftp_range_warm *warm, uint64_t *range_hash_out)
 {
 	struct sshbuf *msg;
 	struct request {
@@ -3283,7 +3283,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	uint32_t status = SSH2_FX_OK;
 	off_t offset = range_offset, bytes_left;
 	off_t first_fail_off = -1;
-	int local_fd = -1, ret = -1, r, yielded = 0;
+	int local_fd = -1, ret = -1, r, yielded = 0, teed = 0;
 
 	if (acked_out != NULL)
 		*acked_out = 0;
@@ -3320,6 +3320,17 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
+
+	/* HPNVerifyTransfer: tee this range's source bytes into a streaming
+	 * XXH3 as we read them to send, so the finalize verify can reuse the
+	 * hash instead of re-reading the source.  Only when the caller asked
+	 * (range_hash_out != NULL).  A range that does not transfer in one
+	 * clean pass (yield / partial / retry) leaves acked < range_length;
+	 * the caller detects that and re-reads just that range at finalize. */
+	if (range_hash_out != NULL && conn->hpn != NULL) {
+		sftp_hpn_src_arm(conn->hpn);
+		teed = 1;
+	}
 
 	for (;;) {
 		int len = 0;
@@ -3363,6 +3374,12 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 				    (long long)bytes_left);
 				break;
 			}
+
+			/* Tee the clean source bytes before the fault-injection
+			 * hook below corrupts what we send, so the verify hash
+			 * reflects the source, not the deliberately bad write. */
+			if (teed)
+				sftp_hpn_src_feed(conn->hpn, data, (size_t)len);
 
 			/* FAULT-INJ: corrupt one byte of this range's outgoing
 			 * data (range-split mirror of the do_upload_body hook);
@@ -3533,6 +3550,14 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	while ((ack = TAILQ_FIRST(&acks)) != NULL) {
 		TAILQ_REMOVE(&acks, ack, tq);
 		free(ack);
+	}
+	/* Finalize the tee.  src_take writes *range_hash_out only when the
+	 * teed byte count equals range_length; the caller additionally gates
+	 * on a clean (acked == range_length) transfer before trusting it. */
+	if (teed) {
+		sftp_hpn_src_finish(conn->hpn);
+		(void)sftp_hpn_src_take(conn->hpn, (uint64_t)range_length,
+		    range_hash_out);
 	}
 	close(local_fd);
 	free(handle);

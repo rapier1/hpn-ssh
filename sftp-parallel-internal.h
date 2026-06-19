@@ -699,6 +699,14 @@ enum sftp_range_target {
  * here would silently give every module its own dead copy. */
 extern volatile sig_atomic_t parallel_user_abort_flag;
 
+/* One per range, for HPNVerifyTransfer per-range verification (upload). */
+struct sftp_range_vslot {
+	u_int64_t off;    /* original range start in the file */
+	u_int64_t len;    /* original range length */
+	u_int64_t hash;   /* teed XXH3 of the source range (when valid) */
+	int       valid;  /* 1 = teed cleanly; 0 = re-read at finalize */
+};
+
 struct sftp_range_tracker {
 	pthread_mutex_t        mu;         /* serialises decrement + cleanup */
 	int                    total;      /* original range count (immutable
@@ -734,6 +742,15 @@ struct sftp_range_tracker {
 	 * an interrupted transfer leaves no empty full-size placeholders
 	 * and verified resume only ever hashes files that hold data. */
 	int                    file_ensured;
+	/* HPNVerifyTransfer per-range verify (upload only): one slot per range
+	 * holding the original byte span and the teed source hash.  NULL unless
+	 * this is a verified upload.  Sized `total`; filled at submit. */
+	struct sftp_range_vslot *vslots;
+	/* vslots allocation count, captured at new and NEVER mutated.  `total`
+	 * can GROW at runtime (the endgame split adds pieces), so every consumer
+	 * that indexes vslots must bound by this, not by total, or it walks off
+	 * the end of the array. */
+	int                      vslots_n;
 };
 
 struct sftp_work_unit {
@@ -774,6 +791,10 @@ struct sftp_work_unit {
 	/* Range fields: used only for SFTP_OP_UPLOAD_RANGE / DOWNLOAD_RANGE. */
 	off_t    range_offset;
 	off_t    range_length;
+	int      range_index;  /* this range's slot in the tracker (0-based) */
+	uint64_t range_hash;   /* HPNVerifyTransfer: XXH3 of the source bytes,
+				* teed during a clean send; consumed into the
+				* tracker slot when acked == range_length. */
 	/* Shared across all range units of one file.  NULL for non-range
 	 * units.  See struct sftp_range_tracker above. */
 	struct sftp_range_tracker *range_tracker;
@@ -1421,6 +1442,8 @@ void	 parallel_unit_pending_trace(const char *, struct sftp_parallel *,
 	    const struct sftp_work_unit *, int, const char *);
 int	 parallel_unit_pending_trace_on(void);
 int	 parallel_unit_submit(struct sftp_parallel *, struct sftp_work_unit *);
+void	 parallel_unit_store_range_hash(struct sftp_range_tracker *, int index,
+	    uint64_t off, uint64_t len, uint64_t hash);
 /* Flush any partially-filled producer-side bundle (the tail); called from
  * sftp_parallel_wait once a command has finished submitting. */
 void	 parallel_bundle_flush_pending(struct sftp_parallel *);
@@ -1440,6 +1463,8 @@ void	*parallel_worker_thread(void *);
  * range-split finalize. */
 void	 parallel_verify_one(struct sftp_worker *, const char *local_path,
 	    const char *remote_path, int local_is_target);
+void	 parallel_verify_one_ranges(struct sftp_worker *,
+	    struct sftp_range_tracker *);
 
 /* sftp-parallel-respawn.c - spawn/respawn lifecycle */
 void	 parallel_respawn_teardown_ssh(struct sftp_worker *);

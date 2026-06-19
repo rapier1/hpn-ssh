@@ -195,7 +195,6 @@ send_status_oqueue(struct sshbuf *oqueue, u_int id, u_int status)
  * flags the chunk as incomplete.
  */
 #define SFTP_HASH_RANGE_MAX_RANGES	65536U
-#define SFTP_HASH_RANGE_MAX_LEN		((u_int64_t)SSHBUF_SIZE_MAX)
 
 struct hash_range {
 	u_int64_t	off;
@@ -307,12 +306,6 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 			error_f("parse range %u: %s", i, ssh_err(r));
 			goto fail_status;
 		}
-		if (ranges[i].len > SFTP_HASH_RANGE_MAX_LEN) {
-			error_f("range %u length %llu > cap %llu for \"%s\"",
-			    i, (unsigned long long)ranges[i].len,
-			    (unsigned long long)SFTP_HASH_RANGE_MAX_LEN, path);
-			goto fail_status;
-		}
 	}
 
 	logit("sftp-hash-range \"%s\" num_ranges=%u", path, num_ranges);
@@ -328,6 +321,37 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto out;
 	}
 	fsize = (u_int64_t)st.st_size;
+
+	/*
+	 * Total-work guard against crafted requests.  A legitimate request
+	 * (range-split upload verify, chunked verified resume) tiles [0, fsize)
+	 * exactly, so the bytes it asks us to hash sum to the file size.  A
+	 * single over-large len is already harmless - it EOF-clamps to one
+	 * end-of-file read.  The real attack is many overlapping / redundant
+	 * ranges (up to SFTP_HASH_RANGE_MAX_RANGES of them) crafted to make the
+	 * server re-hash the file many times over.  EOF-clamp each range and
+	 * reject if the clamped total runs past 2x the file size: that can only
+	 * be such a request.  This bounds our work to reading the file at most
+	 * twice per request, regardless of file size, while never rejecting a
+	 * legitimate tiling.  Overflow-safe: the running total never passes cap.
+	 */
+	{
+		u_int64_t cap = fsize > UINT64_MAX / 2 ? UINT64_MAX : fsize * 2;
+		u_int64_t total = 0, clamped;
+
+		for (i = 0; i < num_ranges; i++) {
+			clamped = ranges[i].off >= fsize ? 0 :
+			    MINIMUM(ranges[i].len, fsize - ranges[i].off);
+			if (clamped > cap - total) {
+				error_f("sftp-hash-range \"%s\": clamped range "
+				    "total exceeds 2x file size (%llu) - "
+				    "rejecting crafted request", path,
+				    (unsigned long long)fsize);
+				goto fail_status;
+			}
+			total += clamped;
+		}
+	}
 
 	if ((state = XXH3_createState()) == NULL) {
 		error_f("XXH3_createState failed");

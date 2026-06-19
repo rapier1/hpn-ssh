@@ -488,7 +488,7 @@ struct sftp_range_warm {
 };
 int sftp_upload_range(struct sftp_conn *, const char *local_path,
     const char *remote_path, off_t range_offset, off_t range_length,
-    off_t *acked_out, struct sftp_range_warm *warm);
+    off_t *acked_out, struct sftp_range_warm *warm, uint64_t *range_hash_out);
 
 /*
  * Download a byte range of a remote file into the corresponding byte range

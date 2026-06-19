@@ -561,6 +561,127 @@ sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
 	return r;
 }
 
+/*
+ * Per-range post-transfer verify for a range-split upload.  Once a file is
+ * split across workers the inline whole-file source tee is unavailable, so
+ * each range's source hash is supplied by the worker's send-time tee in
+ * local_hashes[i] when valid[i] is set; a range that did not tee cleanly
+ * (split / retry) is re-read here - just its [off,len) bytes.  The server
+ * hashes the destination per range.  Equivalent in strength to whole-file
+ * verify: the ranges tile [0, size) exactly, and the dest-size check rejects
+ * trailing bytes that a whole-file hash would otherwise have caught.
+ *
+ * Returns 0 (all ranges match - good), 1 (a range differs or the dest size
+ * disagrees - CORRUPTION), or -1 (could not verify - caller treats as
+ * "verification skipped", not a content failure).
+ */
+int
+sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
+    const char *local_path, const char *remote_path,
+    const struct sftp_hash_range *ranges, const u_int64_t *local_hashes,
+    const int *valid, u_int n)
+{
+	u_int64_t	*src_hashes = NULL, *dst_hashes = NULL;
+	struct stat	 lsb;
+	Attrib		 ra;
+	int		 local_fd = -1, r = -1;
+	u_int		 i;
+
+	if (conn == NULL || local_path == NULL || remote_path == NULL ||
+	    ranges == NULL || local_hashes == NULL || valid == NULL || n == 0)
+		return -1;
+	if (!sftp_conn_has_hash_range(conn)) {
+		logit("DIAG prv: server lacks sftp-hash-range for \"%s\"",
+		    remote_path);
+		return -1;	/* caller falls back to whole-file verify */
+	}
+
+	if (stat(local_path, &lsb) == -1) {
+		error("verify: stat local \"%s\": %s", local_path,
+		    strerror(errno));
+		return -1;
+	}
+	/*
+	 * Dest size must equal source size: per-range hashing only covers
+	 * [0, size), so extra trailing bytes on the destination (a pre-existing
+	 * larger file overwritten in place) would slip past unless we check the
+	 * size that a whole-file hash would otherwise have caught.
+	 */
+	if (sftp_stat(conn, remote_path, 1, &ra) != 0 ||
+	    (ra.flags & SSH2_FILEXFER_ATTR_SIZE) == 0) {
+		logit("DIAG prv: cannot stat remote \"%s\"", remote_path);
+		return -1;
+	}
+	if ((off_t)ra.size != lsb.st_size) {
+		error_f("verify: remote \"%s\" size %llu != source %llu - "
+		    "transferred file does NOT match source", remote_path,
+		    (unsigned long long)ra.size,
+		    (unsigned long long)lsb.st_size);
+		return 1;
+	}
+
+	if ((src_hashes = calloc(n, sizeof(*src_hashes))) == NULL ||
+	    (dst_hashes = calloc(n, sizeof(*dst_hashes))) == NULL) {
+		error_f("calloc for %u ranges failed", n);
+		goto out;
+	}
+
+	/* Source hashes: reuse the send-time tee where the range transferred
+	 * cleanly; re-read just the [off,len) bytes of any range that split. */
+	for (i = 0; i < n; i++) {
+		if (valid[i]) {
+			src_hashes[i] = local_hashes[i];
+			continue;
+		}
+		if (local_fd < 0 &&
+		    (local_fd = open(local_path, O_RDONLY)) == -1) {
+			error("verify: open local \"%s\": %s", local_path,
+			    strerror(errno));
+			goto out;
+		}
+		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
+		    ranges[i].len, &src_hashes[i]) != 0) {
+			error_f("verify: local range hash failed at offset %llu "
+			    "for \"%s\"", (unsigned long long)ranges[i].off,
+			    local_path);
+			sftp_conn_watchdog_resume(conn);
+			goto out;
+		}
+		sftp_conn_watchdog_resume(conn);
+	}
+
+	/* Destination hashes: server XXH3s each range (all-or-nothing). */
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	if (sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n,
+	    dst_hashes) != 0) {
+		logit("DIAG prv: hash_remote_ranges failed for \"%s\"",
+		    remote_path);
+		sftp_conn_watchdog_resume(conn);
+		goto out;
+	}
+	sftp_conn_watchdog_resume(conn);
+
+	r = 0;
+	for (i = 0; i < n; i++) {
+		if (src_hashes[i] != dst_hashes[i]) {
+			error_f("verify: range [%llu+%llu) of \"%s\" MISMATCH "
+			    "- transferred file does NOT match source",
+			    (unsigned long long)ranges[i].off,
+			    (unsigned long long)ranges[i].len, remote_path);
+			r = 1;
+		}
+	}
+	if (r == 0)
+		debug3_f("verify \"%s\": all %u ranges match", remote_path, n);
+ out:
+	if (local_fd >= 0)
+		close(local_fd);
+	free(src_hashes);
+	free(dst_hashes);
+	return r;
+}
+
 int
 sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
     const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out)
@@ -888,7 +1009,7 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 		    (unsigned long long)run_off,
 		    (unsigned long long)run_len, local_path);
 		if (sftp_upload_range(conn, local_path, remote_path,
-		    (off_t)run_off, (off_t)run_len, NULL, NULL) != 0) {
+		    (off_t)run_off, (off_t)run_len, NULL, NULL, NULL) != 0) {
 			/* A dead connection (worker churn) is handled fallout -
 			 * the full-file path retries it; only a failure on a
 			 * live connection deserves the user's attention. */

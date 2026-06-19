@@ -43,6 +43,17 @@ struct sftp_conn;
 int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
     const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out);
 
+/*
+ * Per-range post-transfer verify for a range-split upload (HPNVerifyTransfer).
+ * local_hashes[i] / valid[i] carry the worker's send-time tee for each range;
+ * ranges that did not tee cleanly are re-read here.  Returns 0 (match),
+ * 1 (mismatch / size disagreement = corruption), -1 (could not verify).
+ */
+int sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
+    const char *local_path, const char *remote_path,
+    const struct sftp_hash_range *ranges, const u_int64_t *local_hashes,
+    const int *valid, u_int n);
+
 int sftp_hpn_xxhash_local_fd(struct sftp_conn *, int, uint64_t, uint64_t *);
 int sftp_hpn_hash_remote_file(struct sftp_conn *, const char *, uint64_t,
     uint32_t, uint64_t *);
