@@ -1393,6 +1393,21 @@ struct sftp_parallel {
 	 * stop.  Touched only by the reporter thread. */
 	FILE    *stats_csv;
 	uint64_t stats_csv_start_ns;
+
+	/* HPN_ASYNC_VERIFY (on by default, sized to -j; =0 off): decoupled verify.
+	 * Transfer workers hand a completed range tracker to a dedicated verify
+	 * worker (its OWN ssh connection) instead of blocking on the server
+	 * read-back inline.  vq is a simple FIFO of trackers; the verify worker
+	 * drains it and frees each tracker.  Tracked OUTSIDE workers[] so the
+	 * reporter/respawn machinery ignore it. */
+	int                      async_verify;   /* 1 = verify pool active */
+	pthread_mutex_t          vq_mu;
+	pthread_cond_t           vq_cv;
+	struct sftp_verify_node *vq_head, *vq_tail;
+	int                      vq_closed;
+	int                      vq_nworkers;     /* live pool size (0 = none) */
+	pthread_t               *vq_tids;         /* [vq_nworkers] */
+	struct sftp_worker     **vq_workers;      /* [vq_nworkers], own conns */
 };
 
 /*
@@ -1465,6 +1480,14 @@ void	 parallel_verify_one(struct sftp_worker *, const char *local_path,
 	    const char *remote_path, int local_is_target);
 void	 parallel_verify_one_ranges(struct sftp_worker *,
 	    struct sftp_range_tracker *);
+
+/* HPN_ASYNC_VERIFY: decoupled verify worker (sftp-parallel-respawn.c). */
+void	 parallel_verify_and_free(struct sftp_worker *,
+	    struct sftp_range_tracker *);
+void	 parallel_verify_q_push(struct sftp_parallel *,
+	    struct sftp_range_tracker *);
+int	 parallel_verify_worker_start(struct sftp_parallel *, int npool);
+void	 parallel_verify_worker_drain(struct sftp_parallel *);
 
 /* sftp-parallel-respawn.c - spawn/respawn lifecycle */
 void	 parallel_respawn_teardown_ssh(struct sftp_worker *);

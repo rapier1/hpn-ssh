@@ -322,15 +322,43 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 	} else if (t->verify && w != NULL) {
 		/*
 		 * HPNVerifyTransfer: the file's last range just finished
-		 * cleanly.  Run the post-transfer verify here, on the
-		 * finalizing worker's own live conn (safe from the teardown
-		 * reaper - this thread owns the worker).  Download (target ==
-		 * LOCAL) keeps the whole-file readback verify.  Upload (target
-		 * == REMOTE) uses the per-range verify off the teed source
-		 * hashes - no whole-file source re-read - when slots are
-		 * present; vslots == NULL only on a pre-19 server path, which
-		 * the per-range wrapper handles by falling back to whole-file.
+		 * cleanly.  Default path: run the post-transfer verify HERE, on
+		 * the finalizing worker's own live conn (safe from the teardown
+		 * reaper - this thread owns the worker), then free.
+		 *
+		 * HPN_ASYNC_VERIFY (on by default, =0 disables): instead hand the tracker
+		 * to the dedicated verify worker, which runs the identical verify
+		 * on its OWN connection and frees the tracker - so this transfer
+		 * worker does not block on the server read-back.  Ownership of t
+		 * transfers to the verify worker; do NOT free here.
 		 */
+		if (__atomic_load_n(&w->parent->async_verify, __ATOMIC_RELAXED)) {
+			parallel_verify_q_push(w->parent, t);
+			return incomplete;
+		}
+		parallel_verify_and_free(w, t);
+		return incomplete;
+	}
+	pthread_mutex_destroy(&t->mu);
+	free(t->vslots);
+	free(t->path);
+	free(t->src_path);
+	free(t);
+	return incomplete;
+}
+
+/*
+ * Run the post-transfer verify for a completed range tracker on worker w's
+ * connection, then free the tracker.  Shared by the inline finalize path and
+ * the async verify worker (HPN_ASYNC_VERIFY) so both verify identically.
+ * Download (target LOCAL) keeps the whole-file readback verify; upload (REMOTE)
+ * uses the per-range verify off the teed source hashes when slots are present,
+ * else the whole-file fallback (pre-19 server path).
+ */
+void
+parallel_verify_and_free(struct sftp_worker *w, struct sftp_range_tracker *t)
+{
+	if (t->verify && w != NULL) {
 		if (t->target == SFTP_RANGE_TARGET_LOCAL)
 			parallel_verify_one(w, t->path, t->src_path,
 			    /*local_is_target=*/1);
@@ -345,7 +373,6 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 	free(t->path);
 	free(t->src_path);
 	free(t);
-	return incomplete;
 }
 
 /*

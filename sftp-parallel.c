@@ -467,6 +467,24 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 			goto fail;
 	}
 
+	/* HPN_ASYNC_VERIFY (env, default off): start the decoupled verify worker
+	 * (its own connection) so transfer workers hand off finished files instead
+	 * of blocking on the server read-back.  Only meaningful when verify is on;
+	 * a failed start silently leaves async_verify=0 (inline verify). */
+	{
+		/* Async verify pool is ON by default, sized to the transfer fleet
+		 * (one verify worker per stream preserves the inline path's
+		 * parallel verify - see the single-worker j4 regression).  Override
+		 * with HPN_ASYNC_VERIFY=N to force pool size N, or =0 to disable
+		 * (fall back to inline verify on the transfer workers). */
+		const char *av = getenv("HPN_ASYNC_VERIFY");
+		int navp = (av != NULL) ? atoi(av) : p->cfg.num_streams;
+
+		if (navp >= 1 && p->cfg.verify_transfer &&
+		    parallel_verify_worker_start(p, navp) >= 1)
+			__atomic_store_n(&p->async_verify, 1, __ATOMIC_RELAXED);
+	}
+
 	/* 4. Reporter - best-effort. */
 	if (pthread_create(&p->reporter_tid, NULL, parallel_reporter_thread, p) == 0)
 		p->reporter_started = 1;
@@ -505,6 +523,13 @@ sftp_parallel_wait(struct sftp_parallel *p)
 	while (p->pending > 0 && !p->abort_flag)
 		pthread_cond_wait(&p->pending_cv, &p->pending_mu);
 	pthread_mutex_unlock(&p->pending_mu);
+
+	/* Transfers done: every finished file's tracker was enqueued before its
+	 * unit decremented pending, so the verify queue now holds them all.
+	 * Drain + join the async verify worker so we don't return before the
+	 * decoupled verifies finish and record any failures.  No-op unless
+	 * HPN_ASYNC_VERIFY is active. */
+	parallel_verify_worker_drain(p);
 }
 
 void

@@ -591,7 +591,7 @@ sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
 	    ranges == NULL || local_hashes == NULL || valid == NULL || n == 0)
 		return -1;
 	if (!sftp_conn_has_hash_range(conn)) {
-		logit("DIAG prv: server lacks sftp-hash-range for \"%s\"",
+		debug_f("server lacks sftp-hash-range for \"%s\"",
 		    remote_path);
 		return -1;	/* caller falls back to whole-file verify */
 	}
@@ -609,7 +609,7 @@ sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
 	 */
 	if (sftp_stat(conn, remote_path, 1, &ra) != 0 ||
 	    (ra.flags & SSH2_FILEXFER_ATTR_SIZE) == 0) {
-		logit("DIAG prv: cannot stat remote \"%s\"", remote_path);
+		debug_f("cannot stat remote \"%s\"", remote_path);
 		return -1;
 	}
 	if ((off_t)ra.size != lsb.st_size) {
@@ -655,8 +655,6 @@ sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 	if (sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n,
 	    dst_hashes) != 0) {
-		logit("DIAG prv: hash_remote_ranges failed for \"%s\"",
-		    remote_path);
 		sftp_conn_watchdog_resume(conn);
 		goto out;
 	}

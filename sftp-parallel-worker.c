@@ -170,15 +170,6 @@ parallel_verify_one_ranges(struct sftp_worker *w, struct sftp_range_tracker *t)
 	}
 	r = sftp_hpn_verify_transfer_ranges(w->conn, t->src_path, t->path,
 	    ranges, local_hashes, valid, n);
-	{
-		u_int j, reread = 0;
-		for (j = 0; j < n; j++)
-			if (!valid[j])
-				reread++;
-		logit("DIAG range-verify \"%s\": r=%d n=%u reread=%u "
-		    "valid0=%d valid_last=%d", t->path, r, n, reread,
-		    valid[0], valid[n - 1]);
-	}
 	free(ranges);
 	free(local_hashes);
 	free(valid);
