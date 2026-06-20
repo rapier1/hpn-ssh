@@ -27,14 +27,6 @@
  */
 #define HPN_BUNDLE_FLAG_PRESERVE   0x00000001U
 #define HPN_BUNDLE_FLAG_FSYNC      0x00000002U
-/*
- *   VERIFY - HPNVerifyTransfer: after extracting and fsyncing the batch, the
- *            server reads each file back (O_DIRECT) and returns per-file XXH3
- *            hashes in the CLOSE reply (SSH_FXP_EXTENDED_REPLY instead of
- *            STATUS) so the client can compare against the source hashes it
- *            teed during pack.  Upload path only.
- */
-#define HPN_BUNDLE_FLAG_VERIFY     0x00000004U
 
 /*
  * Tar codec output block size.  Each block becomes one SSH_FXP_WRITE

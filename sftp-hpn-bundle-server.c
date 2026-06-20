@@ -67,7 +67,6 @@
 #include "sftp-common.h"
 #include "sftp-hpn-bundle.h"	/* HPN_BUNDLE_FLAG_* */
 #include "sftp-hpn-server.h"	/* public accessor prototypes + ext names */
-#include "sftp-hpn-verify-hash.h"	/* sftp_hpn_hash_file_ondisk (verify) */
 #include "sftp-hpn-bundle-server.h"
 #include "sftp-hpn-tar.h"
 
@@ -96,18 +95,6 @@ enum hpn_bundle_mode {
  *   bundle_state holds a writer with all paths queued (finish() called
  *   at OPEN time).  sftp_hpn_server_bundle_read drives pack_next() to
  *   produce bytes on demand into the SFTP DATA reply. */
-/*
- * HPNVerifyTransfer: one extracted file to read back and hash at close.
- * Accumulated as each entry finishes; rel_path keys the reply (matches the
- * client's archive path), full_path is what we read back via O_DIRECT.
- */
-struct bundle_verify_entry {
-	char    *rel_path;
-	char    *full_path;
-	uint64_t size;
-	struct bundle_verify_entry *next;
-};
-
 struct hpn_bundle_state {
 	enum hpn_bundle_mode mode;
 	char    *dest_dir;          /* UPLOAD: dir to extract into; FETCH: NULL */
@@ -119,10 +106,6 @@ struct hpn_bundle_state {
 	uint64_t next_write_off;    /* expected SSH_FXP_WRITE offset */
 	/* Per-entry state set by the parser callbacks. */
 	char    *cur_full_path;     /* malloc'd dest_dir + "/" + entry path */
-	char    *cur_rel_path;      /* the entry's archive path (verify key) */
-	/* HPNVerifyTransfer: files extracted so far, read back + hashed at
-	 * close when HPN_BUNDLE_FLAG_VERIFY is set. */
-	struct bundle_verify_entry *verify_head, *verify_tail;
 	int      cur_fd;            /* open output fd, or -1 */
 	uint64_t cur_size;          /* declared size from header */
 	mode_t   cur_mode;
@@ -134,11 +117,6 @@ struct hpn_bundle_state {
 	uint64_t bytes_produced;    /* cumulative pack_next bytes returned */
 	uint64_t next_read_off;     /* expected SSH_FXP_READ offset */
 	uint64_t fetch_total_size;  /* sum of declared file sizes (logged) */
-	/* HPNVerifyTransfer (FETCH): server tees per-file SOURCE hashes as it
-	 * packs (tap on `writer`), returned in the close reply for the client
-	 * to compare against its O_DIRECT read-back of the extracted targets. */
-	struct sftp_hpn_src_hashset *fetch_src_set;
-	struct sftp_hpn_tar_data_tap fetch_tap;
 };
 
 /* Flag constants and HPN_BUNDLE_BLOCK_BYTES live in sftp-hpn-bundle.h, the
@@ -272,16 +250,6 @@ bundle_state_new_fetch(uint32_t flags)
 		free(s);
 		return NULL;
 	}
-	if ((flags & HPN_BUNDLE_FLAG_VERIFY) != 0) {
-		/* HPNVerifyTransfer: tee per-file source hashes as we pack;
-		 * returned in the close reply for the client to compare. */
-		s->fetch_src_set = sftp_hpn_src_hashset_new();
-		if (s->fetch_src_set != NULL) {
-			s->fetch_tap.on_data = sftp_hpn_src_hashset_tap;
-			s->fetch_tap.arg     = s->fetch_src_set;
-			sftp_hpn_tar_writer_set_data_tap(s->writer, &s->fetch_tap);
-		}
-	}
 	return s;
 }
 
@@ -293,16 +261,7 @@ bundle_state_free(struct hpn_bundle_state *s)
 	if (s->cur_fd >= 0)
 		(void)close(s->cur_fd);
 	free(s->cur_full_path);
-	free(s->cur_rel_path);
 	free(s->last_mkdir_dir);
-	while (s->verify_head != NULL) {
-		struct bundle_verify_entry *ve = s->verify_head;
-		s->verify_head = ve->next;
-		free(ve->rel_path);
-		free(ve->full_path);
-		free(ve);
-	}
-	sftp_hpn_src_hashset_free(s->fetch_src_set);
 	if (s->parser != NULL)
 		sftp_hpn_tar_parser_free(s->parser);
 	if (s->writer != NULL)
@@ -377,10 +336,6 @@ bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
 		error_f("hpn-bundle: out of memory composing path");
 		return -1;
 	}
-	/* Remember the entry's archive path - the key the client verifies by. */
-	free(s->cur_rel_path);
-	s->cur_rel_path = xstrdup(path);
-
 	/* Pre-create parent directory.  Skip if last_mkdir_dir matches. */
 	{
 		char *full_copy = strdup(s->cur_full_path);
@@ -492,25 +447,8 @@ bundle_upload_entry_end_cb(void *ctx)
 		}
 		s->cur_fd = -1;
 	}
-	/* HPNVerifyTransfer: queue this just-written file for read-back at
-	 * close (only on a clean extraction). */
-	if (rc == 0 && (s->flags & HPN_BUNDLE_FLAG_VERIFY) != 0 &&
-	    s->cur_full_path != NULL && s->cur_rel_path != NULL) {
-		struct bundle_verify_entry *ve = xcalloc(1, sizeof(*ve));
-
-		ve->rel_path  = xstrdup(s->cur_rel_path);
-		ve->full_path = xstrdup(s->cur_full_path);
-		ve->size      = s->cur_size;
-		if (s->verify_tail != NULL)
-			s->verify_tail->next = ve;
-		else
-			s->verify_head = ve;
-		s->verify_tail = ve;
-	}
 	free(s->cur_full_path);
 	s->cur_full_path = NULL;
-	free(s->cur_rel_path);
-	s->cur_rel_path = NULL;
 	s->cur_size = 0;
 	return rc;
 }
@@ -649,107 +587,6 @@ bundle_path_is_safe(const char *p, const char *dest_dir)
 	return 1;
 }
 
-/*
- * Compose and enqueue the HPNVerifyTransfer CLOSE reply:
- *   SSH_FXP_EXTENDED_REPLY { id, u32 status, u32 n, [string rel_path, u64 hash] x n }
- * On status OK, read each extracted file back via O_DIRECT and emit its hash;
- * the client compares against the source hashes it teed during pack.  On a
- * non-OK status n is 0 (the client bails on status before reading entries).
- */
-static void
-bundle_send_verify_reply(struct sshbuf *oqueue, u_int id, int status,
-    struct hpn_bundle_state *s)
-{
-	struct sshbuf *msg;
-	struct bundle_verify_entry *ve;
-	u_int n = 0;
-	int r;
-
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if (status == SSH2_FX_OK)
-		for (ve = s->verify_head; ve != NULL; ve = ve->next)
-			n++;
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u32(msg, (u_int)status)) != 0 ||
-	    (r = sshbuf_put_u32(msg, n)) != 0)
-		fatal_fr(r, "compose bundle verify reply");
-	if (status == SSH2_FX_OK) {
-		for (ve = s->verify_head; ve != NULL; ve = ve->next) {
-			uint64_t hash = 0;
-
-			if (sftp_hpn_hash_file_ondisk(ve->full_path, ve->size,
-			    /*ondisk=*/1, &hash, NULL, NULL) != 0) {
-				debug_f("hpn-bundle verify: read-back \"%s\" "
-				    "failed; reporting zero hash", ve->full_path);
-				hash = 0;	/* client sees a mismatch */
-			}
-			if ((r = sshbuf_put_cstring(msg, ve->rel_path)) != 0 ||
-			    (r = sshbuf_put_u64(msg, hash)) != 0)
-				fatal_fr(r, "compose bundle verify entry");
-		}
-	}
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue bundle verify reply");
-	sshbuf_free(msg);
-}
-
-struct fetch_verify_emit {
-	struct sshbuf *ents;
-	u_int n;
-	int err;
-};
-
-static void
-fetch_verify_emit_cb(void *arg, const char *archive_path, uint64_t hash)
-{
-	struct fetch_verify_emit *e = arg;
-	int r;
-
-	if (e->err != 0)
-		return;
-	if ((r = sshbuf_put_cstring(e->ents, archive_path)) != 0 ||
-	    (r = sshbuf_put_u64(e->ents, hash)) != 0)
-		e->err = r;
-	else
-		e->n++;
-}
-
-/*
- * FETCH (download) verify reply: the per-file SOURCE hashes the server teed
- * while packing.  Same EXTENDED_REPLY shape as the upload close reply; the
- * client reads back its extracted targets and compares against these.
- */
-static void
-bundle_send_fetch_verify_reply(struct sshbuf *oqueue, u_int id, int status,
-    struct hpn_bundle_state *s)
-{
-	struct sshbuf *msg, *ents;
-	struct fetch_verify_emit e = { NULL, 0, 0 };
-	int r;
-
-	if ((msg = sshbuf_new()) == NULL || (ents = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	e.ents = ents;
-	if (status == SSH2_FX_OK && s->fetch_src_set != NULL)
-		sftp_hpn_src_hashset_foreach(s->fetch_src_set,
-		    fetch_verify_emit_cb, &e);
-	if (e.err != 0)
-		status = SSH2_FX_FAILURE;
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u32(msg, (u_int)status)) != 0 ||
-	    (r = sshbuf_put_u32(msg, status == SSH2_FX_OK ? e.n : 0)) != 0)
-		fatal_fr(r, "compose fetch verify reply");
-	if (status == SSH2_FX_OK && (r = sshbuf_putb(msg, ents)) != 0)
-		fatal_fr(r, "append fetch verify entries");
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue fetch verify reply");
-	sshbuf_free(ents);
-	sshbuf_free(msg);
-}
-
 int
 sftp_hpn_server_bundle_close(int handle, u_int id, struct sshbuf *oqueue)
 {
@@ -762,19 +599,8 @@ sftp_hpn_server_bundle_close(int handle, u_int id, struct sshbuf *oqueue)
 	 * a resource release; the writer's destructor closes any open input
 	 * file and discards the queue. */
 	if (s->mode == HPN_BUNDLE_MODE_FETCH) {
-		int fverify = (s->flags & HPN_BUNDLE_FLAG_VERIFY) != 0;
-
-		debug_f("hpn-bundle close (fetch): handle=%d produced=%llu "
-		    "verify=%d", handle,
-		    (unsigned long long)s->bytes_produced, fverify);
-		if (fverify) {
-			/* Reply with the source hashes teed during pack; the
-			 * client compares against its target read-back. */
-			bundle_send_fetch_verify_reply(oqueue, id, SSH2_FX_OK, s);
-			bundle_state_free(s);
-			handle_free_bundle(handle);
-			return SFTP_HPN_BUNDLE_REPLY_SENT;
-		}
+		debug_f("hpn-bundle close (fetch): handle=%d produced=%llu",
+		    handle, (unsigned long long)s->bytes_produced);
 		bundle_state_free(s);
 		handle_free_bundle(handle);
 		return SSH2_FX_OK;
@@ -789,27 +615,16 @@ sftp_hpn_server_bundle_close(int handle, u_int id, struct sshbuf *oqueue)
 	int status = SSH2_FX_OK;
 	int preserve = (s->flags & HPN_BUNDLE_FLAG_PRESERVE) != 0;
 	int do_fsync = (s->flags & HPN_BUNDLE_FLAG_FSYNC) != 0;
-	int verify   = (s->flags & HPN_BUNDLE_FLAG_VERIFY) != 0;
 
 	debug_f("hpn-bundle close: handle=%d dest=\"%s\" received=%llu "
-	    "preserve=%d fsync=%d verify=%d",
+	    "preserve=%d fsync=%d",
 	    handle, s->dest_dir,
-	    (unsigned long long)s->bytes_received, preserve, do_fsync, verify);
+	    (unsigned long long)s->bytes_received, preserve, do_fsync);
 
 	const char *perr = sftp_hpn_tar_parser_error(s->parser);
 	if (perr != NULL) {
 		error_f("hpn-bundle close: parser error: %s", perr);
 		status = SSH2_FX_FAILURE;
-	}
-
-	if (verify) {
-		/* Per-file verification requested: reply with the extracted
-		 * files' on-disk hashes instead of a plain STATUS.  Built
-		 * before the state is freed. */
-		bundle_send_verify_reply(oqueue, id, status, s);
-		bundle_state_free(s);
-		handle_free_bundle(handle);
-		return SFTP_HPN_BUNDLE_REPLY_SENT;
 	}
 
 	bundle_state_free(s);

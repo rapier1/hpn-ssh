@@ -945,8 +945,10 @@ static void
 verify_one(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, int local_is_target)
 {
+	/* Classic inline path: this verify runs on the connection that just
+	 * uploaded local_path, so the inline source accumulator is valid. */
 	int r = sftp_hpn_verify_transfer(conn, local_path, remote_path,
-	    local_is_target);
+	    local_is_target, /*trust_inline_src=*/1);
 
 	if (r == 0) {
 		debug("verify: \"%s\" OK", remote_path);

@@ -484,7 +484,7 @@ verify_readback_progress(void *arg, uint64_t bytes)
 
 int
 sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, int local_is_target)
+    const char *remote_path, int local_is_target, int trust_inline_src)
 {
 	int fd, r = -1;
 	struct stat sb;
@@ -518,11 +518,16 @@ sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
 			return -1;
 		}
 		sftp_conn_watchdog_resume(conn);
-	} else if (sftp_conn_verify_src_take(conn, (uint64_t)sb.st_size,
+	} else if (trust_inline_src &&
+	    sftp_conn_verify_src_take(conn, (uint64_t)sb.st_size,
 	    &local_hash) == 0) {
 		/*
 		 * Upload: the source hash was accumulated inline during the
-		 * read-to-send (1b); no second read of the source.
+		 * read-to-send (1b); no second read of the source.  Only trusted
+		 * when this verify runs on the same connection that just
+		 * uploaded this file - the accumulator is keyed by size alone,
+		 * so the decoupled post-transfer path passes trust_inline_src=0
+		 * and falls through to the re-read below.
 		 */
 		mode = "inline";
 	} else {

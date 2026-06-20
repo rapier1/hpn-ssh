@@ -62,9 +62,17 @@ int sftp_hpn_hash_remote_file(struct sftp_conn *, const char *, uint64_t,
  * one this host just wrote (a download): its hash is taken as a fsync+O_DIRECT
  * read-back of what landed on disk.  0 when the local file is the source (an
  * upload): the hash comes from the inline accumulator or a buffered re-read.
+ *
+ * trust_inline_src applies only to the upload case (local_is_target 0): 1 lets
+ * the source hash come from the per-connection inline accumulator - safe only
+ * when this verify runs on the connection that just uploaded THIS file (the
+ * classic inline path).  0 forces a fresh source re-read.  The decoupled
+ * post-transfer verify MUST pass 0: it can run on a different connection than
+ * the uploader, where the accumulator (keyed by size alone) may hold another
+ * same-size file's hash.
  */
 int sftp_hpn_verify_transfer(struct sftp_conn *, const char *, const char *,
-    int local_is_target);
+    int local_is_target, int trust_inline_src);
 int sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
     u_int64_t *hash_out);
 

@@ -111,8 +111,12 @@ parallel_verify_one(struct sftp_worker *w, const char *local_path,
     const char *remote_path, int local_is_target)
 {
 	struct sftp_parallel *p = w->parent;
+	/* Decoupled post-transfer verify: force a fresh source re-read.  The
+	 * inline accumulator is per-connection and size-keyed, so a verify that
+	 * runs on a different worker than the uploader could otherwise take
+	 * another same-size file's source hash (the false-positive bug). */
 	int r = sftp_hpn_verify_transfer(w->conn, local_path, remote_path,
-	    local_is_target);
+	    local_is_target, /*trust_inline_src=*/0);
 
 	if (r == 0)
 		return;	/* verified good */
@@ -527,6 +531,21 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 {
 	if (rc == 0) {
 		worker_record_completion(w, u->size, 1);
+		/*
+		 * HPNVerifyTransfer: park every completed batched/bundled member
+		 * for the post-transfer verify phase.  This is the one point the
+		 * pipelined upload batch AND the bundle members converge, so
+		 * parking here gives verify-on coverage to both - the single-file
+		 * and range-split paths park in execute_unit / finalize.
+		 */
+		if (p->cfg.verify_transfer) {
+			if (u->op == SFTP_OP_UPLOAD)
+				parallel_verify_park_whole_file(p, u->src_path,
+				    u->dst_path, /*local_is_target=*/0);
+			else if (u->op == SFTP_OP_DOWNLOAD)
+				parallel_verify_park_whole_file(p, u->dst_path,
+				    u->src_path, /*local_is_target=*/1);
+		}
 		parallel_unit_pending_dec_traced(p, u, w->id, "batch/success");
 		parallel_unit_free(u);
 		return;
@@ -695,18 +714,6 @@ worker_run_bundle(struct sftp_worker *w,
 	for (i = 0; i < bn; i++)
 		if (entries[i].result == 0)
 			ok_count++;
-	/* HPNVerifyTransfer: record per-file bundle verify mismatches into the
-	 * orchestrator's thread-safe list (folded into exit 57), the bundle
-	 * counterpart of parallel_verify_one. */
-	for (i = 0; i < bn; i++) {
-		if (entries[i].verify_failed) {
-			error_f("worker %d BUNDLE VERIFY FAILED: \"%s\" "
-			    "post-transfer hash mismatch", w->id,
-			    entries[i].remote_path);
-			hpn_strlist_append(&p->verify_failed_paths,
-			    entries[i].remote_path);
-		}
-	}
 	{
 		double mibps = 0.0;
 		if (elapsed_us > 0)
@@ -783,17 +790,6 @@ worker_run_bundle_download(struct sftp_worker *w,
 	for (i = 0; i < bn; i++)
 		if (entries[i].result == 0)
 			ok_count++;
-	/* HPNVerifyTransfer: record per-file download bundle verify mismatches
-	 * (mirror of the upload-bundle path). */
-	for (i = 0; i < bn; i++) {
-		if (entries[i].verify_failed) {
-			error_f("worker %d BUNDLE VERIFY FAILED: \"%s\" "
-			    "post-transfer hash mismatch", w->id,
-			    entries[i].local_path);
-			hpn_strlist_append(&p->verify_failed_paths,
-			    entries[i].local_path);
-		}
-	}
 	{
 		double mibps = 0.0;
 		if (elapsed_us > 0)
