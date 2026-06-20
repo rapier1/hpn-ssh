@@ -69,6 +69,13 @@ struct sftp_rdahead {
 	                                   * 0 if cur > floor */
 };
 
+/* One file parked for the classic post-transfer verify phase. */
+struct sftp_verify_pending_entry {
+	char *local_path;
+	char *remote_path;
+	int   local_is_target;		/* 0 = upload, 1 = download */
+};
+
 /*
  * HPN per-connection state.  Embedded in struct sftp_conn as a single
  * pointer so the upstream struct definition gains exactly one line.
@@ -117,6 +124,22 @@ struct sftp_hpn_conn {
 	 * HPNVerifyTransfer here also gates the resume-decision-flow
 	 * trust optimisation, not just the post-transfer integrity check. */
 	int              verify_transfer_enabled;
+
+	/* Classic post-transfer verify phase: the single-conn analogue of the
+	 * -j orchestrator's verify phase.  sftp_upload/sftp_download PARK each
+	 * transferred file (verify_pending); after the command's transfers
+	 * finish, sftp_conn_verify_run_phase() verifies them all and appends any
+	 * mismatch's remote path to verify_failed_paths, which
+	 * sftp_conn_drain_verify_failures() then hands to sftp.c for the run
+	 * summary + exit code.  Plain arrays (main conn is single-threaded, no
+	 * mutex) - deliberately not hpn_strlist, which lives in the parallel
+	 * module that scp does not link.  Both empty on worker conns: the
+	 * orchestrator phase verifies those. */
+	struct sftp_verify_pending_entry *verify_pending;
+	size_t           verify_pending_count;
+	size_t           verify_pending_cap;
+	char           **verify_failed_paths;
+	size_t           verify_failed_count;
 
 	/* Cumulative SFTP payload bytes that actually crossed the wire on
 	 * this connection: incremented after each successful SSH2_FXP_WRITE

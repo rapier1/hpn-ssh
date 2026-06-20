@@ -363,6 +363,25 @@ int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
 int sftp_conn_has_hpn_check_file(struct sftp_conn *conn);
 
 /*
+ * Run the classic (single-conn) post-transfer verify phase: verify every file
+ * parked by sftp_conn_verify_park during the command's transfers, recording
+ * mismatches on the conn.  Call once at the end of each put/get command (the
+ * single-conn analogue of the -j orchestrator's verify phase); no-op when
+ * nothing was parked.
+ */
+void sftp_conn_verify_run_phase(struct sftp_conn *conn);
+
+/*
+ * Drain the classic (single-conn) post-transfer verify failures recorded by
+ * the verify phase.  Ownership of *out_paths and its strings transfers to the
+ * caller; the conn's list resets to empty.  Mirrors
+ * sftp_parallel_drain_verify_failures so the end-of-run summary + exit code
+ * cover classic and parallel transfers uniformly.  Returns the count.
+ */
+size_t sftp_conn_drain_verify_failures(struct sftp_conn *conn,
+    char ***out_paths, size_t *out_used);
+
+/*
  * True iff the server advertised sftp-hash-range@hpnssh.org, i.e. it can
  * answer batched per-range XXH3 queries used by chunked resume to re-transfer
  * only mismatched chunks instead of the whole file.

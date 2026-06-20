@@ -125,6 +125,15 @@ int  sftp_conn_verify_src_take(struct sftp_conn *conn, uint64_t expect_bytes,
 	uint64_t *hash_out);
 
 /*
+ * Park a transferred file for the classic post-transfer verify phase, called
+ * at the end of sftp_upload (local_is_target=0) and sftp_download
+ * (local_is_target=1).  No-op unless verify_transfer_enabled and skipped on
+ * worker conns; the compare runs later in sftp_conn_verify_run_phase.
+ */
+void sftp_conn_verify_park(struct sftp_conn *conn,
+	const char *local_path, const char *remote_path, int local_is_target);
+
+/*
  * Set / query the HPNLustreStripeCount resolved-from-ssh_config value
  * stashed on conn->hpn.  Values: -1 = auto (use -j N); 0 = feature off;
  * >0 = explicit override.  Safe with conn / conn->hpn NULL; query returns

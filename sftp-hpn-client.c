@@ -59,6 +59,16 @@ sftp_hpn_conn_free(struct sftp_hpn_conn *hpn)
 	if (hpn == NULL)
 		return;
 	sftp_hpn_src_dispose(hpn);	/* free any in-flight inline-hash state */
+	/* Safety net: pending is normally drained by the verify phase and
+	 * failures handed to sftp.c, both before teardown. */
+	for (size_t i = 0; i < hpn->verify_pending_count; i++) {
+		free(hpn->verify_pending[i].local_path);
+		free(hpn->verify_pending[i].remote_path);
+	}
+	free(hpn->verify_pending);
+	for (size_t i = 0; i < hpn->verify_failed_count; i++)
+		free(hpn->verify_failed_paths[i]);
+	free(hpn->verify_failed_paths);
 	freezero(hpn, sizeof(*hpn));
 }
 

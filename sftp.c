@@ -938,37 +938,6 @@ parallel_flush(void)
 }
 
 /*
- * HPNVerifyTransfer: verify one just-transferred file end-to-end and record
- * a mismatch for the end-of-run summary.  Never fails the transfer.
- */
-static void
-verify_one(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, int local_is_target)
-{
-	/* Classic inline path: this verify runs on the connection that just
-	 * uploaded local_path, so the inline source accumulator is valid. */
-	int r = sftp_hpn_verify_transfer(conn, local_path, remote_path,
-	    local_is_target, /*trust_inline_src=*/1);
-
-	if (r == 0) {
-		debug("verify: \"%s\" OK", remote_path);
-		return;
-	}
-	if (r < 0) {
-		logit("VERIFY SKIPPED: \"%s\": could not verify (server "
-		    "lacks hpn-check-file@hpnssh.org or read error)",
-		    remote_path);
-		return;
-	}
-	/* r == 1: content mismatch - loud, recorded, but don't abort. */
-	error("VERIFY FAILED: \"%s\" (post-transfer hash mismatch - the "
-	    "transferred file does NOT match the source)", remote_path);
-	verify_fail_list = xreallocarray(verify_fail_list,
-	    verify_fail_count + 1, sizeof(*verify_fail_list));
-	verify_fail_list[verify_fail_count++] = xstrdup(remote_path);
-}
-
-/*
  * Print the verify-failure summary at exit.  Returns the number of files
  * that failed verification (0 = all clean / verify off).
  */
@@ -1350,13 +1319,20 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			else if (dr == 2)
 				mprintf("File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
-			else if (hpn_verify_transfer)	/* dr==0: downloaded */
-				verify_one(conn, abs_dst, g.gl_pathv[i],
-				    /*local_is_target=*/1);
+			/* dr==0: parked by sftp_download for the classic
+			 * post-transfer verify phase run below. */
 		}
 		free(abs_dst);
 		abs_dst = NULL;
 	}
+
+	/*
+	 * Classic post-transfer verify phase (HPN): all files for this command
+	 * are downloaded, so verify them now - the single-conn analogue of the
+	 * -j orchestrator's verify phase.  No-op in parallel mode (the workers
+	 * verify via the orchestrator) and when verify is off.
+	 */
+	sftp_conn_verify_run_phase(conn);
 
 	/*
 	 * In deferred-wait mode (batch mode or future "job submission mode"),
@@ -1531,11 +1507,18 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			else if (ur == 2)
 				mprintf("File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
-			else if (hpn_verify_transfer)	/* ur==0: uploaded */
-				verify_one(conn, g.gl_pathv[i], abs_dst,
-				    /*local_is_target=*/0);
+			/* ur==0: parked by sftp_upload for the classic
+			 * post-transfer verify phase run below. */
 		}
 	}
+
+	/*
+	 * Classic post-transfer verify phase (HPN): all files for this command
+	 * are uploaded, so verify them now - the single-conn analogue of the
+	 * -j orchestrator's verify phase.  No-op in parallel mode (the workers
+	 * verify via the orchestrator) and when verify is off.
+	 */
+	sftp_conn_verify_run_phase(conn);
 
 	/* See process_get - deferred mode skips the per-command drain so
 	 * successive put commands pipeline their files instead of each one
@@ -3838,6 +3821,26 @@ main(int argc, char **argv)
 	        parallel_extra_o));
 
 	err = interactive_loop(conn, file1, file2);
+
+	/*
+	 * Fold classic (single-conn) post-transfer verify mismatches into the
+	 * global list (drain transfers ownership of the strings).  The compare
+	 * now runs inside sftp_upload/sftp_download for every file - single-file
+	 * and recursive - so this is the single classic source feeding the
+	 * shared summary + SFTP_EX_VERIFY_FAILED exit path.
+	 */
+	{
+		char  **cvpaths = NULL;
+		size_t  cvused = 0, i;
+
+		(void)sftp_conn_drain_verify_failures(conn, &cvpaths, &cvused);
+		for (i = 0; i < cvused; i++) {
+			verify_fail_list = xreallocarray(verify_fail_list,
+			    verify_fail_count + 1, sizeof(*verify_fail_list));
+			verify_fail_list[verify_fail_count++] = cvpaths[i];
+		}
+		free(cvpaths);
+	}
 
 	/*
 	 * Fold any parallel post-transfer verify mismatches into the global

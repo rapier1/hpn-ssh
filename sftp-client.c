@@ -2351,6 +2351,17 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	close(local_fd);
 	free(handle);
 
+	/*
+	 * Park for the post-transfer verify phase (HPN): every downloaded file -
+	 * single-file and recursive, since download_dir_internal funnels through
+	 * here - is verified after the command's transfers finish (closing the
+	 * classic `get -r` gap).  Only on a clean download.  No-op unless verify
+	 * enabled.
+	 */
+	if (status == SSH2_FX_OK)
+		sftp_conn_verify_park(conn, local_path, remote_path,
+		    /*local_is_target=*/1);
+
 	return status == SSH2_FX_OK ? 0 : -1;
 }
 
@@ -3018,6 +3029,17 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 		status = -1;
 
 	free(handle);
+
+	/*
+	 * Park for the post-transfer verify phase (HPN): every uploaded file -
+	 * single-file and recursive, since upload_dir_internal funnels through
+	 * here - is verified after the command's transfers finish (closing the
+	 * classic recursive-verify gap).  Only on a clean upload; resume-skipped
+	 * files returned earlier.  No-op unless verify enabled.
+	 */
+	if (r == 0 && status == 0)
+		sftp_conn_verify_park(conn, local_path, remote_path,
+		    /*local_is_target=*/0);
 
 	return (r != 0 || status != 0) ? -1 : 0;
 }
@@ -4516,6 +4538,111 @@ sftp_conn_verify_src_take(struct sftp_conn *conn, uint64_t expect_bytes,
 	if (conn == NULL || conn->hpn == NULL)
 		return -1;
 	return sftp_hpn_src_take(conn->hpn, expect_bytes, hash_out);
+}
+
+/*
+ * Park a just-transferred file for the classic post-transfer verify phase.
+ * Called at the end of sftp_upload (local_is_target=0) and sftp_download
+ * (local_is_target=1).  No-op unless integrity verify is enabled, and skipped
+ * on parallel worker conns - the orchestrator's verify phase handles those
+ * (live_counter is the per-worker hook, NULL on the main conn).  Records paths
+ * only; the hash compare happens later in sftp_conn_verify_run_phase, mirroring
+ * the -j upload-everything-then-verify model instead of stalling each file on a
+ * synchronous round-trip.
+ */
+void
+sftp_conn_verify_park(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, int local_is_target)
+{
+	struct sftp_verify_pending_entry *e;
+
+	if (!sftp_conn_verify_transfer_enabled(conn))
+		return;
+	if (conn->hpn->live_counter != NULL)
+		return;
+	if (conn->hpn->verify_pending_count >= conn->hpn->verify_pending_cap) {
+		size_t newcap = conn->hpn->verify_pending_cap ?
+		    conn->hpn->verify_pending_cap * 2 : 64;
+		conn->hpn->verify_pending = xreallocarray(
+		    conn->hpn->verify_pending, newcap,
+		    sizeof(*conn->hpn->verify_pending));
+		conn->hpn->verify_pending_cap = newcap;
+	}
+	e = &conn->hpn->verify_pending[conn->hpn->verify_pending_count++];
+	e->local_path = xstrdup(local_path);
+	e->remote_path = xstrdup(remote_path);
+	e->local_is_target = local_is_target;
+}
+
+/*
+ * Classic post-transfer verify phase: verify every file parked during the
+ * command's transfers, then clear the list.  The single-conn analogue of the
+ * -j orchestrator's verify phase - same sftp_hpn_verify_transfer core, same
+ * trust_inline_src=0 source re-read (the inline tee cannot span a deferred
+ * phase).  Mismatches are recorded on the conn (drained later to the run
+ * summary + SFTP_EX_VERIFY_FAILED); they do not fail the transfer.  No-op when
+ * nothing was parked (parallel mode, or verify disabled).
+ */
+void
+sftp_conn_verify_run_phase(struct sftp_conn *conn)
+{
+	size_t i;
+
+	if (conn == NULL || conn->hpn == NULL)
+		return;
+	for (i = 0; i < conn->hpn->verify_pending_count; i++) {
+		struct sftp_verify_pending_entry *e =
+		    &conn->hpn->verify_pending[i];
+		int r = sftp_hpn_verify_transfer(conn, e->local_path,
+		    e->remote_path, e->local_is_target, /*trust_inline_src=*/0);
+		if (r == 1) {
+			error("VERIFY FAILED: \"%s\" (post-transfer hash "
+			    "mismatch - the transferred file does NOT match the "
+			    "source)", e->remote_path);
+			conn->hpn->verify_failed_paths = xreallocarray(
+			    conn->hpn->verify_failed_paths,
+			    conn->hpn->verify_failed_count + 1,
+			    sizeof(*conn->hpn->verify_failed_paths));
+			conn->hpn->verify_failed_paths[
+			    conn->hpn->verify_failed_count++] =
+			    xstrdup(e->remote_path);
+		} else if (r < 0) {
+			logit("VERIFY SKIPPED: \"%s\": could not verify (server "
+			    "lacks hpn-check-file@hpnssh.org or read error)",
+			    e->remote_path);
+		}
+		free(e->local_path);
+		free(e->remote_path);
+	}
+	conn->hpn->verify_pending_count = 0;
+}
+
+/*
+ * Hand the classic-path verify failures to the caller; ownership of the array
+ * and the strings transfers out and the conn's list resets to empty.  Mirrors
+ * sftp_parallel_drain_verify_failures so sftp.c folds classic and parallel
+ * mismatches into one summary + exit code.  Returns the count.
+ */
+size_t
+sftp_conn_drain_verify_failures(struct sftp_conn *conn, char ***out_paths,
+    size_t *out_used)
+{
+	size_t n = 0;
+
+	if (out_paths != NULL)
+		*out_paths = NULL;
+	if (out_used != NULL)
+		*out_used = 0;
+	if (conn == NULL || conn->hpn == NULL)
+		return 0;
+	n = conn->hpn->verify_failed_count;
+	if (out_paths != NULL)
+		*out_paths = conn->hpn->verify_failed_paths;
+	if (out_used != NULL)
+		*out_used = n;
+	conn->hpn->verify_failed_paths = NULL;
+	conn->hpn->verify_failed_count = 0;
+	return n;
 }
 
 uint64_t
