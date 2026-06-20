@@ -240,6 +240,10 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	if (u->op == SFTP_OP_VERIFY) {
 		parallel_verify_and_free(w, u->verify_tracker);
 		u->verify_tracker = NULL;
+		/* Drive the verify-phase meter: count completed verifies (the
+		 * submit interleaves with draining, so pending is ambiguous). */
+		__atomic_fetch_add(&w->parent->verify_done_units, 1,
+		    __ATOMIC_RELAXED);
 		return 0;
 	}
 
@@ -698,9 +702,9 @@ worker_run_bundle(struct sftp_worker *w,
 		worker_record_start(w);
 	}
 
-	/* Phase-5 instrumentation: per-bundle wall time.  Always-on; one
-	 * stderr line per bundle.  Format chosen so the harness can grep
-	 * "BUNDLE worker=" and parse the key=value fields. */
+	/* Phase-5 instrumentation: per-bundle wall time.  Logged at debug level
+	 * (-v) - one stderr line per bundle; format chosen so the harness can
+	 * grep "BUNDLE worker=" and parse the key=value fields. */
 	t_start_ns = monotime_ns();
 
 	/* dest_dir = "" - each remote_path is treated as an absolute path
@@ -714,16 +718,24 @@ worker_run_bundle(struct sftp_worker *w,
 
 	t_end_ns = monotime_ns();
 	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
+	off_t wired_data = 0;
 	for (i = 0; i < bn; i++)
-		if (entries[i].result == 0)
+		if (entries[i].result == 0) {
 			ok_count++;
+			wired_data += batch[i]->size;
+		}
+	/* Count member DATA (not the tar-framed wire stream) for the run
+	 * summary, so it reflects what the user moved - not the bundling wire
+	 * overhead - and is not mislabeled "skipped via resume".  Only the ok
+	 * members; failed ones re-transfer and are counted on that path. */
+	sftp_conn_bytes_wired_add(w->conn, (uint64_t)wired_data);
 	{
 		double mibps = 0.0;
 		if (elapsed_us > 0)
 			mibps = ((double)total_bytes /
 			    (1024.0 * 1024.0)) /
 			    ((double)elapsed_us / 1e6);
-		logit("BUNDLE worker=%d files=%d ok=%d bytes=%llu "
+		debug("BUNDLE worker=%d files=%d ok=%d bytes=%llu "
 		    "elapsed_us=%llu MiBps=%.2f",
 		    w->id, bn, ok_count,
 		    (unsigned long long)total_bytes,
@@ -790,9 +802,17 @@ worker_run_bundle_download(struct sftp_worker *w,
 	    p->cfg.preserve_flag);
 	t_end_ns = monotime_ns();
 	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
+	off_t wired_data = 0;
 	for (i = 0; i < bn; i++)
-		if (entries[i].result == 0)
+		if (entries[i].result == 0) {
 			ok_count++;
+			wired_data += batch[i]->size;
+		}
+	/* Count member DATA (not the tar-framed wire stream) for the run
+	 * summary, so it reflects what the user moved - not the bundling wire
+	 * overhead - and is not mislabeled "skipped via resume".  Only the ok
+	 * members; failed ones re-transfer and are counted on that path. */
+	sftp_conn_bytes_wired_add(w->conn, (uint64_t)wired_data);
 	{
 		double mibps = 0.0;
 		if (elapsed_us > 0)

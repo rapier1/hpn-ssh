@@ -371,6 +371,10 @@ int sftp_conn_has_hpn_check_file(struct sftp_conn *conn);
  */
 void sftp_conn_verify_run_phase(struct sftp_conn *conn);
 
+/* Number of files parked for the classic verify phase (0 in parallel mode or
+ * with verify off).  Used to gate the "Verifying N file(s)..." start line. */
+size_t sftp_conn_verify_pending_count(struct sftp_conn *conn);
+
 /*
  * Drain the classic (single-conn) post-transfer verify failures recorded by
  * the verify phase.  Ownership of *out_paths and its strings transfers to the

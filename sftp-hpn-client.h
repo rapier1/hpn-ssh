@@ -73,6 +73,7 @@ struct sftp_rdahead {
 struct sftp_verify_pending_entry {
 	char *local_path;
 	char *remote_path;
+	off_t size;			/* bytes; sized at phase start for the meter */
 	int   local_is_target;		/* 0 = upload, 1 = download */
 };
 

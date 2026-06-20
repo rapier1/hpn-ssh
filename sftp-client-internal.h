@@ -163,4 +163,11 @@ void sftp_conn_set_layout_set_declined(struct sftp_conn *conn, int v);
  */
 uint64_t sftp_conn_bytes_wired(struct sftp_conn *conn);
 
+/*
+ * Add to the wire-payload counter from outside sftp-client.c (the bundle send
+ * path, which bypasses the per-file write loops).  Safe with conn/conn->hpn
+ * NULL; atomic, callable from any thread.
+ */
+void sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n);
+
 #endif /* _SFTP_CLIENT_INTERNAL_H */

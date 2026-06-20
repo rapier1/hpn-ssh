@@ -4587,34 +4587,74 @@ void
 sftp_conn_verify_run_phase(struct sftp_conn *conn)
 {
 	size_t i;
+	off_t total = 0, counter = 0;
+	int meter_on = 0;
+	struct stat sb;
 
-	if (conn == NULL || conn->hpn == NULL)
+	if (conn == NULL || conn->hpn == NULL ||
+	    conn->hpn->verify_pending_count == 0)
 		return;
+	/* Size each parked file for the progress-meter total (stat is cheap;
+	 * the per-file verify re-stats anyway).  The byte-based meter mirrors
+	 * the transfer meter - bar, rate, ETA - so the user sees the verify
+	 * phase is working, not hung.  Gated on showprogress, same as transfers
+	 * (off under -q / batch / non-tty). */
+	for (i = 0; i < conn->hpn->verify_pending_count; i++) {
+		if (stat(conn->hpn->verify_pending[i].local_path, &sb) == 0)
+			conn->hpn->verify_pending[i].size = sb.st_size;
+		total += conn->hpn->verify_pending[i].size;
+	}
+	if (showprogress && total > 0) {
+		start_progress_meter("verify", total, &counter);
+		meter_on = 1;
+	}
 	for (i = 0; i < conn->hpn->verify_pending_count; i++) {
 		struct sftp_verify_pending_entry *e =
 		    &conn->hpn->verify_pending[i];
-		int r = sftp_hpn_verify_transfer(conn, e->local_path,
-		    e->remote_path, e->local_is_target, /*trust_inline_src=*/0);
-		if (r == 1) {
-			error("VERIFY FAILED: \"%s\" (post-transfer hash "
-			    "mismatch - the transferred file does NOT match the "
-			    "source)", e->remote_path);
-			conn->hpn->verify_failed_paths = xreallocarray(
-			    conn->hpn->verify_failed_paths,
-			    conn->hpn->verify_failed_count + 1,
-			    sizeof(*conn->hpn->verify_failed_paths));
-			conn->hpn->verify_failed_paths[
-			    conn->hpn->verify_failed_count++] =
-			    xstrdup(e->remote_path);
-		} else if (r < 0) {
-			logit("VERIFY SKIPPED: \"%s\": could not verify (server "
-			    "lacks hpn-check-file@hpnssh.org or read error)",
-			    e->remote_path);
+		/*
+		 * SIGINT aborts the phase, like the transfer loops: stop
+		 * verifying on interrupt but keep ripping through the rest of the
+		 * list to free it (no network, fast), so nothing leaks and the
+		 * interrupt unwinds promptly to the prompt / exit.
+		 */
+		if (!interrupted) {
+			int r = sftp_hpn_verify_transfer(conn, e->local_path,
+			    e->remote_path, e->local_is_target,
+			    /*trust_inline_src=*/0);
+			if (r == 1) {
+				error("VERIFY FAILED: \"%s\" (post-transfer hash "
+				    "mismatch - the transferred file does NOT "
+				    "match the source)", e->remote_path);
+				conn->hpn->verify_failed_paths = xreallocarray(
+				    conn->hpn->verify_failed_paths,
+				    conn->hpn->verify_failed_count + 1,
+				    sizeof(*conn->hpn->verify_failed_paths));
+				conn->hpn->verify_failed_paths[
+				    conn->hpn->verify_failed_count++] =
+				    xstrdup(e->remote_path);
+			} else if (r < 0) {
+				logit("VERIFY SKIPPED: \"%s\": could not verify "
+				    "(server lacks hpn-check-file@hpnssh.org or "
+				    "read error)", e->remote_path);
+			}
+			counter += e->size;
 		}
 		free(e->local_path);
 		free(e->remote_path);
 	}
+	if (meter_on)
+		stop_progress_meter();
 	conn->hpn->verify_pending_count = 0;
+}
+
+/* Files parked for the classic verify phase; lets the caller print a quiet-
+ * gated "Verifying N file(s)..." line before sftp_conn_verify_run_phase. */
+size_t
+sftp_conn_verify_pending_count(struct sftp_conn *conn)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return 0;
+	return conn->hpn->verify_pending_count;
 }
 
 /*
@@ -4652,6 +4692,19 @@ sftp_conn_bytes_wired(struct sftp_conn *conn)
 		return 0;
 	return __atomic_load_n(&conn->hpn->bytes_wired_payload,
 	    __ATOMIC_RELAXED);
+}
+
+/*
+ * Conn-level bridge so callers outside sftp-client.c (the bundle module) can
+ * count wire payload the per-file write loops already count via
+ * sftp_hpn_bytes_wired_add - without it, bundle-moved bytes never register as
+ * "wired" and the end-of-run summary mislabels them as "skipped via resume".
+ */
+void
+sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n)
+{
+	if (conn != NULL && conn->hpn != NULL)
+		sftp_hpn_bytes_wired_add(conn->hpn, n);
 }
 
 void

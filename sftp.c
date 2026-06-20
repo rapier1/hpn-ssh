@@ -743,6 +743,11 @@ local_is_dir(const char *path)
  * sftp exit code: silent data loss is unacceptable.  When parallel_orch
  * is NULL (parallel mode off) the function is a no-op returning 0.
  */
+/* Cumulative bytes already reflected in an emitted summary line.  parallel_flush
+ * runs both per-command and again at the end-of-batch drain; tracking this lets
+ * a single command print exactly one summary instead of two. */
+static uint64_t parallel_summary_last_total;
+
 static int
 parallel_flush(void)
 {
@@ -764,8 +769,13 @@ parallel_flush(void)
 	 * observed knee-of-the-curve for too many parallel streams on a
 	 * saturated path.  Emitted BEFORE any TRANSFER INCOMPLETE block
 	 * so the signal isn't buried under a long failed-paths list. */
-	if (pstats.elapsed_ms > 0 && pstats.bytes_total_aggregate > 0) {
+	if (pstats.elapsed_ms > 0 && pstats.bytes_total_aggregate > 0 &&
+	    pstats.bytes_total_aggregate != parallel_summary_last_total) {
 		double secs   = pstats.elapsed_ms / 1000.0;
+
+		/* Mark this cumulative total as summarized so the redundant
+		 * end-of-batch flush (or any later no-op flush) stays silent. */
+		parallel_summary_last_total = pstats.bytes_total_aggregate;
 		double wired  = (double)pstats.bytes_wired_aggregate;
 		/*
 		 * Primary number is bytes actually transferred (wired) and
@@ -1332,6 +1342,12 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 	 * -j orchestrator's verify phase.  No-op in parallel mode (the workers
 	 * verify via the orchestrator) and when verify is off.
 	 */
+	if (!quiet) {
+		size_t vn = sftp_conn_verify_pending_count(conn);
+		if (vn > 0)
+			mprintf("Verifying %llu file(s)...\n",
+			    (unsigned long long)vn);
+	}
 	sftp_conn_verify_run_phase(conn);
 
 	/*
@@ -1518,6 +1534,12 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 	 * -j orchestrator's verify phase.  No-op in parallel mode (the workers
 	 * verify via the orchestrator) and when verify is off.
 	 */
+	if (!quiet) {
+		size_t vn = sftp_conn_verify_pending_count(conn);
+		if (vn > 0)
+			mprintf("Verifying %llu file(s)...\n",
+			    (unsigned long long)vn);
+	}
 	sftp_conn_verify_run_phase(conn);
 
 	/* See process_get - deferred mode skips the per-command drain so

@@ -59,6 +59,7 @@
 #include "hpn-exit-codes.h"
 
 extern int showprogress;
+extern int quiet;		/* sftp.c; hpnsftp-only - scp does not link this module */
 
 /* Work-queue depth is computed by work_queue_depth() below (defined after the
  * bundle constants it depends on), NOT a fixed macro: bundle mode needs a much
@@ -514,11 +515,52 @@ sftp_parallel_wait(struct sftp_parallel *p)
 	 * workers verify them in parallel on their own conns - off the transfer
 	 * path - then wait for those units to drain before returning. */
 	if (!p->abort_flag) {
-		parallel_verify_phase_submit(p);
+		int vn = p->verify_pending_n;	/* peek before submit drains it */
+
+		if (vn > 0) {
+			/*
+			 * Verify-phase UX (HPN): set up the meter BEFORE the
+			 * submit, because parallel_verify_phase_submit blocks (the
+			 * verify units exceed the queue depth, so it interleaves
+			 * submitting with draining) and is most of the phase - put
+			 * it after, and the meter only covers the tail while the
+			 * frozen-100% transfer bar sits there looking hung.  Stop
+			 * that bar, announce the phase, and start a verify-labelled
+			 * meter sized to the bytes just moved (= bytes to verify);
+			 * the reporter advances it from verify_done_units (a
+			 * worker-bumped count - pending is ambiguous mid-submit).
+			 * Gated like the transfer meter (saved_showprogress) and
+			 * line (quiet).
+			 */
+			uint64_t moved = 0;
+			off_t vtotal;
+
+			parallel_stats_snapshot(p, &moved, NULL, NULL);
+			vtotal = (moved > p->progress_bytes_baseline)
+			    ? (off_t)(moved - p->progress_bytes_baseline) : 0;
+			if (p->progress_meter_started)
+				sftp_parallel_progress_stop(p);
+			if (!quiet)
+				mprintf("Verifying %d file(s)...\n", vn);
+			if (p->saved_showprogress && vtotal > 0) {
+				p->verify_total_units = (uint64_t)vn;
+				p->verify_done_units = 0;
+				p->verify_meter_total = vtotal;
+				p->aggregate_progress_counter = 0;
+				strlcpy(p->progress_label, "verify",
+				    sizeof(p->progress_label));
+				start_progress_meter(p->progress_label, vtotal,
+				    &p->aggregate_progress_counter);
+				p->progress_meter_started = 1;
+				p->verify_phase_active = 1;
+			}
+		}
+		(void)parallel_verify_phase_submit(p);
 		pthread_mutex_lock(&p->pending_mu);
 		while (p->pending > 0 && !p->abort_flag)
 			pthread_cond_wait(&p->pending_cv, &p->pending_mu);
 		pthread_mutex_unlock(&p->pending_mu);
+		p->verify_phase_active = 0;
 	}
 }
 

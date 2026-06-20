@@ -934,8 +934,23 @@ parallel_reporter_thread(void *arg)
 		uint64_t bytes;
 		parallel_stats_snapshot(p, &bytes, NULL, NULL);
 		p->aggregate_bytes_for_meter = bytes;
-		p->aggregate_progress_counter =
-		    (off_t)(bytes - p->progress_bytes_baseline);
+		if (p->verify_phase_active && p->verify_total_units > 0) {
+			/* Post-transfer verify phase: drive the meter from the
+			 * worker-bumped completed-verify count, not the transfer
+			 * snapshot.  pending is ambiguous while the phase submit is
+			 * still interleaving with draining, so verify_done_units is
+			 * the only clean signal. */
+			uint64_t done = __atomic_load_n(&p->verify_done_units,
+			    __ATOMIC_RELAXED);
+			if (done > p->verify_total_units)
+				done = p->verify_total_units;
+			p->aggregate_progress_counter = (off_t)(
+			    (double)p->verify_meter_total * (double)done /
+			    (double)p->verify_total_units);
+		} else {
+			p->aggregate_progress_counter =
+			    (off_t)(bytes - p->progress_bytes_baseline);
+		}
 		if (p->progress_meter_started)
 			refresh_progress_meter(0);
 

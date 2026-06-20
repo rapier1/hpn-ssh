@@ -1382,6 +1382,16 @@ struct sftp_parallel {
 	char                        progress_label[128];        /* stable storage
 								   * for the meter
 								   * label string */
+	/* Post-transfer verify-phase meter (HPN).  When active, the reporter
+	 * drives aggregate_progress_counter from the verify pending count rather
+	 * than the transfer-byte snapshot, so the meter shows verify progress
+	 * (and not a frozen 100% transfer bar) for the duration of the phase.
+	 * verify_meter_total is the bytes transferred this command (= bytes to
+	 * verify); verify_total_units is the SFTP_OP_VERIFY unit count. */
+	int                         verify_phase_active;
+	uint64_t                    verify_total_units;
+	uint64_t                    verify_done_units;   /* atomic; worker-bumped */
+	off_t                       verify_meter_total;
 
 	int                         started;
 	int                         stopped;
@@ -1537,7 +1547,7 @@ void	 parallel_verify_park(struct sftp_parallel *,
 	    struct sftp_range_tracker *);
 void	 parallel_verify_park_whole_file(struct sftp_parallel *,
 	    const char *local_path, const char *remote_path, int local_is_target);
-void	 parallel_verify_phase_submit(struct sftp_parallel *);
+int	 parallel_verify_phase_submit(struct sftp_parallel *);
 
 /* sftp-parallel-respawn.c - spawn/respawn lifecycle */
 void	 parallel_respawn_teardown_ssh(struct sftp_worker *);

@@ -428,7 +428,7 @@ parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
  * a submit the queue rejects (abort/shutdown) frees it via parallel_unit_free
  * (it owns the tracker through u->verify_tracker).
  */
-void
+int
 parallel_verify_phase_submit(struct sftp_parallel *p)
 {
 	struct sftp_range_tracker **arr;
@@ -454,6 +454,7 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
 		(void)parallel_unit_submit(p, u);
 	}
 	free(arr);
+	return n;
 }
 
 /*
