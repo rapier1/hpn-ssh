@@ -956,6 +956,19 @@ parallel_reporter_thread(void *arg)
 			 * replacements. */
 			(void)parallel_watchdog_check(p);
 
+			/* SIGTERM any respawn wedged in its handshake past the
+			 * stall deadline.  The blocked spawn thread cannot time
+			 * itself out, so the reporter does it: otherwise the
+			 * stalled respawn pins pending_respawns and deadlocks the
+			 * abort net (fatal at -j1). */
+			parallel_respawn_sweep_stalled(p);
+
+			/* Move any worker re-queue overflow back into p->q as it
+			 * frees up.  Workers park here (instead of blocking) when
+			 * a re-queue hits a full queue; draining from the reporter
+			 * is what keeps that non-blocking path live. */
+			parallel_retry_overflow_drain(p);
+
 			/* Track synchronous stalls (all workers at zero bytes
 			 * while work is in flight) as a leading indicator of
 			 * write-cache saturation from too many parallel writers.

@@ -52,6 +52,17 @@ int sftp_workqueue_push(struct sftp_workqueue *q, void *item);
 int sftp_workqueue_push_front(struct sftp_workqueue *q, void *item);
 
 /*
+ * Non-blocking variants of push / push_front: never wait on a full queue.
+ * Return 0 if the item was queued, 1 if the queue is full (item NOT queued),
+ * -1 if the queue is shut down.  A worker re-queueing units onto the same
+ * queue it also drains must use these: a blocking push there can self-deadlock
+ * (the blocked worker stops consuming, so nothing ever drains the queue) -
+ * fatal at -j1, where that worker is the only consumer.
+ */
+int sftp_workqueue_trypush(struct sftp_workqueue *q, void *item);
+int sftp_workqueue_trypush_front(struct sftp_workqueue *q, void *item);
+
+/*
  * Pop an item. Blocks if the queue is empty. On success sets *itemp and
  * returns 0. Returns -1 if shutdown was signaled and the queue is empty
  * (drains residual items before returning -1).

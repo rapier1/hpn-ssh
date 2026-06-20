@@ -512,10 +512,11 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 				    yielded ? "wpr/yield" :
 				    transient ? "wpr/transient" : "wpr/retry");
 			/* Yields jump the queue like transients: the parked
-			 * READY fleet should pick the remainder up NOW. */
-			if (((transient || yielded)
-			    ? sftp_workqueue_push_front(p->q, u)
-			    : sftp_workqueue_push(p->q, u)) != 0)
+			 * READY fleet should pick the remainder up NOW.  Non-
+			 * blocking: a worker must never block on a full queue it
+			 * also drains (self-deadlock, fatal at -j1). */
+			if (parallel_worker_requeue(p, u,
+			    transient || yielded) != 0)
 				worker_give_up_pushfail(p, w, u, "wpr/pushfail");
 			else if (yielded)
 				sftp_workqueue_kick(p->q);
@@ -567,9 +568,11 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 		if (parallel_unit_pending_trace_on())
 			parallel_unit_pending_trace("REQUEUE", p, u, w->id,
 			    transient ? "batch/transient" : "batch/retry");
-		if ((transient
-		    ? sftp_workqueue_push_front(p->q, u)
-		    : sftp_workqueue_push(p->q, u)) != 0)
+		/* Non-blocking: a failed bundle re-queues all its members here,
+		 * and a blocking push on a full queue the sole consumer also
+		 * drains is the -j1 self-deadlock this whole path exists to
+		 * avoid. */
+		if (parallel_worker_requeue(p, u, transient) != 0)
 			worker_give_up_pushfail(p, w, u, "batch/pushfail");
 		return;
 	}
@@ -1270,7 +1273,7 @@ parallel_worker_thread(void *arg)
 		 */
 		if (u0->yield_from == w->id + 1) {
 			u0->yield_from = 0;
-			if (sftp_workqueue_push_front(p->q, u0) != 0) {
+			if (parallel_worker_requeue(p, u0, /*front=*/1) != 0) {
 				worker_give_up_pushfail(p, w, u0,
 				    "yield/pushfail");
 				__atomic_store_n(&w->unit_start_ns, 0,
@@ -1318,7 +1321,7 @@ parallel_worker_thread(void *arg)
 			 * bookkeeping (pending, queued_bytes, tracker
 			 * finalize, free) - silently dropping it stranded
 			 * the tracker and leaked the unit. */
-			if (sftp_workqueue_push(p->q, u0) != 0)
+			if (parallel_worker_requeue(p, u0, /*front=*/0) != 0)
 				worker_give_up_pushfail(p, w, u0,
 				    "capgate/pushfail");
 			__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
@@ -1571,11 +1574,12 @@ parallel_worker_thread(void *arg)
 						    &p->queued_bytes,
 						    (uint64_t)leftover->size,
 						    __ATOMIC_RELAXED);
-					/* Queue shut down under us: full
-					 * give-up bookkeeping, not a silent
-					 * drop (see the cap-gate site). */
-					if (sftp_workqueue_push(p->q,
-					    leftover) != 0)
+					/* Non-blocking re-queue; a give-up here
+					 * means the queue shut down under us:
+					 * full bookkeeping, not a silent drop
+					 * (see the cap-gate site). */
+					if (parallel_worker_requeue(p,
+					    leftover, /*front=*/0) != 0)
 						worker_give_up_pushfail(p, w,
 						    leftover,
 						    "leftover/pushfail");

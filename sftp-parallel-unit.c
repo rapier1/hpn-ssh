@@ -729,6 +729,108 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 }
 
 /*
+ * Worker-context re-queue (non-blocking).  A worker that blocks on a full p->q
+ * it also drains can self-deadlock (fatal at -j1).  Try the queue; on full,
+ * park the unit on the retry-overflow list (existing allocation, FIFO,
+ * reporter-drained).  pending/queued_bytes are unchanged - the unit stays
+ * pending wherever it sits, so callers must NOT re-account here.
+ */
+int
+parallel_worker_requeue(struct sftp_parallel *p, struct sftp_work_unit *u,
+    int front)
+{
+	int rc = front ? sftp_workqueue_trypush_front(p->q, u)
+	               : sftp_workqueue_trypush(p->q, u);
+	if (rc == 0)
+		return 0;	/* placed on the queue */
+	if (rc < 0)
+		return -1;	/* queue shut down -> caller gives up */
+
+	/* rc > 0: queue full.  Park on the overflow list; never block. */
+	pthread_mutex_lock(&p->retry_overflow_mu);
+	u->overflow_next = NULL;
+	u->overflow_front = front;
+	if (p->retry_overflow_tail != NULL)
+		p->retry_overflow_tail->overflow_next = u;
+	else
+		p->retry_overflow_head = u;
+	p->retry_overflow_tail = u;
+	size_t depth = ++p->retry_overflow_n;
+	pthread_mutex_unlock(&p->retry_overflow_mu);
+	debug2_ft("re-queue overflow: p->q full, parked unit (depth=%zu)", depth);
+	return 0;
+}
+
+/*
+ * Reporter-context: move overflow-parked units back into p->q while it has
+ * room.  Each re-enters via its original front/tail intent (a worker blocked
+ * in pop wakes on trypush's not_empty signal).  Stops at the first unit that
+ * won't fit (queue full again) or on shutdown, re-parking it at the head so
+ * FIFO order and the pending invariant hold.
+ */
+void
+parallel_retry_overflow_drain(struct sftp_parallel *p)
+{
+	for (;;) {
+		pthread_mutex_lock(&p->retry_overflow_mu);
+		struct sftp_work_unit *u = p->retry_overflow_head;
+		if (u == NULL) {
+			pthread_mutex_unlock(&p->retry_overflow_mu);
+			return;
+		}
+		p->retry_overflow_head = u->overflow_next;
+		if (p->retry_overflow_head == NULL)
+			p->retry_overflow_tail = NULL;
+		p->retry_overflow_n--;
+		pthread_mutex_unlock(&p->retry_overflow_mu);
+
+		int front = u->overflow_front;
+		u->overflow_next = NULL;
+		u->overflow_front = 0;
+		int rc = front ? sftp_workqueue_trypush_front(p->q, u)
+		               : sftp_workqueue_trypush(p->q, u);
+		if (rc == 0)
+			continue;	/* placed; try the next parked unit */
+
+		/* Full again or shut down: re-park at the head and stop. */
+		pthread_mutex_lock(&p->retry_overflow_mu);
+		u->overflow_front = front;
+		u->overflow_next = p->retry_overflow_head;
+		p->retry_overflow_head = u;
+		if (p->retry_overflow_tail == NULL)
+			p->retry_overflow_tail = u;
+		p->retry_overflow_n++;
+		pthread_mutex_unlock(&p->retry_overflow_mu);
+		return;
+	}
+}
+
+/*
+ * Stop/abort cleanup: free any units still parked on the overflow list.  Run
+ * after the workers and reporter have joined (no concurrent access).  These
+ * units never reached a worker, so freeing mirrors a drained queue item.
+ */
+void
+parallel_retry_overflow_free(struct sftp_parallel *p)
+{
+	struct sftp_work_unit *u, *next;
+
+	pthread_mutex_lock(&p->retry_overflow_mu);
+	u = p->retry_overflow_head;
+	p->retry_overflow_head = NULL;
+	p->retry_overflow_tail = NULL;
+	p->retry_overflow_n = 0;
+	pthread_mutex_unlock(&p->retry_overflow_mu);
+
+	while (u != NULL) {
+		next = u->overflow_next;
+		u->overflow_next = NULL;
+		parallel_unit_free(u);
+		u = next;
+	}
+}
+
+/*
  * Whole-file submit for a resumed and/or verified transfer.  resume/verify
  * disable speculative range-splitting: range-split resume is the deferred
  * sparse-hole case, so the file goes as one unit where sftp_upload/

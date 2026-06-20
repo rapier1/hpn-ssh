@@ -208,8 +208,10 @@ static void
 spawning_pid_register(struct sftp_parallel *p, pid_t pid)
 {
 	pthread_mutex_lock(&p->workers_mu);
-	if (p->n_spawning < SFTP_PARALLEL_MAX_WORKERS)
+	if (p->n_spawning < SFTP_PARALLEL_MAX_WORKERS) {
+		p->spawning_since[p->n_spawning] = monotime();
 		p->spawning_pids[p->n_spawning++] = pid;
+	}
 	pthread_mutex_unlock(&p->workers_mu);
 }
 
@@ -221,8 +223,44 @@ spawning_pid_deregister(struct sftp_parallel *p, pid_t pid)
 		if (p->spawning_pids[i] == pid) {
 			p->spawning_pids[i] =
 			    p->spawning_pids[--p->n_spawning];
+			p->spawning_since[i] = p->spawning_since[p->n_spawning];
 			break;
 		}
+	}
+	pthread_mutex_unlock(&p->workers_mu);
+}
+
+/* A respawn whose connect+handshake has not completed in this many seconds is
+ * wedged.  ConnectTimeout bounds only the TCP connect, not the post-connect
+ * kex/auth, so a server that accepts the socket then stalls the handshake
+ * blocks spawn_one_worker in sftp_init indefinitely - pinning pending_respawns
+ * above 0, which suppresses the dead-end abort net and deadlocks the transfer
+ * (fatal at -j1).  Generous: a healthy spawn finishes in well under a second
+ * even with PQ kex, and a false SIGTERM merely costs one retried respawn. */
+#define HPN_RESPAWN_STALL_SEC 30
+
+/* SIGTERM any in-flight spawn stalled past HPN_RESPAWN_STALL_SEC: the child's
+ * exit fails sftp_init on the pipe EOF, which deregisters the pid and resolves
+ * the respawn (pending_respawns--), letting the normal reap/retry/abort
+ * recovery proceed.  Called every reporter tick (the blocked spawn thread
+ * cannot time itself out). */
+void
+parallel_respawn_sweep_stalled(struct sftp_parallel *p)
+{
+	time_t now = monotime();
+
+	pthread_mutex_lock(&p->workers_mu);
+	for (int i = 0; i < p->n_spawning; i++) {
+		if (p->spawning_pids[i] <= 0 ||
+		    now - p->spawning_since[i] < HPN_RESPAWN_STALL_SEC)
+			continue;
+		debug2_ft("respawn pid %ld stalled %lds in handshake; SIGTERM to "
+		    "free the respawn slot", (long)p->spawning_pids[i],
+		    (long)(now - p->spawning_since[i]));
+		(void)kill(p->spawning_pids[i], SIGTERM);
+		/* Re-arm so we don't SIGTERM-storm before the spawn thread
+		 * deregisters on the EOF; the child dies in milliseconds. */
+		p->spawning_since[i] = now;
 	}
 	pthread_mutex_unlock(&p->workers_mu);
 }

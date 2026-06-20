@@ -360,6 +360,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_mutex_init(&p->workers_mu, NULL);
 	pthread_mutex_init(&p->bundle_mu, NULL);
 	pthread_mutex_init(&p->verify_pending_mu, NULL);
+	pthread_mutex_init(&p->retry_overflow_mu, NULL);
 
 	p->session_start_ns = monotime_ns();
 
@@ -780,7 +781,12 @@ sftp_parallel_stop(struct sftp_parallel *p)
 		free(p->verify_pending);
 		p->verify_pending = NULL;
 	}
+	/* Worker re-queue overflow: units parked here when a worker hit a full
+	 * queue, never drained back (abort/shutdown before the reporter moved
+	 * them).  Threads have joined by now, so free without locking concerns. */
+	parallel_retry_overflow_free(p);
 	pthread_mutex_destroy(&p->verify_pending_mu);
+	pthread_mutex_destroy(&p->retry_overflow_mu);
 	pthread_mutex_destroy(&p->bundle_mu);
 	pthread_mutex_destroy(&p->pending_mu);
 	pthread_cond_destroy(&p->pending_cv);

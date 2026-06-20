@@ -812,6 +812,13 @@ struct sftp_work_unit {
 	 * NULLs this.  parallel_unit_free frees it if still set - i.e. the unit
 	 * was dropped before any worker ran it (abort / queue shutdown). */
 	struct sftp_range_tracker *verify_tracker;
+	/* Retry-overflow list link (sftp-parallel.c retry_overflow_*).  A worker
+	 * re-queue that finds p->q full parks the unit here instead of blocking
+	 * (self-deadlock); the reporter drains it back into p->q as space frees.
+	 * overflow_front preserves the unit's push_front (head) vs push (tail)
+	 * intent across the parking.  Both 0 when the unit is not parked. */
+	struct sftp_work_unit  *overflow_next;
+	int                     overflow_front;
 };
 
 struct sftp_worker {
@@ -1246,6 +1253,21 @@ struct sftp_parallel {
 	uint64_t                    pending;
 
 	/*
+	 * Worker re-queue overflow list (FIFO of already-allocated units).  When
+	 * a worker re-queue finds p->q full it parks the unit here instead of
+	 * blocking on the queue it is itself draining (self-deadlock; fatal at
+	 * -j1).  The reporter drains this back into p->q via trypush as space
+	 * frees.  Costs no new allocation (these are existing pending units, so
+	 * bounded by in-flight work) and is decoupled from pending: parked units
+	 * stay counted in p->pending, so sftp_parallel_wait does not complete
+	 * while any remain.  Guarded by retry_overflow_mu.
+	 */
+	pthread_mutex_t             retry_overflow_mu;
+	struct sftp_work_unit      *retry_overflow_head;
+	struct sftp_work_unit      *retry_overflow_tail;
+	size_t                      retry_overflow_n;
+
+	/*
 	 * Sum of u->size across units currently in the workqueue (waiting to
 	 * be popped - does NOT include in-flight work being processed by a
 	 * worker).  Updated atomically by submit/pop sites.  Brief overcounts
@@ -1292,6 +1314,14 @@ struct sftp_parallel {
 	 * Guarded by workers_mu. */
 	pid_t                       spawning_pids[SFTP_PARALLEL_MAX_WORKERS];
 	int                         n_spawning;
+	/* monotime() seconds when each spawning_pids[] entry registered.  The
+	 * reporter SIGTERMs a spawn stalled past HPN_RESPAWN_STALL_SEC so a
+	 * wedged handshake (server accepted the TCP but stalled kex/auth, which
+	 * ConnectTimeout does not bound) cannot pin pending_respawns above 0 and
+	 * deadlock the dead-end abort net - fatal at -j1, where the stalled
+	 * respawn is the only path to progress.  Parallel to spawning_pids[],
+	 * guarded by workers_mu. */
+	time_t                      spawning_since[SFTP_PARALLEL_MAX_WORKERS];
 
 	uint64_t                    retired_bytes;
 	/* Companions to retired_bytes: counters that previously DIED with the
@@ -1459,6 +1489,17 @@ void	 parallel_unit_pending_trace(const char *, struct sftp_parallel *,
 	    const struct sftp_work_unit *, int, const char *);
 int	 parallel_unit_pending_trace_on(void);
 int	 parallel_unit_submit(struct sftp_parallel *, struct sftp_work_unit *);
+/* Worker-context re-queue: non-blocking.  Tries p->q (front when front!=0);
+ * on a full queue parks the unit on the retry-overflow list rather than
+ * blocking.  Returns 0 if the unit was placed (queue or overflow), -1 only if
+ * the queue is shut down (caller does the give-up bookkeeping). */
+int	 parallel_worker_requeue(struct sftp_parallel *, struct sftp_work_unit *,
+	    int front);
+/* Reporter-context: move overflow-parked units back into p->q while it has
+ * room (non-blocking).  No-op when the overflow list is empty. */
+void	 parallel_retry_overflow_drain(struct sftp_parallel *);
+/* Stop/abort cleanup: free any units still parked on the overflow list. */
+void	 parallel_retry_overflow_free(struct sftp_parallel *);
 void	 parallel_unit_store_range_hash(struct sftp_range_tracker *, int index,
 	    uint64_t off, uint64_t len, uint64_t hash);
 /* Flush any partially-filled producer-side bundle (the tail); called from
@@ -1502,5 +1543,6 @@ void	 parallel_verify_phase_submit(struct sftp_parallel *);
 void	 parallel_respawn_teardown_ssh(struct sftp_worker *);
 int	 parallel_respawn_dispatch(struct sftp_parallel *, int);
 void	*parallel_respawn_spawn_thread(void *);
+void	 parallel_respawn_sweep_stalled(struct sftp_parallel *);
 
 #endif /* SFTP_PARALLEL_INTERNAL_H */

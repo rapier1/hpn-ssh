@@ -135,6 +135,56 @@ sftp_workqueue_push_front(struct sftp_workqueue *q, void *item)
 	return 0;
 }
 
+/*
+ * Non-blocking push (tail).  0 = queued, 1 = full (item NOT queued), -1 =
+ * shutdown.  Used on the worker re-queue path so a worker never blocks on a
+ * full queue it is itself the consumer of (self-deadlock; fatal at -j1).
+ */
+int
+sftp_workqueue_trypush(struct sftp_workqueue *q, void *item)
+{
+	pthread_mutex_lock(&q->mu);
+	if (q->shutdown) {
+		pthread_mutex_unlock(&q->mu);
+		return -1;
+	}
+	if (q->count == q->capacity) {
+		pthread_mutex_unlock(&q->mu);
+		return 1;
+	}
+	q->ring[q->tail] = item;
+	q->tail = (q->tail + 1) % q->capacity;
+	q->count++;
+	if (q->count > q->high_water)
+		q->high_water = q->count;
+	pthread_cond_signal(&q->not_empty);
+	pthread_mutex_unlock(&q->mu);
+	return 0;
+}
+
+/* Non-blocking push_front (head).  Same return contract as trypush. */
+int
+sftp_workqueue_trypush_front(struct sftp_workqueue *q, void *item)
+{
+	pthread_mutex_lock(&q->mu);
+	if (q->shutdown) {
+		pthread_mutex_unlock(&q->mu);
+		return -1;
+	}
+	if (q->count == q->capacity) {
+		pthread_mutex_unlock(&q->mu);
+		return 1;
+	}
+	q->head = (q->head + q->capacity - 1) % q->capacity;
+	q->ring[q->head] = item;
+	q->count++;
+	if (q->count > q->high_water)
+		q->high_water = q->count;
+	pthread_cond_signal(&q->not_empty);
+	pthread_mutex_unlock(&q->mu);
+	return 0;
+}
+
 int
 sftp_workqueue_pop(struct sftp_workqueue *q, void **itemp)
 {
