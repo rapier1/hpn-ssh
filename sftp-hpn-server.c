@@ -424,7 +424,7 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 					if (now != 0 && last_hb_sec != 0 &&
 					    (now - last_hb_sec) >=
 					    (time_t)
-					    HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
+					    HPN_HASH_HEARTBEAT_INTERVAL_SEC) {
 						send_hpn_hash_range_heartbeat(
 						    id, oqueue, hashed_total);
 						last_hb_sec = now;
@@ -524,7 +524,7 @@ hpn_check_file_hb_progress(void *arg, uint64_t done)
 	time_t now = monotime();
 
 	if (now != 0 && c->last_hb_sec != 0 &&
-	    (now - c->last_hb_sec) >= (time_t)HPN_HEARTBEAT_EMIT_INTERVAL_SEC) {
+	    (now - c->last_hb_sec) >= (time_t)HPN_HASH_HEARTBEAT_INTERVAL_SEC) {
 		send_hpn_check_file_heartbeat(c->id, done, c->oqueue);
 		c->last_hb_sec = now;
 	}

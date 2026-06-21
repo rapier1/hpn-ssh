@@ -935,18 +935,34 @@ parallel_reporter_thread(void *arg)
 		parallel_stats_snapshot(p, &bytes, NULL, NULL);
 		p->aggregate_bytes_for_meter = bytes;
 		if (p->verify_phase_active && p->verify_total_units > 0) {
-			/* Post-transfer verify phase: drive the meter from the
-			 * worker-bumped completed-verify count, not the transfer
-			 * snapshot.  pending is ambiguous while the phase submit is
-			 * still interleaving with draining, so verify_done_units is
-			 * the only clean signal. */
-			uint64_t done = __atomic_load_n(&p->verify_done_units,
-			    __ATOMIC_RELAXED);
-			if (done > p->verify_total_units)
-				done = p->verify_total_units;
-			p->aggregate_progress_counter = (off_t)(
-			    (double)p->verify_meter_total * (double)done /
-			    (double)p->verify_total_units);
+			/* Post-transfer verify phase: byte-granular meter.  Counter
+			 * = bytes of fully-verified files (verify_done_bytes) + every
+			 * worker's in-flight count for the file it is hashing right
+			 * now (fed each second by the server hash heartbeat / local
+			 * read-back).  This advances smoothly even when a single
+			 * huge file is the whole phase, instead of the old file-count
+			 * fraction that jumped 0->100% at completion.  Snap to the
+			 * exact total once all units are done so the bar lands at
+			 * 100% (the last heartbeat may trail the final bytes). */
+			uint64_t done_units = __atomic_load_n(
+			    &p->verify_done_units, __ATOMIC_RELAXED);
+			if (done_units >= p->verify_total_units) {
+				p->aggregate_progress_counter =
+				    p->verify_meter_total;
+			} else {
+				uint64_t hashed = __atomic_load_n(
+				    &p->verify_done_bytes, __ATOMIC_RELAXED);
+				for (int wi = 0; wi < p->num_workers; wi++) {
+					struct sftp_worker *w = p->workers[wi];
+					if (w != NULL && w->conn != NULL)
+						hashed +=
+						    sftp_conn_verify_inflight_get(
+						        w->conn);
+				}
+				if (hashed > (uint64_t)p->verify_meter_total)
+					hashed = (uint64_t)p->verify_meter_total;
+				p->aggregate_progress_counter = (off_t)hashed;
+			}
 		} else {
 			p->aggregate_progress_counter =
 			    (off_t)(bytes - p->progress_bytes_baseline);

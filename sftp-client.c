@@ -4707,6 +4707,31 @@ sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n)
 		sftp_hpn_bytes_wired_add(conn->hpn, n);
 }
 
+/*
+ * Per-connection "bytes hashed so far for the file this worker is currently
+ * verifying."  The verify code SETS it to the cumulative figure the server
+ * heartbeat (or the local read-back callback) reports; the orchestrator's
+ * reporter sums it across workers to drive the verify progress meter, and the
+ * worker moves it into the phase's done-bytes total at each file's completion.
+ * Atomic; safe from any thread; no-op / 0 when conn or conn->hpn is NULL.
+ */
+void
+sftp_conn_verify_inflight_set(struct sftp_conn *conn, uint64_t bytes)
+{
+	if (conn != NULL && conn->hpn != NULL)
+		__atomic_store_n(&conn->hpn->verify_inflight_bytes, bytes,
+		    __ATOMIC_RELAXED);
+}
+
+uint64_t
+sftp_conn_verify_inflight_get(struct sftp_conn *conn)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return 0;
+	return __atomic_load_n(&conn->hpn->verify_inflight_bytes,
+	    __ATOMIC_RELAXED);
+}
+
 void
 sftp_conn_set_lustre_stripe_count(struct sftp_conn *conn, int value)
 {

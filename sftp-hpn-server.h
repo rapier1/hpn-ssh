@@ -145,6 +145,17 @@
 #define HPN_HEARTBEAT_EMIT_INTERVAL_SEC	5u
 
 /*
+ * Hash-progress heartbeat cadence (HPN).  The server-side read-back hashes
+ * (sftp-hash-range and hpn-check-file) carry bytes-hashed-so-far; the client
+ * drives the verify progress meter from those.  The meter redraws every
+ * UPDATE_INTERVAL (1 s, progressmeter.c), so emit hash progress every 1 s -
+ * one fresh data point per redraw gives a smooth bar and a real rate.  This is
+ * a progress feed, not the liveness ping (HPN_HEARTBEAT_EMIT_INTERVAL_SEC),
+ * and is kept separate so non-hash heartbeat users are unaffected.
+ */
+#define HPN_HASH_HEARTBEAT_INTERVAL_SEC	1u
+
+/*
  * Heartbeats prove liveness, not progress: each one carries a u64
  * bytes-hashed-so-far figure, and a client seeing no advance for this
  * many seconds treats the connection as failed (a backend so stalled

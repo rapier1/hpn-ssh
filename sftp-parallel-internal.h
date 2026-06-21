@@ -1391,6 +1391,12 @@ struct sftp_parallel {
 	int                         verify_phase_active;
 	uint64_t                    verify_total_units;
 	uint64_t                    verify_done_units;   /* atomic; worker-bumped */
+	/* Byte-granular verify progress: bytes hashed for FULLY verified files
+	 * (atomic; a worker folds its per-conn in-flight count in at each file's
+	 * completion).  The reporter drives the meter from verify_done_bytes plus
+	 * the sum of every worker's in-flight count, so a single huge file's bar
+	 * advances every second instead of jumping 0->100% at completion. */
+	uint64_t                    verify_done_bytes;
 	off_t                       verify_meter_total;
 
 	int                         started;

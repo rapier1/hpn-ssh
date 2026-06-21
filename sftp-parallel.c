@@ -59,7 +59,6 @@
 #include "hpn-exit-codes.h"
 
 extern int showprogress;
-extern int quiet;		/* sftp.c; hpnsftp-only - scp does not link this module */
 
 /* Work-queue depth is computed by work_queue_depth() below (defined after the
  * bundle constants it depends on), NOT a fixed macro: bundle mode needs a much
@@ -540,11 +539,12 @@ sftp_parallel_wait(struct sftp_parallel *p)
 			    ? (off_t)(moved - p->progress_bytes_baseline) : 0;
 			if (p->progress_meter_started)
 				sftp_parallel_progress_stop(p);
-			if (!quiet)
+			if (p->cfg.print_flag != SFTP_QUIET)
 				mprintf("Verifying %d file(s)...\n", vn);
 			if (p->saved_showprogress && vtotal > 0) {
 				p->verify_total_units = (uint64_t)vn;
 				p->verify_done_units = 0;
+				p->verify_done_bytes = 0;
 				p->verify_meter_total = vtotal;
 				p->aggregate_progress_counter = 0;
 				strlcpy(p->progress_label, "verify",

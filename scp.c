@@ -120,6 +120,9 @@
 
 #include "sftp-common.h"
 #include "sftp-client.h"
+#include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
+#include "sftp-parallel.h"
+#include "hpn-exit-codes.h"
 
 extern char *__progname;
 
@@ -182,11 +185,58 @@ int resume_flag = 0; /* 0 is off, 1 is on */
 /* we want the host name for debugging purposes */
 char hostname[HOST_NAME_MAX + 1];
 
+/*
+ * HPN parallel-streams (-j): orchestrator handle plus the worker-spawn
+ * parameters captured from the command line.  parallel_num_streams defaults to
+ * 1 (single-stream, identical to traditional scp); -j N opts into the parallel
+ * orchestrator and the post-transfer verify phase, mirroring hpnsftp.  The
+ * orchestrator spawns its own worker SSH connections, so it needs the same
+ * identity (-i), config file (-F) and -o options scp passes to its control
+ * connection; host/user/port are captured at connect time.
+ */
+static int parallel_num_streams = 1;
+static struct sftp_parallel *parallel_orch = NULL;
+static const char *parallel_identity = NULL;	/* -i */
+static const char *parallel_config_file = NULL;	/* -F */
+static char **parallel_extra_o = NULL;		/* -o KEY=VALUE list, NULL-term */
+static size_t parallel_extra_o_count = 0;
+static size_t parallel_extra_o_cap = 0;
+static int hpn_verify_transfer = 0;		/* HPNVerifyTransfer resolved */
+static int verify_flag = 0;			/* -V: force HPNVerifyTransfer on */
+static int hpn_verify_failed = 0;		/* a transfer failed verify -> exit 57 */
+static int range_split_min_mb_user = 0;		/* -M: range-split min file size, MiB */
+/*
+ * showprogress as it stood before sftp_parallel_start() zeroed the global (it
+ * suppresses each worker's own per-file meter so only the aggregate meter
+ * draws).  The aggregate-meter gates use THIS, not the now-zero global - the
+ * same reason sftp.c gates its progress_start on !quiet rather than showprogress.
+ */
+static int parallel_want_progress = 0;
+
 /* defines for the resume function. Need them even if not supported */
 #define HASH_LEN 16                /* XXH3_64bits: 8 bytes → 16 hex chars */
 #define BUF_AND_HASH (HASH_LEN + 64) /* length of the hash and other data to get size of buffer */
 #define HASH_BUFLEN 8192	   /* 8192 seems to be a good balance between freads
 				    * and the digest func*/
+/*
+ * Append one -o KEY=VALUE option to the parallel worker-spawn list, kept
+ * NULL-terminated so the orchestrator config (cfg->extra_argv) can consume it
+ * directly.  optarg points into argv (stable for the process), but xstrdup
+ * keeps ownership simple and matches sftp.c.
+ */
+static void
+parallel_extra_o_add(const char *opt)
+{
+	if (parallel_extra_o_count + 2 > parallel_extra_o_cap) {
+		parallel_extra_o_cap = parallel_extra_o_cap ?
+		    parallel_extra_o_cap * 2 : 8;
+		parallel_extra_o = xreallocarray(parallel_extra_o,
+		    parallel_extra_o_cap, sizeof(*parallel_extra_o));
+	}
+	parallel_extra_o[parallel_extra_o_count++] = xstrdup(opt);
+	parallel_extra_o[parallel_extra_o_count] = NULL;
+}
+
 static void
 killchild(int signo)
 {
@@ -515,7 +565,7 @@ main(int argc, char **argv)
 
 	fflag = Tflag = tflag = 0;
 	while ((ch = getopt(argc, argv,
-	    "12346ABCTdfOpqRrstvZD:F:J:M:P:S:c:i:l:o:X:")) != -1) {
+	    "12346ABCTVdfOpqRrstvZD:F:J:M:P:S:c:i:j:l:o:X:")) != -1) {
 		switch (ch) {
 		/* User-visible flags. */
 		case '1':
@@ -549,6 +599,19 @@ main(int argc, char **argv)
 			addargs(&remote_remote_args, "%s", optarg);
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
+			/*
+			 * Capture the worker-spawn-relevant options structured
+			 * so the parallel orchestrator (-j) builds matching
+			 * worker SSH connections.  -c (cipher) and -J
+			 * (ProxyJump) ride only on the control connection this
+			 * pass; pass them as -o equivalents for workers.
+			 */
+			if (ch == 'i')
+				parallel_identity = optarg;
+			else if (ch == 'F')
+				parallel_config_file = optarg;
+			else if (ch == 'o')
+				parallel_extra_o_add(optarg);
 			break;
 		case 'O':
 			mode = MODE_SCP;
@@ -598,6 +661,38 @@ main(int argc, char **argv)
 			break;
 		case 'Z':
 			resume_flag = 1;
+			break;
+		case 'V':
+			/*
+			 * Force HPNVerifyTransfer on for this transfer - the
+			 * dedicated switch for what -o HPNVerifyTransfer=yes
+			 * does via ssh_config.  Transfer-layer verify deserves a
+			 * first-class flag rather than only an ssh-wide -o option
+			 * (which plain hpnssh also parses but ignores).
+			 */
+			verify_flag = 1;
+			break;
+		case 'j':
+			parallel_num_streams = (int)strtonum(optarg, 1,
+			    SFTP_PARALLEL_MAX_WORKERS, &errstr);
+			if (errstr != NULL)
+				fatal("Number of parallel streams %s: %s",
+				    optarg, errstr);
+			break;
+		case 'M':
+			/*
+			 * Minimum file size (MiB) at which a single file is
+			 * split across parallel workers by byte range.  Bounded
+			 * [64, 10240] like sftp.c -M so neither degenerate value
+			 * (over-chunking / no parallelism for huge files) can
+			 * occur.  Only meaningful with -j > 1.
+			 */
+			range_split_min_mb_user = (int)strtonum(optarg, 64,
+			    10240, &errstr);
+			if (errstr != NULL)
+				fatal("Range-split minimum (-M) must be between "
+				    "64 and 10240 MiB: \"%s\": %s",
+				    optarg, errstr);
 			break;
 		case 'X':
 			/* Please keep in sync with sftp.c -X */
@@ -741,6 +836,8 @@ main(int argc, char **argv)
 				errs = 1;
 		}
 	}
+	if (hpn_verify_failed)
+		exit(SFTP_EX_VERIFY_FAILED);
 	exit(errs != 0);
 }
 
@@ -1059,6 +1156,155 @@ do_sftp_connect(char *host, char *user, int port, char *sftp_direct,
 	    sftp_copy_buflen, sftp_nrequests, limit_kbps);
 }
 
+/*
+ * Launch the parallel-streams orchestrator for a transfer involving `host`.
+ * Always resolves HPNVerifyTransfer and latches it on the control connection
+ * (so the single-stream path verifies through that conn); only spins up worker
+ * connections when -j N (N > 1) was requested.  On orchestrator start failure
+ * it leaves parallel_orch NULL and reverts to single-stream.
+ */
+static void
+scp_parallel_launch(struct sftp_conn *conn, const char *host,
+    const char *user, int port)
+{
+	struct sftp_parallel_config pcfg;
+	char portbuf[16] = "";
+
+	/*
+	 * Capture whether progress is wanted BEFORE sftp_parallel_start() zeroes
+	 * the global showprogress; the aggregate-meter start gates read this.
+	 */
+	parallel_want_progress = showprogress;
+
+	/*
+	 * Resolve HPNVerifyTransfer once from ssh_config + the -o overrides and
+	 * latch it on the control conn.  Single-stream scp parks verify items on
+	 * this conn inside sftp_upload/sftp_download; parallel workers verify via
+	 * the orchestrator (sftp_parallel_apply_ssh_config resolves it again into
+	 * pcfg.verify_transfer below).
+	 */
+	hpn_verify_transfer = verify_flag || sftp_resolve_hpn_verify_transfer(
+	    host, parallel_config_file, parallel_extra_o);
+	sftp_conn_set_verify_transfer(conn, hpn_verify_transfer);
+
+	if (parallel_num_streams <= 1)
+		return;			/* single-stream: no orchestrator */
+
+	memset(&pcfg, 0, sizeof(pcfg));
+	pcfg.num_streams   = parallel_num_streams;
+	pcfg.host          = host;
+	pcfg.user          = user;
+	if (port > 0) {
+		snprintf(portbuf, sizeof(portbuf), "%d", port);
+		pcfg.port = portbuf;
+	}
+	pcfg.ssh_binary    = ssh_program;
+	pcfg.identity      = parallel_identity;
+	pcfg.config_file   = parallel_config_file;
+	pcfg.extra_argv    = parallel_extra_o;
+	pcfg.transfer_buflen = (u_int)sftp_copy_buflen;
+	pcfg.num_requests  = (u_int)sftp_nrequests;
+	pcfg.limit_kbps    = (uint64_t)limit_kbps;
+	pcfg.writers_per_inode_cap = HPN_RANGE_WRITERS_CAP_DEFAULT;
+	pcfg.range_split_min_mb = range_split_min_mb_user;
+	pcfg.verbose_level = verbose_mode;
+	pcfg.preserve_flag = pflag;
+	pcfg.print_flag    = showprogress ? SFTP_PROGRESS_ONLY : SFTP_QUIET;
+	/*
+	 * Resolves HPNUseBundle, HPNMaxRetries, HPNBundleSize,
+	 * HPNMaxConcurrentWorkers and HPNVerifyTransfer into pcfg from
+	 * ssh_config + the -o overrides; must run before sftp_parallel_start.
+	 */
+	(void)sftp_parallel_apply_ssh_config(&pcfg, host,
+	    parallel_config_file, parallel_extra_o);
+	if (verify_flag)		/* -V forces verify on regardless of config */
+		pcfg.verify_transfer = 1;
+	/* Adaptive throughput-outlier stall detection (mirror sftp.c). */
+	pcfg.tput_path_healthy_kbps = 2000;
+	pcfg.tput_outlier_fraction  = 0.25;
+	pcfg.tput_consec_required   = 5;
+	pcfg.tput_ema_alpha         = 0.0;
+
+	if (showprogress)
+		logit("Parallel streams: -j %d", parallel_num_streams);
+	parallel_orch = sftp_parallel_start(&pcfg);
+	if (parallel_orch == NULL) {
+		logit("Parallel-streams setup failed; falling back to "
+		    "single-stream mode.");
+		parallel_num_streams = 1;
+		return;
+	}
+	/*
+	 * No interrupt flag is registered with the orchestrator: scp tears down
+	 * bluntly on SIGINT - killchild SIGTERMs the control connection and
+	 * _exit()s, and the worker connections die as their pipes close.  That
+	 * is the desired behaviour for a one-shot command, so the orchestrator's
+	 * graceful-abort path is intentionally left unused.
+	 */
+}
+
+/*
+ * Finish a transfer: drain the orchestrator (which runs the post-transfer
+ * verify phase) or, in single-stream mode, run the control conn's verify phase.
+ * Failed deliveries bump errs; a verify mismatch latches hpn_verify_failed so
+ * main exits SFTP_EX_VERIFY_FAILED.  No-op when neither parallel mode nor
+ * verify is active.
+ */
+static void
+scp_parallel_finish(struct sftp_conn *conn)
+{
+	char **paths = NULL;
+	size_t i, used = 0;
+
+	if (parallel_orch != NULL) {
+		struct sftp_parallel_stats pstats;
+
+		sftp_parallel_wait(parallel_orch);
+		sftp_parallel_progress_stop(parallel_orch);
+		sftp_parallel_get_stats(parallel_orch, &pstats);
+		if (showprogress && pstats.bytes_wired_aggregate > 0) {
+			logit("Parallel streams: %.2f MiB transferred in %.1fs",
+			    (double)pstats.bytes_wired_aggregate /
+			    (1024.0 * 1024.0), pstats.elapsed_ms / 1000.0);
+		}
+		if (sftp_parallel_drain_failed_paths(parallel_orch,
+		    &paths, &used) > 0) {
+			for (i = 0; i < used; i++) {
+				fmprintf(stderr,
+				    "scp: transfer incomplete: %s\n", paths[i]);
+				free(paths[i]);
+			}
+			free(paths);
+			++errs;
+		}
+		paths = NULL;
+		used = 0;
+		if (sftp_parallel_drain_verify_failures(parallel_orch,
+		    &paths, &used) > 0) {
+			for (i = 0; i < used; i++) {
+				fmprintf(stderr,
+				    "HPNVerifyTransfer: FAILED: %s\n", paths[i]);
+				free(paths[i]);
+			}
+			free(paths);
+			hpn_verify_failed = 1;
+		}
+		sftp_parallel_stop(parallel_orch);
+		parallel_orch = NULL;
+	} else if (hpn_verify_transfer) {
+		sftp_conn_verify_run_phase(conn);
+		if (sftp_conn_drain_verify_failures(conn, &paths, &used) > 0) {
+			for (i = 0; i < used; i++) {
+				fmprintf(stderr,
+				    "HPNVerifyTransfer: FAILED: %s\n", paths[i]);
+				free(paths[i]);
+			}
+			free(paths);
+			hpn_verify_failed = 1;
+		}
+	}
+}
+
 void
 toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 {
@@ -1228,6 +1474,46 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 						fatal("Unable to open sftp "
 						    "connection");
 					}
+					/*
+					 * Launch the parallel orchestrator and
+					 * resolve HPNVerifyTransfer once the
+					 * control connection is up (-j N only;
+					 * single-stream just latches verify).
+					 */
+					scp_parallel_launch(conn, thost, tuser,
+					    tport > 0 ? tport : sshport);
+					/*
+					 * Start the aggregate transfer meter once,
+					 * sized to the total bytes of every source
+					 * argument (mirrors sftp.c process_put).
+					 * The reporter thread drives it from the
+					 * workers' byte counters.  Gated on the
+					 * pre-launch showprogress (off under -q /
+					 * non-tty); the orchestrator already zeroed
+					 * the global.
+					 */
+					if (parallel_orch != NULL &&
+					    parallel_want_progress) {
+						char label[64];
+						off_t total_bytes = 0;
+						long total_files = 0, fc;
+						int k;
+
+						for (k = 0; k < argc - 1; k++) {
+							fc = 0;
+							total_bytes +=
+							    sftp_parallel_scan_upload_total(
+							    argv[k], &fc);
+							total_files += fc;
+						}
+						snprintf(label, sizeof(label),
+						    "Uploading %ld file%s in "
+						    "parallel", total_files,
+						    total_files == 1 ? "" : "s");
+						sftp_parallel_progress_start(
+						    parallel_orch, label,
+						    total_bytes);
+					}
 				}
 
 				/* The protocol */
@@ -1248,6 +1534,7 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 			source(1, argv + i);
 		}
 	}
+	scp_parallel_finish(conn);
 out:
 	freeargs(&alist);
 	free(tuser);
@@ -1311,9 +1598,42 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 				++errs;
 				continue;
 			}
+			/*
+			 * Launch the parallel orchestrator (and resolve
+			 * HPNVerifyTransfer) for this source's connection,
+			 * finished just below.  Downloads relaunch per source
+			 * argument because each may name a different remote
+			 * host, so one orchestrator can't serve them all.
+			 */
+			scp_parallel_launch(conn, host, suser,
+			    sport > 0 ? sport : sshport);
+			/*
+			 * Start the aggregate transfer meter for this source.
+			 * total=0: the remote byte total is not summed upfront
+			 * (mirrors sftp.c process_get), so the meter shows bytes
+			 * moved + rate rather than a percentage/ETA.  Gated on
+			 * the pre-launch showprogress (off under -q / non-tty);
+			 * the orchestrator already zeroed the global.  For a
+			 * single regular-file source the size is known, so size
+			 * the meter to it for a real percentage/ETA; globs and
+			 * directories fall back to a rate-only meter (total 0).
+			 */
+			if (parallel_orch != NULL && parallel_want_progress) {
+				Attrib da;
+				off_t dtotal = 0;
+
+				if (sftp_stat(conn, src, 1, &da) == 0 &&
+				    (da.flags & SSH2_FILEXFER_ATTR_SIZE) &&
+				    !S_ISDIR(da.perm))
+					dtotal = (off_t)da.size;
+				sftp_parallel_progress_start(parallel_orch,
+				    "Downloading in parallel", dtotal);
+			}
 
 			/* The protocol */
 			sink_sftp(1, argv[argc - 1], src, conn);
+
+			scp_parallel_finish(conn);
 
 			(void) close(remin);
 			(void) close(remout);
@@ -1468,9 +1788,31 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 	debug3_f("copying local %s to remote %s", src, abs_dst);
 
 	if (src_is_dir && iamrecursive) {
-		if (sftp_upload_dir(conn, src, abs_dst, pflag,
+		/*
+		 * Parallel mode (-j N): the orchestrator walks the tree and
+		 * fans the regular files across worker connections; the
+		 * post-transfer verify phase runs inside sftp_parallel_wait.
+		 * The per-call verify arg is resume-verify intent (regetv/-Z
+		 * verified resume), distinct from HPNVerifyTransfer which is
+		 * carried in the orchestrator config - so it stays 0 here.
+		 */
+		if (parallel_orch != NULL) {
+			if (sftp_parallel_upload_dir(parallel_orch, conn, src,
+			    abs_dst, SFTP_PROGRESS_ONLY, resume_flag, 0) != 0) {
+				error("failed to upload directory %s to %s",
+				    src, targ);
+				errs = 1;
+			}
+		} else if (sftp_upload_dir(conn, src, abs_dst, pflag,
 		    SFTP_PROGRESS_ONLY, 0, resume_flag, 0, 1, 1) != 0) {
 			error("failed to upload directory %s to %s", src, targ);
+			errs = 1;
+		}
+	} else if (parallel_orch != NULL) {
+		if (sftp_parallel_submit_upload(parallel_orch, conn, src,
+		    abs_dst, st.st_size, st.st_mode & 07777,
+		    resume_flag, 0) != 0) {
+			error("failed to upload file %s to %s", src, targ);
 			errs = 1;
 		}
 	} else {
@@ -1880,9 +2222,44 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 
 		debug("Fetching %s to %s\n", g.gl_pathv[i], abs_dst);
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) && iamrecursive) {
-			if (sftp_download_dir(conn, g.gl_pathv[i], abs_dst,
-			    NULL, pflag, SFTP_PROGRESS_ONLY, resume_flag,
-			    resume_flag /* verify */, 0, 1, 1) == -1)
+			/*
+			 * Parallel mode (-j N): the orchestrator walks the
+			 * remote tree, fans the files across worker connections
+			 * and runs the post-transfer verify phase in
+			 * sftp_parallel_wait.  verify carries scp's -Z
+			 * verified-resume intent, matching the single-stream
+			 * calls below; HPNVerifyTransfer rides on the
+			 * orchestrator config.
+			 */
+			if (parallel_orch != NULL) {
+				if (sftp_parallel_download_dir(parallel_orch,
+				    conn, g.gl_pathv[i], abs_dst,
+				    SFTP_PROGRESS_ONLY, resume_flag,
+				    resume_flag) == -1)
+					err = -1;
+			} else if (sftp_download_dir(conn, g.gl_pathv[i],
+			    abs_dst, NULL, pflag, SFTP_PROGRESS_ONLY,
+			    resume_flag, resume_flag /* verify */, 0, 1, 1)
+			    == -1)
+				err = -1;
+		} else if (parallel_orch != NULL) {
+			/*
+			 * Single file: stat it so the orchestrator can size the
+			 * range-split decision and meter, then submit.
+			 */
+			Attrib ga;
+			off_t fsize = 0;
+			mode_t fmode = 0;
+
+			if (sftp_stat(conn, g.gl_pathv[i], 1, &ga) == 0) {
+				if (ga.flags & SSH2_FILEXFER_ATTR_SIZE)
+					fsize = (off_t)ga.size;
+				if (ga.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
+					fmode = ga.perm & 07777;
+			}
+			if (sftp_parallel_submit_download(parallel_orch, conn,
+			    g.gl_pathv[i], abs_dst, fsize, fmode,
+			    resume_flag, resume_flag) != 0)
 				err = -1;
 		} else {
 			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
@@ -2633,9 +3010,10 @@ void
 usage(void)
 {
 	(void) fprintf(stderr,
-	    "usage: hpnscp [-346ABCOpqRrsTvZ] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n"
-	    "              [-i identity_file] [-J destination] [-l limit] [-o ssh_option]\n"
-	    "              [-P port] [-S program] [-X sftp_option] source ... target\n");
+	    "usage: hpnscp [-346ABCOpqRrsTVvZ] [-c cipher] [-D sftp_server_path]\n"
+	    "              [-F ssh_config] [-i identity_file] [-J destination] [-j streams]\n"
+	    "              [-l limit] [-M range_split_min] [-o ssh_option] [-P port]\n"
+	    "              [-S program] [-X sftp_option] source ... target\n");
 	exit(1);
 
 }

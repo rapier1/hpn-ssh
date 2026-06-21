@@ -154,6 +154,13 @@ struct sftp_hpn_conn {
 	 * Atomic add; safe from any thread. */
 	volatile uint64_t bytes_wired_payload;
 
+	/* Verify progress meter (HPN): bytes hashed so far for the file this
+	 * worker is currently verifying.  Set to the cumulative figure the
+	 * server hash heartbeat / local read-back callback reports; the reporter
+	 * sums it across workers and the worker folds it into the phase's
+	 * done-bytes total at each file's completion.  Atomic; any thread. */
+	volatile uint64_t verify_inflight_bytes;
+
 	/* HPNLustreStripeCount resolved from ssh_config at sftp_init time.
 	 *   -1  : auto (use -j N as the desired count when destination is
 	 *         on Lustre and currently has stripe_count < N)

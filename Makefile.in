@@ -164,7 +164,9 @@ SSHD_AUTH_OBJS=sshd-auth.o \
 
 SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-hpn-verify.o sftp-hpn-verify-hash.o sftp-fault-inject.o sftp-lustre.o sftp-hpn-bundle-client.o sftp-hpn-tar.o sftp-glob.o ssherr-nolibcrypto.o
 
-SCP_OBJS=	scp.o progressmeter.o $(SFTP_CLIENT_OBJS)
+SCP_OBJS=	scp.o progressmeter.o $(SFTP_CLIENT_OBJS) \
+		sftp-workqueue.o sftp-parallel.o sftp-parallel-respawn.o sftp-parallel-watchdog.o sftp-parallel-reporter.o sftp-parallel-unit.o sftp-parallel-worker.o sftp-parallel-walk.o \
+		sftp-parallel-config.o readconf.o $(P11OBJS) $(SKOBJS)
 
 SSHADD_OBJS=	ssh-add.o $(P11OBJS) $(SKOBJS)
 

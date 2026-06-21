@@ -156,6 +156,7 @@ int global_fflag = 0;
  * process returns SFTP_EX_VERIFY_FAILED (57).
  */
 static int hpn_verify_transfer = 0;
+static int verify_flag_user = 0;	/* -V: force HPNVerifyTransfer on */
 static char **verify_fail_list = NULL;
 static u_int verify_fail_count = 0;
 
@@ -1025,6 +1026,8 @@ parallel_orch_launch(struct sftp_conn *conn)
 	 * if parsing fails or the option isn't set. */
 	(void)sftp_parallel_apply_ssh_config(&pcfg, parallel_launch.host,
 	    parallel_launch.config_file, parallel_launch.extra_o);
+	if (verify_flag_user)		/* -V forces verify on regardless of config */
+		pcfg.verify_transfer = 1;
 	pcfg.preserve_flag    = global_pflag;
 	pcfg.fsync_flag       = global_fflag;
 	pcfg.print_flag       = quiet ? 0 : 1;
@@ -3312,7 +3315,7 @@ usage(void)
 	extern char *__progname;
 
 	fprintf(stderr,
-	    "usage: %s [-46AaCfNpqrv] [-B buffer_size] [-b batchfile] [-c cipher]\n"
+	    "usage: %s [-46AaCfNpqrVv] [-B buffer_size] [-b batchfile] [-c cipher]\n"
 	    "          [-D sftp_server_command] [-F ssh_config] [-i identity_file]\n"
 	    "          [-J destination] [-j parallel_streams] [-l limit]\n"
 	    "          [-M range_split_min_mb] [-o ssh_option] [-P port]\n"
@@ -3458,7 +3461,7 @@ main(int argc, char **argv)
 	}
 
 	while ((ch = getopt(argc, argv,
-	    "1246AafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:w:X:")) != -1) {
+	    "1246AVafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:w:X:")) != -1) {
 		switch (ch) {
 		/* Passed through to ssh(1) */
 		case 'A':
@@ -3609,6 +3612,16 @@ main(int argc, char **argv)
 			break;
 		case 'r':
 			global_rflag = 1;
+			break;
+		case 'V':
+			/*
+			 * Force HPNVerifyTransfer on - the dedicated switch for
+			 * what -o HPNVerifyTransfer=yes does via ssh_config.
+			 * Transfer-layer verify deserves a first-class flag, not
+			 * only an ssh-wide -o option (which plain hpnssh parses
+			 * but ignores).
+			 */
+			verify_flag_user = 1;
 			break;
 		case 'R':
 			num_requests = strtol(optarg, &cp, 10);
@@ -3822,8 +3835,8 @@ main(int argc, char **argv)
 	 * transfer paths (the parallel orchestrator resolves it into pcfg
 	 * separately).  Safe with a NULL/empty host (returns 0 = off).
 	 */
-	hpn_verify_transfer = sftp_resolve_hpn_verify_transfer(host,
-	    parallel_config_file, parallel_extra_o);
+	hpn_verify_transfer = verify_flag_user || sftp_resolve_hpn_verify_transfer(
+	    host, parallel_config_file, parallel_extra_o);
 	/*
 	 * Propagate HPNVerifyTransfer state onto the connection so the
 	 * resume-decision hash callers can flag the hpn-check-file request

@@ -244,6 +244,17 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		 * submit interleaves with draining, so pending is ambiguous). */
 		__atomic_fetch_add(&w->parent->verify_done_units, 1,
 		    __ATOMIC_RELAXED);
+		/* Byte-granular meter: this file is fully hashed now, so fold its
+		 * final in-flight count into the phase's done-bytes total and
+		 * clear in-flight for this worker's next file (also leaves it 0
+		 * for the next unit's start). */
+		{
+			uint64_t hashed =
+			    sftp_conn_verify_inflight_get(w->conn);
+			__atomic_fetch_add(&w->parent->verify_done_bytes, hashed,
+			    __ATOMIC_RELAXED);
+			sftp_conn_verify_inflight_set(w->conn, 0);
+		}
 		return 0;
 	}
 

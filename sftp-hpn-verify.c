@@ -349,6 +349,8 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 			debug3_f("hpn-check-file heartbeat for \"%s\" id=%u "
 			    "progress=%llu", path, id,
 			    (unsigned long long)hb_prog);
+			/* Feed the verify progress meter: server bytes hashed. */
+			sftp_conn_verify_inflight_set(conn, hb_prog);
 			if (hb_prog > hb_prog_last) {
 				hb_prog_last = hb_prog;
 				hb_advance_sec = hb_now;
@@ -477,9 +479,12 @@ sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
 static void
 verify_readback_progress(void *arg, uint64_t bytes)
 {
-	(void)bytes;
-	sftp_conn_watchdog_pause((struct sftp_conn *)arg,
-	    HPN_HEARTBEAT_REFRESH_SEC);
+	struct sftp_conn *conn = (struct sftp_conn *)arg;
+
+	/* Download verify: this host is doing the hashing locally, so `bytes`
+	 * (cumulative bytes read back) is the meter's progress feed. */
+	sftp_conn_verify_inflight_set(conn, bytes);
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 }
 
 int
@@ -829,6 +834,8 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 			debug3_f("sftp-hash-range \"%s\" id=%u heartbeat "
 			    "progress=%llu", path, id,
 			    (unsigned long long)hb_prog);
+			/* Feed the verify progress meter: server bytes hashed. */
+			sftp_conn_verify_inflight_set(conn, hb_prog);
 			if (hb_prog > hb_prog_last) {
 				hb_prog_last = hb_prog;
 				hb_advance_sec = hb_now;

@@ -170,4 +170,14 @@ uint64_t sftp_conn_bytes_wired(struct sftp_conn *conn);
  */
 void sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n);
 
+/*
+ * Verify progress feed: the verify module (sftp-hpn-verify.c) SETS the
+ * cumulative bytes-hashed for the file currently under verification on this
+ * connection; the orchestrator reads it to drive the verify progress meter.
+ * Atomic; any thread; set is a no-op and get returns 0 when conn/conn->hpn is
+ * NULL.
+ */
+void     sftp_conn_verify_inflight_set(struct sftp_conn *conn, uint64_t bytes);
+uint64_t sftp_conn_verify_inflight_get(struct sftp_conn *conn);
+
 #endif /* _SFTP_CLIENT_INTERNAL_H */
