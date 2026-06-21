@@ -18,13 +18,15 @@
 .Nd HPN/OpenSSH secure file copy
 .Sh SYNOPSIS
 .Nm hpnscp
-.Op Fl 346ABCOpqRrsTvZ
+.Op Fl 346ABCOpqRrsTVvZ
 .Op Fl c Ar cipher
 .Op Fl D Ar sftp_server_path
 .Op Fl F Ar ssh_config
 .Op Fl i Ar identity_file
 .Op Fl J Ar destination
+.Op Fl j Ar streams
 .Op Fl l Ar limit
+.Op Fl M Ar range_split_min
 .Op Fl o Ar ssh_option
 .Op Fl P Ar port
 .Op Fl S Ar program
@@ -142,8 +144,24 @@ This is a shortcut to specify a
 configuration directive.
 This option is directly passed to
 .Xr hpnssh 1 .
+.It Fl j Ar streams
+Transfer files using
+.Ar streams
+parallel worker connections rather than a single stream
+.Pq HPNSSH extension .
+The default is 1
+.Pq single-stream, identical to traditional scp ;
+useful values for a high bandwidth-delay path are typically 4 to 8.
+Large files are additionally split across workers by byte range
+.Pq see Fl M .
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
+.It Fl M Ar range_split_min
+Minimum file size, in MiB, at which a single file is split across parallel
+workers by byte range
+.Pq HPNSSH extension; only meaningful with Fl j .
+The value is clamped to the range 64 to 10240.
+The default is 2048 (2 GiB).
 .It Fl O
 Use the legacy SCP protocol for file transfers instead of the SFTP protocol.
 Forcing the use of the SCP protocol may be necessary for servers that do
@@ -325,6 +343,20 @@ Because of differences in how various operating systems and shells interpret
 filename wildcards, these checks may cause wanted files to be rejected.
 This option disables these checks at the expense of fully trusting that
 the server will not send unexpected filenames.
+.It Fl V
+Verify the integrity of every transferred file
+.Pq HPNSSH extension .
+After each file is transferred its local and remote copies are hashed with
+XXH3 and compared via the
+.Cm hpn-check-file@hpnssh.org
+extension; a mismatch is logged and reported and
+.Nm
+exits with code 57
+.Pq Dv SFTP_EX_VERIFY_FAILED ,
+though the transfer itself is not aborted.
+Note the capital letter:
+.Fl v
+is verbose.
 .It Fl v
 Verbose mode.
 Causes
@@ -353,9 +385,9 @@ By default a 32KB buffer is used.
 .Sh EXIT STATUS
 .Ex -std scp
 .Pp
-As an HPNSSH extension, when
-.Cm HPNVerifyTransfer
-is enabled and one or more files fail the post-transfer XXH3 integrity
+As an HPNSSH extension, when integrity verification is requested
+.Pq Fl V
+and one or more files fail the post-transfer XXH3 integrity
 check, the transfer is completed but
 .Nm
 exits with code 57

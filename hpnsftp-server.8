@@ -183,10 +183,8 @@ the file is fully allocated on disk, and the client did not request strict
 mode, the server returns a sparse-allocation sentinel without reading the
 file; this short-circuits bilateral disk I/O on multi-file resumes where
 most files completed before the interrupt.
-Strict mode is selected by
-.Cm HPNVerifyTransfer
-in
-.Xr hpnssh_config 5
+Strict mode is selected by a client integrity-verify request
+.Pq Fl V , Ic getv , Ic putv No in Xr hpnsftp 1 ; Fl V No in Xr hpnscp 1
 and forces a real hash regardless of allocation state.
 .It Sy sftp-hash-range@hpnssh.org
 Compute XXH3_64 hashes over a list of byte ranges of a path in a single

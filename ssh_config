@@ -50,7 +50,6 @@
 #   HPNDisabled no               # disable the HPN performance fast paths
 #   HPNUseBundle yes             # small-file SFTP bundling on put/get -r
 #   HPNBundleSize 8M             # bundle target size [1M, 64M]
-#   HPNVerifyTransfer no         # XXH3 post-transfer hash compare
 #   HPNMaxRetries 3              # parallel-worker retry budget per session
 #   HPNMaxAuthConcurrent 8       # max parallel-worker auths in flight [1, 64]
 #   HPNLustreStripeCount auto    # Lustre stripe count on remote destination

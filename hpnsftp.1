@@ -453,6 +453,24 @@ on the remote host.
 A path is useful when the remote
 .Xr hpnsshd 8
 does not have an sftp subsystem configured.
+.It Fl V
+Verify the integrity of every file transferred in this session, equivalent to
+applying
+.Fl V
+to each
+.Ic get
+and
+.Ic put .
+Verification can also be requested per transfer with
+.Ic get Fl V , Ic put Fl V , Ic getv ,
+or
+.Ic putv ;
+see
+.Ic get
+for the semantics and exit status.
+Note the capital letter:
+.Fl v
+is verbose.
 .It Fl v
 Raise logging level.
 This option is also passed to hpnssh.
@@ -644,7 +662,7 @@ extension.
 Quit
 .Nm hpnsftp .
 .It Xo Ic get
-.Op Fl afpRv
+.Op Fl afpRV
 .Ar remote-path
 .Op Ar local-path
 .Xc
@@ -673,43 +691,31 @@ If the remote file contents differ from the partial local copy then the
 resultant file is likely to be corrupt.
 .Pp
 If the
-.Fl v
-flag is specified, then attempt to resume partial transfers of existing files
-using hash verification.
-The exact behaviour depends on how the local file compares to the remote
-file.
-.Pp
-When the local file is shorter than the remote file, the XXH3 hash of the
-local partial file is compared against the hash of the corresponding prefix
-of the remote file using the
+.Fl V
+flag is specified, the integrity of the transferred file is verified after
+the download completes: the local and remote files are hashed with XXH3 and
+compared using the
 .Cm hpn-check-file@hpnssh.org
-extension.
-Matching hashes resume the download from the end of the local file;
-differing hashes truncate the local file and restart from the beginning.
-.Pp
-When the local and remote files are the same size, the
-.Cm sftp-hash-range@hpnssh.org
-extension is used (when the server advertises it) to hash and compare both
-files in 64 MiB chunks, and only the chunks that differ are re-fetched.
-This catches sparse-zero holes left by a crashed parallel-streams transfer
-without re-pulling every byte of the file.
-If the server does not advertise
-.Cm sftp-hash-range@hpnssh.org
-the implementation falls back to hashing the full file end-to-end via
-.Cm hpn-check-file@hpnssh.org ;
-matching hashes treat the file as complete and the transfer is skipped,
-otherwise the local file is truncated and re-downloaded from scratch.
-.Pp
-When the local file is already larger than the remote file the transfer
-is skipped.
-.Pp
+extension
+.Pq capital Fl V ; lowercase Fl v No is verbose .
+A mismatch is logged, recorded, and reported in a summary when the session
+ends, after which
+.Nm
+exits with code 57
+.Pq Dv SFTP_EX_VERIFY_FAILED ;
+the transfer itself is not aborted.
+This requires the remote server to advertise
+.Cm hpn-check-file@hpnssh.org .
 The
-.Fl v
-flag implies
-.Fl a
-and requires that the remote server support the
-.Cm hpn-check-file@hpnssh.org
-extension.
+.Ic getv
+command is a shorthand for
+.Ic get Fl V .
+For hash-verified
+.Em resume
+of an interrupted transfer, use
+.Ic reget Fl V
+.Pq or Ic regetv
+instead.
 .Pp
 If the
 .Fl f
@@ -735,6 +741,19 @@ flag is specified then directories will be copied recursively.
 Note that
 .Nm
 does not follow symbolic links when performing recursive transfers.
+.It Xo Ic getv
+.Op Fl afpR
+.Ar remote-path
+.Op Ar local-path
+.Xc
+Retrieve
+.Ar remote-path
+and verify its integrity after transfer.
+Equivalent to
+.Ic get
+with the
+.Fl V
+flag set.
 .It Ic help
 Display help text.
 .It Ic lcd Op Ar path
@@ -828,7 +847,7 @@ Create remote directory specified by
 .It Ic progress
 Toggle display of progress meter.
 .It Xo Ic put
-.Op Fl afpRv
+.Op Fl afpRV
 .Ar local-path
 .Op Ar remote-path
 .Xc
@@ -857,43 +876,31 @@ If the local file contents differ from the remote local copy then
 the resultant file is likely to be corrupt.
 .Pp
 If the
-.Fl v
-flag is specified, then attempt to resume partial transfers of existing files
-using hash verification.
-The exact behaviour depends on how the remote file compares to the local
-file.
-.Pp
-When the remote file is shorter than the local file, the XXH3 hash of the
-remote partial file is compared against the hash of the corresponding prefix
-of the local file using the
+.Fl V
+flag is specified, the integrity of the transferred file is verified after
+the upload completes: the local and remote files are hashed with XXH3 and
+compared using the
 .Cm hpn-check-file@hpnssh.org
-extension.
-Matching hashes resume the upload from the end of the remote file;
-differing hashes truncate the remote file and restart from the beginning.
-.Pp
-When the remote and local files are the same size, the
-.Cm sftp-hash-range@hpnssh.org
-extension is used (when the server advertises it) to hash and compare both
-files in 64 MiB chunks, and only the chunks that differ are re-transferred.
-This catches sparse-zero holes left by a crashed parallel-streams transfer
-without re-pushing every byte of the file.
-If the server does not advertise
-.Cm sftp-hash-range@hpnssh.org
-the implementation falls back to hashing the full file end-to-end via
-.Cm hpn-check-file@hpnssh.org ;
-matching hashes treat the file as complete and the transfer is skipped,
-otherwise the remote file is truncated and re-uploaded from scratch.
-.Pp
-When the remote file is already larger than the local file the transfer
-is skipped.
-.Pp
+extension
+.Pq capital Fl V ; lowercase Fl v No is verbose .
+A mismatch is logged, recorded, and reported in a summary when the session
+ends, after which
+.Nm
+exits with code 57
+.Pq Dv SFTP_EX_VERIFY_FAILED ;
+the transfer itself is not aborted.
+This requires the remote server to advertise
+.Cm hpn-check-file@hpnssh.org .
 The
-.Fl v
-flag implies
-.Fl a
-and requires that the remote server support the
-.Cm hpn-check-file@hpnssh.org
-extension.
+.Ic putv
+command is a shorthand for
+.Ic put Fl V .
+For hash-verified
+.Em resume
+of an interrupted transfer, use
+.Ic reput Fl V
+.Pq or Ic reputv
+instead.
 .Pp
 If the
 .Fl f
@@ -920,13 +927,26 @@ flag is specified then directories will be copied recursively.
 Note that
 .Nm
 does not follow symbolic links when performing recursive transfers.
+.It Xo Ic putv
+.Op Fl afpR
+.Ar local-path
+.Op Ar remote-path
+.Xc
+Upload
+.Ar local-path
+and verify its integrity after transfer.
+Equivalent to
+.Ic put
+with the
+.Fl V
+flag set.
 .It Ic pwd
 Display remote working directory.
 .It Ic quit
 Quit
 .Nm hpnsftp .
 .It Xo Ic reget
-.Op Fl fpR
+.Op Fl fpRV
 .Ar remote-path
 .Op Ar local-path
 .Xc
@@ -937,6 +957,26 @@ Equivalent to
 with the
 .Fl a
 flag set.
+.Pp
+If the
+.Fl V
+flag is also specified, the resume is hash-verified.
+When the local file is shorter than the remote file, the XXH3 hash of the
+local partial file is compared against the corresponding prefix of the
+remote file using the
+.Cm hpn-check-file@hpnssh.org
+extension; matching hashes resume from the end of the local file, differing
+hashes truncate and restart.
+When the two files are the same size, the
+.Cm sftp-hash-range@hpnssh.org
+extension (when advertised) hashes and compares both files in 64 MiB chunks
+and re-fetches only the differing chunks, catching sparse-zero holes left by
+a crashed parallel-streams transfer without re-pulling the whole file; if the
+server does not advertise it, the full file is hashed end-to-end instead.
+The
+.Ic regetv
+command is a shorthand for
+.Ic reget Fl V .
 .It Xo Ic regetv
 .Op Fl fpR
 .Ar remote-path
@@ -946,17 +986,12 @@ Resume download of
 .Ar remote-path
 with hash verification.
 Equivalent to
-.Ic get
+.Ic reget
 with the
-.Fl v
+.Fl V
 flag set.
-See the description of
-.Fl v
-under
-.Ic get
-for details.
 .It Xo Ic reput
-.Op Fl fpR
+.Op Fl fpRV
 .Ar local-path
 .Op Ar remote-path
 .Xc
@@ -967,6 +1002,19 @@ Equivalent to
 with the
 .Fl a
 flag set.
+.Pp
+If the
+.Fl V
+flag is also specified, the resume is hash-verified, in the same manner as
+.Ic reget Fl V
+but in the upload direction: a shorter remote file resumes from its verified
+prefix, and a same-size remote file is compared chunk-by-chunk via
+.Cm sftp-hash-range@hpnssh.org
+so only differing 64 MiB chunks are re-sent.
+The
+.Ic reputv
+command is a shorthand for
+.Ic reput Fl V .
 .It Xo Ic reputv
 .Op Fl fpR
 .Ar local-path
@@ -976,15 +1024,10 @@ Resume upload of
 .Ar local-path
 with hash verification.
 Equivalent to
-.Ic put
+.Ic reput
 with the
-.Fl v
+.Fl V
 flag set.
-See the description of
-.Fl v
-under
-.Ic put
-for details.
 .It Ic rename Ar oldpath newpath
 Rename remote file from
 .Ar oldpath
@@ -1018,10 +1061,8 @@ Synonym for help.
 .Nm
 exits 0 on success and >0 if an error occurs.
 .Pp
-As an HPNSSH extension, when
-.Cm HPNVerifyTransfer
-is enabled
-.Pq see Xr hpnssh_config 5
+As an HPNSSH extension, when integrity verification is requested
+.Pq Fl V , Ic getv , or Ic putv
 and one or more files fail the post-transfer XXH3 integrity check, the
 transfer is completed but
 .Nm
