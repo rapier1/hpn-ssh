@@ -360,6 +360,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_mutex_init(&p->workers_mu, NULL);
 	pthread_mutex_init(&p->bundle_mu, NULL);
 	pthread_mutex_init(&p->verify_pending_mu, NULL);
+	pthread_mutex_init(&p->repair_pending_mu, NULL);
 	pthread_mutex_init(&p->retry_overflow_mu, NULL);
 
 	p->session_start_ns = monotime_ns();
@@ -391,6 +392,19 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	{
 		const char *e = getenv("HPN_RESPAWN_SCAN_IDLE");
 		p->respawn_scan_idle = (e != NULL && *e == '1');
+	}
+
+	/* Auto-repair (#6): on a post-transfer verify mismatch, re-transfer the
+	 * bad ranges and re-verify, bounded by a per-range attempt cap.  ON by
+	 * default; HPN_NO_VERIFY_REPAIR disables the whole repair phase.  The cap
+	 * defaults to 3 (HPN_VERIFY_REPAIR_ATTEMPTS); below 1 it is clamped to 1. */
+	{
+		const char *e = getenv("HPN_NO_VERIFY_REPAIR");
+		p->verify_repair_enabled = !(e != NULL && *e != '\0');
+		e = getenv("HPN_VERIFY_REPAIR_ATTEMPTS");
+		p->verify_repair_attempts = (e != NULL && *e != '\0') ? atoi(e) : 3;
+		if (p->verify_repair_attempts < 1)
+			p->verify_repair_attempts = 1;
 	}
 	p->last_worker_exit_code = -1;	/* no worker reaped yet */
 	/* Born-dead 0-bytes kill threshold.  RTT-derived once the path RTT is

@@ -92,9 +92,12 @@ parallel_unit_free(struct sftp_work_unit *u)
 		parallel_verify_and_free(NULL, u->verify_tracker);
 	/* Range-granular verify: this dropped chunk still holds a reference to the
 	 * shared per-file job; release it (free the job on the last reference,
-	 * exactly like a completed chunk - just without recording a failure). */
+	 * exactly like a completed chunk - just without recording a failure).
+	 * SFTP_OP_REPAIR units only BORROW the job (the repair phase owns it on
+	 * p->repair_pending), so they never touch the refcount or free it. */
 	if (u->verify_job != NULL) {
-		if (__atomic_sub_fetch(&u->verify_job->ranges_left, 1,
+		if (u->op == SFTP_OP_VERIFY &&
+		    __atomic_sub_fetch(&u->verify_job->ranges_left, 1,
 		    __ATOMIC_ACQ_REL) == 0)
 			parallel_verify_job_free(u->verify_job);
 		u->verify_job = NULL;
@@ -444,6 +447,8 @@ parallel_verify_job_free(struct verify_job *j)
 	free(j->lens);
 	free(j->hashes);
 	free(j->valid);
+	free(j->range_failed);
+	free(j->range_dest_hash);
 	free(j);
 }
 
@@ -473,6 +478,9 @@ build_verify_job(struct sftp_range_tracker *t)
 	j->lens = xcalloc((size_t)n, sizeof(*j->lens));
 	j->hashes = xcalloc((size_t)n, sizeof(*j->hashes));
 	j->valid = xcalloc((size_t)n, sizeof(*j->valid));
+	/* Auto-repair (#6): per-chunk failure markers + dest-hash baseline. */
+	j->range_failed = xcalloc((size_t)n, sizeof(*j->range_failed));
+	j->range_dest_hash = xcalloc((size_t)n, sizeof(*j->range_dest_hash));
 	for (k = 0; k < n; k++) {
 		j->offs[k] = (off_t)t->vslots[k].off;
 		j->lens[k] = (off_t)t->vslots[k].len;

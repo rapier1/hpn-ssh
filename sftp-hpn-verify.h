@@ -60,10 +60,16 @@ int sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
  * remote per direction.  When have_local_hash is set, local_hash (a teed upload
  * source hash) is used and the local read is skipped; otherwise the local range
  * is O_DIRECT-read back.  0 = match, 1 = mismatch, -1 = unverifiable.
+ *
+ * local_hash_out / remote_hash_out (either may be NULL) receive the two hashes
+ * actually compared - only written when the comparison is reached (return 0 or
+ * 1), untouched on the -1 early-outs.  Auto-repair uses the WRITTEN side's hash
+ * (server=remote on upload, local on download) as its convergence baseline.
  */
 int sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, off_t off, off_t len,
-    int have_local_hash, uint64_t local_hash);
+    int have_local_hash, uint64_t local_hash,
+    uint64_t *local_hash_out, uint64_t *remote_hash_out);
 
 int sftp_hpn_xxhash_local_fd(struct sftp_conn *, int, uint64_t, uint64_t *);
 int sftp_hpn_hash_remote_file(struct sftp_conn *, const char *, uint64_t,

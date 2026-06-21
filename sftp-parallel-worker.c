@@ -253,12 +253,21 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 			 * download (and untee'd ranges) read the local range back. */
 			int have_teed = (!j->local_is_target && j->valid[k]);
 			int r;
+			uint64_t lh = 0, rh = 0;
 
 			r = sftp_hpn_verify_chunk(w->conn, j->local_path,
 			    j->remote_path, j->offs[k], j->lens[k],
-			    have_teed, have_teed ? j->hashes[k] : 0);
-			if (r == 1)	/* mismatch (corruption) */
+			    have_teed, have_teed ? j->hashes[k] : 0, &lh, &rh);
+			if (r == 1) {	/* mismatch (corruption) */
 				__atomic_store_n(&j->failed, 1, __ATOMIC_RELAXED);
+				/* Mark this chunk for the repair phase + capture the
+				 * WRITTEN side's hash (server on upload, local on
+				 * download) as the convergence baseline.  Each chunk
+				 * worker writes only its own index k - no race. */
+				j->range_failed[k] = 1;
+				j->range_dest_hash[k] =
+				    j->local_is_target ? lh : rh;
+			}
 			/* r == -1 (unverifiable: read or hash-range error) is NOT a
 			 * content failure - same as the whole-file path, warn only. */
 			u->verify_job = NULL;
@@ -301,6 +310,59 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 			    __ATOMIC_RELAXED);
 			sftp_conn_verify_inflight_set(w->conn, 0);
 		}
+		return 0;
+	}
+
+	if (u->op == SFTP_OP_REPAIR) {
+		/*
+		 * Auto-repair (#6): re-transfer ONE failed range and re-verify it
+		 * off the platter.  The verify_job is OWNED by the repair phase
+		 * (parked on p->repair_pending); this unit only BORROWS it - it
+		 * writes its own range index's result and never touches ranges_left
+		 * or frees the job.  The repair phase reads the results only after
+		 * draining every repair unit (the pending barrier provides
+		 * happens-before), so each worker writing solely its index k is
+		 * race-free.  Always returns 0 (the outcome lives in the job arrays,
+		 * not in rc): the repair phase, not the retry path, drives retries.
+		 *
+		 * range_failed[k] result codes the phase reads back:
+		 *   0 = repaired (re-verify matched)
+		 *   1 = still corrupt, range_dest_hash[k] = the new dest hash
+		 *   2 = unverifiable this attempt (re-transfer or re-verify errored)
+		 */
+		struct verify_job *j = u->verify_job;
+		int k = u->range_index;
+		off_t acked = 0;
+		uint64_t src_hash = 0, lh = 0, rh = 0;
+		int r;
+
+		if (j == NULL)		/* defensive: nothing to do */
+			return 0;
+		if (j->local_is_target)	/* download: re-fetch source -> local dest */
+			r = sftp_download_range(w->conn, j->remote_path,
+			    j->local_path, j->offs[k], j->lens[k], &acked);
+		else			/* upload: re-send source -> remote dest */
+			r = sftp_upload_range(w->conn, j->local_path,
+			    j->remote_path, j->offs[k], j->lens[k], &acked,
+			    NULL, &src_hash);
+		if (r != 0) {
+			j->range_failed[k] = 2;		/* transfer errored */
+			u->verify_job = NULL;
+			return 0;
+		}
+		/* Re-verify the re-transferred range off the platter.  Upload uses
+		 * the freshly re-teed source hash; download reads the local back. */
+		r = sftp_hpn_verify_chunk(w->conn, j->local_path, j->remote_path,
+		    j->offs[k], j->lens[k], /*have_local=*/!j->local_is_target,
+		    j->local_is_target ? 0 : src_hash, &lh, &rh);
+		if (r == 0)
+			j->range_failed[k] = 0;		/* repaired */
+		else if (r == 1) {
+			j->range_dest_hash[k] = j->local_is_target ? lh : rh;
+			j->range_failed[k] = 1;		/* still corrupt */
+		} else
+			j->range_failed[k] = 2;		/* unverifiable */
+		u->verify_job = NULL;
 		return 0;
 	}
 
@@ -383,9 +445,10 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 			rc = 0;	/* identical / target-larger: complete */
 		break;
 	case SFTP_OP_VERIFY:
+	case SFTP_OP_REPAIR:
 		/* Handled before the switch via an early return; reaching the
-		 * switch with a verify op is a bug. */
-		fatal_f("verify unit reached execute_unit switch (op=%d)",
+		 * switch with a verify/repair op is a bug. */
+		fatal_f("verify/repair unit reached execute_unit switch (op=%d)",
 		    (int)u->op);
 		break;
 	case SFTP_OP_BUNDLE_UPLOAD:

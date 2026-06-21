@@ -702,7 +702,8 @@ sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
 int
 sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, off_t off, off_t len,
-    int have_local_hash, uint64_t local_hash)
+    int have_local_hash, uint64_t local_hash,
+    uint64_t *local_hash_out, uint64_t *remote_hash_out)
 {
 	uint64_t	 remote_hash = 0;
 	struct sftp_hash_range range;
@@ -742,6 +743,11 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 		return -1;
 	}
 	sftp_conn_watchdog_resume(conn);
+
+	if (local_hash_out != NULL)
+		*local_hash_out = local_hash;
+	if (remote_hash_out != NULL)
+		*remote_hash_out = remote_hash;
 
 	if (local_hash != remote_hash) {
 		error_f("verify: range [%llu+%llu) of \"%s\" MISMATCH - "
