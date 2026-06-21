@@ -495,7 +495,215 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	return NULL;
 }
 
-/* Defined later in this file. */
+/*
+ * Auto-repair phase (#6).  Runs after the verify phase drains.  Any
+ * range-granular verify_job that recorded a chunk mismatch was parked on
+ * p->repair_pending (instead of being freed + reported); re-transfer each
+ * failed range and re-verify it off the platter, bounded by a per-range
+ * attempt cap (HPN_VERIFY_REPAIR_ATTEMPTS).  Two give-up paths, each reported
+ * distinctly and folded into verify_failed_paths so the file still exits 57:
+ *   CONVERGENCE - the re-transfer left the dest hash unchanged (deterministic
+ *                 media fault); bail immediately, do not burn the rest of the
+ *                 budget.
+ *   CAP         - still corrupt after the attempt cap (flaky storage).
+ * Repaired ranges are announced (rare, worth surfacing).  Owns + frees the
+ * parked jobs.  No-op when repair is disabled (nothing was parked) or nothing
+ * failed.
+ */
+enum repair_state { RS_ACTIVE, RS_REPAIRED, RS_CONVERGED, RS_CAPPED };
+
+struct repair_item {
+	struct verify_job *job;
+	int                range_index;
+	uint64_t           prev_hash;	/* dest hash from the prior attempt */
+	int                attempts;
+	enum repair_state  state;
+};
+
+static void
+parallel_repair_phase_run(struct sftp_parallel *p)
+{
+	struct verify_job **jobs;
+	struct repair_item *items = NULL;
+	int njobs, nitems = 0, icap = 0;
+	int i, k, iter, repaired = 0, unrepairable = 0;
+	uint64_t repaired_bytes = 0;
+
+	/* Take ownership of the parked failed jobs. */
+	pthread_mutex_lock(&p->repair_pending_mu);
+	jobs = p->repair_pending;
+	njobs = p->repair_pending_n;
+	p->repair_pending = NULL;
+	p->repair_pending_n = 0;
+	p->repair_pending_cap = 0;
+	pthread_mutex_unlock(&p->repair_pending_mu);
+
+	if (njobs == 0)
+		return;
+
+	/* One repair item per failed range across all parked jobs. */
+	for (i = 0; i < njobs; i++) {
+		struct verify_job *j = jobs[i];
+
+		for (k = 0; k < j->n_ranges; k++) {
+			if (j->range_failed == NULL || j->range_failed[k] != 1)
+				continue;
+			if (nitems == icap) {
+				icap = icap ? icap * 2 : 16;
+				items = xreallocarray(items, (size_t)icap,
+				    sizeof(*items));
+			}
+			items[nitems].job = j;
+			items[nitems].range_index = k;
+			items[nitems].prev_hash = j->range_dest_hash[k];
+			items[nitems].attempts = 0;
+			items[nitems].state = RS_ACTIVE;
+			nitems++;
+		}
+	}
+	if (nitems == 0) {	/* defensive: failed flag but no marked range */
+		for (i = 0; i < njobs; i++)
+			parallel_verify_job_free(jobs[i]);
+		free(jobs);
+		return;
+	}
+
+	/* The verify meter (if any) is done; stop it before announcing. */
+	if (p->progress_meter_started)
+		sftp_parallel_progress_stop(p);
+	if (p->cfg.print_flag != SFTP_QUIET)
+		mprintf("Repairing %d corrupt range(s) in %d file(s)...\n",
+		    nitems, njobs);
+
+	for (iter = 1; iter <= p->verify_repair_attempts && !p->abort_flag;
+	    iter++) {
+		int submitted = 0;
+
+		for (i = 0; i < nitems; i++) {
+			struct sftp_work_unit *u;
+
+			if (items[i].state != RS_ACTIVE)
+				continue;
+			u = xcalloc(1, sizeof(*u));
+			u->op = SFTP_OP_REPAIR;
+			u->verify_job = items[i].job;
+			u->range_index = items[i].range_index;
+			u->range_offset =
+			    items[i].job->offs[items[i].range_index];
+			u->range_length =
+			    items[i].job->lens[items[i].range_index];
+			(void)parallel_unit_submit(p, u);
+			submitted++;
+		}
+		if (submitted == 0)
+			break;
+
+		/* Drain: wait for every repair unit to finish (the barrier that
+		 * makes the workers' per-range result writes visible here). */
+		pthread_mutex_lock(&p->pending_mu);
+		while (p->pending > 0 && !p->abort_flag)
+			pthread_cond_wait(&p->pending_cv, &p->pending_mu);
+		pthread_mutex_unlock(&p->pending_mu);
+		if (p->abort_flag)
+			break;
+
+		for (i = 0; i < nitems; i++) {
+			struct verify_job *j = items[i].job;
+			int kk = items[i].range_index;
+			int res;
+
+			if (items[i].state != RS_ACTIVE)
+				continue;
+			res = j->range_failed[kk];
+			items[i].attempts++;
+			if (res == 0) {		/* re-verify matched: repaired */
+				items[i].state = RS_REPAIRED;
+				repaired++;
+				repaired_bytes += (uint64_t)j->lens[kk];
+				if (p->cfg.print_flag != SFTP_QUIET)
+					mprintf("  repaired range [%llu+%llu) "
+					    "of \"%s\"\n",
+					    (unsigned long long)j->offs[kk],
+					    (unsigned long long)j->lens[kk],
+					    j->remote_path);
+			} else if (res == 1) {	/* still corrupt + new hash */
+				uint64_t now = j->range_dest_hash[kk];
+
+				if (now == items[i].prev_hash)
+					items[i].state = RS_CONVERGED;
+				else if (items[i].attempts >=
+				    p->verify_repair_attempts)
+					items[i].state = RS_CAPPED;
+				else
+					items[i].prev_hash = now;
+				if (items[i].state != RS_ACTIVE)
+					unrepairable++;
+			} else {		/* res == 2: unverifiable attempt */
+				if (items[i].attempts >=
+				    p->verify_repair_attempts) {
+					items[i].state = RS_CAPPED;
+					unrepairable++;
+				}
+			}
+		}
+	}
+
+	/* Anything still active (cap reached, or aborted) is unrepairable. */
+	for (i = 0; i < nitems; i++) {
+		if (items[i].state == RS_ACTIVE) {
+			items[i].state = RS_CAPPED;
+			unrepairable++;
+		}
+	}
+
+	/* Report the unrepairable ranges (errors), unless we are aborting. */
+	if (!p->abort_flag) {
+		for (i = 0; i < nitems; i++) {
+			struct verify_job *j = items[i].job;
+			int kk = items[i].range_index;
+
+			if (items[i].state == RS_CONVERGED)
+				error_f("range [%llu+%llu) of \"%s\": two "
+				    "identical failed hashes in a row - "
+				    "deterministic fault, not retrying",
+				    (unsigned long long)j->offs[kk],
+				    (unsigned long long)j->lens[kk],
+				    j->remote_path);
+			else if (items[i].state == RS_CAPPED)
+				error_f("range [%llu+%llu) of \"%s\": still "
+				    "corrupt after %d repair attempts - "
+				    "possible storage/media fault",
+				    (unsigned long long)j->offs[kk],
+				    (unsigned long long)j->lens[kk],
+				    j->remote_path, p->verify_repair_attempts);
+		}
+	}
+
+	/* Fold each job that still has an unrepairable range into the failure
+	 * list (once per file, drives exit 57) and free every job. */
+	for (i = 0; i < njobs; i++) {
+		struct verify_job *j = jobs[i];
+		int bad = 0;
+
+		for (k = 0; k < j->n_ranges; k++) {
+			if (j->range_failed != NULL && j->range_failed[k] != 0) {
+				bad = 1;
+				break;
+			}
+		}
+		if (bad && !p->abort_flag)
+			hpn_strlist_append(&p->verify_failed_paths,
+			    j->remote_path);
+		parallel_verify_job_free(j);
+	}
+	free(jobs);
+	free(items);
+
+	if (!p->abort_flag && p->cfg.print_flag != SFTP_QUIET)
+		mprintf("Auto-repair: repaired %d range(s) (%llu bytes); "
+		    "%d unrepairable\n", repaired,
+		    (unsigned long long)repaired_bytes, unrepairable);
+}
 
 void
 sftp_parallel_wait(struct sftp_parallel *p)
@@ -575,6 +783,11 @@ sftp_parallel_wait(struct sftp_parallel *p)
 			pthread_cond_wait(&p->pending_cv, &p->pending_mu);
 		pthread_mutex_unlock(&p->pending_mu);
 		p->verify_phase_active = 0;
+
+		/* Auto-repair (#6): re-transfer + re-verify any chunk that
+		 * failed verification, bounded by the attempt cap.  No-op when
+		 * repair is disabled (nothing was parked) or nothing failed. */
+		parallel_repair_phase_run(p);
 	}
 }
 
@@ -837,11 +1050,22 @@ sftp_parallel_stop(struct sftp_parallel *p)
 		free(p->verify_pending);
 		p->verify_pending = NULL;
 	}
+	/* Repair-pending (#6): failed verify_jobs parked for the repair phase but
+	 * never processed (e.g. aborted before wait reached it).  Free them and
+	 * the array so neither leaks. */
+	{
+		int i;
+		for (i = 0; i < p->repair_pending_n; i++)
+			parallel_verify_job_free(p->repair_pending[i]);
+		free(p->repair_pending);
+		p->repair_pending = NULL;
+	}
 	/* Worker re-queue overflow: units parked here when a worker hit a full
 	 * queue, never drained back (abort/shutdown before the reporter moved
 	 * them).  Threads have joined by now, so free without locking concerns. */
 	parallel_retry_overflow_free(p);
 	pthread_mutex_destroy(&p->verify_pending_mu);
+	pthread_mutex_destroy(&p->repair_pending_mu);
 	pthread_mutex_destroy(&p->retry_overflow_mu);
 	pthread_mutex_destroy(&p->bundle_mu);
 	pthread_mutex_destroy(&p->pending_mu);

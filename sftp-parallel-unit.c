@@ -408,6 +408,26 @@ parallel_verify_park(struct sftp_parallel *p, struct sftp_range_tracker *t)
 }
 
 /*
+ * Auto-repair (#6): hand a verify_job that had >=1 mismatched chunk to the
+ * post-verify repair phase instead of freeing it.  The phase (in
+ * sftp_parallel_wait) re-transfers the failed ranges, re-verifies, and frees
+ * the job.  Mirrors parallel_verify_park.
+ */
+void
+parallel_repair_park(struct sftp_parallel *p, struct verify_job *j)
+{
+	pthread_mutex_lock(&p->repair_pending_mu);
+	if (p->repair_pending_n == p->repair_pending_cap) {
+		int ncap = p->repair_pending_cap ? p->repair_pending_cap * 2 : 16;
+		p->repair_pending = xreallocarray(p->repair_pending,
+		    (size_t)ncap, sizeof(*p->repair_pending));
+		p->repair_pending_cap = ncap;
+	}
+	p->repair_pending[p->repair_pending_n++] = j;
+	pthread_mutex_unlock(&p->repair_pending_mu);
+}
+
+/*
  * Park a completed whole-file (non-range-split) transfer for the verify phase.
  * Builds a lightweight tracker carrying just the paths + direction; with no
  * vslots, parallel_verify_and_free runs the whole-file readback verify.  The

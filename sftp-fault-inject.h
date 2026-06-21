@@ -28,12 +28,16 @@
  *       view this is indistinguishable from a slow server, with no
  *       server-side scaffolding needed.  At most <max_conns>
  *       connections throttle (default 1).  Never kills.
- *   ENV-VAR SFTP_FAULT_CORRUPT=<offset>
- *       flips one byte at absolute file <offset> in the data SENT, once,
- *       then disarms.  The on-disk source is left clean, so a verified
- *       transfer's source hash stays good and the target hash diverges - a
- *       manufactured transfer/write corruption for exercising the integrity
- *       verify (HPNVerifyTransfer).
+ *   ENV-VAR SFTP_FAULT_CORRUPT=<offset>[:persist|:vary]
+ *       flips one byte at absolute file <offset> in the data SENT.  The on-disk
+ *       source is left clean, so a verified transfer's source hash stays good
+ *       and the target hash diverges - a manufactured transfer/write corruption
+ *       for exercising the integrity verify (HPNVerifyTransfer) and auto-repair.
+ *       No suffix: flip once, then disarm (the verify-detection / repair-success
+ *       case - a repair re-transfer is clean).  :persist: re-flip to the SAME
+ *       value on every write covering the offset (repair re-corrupts identically
+ *       -> drives the repair CONVERGENCE give-up).  :vary: re-flip to a different
+ *       value each write (-> drives the repair attempt-CAP give-up).
  */
 
 #ifndef SFTP_FAULT_INJECT_H

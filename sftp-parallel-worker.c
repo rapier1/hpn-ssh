@@ -279,14 +279,23 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 
 			if (__atomic_sub_fetch(&j->ranges_left, 1,
 			    __ATOMIC_ACQ_REL) == 0) {
-				if (__atomic_load_n(&j->failed, __ATOMIC_RELAXED)) {
+				if (!__atomic_load_n(&j->failed, __ATOMIC_RELAXED)) {
+					parallel_verify_job_free(j);	/* clean */
+				} else if (p->verify_repair_enabled) {
+					/* Hand the failed job to the post-verify
+					 * repair phase: it re-transfers the bad
+					 * ranges + re-verifies (bounded by the
+					 * attempt cap), owns + frees the job, and
+					 * reports any unrepairable ranges itself. */
+					parallel_repair_park(p, j);
+				} else {
 					error_f("worker %d VERIFY FAILED: \"%s\" - "
 					    "transferred file does NOT match source",
 					    w->id, j->remote_path);
 					hpn_strlist_append(&p->verify_failed_paths,
 					    j->remote_path);
+					parallel_verify_job_free(j);
 				}
-				parallel_verify_job_free(j);
 			}
 			__atomic_fetch_add(&p->verify_done_units, 1,
 			    __ATOMIC_RELAXED);

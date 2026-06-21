@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "log.h"
@@ -51,13 +52,23 @@ static struct {
 	pthread_once_t once;
 } fault_inj_pv_state = { 0, 0, PTHREAD_ONCE_INIT };
 
-/* Corruption state for SFTP_FAULT_CORRUPT - flips one sent byte, once. */
+/*
+ * Corruption state for SFTP_FAULT_CORRUPT=<offset>[:persist|:vary].
+ * mode 0 (no suffix): flip one sent byte, once (the original behaviour).
+ * mode 1 (:persist):  re-flip to the SAME value on EVERY write covering the
+ *                     offset (incl. repair re-transfers) -> the dest hash
+ *                     repeats -> exercises the repair CONVERGENCE path.
+ * mode 2 (:vary):     re-flip to a DIFFERENT value each write -> the dest hash
+ *                     changes every attempt -> exercises the repair attempt-CAP.
+ */
 static struct {
 	uint64_t       offset;     /* absolute file offset to corrupt */
 	int            armed;      /* env knob was set */
-	int            done;       /* fired (atomic, single flip) */
+	int            done;       /* mode 0: fired (atomic, single flip) */
+	int            mode;       /* 0=once, 1=persist-constant, 2=persist-vary */
+	uint64_t       seq;        /* mode 2: per-corruption counter (atomic) */
 	pthread_once_t once;
-} fault_inj_corrupt_state = { 0, 0, 0, PTHREAD_ONCE_INIT };
+} fault_inj_corrupt_state = { 0, 0, 0, 0, 0, PTHREAD_ONCE_INIT };
 
 static void
 fault_inj_state_init(void)
@@ -311,11 +322,20 @@ static void
 fault_inj_corrupt_state_init(void)
 {
 	const char *ev = getenv("SFTP_FAULT_CORRUPT");
+	char *ep = NULL;
 
 	if (ev == NULL)
 		return;
-	fault_inj_corrupt_state.offset = strtoull(ev, NULL, 10);
+	fault_inj_corrupt_state.offset = strtoull(ev, &ep, 10);
 	fault_inj_corrupt_state.armed  = 1;
+	/* Optional mode suffix selecting a persistent (re-corrupting) variant
+	 * for exercising the auto-repair give-up paths; default = one-shot. */
+	if (ep != NULL && *ep == ':') {
+		if (strcmp(ep + 1, "persist") == 0)
+			fault_inj_corrupt_state.mode = 1;
+		else if (strcmp(ep + 1, "vary") == 0)
+			fault_inj_corrupt_state.mode = 2;
+	}
 }
 
 void
@@ -327,19 +347,46 @@ fault_inj_corrupt(off_t chunk_off, u_char *buf, size_t len)
 	    fault_inj_corrupt_state_init);
 	if (!fault_inj_corrupt_state.armed || buf == NULL || len == 0)
 		return;
-	if (__atomic_load_n(&fault_inj_corrupt_state.done, __ATOMIC_SEQ_CST))
-		return;
 	target = fault_inj_corrupt_state.offset;
 	if (target < (uint64_t)chunk_off ||
 	    target >= (uint64_t)chunk_off + (uint64_t)len)
 		return;
-	/* Claim the single flip; if we lose the race another send did it. */
-	if (__atomic_exchange_n(&fault_inj_corrupt_state.done, 1,
-	    __ATOMIC_SEQ_CST) != 0)
+
+	if (fault_inj_corrupt_state.mode == 0) {
+		/* One-shot: claim the single flip; lose the race -> another
+		 * send already did it. */
+		if (__atomic_load_n(&fault_inj_corrupt_state.done,
+		    __ATOMIC_SEQ_CST))
+			return;
+		if (__atomic_exchange_n(&fault_inj_corrupt_state.done, 1,
+		    __ATOMIC_SEQ_CST) != 0)
+			return;
+		buf[target - (uint64_t)chunk_off] ^= 0xFFU;
+		error("sftp: fault injection: corrupted byte at file offset "
+		    "%llu (once)", (unsigned long long)target);
 		return;
-	buf[target - (uint64_t)chunk_off] ^= 0xFFU;
-	error("sftp: fault injection: corrupted byte at file offset %llu",
-	    (unsigned long long)target);
+	}
+
+	/* Persistent: corrupt on EVERY write covering the offset (so the repair
+	 * re-transfer re-corrupts).  mode 1 XORs a CONSTANT mask -> the dest hash
+	 * repeats -> repair convergence.  mode 2 XORs a per-corruption counter ->
+	 * the dest hash changes each attempt -> repair attempt-cap. */
+	if (fault_inj_corrupt_state.mode == 2) {
+		uint64_t s = __atomic_add_fetch(&fault_inj_corrupt_state.seq, 1,
+		    __ATOMIC_SEQ_CST);
+		u_char mask = (u_char)s;
+
+		if (mask == 0)		/* keep it a real corruption */
+			mask = 0x5AU;
+		buf[target - (uint64_t)chunk_off] ^= mask;
+		error("sftp: fault injection: corrupted byte at file offset "
+		    "%llu (vary mask=0x%02x)", (unsigned long long)target,
+		    (unsigned)mask);
+	} else {
+		buf[target - (uint64_t)chunk_off] ^= 0xFFU;
+		error("sftp: fault injection: corrupted byte at file offset "
+		    "%llu (persist)", (unsigned long long)target);
+	}
 }
 
 #else /* !HPN_FAULT_INJECTION */

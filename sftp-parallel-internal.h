@@ -1613,6 +1613,10 @@ void	 parallel_verify_park_whole_file(struct sftp_parallel *,
 	    const char *local_path, const char *remote_path, int local_is_target);
 int	 parallel_verify_phase_submit(struct sftp_parallel *);
 void	 parallel_verify_job_free(struct verify_job *);
+/* Auto-repair (#6): hand a failed verify_job to the post-verify repair phase
+ * (mirrors parallel_verify_park; appends to p->repair_pending under its mu).
+ * The repair phase then owns and frees the job. */
+void	 parallel_repair_park(struct sftp_parallel *, struct verify_job *);
 
 /* sftp-parallel-respawn.c - spawn/respawn lifecycle */
 void	 parallel_respawn_teardown_ssh(struct sftp_worker *);
