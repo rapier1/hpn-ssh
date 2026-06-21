@@ -210,17 +210,6 @@ int sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
     char *const *extra_argv);
 
 /*
- * Resolve just the HPNVerifyTransfer ssh_config option for a host.  Used by
- * the single-stream sftp/scp paths, which otherwise don't read ssh_config.
- * `extra_argv` is the NULL-terminated array of -o KEY=VALUE strings collected
- * from the command line (parallel_extra_o), applied as overrides after the
- * config file is parsed.  May be NULL.
- * Returns 1 if HPNVerifyTransfer is enabled, 0 otherwise (default/off/error).
- */
-int sftp_resolve_hpn_verify_transfer(const char *host,
-    const char *user_config_file, char *const *extra_argv);
-
-/*
  * Resolve HPNLustreStripeCount from ssh_config for a host.
  * `extra_argv` plumbing as above.
  * Returns: -1 = auto (default), 0 = feature off, >0 = explicit count.

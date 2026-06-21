@@ -127,8 +127,6 @@ typedef struct {
 	int     tcp_rcv_buf_rescue; /* Forcibly grow SO_RCVBUF when autotune stuck on lossy paths */
 	int     hpn_disabled;     /* Switch to disable HPN buffer management */
 	int     hpn_memory_limit; /* HPN memory limit: default, high, max */
-	int     hpn_verify_transfer; /* Post-transfer XXH3 verify; warn on
-				      * mismatch, never abort (default off) */
 	int     none_switch;    /* Use none cipher */
 	int     none_enabled;   /* Allow none to be used */
 	int     nonemac_enabled;   /* Allow none to be used */

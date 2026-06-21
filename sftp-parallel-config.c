@@ -150,8 +150,8 @@ resolve_ssh_config(const char *host, const char *user_config_file,
 	/*
 	 * Apply -o overrides from the command line so they trump config
 	 * values, matching how ssh.c handles -o.  Without this, options
-	 * like `-o HPNLustreStripeCount=0` and `-o HPNVerifyTransfer=yes`
-	 * silently fail to override the config defaults.
+	 * like `-o HPNLustreStripeCount=0` silently fail to override the
+	 * config defaults.
 	 */
 	if (extra_argv != NULL) {
 		for (int i = 0; extra_argv[i] != NULL; i++) {
@@ -203,33 +203,18 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	pcfg->bundle_size = (options.hpn_bundle_size > 0)
 	    ? (uint64_t)options.hpn_bundle_size : 0;
 	pcfg->max_auth_concurrent = options.hpn_max_auth_concurrent;
-	pcfg->verify_transfer = (options.hpn_verify_transfer != 0);
+	/* verify_transfer is NOT an ssh_config option; it is requested per
+	 * transfer via -V (scp) / put-getv (sftp) and stays at the default 0
+	 * here, toggled later by the caller. */
 
 	debug_f("ssh_config: host=\"%s\" HPNUseBundle=%s HPNMaxRetries=%d "
-	    "HPNBundleSize=%llu HPNMaxAuthConcurrent=%d HPNVerifyTransfer=%s",
+	    "HPNBundleSize=%llu HPNMaxAuthConcurrent=%d",
 	    host, pcfg->use_bundle ? "yes" : "no", pcfg->max_retries,
 	    (unsigned long long)pcfg->bundle_size,
-	    pcfg->max_auth_concurrent,
-	    pcfg->verify_transfer ? "yes" : "no");
+	    pcfg->max_auth_concurrent);
 
 	free_options(&options);
 	return 0;
-}
-
-int
-sftp_resolve_hpn_verify_transfer(const char *host,
-    const char *user_config_file, char *const *extra_argv)
-{
-	Options options;
-	int r = 0;
-
-	if (host == NULL || *host == '\0')
-		return 0;
-	if (resolve_ssh_config(host, user_config_file, extra_argv,
-	    &options) == 0)
-		r = (options.hpn_verify_transfer != 0);
-	free_options(&options);
-	return r;
 }
 
 int

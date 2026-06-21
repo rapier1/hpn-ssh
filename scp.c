@@ -1177,14 +1177,12 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	parallel_want_progress = showprogress;
 
 	/*
-	 * Resolve HPNVerifyTransfer once from ssh_config + the -o overrides and
-	 * latch it on the control conn.  Single-stream scp parks verify items on
-	 * this conn inside sftp_upload/sftp_download; parallel workers verify via
-	 * the orchestrator (sftp_parallel_apply_ssh_config resolves it again into
-	 * pcfg.verify_transfer below).
+	 * Integrity verify is requested by -V only (not ssh_config); latch it on
+	 * the control conn so single-stream scp parks verify items inside
+	 * sftp_upload/sftp_download, and force it into the orchestrator config
+	 * below so parallel workers verify too.
 	 */
-	hpn_verify_transfer = verify_flag || sftp_resolve_hpn_verify_transfer(
-	    host, parallel_config_file, parallel_extra_o);
+	hpn_verify_transfer = verify_flag;
 	sftp_conn_set_verify_transfer(conn, hpn_verify_transfer);
 
 	if (parallel_num_streams <= 1)

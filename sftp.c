@@ -3873,12 +3873,11 @@ main(int argc, char **argv)
 		parallel_orch_launch(conn);
 
 	/*
-	 * Resolve HPNVerifyTransfer from ssh_config for the single-stream
-	 * transfer paths (the parallel orchestrator resolves it into pcfg
-	 * separately).  Safe with a NULL/empty host (returns 0 = off).
+	 * Integrity verify is requested by -V only (the session-global program
+	 * switch), not ssh_config.  Per-command put/get -V and getv/putv toggle
+	 * it on top of this via verify_set_for_command().
 	 */
-	hpn_verify_transfer = verify_flag_user || sftp_resolve_hpn_verify_transfer(
-	    host, parallel_config_file, parallel_extra_o);
+	hpn_verify_transfer = verify_flag_user;
 	/*
 	 * Propagate HPNVerifyTransfer state onto the connection so the
 	 * resume-decision hash callers can flag the hpn-check-file request
