@@ -48,6 +48,16 @@ int sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset,
     sftp_hpn_readback_progress cb, void *cb_arg);
 
 /*
+ * Switch an already-open fd to read from the platter rather than the page
+ * cache: flush dirty DATA (fdatasync; fsync fallback), drop the now-clean
+ * cached pages (best-effort), and set O_DIRECT.  Returns 1 if O_DIRECT
+ * engaged, 0 if it could not be set (caller must read buffered).  Shared so
+ * the client read-back and the server's range-hash reply mean the same thing
+ * by "on-disk".  `path` is used only for log messages.
+ */
+int sftp_hpn_fd_set_ondisk(int fd, const char *path);
+
+/*
  * Per-entry source-hash accumulator (bundle integrity, source side).
  * Implements the tar writer's data tap: XXH3 each bundled file's source bytes
  * as they are packed, keyed by archive_path.  Plug sftp_hpn_src_hashset_tap

@@ -265,7 +265,14 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	XXH3_state_t		*state = NULL;
 	struct sshbuf		*msg = NULL;
 	struct stat		 st;
-	u_char			 buf[65536];
+	/*
+	 * Read-back buffer: 4 MiB page-aligned for O_DIRECT (matches the
+	 * client's HPN_READBACK_BUFSZ - the measured large-FS sweet spot,
+	 * 64 KiB ~43 MB/s vs 4 MiB ~340 MB/s on Lustre).  Heap-allocated.
+	 */
+	const size_t		 bufsz = 4 * 1024 * 1024;
+	u_char			*buf = NULL;
+	int			 direct = 0;
 	u_int64_t		 fsize = 0;
 	u_int64_t		 hashed_total = 0;
 	time_t			 last_hb_sec;
@@ -358,6 +365,24 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail_status;
 	}
 
+	if (posix_memalign((void **)&buf, 4096, bufsz) != 0) {
+		buf = NULL;
+		error_f("posix_memalign(%zu) failed", bufsz);
+		goto fail_status;
+	}
+
+	/*
+	 * Read the bytes from the platter, not the page cache: an upload
+	 * verify must check what actually landed on the server's disk, not
+	 * the copy still warm in cache from the just-finished write.  Mirrors
+	 * the client's read-back (sftp_hpn_hash_range_ondisk).  O_DIRECT (with
+	 * the EINVAL fallback below) where the fs supports it, buffered
+	 * otherwise.
+	 */
+	direct = sftp_hpn_fd_set_ondisk(fd, path);
+	debug_f("range-hash read-back of \"%s\" via %s", path,
+	    direct ? "O_DIRECT" : "buffered");
+
 	/*
 	 * For each range, lseek to the offset and hash bytes
 	 * [offset, min(offset+length, file_size)).  EOF clamping handled by
@@ -397,25 +422,50 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 				goto out;
 			}
 			while (remaining > 0) {
-				size_t toread = (size_t)MINIMUM(
-				    (u_int64_t)sizeof(buf), remaining);
+				/*
+				 * O_DIRECT requires block-aligned request
+				 * lengths, so in direct mode always read a full
+				 * (aligned) buffer and clamp the hashed byte
+				 * count to what remains; a short read at EOF is
+				 * fine.  Buffered mode clamps the request.
+				 */
+				size_t toread = direct ? bufsz :
+				    (size_t)MINIMUM((u_int64_t)bufsz, remaining);
+				size_t hbytes;
+
 				nread = read(fd, buf, toread);
+#ifdef O_DIRECT
+				if (nread < 0 && direct && errno == EINVAL) {
+					/* O_DIRECT rejected at read time on
+					 * this fs; drop it and retry the same
+					 * offset buffered. */
+					int fl = fcntl(fd, F_GETFL);
+					if (fl != -1)
+						(void)fcntl(fd, F_SETFL,
+						    fl & ~O_DIRECT);
+					direct = 0;
+					continue;
+				}
+#endif
 				if (nread == 0)
-					break;	/* shouldn't happen given
-						 * clamp, but defensive */
+					break;	/* EOF before length bytes -
+						 * hash what we have */
 				if (nread < 0) {
 					send_status_oqueue(oqueue, id,
 					    errno_to_sftp_status(errno));
 					goto out;
 				}
+				/* never hash past the requested length */
+				hbytes = (u_int64_t)nread > remaining ?
+				    (size_t)remaining : (size_t)nread;
 				if (XXH3_64bits_update(state, buf,
-				    (size_t)nread) == XXH_ERROR) {
+				    hbytes) == XXH_ERROR) {
 					error_f("XXH3_64bits_update failed "
 					    "at range %u", i);
 					goto fail_status;
 				}
-				remaining -= (u_int64_t)nread;
-				hashed_total += (u_int64_t)nread;
+				remaining -= (u_int64_t)hbytes;
+				hashed_total += (u_int64_t)hbytes;
 
 				/* Time-keyed heartbeat (see comment above). */
 				{
@@ -463,6 +513,7 @@ out:
 		XXH3_freeState(state);
 	if (fd != -1)
 		close(fd);
+	free(buf);
 	free(ranges);
 	free(hashes);
 	free(path);

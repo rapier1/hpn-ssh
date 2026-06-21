@@ -41,6 +41,44 @@
 #define HPN_READBACK_BUFSZ	(4 * 1024 * 1024)
 #define HPN_READBACK_ALIGN	4096
 
+/*
+ * Switch an open fd to platter reads.  fdatasync (not fsync): the read-back
+ * only needs the file DATA durable, not inode metadata (mtime/ctime), so we
+ * skip the metadata flush - on a networked filesystem (e.g. Lustre) that
+ * avoids an extra MDS round-trip, a real per-file cost and a separate stall
+ * risk.  fsync is the fallback where fdatasync is absent (e.g. macOS); a
+ * configure HAVE_FDATASYNC check would extend the fast path to the BSDs too.
+ * posix_fadvise drops the now-clean cached copy; O_DIRECT then bypasses the
+ * cache so the hash reflects the device.  Buffered fallback where O_DIRECT is
+ * unavailable.
+ */
+int
+sftp_hpn_fd_set_ondisk(int fd, const char *path)
+{
+	int direct = 0;
+
+#if defined(HAVE_FDATASYNC) || defined(__linux__)
+	if (fdatasync(fd) == -1)
+		debug_f("fdatasync \"%s\": %s (read-back may reflect cache)",
+		    path, strerror(errno));
+#else
+	if (fsync(fd) == -1)
+		debug_f("fsync \"%s\": %s (read-back may reflect cache)",
+		    path, strerror(errno));
+#endif
+#ifdef POSIX_FADV_DONTNEED
+	(void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+#ifdef O_DIRECT
+	{
+		int fl = fcntl(fd, F_GETFL);
+		if (fl != -1 && fcntl(fd, F_SETFL, fl | O_DIRECT) != -1)
+			direct = 1;
+	}
+#endif
+	return direct;
+}
+
 int
 sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset, uint64_t length,
     int ondisk, uint64_t *hash_out, sftp_hpn_readback_progress cb, void *cb_arg)
@@ -62,39 +100,7 @@ sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset, uint64_t length,
 		goto out;
 	}
 	if (ondisk) {
-		/*
-		 * Flush dirty pages to the platter, drop the now-clean cached
-		 * copy (best-effort), then read via O_DIRECT so the hash
-		 * reflects the device, not the page cache.  Buffered fallback
-		 * where O_DIRECT is unavailable.
-		 *
-		 * fdatasync, not fsync: the read-back only needs the file DATA
-		 * durable, not the inode metadata (mtime/ctime), so we skip the
-		 * metadata flush.  On a networked filesystem (e.g. Lustre) that
-		 * avoids an extra MDS round-trip - a real per-file cost and a
-		 * separate stall risk.  fsync is the fallback where fdatasync is
-		 * absent (e.g. macOS); a configure HAVE_FDATASYNC check would
-		 * extend the fast path to the BSDs too.
-		 */
-#if defined(HAVE_FDATASYNC) || defined(__linux__)
-		if (fdatasync(fd) == -1)
-			debug_f("fdatasync \"%s\": %s (read-back may reflect "
-			    "cache)", path, strerror(errno));
-#else
-		if (fsync(fd) == -1)
-			debug_f("fsync \"%s\": %s (read-back may reflect cache)",
-			    path, strerror(errno));
-#endif
-#ifdef POSIX_FADV_DONTNEED
-		(void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-#endif
-#ifdef O_DIRECT
-		{
-			int fl = fcntl(fd, F_GETFL);
-			if (fl != -1 && fcntl(fd, F_SETFL, fl | O_DIRECT) != -1)
-				direct = 1;
-		}
-#endif
+		direct = sftp_hpn_fd_set_ondisk(fd, path);
 		debug_f("on-disk read-back of \"%s\" via %s", path,
 		    direct ? "O_DIRECT" : "buffered");
 	}
