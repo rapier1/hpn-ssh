@@ -690,6 +690,69 @@ sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
 	return r;
 }
 
+/*
+ * Verify ONE byte range [off, off+len) of a file: O_DIRECT read-back hash of the
+ * local range vs the server's sftp-hash-range of the remote range, compared.
+ * Direction-agnostic - the caller picks which path is local vs remote (upload:
+ * local=source, remote=dest; download: local=dest, remote=source).  Used by the
+ * range-granular parallel verify, where one large file's chunks are spread
+ * across the worker pool.  Returns 0 = match, 1 = MISMATCH (corruption), -1 =
+ * could not verify (local read error or server hash-range failure).
+ */
+int
+sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, off_t off, off_t len,
+    int have_local_hash, uint64_t local_hash)
+{
+	uint64_t	 remote_hash = 0;
+	struct sftp_hash_range range;
+
+	if (conn == NULL || remote_path == NULL || len <= 0)
+		return -1;
+	if (!sftp_conn_has_hash_range(conn))
+		return -1;	/* submit only chunks supported servers; defensive */
+
+	/*
+	 * Local range hash.  When have_local_hash is set (an upload range whose
+	 * source XXH3 was teed during the transfer) re-use it - no re-read.
+	 * Otherwise read the local range back from disk (download dest, or an
+	 * untee'd upload range).
+	 */
+	if (!have_local_hash) {
+		if (local_path == NULL)
+			return -1;
+		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+		if (sftp_hpn_hash_range_ondisk(local_path, (uint64_t)off,
+		    (uint64_t)len, /*ondisk=*/1, &local_hash, NULL, NULL) != 0) {
+			error_f("verify: local range hash failed at %llu+%llu "
+			    "for \"%s\"", (unsigned long long)off,
+			    (unsigned long long)len, local_path);
+			sftp_conn_watchdog_resume(conn);
+			return -1;
+		}
+		sftp_conn_watchdog_resume(conn);
+	}
+
+	range.off = (uint64_t)off;
+	range.len = (uint64_t)len;
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	if (sftp_hpn_hash_remote_ranges(conn, remote_path, &range, 1,
+	    &remote_hash) != 0) {
+		sftp_conn_watchdog_resume(conn);
+		return -1;
+	}
+	sftp_conn_watchdog_resume(conn);
+
+	if (local_hash != remote_hash) {
+		error_f("verify: range [%llu+%llu) of \"%s\" MISMATCH - "
+		    "transferred file does NOT match source",
+		    (unsigned long long)off, (unsigned long long)len,
+		    remote_path);
+		return 1;
+	}
+	return 0;
+}
+
 int
 sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
     const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out)

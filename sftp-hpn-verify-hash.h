@@ -38,6 +38,16 @@ int sftp_hpn_hash_file_ondisk(const char *path, uint64_t length, int ondisk,
     uint64_t *hash_out, sftp_hpn_readback_progress cb, void *cb_arg);
 
 /*
+ * Range variant: hash [offset, offset+length) of `path`.  `offset` must be
+ * O_DIRECT-aligned in `ondisk` mode (verify chunks are >=256 MiB, so they are).
+ * Used by the range-granular parallel verify to read back one chunk of a large
+ * file.  Same return contract as sftp_hpn_hash_file_ondisk.
+ */
+int sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset,
+    uint64_t length, int ondisk, uint64_t *hash_out,
+    sftp_hpn_readback_progress cb, void *cb_arg);
+
+/*
  * Per-entry source-hash accumulator (bundle integrity, source side).
  * Implements the tar writer's data tap: XXH3 each bundled file's source bytes
  * as they are packed, keyed by archive_path.  Plug sftp_hpn_src_hashset_tap

@@ -42,8 +42,8 @@
 #define HPN_READBACK_ALIGN	4096
 
 int
-sftp_hpn_hash_file_ondisk(const char *path, uint64_t length, int ondisk,
-    uint64_t *hash_out, sftp_hpn_readback_progress cb, void *cb_arg)
+sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset, uint64_t length,
+    int ondisk, uint64_t *hash_out, sftp_hpn_readback_progress cb, void *cb_arg)
 {
 	int fd = -1, direct = 0, rc = -1;
 	XXH3_state_t *state = NULL;
@@ -104,6 +104,14 @@ sftp_hpn_hash_file_ondisk(const char *path, uint64_t length, int ondisk,
 		goto out;
 	}
 
+	/* Range start.  Callers pass O_DIRECT-aligned offsets (verify chunks are
+	 * >=256 MiB, so always block-aligned); offset 0 is the whole-file case. */
+	if (offset != 0 && lseek(fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
+		error_f("lseek \"%s\" to %llu: %s", path,
+		    (unsigned long long)offset, strerror(errno));
+		goto out;
+	}
+
 	remaining = length;
 	while (remaining > 0) {
 		/*
@@ -155,6 +163,15 @@ sftp_hpn_hash_file_ondisk(const char *path, uint64_t length, int ondisk,
 		close(fd);
 	free(buf);
 	return rc;
+}
+
+/* Whole-file convenience wrapper: hash [0, length). */
+int
+sftp_hpn_hash_file_ondisk(const char *path, uint64_t length, int ondisk,
+    uint64_t *hash_out, sftp_hpn_readback_progress cb, void *cb_arg)
+{
+	return sftp_hpn_hash_range_ondisk(path, 0, length, ondisk, hash_out,
+	    cb, cb_arg);
 }
 
 /* ── Source-hash accumulator (bundle pack-time source side) ───────────────

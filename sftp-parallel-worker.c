@@ -238,12 +238,58 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	 * a mismatch goes to verify_failed_paths, not a retry - so it always
 	 * returns 0 and worker_process_result just dec-pendings and frees it. */
 	if (u->op == SFTP_OP_VERIFY) {
+		struct sftp_parallel *p = w->parent;
+
+		/*
+		 * Range-granular: one transfer-range chunk of a large file.  Many
+		 * such units share the file's verify_job; the last to finish
+		 * (ranges_left -> 0) records the file as failed if any chunk
+		 * mismatched, and frees the job.
+		 */
+		if (u->verify_job != NULL) {
+			struct verify_job *j = u->verify_job;
+			int k = u->range_index;
+			/* Upload re-uses a teed source hash where one was stored;
+			 * download (and untee'd ranges) read the local range back. */
+			int have_teed = (!j->local_is_target && j->valid[k]);
+			int r;
+
+			r = sftp_hpn_verify_chunk(w->conn, j->local_path,
+			    j->remote_path, j->offs[k], j->lens[k],
+			    have_teed, have_teed ? j->hashes[k] : 0);
+			if (r == 1)	/* mismatch (corruption) */
+				__atomic_store_n(&j->failed, 1, __ATOMIC_RELAXED);
+			/* r == -1 (unverifiable: read or hash-range error) is NOT a
+			 * content failure - same as the whole-file path, warn only. */
+			u->verify_job = NULL;
+
+			/* Meter: this chunk's bytes are now hashed. */
+			__atomic_fetch_add(&p->verify_done_bytes,
+			    (uint64_t)j->lens[k], __ATOMIC_RELAXED);
+			sftp_conn_verify_inflight_set(w->conn, 0);
+
+			if (__atomic_sub_fetch(&j->ranges_left, 1,
+			    __ATOMIC_ACQ_REL) == 0) {
+				if (__atomic_load_n(&j->failed, __ATOMIC_RELAXED)) {
+					error_f("worker %d VERIFY FAILED: \"%s\" - "
+					    "transferred file does NOT match source",
+					    w->id, j->remote_path);
+					hpn_strlist_append(&p->verify_failed_paths,
+					    j->remote_path);
+				}
+				parallel_verify_job_free(j);
+			}
+			__atomic_fetch_add(&p->verify_done_units, 1,
+			    __ATOMIC_RELAXED);
+			return 0;
+		}
+
+		/* Whole-file / small / pre-19-server file: one unit per file. */
 		parallel_verify_and_free(w, u->verify_tracker);
 		u->verify_tracker = NULL;
 		/* Drive the verify-phase meter: count completed verifies (the
 		 * submit interleaves with draining, so pending is ambiguous). */
-		__atomic_fetch_add(&w->parent->verify_done_units, 1,
-		    __ATOMIC_RELAXED);
+		__atomic_fetch_add(&p->verify_done_units, 1, __ATOMIC_RELAXED);
 		/* Byte-granular meter: this file is fully hashed now, so fold its
 		 * final in-flight count into the phase's done-bytes total and
 		 * clear in-flight for this worker's next file (also leaves it 0
@@ -251,7 +297,7 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		{
 			uint64_t hashed =
 			    sftp_conn_verify_inflight_get(w->conn);
-			__atomic_fetch_add(&w->parent->verify_done_bytes, hashed,
+			__atomic_fetch_add(&p->verify_done_bytes, hashed,
 			    __ATOMIC_RELAXED);
 			sftp_conn_verify_inflight_set(w->conn, 0);
 		}

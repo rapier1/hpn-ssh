@@ -754,6 +754,31 @@ struct sftp_range_tracker {
 	int                      vslots_n;
 };
 
+/*
+ * Range-granular parallel verify: one large file's transfer ranges (vslots) are
+ * re-used as verify chunks that fan across the worker pool; they share this
+ * per-file job, built from the tracker at submit (the tracker is then freed).
+ * Each chunk compares the local range hash against the server's sftp-hash-range:
+ * for uploads a valid teed source hash is re-used (no re-read); otherwise the
+ * local range is read back (download dest, or any untee'd range).  ranges_left
+ * counts down (atomic, both the worker-completion and the unit-drop paths) and
+ * whoever drops it to 0 frees the job, recording remote_path as a failure if any
+ * chunk set `failed`.  paths + the parallel range arrays are owned by the job.
+ * local/remote are already direction-resolved (upload: local=source/remote=dest;
+ * download: local=dest/remote=source); local_is_target == download. */
+struct verify_job {
+	char     *local_path;
+	char     *remote_path;
+	int       local_is_target;	/* download=1 (no teed); upload=0 */
+	int       n_ranges;
+	off_t    *offs;
+	off_t    *lens;
+	uint64_t *hashes;		/* teed source hashes (upload) */
+	int      *valid;		/* whether hashes[i] is usable */
+	int       ranges_left;		/* atomic refcount */
+	int       failed;		/* atomic: any chunk mismatched */
+};
+
 struct sftp_work_unit {
 	enum sftp_op op;
 	char    *src_path;
@@ -810,8 +835,14 @@ struct sftp_work_unit {
 	/* SFTP_OP_VERIFY only: the completed range tracker parked at finalize.
 	 * The verify handler verifies it on the worker's own conn, frees it, and
 	 * NULLs this.  parallel_unit_free frees it if still set - i.e. the unit
-	 * was dropped before any worker ran it (abort / queue shutdown). */
+	 * was dropped before any worker ran it (abort / queue shutdown).
+	 * EITHER verify_tracker (whole-file / small-file / pre-19-server path) OR
+	 * verify_job (range-granular chunk path) is set, never both. */
 	struct sftp_range_tracker *verify_tracker;
+	/* SFTP_OP_VERIFY range-granular: one chunk [range_offset, range_length) of
+	 * a large file.  Many units share one verify_job; the last to finish frees
+	 * it.  parallel_unit_free decrements/frees it if the unit is dropped. */
+	struct verify_job *verify_job;
 	/* Retry-overflow list link (sftp-parallel.c retry_overflow_*).  A worker
 	 * re-queue that finds p->q full parks the unit here instead of blocking
 	 * (self-deadlock); the reporter drains it back into p->q as space frees.
@@ -1554,6 +1585,7 @@ void	 parallel_verify_park(struct sftp_parallel *,
 void	 parallel_verify_park_whole_file(struct sftp_parallel *,
 	    const char *local_path, const char *remote_path, int local_is_target);
 int	 parallel_verify_phase_submit(struct sftp_parallel *);
+void	 parallel_verify_job_free(struct verify_job *);
 
 /* sftp-parallel-respawn.c - spawn/respawn lifecycle */
 void	 parallel_respawn_teardown_ssh(struct sftp_worker *);

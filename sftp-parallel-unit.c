@@ -90,6 +90,15 @@ parallel_unit_free(struct sftp_work_unit *u)
 	 * before any worker ran it (abort / queue shutdown): free it here. */
 	if (u->verify_tracker != NULL)
 		parallel_verify_and_free(NULL, u->verify_tracker);
+	/* Range-granular verify: this dropped chunk still holds a reference to the
+	 * shared per-file job; release it (free the job on the last reference,
+	 * exactly like a completed chunk - just without recording a failure). */
+	if (u->verify_job != NULL) {
+		if (__atomic_sub_fetch(&u->verify_job->ranges_left, 1,
+		    __ATOMIC_ACQ_REL) == 0)
+			parallel_verify_job_free(u->verify_job);
+		u->verify_job = NULL;
+	}
 	free(u);
 }
 
@@ -113,9 +122,12 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path,
 	t->path       = xstrdup(path);
 	t->src_path   = (src_path != NULL) ? xstrdup(src_path) : NULL;
 	t->verify     = verify;
-	/* Per-range verify slots: upload (REMOTE target) + verify only; the
-	 * download path keeps the whole-file readback verify. */
-	t->vslots = (verify && target == SFTP_RANGE_TARGET_REMOTE && total > 0)
+	/* Per-range verify slots, allocated for BOTH directions when verifying so
+	 * the range-granular parallel verify can fan a big file's transfer ranges
+	 * across the pool.  Upload (REMOTE) tees a source hash into each slot
+	 * (valid=1); download (LOCAL) leaves valid=0 and reads the dest range back
+	 * at verify time.  Either way submit_*_ranges fills off/len. */
+	t->vslots = (verify && total > 0)
 	    ? xcalloc((size_t)total, sizeof(*t->vslots)) : NULL;
 	t->vslots_n = (t->vslots != NULL) ? total : 0;
 	t->active_writers = 0;
@@ -420,19 +432,71 @@ parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
 	parallel_verify_park(p, t);
 }
 
+/* Free a range-granular verify job (paths + the per-range arrays). */
+void
+parallel_verify_job_free(struct verify_job *j)
+{
+	if (j == NULL)
+		return;
+	free(j->local_path);
+	free(j->remote_path);
+	free(j->offs);
+	free(j->lens);
+	free(j->hashes);
+	free(j->valid);
+	free(j);
+}
+
 /*
- * Submit every parked tracker as an SFTP_OP_VERIFY work unit.  Called from
- * sftp_parallel_wait once the transfer queue has drained: the now idle workers
- * pull the verify units off the same queue and run each verify on their own
- * connection (across-file parallel).  The verify handler frees the tracker;
- * a submit the queue rejects (abort/shutdown) frees it via parallel_unit_free
- * (it owns the tracker through u->verify_tracker).
+ * Build a per-file verify job from a completed range tracker: copy the transfer
+ * ranges (vslots) - the teed source hashes among them - into the job and resolve
+ * the direction.  Upload (REMOTE target): local=source/remote=dest, teed source
+ * hashes apply.  Download (LOCAL target): local=dest/remote=source, no teed.
+ */
+static struct verify_job *
+build_verify_job(struct sftp_range_tracker *t)
+{
+	struct verify_job *j = xcalloc(1, sizeof(*j));
+	int n = t->vslots_n, k;
+
+	j->local_is_target = (t->target == SFTP_RANGE_TARGET_LOCAL);
+	if (j->local_is_target) {
+		j->local_path = xstrdup(t->path);	/* dest */
+		j->remote_path = xstrdup(t->src_path);	/* source */
+	} else {
+		j->local_path = xstrdup(t->src_path);	/* source */
+		j->remote_path = xstrdup(t->path);	/* dest */
+	}
+	j->n_ranges = n;
+	j->ranges_left = n;
+	j->offs = xcalloc((size_t)n, sizeof(*j->offs));
+	j->lens = xcalloc((size_t)n, sizeof(*j->lens));
+	j->hashes = xcalloc((size_t)n, sizeof(*j->hashes));
+	j->valid = xcalloc((size_t)n, sizeof(*j->valid));
+	for (k = 0; k < n; k++) {
+		j->offs[k] = (off_t)t->vslots[k].off;
+		j->lens[k] = (off_t)t->vslots[k].len;
+		j->hashes[k] = t->vslots[k].hash;
+		j->valid[k] = t->vslots[k].valid;
+	}
+	return j;
+}
+
+/*
+ * Submit the parked files as SFTP_OP_VERIFY work units, drained by the idle
+ * workers over their own connections.  Range-split files (vslots present, server
+ * advertises sftp-hash-range) fan ONE unit per transfer range across the pool
+ * (range-granular within-file parallel verify); each shares the file's verify
+ * job and the last range to finish frees it.  Whole-file / small / pre-19-server
+ * files stay one unit per file carrying the tracker (parallel_verify_and_free).
+ * Returns the total UNIT count (= chunks, not files) for the phase meter.
  */
 int
 parallel_verify_phase_submit(struct sftp_parallel *p)
 {
 	struct sftp_range_tracker **arr;
-	int i, n;
+	struct sftp_work_unit **units = NULL;
+	int i, n, can_chunk, nunits = 0, ucap = 0;
 
 	pthread_mutex_lock(&p->verify_pending_mu);
 	arr = p->verify_pending;
@@ -442,19 +506,58 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
 	p->verify_pending_cap = 0;
 	pthread_mutex_unlock(&p->verify_pending_mu);
 
-	for (i = 0; i < n; i++) {
-		struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
+	/* Range-granular verify needs the server's sftp-hash-range; all workers
+	 * talk to the same server, so one worker's conn answers for the fleet. */
+	can_chunk = (p->num_workers > 0 && p->workers[0] != NULL &&
+	    p->workers[0]->conn != NULL &&
+	    sftp_conn_has_hash_range(p->workers[0]->conn));
 
-		u->op = SFTP_OP_VERIFY;
-		u->verify_tracker = arr[i];
-		/* range_tracker NULL: skips the writer-cap gate + ensure-file.
-		 * size 0: no throughput double-count.  paths NULL: the tracker
-		 * carries them.  On submit failure parallel_unit_free frees the
-		 * tracker via u->verify_tracker. */
-		(void)parallel_unit_submit(p, u);
+	for (i = 0; i < n; i++) {
+		struct sftp_range_tracker *t = arr[i];
+
+		if (can_chunk && t->vslots != NULL && t->vslots_n > 0) {
+			struct verify_job *j = build_verify_job(t);
+			int k;
+
+			parallel_verify_and_free(NULL, t);	/* free; no verify */
+			for (k = 0; k < j->n_ranges; k++) {
+				struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
+
+				u->op = SFTP_OP_VERIFY;
+				u->verify_job = j;
+				u->range_index = k;
+				u->range_offset = j->offs[k];
+				u->range_length = j->lens[k];
+				if (nunits == ucap) {
+					ucap = ucap ? ucap * 2 : 64;
+					units = xreallocarray(units,
+					    (size_t)ucap, sizeof(*units));
+				}
+				units[nunits++] = u;
+			}
+		} else {
+			struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
+
+			u->op = SFTP_OP_VERIFY;
+			u->verify_tracker = t;
+			if (nunits == ucap) {
+				ucap = ucap ? ucap * 2 : 64;
+				units = xreallocarray(units, (size_t)ucap,
+				    sizeof(*units));
+			}
+			units[nunits++] = u;
+		}
 	}
 	free(arr);
-	return n;
+
+	/* Set the unit total BEFORE pushing so the reporter's 100%-snap gate
+	 * (done_units >= total) can't fire early while we are still submitting. */
+	p->verify_total_units = (uint64_t)nunits;
+
+	for (i = 0; i < nunits; i++)
+		(void)parallel_unit_submit(p, units[i]);
+	free(units);
+	return nunits;
 }
 
 /*
@@ -1186,8 +1289,16 @@ submit_download_ranges(struct sftp_parallel *p,
 		off_t offset = (off_t)i * range_size;
 		off_t length = (i == effective_ranges - 1) ?
 		    (file_size - offset) : range_size;
-		if (parallel_unit_submit(p, make_download_range_unit(remote_path, local_path,
-		    offset, length, tracker)) != 0) {
+		struct sftp_work_unit *ru = make_download_range_unit(remote_path,
+		    local_path, offset, length, tracker);
+		/* Record the range geometry for the range-granular verify.  Download
+		 * tees no source hash, so valid stays 0 and the verify reads the
+		 * dest range back; only off/len are needed here. */
+		if (ru != NULL && tracker->vslots != NULL) {
+			tracker->vslots[i].off = (u_int64_t)offset;
+			tracker->vslots[i].len = (u_int64_t)length;
+		}
+		if (parallel_unit_submit(p, ru) != 0) {
 			/* Under an abort the refusal is expected fallout
 			 * (queue is shut), not a fault - keep it quiet. */
 			if (p->abort_flag)
