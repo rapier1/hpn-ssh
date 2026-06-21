@@ -155,13 +155,28 @@ int global_fflag = 0;
  * it is logged loudly and recorded; at exit a summary is printed and the
  * process returns SFTP_EX_VERIFY_FAILED (57).
  */
-static int hpn_verify_transfer = 0;
-static int verify_flag_user = 0;	/* -V: force HPNVerifyTransfer on */
+static int hpn_verify_transfer = 0;	/* session-global -V (program switch) */
+static int verify_flag_user = 0;	/* -V program switch -> hpn_verify_transfer */
 static char **verify_fail_list = NULL;
 static u_int verify_fail_count = 0;
 
 /* SIGINT received during command processing */
 volatile sig_atomic_t interrupted = 0;
+
+/*
+ * Toggle the post-transfer whole-file verify phase for the next command on
+ * both the single-stream connection and (when engaged) the parallel
+ * orchestrator.  put/get/-V/getv/putv set it on; the resume verbs set it off
+ * (they use the chunked-resume verify path instead).  Forward declaration of
+ * parallel_orch is above; the accessors no-op on NULL.
+ */
+static void
+verify_set_for_command(struct sftp_conn *conn, int on)
+{
+	sftp_conn_set_verify_transfer(conn, on);
+	if (parallel_orch != NULL)
+		sftp_parallel_set_verify_transfer(parallel_orch, on);
+}
 
 /* I wish qsort() took a separate ctx for the comparison function...*/
 int sort_flag;
@@ -206,6 +221,7 @@ enum sftp_command {
 	I_DEFER,
 	I_DF,
 	I_GET,
+	I_VGET,
 	I_HELP,
 	I_LCHDIR,
 	I_LINK,
@@ -216,6 +232,7 @@ enum sftp_command {
 	I_LUMASK,
 	I_MKDIR,
 	I_PUT,
+	I_VPUT,
 	I_PWD,
 	I_QUIT,
 	I_REGET,
@@ -258,6 +275,7 @@ static const struct CMD cmds[] = {
 	{ "dir",	I_LS,		REMOTE,		NOARGS	},
 	{ "exit",	I_QUIT,		NOARGS,		NOARGS	},
 	{ "get",	I_GET,		REMOTE,		LOCAL	},
+	{ "getv",	I_VGET,		REMOTE,		LOCAL	},
 	{ "help",	I_HELP,		NOARGS,		NOARGS	},
 	{ "lcd",	I_LCHDIR,	LOCAL,		NOARGS	},
 	{ "lchdir",	I_LCHDIR,	LOCAL,		NOARGS	},
@@ -272,6 +290,7 @@ static const struct CMD cmds[] = {
 	{ "mput",	I_PUT,		LOCAL,		REMOTE	},
 	{ "progress",	I_PROGRESS,	NOARGS,		NOARGS	},
 	{ "put",	I_PUT,		LOCAL,		REMOTE	},
+	{ "putv",	I_VPUT,		LOCAL,		REMOTE	},
 	{ "pwd",	I_PWD,		REMOTE,		NOARGS	},
 	{ "quit",	I_QUIT,		NOARGS,		NOARGS	},
 	{ "reget",	I_REGET,	REMOTE,		LOCAL	},
@@ -368,7 +387,8 @@ help(void)
 	    "df [-hi] [path]                    Display statistics for current directory or\n"
 	    "                                   filesystem containing 'path'\n"
 	    "exit                               Quit sftp\n"
-	    "get [-afpRv] remote [local]        Download file (-v: verified resume)\n"
+	    "get [-afpRV] remote [local]        Download file (-V: verify integrity)\n"
+	    "getv [-afpR] remote [local]        Download file and verify integrity\n"
 	    "help                               Display this help text\n"
 	    "lcd path                           Change local directory to 'path'\n"
 	    "lls [ls-options [path]]            Display local directory listing\n"
@@ -379,7 +399,8 @@ help(void)
 	    "lumask umask                       Set local umask to 'umask'\n"
 	    "mkdir path                         Create remote directory\n"
 	    "progress                           Toggle display of progress meter\n"
-	    "put [-afpRv] local [remote]        Upload file (-v: verified resume)\n"
+	    "put [-afpRV] local [remote]        Upload file (-V: verify integrity)\n"
+	    "putv [-afpR] local [remote]        Upload file and verify integrity\n"
 	    "pwd                                Display remote working directory\n"
 	    "quit                               Quit sftp\n"
 	    "reget [-fpR] remote [local]        Resume download file\n"
@@ -481,7 +502,7 @@ parse_getput_flags(const char *cmd, char **argv, int argc,
 	opterr = 0;
 
 	*aflag = *fflag = *rflag = *pflag = *vflag = 0;
-	while ((ch = getopt(argc, argv, "afPpRrv")) != -1) {
+	while ((ch = getopt(argc, argv, "afPpRrV")) != -1) {
 		switch (ch) {
 		case 'a':
 			*aflag = 1;
@@ -497,9 +518,12 @@ parse_getput_flags(const char *cmd, char **argv, int argc,
 		case 'R':
 			*rflag = 1;
 			break;
-		case 'v':
+		case 'V':
+			/* Integrity verify (capital V; lowercase v is verbose).
+			 * Verify only - resume comes from the verb (reput/reget),
+			 * so put/get -V is a fresh post-transfer verify while
+			 * reput/reget -V is a resume+chunked verify. */
 			*vflag = 1;
-			*aflag = 1;
 			break;
 		default:
 			error("%s: Invalid flag -%c", cmd, optopt);
@@ -2137,11 +2161,13 @@ parse_args(const char **cpp, int *ignore_errors, int *disable_echo, int *aflag,
 	optidx = 1;
 	switch (cmdnum) {
 	case I_GET:
+	case I_VGET:
 	case I_REGET:
 	case I_VREGET:
 	case I_REPUT:
 	case I_VREPUT:
 	case I_PUT:
+	case I_VPUT:
 		if ((optidx = parse_getput_flags(cmd, argv, argc,
 		    aflag, fflag, pflag, rflag, vflag)) == -1)
 			return -1;
@@ -2334,28 +2360,44 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		err = -1;
 		break;
 	case I_VREGET:
-		aflag = 1;
-		err = process_get(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag, 1 /* verify */);
-		break;
+		vflag = 1;
+		/* FALLTHROUGH */
 	case I_REGET:
+		/* Resume download.  -V here is the RESUME verify: the chunked
+		 * sftp-hash-range path (verifies what it resumed), not the
+		 * post-transfer phase. */
 		aflag = 1;
+		verify_set_for_command(conn, 0);
+		err = process_get(conn, path1, path2, *pwd, pflag,
+		    rflag, aflag, fflag, vflag || hpn_verify_transfer);
+		break;
+	case I_VGET:
+		vflag = 1;
 		/* FALLTHROUGH */
 	case I_GET:
+		/* Fresh download.  -V (or the session-global -V) runs the
+		 * post-transfer whole-file verify phase for this command; the
+		 * chunked-resume verify arg stays 0 (nothing to resume). */
+		verify_set_for_command(conn, vflag || hpn_verify_transfer);
 		err = process_get(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag, vflag /* verify */);
+		    rflag, aflag, fflag, 0 /* not chunked-resume verify */);
 		break;
 	case I_VREPUT:
-		aflag = 1;
-		err = process_put(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag, 1 /* verify */);
-		break;
+		vflag = 1;
+		/* FALLTHROUGH */
 	case I_REPUT:
 		aflag = 1;
+		verify_set_for_command(conn, 0);
+		err = process_put(conn, path1, path2, *pwd, pflag,
+		    rflag, aflag, fflag, vflag || hpn_verify_transfer);
+		break;
+	case I_VPUT:
+		vflag = 1;
 		/* FALLTHROUGH */
 	case I_PUT:
+		verify_set_for_command(conn, vflag || hpn_verify_transfer);
 		err = process_put(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag, vflag /* verify */);
+		    rflag, aflag, fflag, 0 /* not chunked-resume verify */);
 		break;
 	case I_COPY:
 		path1 = sftp_make_absolute(path1, *pwd);

@@ -390,6 +390,14 @@ void sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
     volatile sig_atomic_t *flag);
 
 /*
+ * Enable/disable the post-transfer verify phase for work submitted from here
+ * on.  The interactive client toggles this per command (put/getv enable it,
+ * resume verbs disable it) since one orchestrator persists across commands.
+ * No-op when p is NULL.
+ */
+void sftp_parallel_set_verify_transfer(struct sftp_parallel *p, int on);
+
+/*
  * Register an app-layer round-trip-time estimate (microseconds) for the
  * remote path.  Used by the reporter's tput-outlier check to compute a
  * BDP-sized warmup threshold so newly-respawned workers in TCP slow-start

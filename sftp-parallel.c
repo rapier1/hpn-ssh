@@ -955,6 +955,13 @@ sftp_parallel_num_streams(const struct sftp_parallel *p)
 	return (p != NULL) ? p->cfg.num_streams : 1;
 }
 
+void
+sftp_parallel_set_verify_transfer(struct sftp_parallel *p, int on)
+{
+	if (p != NULL)
+		p->cfg.verify_transfer = on ? 1 : 0;
+}
+
 int
 sftp_parallel_follow_link_flag(const struct sftp_parallel *p)
 {
