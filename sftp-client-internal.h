@@ -123,16 +123,6 @@ void sftp_conn_set_verify_repair(struct sftp_conn *conn, int enabled,
 	int attempts);
 
 /*
- * HPNVerifyTransfer (1b): consume the inline source hash computed during the
- * just-finished upload on this connection, if it covers expect_bytes.  Returns
- * 0 and writes the hash to *hash_out on success; -1 if unavailable (the verify
- * caller then re-reads the source).  Bridges conn -> conn->hpn for the verify
- * module.  Safe with conn / conn->hpn NULL.
- */
-int  sftp_conn_verify_src_take(struct sftp_conn *conn, uint64_t expect_bytes,
-	uint64_t *hash_out);
-
-/*
  * Park a transferred file for the classic post-transfer verify phase, called
  * at the end of sftp_upload (local_is_target=0) and sftp_download
  * (local_is_target=1).  No-op unless verify_transfer_enabled and skipped on

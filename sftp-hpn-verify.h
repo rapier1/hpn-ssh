@@ -67,29 +67,13 @@ int sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
  * (server=remote on upload, local on download) as its convergence baseline.
  */
 int sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, off_t off, off_t len,
+    const char *remote_path, off_t off, off_t len, int local_is_target,
     int have_local_hash, uint64_t local_hash,
     uint64_t *local_hash_out, uint64_t *remote_hash_out);
 
 int sftp_hpn_xxhash_local_fd(struct sftp_conn *, int, uint64_t, uint64_t *);
 int sftp_hpn_hash_remote_file(struct sftp_conn *, const char *, uint64_t,
     uint64_t *);
-/*
- * Post-transfer integrity check.  local_is_target is 1 when the local file is
- * one this host just wrote (a download): its hash is taken as a fsync+O_DIRECT
- * read-back of what landed on disk.  0 when the local file is the source (an
- * upload): the hash comes from the inline accumulator or a buffered re-read.
- *
- * trust_inline_src applies only to the upload case (local_is_target 0): 1 lets
- * the source hash come from the per-connection inline accumulator - safe only
- * when this verify runs on the connection that just uploaded THIS file (the
- * classic inline path).  0 forces a fresh source re-read.  The decoupled
- * post-transfer verify MUST pass 0: it can run on a different connection than
- * the uploader, where the accumulator (keyed by size alone) may hold another
- * same-size file's hash.
- */
-int sftp_hpn_verify_transfer(struct sftp_conn *, const char *, const char *,
-    int local_is_target, int trust_inline_src, uint64_t *dest_hash_out);
 int sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
     u_int64_t *hash_out);
 
@@ -182,7 +166,8 @@ void sftp_hpn_verify_repair_resolve(int no_verify_repair_cli,
  * server lacks hpn-check-file or a read error; caller treats as "skipped").
  */
 int sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, int local_is_target,
+    const char *remote_path, int local_is_target, off_t off, off_t len,
+    int have_local_hash, uint64_t local_hash,
     int repair_enabled, int max_attempts);
 
 #endif /* SFTP_HPN_VERIFY_H */

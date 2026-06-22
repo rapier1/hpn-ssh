@@ -92,9 +92,7 @@ parallel_unit_free(struct sftp_work_unit *u)
 		parallel_verify_and_free(NULL, u->verify_tracker);
 	/* Range-granular verify: this dropped chunk still holds a reference to the
 	 * shared per-file job; release it (free the job on the last reference,
-	 * exactly like a completed chunk - just without recording a failure).
-	 * SFTP_OP_REPAIR units only BORROW the job (the repair phase owns it on
-	 * p->repair_pending), so they never touch the refcount or free it. */
+	 * exactly like a completed chunk - just without recording a failure). */
 	if (u->verify_job != NULL) {
 		if (u->op == SFTP_OP_VERIFY &&
 		    __atomic_sub_fetch(&u->verify_job->ranges_left, 1,
@@ -408,10 +406,9 @@ parallel_verify_park(struct sftp_parallel *p, struct sftp_range_tracker *t)
 }
 
 /*
- * Auto-repair (#6): hand a verify_job that had >=1 mismatched chunk to the
- * post-verify repair phase instead of freeing it.  The phase (in
- * sftp_parallel_wait) re-transfers the failed ranges, re-verifies, and frees
- * the job.  Mirrors parallel_verify_park.
+ * Record a file whose post-transfer verify (and its inline auto-repair) could
+ * not be made to match, naming the DEST, so the run summary reports it and
+ * hpnsftp exits SFTP_EX_VERIFY_FAILED.
  */
 void
 parallel_verify_fail_record(struct sftp_parallel *p, int local_is_target,
@@ -425,20 +422,6 @@ parallel_verify_fail_record(struct sftp_parallel *p, int local_is_target,
 	    local_is_target ? local_path : remote_path);
 	hpn_strlist_append(&p->verify_failed_paths, desc);
 	free(desc);
-}
-
-void
-parallel_repair_park(struct sftp_parallel *p, struct verify_job *j)
-{
-	pthread_mutex_lock(&p->repair_pending_mu);
-	if (p->repair_pending_n == p->repair_pending_cap) {
-		int ncap = p->repair_pending_cap ? p->repair_pending_cap * 2 : 16;
-		p->repair_pending = xreallocarray(p->repair_pending,
-		    (size_t)ncap, sizeof(*p->repair_pending));
-		p->repair_pending_cap = ncap;
-	}
-	p->repair_pending[p->repair_pending_n++] = j;
-	pthread_mutex_unlock(&p->repair_pending_mu);
 }
 
 /*
@@ -481,8 +464,6 @@ parallel_verify_job_free(struct verify_job *j)
 	free(j->lens);
 	free(j->hashes);
 	free(j->valid);
-	free(j->range_failed);
-	free(j->range_dest_hash);
 	free(j);
 }
 
@@ -512,9 +493,6 @@ build_verify_job(struct sftp_range_tracker *t)
 	j->lens = xcalloc((size_t)n, sizeof(*j->lens));
 	j->hashes = xcalloc((size_t)n, sizeof(*j->hashes));
 	j->valid = xcalloc((size_t)n, sizeof(*j->valid));
-	/* Auto-repair (#6): per-chunk failure markers + dest-hash baseline. */
-	j->range_failed = xcalloc((size_t)n, sizeof(*j->range_failed));
-	j->range_dest_hash = xcalloc((size_t)n, sizeof(*j->range_dest_hash));
 	for (k = 0; k < n; k++) {
 		j->offs[k] = (off_t)t->vslots[k].off;
 		j->lens[k] = (off_t)t->vslots[k].len;

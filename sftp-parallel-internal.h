@@ -599,10 +599,8 @@ enum sftp_op {
 	SFTP_OP_DOWNLOAD_RANGE,	/* download a byte range of a large file */
 	SFTP_OP_BUNDLE_UPLOAD,	/* container: members[] packed as one tar stream */
 	SFTP_OP_BUNDLE_DOWNLOAD,/* container: members[] fetched as one tar stream */
-	SFTP_OP_VERIFY,		/* post-transfer verify of a parked range tracker */
-	SFTP_OP_REPAIR,		/* auto-repair (#6): re-transfer + re-verify ONE
-				 * failed verify chunk; BORROWS the verify_job
-				 * (the repair phase owns it - no refcount) */
+	SFTP_OP_VERIFY,		/* post-transfer verify (+ inline auto-repair) of
+				 * a parked range tracker */
 };
 
 /* -- Per-file range-completion tracker --------------------------------
@@ -779,17 +777,7 @@ struct verify_job {
 	uint64_t *hashes;		/* teed source hashes (upload) */
 	int      *valid;		/* whether hashes[i] is usable */
 	int       ranges_left;		/* atomic refcount */
-	int       failed;		/* atomic: any chunk mismatched */
-	/* Auto-repair (#6): which chunks mismatched + the dest-side hash captured
-	 * at detection.  Allocated with the range arrays in build_verify_job
-	 * (sized n_ranges, ~12 B/range) - eager, not lazy, so each chunk worker
-	 * writes only its OWN index with no allocation race.  range_failed[k]=1
-	 * marks chunk k for the repair phase; range_dest_hash[k] is the hash of
-	 * the WRITTEN side (server hash on upload, local O_DIRECT hash on
-	 * download) - the convergence baseline: a re-transfer that leaves it
-	 * unchanged is a deterministic media fault. */
-	int      *range_failed;
-	uint64_t *range_dest_hash;
+	int       failed;		/* atomic: any chunk's inline repair failed */
 };
 
 struct sftp_work_unit {
@@ -1288,19 +1276,12 @@ struct sftp_parallel {
 	int                         verify_pending_n;
 	int                         verify_pending_cap;
 
-	/* Auto-repair (#6): after the verify phase drains, any range-granular
-	 * verify_job that recorded a chunk mismatch is handed here (instead of
-	 * freed) so a bounded repair phase can re-transfer the bad ranges and
-	 * re-verify.  ON by default; HPN_NO_VERIFY_REPAIR disables the whole
-	 * branch.  verify_repair_attempts is the per-range attempt cap (3).
-	 * Guarded by repair_pending_mu (appended from worker threads at the last
-	 * chunk of a failed job). */
+	/* Auto-repair: on a post-transfer verify mismatch the worker splices the
+	 * bad 64 MiB sub-chunks of its range inline and re-verifies, bounded by
+	 * the attempt cap + convergence.  ON by default; HPN_NO_VERIFY_REPAIR (or
+	 * -X VerifyRepair=no) disables; verify_repair_attempts is the cap (3). */
 	int                         verify_repair_enabled;
 	int                         verify_repair_attempts;
-	pthread_mutex_t             repair_pending_mu;
-	struct verify_job         **repair_pending;
-	int                         repair_pending_n;
-	int                         repair_pending_cap;
 
 	pthread_t                   reporter_tid;
 	int                         reporter_started;
@@ -1613,10 +1594,6 @@ void	 parallel_verify_park_whole_file(struct sftp_parallel *,
 	    const char *local_path, const char *remote_path, int local_is_target);
 int	 parallel_verify_phase_submit(struct sftp_parallel *);
 void	 parallel_verify_job_free(struct verify_job *);
-/* Auto-repair (#6): hand a failed verify_job to the post-verify repair phase
- * (mirrors parallel_verify_park; appends to p->repair_pending under its mu).
- * The repair phase then owns and frees the job. */
-void	 parallel_repair_park(struct sftp_parallel *, struct verify_job *);
 /* Record a verify failure in verify_failed_paths naming the DEST - the written
  * file that is actually corrupt: remote on upload, local on download - with a
  * "local file"/"remote file" label, so the end-of-run summary points at the

@@ -470,124 +470,6 @@ sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
 }
 
 /*
- * Post-transfer integrity check (HPNVerifyTransfer): XXH3 the full local
- * file and the full remote file and compare.  Used by both single-stream
- * (sftp/scp) and parallel paths to confirm a completed transfer matches
- * end-to-end - catches client/server disk corruption, range-offset bugs,
- * and crash-resume sparse-zero holes that the SSH MAC and size checks miss.
- *
- * Returns:
- *    0  hashes match (transfer verified good)
- *    1  hashes differ (CORRUPTION - caller warns + exits SFTP_EX_VERIFY_FAILED)
- *   -1  could not verify (server lacks hpn-check-file, open/hash error) -
- *       caller should warn that verification was skipped, but this is NOT
- *       a content-mismatch failure.
- */
-/* Keep the connection watchdog paused while a long on-disk read-back runs. */
-static void
-verify_readback_progress(void *arg, uint64_t bytes)
-{
-	struct sftp_conn *conn = (struct sftp_conn *)arg;
-
-	/* Download verify: this host is doing the hashing locally, so `bytes`
-	 * (cumulative bytes read back) is the meter's progress feed. */
-	sftp_conn_verify_inflight_set(conn, bytes);
-	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-}
-
-int
-sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, int local_is_target, int trust_inline_src,
-    uint64_t *dest_hash_out)
-{
-	int fd, r = -1;
-	struct stat sb;
-	uint64_t local_hash, remote_hash;
-	const char *mode;
-
-	if (!sftp_conn_has_hpn_check_file(conn)) {
-		debug_f("cannot verify \"%s\": server lacks "
-		    "hpn-check-file@hpnssh.org", remote_path);
-		return -1;
-	}
-	if (stat(local_path, &sb) == -1) {
-		error("verify: stat local \"%s\": %s",
-		    local_path, strerror(errno));
-		return -1;
-	}
-
-	if (local_is_target) {
-		/*
-		 * Download: this host just wrote local_path.  Hash it as a
-		 * fsync+O_DIRECT read-back so we verify what landed on disk,
-		 * not what sits in the page cache - the download-side mirror of
-		 * the server's upload-target read-back.
-		 */
-		mode = "readback";
-		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-		if (sftp_hpn_hash_file_ondisk(local_path, (uint64_t)sb.st_size,
-		    /*ondisk=*/1, &local_hash, verify_readback_progress,
-		    conn) != 0) {
-			sftp_conn_watchdog_resume(conn);
-			return -1;
-		}
-		sftp_conn_watchdog_resume(conn);
-	} else if (trust_inline_src &&
-	    sftp_conn_verify_src_take(conn, (uint64_t)sb.st_size,
-	    &local_hash) == 0) {
-		/*
-		 * Upload: the source hash was accumulated inline during the
-		 * read-to-send (1b); no second read of the source.  Only trusted
-		 * when this verify runs on the same connection that just
-		 * uploaded this file - the accumulator is keyed by size alone,
-		 * so the decoupled post-transfer path passes trust_inline_src=0
-		 * and falls through to the re-read below.
-		 */
-		mode = "inline";
-	} else {
-		/* Upload, inline unavailable: buffered re-read of the source. */
-		mode = "reread";
-		if ((fd = open(local_path, O_RDONLY)) == -1) {
-			error("verify: open local \"%s\": %s",
-			    local_path, strerror(errno));
-			return -1;
-		}
-		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-		if (sftp_hpn_xxhash_local_fd(conn, fd, (uint64_t)sb.st_size,
-		    &local_hash) != 0) {
-			sftp_conn_watchdog_resume(conn);
-			close(fd);
-			return -1;
-		}
-		sftp_conn_watchdog_resume(conn);
-		close(fd);
-	}
-
-	/*
-	 * Post-transfer integrity check: the server always computes the real
-	 * XXH3 off the platter - there is no trust shortcut to opt out of.
-	 */
-	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-	if (sftp_hpn_hash_remote_file(conn, remote_path, (uint64_t)sb.st_size,
-	    &remote_hash) == 0) {
-		r = (local_hash == remote_hash) ? 0 : 1;
-		/* Report the WRITTEN side's hash (remote on upload, local on
-		 * download) so the repair convergence check can compare it
-		 * across attempts.  Only meaningful when the compare was
-		 * reached (r is 0 or 1), so leave *dest_hash_out untouched on
-		 * the -1 early-outs above. */
-		if (dest_hash_out != NULL)
-			*dest_hash_out = local_is_target ? local_hash
-			    : remote_hash;
-	}
-	sftp_conn_watchdog_resume(conn);
-	debug3_f("verify \"%s\": local=%016llx remote=%016llx result=%d (%s)",
-	    remote_path, (unsigned long long)local_hash,
-	    (unsigned long long)remote_hash, r, mode);
-	return r;
-}
-
-/*
  * Per-range post-transfer verify for a range-split upload.  Once a file is
  * split across workers the inline whole-file source tee is unavailable, so
  * each range's source hash is supplied by the worker's send-time tee in
@@ -717,7 +599,7 @@ sftp_hpn_verify_transfer_ranges(struct sftp_conn *conn,
  */
 int
 sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, off_t off, off_t len,
+    const char *remote_path, off_t off, off_t len, int local_is_target,
     int have_local_hash, uint64_t local_hash,
     uint64_t *local_hash_out, uint64_t *remote_hash_out)
 {
@@ -739,8 +621,15 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 		if (local_path == NULL)
 			return -1;
 		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+		/*
+		 * O_DIRECT platter read-back only for the WRITTEN side (a
+		 * download dest); an upload source is read buffered - its cache
+		 * already reflects the on-disk content and the warm re-read is
+		 * cheaper, matching the whole-file verify path.
+		 */
 		if (sftp_hpn_hash_range_ondisk(local_path, (uint64_t)off,
-		    (uint64_t)len, /*ondisk=*/1, &local_hash, NULL, NULL) != 0) {
+		    (uint64_t)len, /*ondisk=*/local_is_target, &local_hash,
+		    NULL, NULL) != 0) {
 			error_f("verify: local range hash failed at %llu+%llu "
 			    "for \"%s\"", (unsigned long long)off,
 			    (unsigned long long)len, local_path);
@@ -969,21 +858,44 @@ out:
 	return rc;
 }
 
-int
-sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
-    const char *local_path, const char *remote_path, off_t file_size)
+/*
+ * Chunked reconciliation of a span [span_off, span_off+span_len) of a file:
+ * hash the span in 64 MiB chunks on both sides (local via the O_DIRECT-capable
+ * range read, remote via sftp-hash-range), then splice each contiguous run of
+ * mismatched chunks in place - sftp_upload_range (upload: local_is_target 0,
+ * source -> remote dest) or sftp_download_range (download: local_is_target 1,
+ * remote source -> local dest).  Only the mismatched chunks move, not the gaps
+ * between them.
+ *
+ * This is the single splice engine behind BOTH verified resume (whole file,
+ * span = [0, size)) and per-range auto-repair (an arbitrary sub-range).
+ *
+ * Returns 1 (every chunk already matched - nothing to do), 0 (one or more runs
+ * spliced successfully), or -1 (declined: server lacks sftp-hash-range, span
+ * below the chunk floor, chunk count over the cap, or a local/remote hash or
+ * transfer error - the caller falls back to a whole-span re-transmit).  A
+ * partial failure mid-run leaves the destination indeterminate, hence -1 +
+ * fallback.
+ */
+static int
+chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
+    const char *local_path, const char *remote_path,
+    off_t span_off, off_t span_len, int local_is_target)
 {
 	struct sftp_hash_range	*ranges = NULL;
 	u_int64_t		*local_hashes = NULL;
 	u_int64_t		*remote_hashes = NULL;
-	u_int64_t		 fsize;
-	u_int64_t		 bytes_retransferred = 0;
+	u_int64_t		 slen, soff, bytes_moved = 0;
+	const char		*ing = local_is_target ? "re-fetching"
+				    : "re-transferring";
+	const char		*ed = local_is_target ? "re-fetched"
+				    : "re-transferred";
 	u_int			 n_chunks, n_mismatched = 0;
 	u_int			 i;
 	int			 rc = -1;
 
 	if (conn == NULL || local_path == NULL || remote_path == NULL ||
-	    local_fd < 0 || file_size <= 0)
+	    local_fd < 0 || span_len <= 0)
 		return -1;
 
 	if (!sftp_conn_has_hash_range(conn)) {
@@ -991,19 +903,21 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 		    "for \"%s\"", local_path);
 		return -1;
 	}
-	fsize = (u_int64_t)file_size;
-	if (fsize < CHUNK_HASH_MIN_FILE_SIZE) {
-		debug_f("file \"%s\" size %llu below chunked threshold %llu; "
-		    "declining", local_path, (unsigned long long)fsize,
+	slen = (u_int64_t)span_len;
+	soff = (u_int64_t)span_off;
+	if (slen < CHUNK_HASH_MIN_FILE_SIZE) {
+		debug_f("span %llu of \"%s\" below chunked threshold %llu; "
+		    "declining", (unsigned long long)slen, local_path,
 		    (unsigned long long)CHUNK_HASH_MIN_FILE_SIZE);
 		return -1;
 	}
 
-	n_chunks = (u_int)((fsize + CHUNK_HASH_CHUNK_SIZE - 1) /
+	n_chunks = (u_int)((slen + CHUNK_HASH_CHUNK_SIZE - 1) /
 	    CHUNK_HASH_CHUNK_SIZE);
 	if (n_chunks > CHUNK_HASH_MAX_RANGES_PER_REQUEST) {
-		debug_f("file \"%s\" would need %u chunks > cap %u; declining",
-		    local_path, n_chunks, CHUNK_HASH_MAX_RANGES_PER_REQUEST);
+		debug_f("span of \"%s\" would need %u chunks > cap %u; "
+		    "declining", local_path, n_chunks,
+		    CHUNK_HASH_MAX_RANGES_PER_REQUEST);
 		return -1;
 	}
 
@@ -1015,33 +929,28 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 	}
 
 	/*
-	 * Build the chunk layout.  Last chunk's length is clamped to
-	 * end-of-file so the server's matching XXH3 (also clamped) lines up
-	 * with the local hash.
+	 * Build the chunk layout over the span.  The last chunk clamps to the
+	 * span end so the server's matching XXH3 (also clamped) lines up with
+	 * the local hash.
 	 */
 	for (i = 0; i < n_chunks; i++) {
-		u_int64_t off = (u_int64_t)i * CHUNK_HASH_CHUNK_SIZE;
-		u_int64_t remain = fsize - off;
+		u_int64_t off = soff + (u_int64_t)i * CHUNK_HASH_CHUNK_SIZE;
+		u_int64_t remain = (soff + slen) - off;
 		ranges[i].off = off;
 		ranges[i].len = remain < CHUNK_HASH_CHUNK_SIZE
 		    ? remain : CHUNK_HASH_CHUNK_SIZE;
 	}
 
 	/* Pause the orchestrator watchdog for the combined local+remote
-	 * hash phase.  Auto-expires; explicit resume on every exit path
-	 * below for promptness. */
+	 * hash phase.  Auto-expires; explicit resume on every exit path. */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 
-	/* Local hashing: any I/O error here is a real local-file problem;
-	 * fall through to existing whole-file path (which will rediscover
-	 * the same error and report it to the user). */
+	/* Local hashing.  Refresh the pause EVERY chunk: hashing a large span
+	 * locally takes minutes of byte-silence, far past one pause window,
+	 * and the watchdog/endgame reaper would otherwise kill a worker that
+	 * is working hard - then the requeued unit re-hashes from scratch
+	 * (churn, or a livelock for a single-file reputv). */
 	for (i = 0; i < n_chunks; i++) {
-		/* Refresh the pause EVERY chunk: hashing a large file locally
-		 * takes minutes of byte-silence, far past one pause window,
-		 * and the watchdog/endgame reaper would otherwise kill a
-		 * worker that is working hard - then the requeued unit
-		 * re-hashes from scratch (churn, or a livelock for a
-		 * single-file reputv). */
 		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
 		    ranges[i].len, &local_hashes[i]) != 0) {
@@ -1068,28 +977,17 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 	}
 
 	if (n_mismatched == 0) {
-		debug("chunked verified transfer: all %u chunks match, "
-		    "\"%s\" already complete", n_chunks, local_path);
+		debug("chunked reconcile: all %u chunks of span match, "
+		    "\"%s\" already current", n_chunks, local_path);
 		rc = 1;
 		goto out;
 	}
 
-	/*
-	 * Walk the chunk list and re-transfer each contiguous run of
-	 * mismatches as a single sftp_upload_range call.  This minimises the
-	 * number of open/close round trips relative to one call per chunk
-	 * while keeping the byte-transfer footprint minimal (we still only
-	 * send the mismatched chunks, not the gaps between them).
-	 *
-	 * Partial failure within a run leaves the destination in an
-	 * indeterminate state, so we return -1 and let the caller's fallback
-	 * path (full-file hash gate -> TRUNC + fresh upload) restore a sane
-	 * destination.  No partial-progress accounting here.
-	 */
 	i = 0;
 	while (i < n_chunks) {
 		u_int run_start;
 		u_int64_t run_off, run_len;
+		int r;
 
 		if (local_hashes[i] == remote_hashes[i]) {
 			i++;
@@ -1101,35 +999,38 @@ sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
 		run_off = ranges[run_start].off;
 		run_len = (ranges[i - 1].off + ranges[i - 1].len) - run_off;
 
-		debug3("chunked resume: re-transferring chunks [%u, %u) "
-		    "at offset %llu length %llu for \"%s\"",
-		    run_start, i,
+		debug3("chunked resume: %s chunks [%u, %u) at offset %llu "
+		    "length %llu for \"%s\"", ing, run_start, i,
 		    (unsigned long long)run_off,
 		    (unsigned long long)run_len, local_path);
-		if (sftp_upload_range(conn, local_path, remote_path,
-		    (off_t)run_off, (off_t)run_len, NULL, NULL, NULL) != 0) {
-			/* A dead connection (worker churn) is handled fallout -
-			 * the full-file path retries it; only a failure on a
-			 * live connection deserves the user's attention. */
+		if (local_is_target)
+			r = sftp_download_range(conn, remote_path, local_path,
+			    (off_t)run_off, (off_t)run_len, NULL);
+		else
+			r = sftp_upload_range(conn, local_path, remote_path,
+			    (off_t)run_off, (off_t)run_len, NULL, NULL, NULL);
+		if (r != 0) {
+			/* A dead connection (worker churn) is expected fallout
+			 * - the caller's fallback retries; only a live-conn
+			 * failure deserves the user's attention. */
 			if (sftp_conn_is_dead(conn))
-				debug_f("re-transfer of chunks [%u, %u) failed "
-				    "for \"%s\"; falling back to full-file "
-				    "path", run_start, i, local_path);
+				debug_f("reconcile of chunks [%u, %u) failed "
+				    "for \"%s\"; falling back", run_start, i,
+				    local_path);
 			else
-				error_f("re-transfer of chunks [%u, %u) failed "
-				    "for \"%s\"; falling back to full-file "
-				    "path", run_start, i, local_path);
+				error_f("reconcile of chunks [%u, %u) failed "
+				    "for \"%s\"; falling back", run_start, i,
+				    local_path);
 			goto out;
 		}
-		bytes_retransferred += run_len;
+		bytes_moved += run_len;
 	}
 
-	logit("chunked verified resume \"%s\": re-transferred %u/%u chunks "
-	    "(%llu / %llu bytes, %.1f%% of file)",
-	    local_path, n_mismatched, n_chunks,
-	    (unsigned long long)bytes_retransferred,
-	    (unsigned long long)fsize,
-	    100.0 * (double)bytes_retransferred / (double)fsize);
+	logit("chunked verified resume \"%s\": %s %u/%u chunks "
+	    "(%llu / %llu bytes, %.1f%% of span)",
+	    local_path, ed, n_mismatched, n_chunks,
+	    (unsigned long long)bytes_moved, (unsigned long long)slen,
+	    100.0 * (double)bytes_moved / (double)slen);
 	rc = 0;
 out:
 	free(ranges);
@@ -1139,154 +1040,23 @@ out:
 }
 
 int
+sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
+    const char *local_path, const char *remote_path, off_t file_size)
+{
+	if (file_size <= 0)
+		return -1;
+	return chunked_reconcile_span(conn, local_fd, local_path, remote_path,
+	    0, file_size, /*local_is_target=*/0);
+}
+
+int
 sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
     const char *local_path, const char *remote_path, off_t file_size)
 {
-	struct sftp_hash_range	*ranges = NULL;
-	u_int64_t		*local_hashes = NULL;
-	u_int64_t		*remote_hashes = NULL;
-	u_int64_t		 fsize;
-	u_int64_t		 bytes_refetched = 0;
-	u_int			 n_chunks, n_mismatched = 0;
-	u_int			 i;
-	int			 rc = -1;
-
-	if (conn == NULL || local_path == NULL || remote_path == NULL ||
-	    local_fd < 0 || file_size <= 0)
+	if (file_size <= 0)
 		return -1;
-
-	if (!sftp_conn_has_hash_range(conn)) {
-		debug_f("server lacks sftp-hash-range; declining chunked path "
-		    "for \"%s\"", local_path);
-		return -1;
-	}
-	fsize = (u_int64_t)file_size;
-	if (fsize < CHUNK_HASH_MIN_FILE_SIZE) {
-		debug_f("file \"%s\" size %llu below chunked threshold %llu; "
-		    "declining", local_path, (unsigned long long)fsize,
-		    (unsigned long long)CHUNK_HASH_MIN_FILE_SIZE);
-		return -1;
-	}
-
-	n_chunks = (u_int)((fsize + CHUNK_HASH_CHUNK_SIZE - 1) /
-	    CHUNK_HASH_CHUNK_SIZE);
-	if (n_chunks > CHUNK_HASH_MAX_RANGES_PER_REQUEST) {
-		debug_f("file \"%s\" would need %u chunks > cap %u; declining",
-		    local_path, n_chunks, CHUNK_HASH_MAX_RANGES_PER_REQUEST);
-		return -1;
-	}
-
-	if ((ranges = calloc(n_chunks, sizeof(*ranges))) == NULL ||
-	    (local_hashes = calloc(n_chunks, sizeof(*local_hashes))) == NULL ||
-	    (remote_hashes = calloc(n_chunks, sizeof(*remote_hashes))) == NULL) {
-		error_f("calloc for %u chunks failed", n_chunks);
-		goto out;
-	}
-
-	/* Chunk layout identical to the upload sibling - the last chunk
-	 * clamps to EOF and the server's matching XXH3 (also clamped) lines
-	 * up with the local hash. */
-	for (i = 0; i < n_chunks; i++) {
-		u_int64_t off = (u_int64_t)i * CHUNK_HASH_CHUNK_SIZE;
-		u_int64_t remain = fsize - off;
-		ranges[i].off = off;
-		ranges[i].len = remain < CHUNK_HASH_CHUNK_SIZE
-		    ? remain : CHUNK_HASH_CHUNK_SIZE;
-	}
-
-	/* Pause the orchestrator watchdog for the combined local+remote
-	 * hash phase.  Auto-expires; explicit resume on every exit path. */
-	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-
-	/* Local hashing: the destination's current state (partial / sparse). */
-	for (i = 0; i < n_chunks; i++) {
-		/* Refresh the pause EVERY chunk: hashing a large file locally
-		 * takes minutes of byte-silence, far past one pause window,
-		 * and the watchdog/endgame reaper would otherwise kill a
-		 * worker that is working hard - then the requeued unit
-		 * re-hashes from scratch (churn, or a livelock for a
-		 * single-file reputv). */
-		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
-		    ranges[i].len, &local_hashes[i]) != 0) {
-			error_f("local hash failed at chunk %u offset %llu "
-			    "for \"%s\"", i,
-			    (unsigned long long)ranges[i].off, local_path);
-			sftp_conn_watchdog_resume(conn);
-			goto out;
-		}
-	}
-
-	/* Remote hashing: the source-of-truth.  All-or-nothing semantics;
-	 * helper emits the user-visible warning on failure. */
-	if (sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n_chunks,
-	    remote_hashes) != 0) {
-		sftp_conn_watchdog_resume(conn);
-		goto out;
-	}
-	sftp_conn_watchdog_resume(conn);
-
-	for (i = 0; i < n_chunks; i++) {
-		if (local_hashes[i] != remote_hashes[i])
-			n_mismatched++;
-	}
-
-	if (n_mismatched == 0) {
-		debug("chunked verified transfer: all %u chunks match, "
-		    "\"%s\" already complete", n_chunks, local_path);
-		rc = 1;
-		goto out;
-	}
-
-	/*
-	 * Walk the chunk list and re-fetch each contiguous run of mismatches
-	 * as a single sftp_download_range call.  Partial failure mid-run
-	 * leaves the local destination in an indeterminate state, so we
-	 * return -1 and let the caller's fallback (full-file hash gate ->
-	 * truncate + fresh download) restore a sane destination.
-	 */
-	i = 0;
-	while (i < n_chunks) {
-		u_int run_start;
-		u_int64_t run_off, run_len;
-
-		if (local_hashes[i] == remote_hashes[i]) {
-			i++;
-			continue;
-		}
-		run_start = i;
-		while (i < n_chunks && local_hashes[i] != remote_hashes[i])
-			i++;
-		run_off = ranges[run_start].off;
-		run_len = (ranges[i - 1].off + ranges[i - 1].len) - run_off;
-
-		debug3("chunked resume: re-fetching chunks [%u, %u) at "
-		    "offset %llu length %llu for \"%s\"",
-		    run_start, i,
-		    (unsigned long long)run_off,
-		    (unsigned long long)run_len, local_path);
-		if (sftp_download_range(conn, remote_path, local_path,
-		    (off_t)run_off, (off_t)run_len, NULL) != 0) {
-			error_f("re-fetch of chunks [%u, %u) failed for "
-			    "\"%s\"; falling back to full-file path",
-			    run_start, i, local_path);
-			goto out;
-		}
-		bytes_refetched += run_len;
-	}
-
-	logit("chunked verified resume \"%s\": re-fetched %u/%u chunks "
-	    "(%llu / %llu bytes, %.1f%% of file)",
-	    local_path, n_mismatched, n_chunks,
-	    (unsigned long long)bytes_refetched,
-	    (unsigned long long)fsize,
-	    100.0 * (double)bytes_refetched / (double)fsize);
-	rc = 0;
-out:
-	free(ranges);
-	free(local_hashes);
-	free(remote_hashes);
-	return rc;
+	return chunked_reconcile_span(conn, local_fd, local_path, remote_path,
+	    0, file_size, /*local_is_target=*/1);
 }
 
 void
@@ -1308,20 +1078,22 @@ sftp_hpn_verify_repair_resolve(int no_verify_repair_cli, int *enabled_out,
 }
 
 /*
- * One repair pass over `local_path`/`remote_path`.  Granularity mirrors the
- * transfer: a file at/above the chunk-hash floor re-hashes in 64 MiB ranges
- * and splices only the mismatched contiguous runs in place (no truncation,
- * offset-addressed WRITE); a smaller file (or one the chunked path declines)
- * re-transmits [0, size) whole.  Returns 0 if a pass ran (caller re-verifies),
- * -1 on a hard transfer error.
+ * One repair pass over the span [span_off, span_off+span_len) of
+ * `local_path`/`remote_path`.  Granularity mirrors the transfer: a span at or
+ * above the chunk-hash floor re-hashes in 64 MiB chunks and splices only the
+ * mismatched contiguous runs in place (no truncation, offset-addressed WRITE);
+ * a smaller span (or one the chunked path declines) re-transmits the whole
+ * span.  Returns 0 if a pass ran (caller re-verifies), -1 on a hard transfer
+ * error.
  */
 static int
 verify_repair_one_pass(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, int local_is_target, off_t size)
+    const char *remote_path, int local_is_target, off_t span_off,
+    off_t span_len)
 {
 	int rc;
 
-	if (size > 0 && (u_int64_t)size >= CHUNK_HASH_MIN_FILE_SIZE) {
+	if (span_len > 0 && (u_int64_t)span_len >= CHUNK_HASH_MIN_FILE_SIZE) {
 		int fd = open(local_path, O_RDONLY);
 
 		if (fd == -1) {
@@ -1329,60 +1101,76 @@ verify_repair_one_pass(struct sftp_conn *conn, const char *local_path,
 			    strerror(errno));
 			return -1;
 		}
-		if (local_is_target)
-			rc = sftp_hpn_try_chunked_resume_download(conn, fd,
-			    local_path, remote_path, size);
-		else
-			rc = sftp_hpn_try_chunked_resume_upload(conn, fd,
-			    local_path, remote_path, size);
+		rc = chunked_reconcile_span(conn, fd, local_path, remote_path,
+		    span_off, span_len, local_is_target);
 		close(fd);
 		/*
 		 * 1 = nothing mismatched at chunk granularity, 0 = spliced;
 		 * either way a pass ran.  -1 = declined (server lacks
 		 * sftp-hash-range, chunk-count cap, or local I/O error) - fall
-		 * through to a whole-file re-transmit.
+		 * through to a whole-span re-transmit.
 		 */
 		if (rc >= 0)
 			return 0;
 	}
 
-	/* Whole-file re-transmit: re-send / re-fetch [0, size) in place. */
+	/* Whole-span re-transmit: re-send / re-fetch [span_off, span_len). */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 	if (local_is_target)
 		rc = sftp_download_range(conn, remote_path, local_path,
-		    0, size, NULL);
+		    span_off, span_len, NULL);
 	else
 		rc = sftp_upload_range(conn, local_path, remote_path,
-		    0, size, NULL, NULL, NULL);
+		    span_off, span_len, NULL, NULL, NULL);
 	sftp_conn_watchdog_resume(conn);
 	return rc == 0 ? 0 : -1;
 }
 
 int
 sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, int local_is_target,
+    const char *remote_path, int local_is_target, off_t off, off_t len,
+    int have_local_hash, uint64_t local_hash,
     int repair_enabled, int max_attempts)
 {
 	struct stat sb;
-	uint64_t dest_hash = 0, prev_hash = 0;
+	uint64_t lh = 0, rh = 0, dest_hash, prev_hash;
 	const char *side, *dst;
 	int r, attempt;
 
-	r = sftp_hpn_verify_transfer(conn, local_path, remote_path,
-	    local_is_target, /*trust_inline_src=*/0, &dest_hash);
+	/*
+	 * Whole-file mode: callers pass len <= 0 to mean "the entire file" and
+	 * the size is resolved here; range callers (the orchestrator's per-range
+	 * verify) pass an explicit [off, len).
+	 */
+	if (len <= 0) {
+		if (stat(local_path, &sb) == -1) {
+			error_f("stat \"%s\": %s", local_path, strerror(errno));
+			return -1;
+		}
+		if (sb.st_size == 0)
+			return 0;	/* empty file: trivially matches */
+		off = 0;
+		len = sb.st_size;
+	}
+
+	side = local_is_target ? "local" : "remote";
+	dst = local_is_target ? local_path : remote_path;
+
+	/*
+	 * Initial verify of the span via the one range-hash path (sftp-hash-
+	 * range, O_DIRECT read-back of the WRITTEN side).  A teed source hash
+	 * (uploads) lets the common no-repair case skip the local read.
+	 */
+	r = sftp_hpn_verify_chunk(conn, local_path, remote_path, off, len,
+	    local_is_target, have_local_hash, local_hash, &lh, &rh);
 	if (r != 1)
 		return r;		/* 0 = good, -1 = unverifiable */
 	if (!repair_enabled)
 		return 1;		/* mismatch, repair disabled */
 
-	if (stat(local_path, &sb) == -1) {
-		error_f("stat \"%s\": %s", local_path, strerror(errno));
-		return 1;
-	}
 	if (max_attempts < 1)
 		max_attempts = 1;
-	side = local_is_target ? "local" : "remote";
-	dst = local_is_target ? local_path : remote_path;
+	dest_hash = local_is_target ? lh : rh;
 	prev_hash = dest_hash;
 
 	logit("Repairing %s file \"%s\" (verify mismatch)...", side, dst);
@@ -1390,8 +1178,8 @@ sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
 	for (attempt = 1; attempt <= max_attempts; attempt++) {
 		/*
 		 * Bail on Ctrl-C between attempts: a converging/capping repair
-		 * of a large file would otherwise grind through every remaining
-		 * attempt before the interrupt is noticed.  The file is left as
+		 * of a large span would otherwise grind through every remaining
+		 * attempt before the interrupt is noticed.  The span is left as
 		 * the last attempt wrote it (still corrupt) and recorded as a
 		 * verify failure by the caller.
 		 */
@@ -1400,12 +1188,13 @@ sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
 			return 1;
 		}
 		if (verify_repair_one_pass(conn, local_path, remote_path,
-		    local_is_target, sb.st_size) != 0) {
+		    local_is_target, off, len) != 0) {
 			error_f("repair re-transfer failed for \"%s\"", dst);
 			return 1;
 		}
-		r = sftp_hpn_verify_transfer(conn, local_path, remote_path,
-		    local_is_target, /*trust_inline_src=*/0, &dest_hash);
+		/* Re-verify off the platter; no tee on the rare repair path. */
+		r = sftp_hpn_verify_chunk(conn, local_path, remote_path, off,
+		    len, local_is_target, /*have_local_hash=*/0, 0, &lh, &rh);
 		if (r == 0) {
 			logit("repaired %s file \"%s\" (attempt %d)",
 			    side, dst, attempt);
@@ -1414,9 +1203,7 @@ sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
 		if (r < 0) {
 			/*
 			 * Could not re-verify this attempt (transient read or
-			 * extension problem): mirror the orchestrator's
-			 * "unverifiable attempt" handling - keep trying to the
-			 * cap, then give up.
+			 * extension problem): keep trying to the cap, give up.
 			 */
 			if (attempt >= max_attempts)
 				break;
@@ -1428,6 +1215,7 @@ sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
 		 * bytes (bad media / a re-corrupting source) - no point
 		 * retrying.
 		 */
+		dest_hash = local_is_target ? lh : rh;
 		if (dest_hash == prev_hash) {
 			error_f("%s file \"%s\": two identical failed hashes in "
 			    "a row - deterministic fault, not retrying",

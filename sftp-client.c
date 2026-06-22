@@ -4490,16 +4490,6 @@ sftp_conn_set_verify_repair(struct sftp_conn *conn, int enabled, int attempts)
 	conn->hpn->verify_repair_attempts = attempts < 1 ? 1 : attempts;
 }
 
-/* HPNVerifyTransfer (1b): bridge conn -> conn->hpn for the verify module. */
-int
-sftp_conn_verify_src_take(struct sftp_conn *conn, uint64_t expect_bytes,
-    uint64_t *hash_out)
-{
-	if (conn == NULL || conn->hpn == NULL)
-		return -1;
-	return sftp_hpn_src_take(conn->hpn, expect_bytes, hash_out);
-}
-
 /*
  * Park a just-transferred file for the classic post-transfer verify phase.
  * Called at the end of sftp_upload (local_is_target=0) and sftp_download
@@ -4580,6 +4570,8 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 		if (!interrupted) {
 			int r = sftp_hpn_verify_repair(conn, e->local_path,
 			    e->remote_path, e->local_is_target,
+			    /*off=*/0, /*len=*/e->size,
+			    /*have_local_hash=*/0, /*local_hash=*/0,
 			    conn->hpn->verify_repair_enabled,
 			    conn->hpn->verify_repair_attempts);
 			if (r == 1) {

@@ -58,7 +58,7 @@ typedef void EditLine;
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
-#include "sftp-hpn-verify.h"		/* sftp_hpn_verify_transfer */
+#include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
 #include "sftp-usergroup.h"
 #include "sftp-parallel.h"
 
