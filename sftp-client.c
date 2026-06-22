@@ -54,7 +54,7 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-hpn-client.h" /* HPN */
-#include "sftp-hpn-server.h" /* HPN_CHECK_FILE_STRICT, HPN_HASH_FULLY_ALLOCATED_SENTINEL */
+#include "sftp-hpn-server.h" /* HPN_CHECK_FILE_STRICT */
 #include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
 #include "sftp-fault-inject.h"	/* FAULT-INJ: test scaffolding */
 
@@ -1932,31 +1932,17 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * sparse-hole corruption gap.
 				 */
 				/*
-				 * Sparse-skip path: ask the server first.  If
-				 * it returns HPN_HASH_FULLY_ALLOCATED_SENTINEL,
-				 * the remote file is full-size and fully
-				 * allocated; trust it and skip the local hash
-				 * entirely.  Sentinel suppressed by
-				 * HPN_CHECK_FILE_STRICT (set when
-				 * HPNVerifyTransfer is enabled).
+				 * Always strict: hash both ends off the platter
+				 * and compare; equal size never implies equal
+				 * content.  STRICT is always sent so a pre-Phase-1
+				 * server still hashes instead of returning the
+				 * (removed) fully-allocated sentinel.
 				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
-				u_int32_t flags =
-				    sftp_conn_verify_transfer_enabled(conn)
-				    ? HPN_CHECK_FILE_STRICT : 0;
 				rret = sftp_hpn_hash_remote_file(conn,
-				    remote_path, size, flags, &remote_hash);
-				if (rret == 0 && remote_hash ==
-				    HPN_HASH_FULLY_ALLOCATED_SENTINEL) {
-					sftp_hpn_watchdog_resume(conn->hpn);
-					debug("verified transfer: server "
-					    "reports \"%s\" fully allocated; "
-					    "skipping local hash and treating "
-					    "as identical", local_path);
-					skip_ret = 1; /* identical */
-					goto resume_fail;
-				}
+				    remote_path, size, HPN_CHECK_FILE_STRICT,
+				    &remote_hash);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    size, &local_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
@@ -2842,28 +2828,14 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
 				/*
-				 * Sparse-skip path: ask the server first.  A
-				 * HPN_HASH_FULLY_ALLOCATED_SENTINEL response
-				 * means "fully allocated, trust the size match,
-				 * skip local hash entirely."  Suppressed by
-				 * HPN_CHECK_FILE_STRICT (set when
-				 * HPNVerifyTransfer is enabled).
+				 * Always strict: hash both ends off the platter
+				 * and compare; equal size never implies equal
+				 * content.  STRICT is always sent so a pre-Phase-1
+				 * server still hashes instead of returning the
+				 * (removed) fully-allocated sentinel.
 				 */
-				u_int32_t flags =
-				    sftp_conn_verify_transfer_enabled(conn)
-				    ? HPN_CHECK_FILE_STRICT : 0;
 				rret = sftp_hpn_hash_remote_file(conn, remote_path,
-				    sb.st_size, flags, &remote_hash);
-				if (rret == 0 && remote_hash ==
-				    HPN_HASH_FULLY_ALLOCATED_SENTINEL) {
-					sftp_hpn_watchdog_resume(conn->hpn);
-					debug("verified transfer: server "
-					    "reports \"%s\" fully allocated; "
-					    "skipping local hash and treating "
-					    "as identical", local_path);
-					close(local_fd);
-					return 1; /* identical */
-				}
+				    sb.st_size, HPN_CHECK_FILE_STRICT, &remote_hash);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    sb.st_size, &local_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);

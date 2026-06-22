@@ -620,45 +620,20 @@ process_hpn_check_file(u_int id, struct sshbuf *iqueue,
 		length = (uint64_t)st.st_size;
 
 	/*
-	 * Sparse-skip optimisation: when the client asks about the WHOLE
-	 * file (length == st_size) AND the file is fully allocated
-	 * (st_blocks*512 >= 95% of st_size, with the 5% margin covering
-	 * filesystem metadata blocks + minor legitimate sparseness) AND
-	 * the client did NOT set HPN_CHECK_FILE_STRICT, short-circuit:
-	 * return HPN_HASH_FULLY_ALLOCATED_SENTINEL without doing any
-	 * read+hash work.  Saves bilateral disk I/O + CPU on multi-file
-	 * resumes where most files completed before the interrupt.
-	 *
-	 * Strict mode (set by client when HPNVerifyTransfer is enabled)
-	 * skips this short-circuit so the user gets full-hash verification
-	 * even for fully-allocated files.
-	 */
-	if ((flags & HPN_CHECK_FILE_STRICT) == 0 &&
-	    length == (uint64_t)st.st_size &&
-	    (uint64_t)st.st_blocks * 512 >=
-	        (uint64_t)st.st_size * 95 / 100) {
-		hash = (XXH64_hash_t)HPN_HASH_FULLY_ALLOCATED_SENTINEL;
-		debug3("hpn-check-file: sparse-skip short-circuit, sending "
-		    "sentinel for \"%s\" (st_size=%lld st_blocks=%lld)",
-		    path, (long long)st.st_size, (long long)st.st_blocks);
-		goto sentinel_reply;
-	}
-
-	/*
-	 * Hash the file via the shared on-disk read-back helper.  Strict mode
-	 * (HPNVerifyTransfer) gets fsync + O_DIRECT so the hash reflects the
-	 * platter; plain (non-strict) resume check-file stays buffered.  The
-	 * helper opens its own fd, so release ours first; the heartbeat
-	 * callback keeps the client's watchdog-pause refreshed during a long
-	 * hash.
+	 * Hash the file via the shared on-disk read-back helper, ALWAYS with
+	 * fsync + O_DIRECT so the hash reflects the platter, not the page cache.
+	 * Size/allocation is never trusted as a content signal (the old
+	 * sparse-skip sentinel short-circuit was removed) - every check is a full
+	 * strict hash.  The helper opens its own fd, so release ours first; the
+	 * heartbeat callback keeps the client's watchdog-pause refreshed during a
+	 * long hash.
 	 */
 	close(fd);
 	fd = -1;
 	hb.id = id;
 	hb.oqueue = oqueue;
 	hb.last_hb_sec = monotime();
-	if (sftp_hpn_hash_file_ondisk(path, length,
-	    (flags & HPN_CHECK_FILE_STRICT) != 0, &hash,
+	if (sftp_hpn_hash_file_ondisk(path, length, /*ondisk=*/1, &hash,
 	    hpn_check_file_hb_progress, &hb) != 0) {
 		send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
 		goto out;
@@ -666,7 +641,6 @@ process_hpn_check_file(u_int id, struct sshbuf *iqueue,
 	debug3("hpn-check-file: computed hash %016llx for \"%s\" length %llu",
 	    (unsigned long long)hash, path, (unsigned long long)length);
 
- sentinel_reply:
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||

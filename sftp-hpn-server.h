@@ -77,35 +77,25 @@
 #define HPN_FILE_LAYOUT_FAIL      3u
 
 /*
- * hpn-check-file@hpnssh.org sparse-skip protocol (19.0):
- *
- * The wire-format request now carries a flags field after length:
+ * hpn-check-file@hpnssh.org wire format (19.0):
  *
  *   string  path
  *   uint64  length
  *   uint32  flags
  *
- * The server short-circuits the read+hash and returns the sentinel
- * HPN_HASH_FULLY_ALLOCATED_SENTINEL when:
- *   - the client did NOT set HPN_CHECK_FILE_STRICT, AND
- *   - length == st.st_size (the client is asking about the whole file),
- *   - st.st_blocks * 512 >= 95% of st.st_size (fully allocated).
+ * The server ALWAYS computes a full strict XXH3 read-back (fsync + O_DIRECT) -
+ * size/allocation is never trusted as a content signal.  The earlier
+ * sparse-skip short-circuit (return a "fully allocated" sentinel without
+ * hashing when the client did not set STRICT) was removed: it traded
+ * correctness for I/O savings on resume, exactly the size-trust we no longer
+ * allow.
  *
- * Client sets HPN_CHECK_FILE_STRICT when HPNVerifyTransfer is enabled
- * (the user explicitly asked for maximum verification; no trust-based
- * shortcuts).  Strict mode forces the server to compute and return the
- * real XXH3.
- *
- * Collision probability of a real XXH3 producing the sentinel value is
- * 1 in 2^64 - effectively zero in any realistic workload.
- *
- * Within 19.0: all servers and clients implement this.  Cross-version
- * 19.0 <-> 18.x is handled by the existing extension-advertisement
- * mechanism (18.x doesn't advertise hpn-check-file, 19.0 client falls
- * through to RESUME_INCOMPAT_MSG; 18.x client never sends the request).
+ * The flags field stays on the wire and current clients ALWAYS set
+ * HPN_CHECK_FILE_STRICT, so a pre-removal server still computes the real hash
+ * (instead of returning its now-absent sentinel) - keeping cross-version
+ * behaviour correct.  Cross-version 19.0 <-> 18.x is handled by the existing
+ * extension-advertisement mechanism (18.x doesn't advertise hpn-check-file).
  */
-#define HPN_HASH_FULLY_ALLOCATED_SENTINEL \
-	((u_int64_t)0xDEADBEEFCAFEBABEULL)
 #define HPN_CHECK_FILE_STRICT		0x00000001U
 
 /*
