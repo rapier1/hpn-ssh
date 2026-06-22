@@ -1617,6 +1617,12 @@ void	 parallel_verify_job_free(struct verify_job *);
  * (mirrors parallel_verify_park; appends to p->repair_pending under its mu).
  * The repair phase then owns and frees the job. */
 void	 parallel_repair_park(struct sftp_parallel *, struct verify_job *);
+/* Record a verify failure in verify_failed_paths naming the DEST - the written
+ * file that is actually corrupt: remote on upload, local on download - with a
+ * "local file"/"remote file" label, so the end-of-run summary points at the
+ * file the user has rather than the (clean) source. */
+void	 parallel_verify_fail_record(struct sftp_parallel *, int local_is_target,
+	    const char *local_path, const char *remote_path);
 
 /* sftp-parallel-respawn.c - spawn/respawn lifecycle */
 void	 parallel_respawn_teardown_ssh(struct sftp_worker *);

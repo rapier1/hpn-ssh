@@ -750,10 +750,13 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 		*remote_hash_out = remote_hash;
 
 	if (local_hash != remote_hash) {
-		error_f("verify: range [%llu+%llu) of \"%s\" MISMATCH - "
-		    "transferred file does NOT match source",
-		    (unsigned long long)off, (unsigned long long)len,
-		    remote_path);
+		/* Low-level, direction-blind, and fires per chunk per repair
+		 * attempt: keep it at debug.  The user-facing message (naming
+		 * the local/remote dest) is emitted by the verify/repair callers
+		 * that know the transfer direction. */
+		debug_f("verify: range [%llu+%llu) of \"%s\" hash mismatch "
+		    "(local vs remote)", (unsigned long long)off,
+		    (unsigned long long)len, remote_path);
 		return 1;
 	}
 	return 0;

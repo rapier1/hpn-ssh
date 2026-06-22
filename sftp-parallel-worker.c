@@ -126,10 +126,10 @@ parallel_verify_one(struct sftp_worker *w, const char *local_path,
 		    w->id, remote_path);
 		return;
 	}
-	error_f("worker %d VERIFY FAILED: \"%s\" post-transfer hash "
-	    "mismatch - transferred file does NOT match source",
-	    w->id, remote_path);
-	hpn_strlist_append(&p->verify_failed_paths, remote_path);
+	error_f("worker %d VERIFY FAILED: %s file \"%s\" does NOT match source",
+	    w->id, local_is_target ? "local" : "remote",
+	    local_is_target ? local_path : remote_path);
+	parallel_verify_fail_record(p, local_is_target, local_path, remote_path);
 }
 
 /*
@@ -187,10 +187,10 @@ parallel_verify_one_ranges(struct sftp_worker *w, struct sftp_range_tracker *t)
 		    /*local_is_target=*/0);
 		return;
 	}
-	error_f("worker %d VERIFY FAILED: \"%s\" post-transfer hash "
-	    "mismatch - transferred file does NOT match source",
-	    w->id, t->path);
-	hpn_strlist_append(&p->verify_failed_paths, t->path);
+	/* Range-split UPLOAD path: the dest is the remote file (t->path). */
+	error_f("worker %d VERIFY FAILED: remote file \"%s\" does NOT match "
+	    "source", w->id, t->path);
+	parallel_verify_fail_record(p, /*local_is_target=*/0, NULL, t->path);
 }
 
 /* Close and clear the worker's warm remote handle (held open across same-
@@ -289,10 +289,13 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 					 * reports any unrepairable ranges itself. */
 					parallel_repair_park(p, j);
 				} else {
-					error_f("worker %d VERIFY FAILED: \"%s\" - "
-					    "transferred file does NOT match source",
-					    w->id, j->remote_path);
-					hpn_strlist_append(&p->verify_failed_paths,
+					error_f("worker %d VERIFY FAILED: %s file "
+					    "\"%s\" does NOT match source", w->id,
+					    j->local_is_target ? "local" : "remote",
+					    j->local_is_target ? j->local_path
+					    : j->remote_path);
+					parallel_verify_fail_record(p,
+					    j->local_is_target, j->local_path,
 					    j->remote_path);
 					parallel_verify_job_free(j);
 				}

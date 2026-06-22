@@ -622,10 +622,12 @@ parallel_repair_phase_run(struct sftp_parallel *p)
 				repaired_bytes += (uint64_t)j->lens[kk];
 				if (p->cfg.print_flag != SFTP_QUIET)
 					mprintf("  repaired range [%llu+%llu) "
-					    "of \"%s\"\n",
+					    "of %s file \"%s\"\n",
 					    (unsigned long long)j->offs[kk],
 					    (unsigned long long)j->lens[kk],
-					    j->remote_path);
+					    j->local_is_target ? "local" : "remote",
+					    j->local_is_target ? j->local_path
+					    : j->remote_path);
 			} else if (res == 1) {	/* still corrupt + new hash */
 				uint64_t now = j->range_dest_hash[kk];
 
@@ -661,21 +663,23 @@ parallel_repair_phase_run(struct sftp_parallel *p)
 		for (i = 0; i < nitems; i++) {
 			struct verify_job *j = items[i].job;
 			int kk = items[i].range_index;
+			const char *side = j->local_is_target ? "local" : "remote";
+			const char *dst = j->local_is_target ? j->local_path
+			    : j->remote_path;
 
 			if (items[i].state == RS_CONVERGED)
-				error_f("range [%llu+%llu) of \"%s\": two "
-				    "identical failed hashes in a row - "
+				error_f("range [%llu+%llu) of %s file \"%s\": "
+				    "two identical failed hashes in a row - "
 				    "deterministic fault, not retrying",
 				    (unsigned long long)j->offs[kk],
-				    (unsigned long long)j->lens[kk],
-				    j->remote_path);
+				    (unsigned long long)j->lens[kk], side, dst);
 			else if (items[i].state == RS_CAPPED)
-				error_f("range [%llu+%llu) of \"%s\": still "
-				    "corrupt after %d repair attempts - "
+				error_f("range [%llu+%llu) of %s file \"%s\": "
+				    "still corrupt after %d repair attempts - "
 				    "possible storage/media fault",
 				    (unsigned long long)j->offs[kk],
-				    (unsigned long long)j->lens[kk],
-				    j->remote_path, p->verify_repair_attempts);
+				    (unsigned long long)j->lens[kk], side, dst,
+				    p->verify_repair_attempts);
 		}
 	}
 
@@ -692,8 +696,8 @@ parallel_repair_phase_run(struct sftp_parallel *p)
 			}
 		}
 		if (bad && !p->abort_flag)
-			hpn_strlist_append(&p->verify_failed_paths,
-			    j->remote_path);
+			parallel_verify_fail_record(p, j->local_is_target,
+			    j->local_path, j->remote_path);
 		parallel_verify_job_free(j);
 	}
 	free(jobs);

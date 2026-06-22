@@ -414,6 +414,20 @@ parallel_verify_park(struct sftp_parallel *p, struct sftp_range_tracker *t)
  * the job.  Mirrors parallel_verify_park.
  */
 void
+parallel_verify_fail_record(struct sftp_parallel *p, int local_is_target,
+    const char *local_path, const char *remote_path)
+{
+	char *desc;
+
+	/* Name the DEST (the written, corrupt file), labeled local/remote. */
+	xasprintf(&desc, "%s file \"%s\"",
+	    local_is_target ? "local" : "remote",
+	    local_is_target ? local_path : remote_path);
+	hpn_strlist_append(&p->verify_failed_paths, desc);
+	free(desc);
+}
+
+void
 parallel_repair_park(struct sftp_parallel *p, struct verify_job *j)
 {
 	pthread_mutex_lock(&p->repair_pending_mu);
