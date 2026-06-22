@@ -321,8 +321,7 @@ spawn_one_worker(struct sftp_parallel *p)
 	/* Propagate HPNVerifyTransfer to this worker conn: the main conn gets
 	 * it at sftp_init time, but worker conns are created here and must be
 	 * told explicitly.  Without it the upload's inline source-hash
-	 * accumulator never arms (verify falls back to a second full read) and
-	 * resume-decision hashes miss HPN_CHECK_FILE_STRICT. */
+	 * accumulator never arms (verify falls back to a second full read). */
 	sftp_conn_set_verify_transfer(w->conn, p->cfg.verify_transfer);
 
 	/* Insert into workers array under lock. */

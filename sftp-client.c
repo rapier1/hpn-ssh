@@ -54,7 +54,7 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-hpn-client.h" /* HPN */
-#include "sftp-hpn-server.h" /* HPN_CHECK_FILE_STRICT */
+#include "sftp-hpn-server.h" /* hpn-check-file + heartbeat protocol constants */
 #include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
 #include "sftp-fault-inject.h"	/* FAULT-INJ: test scaffolding */
 
@@ -1941,8 +1941,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
 				rret = sftp_hpn_hash_remote_file(conn,
-				    remote_path, size, HPN_CHECK_FILE_STRICT,
-				    &remote_hash);
+				    remote_path, size, &remote_hash);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    size, &local_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
@@ -1995,19 +1994,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				/*
 				 * Partial local file: hash the overlapping
 				 * prefix to decide resume (continue) vs
-				 * restart (truncate).  Must pass
-				 * HPN_CHECK_FILE_STRICT: the server's
-				 * sparse-skip optimisation fires when
-				 * length == st.st_size on the *remote* (the
-				 * server has no knowledge of local size).
-				 * For a prefix-resume request the client
-				 * deliberately asks for length == remote
-				 * st_size, which would mis-trigger
-				 * sparse-skip and return a sentinel that the
-				 * client treats as a hash mismatch - forcing
-				 * a full re-transfer of bytes already on the
-				 * peer.  Strict suppresses the sentinel and
-				 * yields the real prefix hash to compare.
+				 * restart (truncate).  The server always
+				 * returns the real prefix hash off the platter
+				 * (no trust shortcut), so the comparison below
+				 * is exact.
 				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
@@ -2015,7 +2005,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				    (uint64_t)st.st_size, &local_hash);
 				rret = sftp_hpn_hash_remote_file(conn,
 				    remote_path, (uint64_t)st.st_size,
-				    HPN_CHECK_FILE_STRICT, &remote_hash);
+				    &remote_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
@@ -2835,7 +2825,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * (removed) fully-allocated sentinel.
 				 */
 				rret = sftp_hpn_hash_remote_file(conn, remote_path,
-				    sb.st_size, HPN_CHECK_FILE_STRICT, &remote_hash);
+				    sb.st_size, &remote_hash);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    sb.st_size, &local_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
@@ -2888,22 +2878,11 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				    HPN_HEARTBEAT_REFRESH_SEC);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    c.size, &local_hash);
-				/*
-				 * Must pass HPN_CHECK_FILE_STRICT here: the
-				 * server's sparse-skip optimisation triggers
-				 * on length == st.st_size of the *remote*
-				 * file (the server has no knowledge of local
-				 * size).  For prefix-resume the client asks
-				 * for length == remote_st_size, which fits
-				 * the sparse-skip condition exactly and would
-				 * return the sentinel - which the client then
-				 * treats as a hash mismatch, forcing a full
-				 * re-transfer of bytes already present on the
-				 * remote.  Strict suppresses the sentinel and
-				 * yields the real prefix XXH3.
-				 */
+				/* Prefix-resume: the server always returns the
+				 * real XXH3 of the requested prefix off the
+				 * platter, so the compare below is exact. */
 				rret = sftp_hpn_hash_remote_file(conn, remote_path,
-				    c.size, HPN_CHECK_FILE_STRICT, &remote_hash);
+				    c.size, &remote_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
 				debug3_f("lret=%d rret=%d local_hash=%016llx "
 				    "remote_hash=%016llx match=%d",
@@ -4485,9 +4464,9 @@ sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn)
 }
 
 /* HPNVerifyTransfer state accessors.  Declared in sftp-client-internal.h.
- * Set from sftp.c after ssh_config resolution; read by the resume-decision
- * hash call sites in sftp_upload / sftp_download to decide whether to set
- * the HPN_CHECK_FILE_STRICT flag on hpn-check-file requests. */
+ * Set from sftp.c after ssh_config resolution; read where verify is gated -
+ * arming the inline source-hash tee and the classic post-transfer verify
+ * phase. */
 void
 sftp_conn_set_verify_transfer(struct sftp_conn *conn, int enabled)
 {

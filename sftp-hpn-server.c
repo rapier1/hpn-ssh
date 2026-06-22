@@ -587,7 +587,6 @@ process_hpn_check_file(u_int id, struct sshbuf *iqueue,
 {
 	char *path = NULL;
 	uint64_t length;
-	uint32_t flags;
 	int r;
 	int fd = -1;
 	uint64_t hash = 0;
@@ -596,14 +595,13 @@ process_hpn_check_file(u_int id, struct sshbuf *iqueue,
 	struct stat st;
 
 	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0 ||
-	    (r = sshbuf_get_u64(iqueue, &length)) != 0 ||
-	    (r = sshbuf_get_u32(iqueue, &flags)) != 0)
+	    (r = sshbuf_get_u64(iqueue, &length)) != 0)
 		fatal_fr(r, "parse");
 
-	debug3("request %u: hpn-check-file \"%s\" length %llu flags=0x%x",
-	    id, path, (unsigned long long)length, flags);
-	logit("hpn-check-file \"%s\" length %llu flags=0x%x", path,
-	    (unsigned long long)length, flags);
+	debug3("request %u: hpn-check-file \"%s\" length %llu",
+	    id, path, (unsigned long long)length);
+	logit("hpn-check-file \"%s\" length %llu", path,
+	    (unsigned long long)length);
 
 	if ((fd = open(path, O_RDONLY|O_NOFOLLOW)) == -1) {
 		send_status_oqueue(oqueue, id, errno_to_sftp_status(errno));

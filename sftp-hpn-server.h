@@ -81,22 +81,16 @@
  *
  *   string  path
  *   uint64  length
- *   uint32  flags
  *
  * The server ALWAYS computes a full strict XXH3 read-back (fsync + O_DIRECT) -
- * size/allocation is never trusted as a content signal.  The earlier
- * sparse-skip short-circuit (return a "fully allocated" sentinel without
- * hashing when the client did not set STRICT) was removed: it traded
- * correctness for I/O savings on resume, exactly the size-trust we no longer
- * allow.
- *
- * The flags field stays on the wire and current clients ALWAYS set
- * HPN_CHECK_FILE_STRICT, so a pre-removal server still computes the real hash
- * (instead of returning its now-absent sentinel) - keeping cross-version
- * behaviour correct.  Cross-version 19.0 <-> 18.x is handled by the existing
- * extension-advertisement mechanism (18.x doesn't advertise hpn-check-file).
+ * size/allocation is never trusted as a content signal, so the request carries
+ * no options.  (An earlier 19.0 development format had a uint32 flags field for
+ * a sparse-skip sentinel; both were removed - the sentinel traded correctness
+ * for I/O savings, and with the sentinel gone the flag had nothing to gate.)
+ * Cross-version 19.0 <-> 18.x is handled by the extension-advertisement
+ * mechanism: 18.x doesn't advertise hpn-check-file, so the client never sends
+ * this request to an 18.x server.
  */
-#define HPN_CHECK_FILE_STRICT		0x00000001U
 
 /*
  * Heartbeat protocol for long-running HPN hash extensions (19.0):

@@ -73,7 +73,7 @@ int sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 
 int sftp_hpn_xxhash_local_fd(struct sftp_conn *, int, uint64_t, uint64_t *);
 int sftp_hpn_hash_remote_file(struct sftp_conn *, const char *, uint64_t,
-    uint32_t, uint64_t *);
+    uint64_t *);
 /*
  * Post-transfer integrity check.  local_is_target is 1 when the local file is
  * one this host just wrote (a download): its hash is taken as a fsync+O_DIRECT

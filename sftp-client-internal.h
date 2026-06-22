@@ -105,11 +105,9 @@ void sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn);
 
 /*
  * Set / query the HPNVerifyTransfer enabled state on a connection.
- * Resolved from ssh_config in sftp.c and stashed on conn->hpn so the
- * resume-decision callers can pass HPN_CHECK_FILE_STRICT in the
- * hpn-check-file request when the user has asked for maximum
- * verification.  Safe with conn / conn->hpn NULL; query returns 0 in
- * that case.
+ * Resolved from ssh_config in sftp.c and stashed on conn->hpn; gates the
+ * inline source-hash tee and the post-transfer verify phase.  Safe with
+ * conn / conn->hpn NULL; query returns 0 in that case.
  */
 void sftp_conn_set_verify_transfer(struct sftp_conn *conn, int enabled);
 int  sftp_conn_verify_transfer_enabled(struct sftp_conn *conn);

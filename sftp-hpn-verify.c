@@ -229,7 +229,7 @@ sftp_hpn_xxhash_local_fd(struct sftp_conn *conn, int fd, uint64_t length,
  */
 int
 sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
-    uint64_t length, uint32_t flags, uint64_t *hash_out)
+    uint64_t length, uint64_t *hash_out)
 {
 	struct sshbuf *msg;
 
@@ -245,15 +245,14 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 	}
 
 	id = sftp_conn_alloc_msg_id(conn);
-	debug3_f("sending hpn-check-file for \"%s\" length=%llu flags=0x%x id=%u",
-	    path, (unsigned long long)length, flags, id);
+	debug3_f("sending hpn-check-file for \"%s\" length=%llu id=%u",
+	    path, (unsigned long long)length, id);
 	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, "hpn-check-file@hpnssh.org")) != 0 ||
 	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
-	    (r = sshbuf_put_u64(msg, length)) != 0 ||
-	    (r = sshbuf_put_u32(msg, flags)) != 0)
+	    (r = sshbuf_put_u64(msg, length)) != 0)
 		fatal_fr(r, "compose");
 	send_msg(conn, msg);
 
@@ -555,14 +554,12 @@ sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
 	}
 
 	/*
-	 * Post-transfer integrity check: ALWAYS require the real XXH3, no
-	 * sparse-skip trust shortcut.  The purpose of this function is to
-	 * verify what actually transferred, not to trust allocation
-	 * metadata.  Pass HPN_CHECK_FILE_STRICT unconditionally.
+	 * Post-transfer integrity check: the server always computes the real
+	 * XXH3 off the platter - there is no trust shortcut to opt out of.
 	 */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 	if (sftp_hpn_hash_remote_file(conn, remote_path, (uint64_t)sb.st_size,
-	    HPN_CHECK_FILE_STRICT, &remote_hash) == 0)
+	    &remote_hash) == 0)
 		r = (local_hash == remote_hash) ? 0 : 1;
 	sftp_conn_watchdog_resume(conn);
 	debug3_f("verify \"%s\": local=%016llx remote=%016llx result=%d (%s)",

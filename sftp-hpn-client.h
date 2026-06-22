@@ -119,11 +119,8 @@ struct sftp_hpn_conn {
 	volatile uint64_t watchdog_pause_until_ns;
 
 	/* HPNVerifyTransfer state, propagated from ssh_config at sftp_init
-	 * time so the resume-decision hash callers can ask the server for
-	 * the real XXH3 (HPN_CHECK_FILE_STRICT) instead of accepting the
-	 * sparse-skip sentinel.  See [[verify-nomenclature-collision]] -
-	 * HPNVerifyTransfer here also gates the resume-decision-flow
-	 * trust optimisation, not just the post-transfer integrity check. */
+	 * time.  Gates the inline source-hash tee (so the post-transfer verify
+	 * has a source hash) and the post-transfer integrity check itself. */
 	int              verify_transfer_enabled;
 
 	/* Classic post-transfer verify phase: the single-conn analogue of the
