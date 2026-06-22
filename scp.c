@@ -119,6 +119,7 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
+#include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
 #include "sftp-parallel.h"
 #include "hpn-exit-codes.h"
 
@@ -1197,6 +1198,21 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	 */
 	hpn_verify_transfer = verify_flag;
 	sftp_conn_set_verify_transfer(conn, hpn_verify_transfer);
+
+	/*
+	 * Resolve and latch the verify auto-repair settings on the control
+	 * conn so single-stream scp's classic verify phase repairs too - the
+	 * parallel path gets them via pcfg.no_verify_repair below.  Mirrors the
+	 * sftp.c wiring: -X VerifyRepair=no (sftp_no_verify_repair) or
+	 * HPN_NO_VERIFY_REPAIR disables; attempts from HPN_VERIFY_REPAIR_ATTEMPTS.
+	 * Contained in { } to narrow the scope for the temprary vars. 
+	 */
+	{
+		int rep_enabled, rep_attempts;
+		sftp_hpn_verify_repair_resolve(sftp_no_verify_repair,
+		    &rep_enabled, &rep_attempts);
+		sftp_conn_set_verify_repair(conn, rep_enabled, rep_attempts);
+	}
 
 	if (parallel_num_streams <= 1)
 		return;			/* single-stream: no orchestrator */
