@@ -169,6 +169,9 @@ not implement SFTP, for backwards-compatibility for particular filename
 wildcard patterns and for expanding paths with a
 .Sq ~
 prefix for older SFTP servers.
+Verified resume
+.Pq Fl Z
+is not available with the legacy SCP protocol.
 .It Fl o Ar hpnssh_option
 Can be used to pass options to
 .Nm hpnssh
@@ -315,7 +318,15 @@ Note that
 .Nm
 follows symbolic links encountered in the tree traversal.
 .It Fl Z
-Resume failed or interrupted transfer. Identical files will be skipped. Remote must have resume option.
+Resume a failed or interrupted transfer with integrity verification.
+The local and remote copies are compared by hashing them in ranges; only
+the ranges that differ are re-transferred, and the repaired file is then
+re-verified.
+A file whose contents already match is skipped.
+This relies on the SFTP protocol's random-access range hashing and so
+cannot be combined with the legacy SCP protocol
+.Pq Fl O .
+This is an
 .Nm
 only option.
 .It Fl S Ar program
@@ -325,12 +336,6 @@ to use for the encrypted connection.
 The program must understand
 .Xr hpnssh 1
 options.
-.It Fl z Ar program
-Path to hpnscp on remote system. Useful if remote has multiple scp installs.
-For example, using the resume option but the default remote scp does not have the resume option.
-Use -z to point the version that does - e.g. -z /opt/hpnssh/bin/hpnscp.
-.Nm
-only option. 
 .It Fl s
 Use the SFTP protocol for transfers rather than the original scp protocol.
 .It Fl T

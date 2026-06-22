@@ -3902,6 +3902,20 @@ main(int argc, char **argv)
 	sftp_conn_set_verify_transfer(conn, hpn_verify_transfer);
 
 	/*
+	 * Resolve and propagate the verify auto-repair (#6) settings onto the
+	 * connection for the single-conn (classic) verify phase, mirroring the
+	 * orchestrator's resolution in sftp_parallel_start.  -X VerifyRepair=no
+	 * (no_verify_repair) or HPN_NO_VERIFY_REPAIR disables; the attempt cap
+	 * comes from HPN_VERIFY_REPAIR_ATTEMPTS (default 3).
+	 */
+	{
+		int rep_enabled, rep_attempts;
+		sftp_hpn_verify_repair_resolve(no_verify_repair,
+		    &rep_enabled, &rep_attempts);
+		sftp_conn_set_verify_repair(conn, rep_enabled, rep_attempts);
+	}
+
+	/*
 	 * Propagate HPNLustreStripeCount (EXPERIMENTAL) onto the connection
 	 * so the parallel upload-walker's dir-layout decision site can see
 	 * it.  Value: -1 = auto (use -j N), 0 = feature off, >0 = explicit.

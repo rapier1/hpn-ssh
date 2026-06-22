@@ -111,21 +111,32 @@ parallel_verify_one(struct sftp_worker *w, const char *local_path,
     const char *remote_path, int local_is_target)
 {
 	struct sftp_parallel *p = w->parent;
-	/* Decoupled post-transfer verify: force a fresh source re-read.  The
-	 * inline accumulator is per-connection and size-keyed, so a verify that
-	 * runs on a different worker than the uploader could otherwise take
-	 * another same-size file's source hash (the false-positive bug). */
-	int r = sftp_hpn_verify_transfer(w->conn, local_path, remote_path,
-	    local_is_target, /*trust_inline_src=*/0);
+	/*
+	 * Shared verify + auto-repair core (#6): whole-file verify, and on a
+	 * content mismatch, splice-repair only the bad ranges (>= chunk-hash
+	 * floor) or re-transmit whole (smaller), bounded by the attempt cap +
+	 * convergence.  The same implementation the classic single-conn phase
+	 * uses, so the two whole-file paths can no longer drift.  The core
+	 * forces a fresh source re-read (the size-keyed inline accumulator may
+	 * hold another same-size file's hash on a different worker).
+	 */
+	int r = sftp_hpn_verify_repair(w->conn, local_path, remote_path,
+	    local_is_target, p->verify_repair_enabled,
+	    p->verify_repair_attempts);
 
 	if (r == 0)
-		return;	/* verified good */
+		return;	/* verified good (possibly after repair) */
 	if (r < 0) {
 		logit("worker %d VERIFY SKIPPED: \"%s\": server lacks "
 		    "hpn-check-file@hpnssh.org or read error",
 		    w->id, remote_path);
 		return;
 	}
+	/*
+	 * Unrepairable (converged, hit the cap, or repair disabled): the core
+	 * already logged the specific cause; record the failure for the run
+	 * summary + exit code.
+	 */
 	error_f("worker %d VERIFY FAILED: %s file \"%s\" does NOT match source",
 	    w->id, local_is_target ? "local" : "remote",
 	    local_is_target ? local_path : remote_path);

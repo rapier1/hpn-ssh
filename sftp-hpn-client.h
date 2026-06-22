@@ -123,6 +123,14 @@ struct sftp_hpn_conn {
 	 * has a source hash) and the post-transfer integrity check itself. */
 	int              verify_transfer_enabled;
 
+	/* Auto-repair (#6) settings for the single-conn (classic) verify phase,
+	 * resolved once in sftp.c from -X VerifyRepair / HPN_NO_VERIFY_REPAIR /
+	 * HPN_VERIFY_REPAIR_ATTEMPTS - the conn-side analogue of the
+	 * orchestrator's p->verify_repair_{enabled,attempts}.  The shared core
+	 * (sftp_hpn_verify_repair) reads these on this path. */
+	int              verify_repair_enabled;
+	int              verify_repair_attempts;
+
 	/* Classic post-transfer verify phase: the single-conn analogue of the
 	 * -j orchestrator's verify phase.  sftp_upload/sftp_download PARK each
 	 * transferred file (verify_pending); after the command's transfers

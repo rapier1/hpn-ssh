@@ -113,6 +113,16 @@ void sftp_conn_set_verify_transfer(struct sftp_conn *conn, int enabled);
 int  sftp_conn_verify_transfer_enabled(struct sftp_conn *conn);
 
 /*
+ * Set the single-conn (classic) verify auto-repair settings on a connection,
+ * resolved in sftp.c from -X VerifyRepair / HPN_NO_VERIFY_REPAIR /
+ * HPN_VERIFY_REPAIR_ATTEMPTS.  The conn-side analogue of the orchestrator's
+ * p->verify_repair_{enabled,attempts}; read by sftp_conn_verify_run_phase.
+ * Safe with conn / conn->hpn NULL.
+ */
+void sftp_conn_set_verify_repair(struct sftp_conn *conn, int enabled,
+	int attempts);
+
+/*
  * HPNVerifyTransfer (1b): consume the inline source hash computed during the
  * just-finished upload on this connection, if it covers expect_bytes.  Returns
  * 0 and writes the hash to *hash_out on success; -1 if unavailable (the verify

@@ -4481,6 +4481,15 @@ sftp_conn_verify_transfer_enabled(struct sftp_conn *conn)
 	    conn->hpn->verify_transfer_enabled;
 }
 
+void
+sftp_conn_set_verify_repair(struct sftp_conn *conn, int enabled, int attempts)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return;
+	conn->hpn->verify_repair_enabled = enabled ? 1 : 0;
+	conn->hpn->verify_repair_attempts = attempts < 1 ? 1 : attempts;
+}
+
 /* HPNVerifyTransfer (1b): bridge conn -> conn->hpn for the verify module. */
 int
 sftp_conn_verify_src_take(struct sftp_conn *conn, uint64_t expect_bytes,
@@ -4569,9 +4578,10 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 		 * interrupt unwinds promptly to the prompt / exit.
 		 */
 		if (!interrupted) {
-			int r = sftp_hpn_verify_transfer(conn, e->local_path,
+			int r = sftp_hpn_verify_repair(conn, e->local_path,
 			    e->remote_path, e->local_is_target,
-			    /*trust_inline_src=*/0);
+			    conn->hpn->verify_repair_enabled,
+			    conn->hpn->verify_repair_attempts);
 			if (r == 1) {
 				error("VERIFY FAILED: \"%s\" (post-transfer hash "
 				    "mismatch - the transferred file does NOT "

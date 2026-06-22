@@ -54,6 +54,7 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"	/* sftp_conn_watchdog_pause_until_ns */
+#include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair[_resolve] */
 #include "sftp-workqueue.h"
 #include "sftp-parallel.h"
 #include "hpn-exit-codes.h"
@@ -399,15 +400,8 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	 * default; disabled by EITHER the -X VerifyRepair=no CLI token
 	 * (cfg->no_verify_repair) OR the HPN_NO_VERIFY_REPAIR env var.  The cap
 	 * defaults to 3 (HPN_VERIFY_REPAIR_ATTEMPTS); below 1 it is clamped to 1. */
-	{
-		const char *e = getenv("HPN_NO_VERIFY_REPAIR");
-		p->verify_repair_enabled = !cfg->no_verify_repair &&
-		    !(e != NULL && *e != '\0');
-		e = getenv("HPN_VERIFY_REPAIR_ATTEMPTS");
-		p->verify_repair_attempts = (e != NULL && *e != '\0') ? atoi(e) : 3;
-		if (p->verify_repair_attempts < 1)
-			p->verify_repair_attempts = 1;
-	}
+	sftp_hpn_verify_repair_resolve(cfg->no_verify_repair,
+	    &p->verify_repair_enabled, &p->verify_repair_attempts);
 	p->last_worker_exit_code = -1;	/* no worker reaped yet */
 	/* Born-dead 0-bytes kill threshold.  RTT-derived once the path RTT is
 	 * registered (sftp_parallel_set_path_rtt); BORN_DEAD_KILL_SEC until then. */

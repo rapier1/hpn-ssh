@@ -488,7 +488,8 @@ verify_readback_progress(void *arg, uint64_t bytes)
 
 int
 sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, int local_is_target, int trust_inline_src)
+    const char *remote_path, int local_is_target, int trust_inline_src,
+    uint64_t *dest_hash_out)
 {
 	int fd, r = -1;
 	struct stat sb;
@@ -559,8 +560,17 @@ sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
 	 */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 	if (sftp_hpn_hash_remote_file(conn, remote_path, (uint64_t)sb.st_size,
-	    &remote_hash) == 0)
+	    &remote_hash) == 0) {
 		r = (local_hash == remote_hash) ? 0 : 1;
+		/* Report the WRITTEN side's hash (remote on upload, local on
+		 * download) so the repair convergence check can compare it
+		 * across attempts.  Only meaningful when the compare was
+		 * reached (r is 0 or 1), so leave *dest_hash_out untouched on
+		 * the -1 early-outs above. */
+		if (dest_hash_out != NULL)
+			*dest_hash_out = local_is_target ? local_hash
+			    : remote_hash;
+	}
 	sftp_conn_watchdog_resume(conn);
 	debug3_f("verify \"%s\": local=%016llx remote=%016llx result=%d (%s)",
 	    remote_path, (unsigned long long)local_hash,
@@ -1268,4 +1278,145 @@ out:
 	free(local_hashes);
 	free(remote_hashes);
 	return rc;
+}
+
+void
+sftp_hpn_verify_repair_resolve(int no_verify_repair_cli, int *enabled_out,
+    int *attempts_out)
+{
+	const char *e = getenv("HPN_NO_VERIFY_REPAIR");
+	int attempts;
+
+	if (enabled_out != NULL)
+		*enabled_out = !no_verify_repair_cli &&
+		    !(e != NULL && *e != '\0');
+	e = getenv("HPN_VERIFY_REPAIR_ATTEMPTS");
+	attempts = (e != NULL && *e != '\0') ? atoi(e) : 3;
+	if (attempts < 1)
+		attempts = 1;
+	if (attempts_out != NULL)
+		*attempts_out = attempts;
+}
+
+/*
+ * One repair pass over `local_path`/`remote_path`.  Granularity mirrors the
+ * transfer: a file at/above the chunk-hash floor re-hashes in 64 MiB ranges
+ * and splices only the mismatched contiguous runs in place (no truncation,
+ * offset-addressed WRITE); a smaller file (or one the chunked path declines)
+ * re-transmits [0, size) whole.  Returns 0 if a pass ran (caller re-verifies),
+ * -1 on a hard transfer error.
+ */
+static int
+verify_repair_one_pass(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, int local_is_target, off_t size)
+{
+	int rc;
+
+	if (size > 0 && (u_int64_t)size >= CHUNK_HASH_MIN_FILE_SIZE) {
+		int fd = open(local_path, O_RDONLY);
+
+		if (fd == -1) {
+			error_f("open local \"%s\": %s", local_path,
+			    strerror(errno));
+			return -1;
+		}
+		if (local_is_target)
+			rc = sftp_hpn_try_chunked_resume_download(conn, fd,
+			    local_path, remote_path, size);
+		else
+			rc = sftp_hpn_try_chunked_resume_upload(conn, fd,
+			    local_path, remote_path, size);
+		close(fd);
+		/*
+		 * 1 = nothing mismatched at chunk granularity, 0 = spliced;
+		 * either way a pass ran.  -1 = declined (server lacks
+		 * sftp-hash-range, chunk-count cap, or local I/O error) - fall
+		 * through to a whole-file re-transmit.
+		 */
+		if (rc >= 0)
+			return 0;
+	}
+
+	/* Whole-file re-transmit: re-send / re-fetch [0, size) in place. */
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	if (local_is_target)
+		rc = sftp_download_range(conn, remote_path, local_path,
+		    0, size, NULL);
+	else
+		rc = sftp_upload_range(conn, local_path, remote_path,
+		    0, size, NULL, NULL, NULL);
+	sftp_conn_watchdog_resume(conn);
+	return rc == 0 ? 0 : -1;
+}
+
+int
+sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, int local_is_target,
+    int repair_enabled, int max_attempts)
+{
+	struct stat sb;
+	uint64_t dest_hash = 0, prev_hash = 0;
+	const char *side, *dst;
+	int r, attempt;
+
+	r = sftp_hpn_verify_transfer(conn, local_path, remote_path,
+	    local_is_target, /*trust_inline_src=*/0, &dest_hash);
+	if (r != 1)
+		return r;		/* 0 = good, -1 = unverifiable */
+	if (!repair_enabled)
+		return 1;		/* mismatch, repair disabled */
+
+	if (stat(local_path, &sb) == -1) {
+		error_f("stat \"%s\": %s", local_path, strerror(errno));
+		return 1;
+	}
+	if (max_attempts < 1)
+		max_attempts = 1;
+	side = local_is_target ? "local" : "remote";
+	dst = local_is_target ? local_path : remote_path;
+	prev_hash = dest_hash;
+
+	logit("repairing %s file \"%s\" (verify mismatch)...", side, dst);
+
+	for (attempt = 1; attempt <= max_attempts; attempt++) {
+		if (verify_repair_one_pass(conn, local_path, remote_path,
+		    local_is_target, sb.st_size) != 0) {
+			error_f("repair re-transfer failed for \"%s\"", dst);
+			return 1;
+		}
+		r = sftp_hpn_verify_transfer(conn, local_path, remote_path,
+		    local_is_target, /*trust_inline_src=*/0, &dest_hash);
+		if (r == 0) {
+			logit("repaired %s file \"%s\" (attempt %d)",
+			    side, dst, attempt);
+			return 0;
+		}
+		if (r < 0) {
+			/*
+			 * Could not re-verify this attempt (transient read or
+			 * extension problem): mirror the orchestrator's
+			 * "unverifiable attempt" handling - keep trying to the
+			 * cap, then give up.
+			 */
+			if (attempt >= max_attempts)
+				break;
+			continue;
+		}
+		/*
+		 * Still corrupt.  Convergence: the same dest hash twice in a
+		 * row means a deterministic fault keeps re-writing the same bad
+		 * bytes (bad media / a re-corrupting source) - no point
+		 * retrying.
+		 */
+		if (dest_hash == prev_hash) {
+			error_f("%s file \"%s\": two identical failed hashes in "
+			    "a row - deterministic fault, not retrying",
+			    side, dst);
+			return 1;
+		}
+		prev_hash = dest_hash;
+	}
+	error_f("%s file \"%s\": still corrupt after %d repair attempt(s) - "
+	    "possible storage/media fault", side, dst, max_attempts);
+	return 1;
 }

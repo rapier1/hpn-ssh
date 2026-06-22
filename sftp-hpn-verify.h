@@ -89,7 +89,7 @@ int sftp_hpn_hash_remote_file(struct sftp_conn *, const char *, uint64_t,
  * same-size file's hash.
  */
 int sftp_hpn_verify_transfer(struct sftp_conn *, const char *, const char *,
-    int local_is_target, int trust_inline_src);
+    int local_is_target, int trust_inline_src, uint64_t *dest_hash_out);
 int sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
     u_int64_t *hash_out);
 
@@ -151,5 +151,38 @@ int sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
  */
 int sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
     const char *local_path, const char *remote_path, off_t file_size);
+
+/*
+ * Resolve the verify auto-repair (#6) settings from the CLI/env precedence,
+ * shared by the orchestrator (sftp_parallel_start) and the single-conn path
+ * (sftp.c).  no_verify_repair_cli is the -X VerifyRepair=no token; the
+ * HPN_NO_VERIFY_REPAIR env also disables.  Attempts come from
+ * HPN_VERIFY_REPAIR_ATTEMPTS (default 3, clamped to >= 1).  One resolution so
+ * the two call paths cannot drift.
+ */
+void sftp_hpn_verify_repair_resolve(int no_verify_repair_cli,
+    int *enabled_out, int *attempts_out);
+
+/*
+ * Shared verify + auto-repair core (#6).  Verifies local_path against
+ * remote_path (local_is_target: 0 = upload/remote-dest, 1 = download/local-
+ * dest); on a content mismatch, when repair_enabled, repairs and re-verifies,
+ * bounded by max_attempts with convergence (two identical failed dest hashes
+ * in a row = deterministic fault, bail).  Repair granularity mirrors the
+ * transfer: files >= the chunk-hash floor splice only the mismatched ranges
+ * in place; smaller files re-transmit whole.
+ *
+ * Called by both the orchestrator whole-file path (parallel_verify_one, with
+ * p->verify_repair_{enabled,attempts}) and the classic single-conn phase
+ * (sftp_conn_verify_run_phase, with conn->hpn->verify_repair_{enabled,
+ * attempts}) so there is one verify+repair implementation.
+ *
+ * Returns 0 (verified good, after any repair), 1 (unrepairable: converged,
+ * hit the attempt cap, or repair disabled + mismatch), or -1 (unverifiable -
+ * server lacks hpn-check-file or a read error; caller treats as "skipped").
+ */
+int sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, int local_is_target,
+    int repair_enabled, int max_attempts);
 
 #endif /* SFTP_HPN_VERIFY_H */
