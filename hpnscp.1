@@ -367,8 +367,8 @@ to print debugging messages about their progress.
 This is helpful in
 debugging connection, authentication, and configuration problems.
 .It Fl X Ar sftp_option
-Specify an option that controls aspects of SFTP protocol behaviour.
-The valid options are:
+Specify an option that controls aspects of SFTP transfer behaviour.
+The valid options, whose names and values are case-insensitive, are:
 .Bl -tag -width Ds
 .It Cm nrequests Ns = Ns Ar value
 Controls how many concurrent SFTP read or write requests may be in progress
@@ -380,6 +380,16 @@ Controls the maximum buffer size for a single SFTP read/write operation used
 during download or upload. This value must be between 1B and 255KB. You may use
 the K unit for the size. E.g. 32768 or 32K.
 By default a 32KB buffer is used.
+.It Cm VerifyRepair Ns = Ns Cm yes Ns | Ns Cm no
+When transfer verification is enabled, controls whether a verification
+failure is automatically repaired by re-transferring and re-verifying only
+the affected byte ranges, bounded by a per-range retry limit, rather than
+failing the transfer.
+The default is
+.Cm yes .
+Setting
+.Cm VerifyRepair Ns = Ns Cm no
+disables auto-repair, so a verification failure exits non-zero as before.
 .El
 .El
 .Sh EXIT STATUS

@@ -1006,6 +1006,7 @@ static struct {
 	char       **extra_o;
 	size_t       buflen;
 	size_t       num_requests;
+	int          no_verify_repair;	/* -X VerifyRepair=no */
 	long long    limit_kbps;
 	int          debug_level;
 	int          valid;
@@ -1039,6 +1040,7 @@ parallel_orch_launch(struct sftp_conn *conn)
 	pcfg.extra_argv       = parallel_launch.extra_o;
 	pcfg.transfer_buflen  = (unsigned int)parallel_launch.buflen;
 	pcfg.num_requests     = (unsigned int)parallel_launch.num_requests;
+	pcfg.no_verify_repair = parallel_launch.no_verify_repair;
 	pcfg.limit_kbps       = parallel_launch.limit_kbps;
 	pcfg.range_split_min_mb = range_split_min_mb_user;
 	pcfg.writers_per_inode_cap = writers_cap_user ?
@@ -3384,6 +3386,7 @@ main(int argc, char **argv)
 	struct sftp_conn *conn;
 	size_t copy_buffer_len = 0;
 	size_t num_requests = 0;
+	int no_verify_repair = 0;	/* -X VerifyRepair=no -> 1 */
 	long long llv, limit_kbps = 0;
 
 	/* Pass-through state for the parallel-streams ControlMaster.
@@ -3725,7 +3728,7 @@ main(int argc, char **argv)
 			break;
 		case 'X':
 			/* Please keep in sync with scp.c -X */
-			if (strncmp(optarg, "buffer=", 7) == 0) {
+			if (strncasecmp(optarg, "buffer=", 7) == 0) {
 				r = scan_scaled(optarg + 7, &llv);
 				/* don't ask for a buffer larger than the maximum
 				 * size that SFTP can handle */
@@ -3738,7 +3741,7 @@ main(int argc, char **argv)
 					      "\"%s\": %s", optarg + 7, strerror(errno));
 				}
 				copy_buffer_len = (size_t)llv;
-			} else if (strncmp(optarg, "nrequests=", 10) == 0) {
+			} else if (strncasecmp(optarg, "nrequests=", 10) == 0) {
 				/* more than 10k to 15k requests starts stalling the connection
 				 * 8192 * default buffer size is 256MB of outstanding data.
 				 * if users need more then they need to up the buffer size */
@@ -3749,6 +3752,16 @@ main(int argc, char **argv)
 					      "\"%s\": %s", optarg + 10, errstr);
 				}
 				num_requests = (size_t)llv;
+			} else if (strncasecmp(optarg, "VerifyRepair=", 13) == 0) {
+				/* Auto-repair toggle (default yes). */
+				const char *v = optarg + 13;
+				if (strcasecmp(v, "no") == 0)
+					no_verify_repair = 1;
+				else if (strcasecmp(v, "yes") == 0)
+					no_verify_repair = 0;
+				else
+					fatal("Invalid VerifyRepair value "
+					      "\"%s\": use yes or no", v);
 			} else {
 				fatal("Invalid -X option");
 			}
@@ -3866,6 +3879,7 @@ main(int argc, char **argv)
 	parallel_launch.extra_o      = parallel_extra_o;
 	parallel_launch.buflen       = copy_buffer_len;
 	parallel_launch.num_requests = num_requests;
+	parallel_launch.no_verify_repair = no_verify_repair;
 	parallel_launch.limit_kbps   = limit_kbps;
 	parallel_launch.debug_level  = debug_level;
 	parallel_launch.valid        = 1;

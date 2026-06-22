@@ -396,11 +396,13 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 
 	/* Auto-repair (#6): on a post-transfer verify mismatch, re-transfer the
 	 * bad ranges and re-verify, bounded by a per-range attempt cap.  ON by
-	 * default; HPN_NO_VERIFY_REPAIR disables the whole repair phase.  The cap
+	 * default; disabled by EITHER the -X VerifyRepair=no CLI token
+	 * (cfg->no_verify_repair) OR the HPN_NO_VERIFY_REPAIR env var.  The cap
 	 * defaults to 3 (HPN_VERIFY_REPAIR_ATTEMPTS); below 1 it is clamped to 1. */
 	{
 		const char *e = getenv("HPN_NO_VERIFY_REPAIR");
-		p->verify_repair_enabled = !(e != NULL && *e != '\0');
+		p->verify_repair_enabled = !cfg->no_verify_repair &&
+		    !(e != NULL && *e != '\0');
 		e = getenv("HPN_VERIFY_REPAIR_ATTEMPTS");
 		p->verify_repair_attempts = (e != NULL && *e != '\0') ? atoi(e) : 3;
 		if (p->verify_repair_attempts < 1)

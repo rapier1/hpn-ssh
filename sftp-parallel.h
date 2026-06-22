@@ -115,6 +115,11 @@ struct sftp_parallel_config {
 	int          verify_transfer;	/* HPNVerifyTransfer: post-transfer
 					 * XXH3 verify; warn+collect on
 					 * mismatch, never abort */
+	int          no_verify_repair;	/* auto-repair (#6): 0 = repair on
+					 * (default), 1 = disabled via the
+					 * -X VerifyRepair=no CLI token.  OR'd
+					 * with HPN_NO_VERIFY_REPAIR in
+					 * sftp_parallel_start. */
 
 	/* Reporting: SFTP_QUIET / SFTP_PROGRESS_ONLY / SFTP_PRINT */
 	int          print_flag;

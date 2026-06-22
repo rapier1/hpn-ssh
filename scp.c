@@ -172,6 +172,7 @@ pid_t do_cmd_pid2 = -1;
 /* SFTP copy parameters */
 size_t sftp_copy_buflen;
 size_t sftp_nrequests;
+int sftp_no_verify_repair;	/* -X VerifyRepair=no -> 1 (auto-repair off) */
 
 /* Needed for sftp */
 volatile sig_atomic_t interrupted = 0;
@@ -696,7 +697,7 @@ main(int argc, char **argv)
 			break;
 		case 'X':
 			/* Please keep in sync with sftp.c -X */
-			if (strncmp(optarg, "buffer=", 7) == 0) {
+			if (strncasecmp(optarg, "buffer=", 7) == 0) {
                                 r = scan_scaled(optarg + 7, &llv);
                                 /* don't ask for a buffer larger than the maximum
                                  * size that SFTP can handle */
@@ -709,7 +710,7 @@ main(int argc, char **argv)
                                               "\"%s\": %s", optarg + 7, strerror(errno));
                                 }
                                 sftp_copy_buflen = (size_t)llv;
-                        } else if (strncmp(optarg, "nrequests=", 10) == 0) {
+                        } else if (strncasecmp(optarg, "nrequests=", 10) == 0) {
                                 /* more than 10k to 15k requests starts stalling the connection
                                  * 8192 * default buffer size is 256MB of outstanding data.
                                  * if users need more then they need to up the buffer size */
@@ -720,6 +721,16 @@ main(int argc, char **argv)
                                               "\"%s\": %s", optarg + 10, errstr);
                                 }
                                 sftp_nrequests = (size_t)llv;
+                        } else if (strncasecmp(optarg, "VerifyRepair=", 13) == 0) {
+                                /* Auto-repair toggle (default yes); no value */
+                                const char *v = optarg + 13;
+                                if (strcasecmp(v, "no") == 0)
+                                        sftp_no_verify_repair = 1;
+                                else if (strcasecmp(v, "yes") == 0)
+                                        sftp_no_verify_repair = 0;
+                                else
+                                        fatal("Invalid VerifyRepair value "
+                                              "\"%s\": use yes or no", v);
                         } else {
                                 fatal("Invalid -X option");
                         }
@@ -1202,6 +1213,7 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	pcfg.extra_argv    = parallel_extra_o;
 	pcfg.transfer_buflen = (u_int)sftp_copy_buflen;
 	pcfg.num_requests  = (u_int)sftp_nrequests;
+	pcfg.no_verify_repair = sftp_no_verify_repair;
 	pcfg.limit_kbps    = (uint64_t)limit_kbps;
 	pcfg.writers_per_inode_cap = HPN_RANGE_WRITERS_CAP_DEFAULT;
 	pcfg.range_split_min_mb = range_split_min_mb_user;
