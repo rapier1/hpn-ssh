@@ -522,7 +522,7 @@ parallel_repair_phase_run(struct sftp_parallel *p)
 	struct verify_job **jobs;
 	struct repair_item *items = NULL;
 	int njobs, nitems = 0, icap = 0;
-	int i, k, iter, repaired = 0, unrepairable = 0;
+	int i, k, iter, unrepairable = 0;
 	uint64_t repaired_bytes = 0;
 
 	/* Take ownership of the parked failed jobs. */
@@ -568,8 +568,7 @@ parallel_repair_phase_run(struct sftp_parallel *p)
 	if (p->progress_meter_started)
 		sftp_parallel_progress_stop(p);
 	if (p->cfg.print_flag != SFTP_QUIET)
-		mprintf("Repairing %d corrupt range(s) in %d file(s)...\n",
-		    nitems, njobs);
+		mprintf("Repairing %d corrupt file(s)...\n", njobs);
 
 	for (iter = 1; iter <= p->verify_repair_attempts && !p->abort_flag;
 	    iter++) {
@@ -614,16 +613,15 @@ parallel_repair_phase_run(struct sftp_parallel *p)
 			items[i].attempts++;
 			if (res == 0) {		/* re-verify matched: repaired */
 				items[i].state = RS_REPAIRED;
-				repaired++;
 				repaired_bytes += (uint64_t)j->lens[kk];
 				if (p->cfg.print_flag != SFTP_QUIET)
-					mprintf("  repaired range [%llu+%llu) "
-					    "of %s file \"%s\"\n",
-					    (unsigned long long)j->offs[kk],
-					    (unsigned long long)j->lens[kk],
+					mprintf("  repaired %s file \"%s\" "
+					    "(%llu bytes at offset %llu)\n",
 					    j->local_is_target ? "local" : "remote",
 					    j->local_is_target ? j->local_path
-					    : j->remote_path);
+					    : j->remote_path,
+					    (unsigned long long)j->lens[kk],
+					    (unsigned long long)j->offs[kk]);
 			} else if (res == 1) {	/* still corrupt + new hash */
 				uint64_t now = j->range_dest_hash[kk];
 
@@ -664,17 +662,19 @@ parallel_repair_phase_run(struct sftp_parallel *p)
 			    : j->remote_path;
 
 			if (items[i].state == RS_CONVERGED)
-				error_f("range [%llu+%llu) of %s file \"%s\": "
-				    "two identical failed hashes in a row - "
-				    "deterministic fault, not retrying",
-				    (unsigned long long)j->offs[kk],
-				    (unsigned long long)j->lens[kk], side, dst);
+				error_f("%s file \"%s\" (%llu bytes at offset "
+				    "%llu): two identical failed hashes in a row "
+				    "- deterministic fault, not retrying",
+				    side, dst,
+				    (unsigned long long)j->lens[kk],
+				    (unsigned long long)j->offs[kk]);
 			else if (items[i].state == RS_CAPPED)
-				error_f("range [%llu+%llu) of %s file \"%s\": "
-				    "still corrupt after %d repair attempts - "
-				    "possible storage/media fault",
+				error_f("%s file \"%s\" (%llu bytes at offset "
+				    "%llu): still corrupt after %d repair "
+				    "attempt(s) - possible storage/media fault",
+				    side, dst,
+				    (unsigned long long)j->lens[kk],
 				    (unsigned long long)j->offs[kk],
-				    (unsigned long long)j->lens[kk], side, dst,
 				    p->verify_repair_attempts);
 		}
 	}
@@ -700,8 +700,7 @@ parallel_repair_phase_run(struct sftp_parallel *p)
 	free(items);
 
 	if (!p->abort_flag && p->cfg.print_flag != SFTP_QUIET)
-		mprintf("Auto-repair: repaired %d range(s) (%llu bytes); "
-		    "%d unrepairable\n", repaired,
+		mprintf("Auto-repair: repaired %llu bytes; %d unrepairable\n",
 		    (unsigned long long)repaired_bytes, unrepairable);
 }
 

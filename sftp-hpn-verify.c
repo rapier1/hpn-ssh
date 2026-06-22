@@ -41,6 +41,15 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
+/*
+ * SIGINT flag, defined in sftp.c (hpnsftp) and scp.c (hpnscp) - both binaries
+ * that link this object provide it, and both set it from their SIGINT handler
+ * in either the classic or the parallel context.  The auto-repair loop polls
+ * it so a multi-attempt repair bails promptly on Ctrl-C instead of grinding
+ * through the remaining attempts.
+ */
+extern volatile sig_atomic_t interrupted;
+
 /* ── BEGIN sftp-hash-range: client-side helpers ───────────────────────────
  *
  * Helpers for chunked resume.  See sftp-hpn-client.h for the public API
@@ -1376,9 +1385,20 @@ sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
 	dst = local_is_target ? local_path : remote_path;
 	prev_hash = dest_hash;
 
-	logit("repairing %s file \"%s\" (verify mismatch)...", side, dst);
+	logit("Repairing %s file \"%s\" (verify mismatch)...", side, dst);
 
 	for (attempt = 1; attempt <= max_attempts; attempt++) {
+		/*
+		 * Bail on Ctrl-C between attempts: a converging/capping repair
+		 * of a large file would otherwise grind through every remaining
+		 * attempt before the interrupt is noticed.  The file is left as
+		 * the last attempt wrote it (still corrupt) and recorded as a
+		 * verify failure by the caller.
+		 */
+		if (interrupted) {
+			logit("repair of %s file \"%s\" interrupted", side, dst);
+			return 1;
+		}
 		if (verify_repair_one_pass(conn, local_path, remote_path,
 		    local_is_target, sb.st_size) != 0) {
 			error_f("repair re-transfer failed for \"%s\"", dst);
