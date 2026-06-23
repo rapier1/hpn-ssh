@@ -144,67 +144,6 @@ parallel_verify_one(struct sftp_worker *w, const char *local_path,
 	parallel_verify_fail_record(p, local_is_target, local_path, remote_path);
 }
 
-/*
- * HPNVerifyTransfer (range-split upload): per-range verify off the tracker's
- * teed source hashes - no whole-file source re-read.  Builds the range arrays
- * from the slots and compares against the server's per-range dest hashes.  A
- * -1 (server lacks sftp-hash-range, or a local read failed) falls back to the
- * whole-file verify so integrity is still checked.
- */
-void
-parallel_verify_one_ranges(struct sftp_worker *w, struct sftp_range_tracker *t)
-{
-	struct sftp_parallel	*p = w->parent;
-	struct sftp_hash_range	*ranges;
-	uint64_t		*local_hashes;
-	int			*valid;
-	u_int			 i, n;
-	int			 r;
-
-	if (t->vslots == NULL || t->vslots_n <= 0) {
-		parallel_verify_one(w, t->src_path, t->path,
-		    /*local_is_target=*/0);
-		return;
-	}
-	/*
-	 * Bound by vslots_n (the allocation), NOT t->total: the endgame split
-	 * grows total with sub-range pieces but never resizes vslots.  Those
-	 * pieces tile a slot whose original range was left valid=0 (the held
-	 * unit shrank, so its hash was not stored), so re-reading that slot's
-	 * full [off, len) at finalize already covers every piece - the extra
-	 * grown slots neither exist nor are needed.
-	 */
-	n = (u_int)t->vslots_n;
-	ranges       = xcalloc(n, sizeof(*ranges));
-	local_hashes = xcalloc(n, sizeof(*local_hashes));
-	valid        = xcalloc(n, sizeof(*valid));
-	for (i = 0; i < n; i++) {
-		ranges[i].off   = t->vslots[i].off;
-		ranges[i].len   = t->vslots[i].len;
-		local_hashes[i] = t->vslots[i].hash;
-		valid[i]        = t->vslots[i].valid;
-	}
-	r = sftp_hpn_verify_transfer_ranges(w->conn, t->src_path, t->path,
-	    ranges, local_hashes, valid, n);
-	free(ranges);
-	free(local_hashes);
-	free(valid);
-
-	if (r == 0)
-		return;	/* verified good */
-	if (r < 0) {
-		/* Per-range path unavailable - re-check whole-file (re-reads
-		 * the source but still proves integrity). */
-		parallel_verify_one(w, t->src_path, t->path,
-		    /*local_is_target=*/0);
-		return;
-	}
-	/* Range-split UPLOAD path: the dest is the remote file (t->path). */
-	error_f("worker %d VERIFY FAILED: remote file \"%s\" does NOT match "
-	    "source", w->id, t->path);
-	parallel_verify_fail_record(p, /*local_is_target=*/0, NULL, t->path);
-}
-
 /* Close and clear the worker's warm remote handle (held open across same-
  * file range writes to skip the boundary close/reopen).  Skips the wire
  * close on a dead connection; always frees the cached handle + path. */
@@ -244,11 +183,12 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	    parallel_unit_ensure_file(w->conn, u) != 0)
 		return -1;
 
-	/* Post-transfer verify: the parked tracker is verified on this worker's
-	 * own conn and freed by the handler (which NULLs verify_tracker so
-	 * parallel_unit_free won't double-free).  Verify never fails the unit -
-	 * a mismatch goes to verify_failed_paths, not a retry - so it always
-	 * returns 0 and worker_process_result just dec-pendings and frees it. */
+	/* Post-transfer verify: the parked file is verified on this worker's own
+	 * conn and its carrier (verify_job for a range chunk, verify_whole for a
+	 * whole file) freed by the handler, which NULLs it so parallel_unit_free
+	 * won't double-free.  Verify never fails the unit - a mismatch goes to
+	 * verify_failed_paths, not a retry - so it always returns 0 and
+	 * worker_process_result just dec-pendings and frees it. */
 	if (u->op == SFTP_OP_VERIFY) {
 		struct sftp_parallel *p = w->parent;
 
@@ -316,9 +256,19 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 			return 0;
 		}
 
-		/* Whole-file / small / pre-19-server file: one unit per file. */
-		parallel_verify_and_free(w, u->verify_tracker);
-		u->verify_tracker = NULL;
+		/* Whole-file / small file: one unit per file, carried by a
+		 * lightweight verify_whole_item.  Verify+repair inline on this
+		 * worker's own conn, then free the item. */
+		if (u->verify_whole != NULL) {
+			struct verify_whole_item *it = u->verify_whole;
+
+			parallel_verify_one(w, it->local_path, it->remote_path,
+			    it->local_is_target);
+			free(it->local_path);
+			free(it->remote_path);
+			free(it);
+			u->verify_whole = NULL;
+		}
 		/* Drive the verify-phase meter: count completed verifies (the
 		 * submit interleaves with draining, so pending is ambiguous). */
 		__atomic_fetch_add(&p->verify_done_units, 1, __ATOMIC_RELAXED);

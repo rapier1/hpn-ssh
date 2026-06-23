@@ -85,11 +85,15 @@ parallel_unit_free(struct sftp_work_unit *u)
 	free(u->dst_path);
 	/* range_tracker is shared across sibling range units; never freed
 	 * by parallel_unit_free.  See parallel_unit_tracker_finalize for ownership rules. */
-	/* A verify unit owns its parked tracker.  The verify handler NULLs this
-	 * after freeing it, so a still-set pointer means the unit was dropped
-	 * before any worker ran it (abort / queue shutdown): free it here. */
-	if (u->verify_tracker != NULL)
-		parallel_verify_and_free(NULL, u->verify_tracker);
+	/* A whole-file verify unit owns its parked item.  The verify handler
+	 * NULLs this after freeing it, so a still-set pointer means the unit was
+	 * dropped before any worker ran it (abort / queue shutdown): free it. */
+	if (u->verify_whole != NULL) {
+		free(u->verify_whole->local_path);
+		free(u->verify_whole->remote_path);
+		free(u->verify_whole);
+		u->verify_whole = NULL;
+	}
 	/* Range-granular verify: this dropped chunk still holds a reference to the
 	 * shared per-file job; release it (free the job on the last reference,
 	 * exactly like a completed chunk - just without recording a failure). */
@@ -359,26 +363,15 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 }
 
 /*
- * Run the post-transfer verify for a completed range tracker on worker w's
- * connection, then free the tracker.  Called from the SFTP_OP_VERIFY worker
- * path; with w == NULL it frees the tracker without verifying (drop path).
- * Download (target LOCAL) uses the whole-file readback verify; upload (REMOTE)
- * uses the per-range verify off the teed source hashes when slots are present,
- * else the whole-file fallback (pre-19 server path, and all whole-file units).
+ * Free a completed range tracker.  Range-split files reuse their transfer
+ * tracker for the verify phase (parked at finalize); this releases it after the
+ * verify units have built their verify_job from it, and on the abort/drop path.
+ * Verify itself now runs inline per range in the worker, so this no longer
+ * verifies anything - it is purely the tracker's free.
  */
 void
-parallel_verify_and_free(struct sftp_worker *w, struct sftp_range_tracker *t)
+parallel_verify_tracker_free(struct sftp_range_tracker *t)
 {
-	if (t->verify && w != NULL) {
-		if (t->target == SFTP_RANGE_TARGET_LOCAL)
-			parallel_verify_one(w, t->path, t->src_path,
-			    /*local_is_target=*/1);
-		else if (t->vslots != NULL)
-			parallel_verify_one_ranges(w, t);
-		else
-			parallel_verify_one(w, t->src_path, t->path,
-			    /*local_is_target=*/0);
-	}
 	pthread_mutex_destroy(&t->mu);
 	free(t->vslots);
 	free(t->path);
@@ -426,30 +419,31 @@ parallel_verify_fail_record(struct sftp_parallel *p, int local_is_target,
 
 /*
  * Park a completed whole-file (non-range-split) transfer for the verify phase.
- * Builds a lightweight tracker carrying just the paths + direction; with no
- * vslots, parallel_verify_and_free runs the whole-file readback verify.  The
- * path/src_path convention matches parallel_verify_and_free's dispatch:
- * download (local is target) hashes t->path locally vs t->src_path remote;
- * upload reads t->src_path locally vs the server's hash of t->path.
+ * Stores a lightweight verify_whole_item (just the two paths + direction) -
+ * NOT a full range_tracker - on the whole-file pending list, which is the
+ * dominant verify-phase memory term in a many-small-file transfer.  The verify
+ * handler resolves local/remote from local_is_target via parallel_verify_one.
  */
 void
 parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
     const char *remote_path, int local_is_target)
 {
-	struct sftp_range_tracker *t = xcalloc(1, sizeof(*t));
+	struct verify_whole_item *it = xcalloc(1, sizeof(*it));
 
-	pthread_mutex_init(&t->mu, NULL);
-	t->verify = 1;
-	if (local_is_target) {
-		t->target = SFTP_RANGE_TARGET_LOCAL;
-		t->path = xstrdup(local_path);
-		t->src_path = xstrdup(remote_path);
-	} else {
-		t->target = SFTP_RANGE_TARGET_REMOTE;
-		t->path = xstrdup(remote_path);
-		t->src_path = xstrdup(local_path);
+	it->local_path = xstrdup(local_path);
+	it->remote_path = xstrdup(remote_path);
+	it->local_is_target = local_is_target;
+
+	pthread_mutex_lock(&p->verify_pending_mu);
+	if (p->verify_whole_pending_n == p->verify_whole_pending_cap) {
+		int ncap = p->verify_whole_pending_cap
+		    ? p->verify_whole_pending_cap * 2 : 16;
+		p->verify_whole_pending = xreallocarray(p->verify_whole_pending,
+		    (size_t)ncap, sizeof(*p->verify_whole_pending));
+		p->verify_whole_pending_cap = ncap;
 	}
-	parallel_verify_park(p, t);
+	p->verify_whole_pending[p->verify_whole_pending_n++] = it;
+	pthread_mutex_unlock(&p->verify_pending_mu);
 }
 
 /* Free a range-granular verify job (paths + the per-range arrays). */
@@ -502,21 +496,36 @@ build_verify_job(struct sftp_range_tracker *t)
 	return j;
 }
 
+/* Grow the pending-units array as needed and append one unit. */
+static void
+verify_units_append(struct sftp_work_unit ***units, int *nunits, int *ucap,
+    struct sftp_work_unit *u)
+{
+	if (*nunits == *ucap) {
+		*ucap = *ucap ? *ucap * 2 : 64;
+		*units = xreallocarray(*units, (size_t)*ucap, sizeof(**units));
+	}
+	(*units)[(*nunits)++] = u;
+}
+
 /*
  * Submit the parked files as SFTP_OP_VERIFY work units, drained by the idle
- * workers over their own connections.  Range-split files (vslots present, server
- * advertises sftp-hash-range) fan ONE unit per transfer range across the pool
- * (range-granular within-file parallel verify); each shares the file's verify
- * job and the last range to finish frees it.  Whole-file / small / pre-19-server
- * files stay one unit per file carrying the tracker (parallel_verify_and_free).
- * Returns the total UNIT count (= chunks, not files) for the phase meter.
+ * workers over their own connections.  Range-split files with teed source
+ * hashes (verified upload, server advertises sftp-hash-range) fan ONE unit per
+ * transfer range across the pool (range-granular within-file parallel verify);
+ * each shares the file's verify job and the last range to finish frees it.
+ * Range-split files WITHOUT teed hashes (verified download, or a pre-19 server)
+ * and parked whole-file items each get one whole-file verify unit carrying a
+ * lightweight verify_whole_item.  Returns the total UNIT count (= chunks +
+ * whole-file units, not files) for the phase meter.
  */
 int
 parallel_verify_phase_submit(struct sftp_parallel *p)
 {
 	struct sftp_range_tracker **arr;
+	struct verify_whole_item **warr;
 	struct sftp_work_unit **units = NULL;
-	int i, n, can_chunk, nunits = 0, ucap = 0;
+	int i, n, wn, can_chunk, nunits = 0, ucap = 0;
 
 	pthread_mutex_lock(&p->verify_pending_mu);
 	arr = p->verify_pending;
@@ -524,6 +533,11 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
 	p->verify_pending = NULL;
 	p->verify_pending_n = 0;
 	p->verify_pending_cap = 0;
+	warr = p->verify_whole_pending;
+	wn = p->verify_whole_pending_n;
+	p->verify_whole_pending = NULL;
+	p->verify_whole_pending_n = 0;
+	p->verify_whole_pending_cap = 0;
 	pthread_mutex_unlock(&p->verify_pending_mu);
 
 	/* Range-granular verify needs the server's sftp-hash-range; all workers
@@ -539,7 +553,7 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
 			struct verify_job *j = build_verify_job(t);
 			int k;
 
-			parallel_verify_and_free(NULL, t);	/* free; no verify */
+			parallel_verify_tracker_free(t);	/* paths copied */
 			for (k = 0; k < j->n_ranges; k++) {
 				struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
 
@@ -548,27 +562,40 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
 				u->range_index = k;
 				u->range_offset = j->offs[k];
 				u->range_length = j->lens[k];
-				if (nunits == ucap) {
-					ucap = ucap ? ucap * 2 : 64;
-					units = xreallocarray(units,
-					    (size_t)ucap, sizeof(*units));
-				}
-				units[nunits++] = u;
+				verify_units_append(&units, &nunits, &ucap, u);
 			}
 		} else {
+			/* No teed hashes: whole-file verify.  t->path is the
+			 * written file (LOCAL target = download, REMOTE = upload);
+			 * resolve to local/remote into a lightweight item. */
+			struct verify_whole_item *it = xcalloc(1, sizeof(*it));
 			struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
 
-			u->op = SFTP_OP_VERIFY;
-			u->verify_tracker = t;
-			if (nunits == ucap) {
-				ucap = ucap ? ucap * 2 : 64;
-				units = xreallocarray(units, (size_t)ucap,
-				    sizeof(*units));
+			if (t->target == SFTP_RANGE_TARGET_LOCAL) {
+				it->local_path = xstrdup(t->path);
+				it->remote_path = xstrdup(t->src_path);
+				it->local_is_target = 1;
+			} else {
+				it->local_path = xstrdup(t->src_path);
+				it->remote_path = xstrdup(t->path);
+				it->local_is_target = 0;
 			}
-			units[nunits++] = u;
+			parallel_verify_tracker_free(t);
+			u->op = SFTP_OP_VERIFY;
+			u->verify_whole = it;
+			verify_units_append(&units, &nunits, &ucap, u);
 		}
 	}
 	free(arr);
+
+	for (i = 0; i < wn; i++) {
+		struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
+
+		u->op = SFTP_OP_VERIFY;
+		u->verify_whole = warr[i];	/* take ownership of the item */
+		verify_units_append(&units, &nunits, &ucap, u);
+	}
+	free(warr);
 
 	/* Set the unit total BEFORE pushing so the reporter's 100%-snap gate
 	 * (done_units >= total) can't fire early while we are still submitting. */

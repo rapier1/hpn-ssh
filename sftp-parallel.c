@@ -825,15 +825,23 @@ sftp_parallel_stop(struct sftp_parallel *p)
 		free(p->bundle_pending);
 		p->bundle_pending = NULL;
 	}
-	/* Verify-pending: trackers parked at completion but never submitted as
-	 * verify units (e.g. aborted before wait's verify phase).  Free them and
-	 * the array so neither leaks. */
+	/* Verify-pending: range trackers + whole-file items parked at completion
+	 * but never submitted as verify units (e.g. aborted before wait's verify
+	 * phase).  Free both lists so neither leaks. */
 	{
 		int i;
 		for (i = 0; i < p->verify_pending_n; i++)
-			parallel_verify_and_free(NULL, p->verify_pending[i]);
+			parallel_verify_tracker_free(p->verify_pending[i]);
 		free(p->verify_pending);
 		p->verify_pending = NULL;
+		for (i = 0; i < p->verify_whole_pending_n; i++) {
+			struct verify_whole_item *it = p->verify_whole_pending[i];
+			free(it->local_path);
+			free(it->remote_path);
+			free(it);
+		}
+		free(p->verify_whole_pending);
+		p->verify_whole_pending = NULL;
 	}
 	/* Worker re-queue overflow: units parked here when a worker hit a full
 	 * queue, never drained back (abort/shutdown before the reporter moved

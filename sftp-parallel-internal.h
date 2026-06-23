@@ -780,6 +780,20 @@ struct verify_job {
 	int       failed;		/* atomic: any chunk's inline repair failed */
 };
 
+/*
+ * Parked entry for a whole-file (non-range-split) post-transfer verify.  Just
+ * the two paths + direction - no ranges, no mutex, no writer-cap/vslots state -
+ * vs the full sftp_range_tracker the range-split path needs.  Most files in a
+ * big recursive transfer are whole-file, so this is the dominant verify-phase
+ * memory term; keeping it small is the point.  local/remote are NOT direction-
+ * resolved here (parallel_verify_one resolves them from local_is_target).
+ */
+struct verify_whole_item {
+	char *local_path;
+	char *remote_path;
+	int   local_is_target;		/* 0 = upload, 1 = download */
+};
+
 struct sftp_work_unit {
 	enum sftp_op op;
 	char    *src_path;
@@ -833,13 +847,12 @@ struct sftp_work_unit {
 	 * attached (abort/drain).  NULL / 0 for ordinary units. */
 	struct sftp_work_unit **members;
 	int                     n_members;
-	/* SFTP_OP_VERIFY only: the completed range tracker parked at finalize.
-	 * The verify handler verifies it on the worker's own conn, frees it, and
-	 * NULLs this.  parallel_unit_free frees it if still set - i.e. the unit
-	 * was dropped before any worker ran it (abort / queue shutdown).
-	 * EITHER verify_tracker (whole-file / small-file / pre-19-server path) OR
-	 * verify_job (range-granular chunk path) is set, never both. */
-	struct sftp_range_tracker *verify_tracker;
+	/* SFTP_OP_VERIFY only: the parked whole-file (small / non-range-split)
+	 * verify item - just the two paths + direction, freed by the verify
+	 * handler (or by parallel_unit_free if the unit was dropped before any
+	 * worker ran it).  EITHER verify_whole (whole-file path) OR verify_job
+	 * (range-granular chunk path) is set, never both. */
+	struct verify_whole_item *verify_whole;
 	/* SFTP_OP_VERIFY range-granular: one chunk [range_offset, range_length) of
 	 * a large file.  Many units share one verify_job; the last to finish frees
 	 * it.  parallel_unit_free decrements/frees it if the unit is dropped. */
@@ -1272,9 +1285,14 @@ struct sftp_parallel {
 	 * idle workers verify them in parallel on their own conns.  Guarded by
 	 * verify_pending_mu (parked from worker threads at completion). */
 	pthread_mutex_t             verify_pending_mu;
-	struct sftp_range_tracker **verify_pending;
+	struct sftp_range_tracker **verify_pending;	/* range-split files */
 	int                         verify_pending_n;
 	int                         verify_pending_cap;
+	/* Whole-file (non-range-split) parked verifies - lightweight items, the
+	 * dominant verify-phase memory term.  Shares verify_pending_mu. */
+	struct verify_whole_item  **verify_whole_pending;
+	int                         verify_whole_pending_n;
+	int                         verify_whole_pending_cap;
 
 	/* Auto-repair: on a post-transfer verify mismatch the worker splices the
 	 * bad 64 MiB sub-chunks of its range inline and re-verifies, bounded by
@@ -1576,18 +1594,15 @@ void	*parallel_worker_thread(void *);
  * range-split finalize. */
 void	 parallel_verify_one(struct sftp_worker *, const char *local_path,
 	    const char *remote_path, int local_is_target);
-void	 parallel_verify_one_ranges(struct sftp_worker *,
-	    struct sftp_range_tracker *);
 
-/* Post-transfer verify of a completed range tracker, then free it.  With a
- * NULL worker it just frees the tracker (no verify).  Defined in
- * sftp-parallel-unit.c; called from the SFTP_OP_VERIFY worker path. */
-void	 parallel_verify_and_free(struct sftp_worker *,
-	    struct sftp_range_tracker *);
+/* Free a completed range tracker (range-split files reuse their transfer
+ * tracker for verify; this releases it afterwards).  Defined in
+ * sftp-parallel-unit.c. */
+void	 parallel_verify_tracker_free(struct sftp_range_tracker *);
 /* Park a completed file for the post-transfer verify phase.  park() takes a
- * range-split tracker (per-range source hashes); park_whole_file() builds a
- * lightweight tracker for a whole-file transfer.  phase_submit() drains the
- * parked set into SFTP_OP_VERIFY work units (from sftp_parallel_wait). */
+ * range-split tracker (per-range source hashes); park_whole_file() stores a
+ * lightweight verify_whole_item.  phase_submit() drains the parked sets into
+ * SFTP_OP_VERIFY work units (from sftp_parallel_wait). */
 void	 parallel_verify_park(struct sftp_parallel *,
 	    struct sftp_range_tracker *);
 void	 parallel_verify_park_whole_file(struct sftp_parallel *,
