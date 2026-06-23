@@ -836,12 +836,22 @@ sftp_parallel_stop(struct sftp_parallel *p)
 		p->verify_pending = NULL;
 		for (i = 0; i < p->verify_whole_pending_n; i++) {
 			struct verify_whole_item *it = p->verify_whole_pending[i];
-			free(it->local_path);
-			free(it->remote_path);
+			free(it->local_rel);
+			free(it->remote_rel);
 			free(it);
 		}
 		free(p->verify_whole_pending);
 		p->verify_whole_pending = NULL;
+	}
+	/* Path-factoring base pool: the registered command-root pairs. */
+	{
+		int i;
+		for (i = 0; i < p->verify_bases_n; i++) {
+			free(p->verify_bases[i].local_base);
+			free(p->verify_bases[i].remote_base);
+		}
+		free(p->verify_bases);
+		p->verify_bases = NULL;
 	}
 	/* Worker re-queue overflow: units parked here when a worker hit a full
 	 * queue, never drained back (abort/shutdown before the reporter moved

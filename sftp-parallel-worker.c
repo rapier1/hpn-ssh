@@ -261,11 +261,21 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		 * worker's own conn, then free the item. */
 		if (u->verify_whole != NULL) {
 			struct verify_whole_item *it = u->verify_whole;
+			/* Rebuild full paths from the base pool + relatives
+			 * (remote_rel == NULL means same as local_rel). */
+			const char *rrel = it->remote_rel ? it->remote_rel
+			    : it->local_rel;
+			char *local = parallel_verify_base_join(p,
+			    it->base_index, /*which=*/0, it->local_rel);
+			char *remote = parallel_verify_base_join(p,
+			    it->base_index, /*which=*/1, rrel);
 
-			parallel_verify_one(w, it->local_path, it->remote_path,
+			parallel_verify_one(w, local, remote,
 			    it->local_is_target);
-			free(it->local_path);
-			free(it->remote_path);
+			free(local);
+			free(remote);
+			free(it->local_rel);
+			free(it->remote_rel);
 			free(it);
 			u->verify_whole = NULL;
 		}

@@ -89,8 +89,8 @@ parallel_unit_free(struct sftp_work_unit *u)
 	 * NULLs this after freeing it, so a still-set pointer means the unit was
 	 * dropped before any worker ran it (abort / queue shutdown): free it. */
 	if (u->verify_whole != NULL) {
-		free(u->verify_whole->local_path);
-		free(u->verify_whole->remote_path);
+		free(u->verify_whole->local_rel);
+		free(u->verify_whole->remote_rel);
 		free(u->verify_whole);
 		u->verify_whole = NULL;
 	}
@@ -417,22 +417,140 @@ parallel_verify_fail_record(struct sftp_parallel *p, int local_is_target,
 	free(desc);
 }
 
+/* Strip trailing '/' from a path in place (but keep a lone "/"). */
+static void
+path_trim_trailing_slash(char *s)
+{
+	size_t n = strlen(s);
+	while (n > 1 && s[n - 1] == '/')
+		s[--n] = '\0';
+}
+
+/* If `base` prefixes `path` at a '/' boundary, point *rel past "base/" and
+ * return 1; else 0. */
+static int
+path_strip_base(const char *path, const char *base, const char **rel)
+{
+	size_t bl = strlen(base);
+
+	if (bl == 0 || strncmp(path, base, bl) != 0 || path[bl] != '/')
+		return 0;
+	*rel = path + bl + 1;
+	return 1;
+}
+
+void
+parallel_verify_base_register(struct sftp_parallel *p, const char *local_base,
+    const char *remote_base)
+{
+	char *lb, *rb;
+	int i;
+
+	if (p == NULL || local_base == NULL || remote_base == NULL)
+		return;
+	lb = xstrdup(local_base);
+	rb = xstrdup(remote_base);
+	path_trim_trailing_slash(lb);
+	path_trim_trailing_slash(rb);
+
+	pthread_mutex_lock(&p->verify_pending_mu);
+	for (i = 0; i < p->verify_bases_n; i++) {	/* dedup exact pairs */
+		if (strcmp(p->verify_bases[i].local_base, lb) == 0 &&
+		    strcmp(p->verify_bases[i].remote_base, rb) == 0) {
+			pthread_mutex_unlock(&p->verify_pending_mu);
+			free(lb);
+			free(rb);
+			return;
+		}
+	}
+	if (p->verify_bases_n == p->verify_bases_cap) {
+		int ncap = p->verify_bases_cap ? p->verify_bases_cap * 2 : 8;
+		p->verify_bases = xreallocarray(p->verify_bases, (size_t)ncap,
+		    sizeof(*p->verify_bases));
+		p->verify_bases_cap = ncap;
+	}
+	p->verify_bases[p->verify_bases_n].local_base = lb;
+	p->verify_bases[p->verify_bases_n].remote_base = rb;
+	p->verify_bases_n++;
+	pthread_mutex_unlock(&p->verify_pending_mu);
+}
+
+int
+parallel_verify_base_match(struct sftp_parallel *p, const char *local_path,
+    const char *remote_path, const char **local_rel, const char **remote_rel)
+{
+	int i, best = -1;
+	size_t best_len = 0;
+
+	if (p == NULL)
+		return -1;
+	pthread_mutex_lock(&p->verify_pending_mu);
+	for (i = 0; i < p->verify_bases_n; i++) {
+		const char *lr, *rr;
+		size_t bl = strlen(p->verify_bases[i].local_base);
+
+		/* The SAME pair must prefix both sides; pick the longest. */
+		if (bl > best_len &&
+		    path_strip_base(local_path,
+			p->verify_bases[i].local_base, &lr) &&
+		    path_strip_base(remote_path,
+			p->verify_bases[i].remote_base, &rr)) {
+			best = i;
+			best_len = bl;
+			*local_rel = lr;
+			*remote_rel = rr;
+		}
+	}
+	pthread_mutex_unlock(&p->verify_pending_mu);
+	return best;
+}
+
+char *
+parallel_verify_base_join(struct sftp_parallel *p, int base_index, int which,
+    const char *rel)
+{
+	char *out, *base = NULL;
+
+	if (base_index < 0)
+		return xstrdup(rel);		/* fallback: rel is the full path */
+	pthread_mutex_lock(&p->verify_pending_mu);
+	if (base_index < p->verify_bases_n)
+		base = xstrdup(which ? p->verify_bases[base_index].remote_base
+		    : p->verify_bases[base_index].local_base);
+	pthread_mutex_unlock(&p->verify_pending_mu);
+	if (base == NULL)
+		return xstrdup(rel);		/* defensive: pool changed */
+	xasprintf(&out, "%s/%s", base, rel);
+	free(base);
+	return out;
+}
+
 /*
  * Park a completed whole-file (non-range-split) transfer for the verify phase.
- * Stores a lightweight verify_whole_item (just the two paths + direction) -
- * NOT a full range_tracker - on the whole-file pending list, which is the
- * dominant verify-phase memory term in a many-small-file transfer.  The verify
- * handler resolves local/remote from local_is_target via parallel_verify_one.
+ * Stores a lightweight verify_whole_item with paths held RELATIVE to a
+ * registered base pair (the long common prefix lives once in the base pool,
+ * not in two full paths per file).  No match (non-recursive / disparate) falls
+ * back to full paths.  The verify handler rebuilds local/remote.
  */
 void
 parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
     const char *remote_path, int local_is_target)
 {
 	struct verify_whole_item *it = xcalloc(1, sizeof(*it));
+	const char *lrel = NULL, *rrel = NULL;
+	int bi = parallel_verify_base_match(p, local_path, remote_path,
+	    &lrel, &rrel);
 
-	it->local_path = xstrdup(local_path);
-	it->remote_path = xstrdup(remote_path);
+	it->base_index = bi;
 	it->local_is_target = local_is_target;
+	if (bi >= 0) {
+		it->local_rel = xstrdup(lrel);
+		/* NULL remote_rel = identical to local_rel (recursive mirror). */
+		it->remote_rel = (strcmp(lrel, rrel) == 0) ? NULL : xstrdup(rrel);
+	} else {
+		it->local_rel = xstrdup(local_path);
+		it->remote_rel = xstrdup(remote_path);
+	}
 
 	pthread_mutex_lock(&p->verify_pending_mu);
 	if (p->verify_whole_pending_n == p->verify_whole_pending_cap) {
@@ -567,17 +685,19 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
 		} else {
 			/* No teed hashes: whole-file verify.  t->path is the
 			 * written file (LOCAL target = download, REMOTE = upload);
-			 * resolve to local/remote into a lightweight item. */
+			 * resolve to local/remote.  These are range-split files
+			 * (few), so just hold full paths (base_index = -1). */
 			struct verify_whole_item *it = xcalloc(1, sizeof(*it));
 			struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
 
+			it->base_index = -1;
 			if (t->target == SFTP_RANGE_TARGET_LOCAL) {
-				it->local_path = xstrdup(t->path);
-				it->remote_path = xstrdup(t->src_path);
+				it->local_rel = xstrdup(t->path);
+				it->remote_rel = xstrdup(t->src_path);
 				it->local_is_target = 1;
 			} else {
-				it->local_path = xstrdup(t->src_path);
-				it->remote_path = xstrdup(t->path);
+				it->local_rel = xstrdup(t->src_path);
+				it->remote_rel = xstrdup(t->path);
 				it->local_is_target = 0;
 			}
 			parallel_verify_tracker_free(t);

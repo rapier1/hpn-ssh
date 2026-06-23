@@ -781,17 +781,29 @@ struct verify_job {
 };
 
 /*
- * Parked entry for a whole-file (non-range-split) post-transfer verify.  Just
- * the two paths + direction - no ranges, no mutex, no writer-cap/vslots state -
- * vs the full sftp_range_tracker the range-split path needs.  Most files in a
- * big recursive transfer are whole-file, so this is the dominant verify-phase
- * memory term; keeping it small is the point.  local/remote are NOT direction-
- * resolved here (parallel_verify_one resolves them from local_is_target).
+ * Parked entry for a whole-file (non-range-split) post-transfer verify - the
+ * dominant verify-phase memory term in a big recursive transfer, so it is kept
+ * small.  Paths are stored RELATIVE to a registered base pair (the command's
+ * root dirs) so the long common prefix is held once in the base pool, not in
+ * two full paths per file:
+ *   base_index >= 0: local_rel is relative to verify_bases[base_index].local_base
+ *                    and remote_rel to .remote_base; remote_rel == NULL means it
+ *                    equals local_rel (the recursive-mirror common case).
+ *   base_index <  0: no base matched (non-recursive / disparate) - local_rel and
+ *                    remote_rel hold the FULL paths (fallback).
+ * Resolved to local/remote at verify time via parallel_verify_base_join.
  */
 struct verify_whole_item {
-	char *local_path;
-	char *remote_path;
+	int   base_index;
+	char *local_rel;
+	char *remote_rel;
 	int   local_is_target;		/* 0 = upload, 1 = download */
+};
+
+/* One registered (local root, remote root) pair for whole-file path factoring. */
+struct verify_base_pair {
+	char *local_base;
+	char *remote_base;
 };
 
 struct sftp_work_unit {
@@ -1293,6 +1305,14 @@ struct sftp_parallel {
 	struct verify_whole_item  **verify_whole_pending;
 	int                         verify_whole_pending_n;
 	int                         verify_whole_pending_cap;
+	/* Path-factoring base pool: each recursive command registers its root
+	 * (local, remote) dir pair once; whole-file items store paths relative to
+	 * the longest-matching pair so the common prefix is held once, not per
+	 * file.  Deduped, small (one entry per distinct command root).  Shares
+	 * verify_pending_mu; freed at sftp_parallel_stop. */
+	struct verify_base_pair   *verify_bases;
+	int                         verify_bases_n;
+	int                         verify_bases_cap;
 
 	/* Auto-repair: on a post-transfer verify mismatch the worker splices the
 	 * bad 64 MiB sub-chunks of its range inline and re-verifies, bounded by
@@ -1594,6 +1614,20 @@ void	*parallel_worker_thread(void *);
  * range-split finalize. */
 void	 parallel_verify_one(struct sftp_worker *, const char *local_path,
 	    const char *remote_path, int local_is_target);
+
+/* Path-factoring base pool for whole-file verify (sftp-parallel-unit.c):
+ * register() records a recursive command's (local root, remote root) once
+ * (deduped); match() finds the longest registered pair that prefixes both of a
+ * file's paths and points local_rel and remote_rel at the suffixes (returns the
+ * base index, or -1 for no match); join() rebuilds a full path from a base
+ * index + relative (which: 0 = local, 1 = remote; index < 0 just copies rel). */
+void	 parallel_verify_base_register(struct sftp_parallel *,
+	    const char *local_base, const char *remote_base);
+int	 parallel_verify_base_match(struct sftp_parallel *,
+	    const char *local_path, const char *remote_path,
+	    const char **local_rel, const char **remote_rel);
+char	*parallel_verify_base_join(struct sftp_parallel *, int base_index,
+	    int which, const char *rel);
 
 /* Free a completed range tracker (range-split files reuse their transfer
  * tracker for verify; this releases it afterwards).  Defined in
