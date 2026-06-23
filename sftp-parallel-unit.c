@@ -923,6 +923,7 @@ parallel_bundle_flush_locked(struct sftp_parallel *p)
 		return;
 	p->bundle_pending_n = 0;
 	p->bundle_pending_framed = 0;
+	p->bundle_pending_path_bytes = 0;
 
 	if (n == 1) {
 		struct sftp_work_unit *u = p->bundle_pending[0];
@@ -984,8 +985,16 @@ parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
 	p->bundle_pending[p->bundle_pending_n++] = u;
 	p->bundle_pending_op = u->op;
 	p->bundle_pending_framed += BUNDLE_TAR_FRAME_BYTES(u->size);
+	/* Download bundles list every member's remote path (src_path) in one
+	 * hpn-bundle-fetch request; track that request size and flush before it
+	 * overflows SFTP_MAX_MSG_LENGTH (see BUNDLE_DL_FETCH_REQ_MAX). */
+	if (u->op == SFTP_OP_DOWNLOAD)
+		p->bundle_pending_path_bytes += 4 +
+		    (u->src_path ? strlen(u->src_path) : 0);
 	if (p->bundle_pending_framed >= target ||
-	    p->bundle_pending_n >= BUNDLE_BATCH_MAX_FILES)
+	    p->bundle_pending_n >= BUNDLE_BATCH_MAX_FILES ||
+	    (p->bundle_pending_op == SFTP_OP_DOWNLOAD &&
+	    p->bundle_pending_path_bytes >= BUNDLE_DL_FETCH_REQ_MAX))
 		parallel_bundle_flush_locked(p);
 	pthread_mutex_unlock(&p->bundle_mu);
 	sftp_workqueue_kick(p->q);

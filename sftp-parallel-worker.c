@@ -1515,8 +1515,22 @@ parallel_worker_thread(void *arg)
 			const uint64_t batch_byte_cap = w->bundle_enabled
 			    ? w->bundle_target_bytes
 			    : UPLOAD_BATCH_BYTE_CAP;
+			/* Download bundles list every member's remote path in ONE
+			 * hpn-bundle-fetch request, so the batch must also stop
+			 * before that path list overflows SFTP_MAX_MSG_LENGTH
+			 * (upload streams paths inside the tar - immune).  Track the
+			 * request cost: 4-byte cstring length + remote path
+			 * (src_path) per member.  The cap leaves room for one
+			 * PATH_MAX overshoot (the gate is checked after the last
+			 * add) plus the ~44-byte request header. */
+			uint64_t batch_path_bytes = 0;
+			const uint64_t batch_fetch_req_cap =
+			    BUNDLE_DL_FETCH_REQ_MAX;
 
 			batch[bn++] = u0;
+			if ((int)batch_op == (int)SFTP_OP_DOWNLOAD)
+				batch_path_bytes = 4 +
+				    (u0->src_path ? strlen(u0->src_path) : 0);
 			/* Gate: in bundle mode, stop iterating BEFORE
 			 * popping a unit that we have no room for.  The
 			 * original soft gate (`batch_bytes <= cap`) tripped
@@ -1536,7 +1550,9 @@ parallel_worker_thread(void *arg)
 			while (bn < batch_cap && !p->abort_flag &&
 			    (w->bundle_enabled
 			        ? batch_bytes <  batch_byte_cap
-			        : batch_bytes <= batch_byte_cap)) {
+			        : batch_bytes <= batch_byte_cap) &&
+			    ((int)batch_op != (int)SFTP_OP_DOWNLOAD ||
+			        batch_path_bytes < batch_fetch_req_cap)) {
 				void *nxt = NULL;
 				if (sftp_workqueue_trypop(p->q, &nxt) != 0)
 					break; /* queue empty or shutdown */
@@ -1565,6 +1581,12 @@ parallel_worker_thread(void *arg)
 					if (nu->size > 0)
 						batch_bytes +=
 						    (uint64_t)nu->size;
+					if ((int)batch_op ==
+					    (int)SFTP_OP_DOWNLOAD)
+						batch_path_bytes += 4 +
+						    (nu->src_path
+						    ? strlen(nu->src_path)
+						    : 0);
 				} else {
 					/* Off-op, bundle-ineligible, OR
 					 * would-overshoot: stop collecting

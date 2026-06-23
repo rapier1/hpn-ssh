@@ -55,6 +55,17 @@ struct sftp_parallel;
 #define BUNDLE_BATCH_MAX_FILES  8192
 
 /*
+ * Download bundles (hpn-bundle-fetch) list every member's remote path in ONE
+ * SFTP request, so a download bundle must also stop before that path list
+ * overflows SFTP_MAX_MSG_LENGTH.  Upload streams paths inside the tar, so it is
+ * immune - this cap is download-only.  Both producers (the worker accumulator
+ * and parallel_bundle_add) check it AFTER adding a member, so the cap reserves
+ * one PATH_MAX overshoot + the ~44-byte request header.  Expanded at the use
+ * sites (worker / unit), which both have SFTP_MAX_MSG_LENGTH and PATH_MAX. */
+#define BUNDLE_DL_FETCH_REQ_MAX \
+    ((uint64_t)SFTP_MAX_MSG_LENGTH - PATH_MAX - 1024)
+
+/*
  * Soft byte cap on the size of a single upload batch.  Once a worker's
  * batch crosses this many bytes it stops grabbing additional units, even
  * if UPLOAD_BATCH_SIZE units have not been collected.  This is a SOFT cap
@@ -1388,6 +1399,9 @@ struct sftp_parallel {
 	int                         bundle_pending_n;
 	int                         bundle_pending_cap;
 	uint64_t                    bundle_pending_framed;  /* sum framed bytes */
+	uint64_t                    bundle_pending_path_bytes; /* download fetch
+				     * request bytes (4 + remote path / member);
+				     * caps the bundle at BUNDLE_DL_FETCH_REQ_MAX */
 	enum sftp_op                bundle_pending_op;   /* UPLOAD | DOWNLOAD */
 
 	/*
