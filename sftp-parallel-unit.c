@@ -393,13 +393,7 @@ parallel_verify_park(struct sftp_parallel *p, struct sftp_range_tracker *t)
 		p->verify_pending_cap = ncap;
 	}
 	p->verify_pending[p->verify_pending_n++] = t;
-	/* Memory gate: account the tracker (struct + its two path strings).  An
-	 * estimate - the per-range vslot arrays are not counted, but range-split
-	 * files are few (one tracker per big file), a minor term vs the whole-file
-	 * items.  +16 for chunk rounding / the array slot. */
-	p->verify_parked_bytes += sizeof(*t)
-	    + (t->path ? strlen(t->path) : 0)
-	    + (t->src_path ? strlen(t->src_path) : 0) + 16;
+	/* Memory gate charged at SUBMIT, not at park (see park_whole_file). */
 	pthread_mutex_unlock(&p->verify_pending_mu);
 }
 
@@ -615,10 +609,8 @@ parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
 		p->verify_whole_pending_cap = ncap;
 	}
 	p->verify_whole_pending[p->verify_whole_pending_n++] = it;
-	/* Memory gate: account this item's footprint (one FAM alloc + the array
-	 * slot, +16 to cover the malloc chunk rounding conservatively). */
-	p->verify_parked_bytes += sizeof(*it) + strlen(lrel) + 1
-	    + strlen(rrel) + 1 + 8 + 16;
+	/* Memory gate is charged at SUBMIT (parallel_verify_item_bytes_estimate),
+	 * not here - parking is the lagging event the submitter can't see. */
 	pthread_mutex_unlock(&p->verify_pending_mu);
 }
 
@@ -1196,6 +1188,26 @@ submit_resume_whole_file(struct sftp_parallel *p, struct sftp_conn *conn,
 	return parallel_unit_submit(p, u);
 }
 
+/*
+ * Estimate the parked-verify footprint of a file BEFORE it transfers, so the
+ * memory gate can be charged at SUBMIT time (a leading signal the submitter
+ * sees) rather than at park time (a lagging signal it misses - on download the
+ * walker submits everything before anything parks).  Same formula as the actual
+ * park in parallel_verify_park_whole_file, using the same prefix factoring, so
+ * the estimate equals the real item size.
+ */
+static uint64_t
+parallel_verify_item_bytes_estimate(struct sftp_parallel *p,
+    const char *local_path, const char *remote_path)
+{
+	const char *lrel = local_path, *rrel = remote_path;
+
+	(void)parallel_verify_prefix_match(p, local_path, &lrel);
+	(void)parallel_verify_prefix_match(p, remote_path, &rrel);
+	return (uint64_t)sizeof(struct verify_whole_item)
+	    + strlen(lrel) + 1 + strlen(rrel) + 1 + 8 + 16;
+}
+
 int
 sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode,
@@ -1223,11 +1235,18 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	else
 		rc = parallel_unit_submit(p,
 		    make_unit(SFTP_OP_UPLOAD, local_path, remote_path, size, mode));
-	/* Parked-verify memory gate: after handing this unit off, drain the
-	 * parked set if it has grown past budget.  Main thread only, so blocking
-	 * here is the intended pause. */
-	if (p != NULL && p->cfg.verify_transfer)
+	/* Memory gate: charge this file's parked-verify footprint NOW, at submit
+	 * (a leading signal), then drain if the outstanding total is over budget.
+	 * Submit blocks during the drain - that block IS the backpressure that
+	 * paces submission with verification.  Main thread only. */
+	if (p != NULL && p->cfg.verify_transfer) {
+		uint64_t est = parallel_verify_item_bytes_estimate(p,
+		    local_path, remote_path);
+		pthread_mutex_lock(&p->verify_pending_mu);
+		p->verify_parked_bytes += est;
+		pthread_mutex_unlock(&p->verify_pending_mu);
 		parallel_verify_maybe_wave(p);
+	}
 	return rc;
 }
 
@@ -1255,9 +1274,18 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
 	else
 		rc = parallel_unit_submit(p,
 		    make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path, size, mode));
-	/* Parked-verify memory gate (see submit_upload). */
-	if (p != NULL && p->cfg.verify_transfer)
+	/* Memory gate (see submit_upload): charge the footprint at submit, drain
+	 * if over budget.  This is what makes the trigger fire on DOWNLOAD too -
+	 * the walker submits all units before any file parks, so charging at
+	 * submit is the only point that sees the memory coming. */
+	if (p != NULL && p->cfg.verify_transfer) {
+		uint64_t est = parallel_verify_item_bytes_estimate(p,
+		    local_path, remote_path);
+		pthread_mutex_lock(&p->verify_pending_mu);
+		p->verify_parked_bytes += est;
+		pthread_mutex_unlock(&p->verify_pending_mu);
 		parallel_verify_maybe_wave(p);
+	}
 	return rc;
 }
 

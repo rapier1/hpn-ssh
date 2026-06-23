@@ -1326,16 +1326,21 @@ struct sftp_parallel {
 	int                         verify_prefixes_n;
 	int                         verify_prefixes_cap;
 
-	/* Parked-verify memory gate (HPN): running total of bytes held in the
-	 * parked verify sets (whole-file items + range trackers + prefix pool).
-	 * When it crosses verify_park_budget - or the prefix pool nears its
-	 * INT16_MAX cap - the main-thread submitter runs a verify WAVE that
-	 * drains+verifies+frees the whole parked set, bounding peak memory
-	 * regardless of file count.  Fleet-wide (one shared set, not per worker).
-	 * Monotonic between waves: frees happen only inside the verify drain, so
-	 * it is reset to 0 in parallel_verify_phase_submit, not decremented per
-	 * free.  Shares verify_pending_mu.  Budget is set once at start from
-	 * ENV-VAR HPN_VERIFY_PARK_BUDGET_MB (default 64 MiB). */
+	/* Parked-verify memory gate (HPN): running total of OUTSTANDING verify
+	 * bytes - the parked-item footprint of every file submitted but not yet
+	 * verified.  Charged at SUBMIT (parallel_verify_item_bytes_estimate), a
+	 * LEADING signal the submitter sees, so the trigger fires the same in both
+	 * directions (on download the walker submits everything before any file
+	 * parks - charging at park would never be seen).  When it crosses
+	 * verify_park_budget - or the prefix pool nears its INT16_MAX cap - submit
+	 * runs a verify WAVE that quiesces the outstanding transfers, drains the
+	 * parked set, and resets this to 0; submit blocks during the wave, and that
+	 * block is the BACKPRESSURE that paces submission with verification and
+	 * keeps the wave's quiesce (hence the peak) bounded by the budget.
+	 * Fleet-wide (one shared counter, not per worker).  Reset to 0 in
+	 * parallel_verify_phase_submit, not decremented per free.  Shares
+	 * verify_pending_mu.  Budget set once at start from ENV-VAR
+	 * HPN_VERIFY_PARK_BUDGET_MB (default 64 MiB). */
 	uint64_t                    verify_parked_bytes;
 	uint64_t                    verify_park_budget;
 
