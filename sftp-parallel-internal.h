@@ -1315,6 +1315,19 @@ struct sftp_parallel {
 	int                         verify_prefixes_n;
 	int                         verify_prefixes_cap;
 
+	/* Parked-verify memory gate (HPN): running total of bytes held in the
+	 * parked verify sets (whole-file items + range trackers + prefix pool).
+	 * When it crosses verify_park_budget - or the prefix pool nears its
+	 * INT16_MAX cap - the main-thread submitter runs a verify WAVE that
+	 * drains+verifies+frees the whole parked set, bounding peak memory
+	 * regardless of file count.  Fleet-wide (one shared set, not per worker).
+	 * Monotonic between waves: frees happen only inside the verify drain, so
+	 * it is reset to 0 in parallel_verify_phase_submit, not decremented per
+	 * free.  Shares verify_pending_mu.  Budget is set once at start from
+	 * ENV-VAR HPN_VERIFY_PARK_BUDGET_MB (default 64 MiB). */
+	uint64_t                    verify_parked_bytes;
+	uint64_t                    verify_park_budget;
+
 	/* Auto-repair: on a post-transfer verify mismatch the worker splices the
 	 * bad 64 MiB sub-chunks of its range inline and re-verifies, bounded by
 	 * the attempt cap + convergence.  ON by default; HPN_NO_VERIFY_REPAIR (or
@@ -1643,6 +1656,14 @@ void	 parallel_verify_park_whole_file(struct sftp_parallel *,
 	    const char *local_path, const char *remote_path, int local_is_target);
 int	 parallel_verify_phase_submit(struct sftp_parallel *);
 void	 parallel_verify_job_free(struct verify_job *);
+/* Parked-verify memory gate (HPN).  maybe_wave() is called by the main-thread
+ * submitter after each unit; if the parked set is over budget (or the prefix
+ * pool near its cap) it runs a verify WAVE: quiesce in-flight transfers, drain
+ * the parked set through phase_submit, then reset the prefix pool.  pool_reset()
+ * empties verify_prefixes (safe only once every parked item is verified+freed,
+ * i.e. inside the wave).  Both run on the submitter thread only. */
+void	 parallel_verify_maybe_wave(struct sftp_parallel *);
+void	 parallel_verify_prefix_pool_reset(struct sftp_parallel *);
 /* Record a verify failure in verify_failed_paths naming the DEST - the written
  * file that is actually corrupt: remote on upload, local on download - with a
  * "local file"/"remote file" label, so the end-of-run summary points at the

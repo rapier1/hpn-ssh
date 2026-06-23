@@ -393,6 +393,13 @@ parallel_verify_park(struct sftp_parallel *p, struct sftp_range_tracker *t)
 		p->verify_pending_cap = ncap;
 	}
 	p->verify_pending[p->verify_pending_n++] = t;
+	/* Memory gate: account the tracker (struct + its two path strings).  An
+	 * estimate - the per-range vslot arrays are not counted, but range-split
+	 * files are few (one tracker per big file), a minor term vs the whole-file
+	 * items.  +16 for chunk rounding / the array slot. */
+	p->verify_parked_bytes += sizeof(*t)
+	    + (t->path ? strlen(t->path) : 0)
+	    + (t->src_path ? strlen(t->src_path) : 0) + 16;
 	pthread_mutex_unlock(&p->verify_pending_mu);
 }
 
@@ -478,6 +485,8 @@ parallel_verify_prefix_register(struct sftp_parallel *p, const char *dir)
 		p->verify_prefixes_cap = ncap;
 	}
 	p->verify_prefixes[p->verify_prefixes_n++] = d;
+	/* Memory gate: account the dir string + its array slot (+16 rounding). */
+	p->verify_parked_bytes += strlen(d) + 1 + 8 + 16;
 	pthread_mutex_unlock(&p->verify_pending_mu);
 }
 
@@ -523,6 +532,27 @@ parallel_verify_prefix_join(struct sftp_parallel *p, int idx, const char *rel)
 	xasprintf(&out, "%s/%s", prefix, rel);
 	free(prefix);
 	return out;
+}
+
+/*
+ * Empty the prefix pool (free the dir strings, keep the array allocation for
+ * reuse).  Called by a verify wave AFTER every parked item has been verified
+ * and freed, so nothing references the pool indices anymore - new parks after
+ * the wave re-register their dirs.  Relieves both the byte budget and the
+ * INT16_MAX pool cap.  Submitter thread only.
+ */
+void
+parallel_verify_prefix_pool_reset(struct sftp_parallel *p)
+{
+	int i;
+
+	if (p == NULL)
+		return;
+	pthread_mutex_lock(&p->verify_pending_mu);
+	for (i = 0; i < p->verify_prefixes_n; i++)
+		free(p->verify_prefixes[i]);
+	p->verify_prefixes_n = 0;
+	pthread_mutex_unlock(&p->verify_pending_mu);
 }
 
 /*
@@ -585,6 +615,10 @@ parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
 		p->verify_whole_pending_cap = ncap;
 	}
 	p->verify_whole_pending[p->verify_whole_pending_n++] = it;
+	/* Memory gate: account this item's footprint (one FAM alloc + the array
+	 * slot, +16 to cover the malloc chunk rounding conservatively). */
+	p->verify_parked_bytes += sizeof(*it) + strlen(lrel) + 1
+	    + strlen(rrel) + 1 + 8 + 16;
 	pthread_mutex_unlock(&p->verify_pending_mu);
 }
 
@@ -680,6 +714,11 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
 	p->verify_whole_pending = NULL;
 	p->verify_whole_pending_n = 0;
 	p->verify_whole_pending_cap = 0;
+	/* Memory gate: this drains every parked item into verify units (their
+	 * frees follow as the units complete), so the parked total returns to 0.
+	 * The prefix pool's bytes are released separately by the wave's
+	 * pool_reset once the verify units finish reading it. */
+	p->verify_parked_bytes = 0;
 	pthread_mutex_unlock(&p->verify_pending_mu);
 
 	/* Range-granular verify needs the server's sftp-hash-range; all workers
@@ -1159,19 +1198,28 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
 		__atomic_store_n(&p->walker_phase, SFTP_WKP_SUBMIT,
 		    __ATOMIC_RELAXED);
+	int rc;
+
 	if (resume || verify)
-		return submit_resume_whole_file(p, conn, SFTP_OP_UPLOAD,
+		rc = submit_resume_whole_file(p, conn, SFTP_OP_UPLOAD,
 		    local_path, remote_path, remote_path, size, mode,
 		    resume, verify);
 	/* When a control connection is supplied, route through the
 	 * speculative-split decision so a single large file produces
 	 * multiple range work units (feeds the byte-based scale-up
 	 * trigger).  Otherwise, fall back to a whole-file unit. */
-	if (conn != NULL)
-		return submit_upload_maybe_split(p, conn, local_path, remote_path,
+	else if (conn != NULL)
+		rc = submit_upload_maybe_split(p, conn, local_path, remote_path,
 		    size, mode);
-	return parallel_unit_submit(p,
-	    make_unit(SFTP_OP_UPLOAD, local_path, remote_path, size, mode));
+	else
+		rc = parallel_unit_submit(p,
+		    make_unit(SFTP_OP_UPLOAD, local_path, remote_path, size, mode));
+	/* Parked-verify memory gate: after handing this unit off, drain the
+	 * parked set if it has grown past budget.  Main thread only, so blocking
+	 * here is the intended pause. */
+	if (p != NULL && p->cfg.verify_transfer)
+		parallel_verify_maybe_wave(p);
+	return rc;
 }
 
 int
@@ -1186,15 +1234,22 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
 		__atomic_store_n(&p->walker_phase, SFTP_WKP_SUBMIT,
 		    __ATOMIC_RELAXED);
+	int rc;
+
 	if (resume || verify)
-		return submit_resume_whole_file(p, conn, SFTP_OP_DOWNLOAD,
+		rc = submit_resume_whole_file(p, conn, SFTP_OP_DOWNLOAD,
 		    remote_path, local_path, remote_path, size, mode,
 		    resume, verify);
-	if (conn != NULL)
-		return submit_download_maybe_split(p, conn, remote_path, local_path,
+	else if (conn != NULL)
+		rc = submit_download_maybe_split(p, conn, remote_path, local_path,
 		    size, mode);
-	return parallel_unit_submit(p,
-	    make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path, size, mode));
+	else
+		rc = parallel_unit_submit(p,
+		    make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path, size, mode));
+	/* Parked-verify memory gate (see submit_upload). */
+	if (p != NULL && p->cfg.verify_transfer)
+		parallel_verify_maybe_wave(p);
+	return rc;
 }
 
 /*

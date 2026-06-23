@@ -363,6 +363,23 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_mutex_init(&p->verify_pending_mu, NULL);
 	pthread_mutex_init(&p->retry_overflow_mu, NULL);
 
+	/* Parked-verify memory gate: fleet-wide budget on parked-path bytes.
+	 * Default 64 MiB; ENV-VAR HPN_VERIFY_PARK_BUDGET_MB overrides (floor 1
+	 * MiB).  When the parked set crosses this the submitter runs a verify
+	 * wave (parallel_verify_maybe_wave). */
+	{
+		const char *ev = getenv("HPN_VERIFY_PARK_BUDGET_MB");
+		unsigned long mb = 64;
+
+		if (ev != NULL) {
+			char *end = NULL;
+			unsigned long v = strtoul(ev, &end, 10);
+			if (end != ev && *end == '\0' && v >= 1)
+				mb = v;
+		}
+		p->verify_park_budget = (uint64_t)mb * 1024ULL * 1024ULL;
+	}
+
 	p->session_start_ns = monotime_ns();
 
 	/* Fleet-abort zero-progress window (HPN_NOPROGRESS_ABORT_SEC, default
@@ -574,6 +591,67 @@ sftp_parallel_wait(struct sftp_parallel *p)
 		 * on its own conn), so there is no separate repair phase here.
 		 */
 	}
+}
+
+/*
+ * Verify wave (parked-verify memory gate, HPN).  Hard pause + full drain run
+ * mid-transfer to bound the parked-path memory: quiesce the in-flight transfers
+ * (so the workers are free to verify and every completed file is parked), drain
+ * the entire parked set through the verify phase, wait for it, then reset the
+ * prefix pool.  Unlike sftp_parallel_wait this does NOT publish walker_phase=
+ * DONE - the walk is not finished, so the endgame machinery stays gated off and
+ * the in-flight units just complete normally.  Submitter (main) thread only -
+ * the sftp_parallel_submit_* callers are never worker threads - so blocking here
+ * is the intended pause; workers drain it.
+ */
+static void
+parallel_verify_wave(struct sftp_parallel *p)
+{
+	parallel_bundle_flush_pending(p);
+	/* Quiesce: drain in-flight transfers (no new units arrive - the walker
+	 * is blocked in this call). */
+	pthread_mutex_lock(&p->pending_mu);
+	while (p->pending > 0 && !p->abort_flag)
+		pthread_cond_wait(&p->pending_cv, &p->pending_mu);
+	pthread_mutex_unlock(&p->pending_mu);
+	if (p->abort_flag)
+		return;
+	debug("verify wave: draining parked set (%llu bytes) to bound memory",
+	    (unsigned long long)p->verify_parked_bytes);
+	/* Drain the parked set into verify units (resets verify_parked_bytes),
+	 * then wait for those units to finish (the items are freed as they do). */
+	(void)parallel_verify_phase_submit(p);
+	pthread_mutex_lock(&p->pending_mu);
+	while (p->pending > 0 && !p->abort_flag)
+		pthread_cond_wait(&p->pending_cv, &p->pending_mu);
+	pthread_mutex_unlock(&p->pending_mu);
+	/* Every parked item is now verified + freed, so nothing references the
+	 * prefix pool indices: free the pool (relieves the byte budget AND the
+	 * INT16_MAX dir cap).  New parks after this re-register their dirs. */
+	parallel_verify_prefix_pool_reset(p);
+}
+
+/*
+ * Trigger check, called by the submitter after each unit (see the tail of
+ * sftp_parallel_submit_upload / _download).  Runs a verify wave when the parked
+ * set is over its byte budget, or the prefix pool nears its INT16_MAX cap
+ * (wave a little early so dirs keep factoring rather than degrading to full
+ * paths).  No-op until something is parked.
+ */
+void
+parallel_verify_maybe_wave(struct sftp_parallel *p)
+{
+	int over;
+
+	if (p == NULL)
+		return;
+	pthread_mutex_lock(&p->verify_pending_mu);
+	over = (p->verify_park_budget > 0 &&
+	    p->verify_parked_bytes >= p->verify_park_budget) ||
+	    (p->verify_prefixes_n >= INT16_MAX - 256);
+	pthread_mutex_unlock(&p->verify_pending_mu);
+	if (over)
+		parallel_verify_wave(p);
 }
 
 void
