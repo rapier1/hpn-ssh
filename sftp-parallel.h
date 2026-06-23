@@ -358,6 +358,14 @@ int sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify);
 
 /*
+ * Register the directory of a single transferred path for whole-file verify
+ * path factoring (the glob / direct-dispatch path that bypasses the walker).
+ * No-op unless verify is enabled.  Pass both the local and remote path.
+ */
+void sftp_parallel_register_verify_dir(struct sftp_parallel *p,
+    const char *path);
+
+/*
  * Block until all submitted units have been completed (or failed past
  * retry limits). After this returns, no in-flight work remains. May be
  * called multiple times; subsequent submits are valid until stop().

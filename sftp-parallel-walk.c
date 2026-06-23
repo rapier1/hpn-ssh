@@ -58,7 +58,7 @@
 #include "sftp-hpn-server.h"        /* HPN_FILE_LAYOUT_* */
 #include "sftp-lustre.h"            /* local layout apply (download parity) */
 #include "sftp-parallel.h"
-#include "sftp-parallel-internal.h"	/* parallel_verify_base_register */
+#include "sftp-parallel-internal.h"	/* parallel_verify_prefix_register */
 
 /*
  * Maximum directory recursion depth.  Deeper trees are refused with a
@@ -448,12 +448,14 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Entering %s\n", src);
-	/* Register this command's root pair so whole-file verify items store
-	 * paths relative to it (upload: local = src, remote = dst).  Gated on
-	 * the orchestrator's verify_transfer (same flag the park checks); the
-	 * per-command `verify` arg is not reliably set for putv. */
-	if (p->cfg.verify_transfer)
-		parallel_verify_base_register(p, src, dst);
+	/* Register this command's roots as prefixes so whole-file verify items
+	 * store paths relative to them (upload: local root = src, remote = dst).
+	 * Gated on the orchestrator's verify_transfer (same flag the park checks);
+	 * the per-command `verify` arg is not reliably set for putv. */
+	if (p->cfg.verify_transfer) {
+		parallel_verify_prefix_register(p, src);
+		parallel_verify_prefix_register(p, dst);
+	}
 	{
 		int rc = parallel_upload_walk(p, conn, src, dst, 0, resume,
 		    verify);
@@ -609,11 +611,12 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Retrieving %s\n", src);
-	/* Register this command's root pair so whole-file verify items store
-	 * paths relative to it (download: local = dst, remote = src).  Gated on
-	 * verify_transfer (same flag the park checks). */
-	if (p->cfg.verify_transfer)
-		parallel_verify_base_register(p, dst, src);
+	/* Register this command's roots as prefixes (download: local root = dst,
+	 * remote = src).  Gated on verify_transfer (same flag the park checks). */
+	if (p->cfg.verify_transfer) {
+		parallel_verify_prefix_register(p, dst);
+		parallel_verify_prefix_register(p, src);
+	}
 	{
 		int rc = parallel_download_walk(p, conn, src, dst, 0, NULL,
 		    resume, verify);

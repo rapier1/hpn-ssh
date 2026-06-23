@@ -834,24 +834,18 @@ sftp_parallel_stop(struct sftp_parallel *p)
 			parallel_verify_tracker_free(p->verify_pending[i]);
 		free(p->verify_pending);
 		p->verify_pending = NULL;
-		for (i = 0; i < p->verify_whole_pending_n; i++) {
-			struct verify_whole_item *it = p->verify_whole_pending[i];
-			free(it->local_rel);
-			free(it->remote_rel);
-			free(it);
-		}
+		for (i = 0; i < p->verify_whole_pending_n; i++)
+			free(p->verify_whole_pending[i]);	/* single block */
 		free(p->verify_whole_pending);
 		p->verify_whole_pending = NULL;
 	}
-	/* Path-factoring base pool: the registered command-root pairs. */
+	/* Path-factoring prefix pool: the registered directory prefixes. */
 	{
 		int i;
-		for (i = 0; i < p->verify_bases_n; i++) {
-			free(p->verify_bases[i].local_base);
-			free(p->verify_bases[i].remote_base);
-		}
-		free(p->verify_bases);
-		p->verify_bases = NULL;
+		for (i = 0; i < p->verify_prefixes_n; i++)
+			free(p->verify_prefixes[i]);
+		free(p->verify_prefixes);
+		p->verify_prefixes = NULL;
 	}
 	/* Worker re-queue overflow: units parked here when a worker hit a full
 	 * queue, never drained back (abort/shutdown before the reporter moved
@@ -990,6 +984,32 @@ sftp_parallel_set_verify_transfer(struct sftp_parallel *p, int on)
 {
 	if (p != NULL)
 		p->cfg.verify_transfer = on ? 1 : 0;
+}
+
+/*
+ * Register the directory of a single transferred path so whole-file verify
+ * items can store it relative to a shared prefix (held once) instead of the
+ * full path per file.  The recursive walker registers command roots itself;
+ * this is the glob / direct-dispatch path (process_put/process_get), which
+ * bypasses the walker.  No-op unless verify is enabled.  Call with both the
+ * local and the remote path of each file; the dedup keeps the pool small for
+ * the common flat-glob case (one or two distinct directories).
+ */
+void
+sftp_parallel_register_verify_dir(struct sftp_parallel *p, const char *path)
+{
+	const char *slash;
+	char *dir;
+
+	if (p == NULL || path == NULL || !p->cfg.verify_transfer)
+		return;
+	if ((slash = strrchr(path, '/')) == NULL)
+		return;			/* relative no-dir path: nothing to factor */
+	dir = xmalloc((size_t)(slash - path) + 1);
+	memcpy(dir, path, (size_t)(slash - path));
+	dir[slash - path] = '\0';
+	parallel_verify_prefix_register(p, dir);  /* handles ""/"."/dedup */
+	free(dir);
 }
 
 int

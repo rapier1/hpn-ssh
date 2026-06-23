@@ -1342,6 +1342,12 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 				if (ga.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
 					fmode = ga.perm & 07777;
 			}
+			/* Glob / direct dispatch bypasses the walker; register
+			 * both sides' directories so whole-file verify factors
+			 * the path (download: local=abs_dst, remote=src). */
+			sftp_parallel_register_verify_dir(parallel_orch, abs_dst);
+			sftp_parallel_register_verify_dir(parallel_orch,
+			    g.gl_pathv[i]);
 			if (sftp_parallel_submit_download(parallel_orch, conn,
 			    g.gl_pathv[i], abs_dst, fsize, fmode,
 			    resume, verify) != 0)
@@ -1536,6 +1542,12 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 				    parent);
 				free(parent);
 			}
+			/* Glob / direct dispatch bypasses the walker; register
+			 * both sides' directories so whole-file verify factors
+			 * the path (upload: local=src, remote=abs_dst). */
+			sftp_parallel_register_verify_dir(parallel_orch,
+			    g.gl_pathv[i]);
+			sftp_parallel_register_verify_dir(parallel_orch, abs_dst);
 			if (sftp_parallel_submit_upload(parallel_orch, conn,
 			    g.gl_pathv[i], abs_dst,
 			    sb.st_size, sb.st_mode, resume, verify) != 0)

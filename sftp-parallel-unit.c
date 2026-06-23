@@ -89,9 +89,7 @@ parallel_unit_free(struct sftp_work_unit *u)
 	 * NULLs this after freeing it, so a still-set pointer means the unit was
 	 * dropped before any worker ran it (abort / queue shutdown): free it. */
 	if (u->verify_whole != NULL) {
-		free(u->verify_whole->local_rel);
-		free(u->verify_whole->remote_rel);
-		free(u->verify_whole);
+		free(u->verify_whole);	/* single block: header + both rels */
 		u->verify_whole = NULL;
 	}
 	/* Range-granular verify: this dropped chunk still holds a reference to the
@@ -426,79 +424,83 @@ path_trim_trailing_slash(char *s)
 		s[--n] = '\0';
 }
 
-/* If `base` prefixes `path` at a '/' boundary, point *rel past "base/" and
+/* If `prefix` prefixes `path` at a '/' boundary, point *rel past "prefix/" and
  * return 1; else 0. */
 static int
-path_strip_base(const char *path, const char *base, const char **rel)
+path_strip_prefix(const char *path, const char *prefix, const char **rel)
 {
-	size_t bl = strlen(base);
+	size_t pl = strlen(prefix);
 
-	if (bl == 0 || strncmp(path, base, bl) != 0 || path[bl] != '/')
+	if (pl == 0 || strncmp(path, prefix, pl) != 0 || path[pl] != '/')
 		return 0;
-	*rel = path + bl + 1;
+	*rel = path + pl + 1;
 	return 1;
 }
 
 void
-parallel_verify_base_register(struct sftp_parallel *p, const char *local_base,
-    const char *remote_base)
+parallel_verify_prefix_register(struct sftp_parallel *p, const char *dir)
 {
-	char *lb, *rb;
+	char *d;
 	int i;
 
-	if (p == NULL || local_base == NULL || remote_base == NULL)
+	if (p == NULL || dir == NULL || dir[0] == '\0')
 		return;
-	lb = xstrdup(local_base);
-	rb = xstrdup(remote_base);
-	path_trim_trailing_slash(lb);
-	path_trim_trailing_slash(rb);
-
+	d = xstrdup(dir);
+	path_trim_trailing_slash(d);
+	/* "." (the dirname of a relative no-dir path) can never prefix-match a
+	 * path at a '/' boundary; don't pollute the pool with it. */
+	if (strcmp(d, ".") == 0) {
+		free(d);
+		return;
+	}
 	pthread_mutex_lock(&p->verify_pending_mu);
-	for (i = 0; i < p->verify_bases_n; i++) {	/* dedup exact pairs */
-		if (strcmp(p->verify_bases[i].local_base, lb) == 0 &&
-		    strcmp(p->verify_bases[i].remote_base, rb) == 0) {
+	for (i = 0; i < p->verify_prefixes_n; i++) {	/* dedup */
+		if (strcmp(p->verify_prefixes[i], d) == 0) {
 			pthread_mutex_unlock(&p->verify_pending_mu);
-			free(lb);
-			free(rb);
+			free(d);
 			return;
 		}
 	}
-	if (p->verify_bases_n == p->verify_bases_cap) {
-		int ncap = p->verify_bases_cap ? p->verify_bases_cap * 2 : 8;
-		p->verify_bases = xreallocarray(p->verify_bases, (size_t)ncap,
-		    sizeof(*p->verify_bases));
-		p->verify_bases_cap = ncap;
+	/* The pool index is stored as int16_t in verify_whole_item.  Cap the pool
+	 * at INT16_MAX entries: past the cap, leave this dir unregistered so its
+	 * files store the full path (prefix = -1) instead of an out-of-range index.
+	 * Graceful degradation - never a bad index.  Reaching here needs one
+	 * command set spanning 32k+ distinct directories. */
+	if (p->verify_prefixes_n >= INT16_MAX) {
+		pthread_mutex_unlock(&p->verify_pending_mu);
+		free(d);
+		return;
 	}
-	p->verify_bases[p->verify_bases_n].local_base = lb;
-	p->verify_bases[p->verify_bases_n].remote_base = rb;
-	p->verify_bases_n++;
+	if (p->verify_prefixes_n == p->verify_prefixes_cap) {
+		int ncap = p->verify_prefixes_cap ? p->verify_prefixes_cap * 2 : 8;
+		p->verify_prefixes = xreallocarray(p->verify_prefixes,
+		    (size_t)ncap, sizeof(*p->verify_prefixes));
+		p->verify_prefixes_cap = ncap;
+	}
+	p->verify_prefixes[p->verify_prefixes_n++] = d;
 	pthread_mutex_unlock(&p->verify_pending_mu);
 }
 
 int
-parallel_verify_base_match(struct sftp_parallel *p, const char *local_path,
-    const char *remote_path, const char **local_rel, const char **remote_rel)
+parallel_verify_prefix_match(struct sftp_parallel *p, const char *path,
+    const char **rel)
 {
 	int i, best = -1;
 	size_t best_len = 0;
 
+	*rel = path;			/* default: no prefix, store the path as-is */
 	if (p == NULL)
 		return -1;
 	pthread_mutex_lock(&p->verify_pending_mu);
-	for (i = 0; i < p->verify_bases_n; i++) {
-		const char *lr, *rr;
-		size_t bl = strlen(p->verify_bases[i].local_base);
+	for (i = 0; i < p->verify_prefixes_n; i++) {
+		const char *r;
+		size_t pl = strlen(p->verify_prefixes[i]);
 
-		/* The SAME pair must prefix both sides; pick the longest. */
-		if (bl > best_len &&
-		    path_strip_base(local_path,
-			p->verify_bases[i].local_base, &lr) &&
-		    path_strip_base(remote_path,
-			p->verify_bases[i].remote_base, &rr)) {
+		if (pl > best_len &&
+		    path_strip_prefix(path, p->verify_prefixes[i], &r)) {
 			best = i;
-			best_len = bl;
-			*local_rel = lr;
-			*remote_rel = rr;
+			best_len = pl;
+			*rel = r;
 		}
 	}
 	pthread_mutex_unlock(&p->verify_pending_mu);
@@ -506,29 +508,56 @@ parallel_verify_base_match(struct sftp_parallel *p, const char *local_path,
 }
 
 char *
-parallel_verify_base_join(struct sftp_parallel *p, int base_index, int which,
-    const char *rel)
+parallel_verify_prefix_join(struct sftp_parallel *p, int idx, const char *rel)
 {
-	char *out, *base = NULL;
+	char *out, *prefix = NULL;
 
-	if (base_index < 0)
-		return xstrdup(rel);		/* fallback: rel is the full path */
+	if (idx < 0)
+		return xstrdup(rel);		/* no prefix: rel is the path as-is */
 	pthread_mutex_lock(&p->verify_pending_mu);
-	if (base_index < p->verify_bases_n)
-		base = xstrdup(which ? p->verify_bases[base_index].remote_base
-		    : p->verify_bases[base_index].local_base);
+	if (idx < p->verify_prefixes_n)
+		prefix = xstrdup(p->verify_prefixes[idx]);
 	pthread_mutex_unlock(&p->verify_pending_mu);
-	if (base == NULL)
+	if (prefix == NULL)
 		return xstrdup(rel);		/* defensive: pool changed */
-	xasprintf(&out, "%s/%s", base, rel);
-	free(base);
+	xasprintf(&out, "%s/%s", prefix, rel);
+	free(prefix);
 	return out;
+}
+
+/*
+ * Allocate a parked whole-file verify item in ONE block: the fixed header
+ * followed by "local_rel\0remote_rel\0".  This is the single point that owns
+ * the item's size arithmetic - both copies use the SAME measured lengths used
+ * to size the allocation (terminating NUL included), so bytes copied can never
+ * exceed bytes allocated.  The PATH_MAX guard is belt-and-suspenders: these are
+ * transfer paths that already opened files (so each is <= PATH_MAX), but it
+ * stops a corrupt length from wrapping the size_t add into a short allocation.
+ */
+static struct verify_whole_item *
+verify_whole_item_new(int local_prefix, const char *local_rel,
+    int remote_prefix, const char *remote_rel, int local_is_target)
+{
+	struct verify_whole_item *it;
+	size_t llen = strlen(local_rel);
+	size_t rlen = strlen(remote_rel);
+
+	if (llen > PATH_MAX || rlen > PATH_MAX)
+		fatal_f("verify path too long (local=%zu remote=%zu)",
+		    llen, rlen);
+	it = xmalloc(sizeof(*it) + llen + 1 + rlen + 1);
+	it->local_prefix = (int16_t)local_prefix;
+	it->remote_prefix = (int16_t)remote_prefix;
+	it->local_is_target = (int8_t)local_is_target;
+	memcpy(it->buf, local_rel, llen + 1);		/* includes NUL */
+	memcpy(it->buf + llen + 1, remote_rel, rlen + 1);
+	return it;
 }
 
 /*
  * Park a completed whole-file (non-range-split) transfer for the verify phase.
  * Stores a lightweight verify_whole_item with paths held RELATIVE to a
- * registered base pair (the long common prefix lives once in the base pool,
+ * registered directory prefix (the long common prefix lives once in the pool,
  * not in two full paths per file).  No match (non-recursive / disparate) falls
  * back to full paths.  The verify handler rebuilds local/remote.
  */
@@ -536,21 +565,16 @@ void
 parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
     const char *remote_path, int local_is_target)
 {
-	struct verify_whole_item *it = xcalloc(1, sizeof(*it));
+	struct verify_whole_item *it;
 	const char *lrel = NULL, *rrel = NULL;
-	int bi = parallel_verify_base_match(p, local_path, remote_path,
-	    &lrel, &rrel);
+	int lp, rp;
 
-	it->base_index = bi;
-	it->local_is_target = local_is_target;
-	if (bi >= 0) {
-		it->local_rel = xstrdup(lrel);
-		/* NULL remote_rel = identical to local_rel (recursive mirror). */
-		it->remote_rel = (strcmp(lrel, rrel) == 0) ? NULL : xstrdup(rrel);
-	} else {
-		it->local_rel = xstrdup(local_path);
-		it->remote_rel = xstrdup(remote_path);
-	}
+	/* Factor each side independently: the always-full side (remote on both
+	 * upload and download) matches a registered dir prefix; a relative side
+	 * matches nothing and is stored as-is (already short). */
+	lp = parallel_verify_prefix_match(p, local_path, &lrel);
+	rp = parallel_verify_prefix_match(p, remote_path, &rrel);
+	it = verify_whole_item_new(lp, lrel, rp, rrel, local_is_target);
 
 	pthread_mutex_lock(&p->verify_pending_mu);
 	if (p->verify_whole_pending_n == p->verify_whole_pending_cap) {
@@ -686,20 +710,17 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
 			/* No teed hashes: whole-file verify.  t->path is the
 			 * written file (LOCAL target = download, REMOTE = upload);
 			 * resolve to local/remote.  These are range-split files
-			 * (few), so just hold full paths (base_index = -1). */
-			struct verify_whole_item *it = xcalloc(1, sizeof(*it));
+			 * (few), and no prefix pool applies here, so hold the full
+			 * paths (prefix = -1). */
+			struct verify_whole_item *it;
 			struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
 
-			it->base_index = -1;
-			if (t->target == SFTP_RANGE_TARGET_LOCAL) {
-				it->local_rel = xstrdup(t->path);
-				it->remote_rel = xstrdup(t->src_path);
-				it->local_is_target = 1;
-			} else {
-				it->local_rel = xstrdup(t->src_path);
-				it->remote_rel = xstrdup(t->path);
-				it->local_is_target = 0;
-			}
+			if (t->target == SFTP_RANGE_TARGET_LOCAL)
+				it = verify_whole_item_new(-1, t->path,
+				    -1, t->src_path, /*local_is_target=*/1);
+			else
+				it = verify_whole_item_new(-1, t->src_path,
+				    -1, t->path, /*local_is_target=*/0);
 			parallel_verify_tracker_free(t);
 			u->op = SFTP_OP_VERIFY;
 			u->verify_whole = it;

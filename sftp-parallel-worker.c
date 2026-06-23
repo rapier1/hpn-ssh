@@ -261,22 +261,21 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		 * worker's own conn, then free the item. */
 		if (u->verify_whole != NULL) {
 			struct verify_whole_item *it = u->verify_whole;
-			/* Rebuild full paths from the base pool + relatives
-			 * (remote_rel == NULL means same as local_rel). */
-			const char *rrel = it->remote_rel ? it->remote_rel
-			    : it->local_rel;
-			char *local = parallel_verify_base_join(p,
-			    it->base_index, /*which=*/0, it->local_rel);
-			char *remote = parallel_verify_base_join(p,
-			    it->base_index, /*which=*/1, rrel);
+			/* Rebuild each full path from its prefix + relative.
+			 * Both rels share one buffer: local_rel is buf, remote_rel
+			 * begins just past local_rel's NUL. */
+			const char *lrel = it->buf;
+			const char *rrel = it->buf + strlen(it->buf) + 1;
+			char *local = parallel_verify_prefix_join(p,
+			    it->local_prefix, lrel);
+			char *remote = parallel_verify_prefix_join(p,
+			    it->remote_prefix, rrel);
 
 			parallel_verify_one(w, local, remote,
 			    it->local_is_target);
 			free(local);
 			free(remote);
-			free(it->local_rel);
-			free(it->remote_rel);
-			free(it);
+			free(it);	/* single block: header + both rels */
 			u->verify_whole = NULL;
 		}
 		/* Drive the verify-phase meter: count completed verifies (the
