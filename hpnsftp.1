@@ -650,6 +650,27 @@ extension.
 Alias to
 .Ic copy
 command.
+.It Xo Ic defer
+.Op Cm on Ns | Ns Cm off
+.Xc
+Control whether
+.Ic put
+and
+.Ic get
+return as soon as their files are queued to the parallel worker pool, rather
+than blocking until the transfer finishes, so successive commands pipeline
+through the pool.
+.Cm on
+enables this;
+.Cm off
+first drains any outstanding transfers
+.Pq a synchronisation barrier
+and then restores blocking behaviour.
+With no argument the current setting is printed.
+Deferral is enabled automatically in batch mode
+.Pq Fl b ;
+disable it mid-batch when a command depends on earlier transfers having
+completed.
 .It Xo Ic df
 .Op Fl hi
 .Op Ar path
@@ -1058,6 +1079,16 @@ to
 Display the
 .Nm
 protocol version.
+.It Ic wait
+Block until all transfers queued by deferred
+.Ic put
+and
+.Ic get
+commands have completed.
+This is a synchronisation barrier; unlike
+.Ic defer Cm off
+it does not change the deferral setting, and it has no effect when no
+transfers are outstanding.
 .It Ic \&! Ns Ar command
 Execute
 .Ar command
