@@ -91,6 +91,15 @@
 #define TAR_PREFIX_OFF   345
 #define TAR_PREFIX_LEN   155
 
+/* HPN variable-length path.  The byte length is stored octal in the (unused -
+ * no symlinks) linkname slot.  The path itself is stored CONTIGUOUSLY starting
+ * at TAR_PATH_OFF: its first bytes occupy the tail of block 0 (from there to the
+ * block end), and a longer path just continues into the 512-byte blocks right
+ * after the header block - so reading/writing it is a single memcpy. */
+#define TAR_PATHLEN_OFF  TAR_LINK_OFF
+#define TAR_PATHLEN_LEN  12
+#define TAR_PATH_OFF     TAR_PREFIX_OFF	/* path starts here, flows into spill */
+
 #define TAR_TYPE_REG     '0'
 #define TAR_TYPE_REG_OLD '\0'
 
@@ -179,55 +188,52 @@ tar_checksum(const u_char *hdr)
 	return sum;
 }
 
+/* Header size (block 0 + path spill) for a path of `len` bytes laid out
+ * contiguously from TAR_PATH_OFF: round the end of the path up to a block. */
+static size_t
+tar_header_size(size_t len)
+{
+	return ((TAR_PATH_OFF + len + SFTP_HPN_TAR_BLOCK - 1) /
+	    SFTP_HPN_TAR_BLOCK) * SFTP_HPN_TAR_BLOCK;
+}
+
 /*
- * Split an archive path into (prefix, name) for USTAR.  Returns:
- *    0    - fits in name alone (<=100 chars); prefix is empty.
- *    1    - split successful; *prefix_len is the prefix component
- *           length, *name_off is the offset into path where the
- *           name component starts (i.e. just past the "/" we split
- *           on).
- *   -1    - does not fit even with prefix splitting (path too long,
- *           or no "/" in a suitable position).
- *
- * USTAR convention: prefix ≤ 155 chars, "/" separator (implicit),
- * name ≤ 100 chars.  Total path = prefix + "/" + name.  For paths
- * <= 100 chars we put it entirely in name and leave prefix empty.
+ * Lay a variable-length pathname into a (zeroed) header buffer: a single
+ * contiguous run from TAR_PATH_OFF, flowing past the block-0 boundary into the
+ * spill blocks when long.  Length is stored octal in the linkname slot.  Returns
+ * the total header size (block 0 + spill), or -1 if the path is empty / >
+ * PATH_MAX.  hdr must be SFTP_HPN_TAR_HDR_MAX bytes and already zeroed.
  */
-static int
-tar_split_path(const char *path, size_t *prefix_len, size_t *name_off)
+static ssize_t
+tar_layout_path(u_char *hdr, const char *path)
 {
 	size_t len = strlen(path);
 
-	if (len == 0)
+	if (len == 0 || len > SFTP_HPN_TAR_MAX_PATH)
 		return -1;
-	if (len <= TAR_NAME_LEN) {
-		*prefix_len = 0;
-		*name_off = 0;
-		return 0;
-	}
-	if (len > SFTP_HPN_TAR_MAX_PATH)
+	memcpy(hdr + TAR_PATH_OFF, path, len);
+	if (tar_put_octal(hdr, TAR_PATHLEN_OFF, TAR_PATHLEN_LEN,
+	    (uint64_t)len) < 0)
 		return -1;
-	/* Find a "/" such that the prefix (before "/") fits in 155 bytes
-	 * and the name (after "/") fits in 100 bytes.  Walk from the
-	 * latest such "/" backward for the most prefix-heavy split. */
-	size_t i;
-	size_t best = (size_t)-1;
-	for (i = len; i > 0; i--) {
-		if (path[i - 1] != '/')
-			continue;
-		size_t name_len = len - i;	/* bytes after the "/" */
-		size_t pre_len  = i - 1;	/* bytes before the "/" */
-		if (name_len <= TAR_NAME_LEN &&
-		    pre_len  <= TAR_PREFIX_LEN) {
-			best = i;
-			break;
-		}
-	}
-	if (best == (size_t)-1)
+	return (ssize_t)tar_header_size(len);
+}
+
+/*
+ * Reconstruct the variable-length pathname from a fully-collected header buffer
+ * into out (must be SFTP_HPN_TAR_MAX_PATH + 1 bytes).  Returns the path length,
+ * or -1 if the stored length field is bad / oversized.
+ */
+static ssize_t
+tar_read_path(const u_char *hdr, char *out)
+{
+	uint64_t len;
+
+	if (tar_get_octal(hdr, TAR_PATHLEN_OFF, TAR_PATHLEN_LEN, &len) < 0 ||
+	    len == 0 || len > SFTP_HPN_TAR_MAX_PATH)
 		return -1;
-	*prefix_len = best - 1;
-	*name_off   = best;
-	return 0;
+	memcpy(out, hdr + TAR_PATH_OFF, (size_t)len);
+	out[len] = '\0';
+	return (ssize_t)len;
 }
 
 /* ── Writer ──────────────────────────────────────────────────────────────── */
@@ -266,7 +272,8 @@ struct sftp_hpn_tar_writer {
 	int      cur_fd;		/* open() result for cur->src_path */
 	uint64_t cur_data_emitted;	/* bytes of data written into out so far */
 	uint64_t cur_pad_remaining;	/* zero bytes still owed for alignment */
-	u_char   hdr_buf[SFTP_HPN_TAR_BLOCK];
+	u_char   hdr_buf[SFTP_HPN_TAR_HDR_MAX];	/* block 0 + path spill */
+	size_t   hdr_total;		/* full header size (block 0 + spill) */
 	size_t   hdr_pos;		/* bytes of hdr_buf already emitted */
 
 	/* EOA: two zero blocks (1024 bytes). */
@@ -338,15 +345,14 @@ sftp_hpn_tar_writer_add_file(struct sftp_hpn_tar_writer *w,
     mode_t mode, uint64_t size, time_t mtime)
 {
 	struct writer_file *f;
-	size_t prefix_len = 0, name_off = 0;
 
 	if (w == NULL || w->state == WS_ERROR || w->finish_signalled)
 		return -1;
 	if (src_path == NULL || archive_path == NULL ||
 	    *src_path == '\0' || *archive_path == '\0')
 		return -1;
-	if (tar_split_path(archive_path, &prefix_len, &name_off) < 0)
-		return -1;	/* path too long for USTAR even with prefix */
+	if (strlen(archive_path) > SFTP_HPN_TAR_MAX_PATH)
+		return -1;	/* longer than PATH_MAX */
 	f = calloc(1, sizeof(*f));
 	if (f == NULL)
 		return -1;
@@ -386,23 +392,15 @@ static int
 writer_build_header(struct sftp_hpn_tar_writer *w)
 {
 	struct writer_file *f = w->cur;
-	size_t prefix_len = 0, name_off = 0;
+	ssize_t hdr_total;
 
-	memset(w->hdr_buf, 0, SFTP_HPN_TAR_BLOCK);
-	if (tar_split_path(f->archive_path, &prefix_len, &name_off) < 0)
+	memset(w->hdr_buf, 0, SFTP_HPN_TAR_HDR_MAX);
+	/* Variable-length path: one contiguous run from TAR_PATH_OFF, spilling
+	 * into the blocks after block 0 when long, length in the linkname slot.
+	 * Returns the full header size (block 0 + spill). */
+	hdr_total = tar_layout_path(w->hdr_buf, f->archive_path);
+	if (hdr_total < 0)
 		return -1;
-	if (prefix_len > 0) {
-		memcpy(w->hdr_buf + TAR_PREFIX_OFF, f->archive_path,
-		    prefix_len);
-		size_t name_len = strlen(f->archive_path) - name_off;
-		memcpy(w->hdr_buf + TAR_NAME_OFF,
-		    f->archive_path + name_off,
-		    name_len > TAR_NAME_LEN ? TAR_NAME_LEN : name_len);
-	} else {
-		size_t name_len = strlen(f->archive_path);
-		memcpy(w->hdr_buf + TAR_NAME_OFF, f->archive_path,
-		    name_len > TAR_NAME_LEN ? TAR_NAME_LEN : name_len);
-	}
 
 	if (tar_put_octal(w->hdr_buf, TAR_MODE_OFF, TAR_MODE_LEN,
 	    (uint64_t)(f->mode & 07777)) < 0 ||
@@ -419,7 +417,8 @@ writer_build_header(struct sftp_hpn_tar_writer *w)
 	w->hdr_buf[TAR_MAGIC_OFF + 5] = '\0';
 	memcpy(w->hdr_buf + TAR_VERS_OFF, "00", 2);
 
-	/* Fill checksum field with spaces, compute, then overwrite. */
+	/* Checksum covers block 0 only (metadata + the length field + the path
+	 * bytes that fit in block 0).  Spill blocks carry path tail, no metadata. */
 	memset(w->hdr_buf + TAR_CKSUM_OFF, ' ', TAR_CKSUM_LEN);
 	uint32_t cksum = tar_checksum(w->hdr_buf);
 	/* Standard convention: 6 octal digits + NUL + space. */
@@ -431,6 +430,7 @@ writer_build_header(struct sftp_hpn_tar_writer *w)
 	w->hdr_buf[TAR_CKSUM_OFF + 6] = '\0';
 	w->hdr_buf[TAR_CKSUM_OFF + 7] = ' ';
 
+	w->hdr_total = (size_t)hdr_total;
 	w->hdr_pos = 0;
 	return 0;
 }
@@ -493,13 +493,13 @@ sftp_hpn_tar_writer_pack_next(struct sftp_hpn_tar_writer *w,
 		}
 
 		if (w->state == WS_HEADER) {
-			size_t avail = SFTP_HPN_TAR_BLOCK - w->hdr_pos;
+			size_t avail = w->hdr_total - w->hdr_pos;
 			size_t take  = (max_bytes - written) < avail
 			    ? (max_bytes - written) : avail;
 			memcpy(out + written, w->hdr_buf + w->hdr_pos, take);
 			w->hdr_pos += take;
 			written    += take;
-			if (w->hdr_pos == SFTP_HPN_TAR_BLOCK) {
+			if (w->hdr_pos == w->hdr_total) {
 				/* Header fully emitted.  Open the source
 				 * file (unless size == 0; then skip DATA). */
 				w->hdr_pos = 0;
@@ -644,7 +644,8 @@ struct sftp_hpn_tar_parser {
 	const struct sftp_hpn_tar_callbacks *cb;
 	void   *ctx;
 
-	u_char  hdr_buf[SFTP_HPN_TAR_BLOCK];
+	u_char  hdr_buf[SFTP_HPN_TAR_HDR_MAX];	/* block 0 + path spill */
+	size_t  hdr_total;	/* full header size; 0 until block 0 is read */
 	size_t  hdr_pos;
 
 	uint64_t cur_size;	/* declared size of current entry */
@@ -769,32 +770,13 @@ parser_handle_header(struct sftp_hpn_tar_parser *p)
 		return -1;
 	}
 
-	/* Reconstruct full path: prefix + "/" + name (if prefix non-empty).
-	 * Each side is NUL-terminated within its field - except when the
-	 * field is fully used, in which case there's no NUL and we use
-	 * the field width.  Strnlen handles both. */
-	size_t pre_len  = strnlen((const char *)p->hdr_buf + TAR_PREFIX_OFF,
-	    TAR_PREFIX_LEN);
-	size_t name_len = strnlen((const char *)p->hdr_buf + TAR_NAME_OFF,
-	    TAR_NAME_LEN);
-	if (name_len == 0) {
-		parser_set_error(p, "tar header has empty name");
-		return -1;
-	}
-	if (pre_len + 1 + name_len > SFTP_HPN_TAR_MAX_PATH) {
-		parser_set_error(p, "tar header path too long");
-		return -1;
-	}
+	/* Reconstruct the variable-length path: one contiguous run from
+	 * TAR_PATH_OFF (block 0 into the spill blocks), length from the
+	 * linkname slot. */
 	char path[SFTP_HPN_TAR_MAX_PATH + 2];
-	if (pre_len > 0) {
-		memcpy(path, p->hdr_buf + TAR_PREFIX_OFF, pre_len);
-		path[pre_len] = '/';
-		memcpy(path + pre_len + 1, p->hdr_buf + TAR_NAME_OFF,
-		    name_len);
-		path[pre_len + 1 + name_len] = '\0';
-	} else {
-		memcpy(path, p->hdr_buf + TAR_NAME_OFF, name_len);
-		path[name_len] = '\0';
+	if (tar_read_path(p->hdr_buf, path) < 0) {
+		parser_set_error(p, "tar header bad/oversized path length field");
+		return -1;
 	}
 
 	/* Invoke entry_cb. */
@@ -822,6 +804,35 @@ parser_handle_header(struct sftp_hpn_tar_parser *p)
 	return 0;
 }
 
+/*
+ * With block 0 of a header in hand, decide the full header size.  An all-zero
+ * block 0 is the EOA marker (one block; parser_handle_header turns it into the
+ * EOA state).  Otherwise the linkname slot holds the path length, and the
+ * header is block 0 plus enough spill blocks for the path tail past block 0.
+ * Returns the total size, or 0 after setting a parser error.
+ */
+static size_t
+header_total_from_block0(struct sftp_hpn_tar_parser *p)
+{
+	size_t   i;
+	uint64_t plen;
+	int      all_zero = 1;
+
+	for (i = 0; i < SFTP_HPN_TAR_BLOCK; i++)
+		if (p->hdr_buf[i] != 0) {
+			all_zero = 0;
+			break;
+		}
+	if (all_zero)
+		return SFTP_HPN_TAR_BLOCK;	/* EOA marker: one block */
+	if (tar_get_octal(p->hdr_buf, TAR_PATHLEN_OFF, TAR_PATHLEN_LEN,
+	    &plen) < 0 || plen == 0 || plen > SFTP_HPN_TAR_MAX_PATH) {
+		parser_set_error(p, "tar header bad/oversized path length field");
+		return 0;
+	}
+	return tar_header_size((size_t)plen);
+}
+
 int
 sftp_hpn_tar_parser_feed(struct sftp_hpn_tar_parser *p,
     const u_char *data, size_t len)
@@ -837,16 +848,28 @@ sftp_hpn_tar_parser_feed(struct sftp_hpn_tar_parser *p,
 
 	while (len > 0) {
 		if (p->state == PS_HEADER) {
-			size_t need = SFTP_HPN_TAR_BLOCK - p->hdr_pos;
+			/* Phase 1: collect block 0 (512) to learn the path
+			 * length and thus the full header size.  Phase 2:
+			 * collect any spill blocks, then handle the header. */
+			size_t target = (p->hdr_total != 0)
+			    ? p->hdr_total : SFTP_HPN_TAR_BLOCK;
+			size_t need = target - p->hdr_pos;
 			size_t take = len < need ? len : need;
 			memcpy(p->hdr_buf + p->hdr_pos, data, take);
 			p->hdr_pos += take;
 			data       += take;
 			len        -= take;
-			if (p->hdr_pos == SFTP_HPN_TAR_BLOCK) {
+			if (p->hdr_total == 0 &&
+			    p->hdr_pos == SFTP_HPN_TAR_BLOCK) {
+				p->hdr_total = header_total_from_block0(p);
+				if (p->hdr_total == 0)
+					return -1;	/* error already set */
+			}
+			if (p->hdr_total != 0 && p->hdr_pos == p->hdr_total) {
 				if (parser_handle_header(p) < 0)
 					return -1;
-				p->hdr_pos = 0;
+				p->hdr_pos   = 0;
+				p->hdr_total = 0;
 				if (p->state == PS_EOA_2ND)
 					continue;
 			}

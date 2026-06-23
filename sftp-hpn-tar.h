@@ -36,17 +36,21 @@
  *             parse_feed(); parser invokes callbacks as each entry's
  *             header / data / end is recognised.
  *
- * Format constraints (matches what we put on the wire today):
+ * Format constraints (HPN-internal; NOT read by any external tar):
  *
- *   - POSIX 1003.1-1988 USTAR - 512-byte fixed header, file data
- *     padded to 512-byte boundary, two-block all-zero EOA marker.
- *   - USTAR "prefix" field used for paths up to 255 chars total
- *     (155-byte prefix + "/" + 100-byte name).  Pathnames longer
- *     than that are rejected with a log message at the caller's
- *     option (writer fails the entry; parser fails the bundle).
- *   - USTAR header checksum computed on write, verified on read.
- *   - No GNU long-name extension, no PAX, no sparse, no symlinks,
- *     no special files.  All entries are regular files.
+ *   - 512-byte block framing, file data padded to 512, two-block
+ *     all-zero EOA marker, octal numeric fields, header checksum.
+ *   - The pathname is a VARIABLE-LENGTH field stored CONTIGUOUSLY:
+ *     its length lives in the header (the old USTAR linkname slot)
+ *     and the path bytes run from a fixed offset in block 0 straight
+ *     into the 512-byte blocks following it when the path is long.
+ *     Reading or writing the path is a single memcpy.  Short paths
+ *     fit in one block exactly like before; longer paths (up to
+ *     PATH_MAX) just make the header longer.  No "/"-split, no
+ *     100/255 ceiling.  (This is why it is no longer plain USTAR -
+ *     the bundle stream is ours end to end, so we extend it freely.)
+ *   - No PAX, no sparse, no symlinks, no special files.  All
+ *     entries are regular files.
  *
  * Error model: bundle is all-or-nothing.  Any per-entry failure
  * during mid-stream pack or unpack causes the codec to enter an
@@ -65,15 +69,22 @@
 #include <sys/types.h>
 #include <stdint.h>
 #include <time.h>
+#include <limits.h>
 
-/* USTAR block size - fixed by the format. */
+/* Block size - fixed by the framing. */
 #define SFTP_HPN_TAR_BLOCK	512u
 
-/* Maximum total path length the USTAR prefix+name combination
- * supports: 155 (prefix) + 1 (separator) + 99 (name without
- * trailing NUL when split point sits cleanly between components)
- * = 255 chars.  Anything longer must be rejected. */
-#define SFTP_HPN_TAR_MAX_PATH	255u
+/* Maximum pathname the codec carries.  The path is a variable-length field
+ * (length in the header, first 255 bytes in block 0, tail spilling into extra
+ * blocks), so the only real limit is PATH_MAX. */
+#define SFTP_HPN_TAR_MAX_PATH	((unsigned)PATH_MAX)
+
+/* The path runs contiguously from a fixed offset in block 0 into the blocks
+ * after it.  Worst-case header = block 0 + enough spill blocks for a PATH_MAX
+ * path. */
+#define SFTP_HPN_TAR_HDR_MAX		(SFTP_HPN_TAR_BLOCK + \
+    ((SFTP_HPN_TAR_MAX_PATH + SFTP_HPN_TAR_BLOCK - 1u) / \
+     SFTP_HPN_TAR_BLOCK) * SFTP_HPN_TAR_BLOCK)
 
 /* ── Writer ──────────────────────────────────────────────────────────────── */
 
