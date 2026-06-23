@@ -3172,7 +3172,7 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 				free(dir);
 				free(startdir);
 				free(remote_path);
-				free(conn);
+				/* conn freed by main (caller) after verify drain */
 				return (-1);
 			}
 		} else {
@@ -3191,7 +3191,7 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 			free(dir);
 			free(startdir);
 			free(remote_path);
-			free(conn);
+			/* conn freed by main (caller) after verify drain */
 			return (err);
 		}
 		free(dir);
@@ -3277,7 +3277,7 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	ssh_signal(SIGCHLD, SIG_DFL);
 	free(remote_path);
 	free(startdir);
-	free(conn);
+	/* conn freed by main (caller) after verify drain */
 
 #ifdef USE_LIBEDIT
 	if (hl != NULL)
@@ -3957,6 +3957,14 @@ main(int argc, char **argv)
 		}
 		free(cvpaths);
 	}
+
+	/*
+	 * conn ownership lives in main (HPN): upstream's interactive_loop freed
+	 * conn on every exit, but the classic verify drain just above needs it
+	 * after the call returns.  This is conn's last use, so free it here.
+	 */
+	free(conn);
+	conn = NULL;
 
 	/*
 	 * Fold any parallel post-transfer verify mismatches into the global
