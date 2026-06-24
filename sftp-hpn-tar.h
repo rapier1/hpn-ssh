@@ -17,11 +17,11 @@
  */
 
 /*
- * sftp-hpn-tar.h - HPN-SSH USTAR codec for the bundle path.
+ * sftp-hpn-tar.h - HPN-SSH bundle codec.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- * Replaces libarchive on both the bundle upload and download paths,
- * both client- and server-side.
+ * Carries small files in bulk on both the bundle upload and download
+ * paths, both client- and server-side.
  *
  * Two streaming state machines, mirror images:
  *
@@ -36,21 +36,22 @@
  *             parse_feed(); parser invokes callbacks as each entry's
  *             header / data / end is recognised.
  *
- * Format constraints (HPN-internal; NOT read by any external tar):
+ * Format (HPN-internal; read only by HPN-SSH at the other end of the same
+ * connection, so it carries no tar/archive compatibility baggage):
  *
- *   - 512-byte block framing, file data padded to 512, two-block
- *     all-zero EOA marker, octal numeric fields, header checksum.
- *   - The pathname is a VARIABLE-LENGTH field stored CONTIGUOUSLY:
- *     its length lives in the header (the old USTAR linkname slot)
- *     and the path bytes run from a fixed offset in block 0 straight
- *     into the 512-byte blocks following it when the path is long.
- *     Reading or writing the path is a single memcpy.  Short paths
- *     fit in one block exactly like before; longer paths (up to
- *     PATH_MAX) just make the header longer.  No "/"-split, no
- *     100/255 ceiling.  (This is why it is no longer plain USTAR -
- *     the bundle stream is ours end to end, so we extend it freely.)
- *   - No PAX, no sparse, no symlinks, no special files.  All
- *     entries are regular files.
+ *   A minimal length-prefixed binary record per file -
+ *     u8   type      (1 = file)
+ *     u32  mode       POSIX permission bits
+ *     u64  mtime      seconds since the epoch
+ *     u64  size       file data length
+ *     u16  path_len   archive-path length (PATH_MAX < 64 KiB)
+ *     u8[path_len]    archive path (length-prefixed; no NUL)
+ *     u8[size]        file data
+ *   - then the next record, with no padding.  A lone type=0 byte ends the
+ *     stream.  All integers are big-endian (the stream can cross
+ *     architectures).  No 512-byte blocks, no octal, no checksum, no magic,
+ *     no uid/gid.
+ *   - No symlinks, dirs, or special files; all entries are regular files.
  *
  * Error model: bundle is all-or-nothing.  Any per-entry failure
  * during mid-stream pack or unpack causes the codec to enter an
@@ -71,20 +72,16 @@
 #include <time.h>
 #include <limits.h>
 
-/* Block size - fixed by the framing. */
-#define SFTP_HPN_TAR_BLOCK	512u
-
-/* Maximum pathname the codec carries.  The path is a variable-length field
- * (length in the header, first 255 bytes in block 0, tail spilling into extra
- * blocks), so the only real limit is PATH_MAX. */
+/* Maximum pathname the codec carries.  The path is a variable-length,
+ * length-prefixed field, so the only limit is PATH_MAX. */
 #define SFTP_HPN_TAR_MAX_PATH	((unsigned)PATH_MAX)
 
-/* The path runs contiguously from a fixed offset in block 0 into the blocks
- * after it.  Worst-case header = block 0 + enough spill blocks for a PATH_MAX
- * path. */
-#define SFTP_HPN_TAR_HDR_MAX		(SFTP_HPN_TAR_BLOCK + \
-    ((SFTP_HPN_TAR_MAX_PATH + SFTP_HPN_TAR_BLOCK - 1u) / \
-     SFTP_HPN_TAR_BLOCK) * SFTP_HPN_TAR_BLOCK)
+/* Fixed record-header prefix before the variable-length path:
+ * type(1) + mode(4) + mtime(8) + size(8) + path_len(2). */
+#define SFTP_HPN_TAR_FIXED_HDR	23u
+
+/* Worst-case header scratch = the fixed prefix plus a PATH_MAX path. */
+#define SFTP_HPN_TAR_HDR_MAX	(SFTP_HPN_TAR_FIXED_HDR + SFTP_HPN_TAR_MAX_PATH)
 
 /* ── Writer ──────────────────────────────────────────────────────────────── */
 

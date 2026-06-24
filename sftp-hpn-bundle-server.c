@@ -418,6 +418,10 @@ bundle_upload_entry_end_cb(void *ctx)
 	if (s->cur_fd >= 0) {
 		if (preserve) {
 			struct timespec ts[2];
+			/* Exact mode: open(O_CREAT, perm) is subject to umask
+			 * and is ignored entirely on a pre-existing file, so
+			 * force the bits here to match real SFTP -p. */
+			(void)fchmod(s->cur_fd, (mode_t)(s->cur_mode & 07777));
 			ts[0].tv_sec = s->cur_mtime; ts[0].tv_nsec = 0;
 			ts[1].tv_sec = s->cur_mtime; ts[1].tv_nsec = 0;
 			(void)futimens(s->cur_fd, ts);

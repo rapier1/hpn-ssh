@@ -196,6 +196,7 @@ struct bundle_dl_stream {
 	const char *cur_local;	/* local_path for current entry (entries[]
 				 * owns the storage; we just point at it) */
 	time_t   cur_mtime;	/* used by entry_end_cb */
+	mode_t   cur_mode;	/* used by entry_end_cb (exact-mode fchmod) */
 	uint64_t cur_written;	/* bytes written for the current entry; used to
 				 * ftruncate the file to its real size */
 
@@ -282,6 +283,7 @@ bundle_dl_entry_cb(void *ctx, const char *path, uint64_t size,
 	}
 	s->cur_local = s->entries[idx].local_path;
 	s->cur_mtime = mtime;
+	s->cur_mode = mode;
 	s->cur_written = 0;
 
 	/* (D) pre-create parent dir, skipping the call if it matches the
@@ -370,6 +372,10 @@ bundle_dl_entry_end_cb(void *ctx)
 	if (s->cur_fd >= 0) {
 		if (s->preserve_flag) {
 			struct timespec ts[2];
+			/* Exact mode: open(O_CREAT, perm) is subject to umask
+			 * and ignored on a pre-existing file; force it here to
+			 * match real SFTP -p. */
+			(void)fchmod(s->cur_fd, (mode_t)(s->cur_mode & 07777));
 			ts[0].tv_sec = s->cur_mtime; ts[0].tv_nsec = 0;
 			ts[1].tv_sec = s->cur_mtime; ts[1].tv_nsec = 0;
 			(void)futimens(s->cur_fd, ts);

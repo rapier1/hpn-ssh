@@ -1064,6 +1064,16 @@ sftp_parallel_set_verify_transfer(struct sftp_parallel *p, int on)
 		p->cfg.verify_transfer = on ? 1 : 0;
 }
 
+/* Per-command preserve toggle: the parallel/bundle path reads preserve from
+ * the orchestrator config, so a per-command put/get -p has to push it here
+ * (the long-lived orchestrator was launched once with the program-level -p). */
+void
+sftp_parallel_set_preserve(struct sftp_parallel *p, int on)
+{
+	if (p != NULL)
+		p->cfg.preserve_flag = on ? 1 : 0;
+}
+
 /*
  * Register the directory of a single transferred path so whole-file verify
  * items can store it relative to a shared prefix (held once) instead of the

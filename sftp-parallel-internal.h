@@ -128,14 +128,14 @@ struct sftp_parallel;
 #define BUNDLE_TARGET_BYTES BUNDLE_TARGET_BYTES_DEFAULT
 
 /*
- * Wire framing of one file inside a tar bundle: a 512-byte USTAR header plus
- * the file data padded up to a 512-byte boundary (SFTP_HPN_TAR_BLOCK).  The
- * producer grouper sizes bundles by this framed cost rather than raw payload,
- * so header/padding overhead - which dominates for tiny files - can't let a
- * bundle balloon past the byte cap on the wire.
+ * Wire cost of one file in a bundle: the fixed record header (type + mode +
+ * mtime + size + path_len = 23 bytes, see sftp-hpn-tar.h) plus the archive
+ * path plus the file data, with no padding.  The producer grouper sizes
+ * bundles by this framed cost rather than raw payload, so a bundle's wire size
+ * stays near the byte cap even when tiny-file headers/paths dominate.
  */
-#define BUNDLE_TAR_FRAME_BYTES(sz) \
-    (512ULL + (((uint64_t)(sz) + 511ULL) / 512ULL) * 512ULL)
+#define BUNDLE_REC_FRAME_BYTES(plen, sz) \
+    (23ULL + (uint64_t)(plen) + (uint64_t)(sz))
 
 /*
  * Work-queue (ring) depth.

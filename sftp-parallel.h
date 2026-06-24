@@ -399,6 +399,11 @@ void sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
  */
 void sftp_parallel_set_verify_transfer(struct sftp_parallel *p, int on);
 
+/* Per-command preserve toggle (put/get -p) for the parallel/bundle path; the
+ * orchestrator persists across commands so each command pushes its effective
+ * preserve here.  No-op when p is NULL. */
+void sftp_parallel_set_preserve(struct sftp_parallel *p, int on);
+
 /*
  * Register an app-layer round-trip-time estimate (microseconds) for the
  * remote path.  Used by the reporter's tput-outlier check to compute a

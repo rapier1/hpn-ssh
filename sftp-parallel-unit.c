@@ -976,7 +976,8 @@ parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
 	}
 	p->bundle_pending[p->bundle_pending_n++] = u;
 	p->bundle_pending_op = u->op;
-	p->bundle_pending_framed += BUNDLE_TAR_FRAME_BYTES(u->size);
+	p->bundle_pending_framed += BUNDLE_REC_FRAME_BYTES(
+	    u->dst_path ? strlen(u->dst_path) : 0, u->size);
 	/* Download bundles list every member's remote path (src_path) in one
 	 * hpn-bundle-fetch request; track that request size and flush before it
 	 * overflows SFTP_MAX_MSG_LENGTH (see BUNDLE_DL_FETCH_REQ_MAX). */
