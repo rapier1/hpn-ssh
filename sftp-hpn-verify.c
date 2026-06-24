@@ -880,7 +880,7 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 		run_off = ranges[run_start].off;
 		run_len = (ranges[i - 1].off + ranges[i - 1].len) - run_off;
 
-		debug3("chunked resume: %s chunks [%u, %u) at offset %llu "
+		debug3("resume: %s chunks [%u, %u) at offset %llu "
 		    "length %llu for \"%s\"", ing, run_start, i,
 		    (unsigned long long)run_off,
 		    (unsigned long long)run_len, local_path);
@@ -907,7 +907,7 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 		bytes_moved += run_len;
 	}
 
-	logit("chunked verified resume \"%s\": %s %u/%u chunks "
+	logit("verified resume \"%s\": %s %u/%u chunks "
 	    "(%llu / %llu bytes, %.1f%% of span)",
 	    local_path, ed, n_mismatched, n_chunks,
 	    (unsigned long long)bytes_moved, (unsigned long long)slen,

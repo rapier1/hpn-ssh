@@ -128,9 +128,9 @@ parallel_verify_one(struct sftp_worker *w, const char *local_path,
 	if (r == 0)
 		return;	/* verified good (possibly after repair) */
 	if (r < 0) {
-		logit("worker %d VERIFY SKIPPED: \"%s\": server lacks "
+		logit("VERIFY SKIPPED: \"%s\": server lacks "
 		    "sftp-hash-range@hpnssh.org or read error",
-		    w->id, remote_path);
+		    remote_path);
 		return;
 	}
 	/*
@@ -335,7 +335,7 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		w->warm_handle = warm.handle;
 		w->warm_handle_len = warm.handle_len;
 		w->warm_dst_path = warm.path;
-		debug("unit-exec: worker %d UPLOAD_RANGE [%lld+%lld) rc=%d "
+		debug3("unit-exec: worker %d UPLOAD_RANGE [%lld+%lld) rc=%d "
 		    "acked=%lld attempt=%d", w->id,
 		    (long long)u->range_offset, (long long)u->range_length,
 		    rc, (long long)u->acked_bytes, u->attempt);
@@ -357,7 +357,7 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	case SFTP_OP_DOWNLOAD_RANGE:
 		rc = sftp_download_range(w->conn, u->src_path, u->dst_path,
 		    u->range_offset, u->range_length, &u->acked_bytes);
-		debug("unit-exec: worker %d DOWNLOAD_RANGE [%lld+%lld) rc=%d "
+		debug3("unit-exec: worker %d DOWNLOAD_RANGE [%lld+%lld) rc=%d "
 		    "acked=%lld attempt=%d", w->id,
 		    (long long)u->range_offset, (long long)u->range_length,
 		    rc, (long long)u->acked_bytes, u->attempt);
@@ -916,8 +916,8 @@ worker_dispatch_bundle_container(struct sftp_worker *w,
 /*
  * Execute a single work unit through the non-batch path: drain any
  * deferred pipelined batch (its STATUSes would corrupt the next RPC),
- * mark the worker as actively working, run execute_unit, log the
- * dispatch-diag line, hand the result to worker_process_result.
+ * mark the worker as actively working, run execute_unit, and hand the
+ * result to worker_process_result.
  *
  * Used in three places by parallel_worker_thread:
  *   - the `bn == 1` branch (batch loop collected only one unit)
@@ -944,11 +944,6 @@ worker_execute_single(struct sftp_worker *w, struct sftp_work_unit *u)
 	worker_drain_pipeline(w);
 	worker_record_start(w);
 	int rc = execute_unit(w, u);
-	debug_ft("dispatch-diag: worker %d executed op=%d rc=%d "
-	    "offset=%lld length=%lld",
-	    w->id, (int)u->op, rc,
-	    (long long)u->range_offset,
-	    (long long)u->range_length);
 	worker_process_result(w, u, rc);
 }
 
@@ -1125,12 +1120,6 @@ worker_thread_init(struct sftp_worker *w)
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGALRM);
 	pthread_sigmask(SIG_BLOCK, &mask, NULL);
-
-	/* DISPATCH-DIAG: worker has reached the main loop entry, fully
-	 * past spawn_one_worker / sftp_init.  If a worker is alive in
-	 * p->workers[] but this line never appears for its id, the
-	 * parallel_worker_thread itself never got scheduled / never started. */
-	debug_ft("dispatch-diag: worker %d entered main loop", w->id);
 
 	/* -1 = "holds no range" (0 is a valid range_offset); the watchdog's
 	 * stuck-range detector compares against this. */
@@ -1424,20 +1413,6 @@ parallel_worker_thread(void *arg)
 		    ? (int64_t)u0->range_offset : (int64_t)-1,
 		    __ATOMIC_RELAXED);
 
-		/* DISPATCH-DIAG: worker pulled a unit off the queue.  If
-		 * "entered main loop" appears for a worker but no "popped"
-		 * line ever follows, the worker is blocked in pop_blocking
-		 * with no signal reaching it. */
-		debug_ft("dispatch-diag: worker %d popped op=%d "
-		    "offset=%lld length=%lld src=\"%s\" dst=\"%s\" "
-		    "idle_us=%llu",
-		    w->id, (int)u0->op,
-		    (long long)u0->range_offset,
-		    (long long)u0->range_length,
-		    u0->src_path ? u0->src_path : "(null)",
-		    u0->dst_path ? u0->dst_path : "(null)",
-		    (unsigned long long)
-		        ((t_work_start - t_idle_start) / 1000ULL));
 		if (u0->size > 0)
 			__atomic_fetch_sub(&p->queued_bytes,
 			    (uint64_t)u0->size, __ATOMIC_RELAXED);

@@ -171,7 +171,7 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	case HPN_FILE_LAYOUT_OK:
 		/* Success is silent at default verbosity (like the rest of the
 		 * auto-tuning); -v recovers it.  PERM/FAIL below stay loud. */
-		debug("Lustre auto-stripe (experimental): \"%s\" -> %s "
+		debug("Lustre auto-stripe: \"%s\" -> %s "
 		    "(stripe_count %u)", dst,
 		    layout_kind ? "tiered composite" : "plain stripe", applied);
 		break;
@@ -182,13 +182,13 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 		sftp_conn_set_layout_set_declined(conn, 1);
 		break;
 	case HPN_FILE_LAYOUT_PERM:
-		logit("Lustre auto-stripe (experimental): \"%s\": permission "
+		logit("Lustre auto-stripe: \"%s\": permission "
 		    "denied; layout will not be set for the rest of this "
 		    "transfer.  Disable with HPNLustreStripeCount=0.", dst);
 		sftp_conn_set_layout_set_declined(conn, 1);
 		break;
 	default:
-		logit("Lustre auto-stripe (experimental): \"%s\": layout set "
+		logit("Lustre auto-stripe: \"%s\": layout set "
 		    "failed (status %d); layout will not be set for the rest "
 		    "of this transfer.", dst, rc);
 		sftp_conn_set_layout_set_declined(conn, 1);
