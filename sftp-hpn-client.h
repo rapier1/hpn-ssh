@@ -220,8 +220,8 @@ struct sftp_hpn_conn {
 /*
  * HPNVerifyTransfer (1b) inline source-hash accumulator (sftp-hpn-verify.c).
  * arm:     begin a streaming XXH3 over the source bytes.
- * feed:    add bytes - call BEFORE any fault injection so the hash reflects
- *          the true on-disk source, not what is sent.
+ * feed:    add bytes as the source is read so the hash reflects the
+ *          on-disk source.
  * finish:  digest + mark valid; frees the streaming state.
  * dispose: abort with no result (partial/failed transfer); frees the state.
  * take:    consume the result iff it covers expect_bytes; 0 + *hash_out on
@@ -358,15 +358,6 @@ void     sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *);
  */
 void sftp_hpn_conn_die(struct sftp_hpn_conn *, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
-
-#ifdef HPN_FAULT_INJECTION
-/*
- * Called by send_msg after each successful write.  Tracks bytes sent and
- * fires the fault injection trigger when the threshold is reached.
- * Returns 0 normally; returns -1 and sets hpn->dead when a fault fires.
- * The caller is responsible for closing the file descriptors.
- */
-#endif /* HPN_FAULT_INJECTION */
 
 
 

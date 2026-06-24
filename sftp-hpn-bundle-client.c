@@ -67,7 +67,6 @@
 #include "sftp-hpn-bundle.h"
 #include "sftp-hpn-bundle-client.h"
 #include "sftp-hpn-tar.h"
-#include "sftp-fault-inject.h"		/* SFTP_FAULT_CORRUPT (test only) */
 
 /* ── BEGIN Phase 5: hpn-bundle-fetch download ─────────────────────────────
  *
@@ -197,8 +196,8 @@ struct bundle_dl_stream {
 	const char *cur_local;	/* local_path for current entry (entries[]
 				 * owns the storage; we just point at it) */
 	time_t   cur_mtime;	/* used by entry_end_cb */
-	uint64_t cur_written;	/* bytes written for the current entry (the
-				 * within-file offset; FAULT-INJ uses it) */
+	uint64_t cur_written;	/* bytes written for the current entry; used to
+				 * ftruncate the file to its real size */
 
 	/* (D) Most-recently-mkdir_p'd parent dir - skip repeats. */
 	char    *last_mkdir_dir;
@@ -344,13 +343,6 @@ bundle_dl_data_cb(void *ctx, const u_char *data, size_t len)
 	if (s->cur_fd < 0)
 		return -1;
 
-	/*
-	 * FAULT-INJ: flip one byte of this file's extracted data at its
-	 * within-file offset before it is written.  The server's source hash
-	 * (teed during pack) holds, so the written target diverges and the
-	 * download bundle read-back catches it.  No-op in normal builds.
-	 */
-	fault_inj_corrupt((off_t)s->cur_written, (u_char *)data, len);
 	s->cur_written += (uint64_t)len;
 
 	remaining = len;
@@ -1206,10 +1198,6 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		}
 		if (produced == 0)
 			break;	/* EOA reached - all bytes sent */
-		/* FAULT-INJ: corrupt one byte of the outgoing tar stream at
-		 * this stream offset so the written target diverges from the
-		 * source - exercises the post-transfer verify phase. */
-		fault_inj_corrupt((off_t)bytes_total, outbuf, (size_t)produced);
 		bytes_total += (uint64_t)produced;
 		if (bundle_ul_send_write(&ctx, outbuf, (size_t)produced) != 0)
 			goto cleanup;

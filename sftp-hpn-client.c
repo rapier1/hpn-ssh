@@ -45,7 +45,6 @@
 #include "sftp-hpn-server.h"	/* hpn-file-layout wire format + status codes */
 #include "sftp-hpn-client.h"
 #include "sftp-hpn-bundle.h"	/* HPN_EXT_HASH_RANGE etc. wire names */
-#include "sftp-fault-inject.h"	/* FAULT-INJ: test scaffolding */
 
 struct sftp_hpn_conn *
 sftp_hpn_conn_init(void)
@@ -126,8 +125,8 @@ sftp_hpn_conn_die(struct sftp_hpn_conn *hpn, const char *fmt, ...)
 
 /*
  * Internal helper called by sftp_set_live_counter() in sftp-client.c.
- * Registers the parallel orchestrator's live-bytes counter and arms the
- * fault injection threshold if SFTP_FAULT_INJECT is set (TEST/DEBUG).
+ * Registers the parallel orchestrator's live-bytes counter for this
+ * connection.
  */
 void
 sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
@@ -135,10 +134,6 @@ sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
 	if (hpn == NULL)
 		return;
 	hpn->live_counter = counter;
-
-	/* FAULT-INJ: test-scaffolding hook; no-op unless built with
-	 * -DHPN_FAULT_INJECTION.  See sftp-fault-inject.c. */
-	fault_inj_arm_conn(hpn);
 }
 
 /*

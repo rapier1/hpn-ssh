@@ -53,22 +53,35 @@ static struct {
 } fault_inj_pv_state = { 0, 0, PTHREAD_ONCE_INIT };
 
 /*
- * Corruption state for SFTP_FAULT_CORRUPT=<offset>[:persist|:vary].
- * mode 0 (no suffix): flip one sent byte, once (the original behaviour).
+ * Corruption state for SFTP_FAULT_CORRUPT=<off1>[,<off2>...][:persist|:vary|:multi[:N]].
+ * mode 0 (no suffix, single offset): flip one sent byte, once (original).
  * mode 1 (:persist):  re-flip to the SAME value on EVERY write covering the
  *                     offset (incl. repair re-transfers) -> the dest hash
- *                     repeats -> exercises the repair CONVERGENCE path.
+ *                     repeats -> exercises the repair CONVERGENCE give-up.
  * mode 2 (:vary):     re-flip to a DIFFERENT value each write -> the dest hash
  *                     changes every attempt -> exercises the repair attempt-CAP.
+ * mode 3 (:multi[:N], or a bare comma-separated offset list): flip each listed
+ *                     offset while a global SLOT remains (default N = number of
+ *                     offsets).  No per-write re-flip; slots are consumed by the
+ *                     initial transmission of each covered offset.  Because
+ *                     verify+repair is a POST-TRANSFER phase, the slots are gone
+ *                     by the time the repair re-sends run, so every corruption
+ *                     converges -> exercises repair SUCCESS across multiple files
+ *                     (one offset, N = file count) AND multiple points in one
+ *                     file (N offsets, one file).
  */
+#define FAULT_CORRUPT_MAX_OFFSETS 16
 static struct {
-	uint64_t       offset;     /* absolute file offset to corrupt */
+	uint64_t       offset;     /* mode 0/1/2: single absolute file offset */
+	uint64_t       offsets[FAULT_CORRUPT_MAX_OFFSETS]; /* mode 3: offset list */
+	int            n_offsets;  /* mode 3: count of offsets parsed */
+	int            slots;      /* mode 3: corruptions left (atomic) */
 	int            armed;      /* env knob was set */
 	int            done;       /* mode 0: fired (atomic, single flip) */
-	int            mode;       /* 0=once, 1=persist-constant, 2=persist-vary */
+	int            mode;       /* 0=once, 1=persist, 2=vary, 3=multi */
 	uint64_t       seq;        /* mode 2: per-corruption counter (atomic) */
 	pthread_once_t once;
-} fault_inj_corrupt_state = { 0, 0, 0, 0, 0, PTHREAD_ONCE_INIT };
+} fault_inj_corrupt_state = { .once = PTHREAD_ONCE_INIT };
 
 static void
 fault_inj_state_init(void)
@@ -323,18 +336,38 @@ fault_inj_corrupt_state_init(void)
 {
 	const char *ev = getenv("SFTP_FAULT_CORRUPT");
 	char *ep = NULL;
+	int n = 0;
 
 	if (ev == NULL)
 		return;
-	fault_inj_corrupt_state.offset = strtoull(ev, &ep, 10);
-	fault_inj_corrupt_state.armed  = 1;
-	/* Optional mode suffix selecting a persistent (re-corrupting) variant
-	 * for exercising the auto-repair give-up paths; default = one-shot. */
+	fault_inj_corrupt_state.armed = 1;
+
+	/* Parse one or more comma-separated absolute file offsets. */
+	fault_inj_corrupt_state.offsets[n++] = strtoull(ev, &ep, 10);
+	while (ep != NULL && *ep == ',' && n < FAULT_CORRUPT_MAX_OFFSETS)
+		fault_inj_corrupt_state.offsets[n++] =
+		    strtoull(ep + 1, &ep, 10);
+	fault_inj_corrupt_state.n_offsets = n;
+	fault_inj_corrupt_state.offset = fault_inj_corrupt_state.offsets[0];
+
+	/* Optional mode suffix.  Default (single offset, no suffix) = one-shot.
+	 * :persist/:vary keep the single-offset give-up modes; :multi[:N] (or a
+	 * bare offset LIST with no suffix) selects the slot-capped multi mode
+	 * that lets the repair converge. */
 	if (ep != NULL && *ep == ':') {
 		if (strcmp(ep + 1, "persist") == 0)
 			fault_inj_corrupt_state.mode = 1;
 		else if (strcmp(ep + 1, "vary") == 0)
 			fault_inj_corrupt_state.mode = 2;
+		else if (strncmp(ep + 1, "multi", 5) == 0) {
+			fault_inj_corrupt_state.mode = 3;
+			ep += 1 + 5;	/* step past ":multi" */
+			fault_inj_corrupt_state.slots = (*ep == ':') ?
+			    (int)strtol(ep + 1, NULL, 10) : n;
+		}
+	} else if (n > 1) {
+		fault_inj_corrupt_state.mode = 3;
+		fault_inj_corrupt_state.slots = n;
 	}
 }
 
@@ -347,6 +380,41 @@ fault_inj_corrupt(off_t chunk_off, u_char *buf, size_t len)
 	    fault_inj_corrupt_state_init);
 	if (!fault_inj_corrupt_state.armed || buf == NULL || len == 0)
 		return;
+
+	/* Mode 3 (multi): flip each listed offset that falls in this write,
+	 * while a global slot remains.  Slots are consumed by the initial
+	 * transmission; since verify+repair runs as a post-transfer phase the
+	 * slots are exhausted before any repair re-send, so each corruption
+	 * converges (repair SUCCESS over multiple files and/or multiple points
+	 * in one file). */
+	if (fault_inj_corrupt_state.mode == 3) {
+		int i;
+
+		for (i = 0; i < fault_inj_corrupt_state.n_offsets; i++) {
+			uint64_t off = fault_inj_corrupt_state.offsets[i];
+			int prev;
+
+			if (off < (uint64_t)chunk_off ||
+			    off >= (uint64_t)chunk_off + (uint64_t)len)
+				continue;
+			prev = __atomic_fetch_sub(&fault_inj_corrupt_state.slots,
+			    1, __ATOMIC_SEQ_CST);
+			if (prev <= 0) {
+				/* Exhausted (this is the repair phase or past
+				 * the requested count): restore, leave clean. */
+				__atomic_fetch_add(
+				    &fault_inj_corrupt_state.slots, 1,
+				    __ATOMIC_SEQ_CST);
+				continue;
+			}
+			buf[off - (uint64_t)chunk_off] ^= 0xFFU;
+			error("sftp: fault injection: corrupted byte at file "
+			    "offset %llu (multi, %d slot(s) left)",
+			    (unsigned long long)off, prev - 1);
+		}
+		return;
+	}
+
 	target = fault_inj_corrupt_state.offset;
 	if (target < (uint64_t)chunk_off ||
 	    target >= (uint64_t)chunk_off + (uint64_t)len)

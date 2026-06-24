@@ -56,7 +56,6 @@
 #include "sftp-hpn-client.h" /* HPN */
 #include "sftp-hpn-server.h" /* hpn-check-file + heartbeat protocol constants */
 #include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
-#include "sftp-fault-inject.h"	/* FAULT-INJ: test scaffolding */
 
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -123,7 +122,7 @@ struct sftp_conn {
 	int fd_in;
 	int fd_out;
 	struct sftp_hpn_conn *hpn;  /* HPN: per-connection extensions (dead flag,
-				     * live counter, fault injection) */
+				     * live counter) */
 	u_int download_buflen;
 	u_int upload_buflen;
 	u_int num_requests;
@@ -247,11 +246,6 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 
 	sshbuf_reset(m);
 
-	/* FAULT-INJ: test-scaffolding hook; no-op unless built with
-	 * -DHPN_FAULT_INJECTION.  See sftp-fault-inject.c. */
-	if (fault_inj_check_send(conn->hpn, msg_len + sizeof(mlen)) != 0)
-		return -1;
-
 	return 0;
 }
 
@@ -321,12 +315,6 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 		return -1;
 	}
 	}
-
-	/* FAULT-INJ: test-scaffolding hook; no-op unless built with
-	 * -DHPN_FAULT_INJECTION.  Delaying here backpressures the local ssh
-	 * child's pipe and thus the SSH channel window - a manufactured
-	 * slow DOWNLOAD stream.  See sftp-fault-inject.c. */
-	fault_inj_check_recv(conn->hpn, msg_len + 4);
 
 	return 0;
 }
@@ -2146,11 +2134,6 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				    "%zu > %zu", len, req->len);
 			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
 			lmodified = 1;
-			/* FAULT-INJ: corrupt one received byte before it is
-			 * written to the local target; the server's source hash
-			 * holds and the written file diverges, so the download
-			 * read-back catches it. */
-			fault_inj_corrupt((off_t)req->offset, data, len);
 			if ((lseek(local_fd, req->offset, SEEK_SET) == -1 ||
 			    atomicio(vwrite, local_fd, data, len) != len) &&
 			    !write_error) {
@@ -2561,14 +2544,9 @@ do_upload_body(struct sftp_conn *conn,
 			fatal("read local \"%s\": %s",
 			    local_path, strerror(errno));
 		} else if (len != 0) {
-			/* HPN 1b: hash the source bytes as read, BEFORE any
-			 * fault injection, so the inline source hash reflects
-			 * the true on-disk source rather than what is sent. */
+			/* HPN 1b: hash the source bytes as they are read so the
+			 * inline source hash reflects the on-disk source. */
 			sftp_hpn_src_feed(conn->hpn, data, (size_t)len);
-			/* FAULT-INJ: corrupt one byte of the data we are about to
-			 * send; the on-disk source stays clean, so a verified
-			 * transfer's source hash holds and the target diverges. */
-			fault_inj_corrupt(offset, data, (size_t)len);
 			ack = request_enqueue(&acks, ++id, len, offset);
 			sshbuf_reset(msg);
 			if ((r = sshbuf_put_u8(msg, SSH2_FXP_WRITE)) != 0 ||
@@ -3348,18 +3326,10 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 				break;
 			}
 
-			/* Tee the clean source bytes before the fault-injection
-			 * hook below corrupts what we send, so the verify hash
-			 * reflects the source, not the deliberately bad write. */
+			/* Tee the clean source bytes so the verify hash
+			 * reflects the source as read. */
 			if (teed)
 				sftp_hpn_src_feed(conn->hpn, data, (size_t)len);
-
-			/* FAULT-INJ: corrupt one byte of this range's outgoing
-			 * data (range-split mirror of the do_upload_body hook);
-			 * the on-disk source stays clean, so a verified
-			 * transfer's source hash holds and the written range
-			 * diverges - exercises the range-split finalize verify. */
-			fault_inj_corrupt(offset, data, (size_t)len);
 
 			ack = xcalloc(1, sizeof(*ack));
 			ack->id     = ++id;
@@ -3688,10 +3658,6 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				fatal("received more data than requested "
 				    "%zu > %zu", len, req->len);
 			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
-			/* FAULT-INJ: corrupt one received byte before the local
-			 * write; the server source hash holds and the written
-			 * range diverges, caught by the download read-back. */
-			fault_inj_corrupt((off_t)req->offset, data, len);
 			if ((lseek(local_fd, (off_t)req->offset,
 			    SEEK_SET) == -1 ||
 			    atomicio(vwrite, local_fd, data, len) != len) &&

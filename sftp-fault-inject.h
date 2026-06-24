@@ -28,16 +28,22 @@
  *       view this is indistinguishable from a slow server, with no
  *       server-side scaffolding needed.  At most <max_conns>
  *       connections throttle (default 1).  Never kills.
- *   ENV-VAR SFTP_FAULT_CORRUPT=<offset>[:persist|:vary]
- *       flips one byte at absolute file <offset> in the data SENT.  The on-disk
+ *   ENV-VAR SFTP_FAULT_CORRUPT=<off1>[,<off2>...][:persist|:vary|:multi[:N]]
+ *       flips byte(s) at absolute file offset(s) in the data SENT.  The on-disk
  *       source is left clean, so a verified transfer's source hash stays good
  *       and the target hash diverges - a manufactured transfer/write corruption
  *       for exercising the integrity verify (HPNVerifyTransfer) and auto-repair.
- *       No suffix: flip once, then disarm (the verify-detection / repair-success
- *       case - a repair re-transfer is clean).  :persist: re-flip to the SAME
- *       value on every write covering the offset (repair re-corrupts identically
- *       -> drives the repair CONVERGENCE give-up).  :vary: re-flip to a different
- *       value each write (-> drives the repair attempt-CAP give-up).
+ *       Single offset, no suffix: flip once, then disarm (verify-detection /
+ *       single-file repair-success - a repair re-transfer is clean).  :persist:
+ *       re-flip to the SAME value on every write covering the offset (repair
+ *       re-corrupts identically -> repair CONVERGENCE give-up).  :vary: re-flip
+ *       to a different value each write (-> repair attempt-CAP give-up).
+ *       :multi[:N] (or a bare comma-separated offset LIST): flip each listed
+ *       offset while a global slot remains (default N = offset count).  Slots
+ *       are consumed by the initial send; verify+repair is a post-transfer
+ *       phase, so the repair re-sends find the slots gone and converge - this is
+ *       the MULTIPLE-corruptions-repair-SUCCESS case (N files at one offset:
+ *       <off>:multi:<filecount>; one file at N points: <off1>,<off2>,...).
  */
 
 #ifndef SFTP_FAULT_INJECT_H
