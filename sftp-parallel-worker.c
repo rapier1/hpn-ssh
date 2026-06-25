@@ -762,7 +762,7 @@ worker_run_bundle(struct sftp_worker *w,
 	 * Slight wire-size cost (full path repeated in every tar header)
 	 * but trivial compared to the small-file payloads. */
 	int bundle_rc = sftp_hpn_bundle_upload(w->conn, "", entries, bn,
-	    p->cfg.preserve_flag, p->cfg.fsync_flag);
+	    p->cfg.preserve_flag, p->cfg.fsync_flag, p->cfg.bundle_size);
 
 	t_end_ns = monotime_ns();
 	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;

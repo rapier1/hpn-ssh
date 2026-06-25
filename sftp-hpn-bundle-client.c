@@ -1074,7 +1074,7 @@ int
 sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n,
-    int preserve_flag, int fsync_flag)
+    int preserve_flag, int fsync_flag, uint64_t bundle_size)
 {
 	struct sshbuf *msg = NULL;
 	u_char *handle = NULL;
@@ -1127,7 +1127,8 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	    (r = sshbuf_put_u32(msg, open_id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, "hpn-bundle-open@hpnssh.org")) != 0 ||
 	    (r = sshbuf_put_cstring(msg, remote_dest_dir)) != 0 ||
-	    (r = sshbuf_put_u32(msg, flags)) != 0)
+	    (r = sshbuf_put_u32(msg, flags)) != 0 ||
+	    (r = sshbuf_put_u64(msg, bundle_size)) != 0)
 		fatal_fr(r, "compose hpn-bundle-open");
 	send_msg(conn, msg);
 	sshbuf_reset(msg);

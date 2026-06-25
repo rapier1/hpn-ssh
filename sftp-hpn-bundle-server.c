@@ -243,7 +243,8 @@ struct bundle_write_job {
 struct bundle_write_pool {
 	pthread_t      *threads;
 	int             n_threads;
-	int             max_depth;	/* backpressure: queued-job cap */
+	int             max_depth;	/* backpressure: queued-job count cap */
+	uint64_t        max_bytes;	/* backpressure: buffered-byte budget */
 	pthread_mutex_t mu;
 	pthread_cond_t  not_empty;
 	pthread_cond_t  not_full;
@@ -304,6 +305,34 @@ bundle_writer_queue_depth(int n_threads)
 	}
 	cached = (int)n;
 	return cached;
+}
+
+/* HPN_BUNDLE_WRITER_BUDGET: the pool's buffered-byte budget (backpressure).
+ * Resolution: explicit env override, else the client's bundle_size from the
+ * bundle-open message, else the compile-time default.  Clamped to the
+ * bundle-size range.  This bounds the pool's RAM regardless of the file-size
+ * mix, and sets how many of the biggest eligible files fit in flight (the
+ * concurrency floor).  Never required for normal operation. */
+static uint64_t
+bundle_writer_budget(uint64_t open_bundle_size)
+{
+	const char *ev = getenv("HPN_BUNDLE_WRITER_BUDGET");
+	uint64_t    b;
+
+	if (ev != NULL && *ev != '\0') {
+		const char *errstr = NULL;
+		long long   ll = strtonum(ev, HPN_BUNDLE_SIZE_MIN,
+		    HPN_BUNDLE_SIZE_MAX, &errstr);
+		if (errstr == NULL)
+			return (uint64_t)ll;
+		/* garbage env -> fall through to the bundle_size default */
+	}
+	b = open_bundle_size > 0 ? open_bundle_size : HPN_BUNDLE_SIZE_DEFAULT;
+	if (b < HPN_BUNDLE_SIZE_MIN)
+		b = HPN_BUNDLE_SIZE_MIN;
+	if (b > HPN_BUNDLE_SIZE_MAX)
+		b = HPN_BUNDLE_SIZE_MAX;
+	return b;
 }
 
 /* Write one complete file (open/write/perms/truncate/fsync/close).  Mirrors the
@@ -400,6 +429,7 @@ bundle_write_pool_thread(void *arg)
 		free(job);
 		pthread_mutex_lock(&pool->mu);
 		pool->cur_bytes -= jlen;	/* buffer released */
+		pthread_cond_signal(&pool->not_full); /* wake byte-blocked producer */
 		pthread_mutex_unlock(&pool->mu);
 	}
 	return NULL;
@@ -411,7 +441,12 @@ static int
 bundle_pool_enqueue(struct bundle_write_pool *pool, struct bundle_write_job *job)
 {
 	pthread_mutex_lock(&pool->mu);
-	while (pool->depth >= pool->max_depth && !pool->error)
+	/* Backpressure: block while admitting this file would exceed the byte
+	 * budget (the cur_bytes > 0 guard admits a lone file bigger than the
+	 * whole budget so it can't deadlock), OR the count backstop is hit. */
+	while (((pool->cur_bytes > 0 &&
+	    pool->cur_bytes + (uint64_t)job->len > pool->max_bytes) ||
+	    pool->depth >= pool->max_depth) && !pool->error)
 		pthread_cond_wait(&pool->not_full, &pool->mu);
 	if (pool->error) {
 		pthread_mutex_unlock(&pool->mu);
@@ -433,7 +468,8 @@ bundle_pool_enqueue(struct bundle_write_pool *pool, struct bundle_write_job *job
 }
 
 static struct bundle_write_pool *
-bundle_write_pool_new(int n_threads, int preserve, int do_fsync)
+bundle_write_pool_new(int n_threads, int preserve, int do_fsync,
+    uint64_t budget)
 {
 	struct bundle_write_pool *pool;
 	int i;
@@ -443,6 +479,7 @@ bundle_write_pool_new(int n_threads, int preserve, int do_fsync)
 		return NULL;
 	pool->n_threads = n_threads;
 	pool->max_depth = bundle_writer_queue_depth(n_threads);
+	pool->max_bytes = budget;
 	pool->preserve  = preserve;
 	pool->do_fsync  = do_fsync;
 	pthread_mutex_init(&pool->mu, NULL);
@@ -533,7 +570,7 @@ bundle_write_pool_finish(struct bundle_write_pool *pool)
 }
 
 static struct hpn_bundle_state *
-bundle_state_new(const char *dest_dir, uint32_t flags)
+bundle_state_new(const char *dest_dir, uint32_t flags, uint64_t bundle_size)
 {
 	struct hpn_bundle_state *s = calloc(1, sizeof(*s));
 	if (s == NULL)
@@ -553,12 +590,14 @@ bundle_state_new(const char *dest_dir, uint32_t flags)
 		return NULL;
 	}
 	if (bundle_writer_threads() > 1) {
+		uint64_t budget = bundle_writer_budget(bundle_size);
 		s->pool = bundle_write_pool_new(bundle_writer_threads(),
 		    (flags & HPN_BUNDLE_FLAG_PRESERVE) != 0,
-		    (flags & HPN_BUNDLE_FLAG_FSYNC) != 0);
+		    (flags & HPN_BUNDLE_FLAG_FSYNC) != 0, budget);
 		if (s->pool != NULL)
-			debug_f("hpn-bundle: writer pool active (%d threads)",
-			    bundle_writer_threads());
+			debug_f("hpn-bundle: writer pool active (%d threads, "
+			    "%llu-byte budget)", bundle_writer_threads(),
+			    (unsigned long long)budget);
 		/* NULL = pool spawn failed; fall back to serial, harmless. */
 	}
 	return s;
@@ -1042,6 +1081,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
 	char *dest_dir = NULL;
 	uint32_t flags = 0;
+	uint64_t bundle_size = 0;
 	struct sshbuf *msg = NULL;
 	struct hpn_bundle_state *s = NULL;
 	int handle = -1;
@@ -1058,12 +1098,13 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	}
 
 	if ((r = sshbuf_get_cstring(iqueue, &dest_dir, NULL)) != 0 ||
-	    (r = sshbuf_get_u32(iqueue, &flags)) != 0) {
+	    (r = sshbuf_get_u32(iqueue, &flags)) != 0 ||
+	    (r = sshbuf_get_u64(iqueue, &bundle_size)) != 0) {
 		error_f("parse hpn-bundle-open: %s", ssh_err(r));
 		goto fail;
 	}
-	debug3("request %u: hpn-bundle-open dest=\"%s\" flags=0x%x",
-	    id, dest_dir, flags);
+	debug3("request %u: hpn-bundle-open dest=\"%s\" flags=0x%x bundle=%llu",
+	    id, dest_dir, flags, (unsigned long long)bundle_size);
 
 	/* Make sure the destination directory exists (mkdir -p semantics).
 	 * Don't fail if it already exists.  Empty dest_dir means the client
@@ -1080,7 +1121,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 
-	s = bundle_state_new(dest_dir, flags);
+	s = bundle_state_new(dest_dir, flags, bundle_size);
 	if (s == NULL) {
 		status = SSH2_FX_FAILURE;
 		goto fail;
