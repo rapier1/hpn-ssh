@@ -253,6 +253,8 @@ struct bundle_write_pool {
 	int             error;		/* a writer thread hit an error */
 	int             preserve;
 	int             do_fsync;
+	uint64_t        cur_bytes;	/* held buffer bytes (queued + in-write) */
+	uint64_t        peak_bytes;	/* high-water of cur_bytes (dev metric) */
 };
 
 /* HPN_BUNDLE_WRITER_THREADS: parallel writer threads in the bundle extract.
@@ -272,6 +274,34 @@ bundle_writer_threads(void)
 		n = 1;
 	if (n > 32)
 		n = 32;
+	cached = (int)n;
+	return cached;
+}
+
+/* HPN_BUNDLE_WRITER_QUEUE_DEPTH: backpressure cap on queued jobs, decoupled
+ * from the thread count.  Unset = the default max(threads*4, 16).  Set = that
+ * value clamped to [1, 4096], so the queue depth (the memory the pool holds)
+ * can be tuned independently of the thread count (the write concurrency).
+ * Dev/exploration knob; never required for normal operation. */
+static int
+bundle_writer_queue_depth(int n_threads)
+{
+	static int  cached = -1;
+	const char *ev;
+	long        n;
+
+	if (cached >= 0)
+		return cached;
+	ev = getenv("HPN_BUNDLE_WRITER_QUEUE_DEPTH");
+	if (ev != NULL && *ev != '\0') {
+		n = strtol(ev, NULL, 10);
+		if (n < 1)
+			n = 1;
+		if (n > 4096)
+			n = 4096;
+	} else {
+		n = n_threads * 4 < 16 ? 16 : n_threads * 4;
+	}
 	cached = (int)n;
 	return cached;
 }
@@ -342,6 +372,7 @@ bundle_write_pool_thread(void *arg)
 
 	for (;;) {
 		struct bundle_write_job *job;
+		uint64_t                 jlen;
 
 		pthread_mutex_lock(&pool->mu);
 		while (pool->head == NULL && !pool->shutdown)
@@ -358,6 +389,7 @@ bundle_write_pool_thread(void *arg)
 		pthread_cond_signal(&pool->not_full);
 		pthread_mutex_unlock(&pool->mu);
 
+		jlen = (uint64_t)job->len;
 		if (bundle_write_one(pool, job) != 0) {
 			pthread_mutex_lock(&pool->mu);
 			pool->error = 1;
@@ -366,6 +398,9 @@ bundle_write_pool_thread(void *arg)
 		free(job->full_path);
 		free(job->data);
 		free(job);
+		pthread_mutex_lock(&pool->mu);
+		pool->cur_bytes -= jlen;	/* buffer released */
+		pthread_mutex_unlock(&pool->mu);
 	}
 	return NULL;
 }
@@ -389,6 +424,9 @@ bundle_pool_enqueue(struct bundle_write_pool *pool, struct bundle_write_job *job
 		pool->head = job;
 	pool->tail = job;
 	pool->depth++;
+	pool->cur_bytes += (uint64_t)job->len;
+	if (pool->cur_bytes > pool->peak_bytes)
+		pool->peak_bytes = pool->cur_bytes;
 	pthread_cond_signal(&pool->not_empty);
 	pthread_mutex_unlock(&pool->mu);
 	return 0;
@@ -404,7 +442,7 @@ bundle_write_pool_new(int n_threads, int preserve, int do_fsync)
 	if (pool == NULL)
 		return NULL;
 	pool->n_threads = n_threads;
-	pool->max_depth = n_threads * 4 < 16 ? 16 : n_threads * 4;
+	pool->max_depth = bundle_writer_queue_depth(n_threads);
 	pool->preserve  = preserve;
 	pool->do_fsync  = do_fsync;
 	pthread_mutex_init(&pool->mu, NULL);
@@ -436,6 +474,32 @@ bundle_write_pool_new(int n_threads, int preserve, int do_fsync)
 	return NULL;
 }
 
+/* HPN_BUNDLE_STATS_FILE: dev/exploration only.  When set, append one line per
+ * pool - "threads=N depth=D peak_bytes=B" - so a harness can read the pool's
+ * peak buffered memory without parsing server logs or debug output.  Off by
+ * default; never part of normal operation. */
+static void
+bundle_pool_emit_stats(const struct bundle_write_pool *pool)
+{
+	const char *path = getenv("HPN_BUNDLE_STATS_FILE");
+	char        line[128];
+	int         fd, n;
+
+	if (path == NULL || *path == '\0')
+		return;
+	n = snprintf(line, sizeof(line),
+	    "threads=%d depth=%d peak_bytes=%llu\n",
+	    pool->n_threads, pool->max_depth,
+	    (unsigned long long)pool->peak_bytes);
+	if (n <= 0 || (size_t)n >= sizeof(line))
+		return;
+	fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0644);
+	if (fd < 0)
+		return;
+	(void)write(fd, line, (size_t)n);
+	(void)close(fd);
+}
+
 /* Shut down, join all threads, free any leftover jobs, then destroy + free the
  * pool.  Returns the error flag (nonzero = some file failed). */
 static int
@@ -459,6 +523,7 @@ bundle_write_pool_finish(struct bundle_write_pool *pool)
 		free(job);
 	}
 	err = pool->error;
+	bundle_pool_emit_stats(pool);
 	pthread_mutex_destroy(&pool->mu);
 	pthread_cond_destroy(&pool->not_empty);
 	pthread_cond_destroy(&pool->not_full);
