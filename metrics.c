@@ -343,6 +343,49 @@ metrics_write_binn_object(struct tcp_info *data, socklen_t tilen,
 				      data->tcpi_fastopen_client_fail);
 	}
 #endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0)
+	if (TCPI_FIELD_IN(tilen, tcpi_rehash)) {
+		binn_object_set_uint32(binnobj, "tcpi_rcv_wnd",
+				       data->tcpi_rcv_wnd);
+		binn_object_set_uint32(binnobj, "tcpi_rehash",
+				       data->tcpi_rehash);
+	}
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,7,0)
+	if (TCPI_FIELD_IN(tilen, tcpi_total_rto_time)) {
+		binn_object_set_uint16(binnobj, "tcpi_total_rto",
+				       data->tcpi_total_rto);
+		binn_object_set_uint16(binnobj, "tcpi_total_rto_recoveries",
+				       data->tcpi_total_rto_recoveries);
+		binn_object_set_uint32(binnobj, "tcpi_total_rto_time",
+				       data->tcpi_total_rto_time);
+	}
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	if (TCPI_FIELD_IN(tilen, tcpi_accecn_opt_seen)) {
+		binn_object_set_uint32(binnobj, "tcpi_received_ce",
+				       data->tcpi_received_ce);
+		binn_object_set_uint32(binnobj, "tcpi_delivered_e1_bytes",
+				       data->tcpi_delivered_e1_bytes);
+		binn_object_set_uint32(binnobj, "tcpi_delivered_e0_bytes",
+				       data->tcpi_delivered_e0_bytes);
+		binn_object_set_uint32(binnobj, "tcpi_delivered_ce_bytes",
+				       data->tcpi_delivered_ce_bytes);
+		binn_object_set_uint32(binnobj, "tcpi_received_e1_bytes",
+				       data->tcpi_received_e1_bytes);
+		binn_object_set_uint32(binnobj, "tcpi_received_e0_bytes",
+				       data->tcpi_received_e0_bytes);
+		binn_object_set_uint32(binnobj, "tcpi_received_ce_bytes",
+				       data->tcpi_received_ce_bytes);
+		binn_object_set_uint16(binnobj, "tcpi_accecn_fail_mode",
+				       data->tcpi_accecn_fail_mode);
+		binn_object_set_uint16(binnobj, "tcpi_accecn_opt_seen",
+				       data->tcpi_accecn_opt_seen);
+	}
+#endif
 #endif /*endif for #ifdef __linux__ */
 #endif /*endif for TCP_INFO */
 }
@@ -353,7 +396,7 @@ metrics_write_binn_object(struct tcp_info *data, socklen_t tilen,
 void
 metrics_read_binn_object (void *binnobj, char *output) {
 	int len = 0;
-	int buflen = 1023;
+	int buflen = 2047;	/* paired with the metricsstring malloc in the caller */
 	if (binnobj == NULL) {
 		fprintf(stderr, "Metric polling returned bad data.\n");
 		return;
@@ -475,6 +518,36 @@ metrics_read_binn_object (void *binnobj, char *output) {
 				binn_object_uint8(binnobj, "tcpi_fastopen_client_fail")
 			);
 	}
+
+	if (metrics_has(binnobj, "tcpi_rcv_wnd")) {
+		len += snprintf(output+len, (buflen-len), ", %d, %d",
+				binn_object_uint32(binnobj, "tcpi_rcv_wnd"),
+				binn_object_uint32(binnobj, "tcpi_rehash")
+			);
+	}
+
+	if (metrics_has(binnobj, "tcpi_total_rto")) {
+		len += snprintf(output+len, (buflen-len), ", %d, %d, %d",
+				binn_object_uint16(binnobj, "tcpi_total_rto"),
+				binn_object_uint16(binnobj, "tcpi_total_rto_recoveries"),
+				binn_object_uint32(binnobj, "tcpi_total_rto_time")
+			);
+	}
+
+	if (metrics_has(binnobj, "tcpi_received_ce")) {
+		len += snprintf(output+len, (buflen-len),
+				", %d, %d, %d, %d, %d, %d, %d, %d, %d",
+				binn_object_uint32(binnobj, "tcpi_received_ce"),
+				binn_object_uint32(binnobj, "tcpi_delivered_e1_bytes"),
+				binn_object_uint32(binnobj, "tcpi_delivered_e0_bytes"),
+				binn_object_uint32(binnobj, "tcpi_delivered_ce_bytes"),
+				binn_object_uint32(binnobj, "tcpi_received_e1_bytes"),
+				binn_object_uint32(binnobj, "tcpi_received_e0_bytes"),
+				binn_object_uint32(binnobj, "tcpi_received_ce_bytes"),
+				binn_object_uint16(binnobj, "tcpi_accecn_fail_mode"),
+				binn_object_uint16(binnobj, "tcpi_accecn_opt_seen")
+			);
+	}
 }
 
 /* Print out the header to the file so that the column header matches the
@@ -521,5 +594,13 @@ metrics_print_header(FILE *fptr, char *extra_text, void *binnobj) {
 		fprintf(fptr, ", snd_wnd, rcv_ooopack");
 	if (metrics_has(binnobj, "tcpi_fastopen_client_fail"))
 		fprintf(fptr, ", fastopen_client_fail");
+	if (metrics_has(binnobj, "tcpi_rcv_wnd"))
+		fprintf(fptr, ", rcv_wnd, rehash");
+	if (metrics_has(binnobj, "tcpi_total_rto"))
+		fprintf(fptr, ", total_rto, total_rto_recoveries, total_rto_time");
+	if (metrics_has(binnobj, "tcpi_received_ce"))
+		fprintf(fptr, ", received_ce, delivered_e1_bytes, delivered_e0_bytes, "
+			"delivered_ce_bytes, received_e1_bytes, received_e0_bytes, "
+			"received_ce_bytes, accecn_fail_mode, accecn_opt_seen");
 	fprintf(fptr, "\n\n");
 }

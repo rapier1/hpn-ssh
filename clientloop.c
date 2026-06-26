@@ -2932,8 +2932,8 @@ client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *
 	info = localtime(&now);
 	strftime(timestamp, 40, "%d-%m-%Y %H:%M:%S", info);
 
-	/* malloc the string 1KB should be large enough */
-	metricsstring = malloc(1024);
+	/* malloc the string; paired with buflen in metrics_read_binn_object */
+	metricsstring = malloc(2048);
 
 	/* get the local socket information */
 	int sock_in = ssh_packet_get_connection_in(ssh);
