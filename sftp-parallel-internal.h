@@ -220,25 +220,6 @@ struct sftp_parallel;
 #define ENDGAME_STUCK_SEC            15
 
 /*
- * Endgame range split.  When the worker that pops the LAST queued unit
- * (walker done, queue empty after the pop) is holding a large byte-range,
- * it splits that range into N pieces so idle workers help drain it instead
- * of one worker grinding the final range solo (the measured ~12% fixed
- * tail).  One-shot per transfer; N defaults to the file's writer cap (-w)
- * so exactly one wave of writers fits under the per-inode gate.  This is
- * FS-agnostic scheduler logic: pieces keep the generic 1 MiB alignment,
- * stripe knowledge stays in the submit path / FS modules.
- */
-#define ENDGAME_SPLIT_MIN_LEN	(256 * 1024 * 1024) /* split only above this */
-#define ENDGAME_SPLIT_MIN_PIECE	 (64 * 1024 * 1024) /* clamp N: pieces >= this */
-#define ENDGAME_SPLIT_ALIGN	      (1024 * 1024) /* piece alignment */
-/* Default per-piece launch gap for the endgame split, in milliseconds.
- * ENV-VAR HPN_ENDGAME_SPLIT_STAGGER_MS overrides; 0 = legacy simultaneous
- * launch (the synchronized burst that inflated path RTT ~2.5x and induced
- * cwnd-collapse wedges). */
-#define ENDGAME_SPLIT_STAGGER_MS	25
-
-/*
  * Number of watchdog ticks (~1 s each) to wait before a worker becomes
  * eligible for throughput-outlier classification.  During this window the
  * worker's EMA is still warming up from its cold-start seed, so any
@@ -1188,10 +1169,6 @@ struct sftp_parallel {
 	int                         peer_stall_terminations; /* ditto, PEER_STALL */
 	int                         endgame_straggler_reaps; /* endgame stuck-
 							 * straggler reaps (orchestrator-doomed) */
-	int                         endgame_split_fired; /* one-shot gate for the
-							 * endgame range split;
-							 * set only when a split
-							 * actually happens */
 	/* Tail trend detector state (phase B, reporter thread only - no
 	 * locking).  rate_ring holds per-tick aggregate-rate samples
 	 * (bytes/sec); the detector compares oldest- vs newest-quarter

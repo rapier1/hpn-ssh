@@ -949,164 +949,6 @@ worker_execute_single(struct sftp_worker *w, struct sftp_work_unit *u)
 }
 
 /*
- * Endgame range split: called by a worker holding a just-popped unit u when
- * that pop may have emptied the queue.  If the walker is done, the queue is
- * empty, and u is a large byte-range - i.e. u is the transfer's last
- * un-started unit - shrink u in place to its first piece and submit the
- * remaining pieces as sibling range units (same tracker) so idle workers
- * drain the tail in parallel instead of this worker grinding the whole
- * range solo.  One-shot per transfer (the gate is set only when a split
- * actually fires, so a final whole-file or bundle unit does not burn it).
- *
- * Tracker accounting: each piece owes exactly one finalize, so total and
- * remaining grow by the added piece count under the tracker mutex BEFORE
- * any piece is visible to other workers.  remaining >= 1 holds throughout
- * (u itself is still un-finalized), so last-completer cleanup cannot race
- * the split.  On a submit failure the unsent pieces are finalized-as-failed,
- * the same synthesis submit_upload_ranges uses; the file then surfaces as
- * INCOMPLETE/resumable.
- *
- * Accounting context: the caller has already subtracted u's full original
- * size from queued_bytes (dispatch path), so submitting pieces 1..n-1 via
- * parallel_unit_submit() re-adds exactly the bytes that are genuinely queued again, and
- * pending grows by one per piece - both consistent.
- *
- * ENV-VAR HPN_ENDGAME_SPLIT_N - developer-only: override the piece count
- * for tail-length sweeps; unset/0 = the file's writer cap (-w), which fits
- * exactly one wave of writers under the per-inode gate.
- */
-static void
-maybe_endgame_split(struct sftp_parallel *p, struct sftp_worker *w,
-    struct sftp_work_unit *u)
-{
-	struct sftp_range_tracker *t = u->range_tracker;
-	off_t piece, end;
-	int n, i;
-	int stagger_ms;
-
-	/*
-	 * Default OFF pending re-evaluation (2026-06-11).  The split's
-	 * measured record: throughput benefit inside noise on large files
-	 * (06-10 campaign), actively harmful on files with fewer ranges
-	 * than workers (5x10GB campaigns: synchronized piece launches
-	 * inflated path RTT 101->312ms; 17s transfers became 40-88s), and
-	 * its rescue scenario - a wedged worker holding the tail - is
-	 * already covered by the watchdog's straggler reap + requeue.
-	 * ENV-VAR HPN_ENDGAME_SPLIT - developer-only: set to 1 to enable
-	 * for clean-window evaluation.
-	 */
-	{
-		const char *en = getenv("HPN_ENDGAME_SPLIT");
-
-		if (en == NULL || *en != '1')
-			return;
-	}
-
-	if (__atomic_load_n(&p->endgame_split_fired, __ATOMIC_RELAXED))
-		return;
-	if (u->op != SFTP_OP_UPLOAD_RANGE && u->op != SFTP_OP_DOWNLOAD_RANGE)
-		return;
-	if (t == NULL || u->range_length < ENDGAME_SPLIT_MIN_LEN)
-		return;
-	if (__atomic_load_n(&p->walker_phase, __ATOMIC_RELAXED) !=
-	    SFTP_WKP_DONE)
-		return;
-	if (p->abort_flag || p->stopped || sftp_workqueue_depth(p->q) != 0)
-		return;
-
-	/*
-	 * No-tail gate: when the file has no more ranges than the per-inode
-	 * writer cap (total <= writer_cap), every range starts at once, the
-	 * queue drains instantly, and there is NO tail to drain.  Firing the
-	 * split here only re-injects a synchronized multi-connection writer
-	 * burst (measured inflating path RTT ~2.5x, 101->312ms) for no gain -
-	 * a net loss on such files.  (No separate maturity check needed: the
-	 * qdepth==0 gate above means every range is already dispatched, so on
-	 * a real tail some have completed by the time we reach here.)
-	 */
-	pthread_mutex_lock(&t->mu);
-	if (t->total <= t->writer_cap) {
-		pthread_mutex_unlock(&t->mu);
-		return;
-	}
-	pthread_mutex_unlock(&t->mu);
-
-	{
-		const char *e = getenv("HPN_ENDGAME_SPLIT_N");
-		n = (e && *e) ? atoi(e) : 0;
-	}
-	if (n <= 0)
-		n = t->writer_cap;
-	if ((off_t)n > u->range_length / ENDGAME_SPLIT_MIN_PIECE)
-		n = (int)(u->range_length / ENDGAME_SPLIT_MIN_PIECE);
-	if (n < 2)
-		return;
-
-	/* Aligned piece size; recompute the real piece count since the
-	 * alignment round-up can swallow the last fractional piece. */
-	piece = (u->range_length / n + ENDGAME_SPLIT_ALIGN - 1) /
-	    ENDGAME_SPLIT_ALIGN * ENDGAME_SPLIT_ALIGN;
-	end = u->range_offset + u->range_length;
-	n = (int)((u->range_length + piece - 1) / piece);
-	if (n < 2)
-		return;
-
-	__atomic_store_n(&p->endgame_split_fired, 1, __ATOMIC_RELAXED);
-
-	pthread_mutex_lock(&t->mu);
-	t->total     += n - 1;
-	t->remaining += n - 1;
-	pthread_mutex_unlock(&t->mu);
-
-	debug_f("endgame split: \"%s\" range %lld+%lld -> %d pieces of %lld",
-	    u->dst_path, (long long)u->range_offset,
-	    (long long)u->range_length, n, (long long)piece);
-	if (getenv("HPN_BUNDLE_TIMING") != NULL)
-		logit("HPN ENDGAME-SPLIT worker=%d len=%lld pieces=%d "
-		    "piece=%lld", w->id, (long long)u->range_length, n,
-		    (long long)piece);
-
-	{
-		const char *sv = getenv("HPN_ENDGAME_SPLIT_STAGGER_MS");
-
-		stagger_ms = (sv != NULL && *sv != '\0') ?
-		    atoi(sv) : ENDGAME_SPLIT_STAGGER_MS;
-	}
-
-	/* Shrink the held unit to piece 0; submit pieces 1..n-1.  De-sync the
-	 * launches: a fixed gap after each submit keeps the N connections from
-	 * ramping in lockstep into the shared path - the synchronized burst was
-	 * measured inflating RTT ~2.5x and tripping cwnd-collapse wedges.  The
-	 * gap after the LAST submit also spaces piece 0, which this worker runs
-	 * on return.  HPN_ENDGAME_SPLIT_STAGGER_MS=0 restores the old
-	 * simultaneous launch.  The submit loop holds no lock (tracker mu was
-	 * released above; parallel_unit_submit takes the workqueue lock only
-	 * internally), so the sleep does not stall the fleet. */
-	u->range_length = piece;
-	u->size         = piece;
-	for (i = 1; i < n; i++) {
-		off_t poff = u->range_offset + (off_t)i * piece;
-		off_t plen = end - poff < piece ? end - poff : piece;
-		struct sftp_work_unit *nu = parallel_unit_make_range(u->src_path,
-		    u->dst_path, poff, plen, t);
-		nu->op = u->op;	/* download pieces inherit DOWNLOAD_RANGE */
-		if (parallel_unit_submit(p, nu) != 0) {
-			error_f("endgame split: submit piece %d of \"%s\" "
-			    "failed", i, u->dst_path);
-			for (; i < n; i++)
-				(void)parallel_unit_tracker_finalize(t, 1, NULL);
-			return;
-		}
-		if (stagger_ms > 0) {
-			struct timespec ts;
-
-			ms_to_timespec(&ts, stagger_ms);
-			nanosleep(&ts, NULL);
-		}
-	}
-}
-
-/*
  * One-time worker setup: signal mask, env-var parsing for the bundle
  * and batch-pipeline kill switches, and per-worker bundle target.
  * Sampled once at startup; survives the worker's lifetime.  Factored
@@ -1418,14 +1260,6 @@ parallel_worker_thread(void *arg)
 			__atomic_fetch_sub(&p->queued_bytes,
 			    (uint64_t)u0->size, __ATOMIC_RELAXED);
 
-		/* Endgame range split: u0 may be the transfer's last
-		 * un-started unit (walker done + queue emptied by this pop).
-		 * All conditions are checked inside; no-op for non-range
-		 * units and after the one-shot gate fires.  Runs after the
-		 * full-size queued_bytes subtraction above so the pieces'
-		 * parallel_unit_submit() re-adds exactly the re-queued bytes. */
-		maybe_endgame_split(p, w, u0);
-
 		/*
 		 * Batch-open optimisation for uploads: accumulate up to
 		 * UPLOAD_BATCH_SIZE upload units using non-blocking trypop,
@@ -1628,11 +1462,6 @@ parallel_worker_thread(void *arg)
 			if (leftover != NULL) {
 				if (parallel_unit_writer_acquire(
 				    leftover->range_tracker)) {
-					/* Endgame range split: a range
-					 * leftover can also be the last
-					 * un-started unit (see the main
-					 * dispatch site). */
-					maybe_endgame_split(p, w, leftover);
 					worker_execute_single(w, leftover);
 				} else {
 					if (leftover->size > 0)
