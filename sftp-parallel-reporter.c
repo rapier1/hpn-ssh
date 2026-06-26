@@ -514,7 +514,7 @@ tail_quarter_median(const uint64_t *ring, int count, int idx, int newest)
 }
 
 /*
- * Phase C (HPN_TAIL_REDISTRIBUTE): a confirmed episode asks the slowest
+ * Phase C (HPNTailRedistribute): a confirmed episode asks the slowest
  * lagging holder to cooperatively yield its unstarted remainder for
  * redistribution.  One yield per episode latch; fires only when the
  * holder's own projected remaining tail is long enough to be worth the

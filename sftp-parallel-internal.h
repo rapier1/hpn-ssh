@@ -1079,7 +1079,7 @@ struct sftp_worker {
 	uint64_t           rate_prev_ns;
 	/* Cooperative yield request (phase C tail redistribution).  Set to 1
 	 * by the reporter when the detector confirms this worker is the
-	 * lagging endgame holder (HPN_TAIL_REDISTRIBUTE only); the range
+	 * lagging endgame holder (HPNTailRedistribute only); the range
 	 * transfer loop polls it via conn->hpn->yield_flag, winds down, and
 	 * worker_process_result consumes+clears it to classify the non-
 	 * success return as voluntary (requeue remainder, no retry charge).
@@ -1209,7 +1209,7 @@ struct sftp_parallel {
 						         * true; episode latches
 						         * only after it holds
 						         * TAIL_CONFIRM_SEC */
-	/* ENV-VAR HPN_TAIL_REDISTRIBUTE=1: arm phase C - on episode latch,
+	/* HPNTailRedistribute (ssh_config, default yes): arm phase C - on episode latch,
 	 * ask the slowest lagging holder to cooperatively yield its
 	 * unstarted remainder for redistribution to a proven READY worker.
 	 * Default off: the detector stays telemetry-only.  Parsed once at

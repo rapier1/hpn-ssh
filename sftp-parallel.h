@@ -102,6 +102,12 @@ struct sftp_parallel_config {
 	 * pool). */
 	int          writer_pool;
 
+	/* Tail-redistribution enable, resolved from ssh_config
+	 * HPNTailRedistribute.  1 = arm phase-C cooperative yield of a
+	 * confirmed-lagging endgame holder (default); 0 = the tail detector
+	 * stays telemetry-only. */
+	int          tail_redistribute;
+
 	/* Retry budget per work unit, resolved from ssh_config
 	 * HPNMaxRetries.  Default 3, clamped to [1, 20] by readconf.c
 	 * fill_default_options. */

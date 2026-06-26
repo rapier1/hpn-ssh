@@ -395,13 +395,10 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		if (p->noprogress_abort_s < 0) p->noprogress_abort_s = 0;
 	}
 
-	/* ENV-VAR HPN_TAIL_REDISTRIBUTE=1: arm phase C tail redistribution
-	 * (cooperative yield of a confirmed-lagging endgame holder).  Default
-	 * off: the tail detector stays telemetry-only. */
-	{
-		const char *e = getenv("HPN_TAIL_REDISTRIBUTE");
-		p->tail_redistribute = (e != NULL && *e == '1');
-	}
+	/* Phase-C tail redistribution (cooperative yield of a confirmed-lagging
+	 * endgame holder), resolved from ssh_config HPNTailRedistribute.  Default
+	 * ON; HPNTailRedistribute no leaves the tail detector telemetry-only. */
+	p->tail_redistribute = cfg->tail_redistribute;
 
 	/* ENV-VAR HPN_RESPAWN_SCAN_IDLE=1: defer fleet-restoring respawns
 	 * while READY healthy workers cover the queued demand.  Default off;

@@ -159,6 +159,7 @@ typedef enum {
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
 	oTcpRcvBufPoll, oTcpRcvBufRescue, oHPNDisabled, oHPNMemoryLimit,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch, oHPNUseBundle, oHPNWriterPool,
+	oHPNTailRedistribute,
 	oHPNMaxRetries, oHPNBundleSize, oHPNMaxAuthConcurrent,
 	oHPNLustreStripeCount,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
@@ -303,6 +304,7 @@ static struct {
 	{ "noneswitch", oNoneSwitch },
 	{ "hpnusebundle", oHPNUseBundle },
 	{ "hpnwriterpool", oHPNWriterPool },
+	{ "hpntailredistribute", oHPNTailRedistribute },
 	{ "hpnmaxretries", oHPNMaxRetries },
 	{ "hpnbundlesize", oHPNBundleSize },
 	{ "hpnmaxauthconcurrent", oHPNMaxAuthConcurrent },
@@ -1398,6 +1400,10 @@ parse_time:
 
 	case oHPNWriterPool:
 		intptr = &options->hpn_writer_pool;
+		goto parse_flag;
+
+	case oHPNTailRedistribute:
+		intptr = &options->hpn_tail_redistribute;
 		goto parse_flag;
 
 	case oHPNMaxRetries:
@@ -2986,6 +2992,7 @@ initialize_options(Options * options)
 	options->nonemac_enabled = -1;
 	options->hpn_use_bundle = -1;
 	options->hpn_writer_pool = -1;
+	options->hpn_tail_redistribute = -1;
 	options->hpn_max_retries = -1;
 	options->hpn_bundle_size = -1;
 	options->hpn_max_auth_concurrent = -1;
@@ -3203,6 +3210,8 @@ fill_default_options(Options * options)
 		options->hpn_use_bundle = 1;	/* default: yes */
 	if (options->hpn_writer_pool == -1)
 		options->hpn_writer_pool = 1;	/* default: yes */
+	if (options->hpn_tail_redistribute == -1)
+		options->hpn_tail_redistribute = 1;	/* default: yes */
 	if (options->hpn_max_retries == -1) {
 		options->hpn_max_retries = 3;	/* default: 3 attempts */
 	} else if (options->hpn_max_retries < 1) {
@@ -4111,6 +4120,7 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oNoneMacEnabled, o->nonemac_enabled);
 	dump_cfg_fmtint(oHPNUseBundle, o->hpn_use_bundle);
 	dump_cfg_fmtint(oHPNWriterPool, o->hpn_writer_pool);
+	dump_cfg_fmtint(oHPNTailRedistribute, o->hpn_tail_redistribute);
 	dump_cfg_int(oHPNMaxRetries, o->hpn_max_retries);
 	dump_cfg_int(oHPNMaxAuthConcurrent, o->hpn_max_auth_concurrent);
 	/* oHPNBundleSize - int64 byte count; printed plain (operator can

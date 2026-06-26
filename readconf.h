@@ -136,6 +136,9 @@ typedef struct {
 	int     hpn_writer_pool;   /* Use the bundle writer pool (default: yes).
 				    * Off -> request serial extract (NO_POOL flag
 				    * on upload; client download pool skipped). */
+	int     hpn_tail_redistribute; /* Arm phase-C tail redistribution -
+				    * cooperative yield of a confirmed-lagging
+				    * endgame holder (default: yes). Client-only. */
 	int     hpn_max_retries;   /* Retry budget per work unit in hpnsftp's
 				    * parallel orchestrator.  Default 3,
 				    * clamped to [1, 20].  Only consulted by

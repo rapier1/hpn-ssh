@@ -1268,6 +1268,26 @@ regardless of this option. Consulted only by
 .Xr hpnsftp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
+.It Cm HPNTailRedistribute
+Controls whether
+.Xr hpnsftp 1 ,
+when transferring with
+.Cm -j
+parallel streams, redistributes work away from a confirmed-lagging stream at the
+tail of a transfer. Near the end of a transfer one slow stream can be left
+holding the last of its range while faster streams sit idle; when enabled, the
+orchestrator detects that case and asks the lagging stream to cooperatively
+yield its unstarted remainder to a faster peer, shortening the tail. The
+argument must be
+.Cm yes
+or
+.Cm no .
+The default is
+.Cm yes .
+Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
 .It Cm HPNLustreStripeCount
 .Sy EXPERIMENTAL :
 desired Lustre stripe count for destination directories when

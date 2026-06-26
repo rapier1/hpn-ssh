@@ -186,6 +186,7 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	/* Sensible defaults if anything below fails. */
 	pcfg->use_bundle  = 1;
 	pcfg->writer_pool = 1;
+	pcfg->tail_redistribute = 1;
 	pcfg->max_retries = 3;
 	pcfg->bundle_size = 0;  /* 0 = let worker use compile-time default */
 	pcfg->max_auth_concurrent = 0;  /* 0 = auto */
@@ -201,6 +202,7 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	 * options append additional assignments here. */
 	pcfg->use_bundle  = (options.hpn_use_bundle != 0);
 	pcfg->writer_pool = (options.hpn_writer_pool != 0);
+	pcfg->tail_redistribute = (options.hpn_tail_redistribute != 0);
 	pcfg->max_retries = options.hpn_max_retries;
 	pcfg->bundle_size = (options.hpn_bundle_size > 0)
 	    ? (uint64_t)options.hpn_bundle_size : 0;
@@ -210,9 +212,11 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	 * here, toggled later by the caller. */
 
 	debug_f("ssh_config: host=\"%s\" HPNUseBundle=%s HPNWriterPool=%s "
-	    "HPNMaxRetries=%d HPNBundleSize=%llu HPNMaxAuthConcurrent=%d",
+	    "HPNTailRedistribute=%s HPNMaxRetries=%d HPNBundleSize=%llu "
+	    "HPNMaxAuthConcurrent=%d",
 	    host, pcfg->use_bundle ? "yes" : "no",
-	    pcfg->writer_pool ? "yes" : "no", pcfg->max_retries,
+	    pcfg->writer_pool ? "yes" : "no",
+	    pcfg->tail_redistribute ? "yes" : "no", pcfg->max_retries,
 	    (unsigned long long)pcfg->bundle_size,
 	    pcfg->max_auth_concurrent);
 
