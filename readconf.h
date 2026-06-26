@@ -133,6 +133,9 @@ typedef struct {
 	int     hpn_use_bundle;    /* Use hpn-bundle SFTP extension for small-file
 				    * aggregation in hpnsftp (default: yes).
 				    * Only consulted by hpnsftp; hpnssh ignores. */
+	int     hpn_writer_pool;   /* Use the bundle writer pool (default: yes).
+				    * Off -> request serial extract (NO_POOL flag
+				    * on upload; client download pool skipped). */
 	int     hpn_max_retries;   /* Retry budget per work unit in hpnsftp's
 				    * parallel orchestrator.  Default 3,
 				    * clamped to [1, 20].  Only consulted by

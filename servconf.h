@@ -245,6 +245,8 @@ typedef struct {
 	 *                                 → no cap.
 	 */
 	int	hpn_use_bundle;
+	int	hpn_writer_pool;	/* server-side bundle writer-pool master
+					 * toggle (HPNWriterPool); -1 -> 1 (on) */
 	int	hpn_max_concurrent_workers;
 	int	none_enabled;		/* Enable NONE cipher switch */
 	int     nonemac_enabled;        /* Enable NONE MAC switch */

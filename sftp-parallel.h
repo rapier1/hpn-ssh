@@ -96,6 +96,12 @@ struct sftp_parallel_config {
 	 * advertising the hpn-bundle extension). */
 	int          use_bundle;
 
+	/* Writer-pool enable, resolved from ssh_config HPNWriterPool.  1 =
+	 * use the bundle writer pool (default); 0 = request serial extract
+	 * (sets HPN_BUNDLE_FLAG_NO_POOL on upload, skips the client download
+	 * pool). */
+	int          writer_pool;
+
 	/* Retry budget per work unit, resolved from ssh_config
 	 * HPNMaxRetries.  Default 3, clamped to [1, 20] by readconf.c
 	 * fill_default_options. */

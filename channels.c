@@ -1458,7 +1458,7 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 		return current_size;
 	}
 
-	/* target: double, capped at SSHBUF_SIZE_MAX (128 MB) */
+	/* target: double, capped at SSHBUF_SIZE_MAX (512 MB) */
 	target = current_size * 2;
 	if (target > SSHBUF_SIZE_MAX)
 		target = SSHBUF_SIZE_MAX;
@@ -1575,7 +1575,7 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 	if (tcpwinsz > memlimit_cap)
 		tcpwinsz = memlimit_cap;
 
-	/* return no more than SSHBUF_SIZE_MAX (currently 128MB) */
+	/* return no more than SSHBUF_SIZE_MAX (currently 512MB) */
 	if (tcpwinsz > SSHBUF_SIZE_MAX)
 		tcpwinsz = SSHBUF_SIZE_MAX;
 

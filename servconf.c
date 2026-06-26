@@ -207,6 +207,7 @@ initialize_server_options(ServerOptions *options)
 	options->hpn_workers_die = -1;
 	options->hpn_memory_limit = -1;
 	options->hpn_use_bundle = -1;
+	options->hpn_writer_pool = -1;
 	options->hpn_max_concurrent_workers = -1;
 	options->none_enabled = -1;
 	options->nonemac_enabled = -1;
@@ -501,6 +502,8 @@ fill_default_server_options(ServerOptions *options)
 		options->hpn_memory_limit = 0;
 	if (options->hpn_use_bundle == -1)
 		options->hpn_use_bundle = 1;	/* default: bundle path on */
+	if (options->hpn_writer_pool == -1)
+		options->hpn_writer_pool = 1;	/* default: writer pool on */
 	if (options->hpn_max_concurrent_workers == -1)
 		options->hpn_max_concurrent_workers = 0;	/* 0 = no cap */
 	if (options->use_mptcp == -1)
@@ -592,7 +595,7 @@ typedef enum {
 	sPrintMotd, sPrintLastLog, sIgnoreRhosts,
 	sNoneEnabled, sNoneMacEnabled, sTcpRcvBufPoll, sTcpRcvBufRescue,
 	sHPNDisabled, sHPNWorkersDie, sHPNMemoryLimit,
-	sHPNUseBundle, sHPNMaxConcurrentWorkers,
+	sHPNUseBundle, sHPNWriterPool, sHPNMaxConcurrentWorkers,
 	sDisableMTAES, sUseMPTCP,
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
@@ -772,6 +775,7 @@ static struct {
 	{ "hpnworkersdie", sHPNWorkersDie, SSHCFG_ALL },
 	{ "hpnmemorylimit", sHPNMemoryLimit, SSHCFG_ALL },
 	{ "hpnusebundle", sHPNUseBundle, SSHCFG_ALL },
+	{ "hpnwriterpool", sHPNWriterPool, SSHCFG_ALL },
 	{ "hpnmaxconcurrentworkers", sHPNMaxConcurrentWorkers, SSHCFG_ALL },
 	{ "tcprcvbufpoll", sTcpRcvBufPoll, SSHCFG_ALL },
 	{ "tcprcvbufrescue", sTcpRcvBufRescue, SSHCFG_ALL },
@@ -1643,6 +1647,10 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 
 	case sHPNUseBundle:
 		intptr = &options->hpn_use_bundle;
+		goto parse_flag;
+
+	case sHPNWriterPool:
+		intptr = &options->hpn_writer_pool;
 		goto parse_flag;
 
 	case sHPNMaxConcurrentWorkers:
@@ -3429,6 +3437,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sHPNWorkersDie, o->hpn_workers_die);
 	dump_cfg_fmtint(sHPNMemoryLimit, o->hpn_memory_limit);
 	dump_cfg_fmtint(sHPNUseBundle, o->hpn_use_bundle);
+	dump_cfg_fmtint(sHPNWriterPool, o->hpn_writer_pool);
 	dump_cfg_int(sHPNMaxConcurrentWorkers, o->hpn_max_concurrent_workers);
 	dump_cfg_fmtint(sTcpRcvBufPoll, o->tcp_rcv_buf_poll);
 	dump_cfg_fmtint(sTcpRcvBufRescue, o->tcp_rcv_buf_rescue);

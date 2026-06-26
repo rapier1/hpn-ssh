@@ -1241,6 +1241,33 @@ per-file pipelined batch upload path. Consulted only by
 .Xr hpnsftp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
+.It Cm HPNWriterPool
+Controls whether
+.Xr hpnsftp 1
+uses a pool of writer threads when extracting bundled small-file transfers
+(the
+.Cm hpn-bundle@hpnssh.org
+SFTP extension). The pool overlaps the per-file open, write, and close
+operations that a serial extractor performs one at a time; on high-latency
+destinations such as a networked or Lustre filesystem those per-file
+round-trips are the small-file ceiling. The argument must be
+.Cm yes
+or
+.Cm no .
+The default is
+.Cm yes .
+The setting applies in both directions: on download it controls the local
+extract pool, and on upload it asks the remote
+.Xr hpnsftp-server 8
+whether to use its extract pool. The server-side
+.Cm HPNWriterPool
+in
+.Xr hpnsshd_config 5
+takes precedence: if the operator disables the pool there, it stays off
+regardless of this option. Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
 .It Cm HPNLustreStripeCount
 .Sy EXPERIMENTAL :
 desired Lustre stripe count for destination directories when
@@ -1513,8 +1540,9 @@ for interactive sessions and
 for non-interactive sessions. If using the
 .Cm HappyEyes
 option these default to
-.Cm lowlatency and
-.m throughput ,
+.Cm lowlatency
+and
+.Cm throughput ,
 respectively.
 .It Cm KbdInteractiveAuthentication
 Specifies whether to use keyboard-interactive authentication.

@@ -910,6 +910,51 @@ In some situations, such as transfers on a local area network, the impact
 of the HPN code produces a net decrease in performance. In these cases it is
 helpful to disable the HPN functionality. By default HPNDisabled is set to
 .Cm no.
+.It Cm HPNMaxConcurrentWorkers
+Sets a hard per-user cap on the number of concurrent parallel-streams
+transfer worker channels that one authenticated user may have open at once.
+These are the SFTP-subsystem connections
+.Xr hpnsftp 1
+opens when run with
+.Cm -j .
+The cap is enforced across processes via a per-user counter file under
+.Pa /var/run/hpnssh/workers/ .
+The argument is an integer;
+.Cm 0 ,
+the default, means no cap. Connections beyond the cap are refused until
+earlier workers finish.
+.It Cm HPNMemoryLimit
+Sets the upper bound on the memory HPN-SSH uses for a single channel's
+dynamic receive buffer, which governs how large the receive window may grow
+on high-bandwidth, high-latency paths. Accepted values are
+.Cm default
+(128 MB, the default),
+.Cm high
+(256 MB), and
+.Cm max
+(512 MB). Larger limits raise throughput on long fat networks at the cost of
+more memory per channel.
+.It Cm HPNUseBundle
+Operator master toggle for the HPN-SSH small-file bundling SFTP extensions
+(the
+.Cm hpn-bundle@hpnssh.org
+family used by
+.Xr hpnsftp 1 ) .
+The argument must be
+.Cm yes
+or
+.Cm no .
+The default is
+.Cm yes .
+When set to
+.Cm no ,
+.Xr hpnsftp-server 8
+does not advertise the bundle extensions and refuses bundle operations, so
+clients fall back to the per-file transfer path. The corresponding client
+option is
+.Cm HPNUseBundle
+in
+.Xr hpnssh_config 5 .
 .It Cm HPNWorkersDie
 Controls whether the server may terminate a parallel-streams transfer
 worker's connection when it detects, from
@@ -924,6 +969,29 @@ This only affects connections that identify themselves as parallel
 streams workers; ordinary sessions are never terminated by this mechanism.
 By default HPNWorkersDie is set to
 .Cm yes.
+.It Cm HPNWriterPool
+Controls whether
+.Xr hpnsftp-server 8
+uses a pool of writer threads when extracting an uploaded small-file bundle
+(the
+.Cm hpn-bundle@hpnssh.org
+SFTP extension), overlapping the per-file open, write, and close operations
+that a serial extractor performs one at a time. On high-latency filesystems
+such as Lustre those per-file metadata round-trips are the small-file ceiling.
+The argument must be
+.Cm yes
+or
+.Cm no .
+The default is
+.Cm yes .
+This is an operator master toggle: when set to
+.Cm no
+the server always extracts bundles serially, regardless of any client
+request. A client may independently decline the pool for its own transfers
+with
+.Cm HPNWriterPool no
+in
+.Xr hpnssh_config 5 .
 .It Cm IgnoreRhosts
 Specifies whether to ignore per-user
 .Pa .rhosts

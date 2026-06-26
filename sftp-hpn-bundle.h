@@ -27,6 +27,11 @@
  */
 #define HPN_BUNDLE_FLAG_PRESERVE   0x00000001U
 #define HPN_BUNDLE_FLAG_FSYNC      0x00000002U
+/* NO_POOL: client asks the server to extract WITHOUT the writer pool (set when
+ * the user disables it via HPNWriterPool=no).  The server-side operator toggle
+ * (sshd_config HPNWriterPool / HPN_WRITER_POOL env) can also force the pool off
+ * regardless of this flag. */
+#define HPN_BUNDLE_FLAG_NO_POOL    0x00000004U
 
 /*
  * Tar codec output block size.  Each block becomes one SSH_FXP_WRITE

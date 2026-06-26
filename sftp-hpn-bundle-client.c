@@ -67,6 +67,7 @@
 #include "sftp-hpn-bundle.h"
 #include "sftp-hpn-bundle-client.h"
 #include "sftp-hpn-tar.h"
+#include "sftp-hpn-bundle-pool.h"	/* shared writer pool (extract overlap) */
 
 /* ── BEGIN Phase 5: hpn-bundle-fetch download ─────────────────────────────
  *
@@ -200,6 +201,14 @@ struct bundle_dl_stream {
 	uint64_t cur_written;	/* bytes written for the current entry; used to
 				 * ftruncate the file to its real size */
 
+	/* Pool (parallel extract) state - active when pool != NULL.  In pool
+	 * mode entry_cb buffers the whole file (cur_buf), data_cb fills it
+	 * (offset tracked by cur_written), and entry_end_cb hands it off as a
+	 * job; the writer threads do the open/write/close. */
+	struct bundle_write_pool *pool;	/* writer pool, or NULL (serial path) */
+	u_char  *cur_buf;	/* pool: current file's data buffer (owns) */
+	uint64_t cur_size;	/* pool: declared size from the tar header */
+
 	/* (D) Most-recently-mkdir_p'd parent dir - skip repeats. */
 	char    *last_mkdir_dir;
 
@@ -309,6 +318,20 @@ bundle_dl_entry_cb(void *ctx, const char *path, uint64_t size,
 		free(tmp);
 	}
 
+	if (s->pool != NULL) {
+		/* Parallel path: buffer this file in RAM; a pool thread does the
+		 * open/write/close so the per-file create round-trips overlap.
+		 * The parent dir was already mkdir'd above (serial, cached). */
+		s->cur_size = size;
+		s->cur_buf  = (size > 0) ? malloc((size_t)size) : NULL;
+		if (size > 0 && s->cur_buf == NULL) {
+			error_f("hpn-bundle-fetch: malloc(%llu) for \"%s\"",
+			    (unsigned long long)size, s->cur_local);
+			return -1;
+		}
+		return 0;
+	}
+
 	mode_t perm = s->preserve_flag ? (mode & 07777) : 0644;
 	/*
 	 * HPN bundle-truncation fix (#4), download side: open WITHOUT O_TRUNC,
@@ -342,6 +365,15 @@ bundle_dl_data_cb(void *ctx, const u_char *data, size_t len)
 		 * the paths we asked for.) */
 		return 0;
 	}
+	if (s->pool != NULL) {
+		/* Parallel path: accumulate into the per-file buffer; a pool
+		 * thread writes it once the entry completes. */
+		if (s->cur_buf != NULL && len > 0)
+			memcpy(s->cur_buf + s->cur_written, data, len);
+		s->cur_written += (uint64_t)len;
+		return 0;
+	}
+
 	if (s->cur_fd < 0)
 		return -1;
 
@@ -368,6 +400,39 @@ bundle_dl_entry_end_cb(void *ctx)
 {
 	struct bundle_dl_stream *s = ctx;
 	int rc = 0;
+
+	if (s->pool != NULL) {
+		/* Parallel path: hand the complete file to the writer pool.
+		 * Per-file success is optimistic (set below); an actual write
+		 * failure surfaces via the pool's error flag at finish, which
+		 * fails the whole bundle (the codec's all-or-nothing model). */
+		if (s->cur_idx >= 0) {
+			struct bundle_write_job *job = calloc(1, sizeof(*job));
+			if (job == NULL) {
+				error_f("hpn-bundle-fetch: write-job alloc failed");
+				free(s->cur_buf); s->cur_buf = NULL;
+				s->cur_idx = -1; s->cur_local = NULL;
+				return -1;
+			}
+			job->full_path = xstrdup(s->cur_local); /* entries[] owns cur_local */
+			job->mode      = s->cur_mode;
+			job->mtime     = s->cur_mtime;
+			job->data      = s->cur_buf;	/* transfer ownership */
+			job->len       = (size_t)s->cur_size;
+			s->cur_buf     = NULL;
+			if (bundle_pool_enqueue(s->pool, job) != 0) {
+				free(job->full_path);
+				free(job->data);
+				free(job);
+				s->cur_idx = -1; s->cur_local = NULL;
+				return -1;	/* a writer already failed; bail */
+			}
+			s->entries[s->cur_idx].result = 0;
+		}
+		s->cur_idx   = -1;
+		s->cur_local = NULL;
+		return 0;
+	}
 
 	if (s->cur_fd >= 0) {
 		if (s->preserve_flag) {
@@ -592,7 +657,7 @@ bundle_dl_stream_drain_inflight(struct bundle_dl_stream *s)
 int
 sftp_hpn_bundle_download(struct sftp_conn *conn,
     struct sftp_hpn_bundle_download_entry *entries, int n,
-    int preserve_flag)
+    int preserve_flag, int writer_pool)
 {
 	struct sshbuf *msg = NULL;
 	u_char *handle = NULL;
@@ -661,6 +726,19 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	stream.preserve_flag = preserve_flag;
 	stream.max_inflight_bytes = bundle_dl_queue_max_bytes();
 
+	/* Parallel extract: a writer pool overlaps the per-file open/write/
+	 * close on the local (possibly networked) destination, mirroring the
+	 * server-side upload extract.  On by default; the user disables it via
+	 * HPNWriterPool=no (writer_pool == 0).  A NULL spawn falls back to
+	 * serial, harmless. */
+	if (writer_pool) {
+		stream.pool = bundle_write_pool_new(bundle_writer_threads(),
+		    preserve_flag, 0 /* do_fsync */, bundle_writer_budget());
+		if (stream.pool != NULL)
+			debug_f("hpn-bundle-fetch: writer pool active (%d threads)",
+			    bundle_writer_threads());
+	}
+
 	parser = sftp_hpn_tar_parser_new(&bundle_dl_callbacks, &stream);
 	if (parser == NULL) {
 		error_f("sftp_hpn_tar_parser_new failed");
@@ -722,9 +800,24 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	if (bundle_dl_stream_drain_inflight(&stream) != 0)
 		goto cleanup;
 
+	/* All entries parsed + enqueued; drain the pool and join the writers.
+	 * A nonzero return = some file failed -> fail the whole bundle. */
+	if (stream.pool != NULL) {
+		int perr = bundle_write_pool_finish(stream.pool);
+		stream.pool = NULL;
+		if (perr != 0) {
+			error_f("hpn-bundle-fetch: writer pool reported a "
+			    "failed file");
+			goto cleanup;
+		}
+	}
+
 	rc = 0;
 
  cleanup:
+	if (stream.pool != NULL)	/* abnormal teardown: join + free pool */
+		(void)bundle_write_pool_finish(stream.pool);
+	free(stream.cur_buf);		/* a file buffered but not yet enqueued */
 	if (parser != NULL)
 		sftp_hpn_tar_parser_free(parser);
 	if (stream.cur_fd >= 0)
@@ -1074,7 +1167,7 @@ int
 sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n,
-    int preserve_flag, int fsync_flag, uint64_t bundle_size)
+    int preserve_flag, int fsync_flag, int writer_pool, uint64_t bundle_size)
 {
 	struct sshbuf *msg = NULL;
 	u_char *handle = NULL;
@@ -1122,7 +1215,8 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 
 	open_id = sftp_conn_alloc_msg_id(conn);
 	flags = (preserve_flag ? HPN_BUNDLE_FLAG_PRESERVE : 0)
-	      | (fsync_flag    ? HPN_BUNDLE_FLAG_FSYNC    : 0);
+	      | (fsync_flag    ? HPN_BUNDLE_FLAG_FSYNC    : 0)
+	      | (writer_pool   ? 0 : HPN_BUNDLE_FLAG_NO_POOL);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, open_id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, "hpn-bundle-open@hpnssh.org")) != 0 ||
