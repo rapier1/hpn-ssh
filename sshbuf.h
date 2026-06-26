@@ -30,6 +30,9 @@
 # endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 
+/* SSHBUF_SIZE_MAX is kept deliberately equal to HPN_MEMLIMIT_MAX
+ * (channels.c hpn_memlimit_caps[]): channel_tcpwinsz() clamps the channel
+ * window to SSHBUF_SIZE_MAX, so change one and change the other. */
 #define SSHBUF_SIZE_MAX		0x20000000	/* Hard maximum size 512MB */
 #define SSHBUF_REFS_MAX		0x100000	/* Max child buffers */
 #define SSHBUF_MAX_BIGNUM	(16384 / 8)	/* Max bignum *bytes* */

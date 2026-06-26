@@ -273,7 +273,10 @@ static int hpn_disabled = 0;
 static int hpn_memlimit = HPN_MEMLIMIT_DEFAULT;
 
 /* We give them a choice of 3 limits. This corresponds to
- * default, high, and max, respectively */
+ * default, high, and max, respectively.  HPN_MEMLIMIT_MAX is kept
+ * deliberately equal to SSHBUF_SIZE_MAX (sshbuf.h): channel_tcpwinsz()
+ * clamps the window to SSHBUF_SIZE_MAX, so a larger tier would be silently
+ * capped.  Change one, change the other. */
 static const u_int32_t hpn_memlimit_caps[] = {
 	0x08000000,	/* HPN_MEMLIMIT_DEFAULT: 128 MB */
 	0x10000000,	/* HPN_MEMLIMIT_HIGH:    256 MB */
