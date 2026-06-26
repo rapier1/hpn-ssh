@@ -749,8 +749,9 @@ server_input_metrics_request(struct ssh *ssh, struct sshbuf **respp)
 		error_f("Could not read tcp_info from socket");
 		goto out;
 	}
-	/* write the tcp_info data to the binn object */
-	metrics_write_binn_object(&tcp_info, metricsobj);
+	/* write the tcp_info data to the binn object (tcp_info_len is the
+	 * getsockopt value-result length = what the running kernel returned) */
+	metrics_write_binn_object(&tcp_info, (socklen_t)tcp_info_len, metricsobj);
 	if ((r = sshbuf_put_string(resp, binn_ptr(metricsobj),
 				   binn_size(metricsobj))) != 0) {
 		error_fr(r, "Failed to build tcp_info object");

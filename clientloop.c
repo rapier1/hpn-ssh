@@ -2926,7 +2926,7 @@ client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *
 	char *metricsstring = NULL;
 	size_t tcpi_len, len = 0;
 	binn *metricsobj = NULL;
-	int r, kernel_version = 0;
+	int r;
 
 	time(&now);
 	info = localtime(&now);
@@ -2975,15 +2975,12 @@ client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *
 		error("Received no remote metrics data. Continuing.");
 	}
 
-	/* get the kernel version printing the header */
-	kernel_version = binn_object_int32((void *)blob, "kernel_version");
-
 	/* create a string of the data from the binn object blob */
 	metrics_read_binn_object((void *)blob, metricsstring);
 
-	/* have we printed the header? */
+	/* have we printed the header? (driven by the record's own field keys) */
 	if (metrics_hdr_remote_flag == 0) {
-		metrics_print_header(remfptr, "REMOTE CONNECTION", kernel_version);
+		metrics_print_header(remfptr, "REMOTE CONNECTION", (void *)blob);
 		metrics_hdr_remote_flag = 1;
 	}
 	fprintf(remfptr, "%s, ", timestamp);
@@ -3020,17 +3017,16 @@ localonly:
 	}
 
 	/* we write and read to a binn object because it lets us
-	 * format the data consistently */
-	metrics_write_binn_object(&local_tcp_info, metricsobj);
+	 * format the data consistently (tcpi_len is the getsockopt value-result
+	 * length = what the running kernel returned) */
+	metrics_write_binn_object(&local_tcp_info, (socklen_t)tcpi_len, metricsobj);
 
 	/* create a string of the data from the binn object metricsobj */
 	metrics_read_binn_object((void *)metricsobj, metricsstring);
 
-	/* get the kernel version printing the header */
-	kernel_version = binn_object_int32(metricsobj, "kernel_version");
-
 	if (metrics_hdr_local_flag == 0) {
-		metrics_print_header(localfptr, "LOCAL CONNECTION", kernel_version);
+		metrics_print_header(localfptr, "LOCAL CONNECTION",
+				     (void *)metricsobj);
 		metrics_hdr_local_flag = 1;
 	}
 

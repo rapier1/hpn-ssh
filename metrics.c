@@ -20,14 +20,77 @@
 #include "ssherr.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <stddef.h>		/* offsetof for the TCPI_FIELD_IN length gate */
+#include <sys/utsname.h>	/* uname for the runtime kernel version stamp */
 
 /* kernel version macro moved to defines.h */
+
+/*
+ * A tcp_info field is genuinely present only if getsockopt wrote at least
+ * through its last byte.  getsockopt returns min(our_buffer, kernel_struct)
+ * and writes the real length back into the socklen_t (value-result).  This
+ * runtime gate -- not the build-time LINUX_VERSION_CODE #if below -- is what
+ * makes serialization correct under binary distribution: a packaged binary is
+ * built against one kernel's headers but runs on whatever kernel the user has,
+ * which is usually older and almost never the same.  The compile-time #if only
+ * proves the field exists in the header we built against; it says nothing about
+ * the running kernel.  Mirrors the gate in tcpi-portable.c.
+ *
+ * offsetof/sizeof do not work on bitfield members, so a group that contains a
+ * bitfield gates on a normal sibling field from the same kernel version.
+ */
+#ifdef TCP_INFO
+#define TCPI_FIELD_IN(len, field)					\
+	((len) >= (socklen_t)(offsetof(struct tcp_info, field) +	\
+	    sizeof(((const struct tcp_info *)0)->field)))
+#endif
+
+/*
+ * The running kernel's version as a KERNEL_VERSION() code, parsed from the
+ * uname(2) release string.  Replaces the old LINUX_VERSION_CODE stamp, which
+ * recorded the BUILD kernel.  Returns 0 if the release does not parse; the
+ * reader treats a missing/0 stamp harmlessly because read-back is keyed on
+ * field presence, not on this value.
+ */
+static unsigned int
+metrics_runtime_kernel_version(const char *release)
+{
+#ifdef __linux__
+	int maj = 0, min = 0, patch = 0;
+
+	if (sscanf(release, "%d.%d.%d", &maj, &min, &patch) < 2)
+		return 0;
+	if (patch > 255)		/* KERNEL_VERSION packs patch into 8 bits */
+		patch = 255;
+	return (unsigned int)KERNEL_VERSION(maj, min, patch);
+#else
+	(void)release;
+	return 0;
+#endif
+}
+
+/*
+ * Read-back and the column header are driven purely by which keys a record
+ * contains, not by any kernel-version comparison.  The writer only emits a
+ * post-3.15 field when the producing kernel actually returned it, so key
+ * presence is the authoritative gate -- and because binn is self-describing by
+ * key name (independent of struct layout), a record produced by a remote host
+ * on a different kernel still reads correctly.
+ */
+static int
+metrics_has(void *binnobj, const char *key)
+{
+	binn value;
+
+	return binn_object_get_value(binnobj, key, &value) ? 1 : 0;
+}
 
 /* add the information from the tcp_info struct to the
  * serialized binary object
  */
 void
-metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
+metrics_write_binn_object(struct tcp_info *data, socklen_t tilen,
+			  struct binn_struct *binnobj) {
 #if !defined TCP_INFO
 	/*tcp info isn't supported on this system */
 	return;
@@ -37,15 +100,26 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
  * these measurements existed in previous kernels but the oldest this
  * is going to support is 3.7.0. We do need to store the kernel version as well */
 
-/* obviously the version code macro only exists under linux so
- * on non linux systems we set the kernel version to 0
- * which will get us the base set of metrics from netinet/tcp.h
- */
-#if (defined __linux__) && !defined(__alpine__)
-	binn_object_set_uint32(binnobj, "kernel_version", LINUX_VERSION_CODE);
-#else
-	binn_object_set_uint32(binnobj, "kernel_version", 0);
-#endif
+	/*
+	 * Stamp the record with the RUNNING kernel, not the build kernel.
+	 * uname(2) gives a human-readable release string and the version code
+	 * we parse from it; tilen (the getsockopt value-result length) records
+	 * exactly how many bytes this kernel returned.  These are diagnostic
+	 * metadata -- read-back gates on key presence, not on the version.
+	 */
+	{
+		struct utsname uts;
+
+		if (uname(&uts) == 0) {
+			binn_object_set_str(binnobj, "kernel_release",
+					    uts.release);
+			binn_object_set_uint32(binnobj, "kernel_version",
+			    metrics_runtime_kernel_version(uts.release));
+		} else {
+			binn_object_set_uint32(binnobj, "kernel_version", 0);
+		}
+	}
+	binn_object_set_uint32(binnobj, "tcpi_len", (unsigned int)tilen);
 
 	/* the following are common under both linux and BSD */
 	binn_object_set_uint8(binnobj, "tcpi_snd_wscale",
@@ -161,84 +235,113 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
 			       data->tcpi_snd_rexmitpack);
 #endif
 
-/* The last section are for kernel specific metrics in linux */
+/* The last section are for kernel specific metrics in linux.  The outer #if
+ * is the COMPILE gate (the member exists in the header we built against); the
+ * inner TCPI_FIELD_IN is the RUNTIME gate (the running kernel actually returned
+ * it).  Both are needed: the #if lets the code compile, the runtime gate keeps
+ * us from serializing uninitialized struct tail as data on an older kernel. */
 #ifdef __linux__
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,15,0)
-	binn_object_set_uint64(binnobj, "tcpi_max_pacing_rate",
-			       data->tcpi_max_pacing_rate);
-	binn_object_set_uint64(binnobj, "tcpi_pacing_rate",
-			       data->tcpi_pacing_rate);
+	if (TCPI_FIELD_IN(tilen, tcpi_pacing_rate)) {
+		binn_object_set_uint64(binnobj, "tcpi_max_pacing_rate",
+				       data->tcpi_max_pacing_rate);
+		binn_object_set_uint64(binnobj, "tcpi_pacing_rate",
+				       data->tcpi_pacing_rate);
+	}
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
-	binn_object_set_uint64(binnobj, "tcpi_bytes_acked",
-			       data->tcpi_bytes_acked);
-	binn_object_set_uint64(binnobj, "tcpi_bytes_received",
-			       data->tcpi_bytes_received);
+	if (TCPI_FIELD_IN(tilen, tcpi_bytes_received)) {
+		binn_object_set_uint64(binnobj, "tcpi_bytes_acked",
+				       data->tcpi_bytes_acked);
+		binn_object_set_uint64(binnobj, "tcpi_bytes_received",
+				       data->tcpi_bytes_received);
+	}
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,2,0)
-	binn_object_set_uint32(binnobj, "tcpi_segs_in",
-			       data->tcpi_segs_in);
-	binn_object_set_uint32(binnobj, "tcpi_segs_out",
-			       data->tcpi_segs_out);
+	if (TCPI_FIELD_IN(tilen, tcpi_segs_out)) {
+		binn_object_set_uint32(binnobj, "tcpi_segs_in",
+				       data->tcpi_segs_in);
+		binn_object_set_uint32(binnobj, "tcpi_segs_out",
+				       data->tcpi_segs_out);
+	}
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
-	binn_object_set_uint32(binnobj, "tcpi_notsent_bytes",
-			       data->tcpi_notsent_bytes);
-	binn_object_set_uint32(binnobj, "tcpi_min_rtt",
-			       data->tcpi_min_rtt);
-	binn_object_set_uint32(binnobj, "tcpi_data_segs_in",
-			       data->tcpi_data_segs_in);
-	binn_object_set_uint32(binnobj, "tcpi_data_segs_out",
-			       data->tcpi_data_segs_out);
+	if (TCPI_FIELD_IN(tilen, tcpi_data_segs_out)) {
+		binn_object_set_uint32(binnobj, "tcpi_notsent_bytes",
+				       data->tcpi_notsent_bytes);
+		binn_object_set_uint32(binnobj, "tcpi_min_rtt",
+				       data->tcpi_min_rtt);
+		binn_object_set_uint32(binnobj, "tcpi_data_segs_in",
+				       data->tcpi_data_segs_in);
+		binn_object_set_uint32(binnobj, "tcpi_data_segs_out",
+				       data->tcpi_data_segs_out);
+	}
 #endif
 
+	/* delivery_rate_app_limited is a bitfield; gate on its u64 sibling. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
-	binn_object_set_uint8(binnobj, "tcpi_delivery_rate_app_limited",
-			      data->tcpi_delivery_rate_app_limited);
-	binn_object_set_uint64(binnobj, "tcpi_delivery_rate",
-			       data->tcpi_delivery_rate);
+	if (TCPI_FIELD_IN(tilen, tcpi_delivery_rate)) {
+		binn_object_set_uint8(binnobj, "tcpi_delivery_rate_app_limited",
+				      data->tcpi_delivery_rate_app_limited);
+		binn_object_set_uint64(binnobj, "tcpi_delivery_rate",
+				       data->tcpi_delivery_rate);
+	}
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
-	binn_object_set_uint64(binnobj, "tcpi_busy_time",
-			       data->tcpi_busy_time);
-	binn_object_set_uint64(binnobj, "tcpi_sndbuf_limited",
-			       data->tcpi_sndbuf_limited);
-	binn_object_set_uint64(binnobj, "tcpi_rwnd_limited",
-			       data->tcpi_rwnd_limited);
+	if (TCPI_FIELD_IN(tilen, tcpi_rwnd_limited)) {
+		binn_object_set_uint64(binnobj, "tcpi_busy_time",
+				       data->tcpi_busy_time);
+		binn_object_set_uint64(binnobj, "tcpi_sndbuf_limited",
+				       data->tcpi_sndbuf_limited);
+		binn_object_set_uint64(binnobj, "tcpi_rwnd_limited",
+				       data->tcpi_rwnd_limited);
+	}
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,18,0)
-	binn_object_set_uint32(binnobj, "tcpi_delivered",
-			       data->tcpi_delivered);
-	binn_object_set_uint32(binnobj, "tcpi_delivered_ce",
-			       data->tcpi_delivered_ce);
+	if (TCPI_FIELD_IN(tilen, tcpi_delivered_ce)) {
+		binn_object_set_uint32(binnobj, "tcpi_delivered",
+				       data->tcpi_delivered);
+		binn_object_set_uint32(binnobj, "tcpi_delivered_ce",
+				       data->tcpi_delivered_ce);
+	}
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)
-	binn_object_set_uint64(binnobj, "tcpi_bytes_sent",
-			       data->tcpi_bytes_sent);
-	binn_object_set_uint64(binnobj, "tcpi_bytes_retrans",
-			       data->tcpi_bytes_retrans);
-	binn_object_set_uint32(binnobj, "tcpi_dsack_dups",
-			       data->tcpi_dsack_dups);
-	binn_object_set_uint32(binnobj, "tcpi_reord_seen",
-			       data->tcpi_reord_seen);
+	if (TCPI_FIELD_IN(tilen, tcpi_reord_seen)) {
+		binn_object_set_uint64(binnobj, "tcpi_bytes_sent",
+				       data->tcpi_bytes_sent);
+		binn_object_set_uint64(binnobj, "tcpi_bytes_retrans",
+				       data->tcpi_bytes_retrans);
+		binn_object_set_uint32(binnobj, "tcpi_dsack_dups",
+				       data->tcpi_dsack_dups);
+		binn_object_set_uint32(binnobj, "tcpi_reord_seen",
+				       data->tcpi_reord_seen);
+	}
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0)
-	binn_object_set_uint32(binnobj, "tcpi_snd_wnd",
-			       data->tcpi_snd_wnd);
-	binn_object_set_uint32(binnobj, "tcpi_rcv_ooopack",
-			       data->tcpi_rcv_ooopack);
+	if (TCPI_FIELD_IN(tilen, tcpi_rcv_ooopack)) {
+		binn_object_set_uint32(binnobj, "tcpi_snd_wnd",
+				       data->tcpi_snd_wnd);
+		binn_object_set_uint32(binnobj, "tcpi_rcv_ooopack",
+				       data->tcpi_rcv_ooopack);
+	}
 #endif
 
+	/* fastopen_client_fail (5.5) is 2 bits packed into the SAME __u8 as
+	 * delivery_rate_app_limited (4.9), so it grew the struct by 0 bytes and
+	 * cannot be length-detected on its own; gate it on that 4.9 byte.  It
+	 * reads 0 on 4.9-5.4 kernels (spare bits), meaningful on 5.5+. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,5,0)
-	binn_object_set_uint8(binnobj, "tcpi_fastopen_client_fail",
-			      data->tcpi_fastopen_client_fail);
+	if (TCPI_FIELD_IN(tilen, tcpi_delivery_rate)) {
+		binn_object_set_uint8(binnobj, "tcpi_fastopen_client_fail",
+				      data->tcpi_fastopen_client_fail);
+	}
 #endif
 #endif /*endif for #ifdef __linux__ */
 #endif /*endif for TCP_INFO */
@@ -251,12 +354,10 @@ void
 metrics_read_binn_object (void *binnobj, char *output) {
 	int len = 0;
 	int buflen = 1023;
-	int kernel_version = 0;
 	if (binnobj == NULL) {
 		fprintf(stderr, "Metric polling returned bad data.\n");
 		return;
 	}
-	kernel_version = binn_object_uint32(binnobj, "kernel_version");
 
 	/* base set of metrics */
 	len = snprintf(output, buflen, "%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d",
@@ -294,33 +395,35 @@ metrics_read_binn_object (void *binnobj, char *output) {
 		       binn_object_uint32(binnobj, "tcpi_total_retrans")
 		);
 
-	/* compare the received kernel version to the version that supports
-	 * any given metric. This means that a remote host that has a different
-	 * kernel that the local host will be able to process the data in terms of
-	 * the remote kernel version. Only necessary under linux*/
-#ifdef __linux__
-	if (kernel_version >= KERNEL_VERSION(3,15,0)) {
+	/*
+	 * Append the post-3.15 fields this record actually carries, keyed on
+	 * which keys are present (see metrics_has).  No kernel-version compare:
+	 * correct regardless of the local build kernel, and correct for a record
+	 * produced by a remote host on a different kernel.  Column order MUST
+	 * match metrics_print_header().
+	 */
+	if (metrics_has(binnobj, "tcpi_max_pacing_rate")) {
 		len += snprintf(output+len, (buflen-len), ", %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_max_pacing_rate"),
 				binn_object_uint64(binnobj, "tcpi_pacing_rate")
 			);
 	}
 
-	if (kernel_version >= KERNEL_VERSION(4,1,0)) {
+	if (metrics_has(binnobj, "tcpi_bytes_acked")) {
 		len += snprintf(output+len, (buflen-len), ", %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_bytes_acked"),
 				binn_object_uint64(binnobj, "tcpi_bytes_received")
 			);
 	}
 
-	if (kernel_version >= KERNEL_VERSION(4,2,0)) {
+	if (metrics_has(binnobj, "tcpi_segs_in")) {
 		len += snprintf(output+len, (buflen-len), ", %d, %d",
 				binn_object_uint32(binnobj, "tcpi_segs_in"),
 				binn_object_uint32(binnobj, "tcpi_segs_out")
 			);
 	}
 
-	if (kernel_version >= KERNEL_VERSION(4,6,0)) {
+	if (metrics_has(binnobj, "tcpi_notsent_bytes")) {
 		len += snprintf(output+len, (buflen-len), ", %d, %d, %d, %d",
 				binn_object_uint32(binnobj, "tcpi_notsent_bytes"),
 				binn_object_uint32(binnobj, "tcpi_min_rtt"),
@@ -329,14 +432,14 @@ metrics_read_binn_object (void *binnobj, char *output) {
 			);
 	}
 
-	if (kernel_version >= KERNEL_VERSION(4,9,0)) {
+	if (metrics_has(binnobj, "tcpi_delivery_rate_app_limited")) {
 		len += snprintf(output+len, (buflen-len), ", %d, %llu",
 				binn_object_uint8(binnobj, "tcpi_delivery_rate_app_limited"),
 				binn_object_uint64(binnobj, "tcpi_delivery_rate")
 			);
 	}
 
-	if (kernel_version >= KERNEL_VERSION(4,10,0)) {
+	if (metrics_has(binnobj, "tcpi_busy_time")) {
 		len += snprintf(output+len, (buflen-len), ", %llu, %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_busy_time"),
 				binn_object_uint64(binnobj, "tcpi_sndbuf_limited"),
@@ -344,14 +447,14 @@ metrics_read_binn_object (void *binnobj, char *output) {
 			);
 	}
 
-	if (kernel_version >= KERNEL_VERSION(4,18,0)) {
+	if (metrics_has(binnobj, "tcpi_delivered")) {
 		len += snprintf(output+len, (buflen-len), ", %d, %d",
 				binn_object_uint32(binnobj, "tcpi_delivered"),
 				binn_object_uint32(binnobj, "tcpi_delivered_ce")
 			);
 	}
 
-	if (kernel_version >= KERNEL_VERSION(4,19,0)) {
+	if (metrics_has(binnobj, "tcpi_bytes_sent")) {
 		len += snprintf(output+len, (buflen-len), ", %llu, %llu, %d, %d",
 				binn_object_uint64(binnobj, "tcpi_bytes_sent"),
 				binn_object_uint64(binnobj, "tcpi_bytes_retrans"),
@@ -360,30 +463,34 @@ metrics_read_binn_object (void *binnobj, char *output) {
 			);
 	}
 
-	if (kernel_version >= KERNEL_VERSION(5,4,0)) {
+	if (metrics_has(binnobj, "tcpi_snd_wnd")) {
 		len += snprintf(output+len, (buflen-len), ", %d, %d",
 				binn_object_uint32(binnobj, "tcpi_snd_wnd"),
 				binn_object_uint32(binnobj, "tcpi_rcv_ooopack")
 			);
 	}
 
-	if (kernel_version >= KERNEL_VERSION(5,5,0)) {
+	if (metrics_has(binnobj, "tcpi_fastopen_client_fail")) {
 		len += snprintf(output+len, (buflen-len), ", %d",
 				binn_object_uint8(binnobj, "tcpi_fastopen_client_fail")
 			);
 	}
-#endif /* ifdef __linux__ */
 }
 
 /* Print out the header to the file so that the column header matches the
- * data in the metrics object. That varies by kernel version so we have to
- * do tests for each possible version where they added new values to tcp_info
- * NOTE: This doesn't put the values/headers in the most useful order but the
- * resulting file is probably going to get processed by something */
+ * data in the metrics object. The post-3.15 columns vary by what the
+ * producing kernel returned, so we test the SAME key presence the reader uses
+ * (metrics_read_binn_object) -- header and data row stay in lockstep with no
+ * kernel-version compare.  NOTE: This doesn't put the values/headers in the
+ * most useful order but the resulting file is probably going to get processed
+ * by something */
 void
-metrics_print_header(FILE *fptr, char *extra_text, int kernel_version) {
+metrics_print_header(FILE *fptr, char *extra_text, void *binnobj) {
+	char *krel = binn_object_str(binnobj, "kernel_release");
+
 	if (extra_text != NULL) {
-		fprintf(fptr, "%s\n", extra_text);
+		fprintf(fptr, "%s (kernel %s)\n", extra_text,
+			krel != NULL ? krel : "unknown");
 	}
 	fprintf(fptr, "timestamp, state, ca_state, retransmits, probes, backoff, options, ");
 	fprintf(fptr, "snd_wscale, rcv_wscale, rto, ato, snd_mss, rcv_mss, unacked, sacked, lost, retrans, ");
@@ -391,49 +498,28 @@ metrics_print_header(FILE *fptr, char *extra_text, int kernel_version) {
 	fprintf(fptr, "last_ack_recv, pmtu, rcv_ssthresh, rtt, rttvar, snd_ssthresh, ");
 	fprintf(fptr, "snd_cwnd, advmss, reordering, rcv_rtt, rcv_space, total_retrans");
 
-	/* compare the received kernel version to the version that supports
-	 * any given metric. This way we can print consistent headers.
-	 * Only necessary under linux*/
-#ifdef __linux__
-	if (kernel_version >= KERNEL_VERSION(3,15,0)) {
+	/* Column names for the post-3.15 fields this record carries, keyed on
+	 * presence so the header always matches the data row.  Order MUST match
+	 * metrics_read_binn_object(). */
+	if (metrics_has(binnobj, "tcpi_max_pacing_rate"))
 		fprintf(fptr, ", max_pacing_rate, pacing_rate");
-	}
-
-	if (kernel_version >= KERNEL_VERSION(4,1,0)) {
+	if (metrics_has(binnobj, "tcpi_bytes_acked"))
 		fprintf(fptr, ", bytes_acked, bytes_received");
-	}
-
-	if (kernel_version >= KERNEL_VERSION(4,2,0)) {
+	if (metrics_has(binnobj, "tcpi_segs_in"))
 		fprintf(fptr, ", segs_in, segs_out");
-	}
-
-	if (kernel_version >= KERNEL_VERSION(4,6,0)) {
+	if (metrics_has(binnobj, "tcpi_notsent_bytes"))
 		fprintf(fptr, ", notsent_bytes, min_rtt, data_segs_in, data_seg_out");
-	}
-
-	if (kernel_version >= KERNEL_VERSION(4,9,0)) {
+	if (metrics_has(binnobj, "tcpi_delivery_rate_app_limited"))
 		fprintf(fptr, ", delivery_rate_app_limited, delivery_rate");
-	}
-
-	if (kernel_version >= KERNEL_VERSION(4,10,0)) {
+	if (metrics_has(binnobj, "tcpi_busy_time"))
 		fprintf(fptr, ", busy_time, sndbuf_limited, rwnd_limited");
-	}
-
-	if (kernel_version >= KERNEL_VERSION(4,18,0)) {
+	if (metrics_has(binnobj, "tcpi_delivered"))
 		fprintf(fptr, ", delivered, delivered_ce");
-	}
-
-	if (kernel_version >= KERNEL_VERSION(4,19,0)) {
+	if (metrics_has(binnobj, "tcpi_bytes_sent"))
 		fprintf(fptr, ", bytes_sent, bytes_retrans, dsack_dups, reord_seen");
-	}
-
-	if (kernel_version >= KERNEL_VERSION(5,4,0)) {
+	if (metrics_has(binnobj, "tcpi_snd_wnd"))
 		fprintf(fptr, ", snd_wnd, rcv_ooopack");
-	}
-
-	if (kernel_version >= KERNEL_VERSION(5,5,0)) {
+	if (metrics_has(binnobj, "tcpi_fastopen_client_fail"))
 		fprintf(fptr, ", fastopen_client_fail");
-	}
-#endif /* ifdef __linux__ */
 	fprintf(fptr, "\n\n");
 }
