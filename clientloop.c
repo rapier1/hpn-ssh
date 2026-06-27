@@ -168,6 +168,7 @@ static int connection_out;	/* Connection to server (output). */
 static struct sftp_hpn_tcp_health_ctx tcp_health;
 static int tcp_health_armed;	/* nonzero once tcp_health is initialised */
 static time_t tcp_health_check_time;	/* monotime deadline for next poll */
+static time_t metrics_check_time;	/* monotime deadline for next metrics poll */
 #define HPN_TCP_HEALTH_INTERVAL 1	/* seconds between health polls */
 
 /*
@@ -890,6 +891,8 @@ client_wait_until_can_do_something(struct ssh *ssh, struct pollfd **pfdp,
 		ptimeout_deadline_monotime(&timeout, server_alive_time);
 	if (tcp_health_armed)
 		ptimeout_deadline_monotime(&timeout, tcp_health_check_time);
+	if (options.metrics)
+		ptimeout_deadline_monotime(&timeout, metrics_check_time);
 	if (options.rekey_interval > 0 && !ssh_packet_is_rekeying(ssh)) {
 		ptimeout_deadline_sec(&timeout,
 		    ssh_packet_get_rekey_timeout(ssh));
@@ -1628,7 +1631,6 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	double start_time, total_time;
 	int interactive = -1, channel_did_enqueue = 0, r;
 	u_int64_t ibytes, obytes;
-	time_t previous_time;
 	int conn_in_ready, conn_out_ready;
 	sigset_t bsigset, osigset;
 
@@ -1672,7 +1674,7 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	client_repledge();
 
 	start_time = monotime_double();
-	previous_time = time(NULL); /* for metrics polling */
+	metrics_check_time = monotime() + options.metrics_interval; /* first metrics poll deadline */
 
 	/* Initialize variables. */
 	last_was_cr = 1;
@@ -1765,11 +1767,14 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 
 	/* Main loop of the client for the interactive session mode. */
 	while (!quit_pending) {
-		if (options.metrics) {
-			if ((time(NULL) - previous_time) >= options.metrics_interval) {
-				client_request_metrics(ssh);
-				previous_time = time(NULL);
-			}
+		/*
+		 * Metrics poll is driven by a ppoll deadline (armed above),
+		 * not by data activity, so it still fires on an idle
+		 * connection instead of waiting for the loop to wake.
+		 */
+		if (options.metrics && monotime() >= metrics_check_time) {
+			client_request_metrics(ssh);
+			metrics_check_time = monotime() + options.metrics_interval;
 		}
 		channel_did_enqueue = 0;
 
