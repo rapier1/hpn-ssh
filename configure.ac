@@ -4744,6 +4744,38 @@ AC_CHECK_MEMBERS([struct tcp_info.tcpi_snd_cwnd], [], [], [[
 #include <netinet/tcp.h>
 ]])
 
+# HPN: modern FreeBSD / OpenBSD tcp_info extensions serialized by metrics.c's
+# BSD path.  BSD has no LINUX_VERSION_CODE equivalent, so each field is gated
+# by its own member check -- it exists on FreeBSD, OpenBSD, or both, since the
+# two structs diverge.  netinet/tcp.h is the BSD header; on Linux these are
+# irrelevant (metrics.c's BSD block is #ifndef __linux__).
+AC_CHECK_MEMBERS([dnl
+struct tcp_info.tcpi_delivered_ce, dnl
+struct tcp_info.tcpi_received_ce, dnl
+struct tcp_info.tcpi_total_tlp, dnl
+struct tcp_info.tcpi_total_tlp_bytes, dnl
+struct tcp_info.tcpi_rcv_numsacks, dnl
+struct tcp_info.tcpi_dupacks, dnl
+struct tcp_info.tcpi_max_sndwnd, dnl
+struct tcp_info.tcpi_rttmin, dnl
+struct tcp_info.tcpi_rcv_adv, dnl
+struct tcp_info.tcpi_ts_recent, dnl
+struct tcp_info.tcpi_rfbuf_cnt, dnl
+struct tcp_info.tcpi_rfbuf_ts, dnl
+struct tcp_info.tcpi_so_rcv_sb_cc, dnl
+struct tcp_info.tcpi_so_rcv_sb_hiwat, dnl
+struct tcp_info.tcpi_so_rcv_sb_lowat, dnl
+struct tcp_info.tcpi_so_rcv_sb_wat, dnl
+struct tcp_info.tcpi_so_snd_sb_cc, dnl
+struct tcp_info.tcpi_so_snd_sb_hiwat, dnl
+struct tcp_info.tcpi_so_snd_sb_lowat, dnl
+struct tcp_info.tcpi_so_snd_sb_wat], [], [], [[
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+]])
+
 AC_CACHE_CHECK([for ss_family field in struct sockaddr_storage],
 		ac_cv_have_ss_family_in_struct_ss, [
 	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[

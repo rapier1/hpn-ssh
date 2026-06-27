@@ -235,6 +235,122 @@ metrics_write_binn_object(struct tcp_info *data, socklen_t tilen,
 			       data->tcpi_snd_rexmitpack);
 #endif
 
+/*
+ * Modern FreeBSD / OpenBSD tcp_info extensions.  BSD has no version macro, so
+ * each field is gated by an autoconf member check (compile: does THIS
+ * platform's struct define it -- FreeBSD and OpenBSD diverge) plus the runtime
+ * TCPI_FIELD_IN length gate.  Wrapped #ifndef __linux__ because
+ * delivered_ce/received_ce also exist on Linux, where the version groups below
+ * already emit them.  On OpenBSD these extension fields read 0 for an
+ * unprivileged caller (the kernel only fills them for privileged sockets).
+ */
+#ifndef __linux__
+	/* FreeBSD AccECN + tail-loss-probe + SACK telemetry. */
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_DELIVERED_CE
+	if (TCPI_FIELD_IN(tilen, tcpi_delivered_ce))
+		binn_object_set_uint32(binnobj, "tcpi_delivered_ce",
+				       data->tcpi_delivered_ce);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_RECEIVED_CE
+	if (TCPI_FIELD_IN(tilen, tcpi_received_ce))
+		binn_object_set_uint32(binnobj, "tcpi_received_ce",
+				       data->tcpi_received_ce);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_TLP
+	if (TCPI_FIELD_IN(tilen, tcpi_total_tlp))
+		binn_object_set_uint32(binnobj, "tcpi_total_tlp",
+				       data->tcpi_total_tlp);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_TLP_BYTES
+	if (TCPI_FIELD_IN(tilen, tcpi_total_tlp_bytes))
+		binn_object_set_uint64(binnobj, "tcpi_total_tlp_bytes",
+				       data->tcpi_total_tlp_bytes);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_RCV_NUMSACKS
+	if (TCPI_FIELD_IN(tilen, tcpi_rcv_numsacks))
+		binn_object_set_uint32(binnobj, "tcpi_rcv_numsacks",
+				       data->tcpi_rcv_numsacks);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_DUPACKS
+	if (TCPI_FIELD_IN(tilen, tcpi_dupacks))
+		binn_object_set_uint32(binnobj, "tcpi_dupacks",
+				       data->tcpi_dupacks);
+#endif
+	/* OpenBSD extensions: peak send window, min RTT, peer advertised
+	 * window, timestamp echo, receive-buffer autotune counters, and the
+	 * socket-buffer occupancy/limit block. */
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_MAX_SNDWND
+	if (TCPI_FIELD_IN(tilen, tcpi_max_sndwnd))
+		binn_object_set_uint32(binnobj, "tcpi_max_sndwnd",
+				       data->tcpi_max_sndwnd);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_RTTMIN
+	if (TCPI_FIELD_IN(tilen, tcpi_rttmin))
+		binn_object_set_uint32(binnobj, "tcpi_rttmin",
+				       data->tcpi_rttmin);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_RCV_ADV
+	if (TCPI_FIELD_IN(tilen, tcpi_rcv_adv))
+		binn_object_set_uint32(binnobj, "tcpi_rcv_adv",
+				       data->tcpi_rcv_adv);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TS_RECENT
+	if (TCPI_FIELD_IN(tilen, tcpi_ts_recent))
+		binn_object_set_uint32(binnobj, "tcpi_ts_recent",
+				       data->tcpi_ts_recent);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_RFBUF_CNT
+	if (TCPI_FIELD_IN(tilen, tcpi_rfbuf_cnt))
+		binn_object_set_uint32(binnobj, "tcpi_rfbuf_cnt",
+				       data->tcpi_rfbuf_cnt);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_RFBUF_TS
+	if (TCPI_FIELD_IN(tilen, tcpi_rfbuf_ts))
+		binn_object_set_uint32(binnobj, "tcpi_rfbuf_ts",
+				       data->tcpi_rfbuf_ts);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_SO_RCV_SB_CC
+	if (TCPI_FIELD_IN(tilen, tcpi_so_rcv_sb_cc))
+		binn_object_set_uint32(binnobj, "tcpi_so_rcv_sb_cc",
+				       data->tcpi_so_rcv_sb_cc);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_SO_RCV_SB_HIWAT
+	if (TCPI_FIELD_IN(tilen, tcpi_so_rcv_sb_hiwat))
+		binn_object_set_uint32(binnobj, "tcpi_so_rcv_sb_hiwat",
+				       data->tcpi_so_rcv_sb_hiwat);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_SO_RCV_SB_LOWAT
+	if (TCPI_FIELD_IN(tilen, tcpi_so_rcv_sb_lowat))
+		binn_object_set_uint32(binnobj, "tcpi_so_rcv_sb_lowat",
+				       data->tcpi_so_rcv_sb_lowat);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_SO_RCV_SB_WAT
+	if (TCPI_FIELD_IN(tilen, tcpi_so_rcv_sb_wat))
+		binn_object_set_uint32(binnobj, "tcpi_so_rcv_sb_wat",
+				       data->tcpi_so_rcv_sb_wat);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_SO_SND_SB_CC
+	if (TCPI_FIELD_IN(tilen, tcpi_so_snd_sb_cc))
+		binn_object_set_uint32(binnobj, "tcpi_so_snd_sb_cc",
+				       data->tcpi_so_snd_sb_cc);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_SO_SND_SB_HIWAT
+	if (TCPI_FIELD_IN(tilen, tcpi_so_snd_sb_hiwat))
+		binn_object_set_uint32(binnobj, "tcpi_so_snd_sb_hiwat",
+				       data->tcpi_so_snd_sb_hiwat);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_SO_SND_SB_LOWAT
+	if (TCPI_FIELD_IN(tilen, tcpi_so_snd_sb_lowat))
+		binn_object_set_uint32(binnobj, "tcpi_so_snd_sb_lowat",
+				       data->tcpi_so_snd_sb_lowat);
+#endif
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_SO_SND_SB_WAT
+	if (TCPI_FIELD_IN(tilen, tcpi_so_snd_sb_wat))
+		binn_object_set_uint32(binnobj, "tcpi_so_snd_sb_wat",
+				       data->tcpi_so_snd_sb_wat);
+#endif
+#endif /* !__linux__ */
+
 /* The last section are for kernel specific metrics in linux.  The outer #if
  * is the COMPILE gate (the member exists in the header we built against); the
  * inner TCPI_FIELD_IN is the RUNTIME gate (the running kernel actually returned
@@ -491,8 +607,15 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	}
 
 	if (metrics_has(binnobj, "tcpi_delivered")) {
-		len += snprintf(output+len, (buflen-len), ", %d, %d",
-				binn_object_uint32(binnobj, "tcpi_delivered"),
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_delivered")
+			);
+	}
+
+	/* delivered_ce is per-key: Linux emits it with tcpi_delivered (4.18),
+	 * FreeBSD emits it standalone -- same column either way. */
+	if (metrics_has(binnobj, "tcpi_delivered_ce")) {
+		len += snprintf(output+len, (buflen-len), ", %d",
 				binn_object_uint32(binnobj, "tcpi_delivered_ce")
 			);
 	}
@@ -534,10 +657,19 @@ metrics_read_binn_object (void *binnobj, char *output) {
 			);
 	}
 
+	/* received_ce is per-key: Linux emits it with the AccECN block (6.18),
+	 * FreeBSD emits it standalone -- same column either way. */
 	if (metrics_has(binnobj, "tcpi_received_ce")) {
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_received_ce")
+			);
+	}
+
+	/* The rest of the Linux 6.18 AccECN block; gated on a 6.18-only key so
+	 * it does not fire for a FreeBSD record that only carries received_ce. */
+	if (metrics_has(binnobj, "tcpi_accecn_opt_seen")) {
 		len += snprintf(output+len, (buflen-len),
-				", %d, %d, %d, %d, %d, %d, %d, %d, %d",
-				binn_object_uint32(binnobj, "tcpi_received_ce"),
+				", %d, %d, %d, %d, %d, %d, %d, %d",
 				binn_object_uint32(binnobj, "tcpi_delivered_e1_bytes"),
 				binn_object_uint32(binnobj, "tcpi_delivered_e0_bytes"),
 				binn_object_uint32(binnobj, "tcpi_delivered_ce_bytes"),
@@ -548,6 +680,54 @@ metrics_read_binn_object (void *binnobj, char *output) {
 				binn_object_uint16(binnobj, "tcpi_accecn_opt_seen")
 			);
 	}
+
+	/*
+	 * FreeBSD / OpenBSD tcp_info extensions (per-key; absent on Linux
+	 * records, so these add no columns there).  Order MUST match
+	 * metrics_print_header().
+	 */
+	if (metrics_has(binnobj, "tcpi_total_tlp"))
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_total_tlp"));
+	if (metrics_has(binnobj, "tcpi_total_tlp_bytes"))
+		len += snprintf(output+len, (buflen-len), ", %llu",
+				binn_object_uint64(binnobj, "tcpi_total_tlp_bytes"));
+	if (metrics_has(binnobj, "tcpi_rcv_numsacks"))
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_rcv_numsacks"));
+	if (metrics_has(binnobj, "tcpi_dupacks"))
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_dupacks"));
+	if (metrics_has(binnobj, "tcpi_max_sndwnd"))
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_max_sndwnd"));
+	if (metrics_has(binnobj, "tcpi_rttmin"))
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_rttmin"));
+	if (metrics_has(binnobj, "tcpi_rcv_adv"))
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_rcv_adv"));
+	if (metrics_has(binnobj, "tcpi_ts_recent"))
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_ts_recent"));
+	if (metrics_has(binnobj, "tcpi_rfbuf_cnt"))
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_rfbuf_cnt"));
+	if (metrics_has(binnobj, "tcpi_rfbuf_ts"))
+		len += snprintf(output+len, (buflen-len), ", %d",
+				binn_object_uint32(binnobj, "tcpi_rfbuf_ts"));
+	if (metrics_has(binnobj, "tcpi_so_rcv_sb_cc"))
+		len += snprintf(output+len, (buflen-len), ", %d, %d, %d, %d",
+				binn_object_uint32(binnobj, "tcpi_so_rcv_sb_cc"),
+				binn_object_uint32(binnobj, "tcpi_so_rcv_sb_hiwat"),
+				binn_object_uint32(binnobj, "tcpi_so_rcv_sb_lowat"),
+				binn_object_uint32(binnobj, "tcpi_so_rcv_sb_wat"));
+	if (metrics_has(binnobj, "tcpi_so_snd_sb_cc"))
+		len += snprintf(output+len, (buflen-len), ", %d, %d, %d, %d",
+				binn_object_uint32(binnobj, "tcpi_so_snd_sb_cc"),
+				binn_object_uint32(binnobj, "tcpi_so_snd_sb_hiwat"),
+				binn_object_uint32(binnobj, "tcpi_so_snd_sb_lowat"),
+				binn_object_uint32(binnobj, "tcpi_so_snd_sb_wat"));
 }
 
 /* Print out the header to the file so that the column header matches the
@@ -587,7 +767,9 @@ metrics_print_header(FILE *fptr, char *extra_text, void *binnobj) {
 	if (metrics_has(binnobj, "tcpi_busy_time"))
 		fprintf(fptr, ", busy_time, sndbuf_limited, rwnd_limited");
 	if (metrics_has(binnobj, "tcpi_delivered"))
-		fprintf(fptr, ", delivered, delivered_ce");
+		fprintf(fptr, ", delivered");
+	if (metrics_has(binnobj, "tcpi_delivered_ce"))
+		fprintf(fptr, ", delivered_ce");
 	if (metrics_has(binnobj, "tcpi_bytes_sent"))
 		fprintf(fptr, ", bytes_sent, bytes_retrans, dsack_dups, reord_seen");
 	if (metrics_has(binnobj, "tcpi_snd_wnd"))
@@ -599,8 +781,39 @@ metrics_print_header(FILE *fptr, char *extra_text, void *binnobj) {
 	if (metrics_has(binnobj, "tcpi_total_rto"))
 		fprintf(fptr, ", total_rto, total_rto_recoveries, total_rto_time");
 	if (metrics_has(binnobj, "tcpi_received_ce"))
-		fprintf(fptr, ", received_ce, delivered_e1_bytes, delivered_e0_bytes, "
+		fprintf(fptr, ", received_ce");
+	if (metrics_has(binnobj, "tcpi_accecn_opt_seen"))
+		fprintf(fptr, ", delivered_e1_bytes, delivered_e0_bytes, "
 			"delivered_ce_bytes, received_e1_bytes, received_e0_bytes, "
 			"received_ce_bytes, accecn_fail_mode, accecn_opt_seen");
+
+	/* FreeBSD / OpenBSD tcp_info extension columns (order MUST match
+	 * metrics_read_binn_object). */
+	if (metrics_has(binnobj, "tcpi_total_tlp"))
+		fprintf(fptr, ", total_tlp");
+	if (metrics_has(binnobj, "tcpi_total_tlp_bytes"))
+		fprintf(fptr, ", total_tlp_bytes");
+	if (metrics_has(binnobj, "tcpi_rcv_numsacks"))
+		fprintf(fptr, ", rcv_numsacks");
+	if (metrics_has(binnobj, "tcpi_dupacks"))
+		fprintf(fptr, ", dupacks");
+	if (metrics_has(binnobj, "tcpi_max_sndwnd"))
+		fprintf(fptr, ", max_sndwnd");
+	if (metrics_has(binnobj, "tcpi_rttmin"))
+		fprintf(fptr, ", rttmin");
+	if (metrics_has(binnobj, "tcpi_rcv_adv"))
+		fprintf(fptr, ", rcv_adv");
+	if (metrics_has(binnobj, "tcpi_ts_recent"))
+		fprintf(fptr, ", ts_recent");
+	if (metrics_has(binnobj, "tcpi_rfbuf_cnt"))
+		fprintf(fptr, ", rfbuf_cnt");
+	if (metrics_has(binnobj, "tcpi_rfbuf_ts"))
+		fprintf(fptr, ", rfbuf_ts");
+	if (metrics_has(binnobj, "tcpi_so_rcv_sb_cc"))
+		fprintf(fptr, ", so_rcv_sb_cc, so_rcv_sb_hiwat, so_rcv_sb_lowat, "
+			"so_rcv_sb_wat");
+	if (metrics_has(binnobj, "tcpi_so_snd_sb_cc"))
+		fprintf(fptr, ", so_snd_sb_cc, so_snd_sb_hiwat, so_snd_sb_lowat, "
+			"so_snd_sb_wat");
 	fprintf(fptr, "\n\n");
 }
