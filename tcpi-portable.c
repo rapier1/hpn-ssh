@@ -15,6 +15,10 @@
  *
  */
 
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+# define _DARWIN_C_SOURCE 1	/* expose struct tcp_connection_info / TCP_CONNECTION_INFO; hidden under strict POSIX */
+#endif
+
 #include "includes.h"
 
 #include <sys/types.h>
@@ -41,6 +45,10 @@
 #elif defined(__FreeBSD__) || defined(__NetBSD__)
 # include <netinet/tcp.h>
 # define TCPI_PORTABLE_SUPPORTED 1
+#elif defined(__APPLE__)
+# include <netinet/tcp.h>	/* struct tcp_connection_info, TCP_CONNECTION_INFO */
+# define TCPI_PORTABLE_SUPPORTED 1
+# define TCPI_PORTABLE_MACOS 1
 #elif defined(__OpenBSD__) && defined(HAVE_STRUCT_TCP_INFO_TCPI_SND_CWND)
 # include <netinet/tcp.h>
 # define TCPI_PORTABLE_SUPPORTED 1
@@ -59,6 +67,62 @@ tcpi_portable_supported(void)
 }
 
 #ifdef TCPI_PORTABLE_SUPPORTED
+
+#ifdef TCPI_PORTABLE_MACOS
+/*
+ * macOS has no Linux-style TCP_INFO; it exposes getsockopt(TCP_CONNECTION_INFO)
+ * -> struct tcp_connection_info instead.  Read that and normalise into struct
+ * tcpi_portable.  Conversions vs the Linux/BSD tcp_info layout:
+ *   - RTT fields are MILLISECONDS on macOS; tcpi_portable wants microseconds
+ *     -> x1000.  (srtt/rttcur are documented "in ms"; tcpi_rttvar has no unit
+ *     comment in the SDK header but is assumed ms for consistency.)
+ *   - snd_cwnd / snd_ssthresh are BYTES on macOS; tcpi_portable expresses them
+ *     in SEGMENTS (Linux convention) -> divide by tcpi_maxseg (guard /0).
+ *   - retransmits arrive as a sender-side packet counter (txretransmitpackets).
+ * Fields macOS does not provide (min_rtt, notsent_bytes, delivery_rate,
+ * busy_time, rwnd_limited, rcv_wnd[6.2], the RTO trio) are left unflagged in
+ * avail_flags -- the same reduced set the BSDs present, which the classifier
+ * already gates on and degrades against.  macOS ships a fixed struct, so no
+ * TCPI_FIELD_IN length-gate is needed here.
+ */
+int
+tcpi_portable_get(int fd, struct tcpi_portable *out)
+{
+	struct tcp_connection_info tci;
+	socklen_t tcilen = sizeof(tci);
+
+	memset(out, 0, sizeof(*out));
+	memset(&tci, 0, sizeof(tci));
+
+	if (getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &tci, &tcilen) != 0)
+		return -1;
+
+	/* Tier 1 -- always populated on a supported platform. */
+	out->state = tci.tcpi_state;
+	out->options = (u_int8_t)tci.tcpi_options;
+	out->snd_wscale = tci.tcpi_snd_wscale;
+	out->rcv_wscale = tci.tcpi_rcv_wscale;
+	out->snd_mss = tci.tcpi_maxseg;
+	out->rtt = tci.tcpi_srtt * 1000;	/* ms -> usec */
+	out->rttvar = tci.tcpi_rttvar * 1000;	/* assumed ms -> usec (see note) */
+	out->rcv_space = tci.tcpi_rcv_wnd;	/* advertised recv window, bytes */
+	if (tci.tcpi_maxseg > 0) {
+		/* macOS reports these in bytes; express in segments. */
+		out->snd_cwnd = tci.tcpi_snd_cwnd / tci.tcpi_maxseg;
+		out->snd_ssthresh = tci.tcpi_snd_ssthresh / tci.tcpi_maxseg;
+	}
+
+	/* Tier 1.5 -- cumulative retransmits (sender-side packets). */
+	out->total_retrans = tci.tcpi_txretransmitpackets;
+	out->avail_flags |= TCPI_AVAIL_TOTAL_RETRANS;
+
+	out->segs_out = (u_int32_t)tci.tcpi_txpackets;
+	out->avail_flags |= TCPI_AVAIL_SEGS_OUT;
+
+	return 0;
+}
+
+#else  /* Linux / BSD via struct tcp_info */
 
 /*
  * A field is genuinely present only if getsockopt wrote at least through
@@ -199,6 +263,8 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 }
 
 #undef TCPI_FIELD_IN
+
+#endif /* TCPI_PORTABLE_MACOS (else: Linux/BSD tcp_info path) */
 
 #else /* !TCPI_PORTABLE_SUPPORTED */
 
