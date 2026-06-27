@@ -23,9 +23,9 @@
 /* linux, freebsd, and netbsd have tcp_info structs.
  * I don't know about other systems so we disable this
  * functionality for them */
-#if defined __linux__ || defined __FreeBSD__ || defined __NetBSD__ && !defined(__alpine__)
+#if defined __linux__ || defined __FreeBSD__ || defined __NetBSD__
 #define TCP_INFO 1
-#if defined __linux__ && !defined(__alpine__)
+#if defined __linux__
 #include <linux/tcp.h>
 #else
 #include <netinet/tcp.h>

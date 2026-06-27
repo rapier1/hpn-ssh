@@ -16,6 +16,9 @@
  * called by a name other than "ssh" or "Secure Shell".
  */
 
+#include <stdarg.h>	/* va_list (xvasprintf); glibc pulls this in via other
+			 * headers transitively, musl does not */
+
 void	*xmalloc(size_t);
 void	*xcalloc(size_t, size_t);
 void	*xreallocarray(void *, size_t, size_t);

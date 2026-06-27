@@ -6014,6 +6014,23 @@ AC_SUBST([LDFLAGS_NOPIE])
 AC_SUBST([CFLAGS_NOPIE])
 AC_SUBST([COMPATINCLUDES])
 
+# HPN: optional dev build identifier (git commit hash + dirty marker).  Computed
+# here in the (portable) configure shell rather than via a GNU-make ifneq in
+# Makefile.in, so the Makefile stays parseable by BSD make.  Opt in with
+# `GITVERSION=1 ./configure`; git is invoked ONLY then, so release/tarball
+# builds never touch git.  See SSH_HPN_EXTRA in version.h.
+AC_ARG_VAR([GITVERSION], [set to a non-empty value to embed the git commit hash (and -dirty marker) in the version string])
+GITVERSIONFLAG=
+if test -n "$GITVERSION"; then
+	hpn_githash=`git rev-parse --short=8 HEAD 2>/dev/null`
+	if test -n "$hpn_githash"; then
+		hpn_gitdirty=
+		git diff --quiet HEAD 2>/dev/null || hpn_gitdirty=-dirty
+		GITVERSIONFLAG="-DSSH_HPN_EXTRA='\"-g${hpn_githash}${hpn_gitdirty}\"'"
+	fi
+fi
+AC_SUBST([GITVERSIONFLAG])
+
 AC_EXEEXT
 AC_CONFIG_FILES([Makefile buildpkg.sh opensshd.init openssh.xml \
 	openbsd-compat/Makefile openbsd-compat/regress/Makefile \

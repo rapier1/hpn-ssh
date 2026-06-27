@@ -52,7 +52,7 @@
 /* For TCP_INFO + the modern struct tcp_info with tcpi_min_rtt.
  * Glibc's <netinet/tcp.h> has an older struct; <linux/tcp.h> has the
  * full kernel definition. Mirror the conditional from metrics.h. */
-#if defined(__linux__) && !defined(__alpine__)
+#if defined(__linux__)
 #include <linux/tcp.h>
 #elif defined(__FreeBSD__) || defined(__NetBSD__)
 #include <netinet/tcp.h>
@@ -1424,6 +1424,8 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 	u_int32_t target, new_size;
 	socklen_t nslen;
 	time_t now;
+	u_int32_t min_rtt, total_retrans;
+	unsigned long long bytes_recv;
 
 	/* cooldown: probe TCP_INFO at most once per second */
 	now = monotime();
@@ -1437,19 +1439,35 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 		return current_size;
 	}
 
+	/*
+	 * tcpi_min_rtt / tcpi_total_retrans / tcpi_bytes_received are Linux-only
+	 * (via <linux/tcp.h>).  The BSDs' <netinet/tcp.h> lacks them, so fall
+	 * back there: smoothed rtt for the LAN gate, snd_rexmitpack for the
+	 * retransmit count, 0 for received-bytes.  Selector mirrors the header
+	 * choice at the top of this file.
+	 */
+#if defined(__linux__)
+	min_rtt = ti.tcpi_min_rtt;
+	total_retrans = ti.tcpi_total_retrans;
+	bytes_recv = ti.tcpi_bytes_received;
+#else
+	min_rtt = ti.tcpi_rtt;
+	total_retrans = ti.tcpi_snd_rexmitpack;
+	bytes_recv = 0;
+#endif
+
 	/* Diagnostic snapshot every check so we can see why rescue does or
-	 * doesn't fire. tcpi_total_retrans is sender-side, so on the receiver
+	 * doesn't fire. total_retrans is sender-side, so on the receiver
 	 * it's typically 0 - we don't gate on it. */
 	debug_f("rcvbuf check: cur=%u min_rtt=%uus rtt=%uus retrans=%u "
 	    "rcv_space=%u bytes_recv=%llu",
-	    current_size, ti.tcpi_min_rtt, ti.tcpi_rtt,
-	    ti.tcpi_total_retrans, ti.tcpi_rcv_space,
-	    (unsigned long long)ti.tcpi_bytes_received);
+	    current_size, min_rtt, ti.tcpi_rtt,
+	    total_retrans, ti.tcpi_rcv_space, bytes_recv);
 
 	/* skip LAN paths: rescuing on a sub-ms RTT path is pointless */
-	if (ti.tcpi_min_rtt < 5000) {	/* microseconds; 5 ms */
+	if (min_rtt < 5000) {	/* microseconds; 5 ms */
 		debug_f("rcvbuf check: skip (LAN: min_rtt=%uus)",
-		    ti.tcpi_min_rtt);
+		    min_rtt);
 		return current_size;
 	}
 
@@ -1505,7 +1523,7 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 
 	if (new_size > current_size) {
 		debug_f("rcvbuf rescued: %u -> %u (min_rtt=%uus)",
-		    current_size, new_size, ti.tcpi_min_rtt);
+		    current_size, new_size, min_rtt);
 	} else {
 		debug_f("rcvbuf rescue: kernel kept it at %u "
 		    "(likely net.core.rmem_max cap)", new_size);

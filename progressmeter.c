@@ -42,6 +42,7 @@
 
 #include "progressmeter.h"
 #include "atomicio.h"
+#include "log.h"
 #include "misc.h"
 #include "utf8.h"
 

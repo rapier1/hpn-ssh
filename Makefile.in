@@ -53,12 +53,10 @@ CFLAGS= @CFLAGS@
 CFLAGS_NOPIE=@CFLAGS_NOPIE@
 CPPFLAGS=-I. -I$(srcdir) -I$(COMPATINCLUDES) @CPPFLAGS@ $(PATHS) @DEFS@
 # DEV-ONLY build identifier (commit hash + dirty marker).  Enable with
-# `make GITVERSION=1`; git is invoked ONLY then, so plain/release builds are
-# untouched.  See SSH_HPN_EXTRA in version.h.
-GITVERSION=
-ifneq ($(GITVERSION),)
-GITVERSIONFLAG=-DSSH_HPN_EXTRA='"-g$(shell git rev-parse --short=8 HEAD 2>/dev/null)$(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)"'
-endif
+# `GITVERSION=1 ./configure`; the value is computed in configure (portable
+# shell) and substituted here, so this Makefile stays parseable by BSD make.
+# Empty for plain/release builds.  See SSH_HPN_EXTRA in version.h.
+GITVERSIONFLAG=@GITVERSIONFLAG@
 PICFLAG=@PICFLAG@
 LIBS=@LIBS@ -lpthread
 CHANNELLIBS=@CHANNELLIBS@

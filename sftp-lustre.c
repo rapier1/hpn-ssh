@@ -20,7 +20,6 @@
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
-#include <sys/xattr.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
@@ -29,6 +28,17 @@
 
 #include "sftp-hpn-server.h"	/* HPN_FILE_LAYOUT_* */
 #include "sftp-lustre.h"
+
+/*
+ * Lustre is a Linux-only filesystem: the layout ABI uses Linux ioctls and the
+ * Linux xattr API (fsetxattr/getxattr).  Build the real implementation only on
+ * Linux -- which covers glibc and musl/Alpine alike -- and stub the public API
+ * everywhere else (BSD, macOS) so those builds link and report "not Lustre".
+ * (Gating on __linux__, not HAVE_SYS_XATTR_H: macOS has <sys/xattr.h> but no
+ * Lustre and a different getxattr signature.)
+ */
+#ifdef __linux__
+#include <sys/xattr.h>
 
 
 /*
@@ -351,3 +361,50 @@ lustre_set_tiered_layout_path(const char *dir, uint32_t small_threshold,
 	close(fd);
 	return rc;
 }
+
+#else /* !__linux__ -- no Lustre off Linux; stub the API so the build links */
+
+uint32_t
+lustre_set_stripe_fd(int fd, uint32_t requested_count, uint32_t *applied_count)
+{
+	(void)fd; (void)requested_count;
+	if (applied_count != NULL)
+		*applied_count = 0;
+	return HPN_FILE_LAYOUT_NOT_FS;
+}
+
+uint32_t
+lustre_set_tiered_layout_fd(int fd, uint32_t small_threshold,
+    uint32_t overflow_count)
+{
+	(void)fd; (void)small_threshold; (void)overflow_count;
+	return HPN_FILE_LAYOUT_NOT_FS;
+}
+
+int
+lustre_get_stripe(const char *path, uint64_t *stripe_size,
+    uint32_t *stripe_count)
+{
+	(void)path; (void)stripe_size; (void)stripe_count;
+	return 0;
+}
+
+uint32_t
+lustre_set_stripe_path(const char *dir, uint32_t requested_count,
+    uint32_t *applied_count)
+{
+	(void)dir; (void)requested_count;
+	if (applied_count != NULL)
+		*applied_count = 0;
+	return HPN_FILE_LAYOUT_NOT_FS;
+}
+
+uint32_t
+lustre_set_tiered_layout_path(const char *dir, uint32_t small_threshold,
+    uint32_t overflow_count)
+{
+	(void)dir; (void)small_threshold; (void)overflow_count;
+	return HPN_FILE_LAYOUT_NOT_FS;
+}
+
+#endif /* __linux__ */

@@ -34,7 +34,10 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #ifdef HAVE_SYS_VFS_H
-# include <sys/vfs.h>
+# include <sys/vfs.h>		/* Linux: struct statfs / statfs() */
+#elif defined(HAVE_SYS_MOUNT_H)
+# include <sys/param.h>		/* BSD: struct statfs / statfs() */
+# include <sys/mount.h>
 #endif
 
 #include <errno.h>
@@ -43,7 +46,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 

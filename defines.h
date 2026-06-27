@@ -1017,7 +1017,7 @@ struct winsize {
 #endif /* _DEFINES_H */
 
 /* used to enable checking linux kernel versions */
-#if defined(__linux__) && !defined(__alpine__)
+#if defined(__linux__)
 #include <linux/version.h>
 #endif
 
