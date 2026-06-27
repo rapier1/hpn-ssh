@@ -56,6 +56,11 @@ struct sftp_parallel_config {
 	const char  *identity;          /* NULL = rely on agent / default key */
 	const char  *known_hosts;       /* NULL = use system/user default */
 	const char  *config_file;
+	const char  *sftp_server;       /* -s remote subsystem name, or a
+	                                 * server-command path (contains '/');
+	                                 * NULL = default "sftp" subsystem.
+	                                 * Always NULL from scp (no -s subsystem
+	                                 * option there). */
 	char *const *extra_argv;        /* additional -o KEY=VALUE; may be NULL */
 
 	/* Per-worker sftp_init parameters */

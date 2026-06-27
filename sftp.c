@@ -1003,6 +1003,7 @@ static struct {
 	char        *ssh_program;
 	const char  *identity;
 	const char  *config_file;
+	const char  *sftp_server;	/* -s remote subsystem / server path */
 	char       **extra_o;
 	size_t       buflen;
 	size_t       num_requests;
@@ -1011,6 +1012,32 @@ static struct {
 	int          debug_level;
 	int          valid;
 } parallel_launch;
+
+/*
+ * Accumulated "-o KEY=VALUE" options to forward to each parallel-streams
+ * worker SSH connection.  Populated during getopt (the -o case plus the
+ * connection-shaping flags -4/-6/-C/-c/-J, which all have exact -o
+ * equivalents); handed to the orchestrator as pcfg.extra_argv so workers
+ * are built with the same connection options as the main connection.
+ * File scope so parallel_extra_o_add() can append from the option-parsing
+ * switch without threading three locals through every call.
+ */
+static char **parallel_extra_o = NULL;
+static size_t parallel_extra_o_count = 0;
+static size_t parallel_extra_o_cap = 0;
+
+static void
+parallel_extra_o_add(const char *opt)
+{
+	if (parallel_extra_o_count + 2 > parallel_extra_o_cap) {
+		parallel_extra_o_cap = parallel_extra_o_cap ?
+		    parallel_extra_o_cap * 2 : 8;
+		parallel_extra_o = xreallocarray(parallel_extra_o,
+		    parallel_extra_o_cap, sizeof(*parallel_extra_o));
+	}
+	parallel_extra_o[parallel_extra_o_count++] = xstrdup(opt);
+	parallel_extra_o[parallel_extra_o_count] = NULL;
+}
 
 /*
  * Build and start the parallel orchestrator from the captured launch
@@ -1037,6 +1064,7 @@ parallel_orch_launch(struct sftp_conn *conn)
 	pcfg.ssh_binary       = parallel_launch.ssh_program;
 	pcfg.identity         = parallel_launch.identity;
 	pcfg.config_file      = parallel_launch.config_file;
+	pcfg.sftp_server      = parallel_launch.sftp_server;
 	pcfg.extra_argv       = parallel_launch.extra_o;
 	pcfg.transfer_buflen  = (unsigned int)parallel_launch.buflen;
 	pcfg.num_requests     = (unsigned int)parallel_launch.num_requests;
@@ -3415,13 +3443,11 @@ main(int argc, char **argv)
 
 	/* Pass-through state for the parallel-streams ControlMaster.
 	 * Captured during getopt and forwarded into sftp_parallel_config so
-	 * the master and worker connections honor the same -i / -F / -o
-	 * options the user gave the main connection. */
+	 * the master and worker connections honor the same connection options
+	 * the user gave the main connection.  The forwarded -o list lives at
+	 * file scope (parallel_extra_o*, appended via parallel_extra_o_add). */
 	const char *parallel_identity = NULL;
 	const char *parallel_config_file = NULL;
-	char **parallel_extra_o = NULL;
-	size_t parallel_extra_o_count = 0;
-	size_t parallel_extra_o_cap = 0;
 
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
@@ -3501,23 +3527,7 @@ main(int argc, char **argv)
 					snprintf(buf, sizeof(buf),
 					    "HPNBundleSize=%lld", bsv);
 					addargs(&args, "-o%s", buf);
-					if (parallel_extra_o_count + 2 >
-					    parallel_extra_o_cap) {
-						parallel_extra_o_cap =
-						    parallel_extra_o_cap ?
-						    parallel_extra_o_cap * 2
-						    : 8;
-						parallel_extra_o =
-						    xreallocarray(
-						    parallel_extra_o,
-						    parallel_extra_o_cap,
-						    sizeof(*parallel_extra_o));
-					}
-					parallel_extra_o[
-					    parallel_extra_o_count++] =
-					    xstrdup(buf);
-					parallel_extra_o[
-					    parallel_extra_o_count] = NULL;
+					parallel_extra_o_add(buf);
 				}
 			}
 			/* Shift remaining argv left over the consumed slot(s). */
@@ -3532,19 +3542,46 @@ main(int argc, char **argv)
 	while ((ch = getopt(argc, argv,
 	    "1246AVafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:w:X:")) != -1) {
 		switch (ch) {
-		/* Passed through to ssh(1) */
+		/* Passed through to ssh(1).  The connection-shaping flags also
+		 * propagate to parallel-streams workers via their -o
+		 * equivalents (the worker SSH argv is rebuilt from pcfg, not
+		 * from this arglist).  -A (agent forwarding) is deliberately
+		 * not forwarded to data-mover workers. */
 		case 'A':
+			addargs(&args, "-%c", ch);
+			break;
 		case '4':
+			addargs(&args, "-%c", ch);
+			parallel_extra_o_add("AddressFamily=inet");
+			break;
 		case '6':
+			addargs(&args, "-%c", ch);
+			parallel_extra_o_add("AddressFamily=inet6");
+			break;
 		case 'C':
 			addargs(&args, "-%c", ch);
+			parallel_extra_o_add("Compression=yes");
 			break;
-		/* Passed through to ssh(1) with argument */
-		case 'J':
-		case 'c':
+		/* Passed through to ssh(1) with argument; also propagated to
+		 * parallel workers as the -o equivalent. */
+		case 'J': {
+			char *o;
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
+			xasprintf(&o, "ProxyJump=%s", optarg);
+			parallel_extra_o_add(o);
+			free(o);
 			break;
+		}
+		case 'c': {
+			char *o;
+			addargs(&args, "-%c", ch);
+			addargs(&args, "%s", optarg);
+			xasprintf(&o, "Ciphers=%s", optarg);
+			parallel_extra_o_add(o);
+			free(o);
+			break;
+		}
 		case 'F':
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
@@ -3558,17 +3595,7 @@ main(int argc, char **argv)
 		case 'o':
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
-			if (parallel_extra_o_count + 2 > parallel_extra_o_cap) {
-				parallel_extra_o_cap =
-				    parallel_extra_o_cap ?
-				    parallel_extra_o_cap * 2 : 8;
-				parallel_extra_o = xreallocarray(
-				    parallel_extra_o, parallel_extra_o_cap,
-				    sizeof(*parallel_extra_o));
-			}
-			parallel_extra_o[parallel_extra_o_count++] =
-			    xstrdup(optarg);
-			parallel_extra_o[parallel_extra_o_count] = NULL;
+			parallel_extra_o_add(optarg);
 			break;
 		case 'q':
 			ll = SYSLOG_LEVEL_ERROR;
@@ -3900,6 +3927,7 @@ main(int argc, char **argv)
 	parallel_launch.ssh_program  = ssh_program;
 	parallel_launch.identity     = parallel_identity;
 	parallel_launch.config_file  = parallel_config_file;
+	parallel_launch.sftp_server  = sftp_server;
 	parallel_launch.extra_o      = parallel_extra_o;
 	parallel_launch.buflen       = copy_buffer_len;
 	parallel_launch.num_requests = num_requests;

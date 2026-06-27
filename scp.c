@@ -568,12 +568,30 @@ main(int argc, char **argv)
 		case '2':
 			/* Ignored */
 			break;
+		/*
+		 * Connection-shaping flags.  Also propagate to parallel-streams
+		 * (-j) workers via their -o equivalents (the worker SSH argv is
+		 * rebuilt from pcfg, not from these arglists).  -A (agent
+		 * forwarding) is deliberately not forwarded to data workers.
+		 */
 		case 'A':
+			addargs(&args, "-%c", ch);
+			addargs(&remote_remote_args, "-%c", ch);
+			break;
 		case '4':
+			addargs(&args, "-%c", ch);
+			addargs(&remote_remote_args, "-%c", ch);
+			parallel_extra_o_add("AddressFamily=inet");
+			break;
 		case '6':
+			addargs(&args, "-%c", ch);
+			addargs(&remote_remote_args, "-%c", ch);
+			parallel_extra_o_add("AddressFamily=inet6");
+			break;
 		case 'C':
 			addargs(&args, "-%c", ch);
 			addargs(&remote_remote_args, "-%c", ch);
+			parallel_extra_o_add("Compression=yes");
 			break;
 		case 'D':
 			sftp_direct = optarg;
@@ -594,11 +612,11 @@ main(int argc, char **argv)
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
 			/*
-			 * Capture the worker-spawn-relevant options structured
-			 * so the parallel orchestrator (-j) builds matching
-			 * worker SSH connections.  -c (cipher) and -J
-			 * (ProxyJump) ride only on the control connection this
-			 * pass; pass them as -o equivalents for workers.
+			 * Capture the worker-spawn-relevant options so the
+			 * parallel orchestrator (-j) builds matching worker SSH
+			 * connections.  -c (cipher) and -J (ProxyJump) have no
+			 * structured pcfg field, so forward them as their -o
+			 * equivalents (Ciphers= / ProxyJump=).
 			 */
 			if (ch == 'i')
 				parallel_identity = optarg;
@@ -606,6 +624,17 @@ main(int argc, char **argv)
 				parallel_config_file = optarg;
 			else if (ch == 'o')
 				parallel_extra_o_add(optarg);
+			else if (ch == 'c') {
+				char *o;
+				xasprintf(&o, "Ciphers=%s", optarg);
+				parallel_extra_o_add(o);
+				free(o);
+			} else if (ch == 'J') {
+				char *o;
+				xasprintf(&o, "ProxyJump=%s", optarg);
+				parallel_extra_o_add(o);
+				free(o);
+			}
 			break;
 		case 'O':
 			mode = MODE_SCP;

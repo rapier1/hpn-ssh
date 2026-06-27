@@ -174,9 +174,24 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 				argv[argc++] = cfg->extra_argv[i];
 			}
 		}
-		argv[argc++] = "-s";
-		argv[argc++] = user_host;
-		argv[argc++] = "sftp";
+		/*
+		 * Remote subsystem / server-command selection, mirroring the
+		 * main connection (sftp.c): a spec containing '/' is a path to
+		 * a server command run directly (no -s); otherwise it is a
+		 * subsystem name requested with -s (default "sftp").
+		 * cfg->sftp_server carries the user's -s argument (NULL when
+		 * unset; always NULL from scp, which has no -s subsystem).
+		 */
+		if (cfg->sftp_server != NULL &&
+		    strchr(cfg->sftp_server, '/') != NULL) {
+			argv[argc++] = user_host;
+			argv[argc++] = (char *)cfg->sftp_server;
+		} else {
+			argv[argc++] = "-s";
+			argv[argc++] = user_host;
+			argv[argc++] = (char *)(cfg->sftp_server != NULL ?
+			    cfg->sftp_server : "sftp");
+		}
 		argv[argc]   = NULL;
 
 		execvp(ssh_bin, argv);
