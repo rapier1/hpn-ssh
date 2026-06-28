@@ -49,14 +49,6 @@
 #include <sys/queue.h>
 
 #include <netinet/in.h>
-/* For TCP_INFO + the modern struct tcp_info with tcpi_min_rtt.
- * Glibc's <netinet/tcp.h> has an older struct; <linux/tcp.h> has the
- * full kernel definition. Mirror the conditional from metrics.h. */
-#if defined(__linux__)
-#include <linux/tcp.h>
-#elif defined(__FreeBSD__) || defined(__NetBSD__)
-#include <netinet/tcp.h>
-#endif
 #include <arpa/inet.h>
 
 #include <errno.h>
@@ -81,6 +73,7 @@
 #include "log.h"
 #include "misc.h"
 #include "channels.h"
+#include "tcpi-portable.h"	/* cross-platform TCP_INFO / TCP_CONNECTION_INFO accessor */
 #include "compat.h"
 #include "canohost.h"
 #include "pathnames.h"
@@ -1396,7 +1389,6 @@ channel_pre_connecting(struct ssh *ssh, Channel *c)
 	c->io_want = SSH_CHAN_IO_SOCK_W;
 }
 
-#ifdef TCP_INFO
 /*
  * Attempt to forcibly grow SO_RCVBUF on a stuck connection.
  *
@@ -1419,50 +1411,52 @@ static u_int32_t
 channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 {
 	static time_t last_check = 0;
-	struct tcp_info ti;
-	socklen_t tilen = sizeof(ti);
+	struct tcpi_portable t;
 	u_int32_t target, new_size;
 	socklen_t nslen;
 	time_t now;
-	u_int32_t min_rtt, total_retrans;
+	u_int32_t min_rtt, total_retrans, rtt, rcv_space;
 	unsigned long long bytes_recv;
 
-	/* cooldown: probe TCP_INFO at most once per second */
+	/* cooldown: probe the stack at most once per second */
 	now = monotime();
 	if (now - last_check < 1)
 		return current_size;
 	last_check = now;
 
-	if (getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &ti, &tilen) != 0) {
-		debug_f("rcvbuf check: TCP_INFO failed: %s",
+	/*
+	 * Stack metrics via tcpi-portable (TCP_INFO on Linux/BSD,
+	 * TCP_CONNECTION_INFO on macOS).  On a platform with no usable accessor
+	 * this returns nonzero and the rescue no-ops, so this routine carries no
+	 * per-OS conditionals.
+	 */
+	if (tcpi_portable_get(sockfd, &t) != 0) {
+		debug_f("rcvbuf check: stack metrics unavailable: %s",
 		    strerror(errno));
 		return current_size;
 	}
 
 	/*
-	 * tcpi_min_rtt / tcpi_total_retrans / tcpi_bytes_received are Linux-only
-	 * (via <linux/tcp.h>).  The BSDs' <netinet/tcp.h> lacks them, so fall
-	 * back there: smoothed rtt for the LAN gate, snd_rexmitpack for the
-	 * retransmit count, 0 for received-bytes.  Selector mirrors the header
-	 * choice at the top of this file.
+	 * min_rtt / total_retrans / bytes_received are gated by avail_flags:
+	 * Linux supplies all three; the BSDs and macOS have no min_rtt, so the
+	 * LAN gate falls back to smoothed rtt (the value the BSDs always used
+	 * here).
 	 */
-#if defined(__linux__)
-	min_rtt = ti.tcpi_min_rtt;
-	total_retrans = ti.tcpi_total_retrans;
-	bytes_recv = ti.tcpi_bytes_received;
-#else
-	min_rtt = ti.tcpi_rtt;
-	total_retrans = ti.tcpi_snd_rexmitpack;
-	bytes_recv = 0;
-#endif
+	min_rtt = (t.avail_flags & TCPI_AVAIL_MIN_RTT) ? t.min_rtt : t.rtt;
+	total_retrans = (t.avail_flags & TCPI_AVAIL_TOTAL_RETRANS) ?
+	    (u_int32_t)t.total_retrans : 0;
+	bytes_recv = (t.avail_flags & TCPI_AVAIL_BYTES_RECEIVED) ?
+	    t.bytes_received : 0;
+	rtt = t.rtt;
+	rcv_space = t.rcv_space;
 
 	/* Diagnostic snapshot every check so we can see why rescue does or
 	 * doesn't fire. total_retrans is sender-side, so on the receiver
 	 * it's typically 0 - we don't gate on it. */
 	debug_f("rcvbuf check: cur=%u min_rtt=%uus rtt=%uus retrans=%u "
 	    "rcv_space=%u bytes_recv=%llu",
-	    current_size, min_rtt, ti.tcpi_rtt,
-	    total_retrans, ti.tcpi_rcv_space, bytes_recv);
+	    current_size, min_rtt, rtt,
+	    total_retrans, rcv_space, bytes_recv);
 
 	/* skip LAN paths: rescuing on a sub-ms RTT path is pointless */
 	if (min_rtt < 5000) {	/* microseconds; 5 ms */
@@ -1503,17 +1497,9 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 	 * the new buffer size so subsequent ACKs can actually advertise
 	 * the larger window to the peer. Non-fatal on failure.
 	 */
-#ifdef TCP_WINDOW_CLAMP
-	{
-		int clamp = (int)target;
-		if (setsockopt(sockfd, IPPROTO_TCP, TCP_WINDOW_CLAMP,
-		    &clamp, sizeof(clamp)) != 0) {
-			debug_f("rcvbuf rescue: setsockopt("
-			    "TCP_WINDOW_CLAMP=%d) failed: %s",
-			    clamp, strerror(errno));
-		}
-	}
-#endif
+	if (tcpi_portable_clamp_rcvwnd(sockfd, target) != 0)
+		debug_f("rcvbuf rescue: window clamp to %u failed: %s",
+		    target, strerror(errno));
 
 	/* re-read; kernel caps at net.core.rmem_max */
 	nslen = sizeof(new_size);
@@ -1530,7 +1516,6 @@ channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
 	}
 	return new_size;
 }
-#endif /* TCP_INFO */
 
 static int
 channel_tcpwinsz(struct ssh *ssh, Channel *c)
@@ -1557,7 +1542,6 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 		return (2 * 1024 * 1024);
 	}
 
-#ifdef TCP_INFO
 	/* If this channel has rcvbuf rescue enabled, try to forcibly grow
 	 * SO_RCVBUF when the connection looks stuck on a lossy path.  Runs
 	 * before the memlimit / SSHBUF_SIZE_MAX clamps below so the rescue
@@ -1575,13 +1559,11 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 	 * several-fold and lets c->output over-fill on a slow consumer; capping
 	 * to ~BDP tracks the path and bounds memory. */
 	{
-		struct tcp_info ti;
-		socklen_t tilen = sizeof(ti);
+		struct tcpi_portable t;
 
-		if (getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &ti, &tilen) == 0 &&
-		    ti.tcpi_rcv_space > 0) {
+		if (tcpi_portable_get(sockfd, &t) == 0 && t.rcv_space > 0) {
 			u_int32_t bdp_cap = (u_int32_t)MINIMUM(
-			    (uint64_t)ti.tcpi_rcv_space *
+			    (uint64_t)t.rcv_space *
 			    CHANNEL_WINDOW_RCVSPACE_PCT / 100,
 			    (uint64_t)0xffffffffU);
 			if (bdp_cap < CHANNEL_OUTPUT_HWM_FLOOR)
@@ -1590,7 +1572,6 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 				tcpwinsz = bdp_cap;
 		}
 	}
-#endif
 
 	/* cap the channel window at the configured HPN memory limit */
 	if (tcpwinsz > memlimit_cap)

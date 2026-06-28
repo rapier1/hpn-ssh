@@ -62,6 +62,7 @@
 #define TCPI_AVAIL_RWND_LIMITED		(1u << 6)
 #define TCPI_AVAIL_RCV_WND		(1u << 7)	/* Linux 6.2+ */
 #define TCPI_AVAIL_TOTAL_RTO		(1u << 8)	/* Linux 6.7+ (the trio) */
+#define TCPI_AVAIL_BYTES_RECEIVED	(1u << 9)	/* Linux tcpi_bytes_received */
 
 struct tcpi_portable {
 	/*
@@ -81,6 +82,7 @@ struct tcpi_portable {
 
 	/* Tier 1.5 + Tier 2 -- valid only where avail_flags says so. */
 	u_int64_t	total_retrans;	/* cumulative retransmits (sender side) */
+	u_int64_t	bytes_received;	/* cumulative bytes received (Linux only) */
 	u_int32_t	segs_out;	/* segments sent */
 	u_int32_t	min_rtt;	/* minimum observed RTT, microseconds */
 	u_int32_t	notsent_bytes;	/* bytes queued but not yet sent */
@@ -116,5 +118,16 @@ int	tcpi_portable_get(int fd, struct tcpi_portable *out);
  * TCP_INFO-driven code path.
  */
 int	tcpi_portable_supported(void);
+
+/*
+ * Best-effort write op: clamp the advertised receive window on a connected
+ * TCP socket to `bytes` (Linux: setsockopt(TCP_WINDOW_CLAMP)).  Returns 0
+ * when the clamp was applied, and also when the platform has no such option
+ * (a silent no-op -- e.g. the BSDs and macOS); returns -1 (errno set) only
+ * if an attempt was made and the setsockopt failed.  This is the first write
+ * member of the interface: tcpi-portable is the portable TCP-stack accessor,
+ * reads and the few tuning writes HPN needs, not a read-only metrics view.
+ */
+int	tcpi_portable_clamp_rcvwnd(int fd, u_int32_t bytes);
 
 #endif /* TCPI_PORTABLE_H */

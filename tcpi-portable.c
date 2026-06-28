@@ -119,6 +119,9 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	out->segs_out = (u_int32_t)tci.tcpi_txpackets;
 	out->avail_flags |= TCPI_AVAIL_SEGS_OUT;
 
+	out->bytes_received = tci.tcpi_rxbytes;
+	out->avail_flags |= TCPI_AVAIL_BYTES_RECEIVED;
+
 	return 0;
 }
 
@@ -204,6 +207,12 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	 * BSDs (not merely old-kernel), so they stay unflagged off Linux.
 	 */
 #if defined(__linux__)
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
+	if (TCPI_FIELD_IN(tilen, tcpi_bytes_received)) {
+		out->bytes_received = ti.tcpi_bytes_received;
+		out->avail_flags |= TCPI_AVAIL_BYTES_RECEIVED;
+	}
+# endif
 # if LINUX_VERSION_CODE >= KERNEL_VERSION(4,2,0)
 	if (TCPI_FIELD_IN(tilen, tcpi_segs_out)) {
 		out->segs_out = ti.tcpi_segs_out;
@@ -278,3 +287,24 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 }
 
 #endif /* TCPI_PORTABLE_SUPPORTED */
+
+/*
+ * Clamp the advertised receive window to `bytes`.  Compiled on every platform
+ * (independent of the read path above): where TCP_WINDOW_CLAMP exists (Linux)
+ * it applies the clamp; elsewhere it is a silent no-op.  Returns 0 on success
+ * or no-op, -1 only if an attempted setsockopt failed.
+ */
+int
+tcpi_portable_clamp_rcvwnd(int fd, u_int32_t bytes)
+{
+#ifdef TCP_WINDOW_CLAMP
+	int clamp = (int)bytes;
+
+	return setsockopt(fd, IPPROTO_TCP, TCP_WINDOW_CLAMP,
+	    &clamp, sizeof(clamp));
+#else
+	(void)fd;
+	(void)bytes;
+	return 0;	/* no such option on this platform: silent no-op */
+#endif
+}
