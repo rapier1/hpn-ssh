@@ -809,6 +809,32 @@ process_init(void)
 	}
 	compose_extension(msg, HPN_EXT_FILE_LAYOUT, "1");
 
+	/*
+	 * HPN: advertise the operator's per-user parallel-worker cap so the
+	 * client orchestrator can self-limit -j.  The value is the resolved
+	 * sshd_config HPNMaxConcurrentWorkers, handed down by session.c via
+	 * the HPN_MAX_CONCURRENT_WORKERS environment variable (0 = no cap;
+	 * absent env, e.g. a standalone server, is treated as 0).  This is an
+	 * advisory advertisement, not a request type, so it is emitted as a
+	 * plain name/value pair rather than via compose_extension (which
+	 * requires a request handler).  A stock OpenSSH server never sends
+	 * this, which the client reads as "no policy" and applies its own
+	 * conservative default.
+	 */
+	{
+		const char *e = getenv("HPN_MAX_CONCURRENT_WORKERS");
+		long cap = (e != NULL && *e != '\0') ? strtol(e, NULL, 10) : 0;
+		char capbuf[16];
+
+		if (cap < 0)
+			cap = 0;
+		snprintf(capbuf, sizeof(capbuf), "%ld", cap);
+		if ((r = sshbuf_put_cstring(msg,
+		    "hpn-max-workers@hpnssh.org")) != 0 ||
+		    (r = sshbuf_put_cstring(msg, capbuf)) != 0)
+			fatal_fr(r, "compose hpn-max-workers");
+	}
+
 	send_msg(msg);
 	sshbuf_free(msg);
 }

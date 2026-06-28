@@ -1246,6 +1246,44 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	if (parallel_num_streams <= 1)
 		return;			/* single-stream: no orchestrator */
 
+	/*
+	 * HPN: clamp the requested worker count to the server's advertised
+	 * per-user cap (hpn-max-workers@hpnssh.org, read at sftp_init):
+	 *   cap < 0  -> not advertised (stock / non-HPN server): apply the
+	 *               conservative no-policy default.
+	 *   cap == 0 -> HPN server with no admin cap: honour the request.
+	 *   cap > 0  -> HPN server policy: clamp to it.
+	 * (The hard SFTP_PARALLEL_MAX_WORKERS ceiling is enforced at parse.)
+	 */
+	{
+		static int worker_cap_applied = 0;
+		if (!worker_cap_applied) {
+			int cap = sftp_hpn_max_workers_cap(conn);
+			int requested = parallel_num_streams;
+			int eff = requested;
+
+			if (cap < 0)
+				eff = MINIMUM(requested,
+				    HPN_NO_POLICY_WORKER_DEFAULT);
+			else if (cap > 0)
+				eff = MINIMUM(requested, cap);
+			if (eff < requested) {
+				if (cap < 0)
+					logit("Parallel streams limited to %d "
+					    "(server advertises no policy; "
+					    "requested %d)", eff, requested);
+				else
+					logit("Parallel streams limited to %d "
+					    "by server policy (requested %d)",
+					    eff, requested);
+				parallel_num_streams = eff;
+			}
+			worker_cap_applied = 1;
+		}
+	}
+	if (parallel_num_streams <= 1)
+		return;			/* clamped down to single-stream */
+
 	memset(&pcfg, 0, sizeof(pcfg));
 	pcfg.num_streams   = parallel_num_streams;
 	pcfg.host          = host;
@@ -1269,8 +1307,11 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	pcfg.print_flag    = showprogress ? SFTP_PROGRESS_ONLY : SFTP_QUIET;
 	/*
 	 * Resolves HPNUseBundle, HPNMaxRetries, HPNBundleSize,
-	 * HPNMaxConcurrentWorkers and HPNVerifyTransfer into pcfg from
+	 * HPNMaxAuthConcurrent and HPNVerifyTransfer into pcfg from
 	 * ssh_config + the -o overrides; must run before sftp_parallel_start.
+	 * (The per-user worker cap, HPNMaxConcurrentWorkers, is a server-side
+	 * option delivered over the wire via hpn-max-workers@hpnssh.org and
+	 * applied above, not resolved from client ssh_config.)
 	 */
 	(void)sftp_parallel_apply_ssh_config(&pcfg, host,
 	    parallel_config_file, parallel_extra_o);

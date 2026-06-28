@@ -145,6 +145,11 @@ struct sftp_conn {
 #define SFTP_EXT_HASH_RANGE		0x00004000
 #define SFTP_EXT_HPN_FILE_LAYOUT	0x00008000
 	u_int exts;
+	/* HPN: operator's per-user parallel-worker cap advertised by the
+	 * server in SSH2_FXP_VERSION (hpn-max-workers@hpnssh.org).
+	 * -1 = not advertised (stock / non-HPN server); 0 = advertised with
+	 * no cap (HPN server, admin set none); N>0 = advertised cap. */
+	int hpn_max_workers_cap;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
 	struct sshbuf *msg;	/* persistent message buffer, reset by send_msg/get_msg */
@@ -594,6 +599,7 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	/* HPN: seed the adaptive read-ahead controller with -R as its ceiling. */
 	sftp_hpn_rdahead_init(ret->hpn, ret->num_requests);
 	ret->exts = 0;
+	ret->hpn_max_workers_cap = -1;	/* -1 until/unless the server advertises */
 	ret->limit_kbps = 0;
 
 	if ((ret->msg = sshbuf_new()) == NULL)
@@ -709,6 +715,22 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 			 * sftp-hpn-server.h for wire format. */
 			ret->exts |= SFTP_EXT_HPN_FILE_LAYOUT;
 			known = 1;
+		} else if (strcmp(name, "hpn-max-workers@hpnssh.org") == 0) {
+			/* Operator's per-user parallel-worker cap.  The value
+			 * is a decimal count, not a revision: 0 = HPN server
+			 * with no cap, N>0 = cap.  The orchestrator clamps -j
+			 * to it (and applies a conservative default when this
+			 * is absent, i.e. a non-HPN server). */
+			const char *errstr = NULL;
+			long long v = strtonum((char *)value, 0,
+			    1000000, &errstr);
+			/* Parse generously; the orchestrator clamps to the
+			 * hard SFTP_PARALLEL_MAX_WORKERS ceiling. */
+			if (errstr == NULL)
+				ret->hpn_max_workers_cap = (int)v;
+			else
+				ret->hpn_max_workers_cap = 0; /* malformed = no cap */
+			known = 1;
 		}
 		if (known) {
 			debug2("Server supports extension \"%s\" revision %s",
@@ -773,6 +795,18 @@ u_int
 sftp_proto_version(struct sftp_conn *conn)
 {
 	return conn->version;
+}
+
+/*
+ * HPN: the operator's per-user parallel-worker cap as advertised by the
+ * server (hpn-max-workers@hpnssh.org).  Returns -1 when the server did not
+ * advertise it (a stock / non-HPN server), 0 when advertised with no cap,
+ * or the positive cap otherwise.  The orchestrator uses this to clamp -j.
+ */
+int
+sftp_hpn_max_workers_cap(struct sftp_conn *conn)
+{
+	return conn->hpn_max_workers_cap;
 }
 
 /* HPN: thin wrappers - logic lives in sftp-hpn-client.c */

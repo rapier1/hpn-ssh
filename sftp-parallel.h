@@ -554,4 +554,14 @@ uint64_t sftp_parallel_drain_verify_failures(struct sftp_parallel *p,
  */
 #define SFTP_PARALLEL_MAX_WORKERS 24
 
+/*
+ * Conservative worker count the orchestrator falls back to when the server
+ * advertises no parallel-worker policy (hpn-max-workers@hpnssh.org absent,
+ * i.e. a stock / non-HPN server).  Keeps an HPN client from opening a large
+ * burst of connections to a server that expressed no preference and may not
+ * be sized for it.  An HPN server that advertises the extension with value 0
+ * ("no cap") is honoured up to SFTP_PARALLEL_MAX_WORKERS instead.
+ */
+#define HPN_NO_POLICY_WORKER_DEFAULT 8
+
 #endif /* _SFTP_PARALLEL_H */

@@ -132,6 +132,13 @@ int sftp_conn_is_protocol_violation(struct sftp_conn *);
 
 u_int sftp_proto_version(struct sftp_conn *);
 
+/*
+ * HPN: server-advertised per-user parallel-worker cap.
+ * -1 = not advertised (stock/non-HPN server); 0 = advertised, no cap;
+ * N>0 = advertised cap.  Used by the orchestrator to clamp -j.
+ */
+int sftp_hpn_max_workers_cap(struct sftp_conn *);
+
 /* Query server limits */
 int sftp_get_limits(struct sftp_conn *, struct sftp_limits *);
 

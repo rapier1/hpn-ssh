@@ -1053,6 +1053,44 @@ parallel_orch_launch(struct sftp_conn *conn)
 
 	if (!parallel_launch.valid)
 		return;
+
+	/*
+	 * HPN: clamp the requested worker count to the server's advertised
+	 * per-user cap (hpn-max-workers@hpnssh.org, read at sftp_init):
+	 *   cap < 0  -> not advertised (stock / non-HPN server): apply the
+	 *               conservative no-policy default.
+	 *   cap == 0 -> HPN server with no admin cap: honour the request
+	 *               (already bounded by SFTP_PARALLEL_MAX_WORKERS at parse).
+	 *   cap > 0  -> HPN server policy: clamp to it.
+	 * Done once (re-launch after an interrupt keeps the effective count).
+	 */
+	{
+		static int worker_cap_applied = 0;
+		if (!worker_cap_applied && parallel_num_streams > 1) {
+			int cap = sftp_hpn_max_workers_cap(conn);
+			int requested = parallel_num_streams;
+			int eff = requested;
+
+			if (cap < 0)
+				eff = MINIMUM(requested,
+				    HPN_NO_POLICY_WORKER_DEFAULT);
+			else if (cap > 0)
+				eff = MINIMUM(requested, cap);
+			if (eff < requested) {
+				if (cap < 0)
+					logit("Parallel streams limited to %d "
+					    "(server advertises no policy; "
+					    "requested %d)", eff, requested);
+				else
+					logit("Parallel streams limited to %d "
+					    "by server policy (requested %d)",
+					    eff, requested);
+				parallel_num_streams = eff;
+			}
+			worker_cap_applied = 1;
+		}
+	}
+
 	memset(&pcfg, 0, sizeof(pcfg));
 	pcfg.num_streams      = parallel_num_streams;
 	pcfg.host             = parallel_launch.host;

@@ -911,18 +911,37 @@ of the HPN code produces a net decrease in performance. In these cases it is
 helpful to disable the HPN functionality. By default HPNDisabled is set to
 .Cm no.
 .It Cm HPNMaxConcurrentWorkers
-Sets a hard per-user cap on the number of concurrent parallel-streams
-transfer worker channels that one authenticated user may have open at once.
-These are the SFTP-subsystem connections
+Advertises a per-user cap on the number of concurrent parallel-streams
+transfer workers that an HPN-SSH client should open to this server.
+These workers are the additional SFTP-subsystem connections that
 .Xr hpnsftp 1
-opens when run with
+and
+.Xr hpnscp 1
+open when run with
 .Cm -j .
-The cap is enforced across processes via a per-user counter file under
-.Pa /var/run/hpnssh/workers/ .
+The value is sent to the client during the SFTP handshake; a cooperating
+HPN-SSH client clamps its requested worker count to it and reports the
+reduction to the user.
 The argument is an integer;
 .Cm 0 ,
-the default, means no cap. Connections beyond the cap are refused until
-earlier workers finish.
+the default, advertises
+.Dq no cap ,
+in which case HPN clients fall back to their built-in worker ceiling.
+.Pp
+This control is advisory.
+It constrains cooperating HPN clients only; it does not refuse connections
+and is not a hard enforcement boundary, so a client that ignores the
+advertisement (including any non-HPN client) is unaffected.
+For hard limits, use
+.Cm MaxStartups
+and
+.Cm PerSourceMaxStartups
+to bound connection floods, and operating-system facilities such as PAM
+.Cm maxlogins
+or cgroup memory limits for per-user resource caps.
+It may be used in a
+.Cm Match
+block to apply different caps to different users.
 .It Cm HPNMemoryLimit
 Sets the upper bound on the memory HPN-SSH uses for a single channel's
 dynamic receive buffer, which governs how large the receive window may grow
