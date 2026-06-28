@@ -181,6 +181,18 @@ stop_and_join_pregen_threads(struct aes_mt_ctx_st *aes_mt_ctx)
  * note this function updates two globals - numkq and cipher_threads
  * it returns the value of cipher_threads but it doesn't need to */
 static int get_thread_count() {
+	/*
+	 * cipher_threads and numkq are process-global and deterministic
+	 * (SSH_CIPHER_THREADS cannot change mid-process), so compute them
+	 * exactly once.  Rewriting them on every newkeys/rekey raced the
+	 * running cipher threads that read numkq (flagged by TSan); once set,
+	 * later callers reuse the cached values.  Only ever called from the
+	 * main thread (via aes_mt_newctx_*), so the static guard needs no lock.
+	 */
+	static int computed = 0;
+
+	if (computed)
+		return (cipher_threads);
 
 	char * aes_threads = getenv("SSH_CIPHER_THREADS");
 	debug_f ("SSH thread count is %s", aes_threads);
@@ -202,6 +214,7 @@ static int get_thread_count() {
 
 	debug_f ("Starting %d threads and %d queues\n", cipher_threads, numkq);
 
+	computed = 1;
 	return (cipher_threads);
 }
 
