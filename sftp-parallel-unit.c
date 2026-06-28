@@ -1012,13 +1012,18 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 		parallel_unit_free(u);
 		return -1;
 	}
+	/* u is contractually non-NULL (callers build units via make_unit() /
+	 * xcalloc, which fatal on OOM).  Guard once here so the derefs below
+	 * need no per-site NULL check. */
+	if (u == NULL)
+		return -1;
 	/* Bundle-eligibility gate: when bundle mode is enabled and the
 	 * unit's file size exceeds the per-target threshold, mark it
 	 * ineligible so the worker routes it through the single-file
 	 * path (which may further range-split it).  Range and resume
 	 * units are never bundle-eligible regardless of size - handled
 	 * by their op-type elsewhere. */
-	if (u != NULL && p->cfg.use_bundle && u->size > 0 &&
+	if (p->cfg.use_bundle && u->size > 0 &&
 	    (uint64_t)u->size > bundle_file_size_max_for(p)) {
 		u->bundle_ineligible = 1;
 	}
@@ -1027,7 +1032,7 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 	 * rather than racing to accumulate one.  Everything else - large/range/
 	 * resume units, and worker re-submits (always bundle_ineligible) - takes
 	 * the individual path below. */
-	if (u != NULL && p->cfg.use_bundle && !u->bundle_ineligible &&
+	if (p->cfg.use_bundle && !u->bundle_ineligible &&
 	    (u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_DOWNLOAD))
 		return parallel_bundle_add(p, u);
 	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
