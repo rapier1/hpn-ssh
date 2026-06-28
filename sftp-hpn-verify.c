@@ -48,7 +48,7 @@
  * it so a multi-attempt repair bails promptly on Ctrl-C instead of grinding
  * through the remaining attempts.
  */
-extern volatile sig_atomic_t interrupted;
+extern _Atomic sig_atomic_t interrupted;
 
 /* ── BEGIN sftp-hash-range: client-side helpers ───────────────────────────
  *

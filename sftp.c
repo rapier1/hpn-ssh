@@ -160,8 +160,10 @@ static int verify_flag_user = 0;	/* -V program switch -> hpn_verify_transfer */
 static char **verify_fail_list = NULL;
 static u_int verify_fail_count = 0;
 
-/* SIGINT received during command processing */
-volatile sig_atomic_t interrupted = 0;
+/* SIGINT received during command processing.  _Atomic (lock-free): set by the
+ * signal handler and the main loop, read by parallel worker/reporter threads;
+ * the qualifier makes those cross-thread reads race-free (was TSan-flagged). */
+_Atomic sig_atomic_t interrupted = 0;
 
 /*
  * Toggle the post-transfer whole-file verify phase for the next command on

@@ -724,7 +724,7 @@ sftp_parallel_abort(struct sftp_parallel *p)
 
 void
 sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
-    volatile sig_atomic_t *flag)
+    _Atomic sig_atomic_t *flag)
 {
 	if (p != NULL)
 		p->ext_interrupt_flag = flag;

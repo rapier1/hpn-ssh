@@ -1425,7 +1425,11 @@ struct sftp_parallel {
 	 * sftp_parallel_abort() as soon as *ext_interrupt_flag becomes
 	 * non-zero, which wakes sftp_parallel_wait() within one reporter
 	 * tick (~200ms) rather than waiting for workers to finish naturally. */
-	volatile sig_atomic_t      *ext_interrupt_flag;
+	/* Atomic pointer to an atomic flag: written once by the orchestrator
+	 * (main) in set_interrupt_flag while the reporter thread is already
+	 * polling it, so both the pointer and the pointed-to flag are accessed
+	 * across threads (TSan-flagged data race; _Atomic removes it). */
+	_Atomic sig_atomic_t * _Atomic ext_interrupt_flag;
 
 	/*
 	 * App-layer RTT measured on the control connection at startup
@@ -1454,7 +1458,7 @@ struct sftp_parallel {
 	 * (and not a frozen 100% transfer bar) for the duration of the phase.
 	 * verify_meter_total is the bytes transferred this command (= bytes to
 	 * verify); verify_total_units is the SFTP_OP_VERIFY unit count. */
-	int                         verify_phase_active;
+	_Atomic int                 verify_phase_active; /* main-set, reporter-read */
 	uint64_t                    verify_total_units;
 	uint64_t                    verify_done_units;   /* atomic; worker-bumped */
 	/* Byte-granular verify progress: bytes hashed for FULLY verified files
@@ -1466,7 +1470,9 @@ struct sftp_parallel {
 	off_t                       verify_meter_total;
 
 	int                         started;
-	int                         stopped;
+	/* Set by main in sftp_parallel_stop() while reporter/respawn/worker
+	 * threads still poll it; _Atomic removes the cross-thread race. */
+	_Atomic int                 stopped;
 
 	/*
 	 * Synchronous-stall detector state.  Touched only by the reporter's

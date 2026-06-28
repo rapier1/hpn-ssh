@@ -60,7 +60,7 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
-extern volatile sig_atomic_t interrupted;
+extern _Atomic sig_atomic_t interrupted;
 extern int showprogress;
 
 /*

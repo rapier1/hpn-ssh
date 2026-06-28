@@ -124,7 +124,8 @@ struct sftp_parallel_config {
 	uint64_t     bundle_size;
 
 	/* Transfer flags applied to every submitted unit */
-	int          preserve_flag;
+	/* _Atomic: per-command set_preserve() (main) races worker reads */
+	_Atomic int  preserve_flag;
 	int          resume_flag;
 	int          fsync_flag;
 	int          inplace_flag;
@@ -406,7 +407,7 @@ void sftp_parallel_abort(struct sftp_parallel *p);
  * clear a previously registered flag.
  */
 void sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
-    volatile sig_atomic_t *flag);
+    _Atomic sig_atomic_t *flag);
 
 /*
  * Enable/disable the post-transfer verify phase for work submitted from here
