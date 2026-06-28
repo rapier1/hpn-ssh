@@ -11,8 +11,6 @@
 
 tid="sftp verified resume gate and HPNVerifyTransfer"
 
-VCFG=${OBJ}/sftp-verify-ssh_config
-
 # Need a source large enough that a full-file hash is meaningful.
 increase_datafile_size 512
 
@@ -55,30 +53,27 @@ echo "reputv ${COPY}.1 ${COPY}.2" | \
     fail "reputv (identical) failed"
 cmp ${COPY}.1 ${COPY}.2 || fail "reputv corrupted an identical file"
 
-# ---- Part 2: HPNVerifyTransfer post-transfer check (config-driven) ----
-# Resolved from ssh_config for the host, so write a config that enables it
-# and run a normal transfer over the test sshd.  A clean transfer must
-# verify successfully: exit 0 and no "VERIFY FAILED" output.
+# ---- Part 2: -V whole-file verify (post-transfer integrity check) ----
+# -V is the program switch that replaced the old HPNVerifyTransfer
+# ssh_config option.  A clean transfer must verify successfully: exit 0
+# and no "VERIFY FAILED" output.
 
 start_sshd
 
-cp $OBJ/ssh_config ${VCFG}
-echo "HPNVerifyTransfer yes" >> ${VCFG}
-
-verbose "$tid: HPNVerifyTransfer clean upload verifies (no false positive)"
+verbose "$tid: -V clean upload verifies (no false positive)"
 rm -f ${COPY}.2
 echo "put ${DATA} ${COPY}.2" | \
-    ${SFTP} -q -S "$SSH" -F ${VCFG} -P ${PORT} -o BatchMode=yes \
+    ${SFTP} -V -q -S "$SSH" -F $OBJ/ssh_config -P ${PORT} -o BatchMode=yes \
     -b - ${USER}@somehost > ${OBJ}/verify.out 2>&1
 r=$?
 if [ $r -ne 0 ]; then
-	fail "HPNVerifyTransfer clean upload exit $r (expected 0)"
 	cat ${OBJ}/verify.out >&2
+	fail "-V clean upload exit $r (expected 0)"
 fi
-cmp ${DATA} ${COPY}.2 || fail "HPNVerifyTransfer upload corrupted the file"
+cmp ${DATA} ${COPY}.2 || fail "-V upload corrupted the file"
 if grep -q "VERIFY FAILED" ${OBJ}/verify.out; then
-	fail "HPNVerifyTransfer reported a false-positive mismatch on a clean transfer"
+	fail "-V reported a false-positive mismatch on a clean transfer"
 fi
 
 stop_sshd
-rm -f ${COPY}.1 ${COPY}.2 ${VCFG} ${OBJ}/verify.out
+rm -f ${COPY}.1 ${COPY}.2 ${OBJ}/verify.out
