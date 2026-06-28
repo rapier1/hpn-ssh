@@ -23,18 +23,27 @@ scpclean() {
 }
 
 # The resume function uses xxhash (bundled, header-only) -- no OpenSSL needed.
-# Test both legacy SCP protocol (-O -Z) and normal SFTP-path (-Z), and both
-# put and get directions.
+# Verified resume (-Z) is SFTP-only: confirm the legacy SCP protocol (-O)
+# refuses it, then exercise the supported SFTP path for both put and get.
 
-for mode in legacy sftp; do
-	if test $mode = legacy; then
-		# -O forces legacy SCP protocol; -S wires in the ssh wrapper
-		scpopts="-O -S ${OBJ}/scp-ssh-wrapper.scp"
-		tag="$tid: legacy (-O)"
-	else
-		scpopts="-D ${SFTPSERVER}"
-		tag="$tid: sftp"
-	fi
+# Verified resume (-Z) is SFTP-only.  Confirm the legacy SCP protocol (-O)
+# refuses the combination loudly instead of silently degrading.
+verbose "$tid: legacy (-O) -Z is refused"
+scpclean
+rm -f ${COPY}.1 ${COPY}.2
+cp ${DATA} ${COPY}.1
+touch ${COPY}.2
+$SCP -Z -O -S ${OBJ}/scp-ssh-wrapper.scp ${COPY}.1 somehost:${COPY}.2 \
+    2>${OBJ}/scp-resume.err && \
+    fail "$tid: legacy (-O) -Z was accepted, expected refusal"
+grep -q "requires SFTP mode" ${OBJ}/scp-resume.err || \
+    fail "$tid: legacy (-O) -Z did not fail with the expected message"
+rm -f ${OBJ}/scp-resume.err
+
+# Full verified-resume matrix over the supported SFTP path.
+for mode in sftp; do
+	scpopts="-D ${SFTPSERVER}"
+	tag="$tid: sftp"
 
 	for direction in put get; do
 		for size in 0 1k size-1 larger corrupt same; do
