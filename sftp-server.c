@@ -77,6 +77,15 @@ static int init_done;
 /* Disable writes */
 static int readonly;
 
+/*
+ * HPN: operator's per-user parallel-worker cap (HPNMaxConcurrentWorkers),
+ * passed in by sshd on the command line (-W) so process_init can advertise
+ * it to the client as hpn-max-workers@hpnssh.org.  0 = no cap.  Delivered
+ * via argv rather than an environment variable so a user cannot override it
+ * (e.g. through PermitUserEnvironment).
+ */
+static int hpn_max_concurrent_workers;
+
 /* Requests that are allowed/denied */
 static char *request_allowlist, *request_denylist;
 
@@ -812,23 +821,19 @@ process_init(void)
 	/*
 	 * HPN: advertise the operator's per-user parallel-worker cap so the
 	 * client orchestrator can self-limit -j.  The value is the resolved
-	 * sshd_config HPNMaxConcurrentWorkers, handed down by session.c via
-	 * the HPN_MAX_CONCURRENT_WORKERS environment variable (0 = no cap;
-	 * absent env, e.g. a standalone server, is treated as 0).  This is an
-	 * advisory advertisement, not a request type, so it is emitted as a
-	 * plain name/value pair rather than via compose_extension (which
-	 * requires a request handler).  A stock OpenSSH server never sends
-	 * this, which the client reads as "no policy" and applies its own
-	 * conservative default.
+	 * sshd_config HPNMaxConcurrentWorkers, handed to this process by sshd
+	 * on the command line (-W, see hpn_max_concurrent_workers; 0 = no cap;
+	 * a standalone server with no -W defaults to 0).  This is an advisory
+	 * advertisement, not a request type, so it is emitted as a plain
+	 * name/value pair rather than via compose_extension (which requires a
+	 * request handler).  A stock OpenSSH server never sends this, which the
+	 * client reads as "no policy" and applies its own conservative default.
 	 */
 	{
-		const char *e = getenv("HPN_MAX_CONCURRENT_WORKERS");
-		long cap = (e != NULL && *e != '\0') ? strtol(e, NULL, 10) : 0;
 		char capbuf[16];
 
-		if (cap < 0)
-			cap = 0;
-		snprintf(capbuf, sizeof(capbuf), "%ld", cap);
+		snprintf(capbuf, sizeof(capbuf), "%d",
+		    hpn_max_concurrent_workers);
 		if ((r = sshbuf_put_cstring(msg,
 		    "hpn-max-workers@hpnssh.org")) != 0 ||
 		    (r = sshbuf_put_cstring(msg, capbuf)) != 0)
@@ -2126,8 +2131,21 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 	pw = pwcopy(user_pw);
 
 	while (!skipargs && (ch = getopt(argc, argv,
-	    "d:f:l:P:p:Q:u:cehR")) != -1) {
+	    "d:f:l:P:p:Q:u:W:cehR")) != -1) {
 		switch (ch) {
+		case 'W': {
+			/* HPN: per-user parallel-worker cap from sshd (see the
+			 * hpn_max_concurrent_workers global).  0 = no cap. */
+			const char *werr = NULL;
+			hpn_max_concurrent_workers =
+			    (int)strtonum(optarg, 0, 1000000, &werr);
+			if (werr != NULL) {
+				error("Invalid -W worker cap \"%s\": %s",
+				    optarg, werr);
+				hpn_max_concurrent_workers = 0;
+			}
+			break;
+		}
 		case 'Q':
 			if (strcasecmp(optarg, "requests") != 0) {
 				fprintf(stderr, "Invalid query type\n");

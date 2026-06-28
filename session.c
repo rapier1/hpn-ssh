@@ -1050,10 +1050,13 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 		child_set_env(&env, &envsize, "HPN_USE_BUNDLE", tmp);
 		snprintf(tmp, sizeof(tmp), "%d", options.hpn_writer_pool);
 		child_set_env(&env, &envsize, "HPN_WRITER_POOL", tmp);
-		snprintf(tmp, sizeof(tmp), "%d",
-		    options.hpn_max_concurrent_workers);
-		child_set_env(&env, &envsize,
-		    "HPN_MAX_CONCURRENT_WORKERS", tmp);
+		/*
+		 * HPNMaxConcurrentWorkers is deliberately NOT exported as an
+		 * environment variable: under PermitUserEnvironment a user could
+		 * override it and lift their own cap.  It is handed to the
+		 * hpnsftp-server on the command line (-W) in session_subsystem_req
+		 * instead, where the user cannot influence it.
+		 */
 	}
 
 	if (getenv("TZ"))
@@ -1980,7 +1983,27 @@ session_subsystem_req(struct ssh *ssh, Session *s)
 			    options.subsystem_name[i]);
 			channel_set_xtype(ssh, s->chanid, type);
 			free(type);
-			success = do_exec(ssh, s, cmd) == 0;
+			if (s->is_subsystem == SUBSYSTEM_EXT &&
+			    strcmp(s->subsys, "sftp") == 0) {
+				/*
+				 * HPN: hand the operator's per-user parallel-
+				 * worker cap (HPNMaxConcurrentWorkers) to the
+				 * hpnsftp-server via argv so it can advertise it
+				 * (hpn-max-workers@hpnssh.org).  Argv, not an
+				 * environment variable, so a user cannot override
+				 * it under PermitUserEnvironment.  This couples
+				 * the daemon to an hpnsftp-server that understands
+				 * -W; a stock or older server configured as the
+				 * sftp subsystem would reject the flag.
+				 */
+				char *hpncmd;
+				xasprintf(&hpncmd, "%s -W %d", cmd,
+				    options.hpn_max_concurrent_workers);
+				success = do_exec(ssh, s, hpncmd) == 0;
+				free(hpncmd);
+			} else {
+				success = do_exec(ssh, s, cmd) == 0;
+			}
 			break;
 		}
 	}

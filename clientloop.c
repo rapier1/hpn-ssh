@@ -3077,7 +3077,7 @@ client_request_parallel_worker(struct ssh *ssh)
 void client_request_metrics(struct ssh *ssh) {
 	int r;
 
-	debug_f("Asking server for TCP stack metrics");
+	debug3_f("Asking server for TCP stack metrics");
 	/* create a pakcet of GLOBAL_REQUEST type */
 	if ((r = sshpkt_start(ssh, SSH2_MSG_GLOBAL_REQUEST)) != 0 ||
 	    /* define the type of GLOBAL_REQUEST message */
