@@ -252,6 +252,8 @@ thread_loop(void *job)
 
 	/* create the context for this thread */
 	evp_ctx = EVP_CIPHER_CTX_new();
+	if (evp_ctx == NULL)
+		fatal_f("EVP_CIPHER_CTX_new failed");
 
 	/* keep track of the pointer for the evp in this struct
 	 * so we can free it later. So we place it in a hash indexed on the
@@ -267,14 +269,17 @@ thread_loop(void *job)
 
 	/* initialize the cipher ctx with the key provided
 	 * determine which cipher to use based on the key size */
+	const EVP_CIPHER *type;
 	if (aes_mt_ctx->keylen == 256)
-		EVP_EncryptInit_ex(evp_ctx, EVP_aes_256_ctr(), NULL, aes_mt_ctx->orig_key, NULL);
+		type = EVP_aes_256_ctr();
 	else if (aes_mt_ctx->keylen == 128)
-		EVP_EncryptInit_ex(evp_ctx, EVP_aes_128_ctr(), NULL, aes_mt_ctx->orig_key, NULL);
+		type = EVP_aes_128_ctr();
 	else if (aes_mt_ctx->keylen == 192)
-		EVP_EncryptInit_ex(evp_ctx, EVP_aes_192_ctr(), NULL, aes_mt_ctx->orig_key, NULL);
+		type = EVP_aes_192_ctr();
 	else
 		fatal("Invalid key length of %d in AES CTR MT. Exiting", aes_mt_ctx->keylen);
+	if (!EVP_EncryptInit_ex(evp_ctx, type, NULL, aes_mt_ctx->orig_key, NULL))
+		fatal_f("EVP_EncryptInit_ex (key) failed");
 
 	/*
 	 * Handle the special case of startup, one thread must fill
@@ -287,11 +292,13 @@ thread_loop(void *job)
 		/* if we are in the INIT state then fill the queue */
 		if (q->qstate == KQINIT) {
 			/* set the initial counter */
-			EVP_EncryptInit_ex(evp_ctx, NULL, NULL, NULL, q->ctr);
+			if (!EVP_EncryptInit_ex(evp_ctx, NULL, NULL, NULL, q->ctr))
+				fatal_f("EVP_EncryptInit_ex (ctr) failed");
 			/* encipher a block sized null string (mynull) with the key. This
 			 * returns the keystream because xoring the keystream
 			 * against null returns the keystream. Store that in the appropriate queue */
-			EVP_EncryptUpdate(evp_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
+			if (!EVP_EncryptUpdate(evp_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE))
+				fatal_f("EVP_EncryptUpdate failed");
 			/* Update the aes counter */
 			ssh_ctr_add(q->ctr, KQLEN * numkq, AES_BLOCK_SIZE);
 			/* since this is the first thread set it to draining */
@@ -349,10 +356,12 @@ thread_loop(void *job)
 		pthread_mutex_unlock(&q->lock);
 
 		/* set the initial counter */
-		EVP_EncryptInit_ex(evp_ctx, NULL, NULL, NULL, q->ctr);
+		if (!EVP_EncryptInit_ex(evp_ctx, NULL, NULL, NULL, q->ctr))
+			fatal_f("EVP_EncryptInit_ex (ctr) failed");
 
 		/* see corresponding block above for useful comments */
-		EVP_EncryptUpdate(evp_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
+		if (!EVP_EncryptUpdate(evp_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE))
+			fatal_f("EVP_EncryptUpdate failed");
 
 		/* Re-lock, mark full and signal consumer */
 		pthread_mutex_lock(&q->lock);
@@ -619,6 +628,12 @@ int aes_mt_do_cipher(void *vevp_ctx,
 	EVP_CIPHER_CTX *evp_ctx = vevp_ctx;
 	uint64_t src_a, key_a;
 	
+	/* CTR output length equals input length; report it per the OSSL
+	 * update/cipher contract. Current callers on the EVP_Cipher path
+	 * ignore the count, but the contract requires *destlen to be set. */
+	if (destlen != NULL)
+		*destlen = len;
+
 	if (len == 0)
 		return 1;
 

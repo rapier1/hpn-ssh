@@ -169,6 +169,8 @@ static const OSSL_PARAM ctx_get_param_table[] = {
 static const OSSL_PARAM cipher_get_param_table[] = {
         { "blocksize", OSSL_PARAM_UNSIGNED_INTEGER, NULL, sizeof(size_t), 0 },
         { "keylen", OSSL_PARAM_UNSIGNED_INTEGER, NULL, sizeof(size_t), 0 },
+        { "ivlen", OSSL_PARAM_UNSIGNED_INTEGER, NULL, sizeof(size_t), 0 },
+        { "mode", OSSL_PARAM_UNSIGNED_INTEGER, NULL, sizeof(unsigned int), 0 },
         { NULL, 0, NULL, 0, 0 },
 };
 
@@ -277,6 +279,16 @@ static int aes_mt_get_params_256(OSSL_PARAM params[])
 				continue;
 			}
 		}
+		if (strcasecmp(p->key, "ivlen") == 0)
+			if (provnum_set_size_t(p, AES_BLOCK_SIZE) < 0) {
+				ok = 0;
+				continue;
+			}
+		if (strcasecmp(p->key, "mode") == 0)
+			if (provnum_set_size_t(p, EVP_CIPH_CTR_MODE) < 0) {
+				ok = 0;
+				continue;
+			}
 	}
 	return ok;
 }
@@ -300,6 +312,16 @@ static int aes_mt_get_params_192(OSSL_PARAM params[])
 				continue;
 			}
 		}
+		if (strcasecmp(p->key, "ivlen") == 0)
+			if (provnum_set_size_t(p, AES_BLOCK_SIZE) < 0) {
+				ok = 0;
+				continue;
+			}
+		if (strcasecmp(p->key, "mode") == 0)
+			if (provnum_set_size_t(p, EVP_CIPH_CTR_MODE) < 0) {
+				ok = 0;
+				continue;
+			}
 	}
 	return ok;
 }
@@ -323,6 +345,16 @@ static int aes_mt_get_params_128(OSSL_PARAM params[])
 				continue;
 			}
 		}
+		if (strcasecmp(p->key, "ivlen") == 0)
+			if (provnum_set_size_t(p, AES_BLOCK_SIZE) < 0) {
+				ok = 0;
+				continue;
+			}
+		if (strcasecmp(p->key, "mode") == 0)
+			if (provnum_set_size_t(p, EVP_CIPH_CTR_MODE) < 0) {
+				ok = 0;
+				continue;
+			}
 	}
 	return ok;
 }

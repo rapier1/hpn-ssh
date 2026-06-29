@@ -570,6 +570,11 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 	struct mt_keystream * ks = &(batch->streams[seqnr % NUMSTREAMS]);
 
 	int r = SSH_ERR_INTERNAL_ERROR;
+	/* mac_ok gates whether we write plaintext: true for encrypt (no inbound
+	 * tag to verify), and for decrypt only after the poly1305 tag verifies.
+	 * Initialized false for decrypt so any path that does not explicitly
+	 * verify the tag fails safe rather than emitting unauthenticated data. */
+	int mac_ok = do_encrypt;
 
 	/* check tag before anything else */
 	if (!do_encrypt) {
@@ -593,11 +598,12 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 		poly1305_auth(ctx_mt->poly_ctx, expected_tag, src,
 	            aadlen + len, ks->poly_key);
 #endif
-		if (timingsafe_bcmp(expected_tag, tag, POLY1305_TAGLEN) != 0)
+		mac_ok = timingsafe_bcmp(expected_tag, tag, POLY1305_TAGLEN) == 0;
+		if (!mac_ok)
 			r = SSH_ERR_MAC_INVALID;
 		explicit_bzero(expected_tag, sizeof(expected_tag));
 	}
-	if (r != SSH_ERR_MAC_INVALID) {
+	if (mac_ok) {
 		/* Crypt additional data (i.e., packet length) */
 		/* TODO: is aadlen always four bytes? */
 		/* For chachapoly yes. It is always 4 bytes -cjr */
