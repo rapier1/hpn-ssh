@@ -1159,7 +1159,6 @@ struct sftp_parallel {
 	uint64_t                    tail_prev_ns;
 	int                         tail_episode;      /* latch: in episode */
 	uint64_t                    tail_episode_ns;   /* episode start */
-	int                         tail_episodes_total; /* per-transfer count */
 	uint64_t                    tail_lag_start_ns; /* when the arm condition
 						         * became continuously
 						         * true; episode latches
@@ -1178,10 +1177,8 @@ struct sftp_parallel {
 	 * a fresh connection into a possibly penalty-counting server; idle
 	 * capacity restarts work instantly with no penalty exposure).
 	 * respawn_owed persists, so deferred respawns fire when demand
-	 * outgrows the idle pool.  Default off.  respawn_defers counts
-	 * deferral ticks for telemetry. */
+	 * outgrows the idle pool.  Default off. */
 	int                         respawn_scan_idle;
-	uint64_t                    respawn_defers;
 	uint64_t                    session_start_ns;  /* monotime_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in

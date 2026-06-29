@@ -692,7 +692,6 @@ parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
 		if (to_spawn > 0 && n_ready_healthy > 0 &&
 		    p->noprogress_consec_ticks == 0 &&
 		    sftp_workqueue_depth(p->q) <= (size_t)n_ready_healthy) {
-			p->respawn_defers++;
 			if (getenv("HPN_BUNDLE_TIMING") != NULL)
 				logit("HPN RESPAWN-DEFER owed=%d ready=%d "
 				    "qdepth=%zu", p->respawn_owed,

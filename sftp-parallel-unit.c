@@ -52,13 +52,18 @@ make_unit(enum sftp_op op, const char *src, const char *dst,
 	return u;
 }
 
-struct sftp_work_unit *
-parallel_unit_make_range(const char *src, const char *dst,
+/*
+ * Shared range-unit builder: upload and download range units are identical
+ * except for the op enum.  src/dst map to src_path/dst_path (upload:
+ * local -> remote; download: remote -> local).
+ */
+static struct sftp_work_unit *
+make_range_unit(enum sftp_op op, const char *src, const char *dst,
     off_t range_offset, off_t range_length,
     struct sftp_range_tracker *tracker)
 {
 	struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
-	u->op            = SFTP_OP_UPLOAD_RANGE;
+	u->op            = op;
 	u->src_path      = xstrdup(src);
 	u->dst_path      = xstrdup(dst);
 	u->size          = range_length;
@@ -66,6 +71,15 @@ parallel_unit_make_range(const char *src, const char *dst,
 	u->range_length  = range_length;
 	u->range_tracker = tracker;
 	return u;
+}
+
+struct sftp_work_unit *
+parallel_unit_make_range(const char *src, const char *dst,
+    off_t range_offset, off_t range_length,
+    struct sftp_range_tracker *tracker)
+{
+	return make_range_unit(SFTP_OP_UPLOAD_RANGE, src, dst,
+	    range_offset, range_length, tracker);
 }
 
 void
@@ -1398,15 +1412,8 @@ make_download_range_unit(const char *remote_path, const char *local_path,
     off_t range_offset, off_t range_length,
     struct sftp_range_tracker *tracker)
 {
-	struct sftp_work_unit *u = xcalloc(1, sizeof(*u));
-	u->op            = SFTP_OP_DOWNLOAD_RANGE;
-	u->src_path      = xstrdup(remote_path);
-	u->dst_path      = xstrdup(local_path);
-	u->size          = range_length;
-	u->range_offset  = range_offset;
-	u->range_length  = range_length;
-	u->range_tracker = tracker;
-	return u;
+	return make_range_unit(SFTP_OP_DOWNLOAD_RANGE, remote_path, local_path,
+	    range_offset, range_length, tracker);
 }
 
 /*

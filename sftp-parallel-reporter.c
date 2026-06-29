@@ -730,7 +730,6 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 						    (unsigned long long)baseline);
 					p->tail_episode = 1;
 					p->tail_episode_ns = p->tail_lag_start_ns;
-					p->tail_episodes_total++;
 					tail_fire_yield(p, yield_tgt,
 					    yield_tgt_med, yield_tgt_proj);
 				}
