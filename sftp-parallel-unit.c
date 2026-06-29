@@ -1620,183 +1620,108 @@ submit_download_ranges(struct sftp_parallel *p,
 	return 0;
 }
 
+/*
+ * Shared range-split decision used by both directions.  Returns 1 and fills
+ * *range_size / *num_ranges when the file should be split into ranges, or 0
+ * to fall back to a whole-file transfer.  Range splitting needs a known file
+ * size (callers pass it from the local stat / the SFTP directory listing /
+ * the glob attrib cache); a zero/too-small size, a sub-floor file, or the
+ * HPN_NO_RANGE_SPLIT escape hatch all return 0.
+ *
+ * Range COUNT = file_size / floor (parallel_unit_split_min_size, default
+ * 2 GiB, -M override): the floor is the single knob and governs range SIZE;
+ * there is no count cap.  Range SIZE is stripe-aligned when hpn-fs-info
+ * reports Lustre/GPFS geometry (adjacent ranges target different OSTs),
+ * otherwise plain file_size/num_ranges.
+ */
+static int
+compute_range_split(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *remote_path, off_t file_size,
+    off_t *range_size, int *num_ranges)
+{
+	struct sftp_fs_info info;
+	const char *no_split;
+	int max_ranges, n, have_stripe;
+	off_t per_range;
+
+	if (file_size <= 0)
+		return 0;
+	/* Static-floor fast path: below any plausible threshold, short-circuit
+	 * without paying for the fs-info RTT. */
+	if ((uint64_t)file_size < RANGE_SPLIT_MIN_SIZE_FLOOR)
+		return 0;
+	if ((uint64_t)file_size < parallel_unit_split_min_size(p))
+		return 0;
+
+	/* ENV-VAR HPN_NO_RANGE_SPLIT - developer-only kill switch (force the
+	 * whole-file path to A/B multi-file parallelism vs range-splitting). */
+	no_split = getenv("HPN_NO_RANGE_SPLIT");
+	if (no_split && *no_split && *no_split != '0')
+		return 0;
+
+	max_ranges = (int)(file_size / parallel_unit_split_min_size(p));
+	if (max_ranges < 2)
+		return 0;
+
+	/* fs-info costs one control-connection RTT; cached per orchestrator
+	 * (the destination filesystem does not change within a transfer). */
+	have_stripe = get_cached_fs_info(p, conn, remote_path, &info);
+	n = max_ranges;
+	per_range = (file_size + n - 1) / n;
+	if (have_stripe && info.stripe_size > 0) {
+		off_t stripe = (off_t)info.stripe_size;
+		*range_size = ((per_range + stripe - 1) / stripe) * stripe;
+	} else {
+		/* TEMP (pending fs-info stripe fix): fs-info returned no stripe,
+		 * but the Lustre stripe here is 1 MiB - align ranges to it so
+		 * range offsets stay page-aligned and the server's O_DIRECT
+		 * helper engages instead of silently falling back to buffered.
+		 * Revert to plain per_range once fs-info reports stripe
+		 * geometry (have_stripe). */
+		off_t stripe = 1048576;
+		*range_size = ((per_range + stripe - 1) / stripe) * stripe;
+	}
+	*num_ranges = n;
+	return 1;
+}
+
 static int
 submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *remote_path, const char *local_path,
     off_t file_size, mode_t mode)
 {
-	struct sftp_fs_info info;
 	off_t range_size;
-	int num_ranges, max_ranges;
+	int num_ranges;
 
-	/* Range splitting requires a known file size.  Callers always pass it:
-	 *   - recursive walk      - from the SFTP directory listing
-	 *   - upload              - from the local stat
-	 *   - process_get (sftp.c) - from the glob attrib cache (free, since
-	 *                            glob already stat'd via fudge_stat), with
-	 *                            an explicit stat as defensive fallback.
-	 * If size is still zero here (very small file or unknown), fall back
-	 * to whole-file. */
-	if (file_size <= 0)
-		goto whole_file;
-
-	/* Static-floor fast path: files clearly below any plausible
-	 * threshold can short-circuit without paying for the fs-info RTT. */
-	if ((uint64_t)file_size < RANGE_SPLIT_MIN_SIZE_FLOOR)
-		goto whole_file;
-
-	{
-		uint64_t min_split =
-		    parallel_unit_split_min_size(p);
-		if ((uint64_t)file_size < min_split)
-			goto whole_file;
-	}
-
-	/* Diagnostic / testing escape hatch: HPN_NO_RANGE_SPLIT=1 in the
-	 * environment forces the whole-file path so we can compare pure
-	 * multi-file parallelism (one worker per file) against the
-	 * range-split path on the same workload. */
-	{
-		/* ENV-VAR HPN_NO_RANGE_SPLIT - developer-only: kill switch for
-		 * range-splitting (force whole-file upload).  A/B test and
-		 * diagnostic only; not user-facing. */
-		const char *no_split = getenv("HPN_NO_RANGE_SPLIT");
-		if (no_split && *no_split && *no_split != '0')
-			goto whole_file;
-	}
-
-	/* Range COUNT = file_size / floor.  The floor (parallel_unit_split_min_size,
-	 * default 2 GiB, -M override) is the single knob and governs range SIZE.
-	 * No count cap: the old min(by_size, num_streams*RANGE_CHUNK_MULTIPLIER)
-	 * ceiling forced absurd ranges on big files (a 1.5 TB file became 32 x
-	 * 46 GB), so it's removed - let the floor decide. */
-	max_ranges = (int)(file_size / parallel_unit_split_min_size(p));
-	if (max_ranges < 2)
-		goto whole_file;
-
-	/* Same rationale as submit_upload_maybe_split: stripe-aligned when geometry
-	 * is available, plain file_size/num_ranges otherwise. */
-	int have_stripe = get_cached_fs_info(p, conn, remote_path, &info);
-	num_ranges = max_ranges;
-	if (num_ranges < 2)
-		goto whole_file;
-
-	{
-		off_t per_range = (file_size + num_ranges - 1) / num_ranges;
-		if (have_stripe && info.stripe_size > 0) {
-			off_t stripe = (off_t)info.stripe_size;
-			range_size = ((per_range + stripe - 1) / stripe) * stripe;
-		} else {
-			/* TEMP (pending fs-info stripe fix): fs-info returned no
-			 * stripe, but the Lustre stripe here is 1 MiB - align
-			 * ranges to it so range offsets stay page-aligned and the
-			 * server's O_DIRECT helper engages instead of silently
-			 * falling back to buffered.  Revert to plain per_range
-			 * once fs-info reports stripe geometry (have_stripe). */
-			off_t stripe = 1048576;
-			range_size = ((per_range + stripe - 1) / stripe) * stripe;
-		}
-	}
-
-	if (submit_download_ranges(p, remote_path, local_path,
+	if (compute_range_split(p, conn, remote_path, file_size,
+	    &range_size, &num_ranges) &&
+	    submit_download_ranges(p, remote_path, local_path,
 	    file_size, mode, range_size, num_ranges) == 0)
 		return 0;
-	/* Pre-creation failed - fall back to whole-file. */
-
- whole_file:
-	return parallel_unit_submit(p, make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path,
-	    file_size, mode));
+	/* No split, or pre-creation failed - whole-file. */
+	return parallel_unit_submit(p, make_unit(SFTP_OP_DOWNLOAD,
+	    remote_path, local_path, file_size, mode));
 }
 
 /*
  * Decide whether and how to range-split a large file, then either submit
  * range units (via submit_upload_ranges) or fall back to a whole-file unit.
- *
- * Two range-split modes:
- *   - Stripe-aligned: when hpn-fs-info reports valid Lustre/GPFS stripe
- *     geometry, each range is rounded up to a stripe boundary so adjacent
- *     ranges target different OSTs.
- *   - Plain: when no stripe info is available (ext4/xfs/NFS/etc.), ranges
- *     are simply file_size / num_ranges.  The server pwrite()s into a
- *     pre-allocated file; whether the underlying FS actually parallelises
- *     those writes is filesystem-dependent, but exercised in practice on
- *     ext4 (juliet) without measurable regression vs. whole-file.
+ * The split decision is shared with the download side in compute_range_split().
  */
 static int
 submit_upload_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
     off_t file_size, mode_t mode)
 {
-	struct sftp_fs_info info;
 	off_t range_size;
-	int num_ranges, max_ranges;
+	int num_ranges;
 
-	/* Static-floor fast path: avoid the fs-info RTT for clearly
-	 * too-small files. */
-	if ((uint64_t)file_size < RANGE_SPLIT_MIN_SIZE_FLOOR)
-		goto whole_file;
-
-	{
-		uint64_t min_split =
-		    parallel_unit_split_min_size(p);
-		if ((uint64_t)file_size < min_split)
-			goto whole_file;
-	}
-
-	/* HPN_NO_RANGE_SPLIT=1 escape hatch, mirroring submit_upload_maybe_split. */
-	{
-		/* ENV-VAR HPN_NO_RANGE_SPLIT - developer-only: kill switch for
-		 * range-splitting (same as upload-side use, download path). */
-		const char *no_split = getenv("HPN_NO_RANGE_SPLIT");
-		if (no_split && *no_split && *no_split != '0')
-			goto whole_file;
-	}
-
-	/* Range count = file_size / floor; no count cap (see submit_upload_maybe_
-	 * split for the rationale - the old num_streams*RANGE_CHUNK_MULTIPLIER
-	 * ceiling forced absurd ranges on big files).  Floor is the single knob. */
-	max_ranges = (int)(file_size / parallel_unit_split_min_size(p));
-	if (max_ranges < 2)
-		goto whole_file;
-
-	/* fs-info costs one RTT on the control connection.  Cache the
-	 * answer per orchestrator (cached on p): the destination filesystem
-	 * does not change within a transfer, and querying every file at high
-	 * RTT starves the workers. */
-	/* When stripe geometry is available (Lustre/GPFS), align each range
-	 * to a stripe boundary so adjacent ranges target different OSTs.
-	 * Otherwise (ext4/xfs/NFS/etc., where sftp_fs_info returned no stripe
-	 * data), fall back to plain file_size/num_ranges chunks.  The server
-	 * pwrite()s into a pre-allocated file; whether the underlying FS
-	 * actually parallelises those writes is filesystem-dependent. */
-	int have_stripe = get_cached_fs_info(p, conn, remote_path, &info);
-	num_ranges = max_ranges;
-	if (num_ranges < 2)
-		goto whole_file;
-
-	{
-		off_t per_range = (file_size + num_ranges - 1) / num_ranges;
-		if (have_stripe && info.stripe_size > 0) {
-			off_t stripe = (off_t)info.stripe_size;
-			range_size = ((per_range + stripe - 1) / stripe) * stripe;
-		} else {
-			/* TEMP (pending fs-info stripe fix): fs-info returned no
-			 * stripe, but the Lustre stripe here is 1 MiB - align
-			 * ranges to it so range offsets stay page-aligned and the
-			 * server's O_DIRECT helper engages instead of silently
-			 * falling back to buffered.  Revert to plain per_range
-			 * once fs-info reports stripe geometry (have_stripe). */
-			off_t stripe = 1048576;
-			range_size = ((per_range + stripe - 1) / stripe) * stripe;
-		}
-	}
-
-	if (submit_upload_ranges(p, conn, local_path, remote_path,
+	if (compute_range_split(p, conn, remote_path, file_size,
+	    &range_size, &num_ranges) &&
+	    submit_upload_ranges(p, conn, local_path, remote_path,
 	    file_size, mode, range_size, num_ranges) == 0)
 		return 0;
-	/* Pre-creation failed - fall back to whole-file. */
-
- whole_file:
-	return parallel_unit_submit(p, make_unit(SFTP_OP_UPLOAD, local_path, remote_path,
-	    file_size, mode));
+	/* No split, or pre-creation failed - whole-file. */
+	return parallel_unit_submit(p, make_unit(SFTP_OP_UPLOAD,
+	    local_path, remote_path, file_size, mode));
 }
