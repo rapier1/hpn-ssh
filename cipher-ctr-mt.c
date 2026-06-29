@@ -172,6 +172,11 @@ long unsigned int global_struct_id = 0;
 
 /* keep a copy of the pointers created in thread_loop to free later */
 struct aes_mt_ctx_ptrs *evp_ptrs = NULL;
+/* evp_ptrs is a process-global uthash mutated by every pregen thread
+ * (HASH_ADD in thread_loop) and read/deleted from the join path; with
+ * SSH_CIPHER_THREADS>1 those HASH_ADDs run concurrently.  Serialize all
+ * access (startup/join only, never the per-block hot path). */
+static pthread_mutex_t evp_ptrs_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Add num to counter 'ctr'
@@ -259,12 +264,16 @@ stop_and_join_pregen_threads(struct ssh_aes_ctr_ctx_mt *c)
 			 * thread id. That's used to find the pointer to the cipher struct
 			 * created in thread_loop. */
 			struct aes_mt_ctx_ptrs *ptr;
+			pthread_mutex_lock(&evp_ptrs_mu);
 			HASH_FIND_INT(evp_ptrs, &c->tid[i], ptr);
 			if (ptr != NULL)
 				EVP_CIPHER_CTX_free(ptr->pointer);
-			else
+			else {
+				pthread_mutex_unlock(&evp_ptrs_mu);
 				fatal_f ("Cannot find entry in hash table for thread id");
+			}
 			HASH_DEL(evp_ptrs, ptr);
+			pthread_mutex_unlock(&evp_ptrs_mu);
 			free(ptr);              }
         }
 	pthread_rwlock_destroy(&c->tid_lock);
@@ -313,7 +322,9 @@ thread_loop(void *x)
 	ptr = xmalloc(sizeof *ptr); /*freed in stop & prejoin */
 	ptr->tid = pthread_self(); /* index for hash */
 	ptr->pointer = aesni_ctx;
+	pthread_mutex_lock(&evp_ptrs_mu);
 	HASH_ADD_INT(evp_ptrs, tid, ptr);
+	pthread_mutex_unlock(&evp_ptrs_mu);
 
 	/* initialize the cipher ctx with the key provided
 	 * determine which cipher to use based on the key size */

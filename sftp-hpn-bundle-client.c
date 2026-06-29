@@ -842,6 +842,21 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	}
 	if (msg != NULL)
 		sshbuf_free(msg);
+	/*
+	 * The pool path flips entries[].result to 0 at enqueue time, before
+	 * the writer thread has persisted the file.  On success that is
+	 * validated by bundle_write_pool_finish() above (rc stays -1 unless
+	 * every queued write succeeded); on ANY failure those optimistic 0s
+	 * cannot be trusted - a deferred writer failure would otherwise be
+	 * finalized as success and the file silently lost.  Force every entry
+	 * back to failed so the worker re-queues the whole batch via the
+	 * per-file path (the bundle is all-or-nothing; a re-transfer of the
+	 * files that did land is harmless).
+	 */
+	if (rc != 0) {
+		for (i = 0; i < n; i++)
+			entries[i].result = -1;
+	}
 	/* Same cause-scoping as the upload path: dead conn => this worker's
 	 * transport failed (keep units bundle-eligible); live conn => server
 	 * refused / lacks the extension (permanent single-file fallback). */

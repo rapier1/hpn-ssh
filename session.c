@@ -1984,17 +1984,20 @@ session_subsystem_req(struct ssh *ssh, Session *s)
 			channel_set_xtype(ssh, s->chanid, type);
 			free(type);
 			if (s->is_subsystem == SUBSYSTEM_EXT &&
-			    strcmp(s->subsys, "sftp") == 0) {
+			    strcmp(s->subsys, "sftp") == 0 &&
+			    options.hpn_max_concurrent_workers > 0) {
 				/*
 				 * HPN: hand the operator's per-user parallel-
 				 * worker cap (HPNMaxConcurrentWorkers) to the
 				 * hpnsftp-server via argv so it can advertise it
 				 * (hpn-max-workers@hpnssh.org).  Argv, not an
 				 * environment variable, so a user cannot override
-				 * it under PermitUserEnvironment.  This couples
-				 * the daemon to an hpnsftp-server that understands
-				 * -W; a stock or older server configured as the
-				 * sftp subsystem would reject the flag.
+				 * it under PermitUserEnvironment.  Only appended
+				 * when a cap is actually configured (>0): -W
+				 * couples the daemon to an hpnsftp-server that
+				 * understands it, so a stock/older server set as
+				 * the sftp subsystem keeps working when no cap is
+				 * configured.
 				 */
 				char *hpncmd;
 				xasprintf(&hpncmd, "%s -W %d", cmd,

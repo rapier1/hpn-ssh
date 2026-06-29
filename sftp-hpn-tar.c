@@ -504,6 +504,21 @@ parser_handle_header(struct sftp_hpn_tar_parser *p)
 	memcpy(path, p->hdr_buf + HPN_REC_OFF_PATH, (size_t)plen);
 	path[plen] = '\0';
 
+#if SIZE_MAX < UINT64_MAX
+	/*
+	 * size_v is an attacker-controlled 64-bit field.  The pool-path
+	 * consumers malloc((size_t)size) while the parser still delivers the
+	 * full size_v bytes; on an ILP32 platform (size_t narrower than 64
+	 * bits) that truncates the allocation and the entry then overflows
+	 * it.  Reject any entry whose size cannot be represented as size_t.
+	 * Bundles carry small files, so this never rejects a legitimate one.
+	 */
+	if (size_v > (uint64_t)SIZE_MAX) {
+		parser_set_error(p, "record size too large for this platform");
+		return -1;
+	}
+#endif
+
 	if (p->cb->entry_cb != NULL &&
 	    p->cb->entry_cb(p->ctx, path, size_v, (mode_t)(mode_v & 07777),
 	    (time_t)mtime_v) != 0) {
