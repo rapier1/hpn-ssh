@@ -1672,14 +1672,11 @@ compute_range_split(struct sftp_parallel *p, struct sftp_conn *conn,
 		off_t stripe = (off_t)info.stripe_size;
 		*range_size = ((per_range + stripe - 1) / stripe) * stripe;
 	} else {
-		/* TEMP (pending fs-info stripe fix): fs-info returned no stripe,
-		 * but the Lustre stripe here is 1 MiB - align ranges to it so
-		 * range offsets stay page-aligned and the server's O_DIRECT
-		 * helper engages instead of silently falling back to buffered.
-		 * Revert to plain per_range once fs-info reports stripe
-		 * geometry (have_stripe). */
-		off_t stripe = 1048576;
-		*range_size = ((per_range + stripe - 1) / stripe) * stripe;
+		/* No stripe geometry from hpn-fs-info.  The server now resolves
+		 * the Lustre default (sftp-lustre.c lustre_get_stripe walks up to
+		 * a concrete default), so a zero stripe here means a non-striped
+		 * filesystem (ext4/xfs/NFS/etc.) - use plain even division. */
+		*range_size = per_range;
 	}
 	*num_ranges = n;
 	return 1;

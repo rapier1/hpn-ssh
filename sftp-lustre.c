@@ -262,19 +262,20 @@ lustre_set_tiered_layout_fd(int fd, uint32_t small_threshold,
 }
 
 /*
- * Read a directory's default OST stripe geometry (count + size) WITHOUT a
- * subprocess: getxattr the raw "lustre.lov" layout EA and parse it.  Replaces a
- * fork()+execlp("lfs","getstripe","-d") - a fork/exec is a liability on
- * seccomp-hardened data-transfer nodes (a blocked execve can SIGSYS the child),
- * and getxattr is a plain syscall any sftp-capable node allows.
+ * Parse one path's "lustre.lov" layout EA WITHOUT a subprocess: getxattr the
+ * raw EA and read its geometry.  Replaces a fork()+execlp("lfs","getstripe")
+ * - a fork/exec is a liability on seccomp-hardened data-transfer nodes (a
+ * blocked execve can SIGSYS the child), and getxattr is a plain syscall any
+ * sftp-capable node allows.  The EA is either a simple lov_user_md_v1/v3 or a
+ * composite lov_comp_md_v1 (DoM/PFL - report the non-MDT, i.e. OST, component).
  *
- * The EA is either a simple lov_user_md_v1/v3 (read its stripe_count/size) or a
- * composite lov_comp_md_v1 (a DoM/PFL layout - report the non-MDT, i.e. OST,
- * component: the geometry large files stripe with).  Struct ABI is the inlined
- * set above.  ENOTSUP/ENODATA (non-Lustre, or no explicit default) -> 0.
+ * Returns 1 if a LOV layout was present and parsed (sets *stripe_size and
+ * *stripe_count, EITHER of which may be 0 when the layout says "inherit the
+ * filesystem default"); 0 if the path carries no LOV layout at all
+ * (non-Lustre / ENODATA / ENOTSUP).
  */
-int
-lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_count)
+static int
+read_lov_layout(const char *path, uint64_t *stripe_size, uint32_t *stripe_count)
 {
 	unsigned char buf[8192];
 	ssize_t n;
@@ -292,9 +293,9 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 			return 0;
 		*stripe_count = lum->lmm_stripe_count;
 		*stripe_size  = lum->lmm_stripe_size;
+		return 1;
 	} else if (magic == LOV_USER_MAGIC_COMP_V1) {
 		const struct hpn_lov_comp_md_v1 *cm = (const void *)buf;
-		int found = 0;
 		uint16_t i;
 
 		if (n < (ssize_t)sizeof(*cm))
@@ -315,16 +316,48 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 				continue;   /* skip the Data-on-MDT component */
 			*stripe_count = sub->lmm_stripe_count;
 			*stripe_size  = sub->lmm_stripe_size;
-			found = 1;
-			break;
+			return 1;
 		}
-		if (!found)
-			return 0;
-	} else {
 		return 0;
 	}
+	return 0;
+}
 
-	return *stripe_size > 0 && *stripe_count > 0;
+/*
+ * Resolve a usable OST stripe geometry for `path`.  A layout whose
+ * stripe_size is 0 means "inherit the filesystem default", so when the path's
+ * own layout is the default we walk up ancestor directories reading each
+ * default layout until a CONCRETE geometry is found (the Lustre mount root
+ * always carries one).  This makes the client see a real stripe on Lustre
+ * even for default-striped files, so its no-stripe path reliably means "not
+ * Lustre" (-> plain per_range range-splitting) rather than a guessed default.
+ * Returns 1 with a concrete stripe_size and stripe_count, else 0.
+ *
+ * NOTE: the walk-up default resolution is UNVERIFIED on a live Lustre mount
+ * (none in the dev environment) - validate on br008.
+ */
+int
+lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_count)
+{
+	char p[PATH_MAX];
+	char *slash;
+
+	if (strlcpy(p, path, sizeof(p)) >= sizeof(p))
+		return 0;
+	for (;;) {
+		*stripe_size  = 0;
+		*stripe_count = 0;
+		if (read_lov_layout(p, stripe_size, stripe_count) &&
+		    *stripe_size > 0 && *stripe_count > 0)
+			return 1;
+		/* Non-Lustre, or an "inherit default" layout: step to the parent
+		 * directory and read its default.  Stop at the top component. */
+		slash = strrchr(p, '/');
+		if (slash == NULL || slash == p)
+			break;
+		*slash = '\0';
+	}
+	return 0;
 }
 
 /*
