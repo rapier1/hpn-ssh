@@ -3286,11 +3286,14 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	/*
 	 * Warm handle: reuse the open remote handle across consecutive same-
 	 * file ranges (skips the close/reopen + cold-window dip at the range
-	 * boundary).  The caller guarantees warm->handle is for THIS
-	 * remote_path (it closes a stale one on file change).  Otherwise open
-	 * fresh, without O_CREAT/O_TRUNC - the file was pre-created.
+	 * boundary).  The caller is expected to keep warm->handle for THIS
+	 * remote_path (it closes a stale one on file change); we also verify
+	 * warm->path matches here, so a caller-side slip opens fresh rather
+	 * than writing this range into the previous file's handle.  Otherwise
+	 * open fresh, without O_CREAT/O_TRUNC - the file was pre-created.
 	 */
-	if (warm != NULL && warm->handle != NULL) {
+	if (warm != NULL && warm->handle != NULL &&
+	    warm->path != NULL && strcmp(warm->path, remote_path) == 0) {
 		handle = warm->handle;
 		handle_len = warm->handle_len;
 	} else if (send_open(conn, remote_path, "range-dest",

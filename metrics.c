@@ -566,28 +566,28 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	 * match metrics_print_header().
 	 */
 	if (metrics_has(binnobj, "tcpi_max_pacing_rate")) {
-		len += snprintf(output+len, (buflen-len), ", %llu, %llu",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_max_pacing_rate"),
 				binn_object_uint64(binnobj, "tcpi_pacing_rate")
 			);
 	}
 
 	if (metrics_has(binnobj, "tcpi_bytes_acked")) {
-		len += snprintf(output+len, (buflen-len), ", %llu, %llu",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_bytes_acked"),
 				binn_object_uint64(binnobj, "tcpi_bytes_received")
 			);
 	}
 
 	if (metrics_has(binnobj, "tcpi_segs_in")) {
-		len += snprintf(output+len, (buflen-len), ", %u, %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u, %u",
 				binn_object_uint32(binnobj, "tcpi_segs_in"),
 				binn_object_uint32(binnobj, "tcpi_segs_out")
 			);
 	}
 
 	if (metrics_has(binnobj, "tcpi_notsent_bytes")) {
-		len += snprintf(output+len, (buflen-len), ", %u, %u, %u, %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u, %u, %u, %u",
 				binn_object_uint32(binnobj, "tcpi_notsent_bytes"),
 				binn_object_uint32(binnobj, "tcpi_min_rtt"),
 				binn_object_uint32(binnobj, "tcpi_data_segs_in"),
@@ -596,14 +596,14 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	}
 
 	if (metrics_has(binnobj, "tcpi_delivery_rate_app_limited")) {
-		len += snprintf(output+len, (buflen-len), ", %u, %llu",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u, %llu",
 				binn_object_uint8(binnobj, "tcpi_delivery_rate_app_limited"),
 				binn_object_uint64(binnobj, "tcpi_delivery_rate")
 			);
 	}
 
 	if (metrics_has(binnobj, "tcpi_busy_time")) {
-		len += snprintf(output+len, (buflen-len), ", %llu, %llu, %llu",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %llu, %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_busy_time"),
 				binn_object_uint64(binnobj, "tcpi_sndbuf_limited"),
 				binn_object_uint64(binnobj, "tcpi_rwnd_limited")
@@ -611,7 +611,7 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	}
 
 	if (metrics_has(binnobj, "tcpi_delivered")) {
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_delivered")
 			);
 	}
@@ -619,13 +619,13 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	/* delivered_ce is per-key: Linux emits it with tcpi_delivered (4.18),
 	 * FreeBSD emits it standalone -- same column either way. */
 	if (metrics_has(binnobj, "tcpi_delivered_ce")) {
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_delivered_ce")
 			);
 	}
 
 	if (metrics_has(binnobj, "tcpi_bytes_sent")) {
-		len += snprintf(output+len, (buflen-len), ", %llu, %llu, %u, %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %llu, %llu, %u, %u",
 				binn_object_uint64(binnobj, "tcpi_bytes_sent"),
 				binn_object_uint64(binnobj, "tcpi_bytes_retrans"),
 				binn_object_uint32(binnobj, "tcpi_dsack_dups"),
@@ -634,27 +634,27 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	}
 
 	if (metrics_has(binnobj, "tcpi_snd_wnd")) {
-		len += snprintf(output+len, (buflen-len), ", %u, %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u, %u",
 				binn_object_uint32(binnobj, "tcpi_snd_wnd"),
 				binn_object_uint32(binnobj, "tcpi_rcv_ooopack")
 			);
 	}
 
 	if (metrics_has(binnobj, "tcpi_fastopen_client_fail")) {
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint8(binnobj, "tcpi_fastopen_client_fail")
 			);
 	}
 
 	if (metrics_has(binnobj, "tcpi_rcv_wnd")) {
-		len += snprintf(output+len, (buflen-len), ", %u, %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u, %u",
 				binn_object_uint32(binnobj, "tcpi_rcv_wnd"),
 				binn_object_uint32(binnobj, "tcpi_rehash")
 			);
 	}
 
 	if (metrics_has(binnobj, "tcpi_total_rto")) {
-		len += snprintf(output+len, (buflen-len), ", %u, %u, %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u, %u, %u",
 				binn_object_uint16(binnobj, "tcpi_total_rto"),
 				binn_object_uint16(binnobj, "tcpi_total_rto_recoveries"),
 				binn_object_uint32(binnobj, "tcpi_total_rto_time")
@@ -664,7 +664,7 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	/* received_ce is per-key: Linux emits it with the AccECN block (6.18),
 	 * FreeBSD emits it standalone -- same column either way. */
 	if (metrics_has(binnobj, "tcpi_received_ce")) {
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_received_ce")
 			);
 	}
@@ -672,7 +672,7 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	/* The rest of the Linux 6.18 AccECN block; gated on a 6.18-only key so
 	 * it does not fire for a FreeBSD record that only carries received_ce. */
 	if (metrics_has(binnobj, "tcpi_accecn_opt_seen")) {
-		len += snprintf(output+len, (buflen-len),
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0),
 				", %u, %u, %u, %u, %u, %u, %u, %u",
 				binn_object_uint32(binnobj, "tcpi_delivered_e1_bytes"),
 				binn_object_uint32(binnobj, "tcpi_delivered_e0_bytes"),
@@ -691,43 +691,43 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	 * metrics_print_header().
 	 */
 	if (metrics_has(binnobj, "tcpi_total_tlp"))
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_total_tlp"));
 	if (metrics_has(binnobj, "tcpi_total_tlp_bytes"))
-		len += snprintf(output+len, (buflen-len), ", %llu",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %llu",
 				binn_object_uint64(binnobj, "tcpi_total_tlp_bytes"));
 	if (metrics_has(binnobj, "tcpi_rcv_numsacks"))
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_rcv_numsacks"));
 	if (metrics_has(binnobj, "tcpi_dupacks"))
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_dupacks"));
 	if (metrics_has(binnobj, "tcpi_max_sndwnd"))
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_max_sndwnd"));
 	if (metrics_has(binnobj, "tcpi_rttmin"))
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_rttmin"));
 	if (metrics_has(binnobj, "tcpi_rcv_adv"))
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_rcv_adv"));
 	if (metrics_has(binnobj, "tcpi_ts_recent"))
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_ts_recent"));
 	if (metrics_has(binnobj, "tcpi_rfbuf_cnt"))
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_rfbuf_cnt"));
 	if (metrics_has(binnobj, "tcpi_rfbuf_ts"))
-		len += snprintf(output+len, (buflen-len), ", %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u",
 				binn_object_uint32(binnobj, "tcpi_rfbuf_ts"));
 	if (metrics_has(binnobj, "tcpi_so_rcv_sb_cc"))
-		len += snprintf(output+len, (buflen-len), ", %u, %u, %u, %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u, %u, %u, %u",
 				binn_object_uint32(binnobj, "tcpi_so_rcv_sb_cc"),
 				binn_object_uint32(binnobj, "tcpi_so_rcv_sb_hiwat"),
 				binn_object_uint32(binnobj, "tcpi_so_rcv_sb_lowat"),
 				binn_object_uint32(binnobj, "tcpi_so_rcv_sb_wat"));
 	if (metrics_has(binnobj, "tcpi_so_snd_sb_cc"))
-		len += snprintf(output+len, (buflen-len), ", %u, %u, %u, %u",
+		len += snprintf(output + (len < buflen ? len : buflen), (size_t)(len < buflen ? buflen - len : 0), ", %u, %u, %u, %u",
 				binn_object_uint32(binnobj, "tcpi_so_snd_sb_cc"),
 				binn_object_uint32(binnobj, "tcpi_so_snd_sb_hiwat"),
 				binn_object_uint32(binnobj, "tcpi_so_snd_sb_lowat"),

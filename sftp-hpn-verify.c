@@ -241,17 +241,19 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
     uint64_t length, uint64_t *hash_out)
 {
 	struct sshbuf *msg;
-
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
 	u_int id, rid;
 	u_char type;
 	int r;
 
+	/* Check the extension before allocating msg, so the unsupported-server
+	 * path does not leak an sshbuf (this is called per file). */
 	if (!sftp_conn_has_hpn_check_file(conn)) {
 		debug_f("server does not support hpn-check-file extension");
 		return -1;
 	}
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
 
 	id = sftp_conn_alloc_msg_id(conn);
 	debug3_f("sending hpn-check-file for \"%s\" length=%llu id=%u",

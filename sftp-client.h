@@ -204,7 +204,13 @@ int sftp_fsync(struct sftp_conn *conn, u_char *, u_int);
 
 /*
  * Download 'remote_path' to 'local_path'. Preserve permissions and times
- * if 'pflag' is set
+ * if 'pflag' is set.
+ *
+ * Trailing ints are (preserve, resume, fsync, inplace, verify): 'verify' is
+ * LAST here, unlike sftp_upload / sftp_upload_dir / sftp_download_dir where
+ * it follows 'resume'.  All args are plain ints, so a mis-ordered call
+ * compiles silently - do not copy another transfer function's argument
+ * order onto sftp_download().
  */
 int sftp_download(struct sftp_conn *, const char *, const char *, Attrib *,
     int, int, int, int, int);
