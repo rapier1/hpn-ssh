@@ -205,6 +205,7 @@ static int hpn_verify_transfer = 0;		/* HPNVerifyTransfer resolved */
 static int verify_flag = 0;			/* -V: force HPNVerifyTransfer on */
 static int hpn_verify_failed = 0;		/* a transfer failed verify -> exit 57 */
 static int range_split_min_mb_user = 0;		/* -M: range-split min file size, MiB */
+static int writers_cap_user = 0;		/* -w: max range-writers per inode */
 /*
  * showprogress as it stood before sftp_parallel_start() zeroed the global (it
  * suppresses each worker's own per-file meter so only the aggregate meter
@@ -559,7 +560,7 @@ main(int argc, char **argv)
 
 	fflag = Tflag = tflag = 0;
 	while ((ch = getopt(argc, argv,
-	    "12346ABCTVdfOpqRrstvZD:F:J:M:P:S:c:i:j:l:o:X:")) != -1) {
+	    "12346ABCTVdfOpqRrstvZD:F:J:M:P:S:c:i:j:l:o:w:X:")) != -1) {
 		switch (ch) {
 		/* User-visible flags. */
 		case '1':
@@ -716,6 +717,22 @@ main(int argc, char **argv)
 				fatal("Range-split minimum (-M) must be between "
 				    "64 and 10240 MiB: \"%s\": %s",
 				    optarg, errstr);
+			break;
+		case 'w':
+			/* Max concurrent range-writers per inode (mirror
+			 * sftp.c -w).  Caps how many range-split workers write
+			 * one file at once; buffered multi-writer into a single
+			 * inode serialises on the per-inode lock (4 is the
+			 * measured throughput knee).  Effective cap is
+			 * min(this, -j); only meaningful with -j > 1. */
+			writers_cap_user = (int)strtonum(optarg,
+			    HPN_RANGE_WRITERS_CAP_FLOOR,
+			    HPN_RANGE_WRITERS_CAP_MAX, &errstr);
+			if (errstr != NULL)
+				fatal("Concurrent range-writers per inode (-w) "
+				    "must be between %d and %d: \"%s\": %s",
+				    HPN_RANGE_WRITERS_CAP_FLOOR,
+				    HPN_RANGE_WRITERS_CAP_MAX, optarg, errstr);
 			break;
 		case 'X':
 			/* Please keep in sync with sftp.c -X */
@@ -1300,7 +1317,8 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	pcfg.num_requests  = (u_int)sftp_nrequests;
 	pcfg.no_verify_repair = sftp_no_verify_repair;
 	pcfg.limit_kbps    = (uint64_t)limit_kbps;
-	pcfg.writers_per_inode_cap = HPN_RANGE_WRITERS_CAP_DEFAULT;
+	pcfg.writers_per_inode_cap = writers_cap_user ?
+	    writers_cap_user : HPN_RANGE_WRITERS_CAP_DEFAULT;
 	pcfg.range_split_min_mb = range_split_min_mb_user;
 	pcfg.verbose_level = verbose_mode;
 	pcfg.preserve_flag = pflag;
@@ -2732,7 +2750,8 @@ usage(void)
 	    "usage: hpnscp [-346ABCOpqRrsTVvZ] [-c cipher] [-D sftp_server_path]\n"
 	    "              [-F ssh_config] [-i identity_file] [-J destination] [-j streams]\n"
 	    "              [-l limit] [-M range_split_min] [-o ssh_option] [-P port]\n"
-	    "              [-S program] [-X sftp_option] source ... target\n");
+	    "              [-S program] [-w writers_per_file] [-X sftp_option]\n"
+	    "              source ... target\n");
 	exit(1);
 
 }
