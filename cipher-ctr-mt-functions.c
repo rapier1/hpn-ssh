@@ -388,6 +388,7 @@ thread_loop(void *job)
 void *aes_mt_newctx_256(void *provctx)
 {
 	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
+	memset(aes_mt_ctx, 0, sizeof(*aes_mt_ctx));
 	EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
@@ -416,6 +417,7 @@ void *aes_mt_newctx_256(void *provctx)
 void *aes_mt_newctx_192(void *provctx)
 {
 	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
+	memset(aes_mt_ctx, 0, sizeof(*aes_mt_ctx));
 	EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
@@ -444,6 +446,7 @@ void *aes_mt_newctx_192(void *provctx)
 void *aes_mt_newctx_128(void *provctx)
 {
 	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
+	memset(aes_mt_ctx, 0, sizeof(*aes_mt_ctx));
 	EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {

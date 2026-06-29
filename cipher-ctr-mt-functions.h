@@ -116,7 +116,6 @@ struct aes_mt_ctx_st {
 	pthread_rwlock_t        stop_lock;
 	int		        exit_flag;
 #endif /* __APPLE__ */
-	int                     ongoing; /* possibly not needed */
 };
 
 /* this holds an array of evp context pointers that are

@@ -31,6 +31,7 @@
 #include <openssl/core_dispatch.h>
 #include <openssl/core_names.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include "xmalloc.h"
 #include "ossl3-provider-err.h"
 #include "num.h"
@@ -77,8 +78,7 @@ OSSL_FUNC_core_pop_error_to_mark_fn *c_pop_error_to_mark;
 
 /* Errors used in this provider */
 #define AES_MT_E_MALLOC           1
-#define AES_MT_ONGOING_OPERATION  2
-#define AES_MT_BAD_KEYLEN         3
+#define AES_MT_BAD_KEYLEN         2
 
 /* typedef for function pointers */
 typedef void(*fptr_t)(void);
@@ -88,7 +88,6 @@ typedef void(*fptr_t)(void);
 /* BAD_KEYLEN isn't being used at the moment */
 const OSSL_ITEM reasons[] = {
 	{ AES_MT_E_MALLOC, "Memory allocation failure" },
-	{ AES_MT_ONGOING_OPERATION, "Operation underway" },
 	{ AES_MT_BAD_KEYLEN, "Only 256, 192, and 128 Key lengths are supported" },
 	{ 0, NULL } /* Termination */
 };
@@ -341,8 +340,11 @@ static const OSSL_PARAM *aes_mt_gettable_ctx_params(void *cctx, void *provctx)
 
 static int aes_mt_get_ctx_params(void *vctx, OSSL_PARAM params[])
 {
-    struct aes_mt_ctx_st *ctx = vctx;
+    struct aes_mt_ctx_st *ctx = EVP_CIPHER_CTX_get_app_data(vctx);
     int ok = 1;
+
+    if (ctx == NULL)
+        return 0;
 
     if (ctx->keylen > 0) {
         OSSL_PARAM *p;
@@ -365,14 +367,12 @@ static const OSSL_PARAM *aes_mt_settable_ctx_params(void *cctx, void *provctx)
 
 static int aes_mt_set_ctx_params(void *vctx, const OSSL_PARAM params[])
 {
-    struct aes_mt_ctx_st *ctx = vctx;
+    struct aes_mt_ctx_st *ctx = EVP_CIPHER_CTX_get_app_data(vctx);
     const OSSL_PARAM *p;
     int ok = 1;
 
-    if (ctx->ongoing) {
-        ERR_raise(ERR_HANDLE(ctx), AES_MT_ONGOING_OPERATION);
+    if (ctx == NULL)
         return 0;
-    }
 
     for (p = params; p->key != NULL; p++)
         if (strcasecmp(p->key, "keylen") == 0) {
