@@ -349,9 +349,11 @@ static int aes_mt_get_ctx_params(void *vctx, OSSL_PARAM params[])
     if (ctx->keylen > 0) {
         OSSL_PARAM *p;
 
+        /* the field is stored in bits internally (see aes_mt_start_threads
+         * and the keyschedule selector); the OSSL keylen param is in bytes */
         for (p = params; p->key != NULL; p++)
             if (strcasecmp(p->key, "keylen") == 0
-                && provnum_set_size_t(p, ctx->keylen) < 0) {
+                && provnum_set_size_t(p, ctx->keylen / 8) < 0) {
                 ok = 0;
                 continue;
             }
@@ -382,7 +384,8 @@ static int aes_mt_set_ctx_params(void *vctx, const OSSL_PARAM params[])
                 ok = 0;
                 continue;
             }
-            ctx->keylen = keyl;
+            /* keylen param is in bytes; the field is in bits */
+            ctx->keylen = keyl * 8;
         }
     return ok;
 }

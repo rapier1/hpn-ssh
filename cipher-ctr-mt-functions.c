@@ -381,10 +381,15 @@ thread_loop(void *job)
  * a better way of doing this however, I've yet to find one that doesn't
  * involve more madness. I think that's mostly becase I don't understand
  * how params work properly. I feel like I should be able to use them
- * to specify the key length but... also, I'd think I'd be able to
- * set aes_mt_ctx_st->keylen to the keylength but that doesn't seem to
- * work either. That said, this does work even if it's a bit clunky.
- * -cjr 09/08/2022 */
+ * to specify the key length but until then... */
+/* Note: newctx returns the EVP_CIPHER_CTX, not the aes_mt_ctx_st directly.
+ * The aes_mt_ctx_st is attached as app_data and retrieved with
+ * EVP_CIPHER_CTX_get_app_data() in the other callbacks. The key length
+ * comes in through the provider keylen param (set_ctx_params, in bytes),
+ * is stored in aes_mt_ctx_st->keylen in bits, and selects the cipher in
+ * the keyschedule below. Setting keylen through the params previously
+ * looked broken only because get/set_ctx_params cast the context to the
+ * wrong type; that was fixed 2026-06-29.*/
 void *aes_mt_newctx_256(void *provctx)
 {
 	struct aes_mt_ctx_st *aes_mt_ctx = xmalloc(sizeof(*aes_mt_ctx));
@@ -523,6 +528,8 @@ int aes_mt_start_threads(void *vevp_ctx, const u_char *key,
 
 	/* set the initial key for this key stream queue */
 	if (key != NULL) {
+		/* keylen is stored in bits here for the keyschedule selector
+		 * below; the provider get/set_ctx_params convert to/from bytes */
 		aes_mt_ctx->keylen = EVP_CIPHER_CTX_key_length(evp_ctx) * 8;
 		aes_mt_ctx->orig_key = key;
 		aes_mt_ctx->state |= HAVE_KEY;
