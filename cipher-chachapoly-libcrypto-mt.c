@@ -98,6 +98,13 @@ struct chachapoly_ctx_mt {
 	pid_t mainpid;
 	u_char zeros[KEYSTREAMLEN]; /* KEYSTREAMLEN == 32768 */
 
+	/* Crypt-thread-owned ChaCha20 context for the rare oversized-packet
+	 * path (payload > KEYSTREAMLEN, e.g. a peer advertising a large
+	 * maxpacket): the precomputed mainStream covers only KEYSTREAMLEN
+	 * bytes, so the overflow tail is encrypted directly through this
+	 * context.  Only the single crypt caller touches it (no worker race). */
+	EVP_CIPHER_CTX *main_evp_overflow;
+
   /* if OpenSSL has support for Poly1305 in the MAC EVPs
    * use that (OSSL >= 3.0) if not then it's OSSL 1.1 so
    * use the Poly1305 digest methods. Failing that use the
@@ -289,6 +296,9 @@ chachapoly_free_mt(struct chachapoly_ctx_mt * ctx_mt)
 		for (int j=0; j<NUMTHREADS; j++)
 			free_threadData(&(ctx_mt->batches[i].tds[j]));
 
+	if (ctx_mt->main_evp_overflow != NULL)
+		EVP_CIPHER_CTX_free(ctx_mt->main_evp_overflow);
+
 	/* Zero and free the whole multithreaded cipher context. */
 	freezero(ctx_mt, sizeof(*ctx_mt));
 
@@ -327,6 +337,15 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 #else
 	ctx_mt->poly_ctx = NULL;
 #endif
+
+	/* Keyed ChaCha20 context for the oversized-packet overflow path (see
+	 * the struct field).  Keyed with the main key; the per-packet IV
+	 * (counter block + seqnr nonce) is set at crypt time. */
+	if ((ctx_mt->main_evp_overflow = EVP_CIPHER_CTX_new()) == NULL)
+		goto fail;
+	if (!EVP_CipherInit(ctx_mt->main_evp_overflow, EVP_chacha20(),
+	    key, NULL, 1))
+		goto fail;
 
 	ctx_mt->batches[ctx_mt->batchID % 2].batchID = ctx_mt->batchID;
 	ctx_mt->batches[(ctx_mt->batchID + 1) % 2].batchID =
@@ -417,6 +436,8 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 		ctx_mt->pkey = NULL;
 	}
 #endif
+	if (ctx_mt->main_evp_overflow != NULL)
+		EVP_CIPHER_CTX_free(ctx_mt->main_evp_overflow);
 	freezero(ctx_mt, sizeof(*ctx_mt));
 	explicit_bzero(&startseqnr, sizeof(startseqnr));
 	return NULL;
@@ -593,8 +614,41 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 		memcpy(&aad_key, ks->headerStream, sizeof(uint32_t));
 		aad_dst = aad_src ^ aad_key;
 		memcpy(dest, &aad_dst, sizeof(uint32_t));
-		/* Crypt payload */
-		fastXOR2(dest+aadlen,src+aadlen,ks->mainStream,len);
+		/* Crypt payload.  The precomputed keystream covers only
+		 * KEYSTREAMLEN (SSH_IOBUFSZ + 128) bytes, but the payload can be
+		 * larger and we must handle it rather than reject it.  Bulk
+		 * channel data is capped at the ~32 KiB channel maxpacket, but
+		 * pre-auth packets are bounded only by the 256 KiB transport
+		 * packet_max_size, and legitimate auth packets DO exceed 32 KiB:
+		 * most notably large GSSAPI/Kerberos tokens (the well-known
+		 * Active Directory "MaxTokenSize" case, where a token carrying
+		 * many group memberships runs to 48 KiB or more) and large
+		 * certificate chains.  Those arrive as userauth packets
+		 * encrypted with this cipher (everything after NEWKEYS is), so
+		 * rejecting an oversized packet would break those logins - but
+		 * only over chacha20-poly1305-mt, a baffling cipher-specific auth
+		 * failure that the single-threaded chachapoly (no fixed keystream
+		 * buffer, no such limit) does not have.
+		 *
+		 * So for an oversized packet, fall back to a direct ChaCha20 over
+		 * the whole payload using the SAME init as generate_keystream's
+		 * main stream (counter block 1, seqnr nonce), letting OpenSSL
+		 * advance the counter across every block exactly as the
+		 * single-threaded cipher does.  This also avoids the
+		 * out-of-bounds read of mainStream past KEYSTREAMLEN. */
+		if (len <= KEYSTREAMLEN) {
+			fastXOR2(dest+aadlen, src+aadlen, ks->mainStream, len);
+		} else {
+			u_char ovseq[16];
+			memset(ovseq, 0, sizeof(ovseq));
+			POKE_U64(ovseq + 8, seqnr);
+			ovseq[0] = 1;
+			if (!EVP_CipherInit(ctx_mt->main_evp_overflow, NULL,
+			    NULL, ovseq, 1) ||
+			    EVP_Cipher(ctx_mt->main_evp_overflow, dest + aadlen,
+			    src + aadlen, len) < 0)
+				return SSH_ERR_INTERNAL_ERROR;
+		}
 		/* calculate and append tag */
 #if !defined(WITH_OPENSSL3) && defined(EVP_PKEY_POLY1305)
 		if (do_encrypt) {
