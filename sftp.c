@@ -1127,45 +1127,12 @@ parallel_orch_launch(struct sftp_conn *conn)
 	pcfg.print_flag       = quiet ? 0 : 1;
 
 	/*
-	 * Adaptive throughput-outlier stall detection.  On by default
-	 * in parallel mode with conservative settings suited to WAN
-	 * bulk transfer.  Override or disable via env vars:
-	 *
-	 *   SFTP_TPUT_HEALTHY_KBPS=N  override minimum path rate (kbps)
-	 *                             that must be seen before outlier
-	 *                             classification fires; set to 0 to
-	 *                             disable the feature entirely
-	 *   SFTP_TPUT_FRACTION=F      worker is outlier if its kbps
-	 *                             is less than F * max_kbps
-	 *                             (default 0.25)
-	 *   SFTP_TPUT_CONSEC=N        consecutive outlier ticks before
-	 *                             STALLED (default 5); DEAD at 2N
-	 *   SFTP_TPUT_EMA_ALPHA=F     EMA smoothing factor (default 0.2)
+	 * Adaptive throughput-outlier stall detection.  On by default in
+	 * parallel mode with conservative WAN-bulk settings; defaults and the
+	 * SFTP_TPUT_* developer overrides live in sftp_parallel_set_stall_defaults
+	 * so hpnsftp and hpnscp share one source of truth.
 	 */
-	{
-		/* ENV-VAR SFTP_TPUT_HEALTHY_KBPS - developer-only:
-		 * adaptive stall detector path-health floor (kbps).
-		 * Tuning knob for the throughput-outlier detector; not
-		 * meaningful to end users. */
-		const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
-		/* ENV-VAR SFTP_TPUT_FRACTION - developer-only:
-		 * adaptive stall detector outlier fraction (0-1). */
-		const char *e_f = getenv("SFTP_TPUT_FRACTION");
-		/* ENV-VAR SFTP_TPUT_CONSEC - developer-only:
-		 * adaptive stall detector consecutive-tick count. */
-		const char *e_c = getenv("SFTP_TPUT_CONSEC");
-		/* ENV-VAR SFTP_TPUT_EMA_ALPHA - developer-only:
-		 * adaptive stall detector EMA smoothing factor. */
-		const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
-		pcfg.tput_path_healthy_kbps =
-		    (e_h && *e_h) ? strtoull(e_h, NULL, 10) : 2000;
-		pcfg.tput_outlier_fraction =
-		    (e_f && *e_f) ? strtod(e_f, NULL) : 0.25;
-		pcfg.tput_consec_required =
-		    (e_c && *e_c) ? atoi(e_c) : 5;
-		pcfg.tput_ema_alpha =
-		    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
-	}
+	sftp_parallel_set_stall_defaults(&pcfg);
 
 	if (!quiet)
 		logit("Parallel streams: -j %d",

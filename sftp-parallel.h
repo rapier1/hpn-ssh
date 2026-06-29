@@ -233,6 +233,13 @@ int sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
     char *const *extra_argv);
 
 /*
+ * Set the adaptive throughput-outlier stall-detector fields of pcfg to their
+ * defaults, honouring the SFTP_TPUT_* developer env overrides.  Shared by
+ * hpnsftp and hpnscp so the tunables cannot drift between the two.
+ */
+void sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg);
+
+/*
  * Resolve HPNLustreStripeCount from ssh_config for a host.
  * `extra_argv` plumbing as above.
  * Returns: -1 = auto (default), 0 = feature off, >0 = explicit count.

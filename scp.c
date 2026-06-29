@@ -1317,11 +1317,10 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	    parallel_config_file, parallel_extra_o);
 	if (verify_flag)		/* -V forces verify on regardless of config */
 		pcfg.verify_transfer = 1;
-	/* Adaptive throughput-outlier stall detection (mirror sftp.c). */
-	pcfg.tput_path_healthy_kbps = 2000;
-	pcfg.tput_outlier_fraction  = 0.25;
-	pcfg.tput_consec_required   = 5;
-	pcfg.tput_ema_alpha         = 0.0;
+	/* Adaptive throughput-outlier stall detection: shared defaults +
+	 * SFTP_TPUT_* overrides (was a copy-paste of sftp.c's values that
+	 * silently dropped the env overrides). */
+	sftp_parallel_set_stall_defaults(&pcfg);
 
 	if (showprogress)
 		logit("Parallel streams: -j %d", parallel_num_streams);

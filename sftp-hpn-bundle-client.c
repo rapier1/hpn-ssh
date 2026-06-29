@@ -104,36 +104,6 @@ bundle_dl_lookup_entry(struct sftp_hpn_bundle_download_entry *entries, int n,
 	return -1;
 }
 
-/* mkdir -p for a local directory path. */
-static int
-bundle_dl_mkdir_p(const char *dirpath, mode_t mode)
-{
-	char *copy, *p;
-	int rc = 0;
-
-	if (dirpath == NULL || *dirpath == '\0')
-		return -1;
-	copy = xstrdup(dirpath);
-	p = copy;
-	if (*p == '/')
-		p++;
-	for (; *p != '\0'; p++) {
-		if (*p != '/')
-			continue;
-		*p = '\0';
-		if (mkdir(copy, mode) != 0 && errno != EEXIST) {
-			rc = -1;
-			goto out;
-		}
-		*p = '/';
-	}
-	if (mkdir(copy, mode) != 0 && errno != EEXIST)
-		rc = -1;
- out:
-	free(copy);
-	return rc;
-}
-
 /*
  * Per-READ chunk size for bundle downloads.  128 KiB matches the
  * default SFTP_MAX_READ_LENGTH ceiling on most server builds, so each
@@ -304,7 +274,7 @@ bundle_dl_entry_cb(void *ctx, const char *path, uint64_t size,
 		    strcmp(dir, ".") != 0) {
 			if (s->last_mkdir_dir == NULL ||
 			    strcmp(s->last_mkdir_dir, dir) != 0) {
-				if (bundle_dl_mkdir_p(dir, 0755) != 0 &&
+				if (mkdir_p(dir, 0755) != 0 &&
 				    errno != EEXIST) {
 					error_f("mkdir_p \"%s\": %s",
 					    dir, strerror(errno));

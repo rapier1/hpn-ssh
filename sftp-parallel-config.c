@@ -239,3 +239,41 @@ sftp_resolve_hpn_lustre_stripe_count(const char *host,
 	free_options(&options);
 	return r;
 }
+
+/*
+ * Adaptive throughput-outlier stall detection defaults, shared by hpnsftp
+ * and hpnscp so the two stay in lockstep (the defaults used to be copy-pasted
+ * into both, and only sftp.c honoured the env overrides).  On by default in
+ * parallel mode with conservative WAN-bulk settings; each knob is overridable
+ * via a developer-only env var:
+ *
+ *   SFTP_TPUT_HEALTHY_KBPS=N  minimum path rate (kbps) seen before outlier
+ *                             classification fires; 0 disables the feature
+ *   SFTP_TPUT_FRACTION=F      worker is an outlier if its kbps < F * max_kbps
+ *   SFTP_TPUT_CONSEC=N        consecutive outlier ticks before STALLED
+ *                             (DEAD at 2N)
+ *   SFTP_TPUT_EMA_ALPHA=F     EMA smoothing factor (0 = use the 0.2 default
+ *                             at evaluation time)
+ */
+void
+sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg)
+{
+	/* ENV-VAR SFTP_TPUT_HEALTHY_KBPS - developer-only: adaptive stall
+	 * detector path-health floor (kbps); 0 disables the detector. */
+	const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
+	/* ENV-VAR SFTP_TPUT_FRACTION - developer-only: outlier fraction (0-1). */
+	const char *e_f = getenv("SFTP_TPUT_FRACTION");
+	/* ENV-VAR SFTP_TPUT_CONSEC - developer-only: consecutive-tick count. */
+	const char *e_c = getenv("SFTP_TPUT_CONSEC");
+	/* ENV-VAR SFTP_TPUT_EMA_ALPHA - developer-only: EMA smoothing factor. */
+	const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
+
+	pcfg->tput_path_healthy_kbps =
+	    (e_h && *e_h) ? strtoull(e_h, NULL, 10) : 2000;
+	pcfg->tput_outlier_fraction =
+	    (e_f && *e_f) ? strtod(e_f, NULL) : 0.25;
+	pcfg->tput_consec_required =
+	    (e_c && *e_c) ? atoi(e_c) : 5;
+	pcfg->tput_ema_alpha =
+	    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
+}

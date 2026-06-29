@@ -730,46 +730,28 @@ worker_run_batch_pipelined(struct sftp_worker *w,
 	}
 }
 
+/*
+ * Shared tail for worker_run_bundle{,_download}: account the wired member
+ * bytes, log the per-bundle timing line, apply the SERVER_CANT single-file
+ * downgrade, and finalize each unit with its per-entry result.  The two
+ * callers differ only in the entry-struct type, so they copy the per-entry
+ * results into `results[]` before calling here.  `label`/`use_logit` select
+ * the log tag and level (upload at debug, download at logit).
+ */
 static void
-worker_run_bundle(struct sftp_worker *w,
-    struct sftp_work_unit **batch, int bn)
+worker_finish_bundle(struct sftp_parallel *p, struct sftp_worker *w,
+    struct sftp_work_unit **batch, int bn, int bundle_rc,
+    const int *results, uint64_t total_bytes,
+    uint64_t t_start_ns, uint64_t t_end_ns,
+    const char *label, int use_logit)
 {
-	struct sftp_parallel *p = w->parent;
-	struct sftp_hpn_bundle_upload_entry *entries;
-	uint64_t total_bytes = 0;
-	int i, ok_count = 0;
-	uint64_t t_start_ns, t_end_ns, elapsed_us;
-
-	entries = xcalloc(bn, sizeof(*entries));
-	for (i = 0; i < bn; i++) {
-		entries[i].local_path  = batch[i]->src_path;
-		entries[i].remote_path = batch[i]->dst_path;
-		entries[i].result      = 0;
-		if (batch[i]->size > 0)
-			total_bytes += (uint64_t)batch[i]->size;
-		worker_record_start(w);
-	}
-
-	/* Phase-5 instrumentation: per-bundle wall time.  Logged at debug level
-	 * (-v) - one stderr line per bundle; format chosen so the harness can
-	 * grep "BUNDLE worker=" and parse the key=value fields. */
-	t_start_ns = monotime_ns();
-
-	/* dest_dir = "" - each remote_path is treated as an absolute path
-	 * by the server-side bundle handler.  This avoids needing to
-	 * compute a common prefix across the batch; the server's bundle
-	 * extractor calls mkdir_p on each containing directory anyway.
-	 * Slight wire-size cost (full path repeated in every tar header)
-	 * but trivial compared to the small-file payloads. */
-	int bundle_rc = sftp_hpn_bundle_upload(w->conn, "", entries, bn,
-	    p->cfg.preserve_flag, p->cfg.fsync_flag, p->cfg.writer_pool,
-	    p->cfg.bundle_size);
-
-	t_end_ns = monotime_ns();
-	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
+	uint64_t elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
 	off_t wired_data = 0;
+	double mibps = 0.0;
+	int i, ok_count = 0;
+
 	for (i = 0; i < bn; i++)
-		if (entries[i].result == 0) {
+		if (results[i] == 0) {
 			ok_count++;
 			wired_data += batch[i]->size;
 		}
@@ -778,18 +760,21 @@ worker_run_bundle(struct sftp_worker *w,
 	 * overhead - and is not mislabeled "skipped via resume".  Only the ok
 	 * members; failed ones re-transfer and are counted on that path. */
 	sftp_conn_bytes_wired_add(w->conn, (uint64_t)wired_data);
-	{
-		double mibps = 0.0;
-		if (elapsed_us > 0)
-			mibps = ((double)total_bytes /
-			    (1024.0 * 1024.0)) /
-			    ((double)elapsed_us / 1e6);
-		debug("BUNDLE worker=%d files=%d ok=%d bytes=%llu "
-		    "elapsed_us=%llu MiBps=%.2f",
-		    w->id, bn, ok_count,
+	if (elapsed_us > 0)
+		mibps = ((double)total_bytes / (1024.0 * 1024.0)) /
+		    ((double)elapsed_us / 1e6);
+	/* One stderr line per bundle; format chosen so the harness can grep
+	 * the tag and parse the key=value fields. */
+	if (use_logit)
+		logit("%s worker=%d files=%d ok=%d bytes=%llu elapsed_us=%llu "
+		    "MiBps=%.2f", label, w->id, bn, ok_count,
 		    (unsigned long long)total_bytes,
 		    (unsigned long long)elapsed_us, mibps);
-	}
+	else
+		debug("%s worker=%d files=%d ok=%d bytes=%llu elapsed_us=%llu "
+		    "MiBps=%.2f", label, w->id, bn, ok_count,
+		    (unsigned long long)total_bytes,
+		    (unsigned long long)elapsed_us, mibps);
 
 	/*
 	 * Downgrade to single-file ONLY when the server itself can't bundle
@@ -802,29 +787,64 @@ worker_run_bundle(struct sftp_worker *w,
 	 * poisoning that dragged the whole fleet to single-file speed when a
 	 * few connections wedged (2026-06-05 8-pass campaign).
 	 */
-	if (bundle_rc == SFTP_HPN_BUNDLE_SERVER_CANT) {
+	if (bundle_rc == SFTP_HPN_BUNDLE_SERVER_CANT)
 		for (i = 0; i < bn; i++)
 			batch[i]->bundle_ineligible = 1;
-	}
 
 	for (i = 0; i < bn; i++)
-		worker_finalize_one_entry(p, w, batch[i], entries[i].result);
+		worker_finalize_one_entry(p, w, batch[i], results[i]);
+}
+
+static void
+worker_run_bundle(struct sftp_worker *w,
+    struct sftp_work_unit **batch, int bn)
+{
+	struct sftp_parallel *p = w->parent;
+	struct sftp_hpn_bundle_upload_entry *entries;
+	int *results;
+	uint64_t total_bytes = 0, t_start_ns, t_end_ns;
+	int i, bundle_rc;
+
+	entries = xcalloc(bn, sizeof(*entries));
+	results = xcalloc(bn, sizeof(*results));
+	for (i = 0; i < bn; i++) {
+		entries[i].local_path  = batch[i]->src_path;
+		entries[i].remote_path = batch[i]->dst_path;
+		entries[i].result      = 0;
+		if (batch[i]->size > 0)
+			total_bytes += (uint64_t)batch[i]->size;
+		worker_record_start(w);
+	}
+
+	t_start_ns = monotime_ns();
+	/* dest_dir = "" - each remote_path is treated as an absolute path by
+	 * the server-side bundle handler.  This avoids computing a common
+	 * prefix across the batch; the server's bundle extractor calls mkdir_p
+	 * on each containing directory anyway.  Slight wire-size cost (full
+	 * path repeated in every tar header) but trivial vs the small-file
+	 * payloads. */
+	bundle_rc = sftp_hpn_bundle_upload(w->conn, "", entries, bn,
+	    p->cfg.preserve_flag, p->cfg.fsync_flag, p->cfg.writer_pool,
+	    p->cfg.bundle_size);
+	t_end_ns = monotime_ns();
+
+	for (i = 0; i < bn; i++)
+		results[i] = entries[i].result;
+	worker_finish_bundle(p, w, batch, bn, bundle_rc, results, total_bytes,
+	    t_start_ns, t_end_ns, "BUNDLE", 0);
 
 	free(entries);
+	free(results);
 }
 
 /*
- * Download-side counterpart of worker_run_bundle.  Builds the entries
- * array from a batch of SFTP_OP_DOWNLOAD units (src_path = remote,
- * dst_path = local), asks the server to pack the listed paths via
- * sftp_hpn_bundle_download, then finalises each work unit with its
- * per-entry result.
- *
- * Mirrors worker_run_bundle's failure handling: per-entry result is
- * propagated through worker_finalize_one_entry, which re-queues on
- * failure via the normal retry path.  If the whole transaction fails
- * (server refused extension, mid-stream wire error), every entry is
- * marked -1 and each gets retried individually.
+ * Download-side counterpart of worker_run_bundle: builds the entries array
+ * from a batch of SFTP_OP_DOWNLOAD units (src_path = remote, dst_path =
+ * local), asks the server to pack the listed paths via
+ * sftp_hpn_bundle_download, then shares worker_finish_bundle for
+ * byte-accounting, the per-bundle log line, the SERVER_CANT single-file
+ * downgrade, and per-entry finalisation (which re-queues failures via the
+ * normal retry path).
  */
 static void
 worker_run_bundle_download(struct sftp_worker *w,
@@ -832,11 +852,12 @@ worker_run_bundle_download(struct sftp_worker *w,
 {
 	struct sftp_parallel *p = w->parent;
 	struct sftp_hpn_bundle_download_entry *entries;
-	uint64_t total_bytes = 0;
-	int i, ok_count = 0;
-	uint64_t t_start_ns, t_end_ns, elapsed_us;
+	int *results;
+	uint64_t total_bytes = 0, t_start_ns, t_end_ns;
+	int i, bundle_rc;
 
 	entries = xcalloc(bn, sizeof(*entries));
+	results = xcalloc(bn, sizeof(*results));
 	for (i = 0; i < bn; i++) {
 		entries[i].remote_path = batch[i]->src_path;
 		entries[i].local_path  = batch[i]->dst_path;
@@ -847,46 +868,17 @@ worker_run_bundle_download(struct sftp_worker *w,
 	}
 
 	t_start_ns = monotime_ns();
-	int bundle_rc = sftp_hpn_bundle_download(w->conn, entries, bn,
+	bundle_rc = sftp_hpn_bundle_download(w->conn, entries, bn,
 	    p->cfg.preserve_flag, p->cfg.writer_pool);
 	t_end_ns = monotime_ns();
-	elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
-	off_t wired_data = 0;
-	for (i = 0; i < bn; i++)
-		if (entries[i].result == 0) {
-			ok_count++;
-			wired_data += batch[i]->size;
-		}
-	/* Count member DATA (not the tar-framed wire stream) for the run
-	 * summary, so it reflects what the user moved - not the bundling wire
-	 * overhead - and is not mislabeled "skipped via resume".  Only the ok
-	 * members; failed ones re-transfer and are counted on that path. */
-	sftp_conn_bytes_wired_add(w->conn, (uint64_t)wired_data);
-	{
-		double mibps = 0.0;
-		if (elapsed_us > 0)
-			mibps = ((double)total_bytes / (1024.0 * 1024.0)) /
-			    ((double)elapsed_us / 1e6);
-		logit("BUNDLE-DL worker=%d files=%d ok=%d bytes=%llu "
-		    "elapsed_us=%llu MiBps=%.2f",
-		    w->id, bn, ok_count,
-		    (unsigned long long)total_bytes,
-		    (unsigned long long)elapsed_us, mibps);
-	}
-
-	/* Cause-scoped downgrade (see worker_run_bundle): only SERVER_CANT
-	 * (server refused / no extension) forces the per-file path; a
-	 * TRANSPORT_FAILED leaves the units bundle-eligible for a healthy
-	 * worker. */
-	if (bundle_rc == SFTP_HPN_BUNDLE_SERVER_CANT) {
-		for (i = 0; i < bn; i++)
-			batch[i]->bundle_ineligible = 1;
-	}
 
 	for (i = 0; i < bn; i++)
-		worker_finalize_one_entry(p, w, batch[i], entries[i].result);
+		results[i] = entries[i].result;
+	worker_finish_bundle(p, w, batch, bn, bundle_rc, results, total_bytes,
+	    t_start_ns, t_end_ns, "BUNDLE-DL", 1);
 
 	free(entries);
+	free(results);
 }
 
 /*
