@@ -160,10 +160,6 @@ int sshport = -1;
 /* This is the program to execute for the secure connection. ("ssh" or -S) */
 char *ssh_program = _PATH_SSH_PROGRAM;
 
-/* this is path to the remote scp program allowing the user to specify
- * a non-default scp */
-char *remote_path;
-
 /* This is used to store the pid of ssh_program */
 pid_t do_cmd_pid = -1;
 pid_t do_cmd_pid2 = -1;
@@ -508,7 +504,6 @@ void source(int, char *[]);
 void tolocal(int, char *[], enum scp_mode_e, char *sftp_direct);
 void toremote(int, char *[], enum scp_mode_e, char *sftp_direct);
 void usage(void);
-void rand_str(char *, size_t); /*gen randome char string */
 
 void source_sftp(int, char *, char *, struct sftp_conn *);
 void sink_sftp(int, char *, const char *, struct sftp_conn *);
@@ -862,7 +857,7 @@ main(int argc, char **argv)
 	 * clientloop.c -cjr 12/12/2022 */
 
 	(void) snprintf(cmd, sizeof cmd, "%s%s%s%s%s",
-			remote_path ? remote_path : "scp",
+			"scp",
 			verbose_mode ? " -v" : "",
 			iamrecursive ? " -r" : "",
 			pflag ? " -p" : "",
@@ -2890,17 +2885,6 @@ lostconn(int signo)
 		_exit(1);
 	else
 		exit(1);
-}
-
-void rand_str(char *dest, size_t length) {
-	char charset[] = "0123456789"
-		"abcdefghijklmnopqrstuvwxyz"
-		"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-
-	while (length-- > 0) {
-		*dest++ = charset[arc4random_uniform(sizeof(charset) - 1)];
-	}
-	*dest = '\0';
 }
 
 void
