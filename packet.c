@@ -1067,7 +1067,7 @@ ssh_set_newkeys(struct ssh *ssh, int mode)
 			enc->cipher = cipher_by_name(
 			    "chacha20-poly1305@openssh.com");
 		if (enc->cipher == NULL)
-			return r;
+			return SSH_ERR_INTERNAL_ERROR;
 	}
 #endif
 	if ((r = cipher_init(ccp, enc->cipher, enc->key, enc->key_len, enc->iv,
