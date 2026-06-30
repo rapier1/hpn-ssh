@@ -175,28 +175,23 @@ bundle_send_status_failure(struct sshbuf *oqueue, u_int id, int status,
 	sshbuf_free(msg);
 }
 
+/* HPN operator toggles parsed from argv (-B / -O) in sftp-server.c. */
+extern int    sftp_server_hpn_use_bundle(void);
+extern int    sftp_server_hpn_writer_pool(void);
+
 static void
 bundle_enabled_init(void)
 {
 	static int initialised = 0;
-	const char *ev;
 
 	if (initialised)
 		return;
 
-	/* HPN_USE_BUNDLE (sshd_config: HPNUseBundle) - master toggle.
-	 * Absent / unparseable defaults to 1 (enabled). */
-	if (bundle_enabled == -1) {
-		ev = getenv("HPN_USE_BUNDLE");
-		if (ev != NULL && *ev != '\0') {
-			if (strcmp(ev, "0") == 0 || strcmp(ev, "no") == 0)
-				bundle_enabled = 0;
-			else
-				bundle_enabled = 1;
-		} else {
-			bundle_enabled = 1;
-		}
-	}
+	/* Operator master toggle (sshd_config: HPNUseBundle), handed to this
+	 * process by sshd via the -B argv flag (see sftp_server_hpn_use_bundle
+	 * in sftp-server.c).  Defaults to 1 (enabled) when not specified. */
+	if (bundle_enabled == -1)
+		bundle_enabled = sftp_server_hpn_use_bundle();
 
 	initialised = 1;
 	debug_f("hpn-bundle: enabled=%d", bundle_enabled);
@@ -230,15 +225,12 @@ static int
 bundle_writer_pool_allowed(void)
 {
 	static int  cached = -1;
-	const char *ev;
 
 	if (cached >= 0)
 		return cached;
-	ev = getenv("HPN_WRITER_POOL");
-	if (ev != NULL && (strcmp(ev, "0") == 0 || strcmp(ev, "no") == 0))
-		cached = 0;
-	else
-		cached = 1;
+	/* Operator master toggle (sshd_config: HPNWriterPool), handed in by
+	 * sshd via the -O argv flag (see sftp_server_hpn_writer_pool). */
+	cached = sftp_server_hpn_writer_pool();
 	return cached;
 }
 

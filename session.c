@@ -1037,28 +1037,6 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 	/* Normal systems set SHELL by default. */
 	child_set_env(&env, &envsize, "SHELL", shell);
 
-	/* HPN-SSH: propagate bundle-path operator controls to the child
-	 * (most notably sftp-server when launched as a subsystem) via
-	 * the well-known env vars sftp-hpn-server.c reads at startup.
-	 * Only set when the option was explicitly given (non-default
-	 * sentinel test would have already been resolved to the default
-	 * during fill_default_server_options).  Other processes ignore
-	 * unknown env vars; no harm in setting them universally. */
-	{
-		char tmp[64];
-		snprintf(tmp, sizeof(tmp), "%d", options.hpn_use_bundle);
-		child_set_env(&env, &envsize, "HPN_USE_BUNDLE", tmp);
-		snprintf(tmp, sizeof(tmp), "%d", options.hpn_writer_pool);
-		child_set_env(&env, &envsize, "HPN_WRITER_POOL", tmp);
-		/*
-		 * HPNMaxConcurrentWorkers is deliberately NOT exported as an
-		 * environment variable: under PermitUserEnvironment a user could
-		 * override it and lift their own cap.  It is handed to the
-		 * hpnsftp-server on the command line (-W) in session_subsystem_req
-		 * instead, where the user cannot influence it.
-		 */
-	}
-
 	if (getenv("TZ"))
 		child_set_env(&env, &envsize, "TZ", getenv("TZ"));
 #ifdef HAVE_LOGIN_CAP
@@ -1657,12 +1635,35 @@ do_child(struct ssh *ssh, Session *s, const char *command)
 		extern int optind, optreset;
 		int i;
 		char *p, *args;
+		char hpn_b[16], hpn_o[16], hpn_w[16];
 
 		setproctitle("%s@%s", s->pw->pw_name, INTERNAL_SFTP_NAME);
 		args = xstrdup(command ? command : "sftp-server");
 		for (i = 0, (p = strtok(args, " ")); p; (p = strtok(NULL, " ")))
 			if (i < ARGV_MAX - 1)
 				argv[i++] = p;
+		/*
+		 * HPN: inject the operator's sshd_config controls so internal-sftp
+		 * honors them too, matching the external sftp subsystem in
+		 * session_subsystem_req: -B HPNUseBundle, -O HPNWriterPool, and -W
+		 * the per-user worker cap when configured (>0).  argv, not env, so
+		 * a user cannot override them under PermitUserEnvironment.  These
+		 * buffers stay in scope through the sftp_server_main() call below.
+		 */
+		snprintf(hpn_b, sizeof(hpn_b), "%d", options.hpn_use_bundle);
+		snprintf(hpn_o, sizeof(hpn_o), "%d", options.hpn_writer_pool);
+		snprintf(hpn_w, sizeof(hpn_w), "%d",
+		    options.hpn_max_concurrent_workers);
+		if (i < ARGV_MAX - 7) {
+			argv[i++] = "-B";
+			argv[i++] = hpn_b;
+			argv[i++] = "-O";
+			argv[i++] = hpn_o;
+			if (options.hpn_max_concurrent_workers > 0) {
+				argv[i++] = "-W";
+				argv[i++] = hpn_w;
+			}
+		}
 		argv[i] = NULL;
 		optind = optreset = 1;
 		__progname = argv[0];
@@ -1984,24 +1985,31 @@ session_subsystem_req(struct ssh *ssh, Session *s)
 			channel_set_xtype(ssh, s->chanid, type);
 			free(type);
 			if (s->is_subsystem == SUBSYSTEM_EXT &&
-			    strcmp(s->subsys, "sftp") == 0 &&
-			    options.hpn_max_concurrent_workers > 0) {
+			    strcmp(s->subsys, "sftp") == 0) {
 				/*
-				 * HPN: hand the operator's per-user parallel-
-				 * worker cap (HPNMaxConcurrentWorkers) to the
-				 * hpnsftp-server via argv so it can advertise it
-				 * (hpn-max-workers@hpnssh.org).  Argv, not an
-				 * environment variable, so a user cannot override
-				 * it under PermitUserEnvironment.  Only appended
-				 * when a cap is actually configured (>0): -W
-				 * couples the daemon to an hpnsftp-server that
-				 * understands it, so a stock/older server set as
-				 * the sftp subsystem keeps working when no cap is
-				 * configured.
+				 * HPN: hand the operator's sshd_config controls to
+				 * the hpnsftp-server via argv (not environment vars,
+				 * so a user cannot override them under
+				 * PermitUserEnvironment):
+				 *   -B  HPNUseBundle       (bundle path master toggle)
+				 *   -O  HPNWriterPool      (server writer-pool toggle)
+				 *   -W  HPNMaxConcurrentWorkers (per-user cap, only
+				 *       when configured >0)
+				 * This couples the sftp subsystem to an hpnsftp-server
+				 * that understands these flags, which is expected when
+				 * running hpnsshd.
 				 */
 				char *hpncmd;
-				xasprintf(&hpncmd, "%s -W %d", cmd,
-				    options.hpn_max_concurrent_workers);
+				if (options.hpn_max_concurrent_workers > 0)
+					xasprintf(&hpncmd,
+					    "%s -B %d -O %d -W %d", cmd,
+					    options.hpn_use_bundle,
+					    options.hpn_writer_pool,
+					    options.hpn_max_concurrent_workers);
+				else
+					xasprintf(&hpncmd, "%s -B %d -O %d", cmd,
+					    options.hpn_use_bundle,
+					    options.hpn_writer_pool);
 				success = do_exec(ssh, s, hpncmd) == 0;
 				free(hpncmd);
 			} else {

@@ -86,6 +86,29 @@ static int readonly;
  */
 static int hpn_max_concurrent_workers;
 
+/*
+ * HPN: operator's bundle-path master toggle (HPNUseBundle, -B) and the
+ * server-side writer-pool toggle (HPNWriterPool, -O), handed in by sshd on
+ * the command line for the same reason as -W (argv, not env, so a user
+ * cannot override them via PermitUserEnvironment).  Default on (1) when no
+ * flag is given.  Accessors let the bundle module (a separate translation
+ * unit) read the parsed values without touching these statics.
+ */
+static int hpn_use_bundle = 1;
+static int hpn_writer_pool = 1;
+
+int
+sftp_server_hpn_use_bundle(void)
+{
+	return hpn_use_bundle;
+}
+
+int
+sftp_server_hpn_writer_pool(void)
+{
+	return hpn_writer_pool;
+}
+
 /* Requests that are allowed/denied */
 static char *request_allowlist, *request_denylist;
 
@@ -2131,7 +2154,7 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 	pw = pwcopy(user_pw);
 
 	while (!skipargs && (ch = getopt(argc, argv,
-	    "d:f:l:P:p:Q:u:W:cehR")) != -1) {
+	    "d:f:l:P:p:Q:u:W:B:O:cehR")) != -1) {
 		switch (ch) {
 		case 'W': {
 			/* HPN: per-user parallel-worker cap from sshd (see the
@@ -2146,6 +2169,18 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 			}
 			break;
 		}
+		case 'B':
+			/* HPN: bundle-path master toggle (sshd_config
+			 * HPNUseBundle) from sshd; 0/no = off, else on. */
+			hpn_use_bundle = (strcmp(optarg, "0") == 0 ||
+			    strcmp(optarg, "no") == 0) ? 0 : 1;
+			break;
+		case 'O':
+			/* HPN: server writer-pool toggle (sshd_config
+			 * HPNWriterPool) from sshd; 0/no = off, else on. */
+			hpn_writer_pool = (strcmp(optarg, "0") == 0 ||
+			    strcmp(optarg, "no") == 0) ? 0 : 1;
+			break;
 		case 'Q':
 			if (strcasecmp(optarg, "requests") != 0) {
 				fprintf(stderr, "Invalid query type\n");
