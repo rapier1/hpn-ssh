@@ -319,7 +319,7 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 
 	logit("sftp-hash-range \"%s\" num_ranges=%u", path, num_ranges);
 
-	if ((fd = open(path, O_RDONLY|O_NOFOLLOW)) == -1) {
+	if ((fd = open(path, O_RDONLY)) == -1) {
 		send_status_oqueue(oqueue, id,
 		    errno_to_sftp_status(errno));
 		goto out;
@@ -605,7 +605,7 @@ process_hpn_check_file(u_int id, struct sshbuf *iqueue,
 	logit("hpn-check-file \"%s\" length %llu", path,
 	    (unsigned long long)length);
 
-	if ((fd = open(path, O_RDONLY|O_NOFOLLOW)) == -1) {
+	if ((fd = open(path, O_RDONLY)) == -1) {
 		send_status_oqueue(oqueue, id, errno_to_sftp_status(errno));
 		goto out;
 	}
