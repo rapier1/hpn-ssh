@@ -451,6 +451,16 @@ bundle_upload_data_cb(void *ctx, const u_char *data, size_t len)
 	if (s->pool != NULL) {
 		/* Parallel path: accumulate into the per-file buffer; the pool
 		 * thread writes it once the entry completes. */
+		/* Defense-in-depth: the parser already clamps delivered data to
+		 * the declared entry size, but bound the memcpy locally too so a
+		 * parser regression cannot overflow the cur_size-sized buffer.
+		 * Written as a subtraction to avoid overflow in the check itself
+		 * (cur_job_filled <= cur_size is the maintained invariant). */
+		if (len > (size_t)s->cur_size - s->cur_job_filled) {
+			error_f("bundle entry data exceeds declared size %llu",
+			    (unsigned long long)s->cur_size);
+			return -1;
+		}
 		if (s->cur_job_buf != NULL && len > 0)
 			memcpy(s->cur_job_buf + s->cur_job_filled, data, len);
 		s->cur_job_filled += len;
