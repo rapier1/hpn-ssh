@@ -3246,26 +3246,23 @@ client_session2_setup(struct ssh *ssh, int id, int want_tty, int want_subsystem,
 		 * scp commands to look for hpnscp instead.
 		 */
 		if (ssh->compat & SSH_HPNSSH_PREFIX) {
-			char *new_cmd;
-			new_cmd = malloc(len+4);
-			/* read the existing command into a temp buffer */
-			sprintf(new_cmd, "%s", (const u_char*)sshbuf_ptr(cmd));
-			const char *pos;
-			/* see if the command starts with scp */
-			pos = strstr(new_cmd, "scp");
-			/* by substracting the pointer new_cmd from the pointer
-			 * pos we end up with the position of the needle in the
-			 * haystack. If it's 0 then we can mess with it
+			/*
+			 * sshbuf_dup_string returns a NUL-terminated copy (and NULL
+			 * on an embedded NUL or OOM), so we never sprintf/strstr over
+			 * a non-NUL-terminated sshbuf_ptr.  Only rewrite a command
+			 * that actually starts with "scp".
 			 */
-			if (pos - new_cmd == 0) {
+			char *cur_cmd = sshbuf_dup_string(cmd);
+
+			if (cur_cmd != NULL && strncmp(cur_cmd, "scp", 3) == 0) {
+				char *new_cmd = NULL;
+
 				debug_f("Rewriting scp command for hpnscp.");
-				sprintf(new_cmd, "hpn%s", (const u_char*)sshbuf_ptr(cmd));
+				xasprintf(&new_cmd, "hpn%s", cur_cmd);
 				debug_f("Command was: %s and is now %s",
-				      (const u_char*)sshbuf_ptr(cmd), new_cmd);
-				/* free the existing sshbuf 'cmd'
-				 * recreate it and then write our new_cmd into
-				 * the sshbuf struct
-				 */
+				      cur_cmd, new_cmd);
+				/* free the existing sshbuf 'cmd', recreate it and
+				 * write our new_cmd into the sshbuf struct */
 				sshbuf_free(cmd);
 				if ((cmd = sshbuf_new()) == NULL)
 					fatal("sshbuf_new failed in scp rewrite");
@@ -3277,6 +3274,7 @@ client_session2_setup(struct ssh *ssh, int id, int want_tty, int want_subsystem,
 				len += 3;
 				free(new_cmd);
 			}
+			free(cur_cmd);
 		}
 		if (len > 900)
 			len = 900;
