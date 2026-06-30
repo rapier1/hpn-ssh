@@ -2974,13 +2974,39 @@ client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *
 	/* read the entire packet string into blob
 	 * blob has to be a const uchar as that's what string_direct expects
 	 * we cast it as a void for the binn functions */
-	sshpkt_get_string_direct(ssh, &blob, &len);
-	if (len == 0) {
-		/* received no data. which is weird */
-		error("Received no remote metrics data. Continuing.");
+	if ((r = sshpkt_get_string_direct(ssh, &blob, &len)) != 0) {
+		error_fr(r, "read remote metrics blob");
+		fclose(remfptr);
+		goto localonly;
 	}
 
-	/* create a string of the data from the binn object blob */
+	/*
+	 * blob is the peer's reply = attacker-controlled. The binn convenience
+	 * getters trust the blob's own embedded size field, so validate the
+	 * whole structure against the actual received length first.
+	 * binn_is_valid_ex (with *psize = len) rejects an embedded size that
+	 * does not match len and any element that walks past the buffer;
+	 * without it a hostile peer could drive an out-of-bounds read. binn is
+	 * third party - this is its documented caller-side check, no binn change.
+	 */
+	{
+		int v_type = 0, v_count = 0, v_size;
+
+		if (len == 0 || len > INT_MAX) {
+			error("Remote metrics blob has implausible length. Skipping.");
+			fclose(remfptr);
+			goto localonly;
+		}
+		v_size = (int)len;
+		if (binn_is_valid_ex((void *)blob, &v_type, &v_count,
+		    &v_size) == FALSE || v_type != BINN_OBJECT) {
+			error("Remote metrics blob failed validation. Skipping.");
+			fclose(remfptr);
+			goto localonly;
+		}
+	}
+
+	/* create a string of the data from the (validated) binn object blob */
 	metrics_read_binn_object((void *)blob, metricsstring);
 
 	/* have we printed the header? (driven by the record's own field keys) */

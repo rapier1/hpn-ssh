@@ -743,11 +743,25 @@ metrics_read_binn_object (void *binnobj, char *output) {
  * by something */
 void
 metrics_print_header(FILE *fptr, char *extra_text, void *binnobj) {
-	char *krel = binn_object_str(binnobj, "kernel_release");
+	/*
+	 * kernel_release is a string field.  For a remote (peer-supplied)
+	 * record the blob is validated against its real length before we get
+	 * here, but the stored string is not guaranteed NUL-terminated within
+	 * its declared length, so bind the print to the binn-reported size
+	 * with %.*s instead of %s-ing the in-blob pointer (which could over-read
+	 * past the buffer looking for a terminator).
+	 */
+	char *krel = NULL;
+	int krlen = 0;
+
+	if (binn_object_get(binnobj, "kernel_release", BINN_STRING,
+	    (void *)&krel, &krlen) == FALSE || krel == NULL || krlen < 0) {
+		krel = "unknown";
+		krlen = 7; /* strlen("unknown") */
+	}
 
 	if (extra_text != NULL) {
-		fprintf(fptr, "%s (kernel %s)\n", extra_text,
-			krel != NULL ? krel : "unknown");
+		fprintf(fptr, "%s (kernel %.*s)\n", extra_text, krlen, krel);
 	}
 	fprintf(fptr, "timestamp, state, ca_state, retransmits, probes, backoff, options, ");
 	fprintf(fptr, "snd_wscale, rcv_wscale, rto, ato, snd_mss, rcv_mss, unacked, sacked, lost, retrans, ");
