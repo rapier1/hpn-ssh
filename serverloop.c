@@ -732,6 +732,9 @@ server_input_metrics_request(struct ssh *ssh, struct sshbuf **respp)
 	int r;
 	binn *metricsobj;
 
+	/* zero first: getsockopt fills only the bytes the running kernel
+	 * supports, and the serializer reads the base field block unconditionally */
+	memset(&tcp_info, 0, sizeof(tcp_info));
 	tcp_info_len = sizeof(tcp_info); /*expect around 330 bytes */
 	if ((resp = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new");

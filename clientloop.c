@@ -3040,6 +3040,9 @@ localonly:
 		fatal("Could not create metrics object");
 	}
 
+	/* zero first: getsockopt fills only the bytes the running kernel
+	 * supports, and the serializer reads the base field block unconditionally */
+	memset(&local_tcp_info, 0, sizeof(local_tcp_info));
 	tcpi_len = (size_t)sizeof(local_tcp_info);
 	if ((r = getsockopt(sock_in, IPPROTO_TCP, TCP_INFO, (void *)&local_tcp_info,
 			    (socklen_t *)&tcpi_len)) != 0){
