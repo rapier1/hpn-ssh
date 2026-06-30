@@ -1229,6 +1229,7 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 {
 	struct sftp_parallel_config pcfg;
 	char portbuf[16] = "";
+	int eff_streams = 0;	/* per-call effective stream count after the cap */
 
 	/*
 	 * Capture whether progress is wanted BEFORE sftp_parallel_start() zeroes
@@ -1264,8 +1265,13 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 		return;			/* single-stream: no orchestrator */
 
 	/*
-	 * HPN: clamp the requested worker count to the server's advertised
-	 * per-user cap (hpn-max-workers@hpnssh.org, read at sftp_init):
+	 * HPN: clamp the requested worker count to THIS connection's advertised
+	 * per-user cap (hpn-max-workers@hpnssh.org, read at sftp_init).  Computed
+	 * per call into a local; parallel_num_streams stays the immutable -j
+	 * request so each source connection caps against the original request.
+	 * Downloads relaunch this per source argument (each may be a different
+	 * host), and 3rd-party/crossload transfers will too, so the cap must be
+	 * per-connection rather than a sticky once-only global.
 	 *   cap < 0  -> not advertised (stock / non-HPN server): apply the
 	 *               conservative no-policy default.
 	 *   cap == 0 -> HPN server with no admin cap: honour the request.
@@ -1273,36 +1279,31 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	 * (The hard SFTP_PARALLEL_MAX_WORKERS ceiling is enforced at parse.)
 	 */
 	{
-		static int worker_cap_applied = 0;
-		if (!worker_cap_applied) {
-			int cap = sftp_hpn_max_workers_cap(conn);
-			int requested = parallel_num_streams;
-			int eff = requested;
+		int cap = sftp_hpn_max_workers_cap(conn);
+		int requested = parallel_num_streams;
 
+		eff_streams = requested;
+		if (cap < 0)
+			eff_streams = MINIMUM(requested,
+			    HPN_NO_POLICY_WORKER_DEFAULT);
+		else if (cap > 0)
+			eff_streams = MINIMUM(requested, cap);
+		if (eff_streams < requested) {
 			if (cap < 0)
-				eff = MINIMUM(requested,
-				    HPN_NO_POLICY_WORKER_DEFAULT);
-			else if (cap > 0)
-				eff = MINIMUM(requested, cap);
-			if (eff < requested) {
-				if (cap < 0)
-					logit("Parallel streams limited to %d "
-					    "(server advertises no policy; "
-					    "requested %d)", eff, requested);
-				else
-					logit("Parallel streams limited to %d "
-					    "by server policy (requested %d)",
-					    eff, requested);
-				parallel_num_streams = eff;
-			}
-			worker_cap_applied = 1;
+				logit("Parallel streams limited to %d "
+				    "(server advertises no policy; "
+				    "requested %d)", eff_streams, requested);
+			else
+				logit("Parallel streams limited to %d "
+				    "by server policy (requested %d)",
+				    eff_streams, requested);
 		}
 	}
-	if (parallel_num_streams <= 1)
+	if (eff_streams <= 1)
 		return;			/* clamped down to single-stream */
 
 	memset(&pcfg, 0, sizeof(pcfg));
-	pcfg.num_streams   = parallel_num_streams;
+	pcfg.num_streams   = eff_streams;
 	pcfg.host          = host;
 	pcfg.user          = user;
 	if (port > 0) {
@@ -1341,12 +1342,11 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	sftp_parallel_set_stall_defaults(&pcfg);
 
 	if (showprogress)
-		logit("Parallel streams: -j %d", parallel_num_streams);
+		logit("Parallel streams: -j %d", eff_streams);
 	parallel_orch = sftp_parallel_start(&pcfg);
 	if (parallel_orch == NULL) {
 		logit("Parallel-streams setup failed; falling back to "
 		    "single-stream mode.");
-		parallel_num_streams = 1;
 		return;
 	}
 	/*
