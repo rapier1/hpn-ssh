@@ -1489,6 +1489,7 @@ parse_time:
 
 	case oMetricsInterval:
 		intptr = &options->metrics_interval;
+		options->metrics = 1;
 		goto parse_int;
 
 	case oMetricsPath:
@@ -3273,7 +3274,10 @@ fill_default_options(Options * options)
 		options->disable_multithreaded = 0;
 	if (options->metrics == -1)
 		options->metrics = 0;
-	if (options->metrics_interval == -1)
+	/* If they set the metrics interval to zero or a negative number
+	 * that would be bad so restore it to the default. This also captures
+	 * the -1 initialization. */
+	if (options->metrics_interval <= 0)
 		options->metrics_interval = 5;
 	if (options->control_master == -1)
 		options->control_master = 0;
