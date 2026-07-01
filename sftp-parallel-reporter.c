@@ -802,6 +802,16 @@ parallel_reporter_thread(void *arg)
 			} else {
 				uint64_t hashed = __atomic_load_n(
 				    &p->verify_done_bytes, __ATOMIC_RELAXED);
+				/* workers_mu: a detached respawn thread can
+				 * xreallocarray(p->workers) (and the reap loop can
+				 * remove/free a worker) during the verify phase -
+				 * a worker whose conn drops mid-hash is reaped and
+				 * respawned.  Iterating workers[]/w->conn unlocked
+				 * would race that realloc/free (UAF/OOB).  Mirror
+				 * the sibling fleet-sample/reap/CSV loops, which all
+				 * hold this lock; the body is only a cheap atomic
+				 * getter. */
+				pthread_mutex_lock(&p->workers_mu);
 				for (int wi = 0; wi < p->num_workers; wi++) {
 					struct sftp_worker *w = p->workers[wi];
 					if (w != NULL && w->conn != NULL)
@@ -809,6 +819,7 @@ parallel_reporter_thread(void *arg)
 						    sftp_conn_verify_inflight_get(
 						        w->conn);
 				}
+				pthread_mutex_unlock(&p->workers_mu);
 				if (hashed > (uint64_t)p->verify_meter_total)
 					hashed = (uint64_t)p->verify_meter_total;
 				p->aggregate_progress_counter = (off_t)hashed;
