@@ -1125,9 +1125,14 @@ struct sftp_parallel {
 						 * "path may be unreliable" notice
 						 * has fired once this transfer
 						 * (reporter thread only) */
-	int                         wedge_terminations;	/* workers reaped with
+	/* _Atomic: bumped in classify_worker_death on the reporter thread's
+	 * UNLOCKED reap loop (siblings total_respawns/endgame_straggler_reaps/
+	 * protocol_violations are all written under workers_mu, but this one is
+	 * not), and read by main in get_stats before the reporter is joined -
+	 * cross-thread, so the access must be atomic. */
+	_Atomic int                 wedge_terminations;	/* workers reaped with
 							 * HPN_EXIT_TCP_WEDGE */
-	int                         peer_stall_terminations; /* ditto, PEER_STALL */
+	_Atomic int                 peer_stall_terminations; /* ditto, PEER_STALL */
 	int                         endgame_straggler_reaps; /* endgame stuck-
 							 * straggler reaps (orchestrator-doomed) */
 	/* Tail trend detector state (phase B, reporter thread only - no
@@ -1423,9 +1428,11 @@ struct sftp_parallel {
 	 * outlier-detection warmup so newly-respawned workers in TCP
 	 * slow-start aren't killed before their cwnd has had ~RAMP_RTTS
 	 * round-trips to ramp.  Set once via sftp_parallel_set_path_rtt;
-	 * read by the reporter thread.
+	 * read by the reporter thread.  _Atomic: sftp_parallel_set_path_rtt
+	 * (main) writes it AFTER the reporter thread is already running, which
+	 * reads it in the watchdog - concurrent, so make the access atomic.
 	 */
-	uint64_t                    path_rtt_us;
+	_Atomic uint64_t            path_rtt_us;
 
 	int                         saved_showprogress;
 	int                         progress_meter_started;
@@ -1494,8 +1501,10 @@ struct sftp_parallel {
 	                                  * or heartbeat (a sign of life) */
 	int      last_worker_exit_code;  /* last reaped worker's exit code, -1 if
 	                                  * signaled/unknown; for the abort message */
-	int      born_dead_sec;          /* 0-bytes kill threshold; RTT-derived in
-	                                  * sftp_parallel_set_path_rtt */
+	_Atomic int born_dead_sec;       /* 0-bytes kill threshold; RTT-derived in
+	                                  * sftp_parallel_set_path_rtt (main) after
+	                                  * the reporter started, read by the
+	                                  * watchdog (reporter thread) - _Atomic. */
 	/* Stuck-range detector (reporter/watchdog thread only).  born_dead's
 	 * "kill fast, the respawn lands on a healthier path" assumption is
 	 * false when the stall is a server-side STUCK RANGE (e.g. a Lustre OST
