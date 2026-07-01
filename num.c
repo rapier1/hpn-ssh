@@ -17,14 +17,13 @@ static endian_t nativeendian(void)
 
 static sign_t paramsign(const OSSL_PARAM *param)
 {
-    size_t srcmsb = nativeendian() == BIG ? 0 : param->data_size - 1;
+    size_t srcmsb;
 
-    return
-        param->data_type == OSSL_PARAM_UNSIGNED_INTEGER
-        ? POSITIVE
-        : (((unsigned char *)param->data)[srcmsb] & 0x80
-           ? NEGATIVE
-           : POSITIVE);
+    if (param->data_type == OSSL_PARAM_UNSIGNED_INTEGER ||
+        param->data == NULL || param->data_size == 0)
+        return POSITIVE;
+    srcmsb = nativeendian() == BIG ? 0 : param->data_size - 1;
+    return ((unsigned char *)param->data)[srcmsb] & 0x80 ? NEGATIVE : POSITIVE;
 }
 
 struct numdesc {
