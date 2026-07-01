@@ -326,7 +326,7 @@ struct ssh *
 ssh_packet_set_connection(struct ssh *ssh, int fd_in, int fd_out)
 {
 	struct session_state *state;
-	struct sshcipher *none = cipher_by_name("none");
+	const struct sshcipher *none = cipher_by_name("none");
 	int r;
 
 	if (none == NULL) {

@@ -56,7 +56,7 @@
 struct sshcipher;
 struct sshcipher_ctx;
 
-struct sshcipher *cipher_by_name(const char *);
+const struct sshcipher *cipher_by_name(const char *);
 const char *cipher_warning_message(const struct sshcipher_ctx *);
 int	 ciphers_valid(const char *);
 char	*cipher_alg_list(char, int);

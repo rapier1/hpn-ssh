@@ -99,7 +99,7 @@ struct sshcipher {
 #endif
 };
 
-static struct sshcipher ciphers[] = {
+static const struct sshcipher ciphers[] = {
 #ifdef WITH_OPENSSL
 #ifndef OPENSSL_NO_DES
 	{ "3des-cbc",		8, 24, 0, 0, CFLAG_CBC, EVP_des_ede3_cbc },
@@ -261,10 +261,10 @@ cipher_ctx_is_plaintext(struct sshcipher_ctx *cc)
 	return cc->plaintext;
 }
 
-struct sshcipher *
+const struct sshcipher *
 cipher_by_name(const char *name)
 {
-	struct sshcipher *c;
+	const struct sshcipher *c;
 	for (c = ciphers; c->name != NULL; c++)
 		if (strcmp(c->name, name) == 0)
 			return c;
