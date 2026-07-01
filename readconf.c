@@ -1489,12 +1489,10 @@ parse_time:
 
 	case oMetricsInterval:
 		intptr = &options->metrics_interval;
-		options->metrics = 1;
 		goto parse_int;
 
 	case oMetricsPath:
 		charptr = &options->metrics_path;
-		options->metrics = 1;
 		goto parse_string;
 
 	case oFallback:
