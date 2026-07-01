@@ -219,15 +219,18 @@ parallel_respawn_teardown_ssh(struct sftp_worker *w)
 
 /* Register/deregister an in-flight spawn's ssh child so abort/stop can
  * SIGTERM it out of a blocking connect instead of waiting it out. */
-static void
+static int
 spawning_pid_register(struct sftp_parallel *p, pid_t pid)
 {
+	int registered = 0;
 	pthread_mutex_lock(&p->workers_mu);
 	if (p->n_spawning < SFTP_PARALLEL_MAX_WORKERS) {
 		p->spawning_since[p->n_spawning] = monotime();
 		p->spawning_pids[p->n_spawning++] = pid;
+		registered = 1;
 	}
 	pthread_mutex_unlock(&p->workers_mu);
+	return registered;
 }
 
 static void
@@ -311,7 +314,17 @@ spawn_one_worker(struct sftp_parallel *p)
 	 * SIGTERM it (the pipe EOF fails sftp_init within ms), and re-check
 	 * the flags AFTER registering: a teardown that swept the registry
 	 * just before our registration is caught here and we self-kill. */
-	spawning_pid_register(p, w->ssh_pid);
+	if (!spawning_pid_register(p, w->ssh_pid)) {
+		/* Registry full (SFTP_PARALLEL_MAX_WORKERS spawns already in
+		 * flight - pathological, e.g. a spawn storm).  An unregistered
+		 * child cannot be found by abort/stop's SIGTERM sweep, so
+		 * proceeding would pin teardown for a full connect timeout.
+		 * Reap it now and fail the spawn; respawn_owed persists, so the
+		 * dispatch retries once an in-flight slot frees. */
+		error_ft("spawn registry full; abandoning spawn");
+		(void)kill(w->ssh_pid, SIGTERM);
+		goto fail;
+	}
 	registered = 1;
 	if (p->abort_flag || p->stopped) {
 		(void)kill(w->ssh_pid, SIGTERM);
@@ -651,8 +664,16 @@ parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
 		/* Fleet empty: launch a SINGLE probe rather than num_streams
 		 * fresh connections, so we don't slam a possibly-still-
 		 * saturated backend.  A healthy probe refills normally on the
-		 * following ticks; a re-stall escalates the cooldown. */
-		to_spawn = (p->respawn_owed > 0 || pending > 0) ? 1 : 0;
+		 * following ticks; a re-stall escalates the cooldown.
+		 *
+		 * Gate on pending_respawns == 0: the probe's respawn thread
+		 * sleeps ~2s (the FXP_INIT-race cooldown) before it connects,
+		 * longer than the reporter tick (~1s), so without this guard the
+		 * next tick(s) still see cur_workers == 0 and launch additional
+		 * probes - the exact connection storm the single-probe design
+		 * exists to avoid.  One probe in flight is enough. */
+		to_spawn = (p->pending_respawns == 0 &&
+		    (p->respawn_owed > 0 || pending > 0)) ? 1 : 0;
 	} else {
 		to_spawn = (p->respawn_owed > 0 && slots > 0)
 		    ? ((p->respawn_owed < slots) ? p->respawn_owed : slots)
