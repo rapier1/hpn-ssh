@@ -119,6 +119,22 @@ struct sftp_conn {
 	u_int last_status;	/* most recent SSH2_FXP_STATUS code seen by
 				 * get_status/get_handle; lets callers
 				 * classify permanent failures (HPN) */
+	int saw_perm_denied;	/* HPN: set by get_status/get_handle whenever a
+				 * reply is SSH2_FX_PERMISSION_DENIED.  Read by
+				 * the parallel worker's retry deciders to set
+				 * u->no_retry - a refusal is permanent, so
+				 * retrying only burns the budget.  Unlike
+				 * last_status it survives the post-failure CLOSE
+				 * (an OK close would overwrite last_status).
+				 * Reset at each unit/batch status-read boundary
+				 * so it is scoped to one unit/batch. */
+	int saw_policy_denied;	/* HPN: a refused op was tagged by the server as
+				 * a -P/-p request-policy denial (HPN_POLICY_-
+				 * DENIED_TAG in the STATUS message), as opposed
+				 * to a filesystem error.  Lets the bundle path
+				 * abort the whole transfer (every file of this
+				 * class is refused) instead of falling back per
+				 * file.  Reset at each bundle attempt. */
 	int fd_in;
 	int fd_out;
 	struct sftp_hpn_conn *hpn;  /* HPN: per-connection extensions (dead flag,
@@ -408,6 +424,10 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 	debug3("SSH2_FXP_STATUS %u", status);
 
 	conn->last_status = status; /* HPN: permanent-failure classification */
+	if (status == SSH2_FX_PERMISSION_DENIED) {
+		conn->saw_perm_denied = 1; /* HPN: sticky no-retry signal */
+		sftp_conn_check_policy_tag(conn, msg); /* HPN: policy-abort */
+	}
 	return status;
 }
 
@@ -445,6 +465,10 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 		if ((r = sshbuf_get_u32(msg, &status)) != 0)
 			fatal_fr(r, "parse status");
 		conn->last_status = status; /* HPN */
+		if (status == SSH2_FX_PERMISSION_DENIED) {
+			conn->saw_perm_denied = 1; /* HPN: sticky no-retry */
+			sftp_conn_check_policy_tag(conn, msg); /* HPN */
+		}
 		if (errfmt != NULL)
 			error("%s: %s", errmsg, fx2txt(status));
 		return NULL;
@@ -814,6 +838,54 @@ int
 sftp_conn_is_dead(struct sftp_conn *conn)
 {
 	return conn != NULL && sftp_hpn_is_dead(conn->hpn);
+}
+
+/* HPN: permanent-denial signal accessors (struct sftp_conn is opaque to
+ * callers; the parallel worker uses these to set no_retry on a refusal). */
+int
+sftp_conn_saw_perm_denied(struct sftp_conn *conn)
+{
+	return conn != NULL && conn->saw_perm_denied;
+}
+
+void
+sftp_conn_clear_perm_denied(struct sftp_conn *conn)
+{
+	if (conn != NULL)
+		conn->saw_perm_denied = 0;
+}
+
+int
+sftp_conn_saw_policy_denied(struct sftp_conn *conn)
+{
+	return conn != NULL && conn->saw_policy_denied;
+}
+
+void
+sftp_conn_clear_policy_denied(struct sftp_conn *conn)
+{
+	if (conn != NULL)
+		conn->saw_policy_denied = 0;
+}
+
+/*
+ * Called right after a PERMISSION_DENIED status code is read, with `msg`
+ * positioned at the status reply's error-message string.  If that message
+ * carries HPN_POLICY_DENIED_TAG the refusal came from the server's -P/-p
+ * request policy (not a filesystem error), so latch saw_policy_denied.
+ * Consumes the message string from `msg`; harmless on a buffer that has none.
+ */
+void
+sftp_conn_check_policy_tag(struct sftp_conn *conn, struct sshbuf *msg)
+{
+	char *errmsg = NULL;
+
+	if (conn == NULL || msg == NULL)
+		return;
+	if (sshbuf_get_cstring(msg, &errmsg, NULL) == 0 && errmsg != NULL &&
+	    strstr(errmsg, HPN_POLICY_DENIED_TAG) != NULL)
+		conn->saw_policy_denied = 1;
+	free(errmsg);
 }
 
 int
@@ -2302,6 +2374,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	}
 	if (read_error) {
 		error("read remote \"%s\" : %s", remote_path, fx2txt(status));
+		if (status == SSH2_FX_PERMISSION_DENIED)
+			conn->saw_perm_denied = 1; /* HPN: no-retry */
 		status = -1;
 		sftp_close(conn, handle, handle_len);
 	} else if (write_error) {
@@ -2703,6 +2777,8 @@ do_upload_body(struct sftp_conn *conn,
 	}
 	if (status != SSH2_FX_OK) {
 		error("write remote \"%s\": %s", remote_path, fx2txt(status));
+		if (status == SSH2_FX_PERMISSION_DENIED)
+			conn->saw_perm_denied = 1; /* HPN: no-retry */
 		status = SSH2_FX_FAILURE;
 	}
 
@@ -3429,6 +3505,8 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			error("write remote \"%s\" at offset %llu: %s",
 			    remote_path, (unsigned long long)ack->offset,
 			    fx2txt(status));
+			if (status == SSH2_FX_PERMISSION_DENIED)
+				conn->saw_perm_denied = 1; /* HPN: no-retry */
 			/* Highwater clamp: acks are processed in order, but
 			 * the loop keeps draining after a failed write, so
 			 * later OK acks would advance the head past a HOLE.
@@ -3668,6 +3746,8 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			else
 				error("read remote \"%s\": %s",
 				    remote_path, fx2txt(status));
+			if (status == SSH2_FX_PERMISSION_DENIED)
+				conn->saw_perm_denied = 1; /* HPN: no-retry */
 			read_error = 1;
 			/* The failing read's own offset bounds contiguity. */
 			if (contig_hw < 0 || (off_t)req->offset < contig_hw)
@@ -4233,6 +4313,8 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 			if (status != SSH2_FX_OK) {
 				error("write remote \"%s\": %s",
 				    entries[i].remote_path, fx2txt(status));
+				if (status == SSH2_FX_PERMISSION_DENIED)
+					conn->saw_perm_denied = 1; /* HPN */
 				bs[i].failed = 1;
 				entries[i].result = -1;
 				any_fail = 1;

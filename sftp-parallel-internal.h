@@ -1411,6 +1411,13 @@ struct sftp_parallel {
 	/* Set by sftp_parallel_abort, read by workers between units. */
 	volatile sig_atomic_t       abort_flag;
 
+	/* HPN: set when a worker sees a server -P/-p request-policy denial (a
+	 * class-wide refusal: every file of this kind would be denied).  The
+	 * worker also raises abort_flag and shuts the workqueue so the whole
+	 * transfer stops fast instead of re-denying every file; this flag is
+	 * the reporting/idempotency latch for that path. */
+	_Atomic int                 policy_denied;
+
 	/* Abort CAUSE: 1 when the abort came from the user's interrupt
 	 * (Ctrl-C via ext_interrupt_flag) rather than a fleet failure.
 	 * Read by the interrupt-aware messaging - a user who hit Ctrl-C

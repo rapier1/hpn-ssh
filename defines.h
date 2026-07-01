@@ -1014,6 +1014,15 @@ struct winsize {
 #define HPN_BUNDLE_SIZE_MAX		(256 * 1024 * 1024)	/* 256 MiB */
 #define HPN_BUNDLE_SIZE_DEFAULT		(32 * 1024 * 1024)	/* 32 MiB */
 
+/*
+ * Marker the server places in the SSH_FXP_STATUS error-message string of a
+ * PERMISSION_DENIED that originates from the -P/-p request policy (as opposed
+ * to a filesystem error like a directory ACL).  An HPN client matches this to
+ * recognise a class-wide denial - every file of this kind will be refused -
+ * and abort the whole transfer instead of re-denying every file one by one.
+ */
+#define HPN_POLICY_DENIED_TAG		"hpn-policy-denied"
+
 #endif /* _DEFINES_H */
 
 /* used to enable checking linux kernel versions */

@@ -117,6 +117,54 @@ to with a failure message.
 .Pp
 Care must be taken when using this feature to ensure that requests made
 implicitly by SFTP clients are permitted.
+.Pp
+The HPN-SSH server-side hashing extensions
+.Cm hpn-check-file
+and
+.Cm sftp-hash-range
+are additionally governed by the
+.Cm read
+policy, the layout extension
+.Cm hpn-file-layout
+by the
+.Cm write
+policy, and the filesystem-info extension
+.Cm hpn-fs-info
+by the
+.Cm statvfs
+policy, because they act on file contents or metadata directly rather than
+through the standard read and write requests.
+Denying
+.Cm read ,
+.Cm write ,
+or
+.Cm statvfs
+therefore also denies the corresponding extension; each may also be named
+explicitly.
+.Pp
+Denying these extensions disables the HPN-SSH features that depend on them.
+Without
+.Cm hpn-check-file
+and
+.Cm sftp-hash-range
+the server will not hash files on the client's behalf, so post-transfer
+integrity verification and hash-verified resume of interrupted transfers
+become unavailable; affected transfers fall back to a size-based resume or a
+full re-transfer, and the client cannot cryptographically confirm that the
+bytes on the server match the source.
+Without
+.Cm hpn-file-layout
+the client cannot set a storage layout on the destination, so files are
+written with the filesystem's default layout; on a parallel filesystem such
+as Lustre this can substantially reduce large-file throughput.
+Without
+.Cm hpn-fs-info
+the client cannot query the destination filesystem's type, optimal block
+size, and stripe geometry, so it falls back to generic defaults and forgoes
+filesystem-aware tuning such as detecting Lustre to select a stripe layout.
+Ordinary reads and writes are otherwise unaffected, so denying these
+extensions trades those acceleration and integrity features for the tighter
+policy.
 .It Fl Q Ar protocol_feature
 Queries protocol features supported by
 .Nm .

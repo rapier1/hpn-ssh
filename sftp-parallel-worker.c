@@ -167,6 +167,11 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 	struct sftp_parallel *p = w->parent;
 	int rc = -1;
 
+	/* HPN: scope the permanent-denial signal (set by the SFTP status
+	 * reader on PERMISSION_DENIED) to this unit, so the retry decider
+	 * sees only THIS unit's refusals. */
+	sftp_conn_clear_perm_denied(w->conn);
+
 	/* The warm handle is only valid as a same-file UPLOAD_RANGE
 	 * continuation; any other op, or a different file, closes it first. */
 	if (w->warm_handle != NULL &&
@@ -515,6 +520,12 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		 */
 		int transient = sftp_conn_is_dead(w->conn);
 
+		/* HPN: a server PERMISSION_DENIED on a still-live connection
+		 * is permanent - retrying cannot clear it.  Mark the unit
+		 * no_retry so it fails now instead of burning MAX_RETRIES. */
+		if (!transient && sftp_conn_saw_perm_denied(w->conn))
+			u->no_retry = 1;
+
 		/* A yield on a connection that DIED during the wind-down is
 		 * not a yield - it is an ordinary death; the transient path
 		 * already handles it (and the respawned worker can't defer). */
@@ -604,6 +615,10 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 		return;
 	}
 	int transient = sftp_conn_is_dead(w->conn);
+	/* HPN: a live-conn PERMISSION_DENIED is permanent (same rule as
+	 * worker_process_result) - don't retry it. */
+	if (!transient && sftp_conn_saw_perm_denied(w->conn))
+		u->no_retry = 1;
 	if (!u->no_retry &&
 	    (transient || ++u->attempt < parallel_unit_max_retries(p))) {
 		/*
@@ -637,6 +652,7 @@ worker_drain_pipeline(struct sftp_worker *w)
 	struct sftp_parallel *p = w->parent;
 	if (w->batch_prev_pending == NULL)
 		return;
+	sftp_conn_clear_perm_denied(w->conn); /* HPN: scope to this batch drain */
 	(void)sftp_upload_batch_finish(w->conn, w->batch_prev_pending);
 	for (int i = 0; i < w->batch_prev_n; i++)
 		worker_finalize_one_entry(p, w,
@@ -658,6 +674,9 @@ worker_run_batch_pipelined(struct sftp_worker *w,
 	struct sftp_upload_batch_entry *entries;
 	struct sftp_work_unit **units;
 	struct sftp_upload_batch_pending *new_pending;
+
+	/* HPN: scope the permanent-denial signal to this batch's drain. */
+	sftp_conn_clear_perm_denied(w->conn);
 
 	if (w->batch_pipe_disabled) {
 		/* Legacy un-pipelined path - kept verbatim from the
@@ -787,9 +806,31 @@ worker_finish_bundle(struct sftp_parallel *p, struct sftp_worker *w,
 	 * poisoning that dragged the whole fleet to single-file speed when a
 	 * few connections wedged (2026-06-05 8-pass campaign).
 	 */
-	if (bundle_rc == SFTP_HPN_BUNDLE_SERVER_CANT)
+	if (bundle_rc == SFTP_HPN_BUNDLE_POLICY_DENIED) {
+		/*
+		 * The server's -P/-p request policy forbids this whole class of
+		 * transfer - every file would be denied.  Fail this batch with
+		 * no per-file fallback and stop the ENTIRE transfer: abort_flag
+		 * halts each worker at the top of its loop and the workqueue
+		 * shutdown wakes any blocked in pop, so we don't grind through
+		 * and re-deny every remaining file (the 100k-file / 200k-RTT
+		 * pathology).  Only a confirmed policy tag reaches here, so a
+		 * real per-file ACL still takes the SERVER_CANT fallback below.
+		 */
+		for (i = 0; i < bn; i++)
+			batch[i]->no_retry = 1;
+		if (!p->policy_denied) {
+			p->policy_denied = 1;
+			logit("transfer stopped: server request policy denies "
+			    "this class of transfer");
+		}
+		p->abort_flag = 1;
+		if (p->q != NULL)
+			sftp_workqueue_shutdown(p->q);
+	} else if (bundle_rc == SFTP_HPN_BUNDLE_SERVER_CANT) {
 		for (i = 0; i < bn; i++)
 			batch[i]->bundle_ineligible = 1;
+	}
 
 	for (i = 0; i < bn; i++)
 		worker_finalize_one_entry(p, w, batch[i], results[i]);

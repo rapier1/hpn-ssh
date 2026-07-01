@@ -572,6 +572,9 @@ bundle_dl_stream_drain_one(struct bundle_dl_stream *s,
 			sshbuf_free(msg);
 			return -1;
 		}
+		/* HPN: read the policy tag (if any) before freeing msg. */
+		if (status == SSH2_FX_PERMISSION_DENIED)
+			sftp_conn_check_policy_tag(s->conn, msg);
 		sshbuf_free(msg);
 		if (status == SSH2_FX_EOF)
 			return 2;
@@ -619,14 +622,18 @@ bundle_dl_stream_drain_inflight(struct bundle_dl_stream *s)
 			return -1;
 		}
 		s->chunks_received++;
+		/* A server-error STATUS (e.g. PERMISSION_DENIED) is a
+		 * well-formed, in-order reply, not a transport fault: discard
+		 * it and keep draining so the pipeline stays in sync.  Bailing
+		 * here would strand the remaining replies and desync the CLOSE
+		 * (the download twin of the bundle_drain_n write-side fix).
+		 * Only the transport faults above (read error / bad header /
+		 * id mismatch) abort the resync. */
 		if (type == SSH2_FXP_STATUS &&
 		    sshbuf_get_u32(msg, &status) == 0 &&
-		    status != SSH2_FX_EOF) {
-			error_f("hpn-bundle-fetch drain: server error %u",
-			    status);
-			sshbuf_free(msg);
-			return -1;
-		}
+		    status != SSH2_FX_EOF)
+			debug2_f("hpn-bundle-fetch drain: discarding server "
+			    "STATUS %u to resync", status);
 		sshbuf_free(msg);
 	}
 	return 0;
@@ -647,6 +654,9 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	struct  sftp_hpn_tar_parser *parser = NULL;
 	int     i, r, rc = -1;
 	int     done = 0;
+
+	/* HPN: scope the policy-denied signal to this bundle attempt. */
+	sftp_conn_clear_policy_denied(conn);
 
 	memset(&stream, 0, sizeof(stream));
 	stream.cur_idx = -1;
@@ -804,6 +814,16 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 		(void)close(stream.cur_fd);
 	free(stream.last_mkdir_dir);
 
+	/* Resync before CLOSE: a mid-stream failure (e.g. a refused read that
+	 * sent us to cleanup) can leave outstanding READ replies on the wire.
+	 * Consume them now - drain_inflight tolerates a server-error STATUS and
+	 * keeps draining - so the CLOSE STATUS is not confused with a stray
+	 * DATA/STATUS that get_msg would flag as a protocol violation and kill
+	 * the worker.  No-op on the normal path (already drained above) and
+	 * skipped on a dead connection. */
+	if (handle != NULL && !sftp_conn_is_dead(conn))
+		(void)bundle_dl_stream_drain_inflight(&stream);
+
 	/* Send CLOSE and consume STATUS reply. */
 	if (handle != NULL) {
 		u_int close_id;
@@ -840,10 +860,14 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	/* Same cause-scoping as the upload path: dead conn => this worker's
 	 * transport failed (keep units bundle-eligible); live conn => server
 	 * refused / lacks the extension (permanent single-file fallback). */
-	if (rc != 0)
-		rc = sftp_conn_is_dead(conn)
-		    ? SFTP_HPN_BUNDLE_TRANSPORT_FAILED
-		    : SFTP_HPN_BUNDLE_SERVER_CANT;
+	if (rc != 0) {
+		if (sftp_conn_saw_policy_denied(conn))
+			rc = SFTP_HPN_BUNDLE_POLICY_DENIED;
+		else
+			rc = sftp_conn_is_dead(conn)
+			    ? SFTP_HPN_BUNDLE_TRANSPORT_FAILED
+			    : SFTP_HPN_BUNDLE_SERVER_CANT;
+	}
 	return rc;
 }
 
@@ -919,6 +943,13 @@ struct bundle_write_ctx {
 	size_t        handle_len;
 	off_t         offset;        /* monotonically increasing */
 	int           any_fail;      /* sticky: any WRITE/STATUS failed */
+	int           conn_lost;     /* sticky: a genuine transport break (read
+				      * error / malformed reply / rid desync), as
+				      * opposed to a server refusal (a non-OK
+				      * STATUS).  Only a transport break condemns
+				      * the connection; a refusal leaves it alive
+				      * so the bundle is classified SERVER_CANT
+				      * (permanent) rather than respawn-retried. */
 
 	uint64_t      n_sent;        /* WRITEs sent */
 	uint64_t      n_drained;     /* STATUS replies successfully drained */
@@ -950,10 +981,20 @@ struct bundle_write_ctx {
 
 /*
  * Drain up to `n` outstanding WRITE STATUS replies.  Pass SIZE_MAX to
- * drain all of them.  Sets ctx->any_fail on any read error or unexpected
- * reply; the caller is responsible for not issuing the SSH_FXP_CLOSE
- * before all WRITEs have been drained (otherwise the CLOSE STATUS would
- * be confused with a WRITE STATUS).
+ * drain all of them.  The caller is responsible for not issuing the
+ * SSH_FXP_CLOSE before all WRITEs have been drained (otherwise the CLOSE
+ * STATUS would be confused with a WRITE STATUS).
+ *
+ * Two failure classes, kept distinct:
+ *   - Server refusal: a well-formed STATUS with a non-OK code (e.g.
+ *     PERMISSION_DENIED).  The transport is fine; the server simply said
+ *     no.  Sets any_fail, accounts the STATUS, and keeps draining so the
+ *     pipeline stays in sync.  conn_lost is NOT set - the connection
+ *     survives and the bundle is classified SERVER_CANT (permanent).
+ *   - Transport break: a read error, a malformed reply, or a rid desync.
+ *     Sets any_fail AND conn_lost and stops; the caller condemns the
+ *     connection and the bundle is classified TRANSPORT_FAILED (retry).
+ * Returns 0 if every drained STATUS was OK, -1 otherwise.
  */
 static int
 bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
@@ -1030,6 +1071,7 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
 			    (unsigned long long)ctx->n_drained,
 			    (unsigned long long)ctx->n_sent);
 			ctx->any_fail = 1;
+			ctx->conn_lost = 1;
 			rc = -1;
 			break;
 		}
@@ -1054,6 +1096,7 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
 			error_f("bundle drain: malformed STATUS reply "
 			    "(type=%u r=%d)", type, r);
 			ctx->any_fail = 1;
+			ctx->conn_lost = 1;
 			rc = -1;
 			break;
 		}
@@ -1061,15 +1104,42 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t n)
 			error_f("bundle drain: rid mismatch "
 			    "(got %u expected %u)", reply_rid, expected_rid);
 			ctx->any_fail = 1;
+			ctx->conn_lost = 1;
 			rc = -1;
 			break;
 		}
 		if (status != SSH2_FX_OK) {
-			error_f("bundle drain: WRITE STATUS %u "
-			    "(rid=%u)", status, reply_rid);
+			/*
+			 * The server refused this WRITE (e.g. PERMISSION_DENIED
+			 * from a -P write policy, a read-only mount, quota, or a
+			 * mid-stream ACL denial).  This is an authoritative
+			 * per-WRITE refusal, NOT a transport failure: the
+			 * connection is healthy and replied in order.  Record
+			 * the failure but account the consumed STATUS (advance
+			 * n_drained) and keep draining the rest of the pipeline
+			 * so it stays in sync - breaking here would strand the
+			 * remaining STATUSes and desync the next op.  conn_lost
+			 * is deliberately NOT set: leaving the connection alive
+			 * makes the caller classify this SERVER_CANT (permanent)
+			 * instead of a phantom transport death that respawns and
+			 * retries the same doomed WRITE forever.  Log only the
+			 * first refusal in this drain to avoid a per-WRITE storm.
+			 */
+			if (!ctx->any_fail) {
+				error_f("bundle drain: WRITE STATUS %u "
+				    "(rid=%u) - server refused", status,
+				    reply_rid);
+				/* HPN: if the server tagged this a -P/-p policy
+				 * denial, the caller aborts the whole transfer
+				 * rather than re-denying every file. */
+				if (status == SSH2_FX_PERMISSION_DENIED)
+					sftp_conn_check_policy_tag(ctx->conn,
+					    msg);
+			}
 			ctx->any_fail = 1;
 			rc = -1;
-			break;
+			ctx->n_drained++;
+			continue;
 		}
 		ctx->n_drained++;
 		/* Feed the adaptive read-ahead controller with the true
@@ -1200,6 +1270,9 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		debug_f("hpn-bundle: wsizes calloc failed; "
 		    "rdahead controller will see zero-byte acks");
 
+	/* HPN: scope the policy-denied signal to this bundle attempt. */
+	sftp_conn_clear_policy_denied(conn);
+
 	debug_f("hpn-bundle upload: n=%d dest=\"%s\" preserve=%d fsync=%d",
 	    n, remote_dest_dir, preserve_flag, fsync_flag);
 	t_enter = monotime_double();
@@ -1222,8 +1295,11 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	send_msg(conn, msg);
 	sshbuf_reset(msg);
 
+	/* The base dir is often empty (entries carry their own paths), so a
+	 * "%s" would render as hpn-bundle-open "": describe the batch by file
+	 * count instead, which is always meaningful. */
 	handle = get_handle(conn, open_id, &handle_len,
-	    "hpn-bundle-open \"%s\"", remote_dest_dir);
+	    "hpn-bundle-open (%d files)", n);
 	if (handle == NULL) {
 		debug_f("hpn-bundle: server refused open");
 		goto cleanup;
@@ -1383,14 +1459,21 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
  cleanup:
 	/* If we sent WRITEs but bailed before draining, consume the
 	 * matching STATUSes so the next op on this conn doesn't read
-	 * them as its own reply. */
+	 * them as its own reply.  A non-OK STATUS encountered here is a
+	 * server refusal, not a transport break, so it does NOT condemn
+	 * the connection - only a genuine transport loss does.  conn_lost
+	 * (set inside bundle_drain_n on a read error / malformed reply /
+	 * rid desync) is the authoritative "transport actually broke"
+	 * signal, so gate sftp_conn_set_dead on it rather than on the
+	 * drain's -1 (which also fires on a plain refusal). */
 	if (rc != 0 && ctx.n_sent > ctx.n_drained) {
 		int saved_fail = ctx.any_fail;
 		ctx.any_fail = 0;
-		if (bundle_drain_n(&ctx, SIZE_MAX) < 0)
-			sftp_conn_set_dead(conn);
+		(void)bundle_drain_n(&ctx, SIZE_MAX);
 		ctx.any_fail = saved_fail;
 	}
+	if (rc != 0 && ctx.conn_lost)
+		sftp_conn_set_dead(conn);
 	if (rc != 0) {
 		for (i = 0; i < n; i++)
 			entries[i].result = -1;
@@ -1409,10 +1492,14 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	 * healthy worker - keep them eligible); a live conn means the server
 	 * refused / lacks the extension (permanent - mark ineligible).
 	 */
-	if (rc != 0)
-		rc = sftp_conn_is_dead(conn)
-		    ? SFTP_HPN_BUNDLE_TRANSPORT_FAILED
-		    : SFTP_HPN_BUNDLE_SERVER_CANT;
+	if (rc != 0) {
+		if (sftp_conn_saw_policy_denied(conn))
+			rc = SFTP_HPN_BUNDLE_POLICY_DENIED;
+		else
+			rc = sftp_conn_is_dead(conn)
+			    ? SFTP_HPN_BUNDLE_TRANSPORT_FAILED
+			    : SFTP_HPN_BUNDLE_SERVER_CANT;
+	}
 	return rc;
 }
 

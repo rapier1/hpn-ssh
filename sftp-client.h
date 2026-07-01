@@ -109,6 +109,18 @@ void sftp_set_yield_flag(struct sftp_conn *, volatile int *);
  * Workers should check this after a failed transfer and exit their loop. */
 int sftp_conn_is_dead(struct sftp_conn *);
 
+/* HPN: non-zero if a PERMISSION_DENIED reply was seen since the last
+ * clear; clear resets it.  Used to make a refused op non-retryable. */
+int sftp_conn_saw_perm_denied(struct sftp_conn *);
+void sftp_conn_clear_perm_denied(struct sftp_conn *);
+
+/* HPN: a refused op was a -P/-p request-policy denial (server-tagged), not a
+ * filesystem error.  check_policy_tag reads the SSH_FXP_STATUS error-message
+ * just after the status code and latches the flag if it carries the tag. */
+int sftp_conn_saw_policy_denied(struct sftp_conn *);
+void sftp_conn_clear_policy_denied(struct sftp_conn *);
+void sftp_conn_check_policy_tag(struct sftp_conn *, struct sshbuf *);
+
 /*
  * Mark a connection as dead with prominent diagnostic logging, without
  * terminating the process. Used to replace fatal() in code paths that
@@ -354,6 +366,9 @@ enum sftp_hpn_bundle_result {
 	SFTP_HPN_BUNDLE_OK               =  0,
 	SFTP_HPN_BUNDLE_SERVER_CANT      = -1, /* permanent: refused / no ext */
 	SFTP_HPN_BUNDLE_TRANSPORT_FAILED = -2, /* transient: this conn died */
+	SFTP_HPN_BUNDLE_POLICY_DENIED    = -3, /* permanent: -P/-p policy forbids
+						* this whole class - abort the
+						* transfer, do not fall back */
 };
 
 int sftp_hpn_bundle_upload(struct sftp_conn *conn,

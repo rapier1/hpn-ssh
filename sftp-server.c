@@ -237,9 +237,41 @@ extended_handler_byname(const char *name)
 	return NULL;
 }
 
+/*
+ * The request name(s) that policy (-p allowlist / -P denylist) matches for
+ * handler h.  The HPN hashing, layout, and filesystem-info extensions perform
+ * read-, write-, or query-class operations under their own names, so a policy
+ * written against the standard op (read / write / statvfs) would otherwise
+ * miss them.  Map each to its equivalent op class so -P read / -P write /
+ * -P statvfs (or a matching -p allowlist) covers it, closing the gap where it
+ * would slip past the policy.  Each is still matched by its own name too, so
+ * it can be named explicitly.  An admin who denies read/write/statvfs thereby
+ * also loses server-side hashing / layout / fs-info - their responsibility,
+ * by design.
+ *
+ * The bundle DATA handlers (hpn-bundle-open/-fetch) are deliberately NOT
+ * mapped here: their bulk data already rides FXP_READ/FXP_WRITE, so the
+ * policy already enforces it, and they must stay advertised so the client
+ * attempts them and the policy-denied fast-abort can fire.
+ */
+static const char *
+request_policy_names(const struct sftp_handler *h)
+{
+	if (strcmp(h->name, "hpn-check-file") == 0)
+		return "hpn-check-file,read";
+	if (strcmp(h->name, "sftp-hash-range") == 0)
+		return "sftp-hash-range,read";
+	if (strcmp(h->name, "hpn-file-layout") == 0)
+		return "hpn-file-layout,write";
+	if (strcmp(h->name, "hpn-fs-info") == 0)
+		return "hpn-fs-info,statvfs";
+	return h->name;
+}
+
 static int
 request_permitted(const struct sftp_handler *h)
 {
+	const char *names = request_policy_names(h);
 	char *result;
 
 	if (readonly && h->does_write) {
@@ -247,13 +279,13 @@ request_permitted(const struct sftp_handler *h)
 		return 0;
 	}
 	if (request_denylist != NULL &&
-	    ((result = match_list(h->name, request_denylist, NULL))) != NULL) {
+	    ((result = match_list(names, request_denylist, NULL))) != NULL) {
 		free(result);
 		verbose("Refusing denylisted %s request", h->name);
 		return 0;
 	}
 	if (request_allowlist != NULL &&
-	    ((result = match_list(h->name, request_allowlist, NULL))) != NULL) {
+	    ((result = match_list(names, request_allowlist, NULL))) != NULL) {
 		free(result);
 		debug2("Permitting allowlisted %s request", h->name);
 		return 1;
@@ -867,6 +899,35 @@ process_init(void)
 	sshbuf_free(msg);
 }
 
+/*
+ * Whether a WRITE request would currently be permitted - readonly mode or a
+ * -P/-p request policy can forbid it.  Mirrors request_permitted()'s decision
+ * for the "write" handler but without its logging, so it can be used as a
+ * quiet predicate to gate a write-intent open.
+ */
+static int
+writes_permitted(void)
+{
+	char *result;
+
+	if (readonly)
+		return 0;
+	if (request_denylist != NULL &&
+	    (result = match_list("write", request_denylist, NULL)) != NULL) {
+		free(result);
+		return 0;
+	}
+	if (request_allowlist != NULL) {
+		if ((result = match_list("write", request_allowlist, NULL))
+		    != NULL) {
+			free(result);
+			return 1;
+		}
+		return 0;	/* allowlist set and "write" not in it */
+	}
+	return 1;
+}
+
 static void
 process_open(uint32_t id)
 {
@@ -885,10 +946,22 @@ process_open(uint32_t id)
 	mode = (a.flags & SSH2_FILEXFER_ATTR_PERMISSIONS) ? a.perm : 0666;
 	logit("open \"%s\" flags %s mode 0%o",
 	    name, string_from_portable(pflags), mode);
-	if (readonly &&
-	    ((flags & O_ACCMODE) != O_RDONLY ||
-	    (flags & (O_CREAT|O_TRUNC)) != 0)) {
-		verbose("Refusing open request in read-only mode");
+	/*
+	 * Refuse a write-intent open (write access, O_CREAT, or O_TRUNC)
+	 * whenever a WRITE would not be permitted - readonly mode OR a -P/-p
+	 * policy that denies "write".  Without this a write-denying policy
+	 * still lets the create through, since the policy is name-based and
+	 * "open" != "write", littering the target with empty files the client
+	 * can never write.  writes_permitted() folds readonly and the policy
+	 * together (readonly alone was the previous, narrower gate).
+	 */
+	if (((flags & O_ACCMODE) != O_RDONLY ||
+	    (flags & (O_CREAT|O_TRUNC)) != 0) && !writes_permitted()) {
+		if (readonly)
+			verbose("Refusing open request in read-only mode");
+		else
+			verbose("Refusing open request - writes denied "
+			    "by request policy");
 		status = SSH2_FX_PERMISSION_DENIED;
 	} else {
 		fd = open(name, flags, mode);
@@ -2025,7 +2098,8 @@ process_extended(uint32_t id)
 		send_status(id, SSH2_FX_OP_UNSUPPORTED);	/* MUST */
 	} else {
 		if (!request_permitted(exthand))
-			send_status(id, SSH2_FX_PERMISSION_DENIED);
+			send_status_errmsg(id, SSH2_FX_PERMISSION_DENIED,
+			    HPN_POLICY_DENIED_TAG);	/* HPN: class-denial tag */
 		else
 			exthand->handler(id);
 	}
@@ -2083,8 +2157,9 @@ process(void)
 		for (i = 0; handlers[i].handler != NULL; i++) {
 			if (type == handlers[i].type) {
 				if (!request_permitted(&handlers[i])) {
-					send_status(id,
-					    SSH2_FX_PERMISSION_DENIED);
+					send_status_errmsg(id,
+					    SSH2_FX_PERMISSION_DENIED,
+					    HPN_POLICY_DENIED_TAG); /* HPN */
 				} else {
 					handlers[i].handler(id);
 				}
