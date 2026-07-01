@@ -761,32 +761,38 @@ patch_list(char * orig)
 {
 	char * adj = xstrdup(orig);
 	char * match;
-	u_int next;
 
 	const char * ccpstr = "chacha20-poly1305@openssh.com";
 	const char * ccpmtstr = "chacha20-poly1305-mt@hpnssh.org";
 
-	match = match_list(ccpmtstr, orig, &next);
+	match = match_list(ccpmtstr, orig, NULL);
 	if (match != NULL) { /* CC20-MT found in the list */
 		free(match);
 		match = match_list(ccpstr, orig, NULL);
 		if (match == NULL) { /* CC20-Serial NOT found in the list */
+			/*
+			 * Splice serial CC20 in immediately after the MT token,
+			 * keeping MT first for the first-match preference.  Locate
+			 * the MT token's REAL position in orig: match_list's `next`
+			 * output is an offset into its CLIENT arg (here the lone MT
+			 * token), always strlen(ccpmtstr) - not the token's position
+			 * in orig - which corrupted the list whenever MT was not the
+			 * first entry.  match_list already confirmed MT is a token,
+			 * so strstr cannot return NULL and lands on the real token.
+			 */
+			char *mt = strstr(orig, ccpmtstr);
+			size_t off = (size_t)(mt - orig) + strlen(ccpmtstr);
 			adj = xreallocarray(adj,
 			    strlen(adj) /* original string length */
 			    + 1 /* for the original null-terminator */
 			    + strlen(ccpstr) /* make room for ccpstr */
 			    + 1 /* make room for the comma delimiter */
 			    , sizeof(char));
-			/*
-			 * adj[next] points to the character after the CC20-MT
-			 * string. adj[next] might be ',' or '\0' at this point.
-			 */
-			adj[next] = ',';
-			/* adj + next + 1 is the character after that comma */
-			memcpy(adj + next + 1, ccpstr, strlen(ccpstr));
-			/* rewrite the rest of the original list */
-			memcpy(adj + next + 1 + strlen(ccpstr), orig + next,
-			    strlen(orig + next) + 1);
+			/* orig[off] is ',' (MT not last) or '\0' (MT last). */
+			adj[off] = ',';
+			memcpy(adj + off + 1, ccpstr, strlen(ccpstr));
+			memcpy(adj + off + 1 + strlen(ccpstr), orig + off,
+			    strlen(orig + off) + 1);
 		} else { /* CC20-Serial found in the list, nothing to do */
 			free(match);
 		}
