@@ -1702,8 +1702,11 @@ tryagain:
 	    options.port, options.connection_attempts,
 	    &timeout_ms, options.tcp_keep_alive) != 0) {
 		/* could not connect. If the port requested is the same as
-		 * hpnssh default port then fallback. Otherwise, exit */
-		if ((options.port == default_ssh_port()) && options.fallback) {
+		 * hpnssh default port then fallback. Otherwise, exit.
+		 * Only fall back to a DIFFERENT port; this also stops an
+		 * endless loop when fallback_port == the default port. */
+		if ((options.port == default_ssh_port()) && options.fallback &&
+		    options.port != options.fallback_port) {
 			int port = options.fallback_port;
 			options.port = port;
 			fprintf(stderr, "HPNSSH server not available on default port %d\n",
@@ -1714,11 +1717,11 @@ tryagain:
 			else
 				fprintf(stderr, "Falling back to user defined port %d\n",
 					port);
-			addrs = resolve_host(host, port, 1,
-					     cname, sizeof(cname));
+			freeaddrinfo(addrs);
+			if ((addrs = resolve_host(host, port, 1,
+			    cname, sizeof(cname))) == NULL)
+				exit(255);
 			goto tryagain;
-		} else {
-			exit(255);
 		}
 		exit(255);
 	}
