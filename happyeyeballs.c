@@ -263,6 +263,8 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 				diff = *timeout_ms;
 				ms_subtract_diff(&start_tv, &diff);
 			}
+			if (diff < 0)
+				diff = 0;
 			tv->tv_sec = diff / 1000;
 			tv->tv_usec = (diff % 1000) * 1000;
 		}
@@ -278,9 +280,11 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 		/* preserve any errors */
 		oerrno = errno;
 		if (res < 0) {
+			if (errno == EINTR)
+				continue;
 			error("select failed: %s", strerror(errno));
 			errno = oerrno;
-			continue;
+			break;
 		}
 		/* start processing the sockets */
 		debug2_f ("RFC 8305: Processing happy eyeballs fds");
