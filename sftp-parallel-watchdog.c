@@ -212,9 +212,19 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		 * tick-based EMA warmup above is the fallback in that case.
 		 */
 		if (p->path_rtt_us > 0 && max_ema_kbps > 0) {
+			/*
+			 * max_ema_kbps is KiB/s (bytes/s / 1024; see the raw-kbps
+			 * computation in the first pass), so the ramp-window byte
+			 * budget is KiB/s * 1024 (-> bytes/s) * path_rtt_us / 1e6
+			 * (-> bytes per RTT) * RAMP_RTTS.  The old "/ 8000" assumed
+			 * the rate was in kilobits/s, which made warmup_bytes ~8x
+			 * too small and lifted the slow-start gate far too early -
+			 * the exact premature-outlier-kill / respawn-churn this
+			 * gate exists to prevent.
+			 */
 			uint64_t warmup_bytes =
-			    ((uint64_t)max_ema_kbps * p->path_rtt_us *
-			        (uint64_t)RAMP_RTTS) / 8000ULL;
+			    ((uint64_t)max_ema_kbps * 1024ULL * p->path_rtt_us *
+			        (uint64_t)RAMP_RTTS) / 1000000ULL;
 			if (warmup_bytes < RAMP_WARMUP_BYTES_MIN)
 				warmup_bytes = RAMP_WARMUP_BYTES_MIN;
 			if (warmup_bytes > RAMP_WARMUP_BYTES_MAX)
@@ -242,7 +252,12 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 			 * not protected for its entire slow lifetime. */
 			uint64_t unit_start = __atomic_load_n(
 			    &w->unit_start_ns, __ATOMIC_RELAXED);
-			int past_time_cap = (unit_start > 0 &&
+			/* Guard now > unit_start before the unsigned subtraction:
+			 * the worker can store a fresh unit_start_ns after we
+			 * sampled `now`, so unit_start > now would wrap to a huge
+			 * delta and spuriously trip the cap.  Matches the sibling
+			 * since_unit_start_ns guard in watchdog_check_one_worker. */
+			int past_time_cap = (unit_start > 0 && now > unit_start &&
 			    now - unit_start >
 			    (uint64_t)RAMP_MAX_WARMUP_SEC * 1000000000ULL);
 
