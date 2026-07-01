@@ -832,6 +832,17 @@ worker_finish_bundle(struct sftp_parallel *p, struct sftp_worker *w,
 			batch[i]->bundle_ineligible = 1;
 	}
 
+	/*
+	 * A bundle member has not yet had its own per-file open/write attempted,
+	 * so the per-conn saw_perm_denied flag - whether stale from a prior unit
+	 * on this worker or set by the bundle's own container OPEN - must not
+	 * decide the members' no_retry.  Clear it so a SERVER_CANT bundle's
+	 * members fall back to the per-file path, where each member's OWN denial
+	 * (if any) sets no_retry.  POLICY_DENIED already set no_retry explicitly
+	 * above; TRANSPORT_FAILED is guarded by !transient in the finalizer.
+	 */
+	sftp_conn_clear_perm_denied(w->conn);
+
 	for (i = 0; i < bn; i++)
 		worker_finalize_one_entry(p, w, batch[i], results[i]);
 }
