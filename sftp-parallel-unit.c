@@ -1177,6 +1177,14 @@ parallel_retry_overflow_free(struct sftp_parallel *p)
 	while (u != NULL) {
 		next = u->overflow_next;
 		u->overflow_next = NULL;
+		/* Each parked unit still owes its shared range_tracker exactly
+		 * one finalize (invariant I1); parallel_unit_free never touches
+		 * the tracker.  Without this the tracker's remaining never
+		 * reaches 0, so the tracker (plus its path/src_path/vslots)
+		 * leaks and the incomplete-file finalize is skipped.  Mirror the
+		 * abort queue-drain in sftp_parallel_stop.  A NULL tracker
+		 * (whole-file / bundle units) is a no-op. */
+		(void)parallel_unit_tracker_finalize(u->range_tracker, 1, NULL);
 		parallel_unit_free(u);
 		u = next;
 	}

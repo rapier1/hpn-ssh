@@ -848,9 +848,16 @@ sftp_parallel_stop(struct sftp_parallel *p)
 		void *item;
 		while (sftp_workqueue_drain(p->q, &item) == 0) {
 			struct sftp_work_unit *u = item;
+			/* A bundle container is ONE queue item but N members, and
+			 * pending was bumped once per member at bundle-add time
+			 * (parallel_bundle_add), so decrement by n_members - a
+			 * single decrement leaves pending overstated by N-1.
+			 * Harmless at terminal stop (pending is not read after),
+			 * but keeps the accounting correct if the drain is reused. */
+			uint64_t dec = (u->members != NULL && u->n_members > 0)
+			    ? (uint64_t)u->n_members : 1;
 			pthread_mutex_lock(&p->pending_mu);
-			if (p->pending > 0)
-				p->pending--;
+			p->pending = (p->pending > dec) ? (p->pending - dec) : 0;
 			pthread_mutex_unlock(&p->pending_mu);
 			(void)parallel_unit_tracker_finalize(u->range_tracker, 1, NULL);
 			parallel_unit_free(u);
