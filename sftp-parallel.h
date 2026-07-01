@@ -119,8 +119,8 @@ struct sftp_parallel_config {
 	int          max_retries;
 
 	/* Bundle-mode accumulator target size in bytes, resolved from
-	 * ssh_config HPNBundleSize.  Default 4 MiB.  0 = unset / use
-	 * default. */
+	 * ssh_config HPNBundleSize.  Default 32 MiB (HPN_BUNDLE_SIZE_DEFAULT),
+	 * clamped to [1 MiB, 256 MiB].  0 = unset / use default. */
 	uint64_t     bundle_size;
 
 	/* Transfer flags applied to every submitted unit */

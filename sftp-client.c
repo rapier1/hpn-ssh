@@ -3342,13 +3342,24 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	size_t handle_len;
 	u_int id, ackid;
 	uint32_t status = SSH2_FX_OK;
-	off_t offset = range_offset, bytes_left;
+	off_t offset = range_offset, bytes_left = range_length;
 	off_t first_fail_off = -1;
 	int local_fd = -1, ret = -1, r, yielded = 0, teed = 0;
 
 	if (acked_out != NULL)
 		*acked_out = 0;
 	TAILQ_INIT(&acks);
+
+	/* Defensive: submit_upload_ranges only ever emits positive-length
+	 * ranges (its effective_ranges pass drops any <= 0), so a non-positive
+	 * length here means a malformed range unit reached the wire.  Reject it
+	 * rather than skipping the send loop and returning success, which would
+	 * launder the bug as a completed transfer. */
+	if (range_length <= 0) {
+		error_f("refusing upload range of non-positive length %lld "
+		    "for \"%s\"", (long long)range_length, remote_path);
+		return -1;
+	}
 
 	if ((local_fd = open(local_path, O_RDONLY)) < 0) {
 		error("open local \"%s\": %s", local_path, strerror(errno));
@@ -3659,6 +3670,15 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	if (acked_out != NULL)
 		*acked_out = 0;
 	TAILQ_INIT(&requests);
+
+	/* Defensive: see sftp_upload_range - a non-positive range length is a
+	 * malformed unit (submit_download_ranges never emits one); reject it
+	 * instead of silently "succeeding" on an empty send/recv loop. */
+	if (range_length <= 0) {
+		error_f("refusing download range of non-positive length %lld "
+		    "for \"%s\"", (long long)range_length, remote_path);
+		return -1;
+	}
 
 	/* Open remote file for reading. */
 	if (send_open(conn, remote_path, "range-src",

@@ -77,6 +77,24 @@
 #define LUSTRE_SMALL_THRESHOLD_FALLBACK  (1u * 1024u * 1024u)   /* 1 MiB */
 
 /*
+ * Resolve the tiered small-file threshold from a 64-bit stripe size.  The
+ * threshold is carried in a u32 (the hpn-file-layout wire field and the local
+ * lustre setter), so a stripe >= 4 GiB - or an exact multiple of 2^32 - would
+ * truncate to a bogus value (e.g. 0, which disables the small-file tier).
+ * Clamp to UINT32_MAX; a 4 GiB "small file" boundary is already well past any
+ * sane ceiling.  A zero stripe (server reported none) falls back to 1 MiB.
+ */
+static uint32_t
+stripe_to_small_threshold(uint64_t stripe_size)
+{
+	if (stripe_size == 0)
+		return LUSTRE_SMALL_THRESHOLD_FALLBACK;
+	if (stripe_size > UINT32_MAX)
+		return UINT32_MAX;
+	return (uint32_t)stripe_size;
+}
+
+/*
  * HPNLustreStripeCount (EXPERIMENTAL): one-shot helper run at the top of
  * the upload walker.  Queries the destination directory's filesystem via
  * hpn-fs-info; if it's Lustre, asks the server to set the directory's default
@@ -146,8 +164,7 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	 * size.  0 for the explicit plain-stripe path (no tiering).
 	 */
 	small_threshold = use_tiered
-	    ? (info.stripe_size > 0
-	        ? (uint32_t)info.stripe_size : LUSTRE_SMALL_THRESHOLD_FALLBACK)
+	    ? stripe_to_small_threshold(info.stripe_size)
 	    : 0;
 	/*
 	 * Plain-stripe path: HPNLustreStripeCount=N is authoritative, so apply
@@ -251,8 +268,7 @@ maybe_apply_lustre_layout_local(struct sftp_parallel *p,
 		return;
 	}
 	small_threshold = use_tiered
-	    ? (l_ssize > 0
-	        ? (uint32_t)l_ssize : LUSTRE_SMALL_THRESHOLD_FALLBACK)
+	    ? stripe_to_small_threshold(l_ssize)
 	    : 0;
 
 	rc = use_tiered
@@ -327,10 +343,15 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (sftp_mkdir(conn, dst, &a, 0) == 0) {
 		created = 1;
 	} else {
-		if (sftp_stat(conn, dst, 0, &dirattrib) != 0)
+		if (sftp_stat(conn, dst, 0, &dirattrib) != 0) {
+			sftp_parallel_walker_record_failure(p, src,
+			    "cannot create or access destination directory");
 			return -1;
+		}
 		if (!S_ISDIR(dirattrib.perm)) {
 			error("\"%s\" exists but is not a directory", dst);
+			sftp_parallel_walker_record_failure(p, src,
+			    "destination exists but is not a directory");
 			return -1;
 		}
 	}

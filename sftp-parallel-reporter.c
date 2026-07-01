@@ -302,28 +302,32 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 		if (w->conn) sftp_free(w->conn);
 		if (w->fd_in >= 0) close(w->fd_in);
 		if (w->fd_out >= 0) close(w->fd_out);
+		int s = 0, reaped = 0;
 		if (w->ssh_pid > 0) {
-			int s = 0;
-			int reaped;
 			/* Belt-and-suspenders: may already be dead from
 			 * SIGTERM above.  A child that self-exited is already a
 			 * zombie, so this SIGKILL is a no-op and waitpid still
 			 * returns its real exit code. */
 			(void)kill(w->ssh_pid, SIGKILL);
 			reaped = (waitpid(w->ssh_pid, &s, 0) == w->ssh_pid);
-			p->last_worker_exit_code =
-			    (reaped && WIFEXITED(s)) ? WEXITSTATUS(s) : -1;
-			/* Fleet-abort signal: a worker that died without ever
-			 * committing a byte, and not as a clean end-of-queue
-			 * exit, is a respawn that failed to take hold.  The
-			 * streak resets in parallel_watchdog_sync_check on any sign
-			 * of life (fleet progress or a heartbeat). */
-			int clean = reaped && WIFEXITED(s) &&
-			    WEXITSTATUS(s) == 0;
-			if (lifetime_bytes == 0 && !clean)
-				p->unproductive_deaths++;
-			classify_worker_death(w, reaped, s);
 		}
+		/* Classify and account EVERY reaped worker, not only those with
+		 * a live ssh_pid.  An in-array worker always has ssh_pid > 0
+		 * today (set before insertion, cleared only at teardown
+		 * post-join), so the pid<=0 path is unreachable now - but if
+		 * that ever changes, still classify the death (no wait status)
+		 * and count the unproductive streak rather than freeing the
+		 * worker silently and losing it from the summary. */
+		p->last_worker_exit_code =
+		    (reaped && WIFEXITED(s)) ? WEXITSTATUS(s) : -1;
+		/* Fleet-abort signal: a worker that died without ever committing
+		 * a byte, and not as a clean end-of-queue exit, is a respawn
+		 * that failed to take hold.  The streak resets in
+		 * parallel_watchdog_sync_check on any sign of life. */
+		int clean = reaped && WIFEXITED(s) && WEXITSTATUS(s) == 0;
+		if (lifetime_bytes == 0 && !clean)
+			p->unproductive_deaths++;
+		classify_worker_death(w, reaped, s);
 		pthread_mutex_destroy(&w->mu);
 		free(w);
 	}
