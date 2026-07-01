@@ -899,35 +899,6 @@ process_init(void)
 	sshbuf_free(msg);
 }
 
-/*
- * Whether a WRITE request would currently be permitted - readonly mode or a
- * -P/-p request policy can forbid it.  Mirrors request_permitted()'s decision
- * for the "write" handler but without its logging, so it can be used as a
- * quiet predicate to gate a write-intent open.
- */
-static int
-writes_permitted(void)
-{
-	char *result;
-
-	if (readonly)
-		return 0;
-	if (request_denylist != NULL &&
-	    (result = match_list("write", request_denylist, NULL)) != NULL) {
-		free(result);
-		return 0;
-	}
-	if (request_allowlist != NULL) {
-		if ((result = match_list("write", request_allowlist, NULL))
-		    != NULL) {
-			free(result);
-			return 1;
-		}
-		return 0;	/* allowlist set and "write" not in it */
-	}
-	return 1;
-}
-
 static void
 process_open(uint32_t id)
 {
@@ -946,22 +917,10 @@ process_open(uint32_t id)
 	mode = (a.flags & SSH2_FILEXFER_ATTR_PERMISSIONS) ? a.perm : 0666;
 	logit("open \"%s\" flags %s mode 0%o",
 	    name, string_from_portable(pflags), mode);
-	/*
-	 * Refuse a write-intent open (write access, O_CREAT, or O_TRUNC)
-	 * whenever a WRITE would not be permitted - readonly mode OR a -P/-p
-	 * policy that denies "write".  Without this a write-denying policy
-	 * still lets the create through, since the policy is name-based and
-	 * "open" != "write", littering the target with empty files the client
-	 * can never write.  writes_permitted() folds readonly and the policy
-	 * together (readonly alone was the previous, narrower gate).
-	 */
-	if (((flags & O_ACCMODE) != O_RDONLY ||
-	    (flags & (O_CREAT|O_TRUNC)) != 0) && !writes_permitted()) {
-		if (readonly)
-			verbose("Refusing open request in read-only mode");
-		else
-			verbose("Refusing open request - writes denied "
-			    "by request policy");
+	if (readonly &&
+	    ((flags & O_ACCMODE) != O_RDONLY ||
+	    (flags & (O_CREAT|O_TRUNC)) != 0)) {
+		verbose("Refusing open request in read-only mode");
 		status = SSH2_FX_PERMISSION_DENIED;
 	} else {
 		fd = open(name, flags, mode);
