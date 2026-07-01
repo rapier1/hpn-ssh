@@ -1217,6 +1217,20 @@ emitted on standard error. The default is
 .Xr hpnsftp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
+.It Cm HPNMemoryLimit
+Sets the upper bound on the memory HPN-SSH uses for a single channel's
+dynamic receive buffer, which governs how large the receive window may grow
+on high-bandwidth, high-latency paths.
+Accepted values are
+.Cm default
+(128 MB, the default),
+.Cm high
+(256 MB), and
+.Cm max
+(512 MB).
+Larger limits raise throughput on long fat networks at the cost of more
+memory per channel.
+HPNSSH only.
 .It Cm HPNUseBundle
 Controls whether
 .Xr hpnsftp 1
