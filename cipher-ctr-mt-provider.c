@@ -30,6 +30,7 @@
 #include <openssl/core.h>
 #include <openssl/core_dispatch.h>
 #include <openssl/core_names.h>
+#include <openssl/params.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include "xmalloc.h"
@@ -225,21 +226,21 @@ const OSSL_ITEM *aes_mt_prov_reasons(void *provctx)
 static int aes_mt_prov_get_params(void *provctx, OSSL_PARAM *params)
 {
 	OSSL_PARAM *p;
-	int ok = 1;
 
-	char *VERSION="1.0";
-	char *BUILDTYPE="aes_ctr_mt@hpnssh.org";
-	
-	for(p = params; p->key != NULL; p++)
-		if (strcasecmp(p->key, "version") == 0) {
-			*(const void **)p->data = VERSION;
-			p->return_size = strlen(VERSION);
-		} else if (strcasecmp(p->key, "buildinfo") == 0
-			   && BUILDTYPE[0] != '\0') {
-			*(const void **)p->data = BUILDTYPE;
-			p->return_size = strlen(BUILDTYPE);
-		}
-	return ok;
+	/*
+	 * Use the OSSL_PARAM API rather than writing directly into p->data:
+	 * OSSL_PARAM_set_utf8_ptr verifies the param is a UTF8_PTR, tolerates a
+	 * NULL data pointer (a size-only query), and sets return_size - so a
+	 * caller supplying a different param type or a NULL buffer can no longer
+	 * corrupt memory or NULL-deref, and a bad param is reported as failure.
+	 */
+	p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_VERSION);
+	if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, "1.0"))
+		return 0;
+	p = OSSL_PARAM_locate(params, OSSL_PROV_PARAM_BUILDINFO);
+	if (p != NULL && !OSSL_PARAM_set_utf8_ptr(p, "aes_ctr_mt@hpnssh.org"))
+		return 0;
+	return 1;
 }
 
 /* The function that tears down this provider */
