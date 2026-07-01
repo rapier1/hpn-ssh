@@ -86,70 +86,6 @@ parallel_stats_snapshot(struct sftp_parallel *p, uint64_t *bytes_out,
 }
 
 /*
- * Phase-5 instrumentation: per-worker stats CSV.  Enabled by
- * HPN_WORKER_STATS_CSV=/path in the environment.  Opens the file on
- * first call (lazy), emits one row per worker per slow tick.
- *
- * Columns: t_ms, worker_id, bytes_total, live_bytes, units_started,
- *          units_completed, units_failed, health, reconnect_count,
- *          first_reconnect_ms, last_reconnect_ms
- *
- * Factored out of parallel_reporter_thread to keep the slow-tick body readable.
- * Holds workers_mu while iterating, plus per-worker mu for each row.
- */
-static void
-reporter_emit_stats_csv(struct sftp_parallel *p)
-{
-	if (p->stats_csv == NULL) {
-		/* ENV-VAR HPN_WORKER_STATS_CSV - developer-only: path for
-		 * per-second per-worker stats CSV used by the benchmark
-		 * harness.  Not user-facing. */
-		const char *path = getenv("HPN_WORKER_STATS_CSV");
-		if (path == NULL || *path == '\0')
-			return;
-		p->stats_csv = fopen(path, "w");
-		if (p->stats_csv == NULL)
-			return;
-		setvbuf(p->stats_csv, NULL, _IOLBF, 0);
-		fprintf(p->stats_csv,
-		    "t_ms,worker_id,bytes_total,live_bytes,units_started"
-		    ",units_completed,units_failed,health,reconnect_count"
-		    ",first_reconnect_ms,last_reconnect_ms\n");
-		p->stats_csv_start_ns = monotime_ns();
-	}
-	uint64_t t_ms =
-	    (monotime_ns() - p->stats_csv_start_ns) / 1000000ULL;
-	pthread_mutex_lock(&p->workers_mu);
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = p->workers[i];
-		pthread_mutex_lock(&w->mu);
-		/* Per-worker respawn timestamps emitted as ms-since-CSV-start
-		 * (matching t_ms's basis).  Zero means "no respawn yet for
-		 * this worker."  Observability only - no gating depends on
-		 * these; see the respawn dispatch comment for the policy. */
-		uint64_t first_ms = w->first_reconnect_ns == 0 ? 0 :
-		    (w->first_reconnect_ns - p->stats_csv_start_ns) / 1000000ULL;
-		uint64_t last_ms = w->last_reconnect_ns == 0 ? 0 :
-		    (w->last_reconnect_ns - p->stats_csv_start_ns) / 1000000ULL;
-		fprintf(p->stats_csv,
-		    "%llu,%d,%llu,%llu,%llu,%llu,%llu,%d,%llu,%llu,%llu\n",
-		    (unsigned long long)t_ms,
-		    w->id,
-		    (unsigned long long)w->bytes_total,
-		    (unsigned long long)w->live_bytes,
-		    (unsigned long long)w->units_started,
-		    (unsigned long long)w->units_completed,
-		    (unsigned long long)w->units_failed,
-		    (int)w->health,
-		    (unsigned long long)w->reconnect_count,
-		    (unsigned long long)first_ms,
-		    (unsigned long long)last_ms);
-		pthread_mutex_unlock(&w->mu);
-	}
-	pthread_mutex_unlock(&p->workers_mu);
-}
-
-/*
  * Classify and log how a reaped worker died, using the wait status plus
  * w->doomed (did WE kill it?).  Diagnostic only - it changes no control
  * flow; the caller respawns regardless.  Death modes:
@@ -278,6 +214,25 @@ classify_worker_death(const struct sftp_worker *w, int have_status, int status)
 	else
 		logit("%s; reconnecting (respawn %llu)", cause,
 		    (unsigned long long)n);
+
+	/*
+	 * One-time heads-up once the cumulative reconnect count crosses a
+	 * fleet-scaled threshold.  The per-respawn lines above show the churn
+	 * happening; this names it as a path-reliability concern.  Keyed on the
+	 * session-wide death_ordinal (survives per-worker respawn, unlike the
+	 * old per-struct reconnect_count which reset every respawn and so never
+	 * reached its threshold).  Fires ahead of the give-up thresholds
+	 * (FLEET_ABORT_UNPRODUCTIVE_MULT / RESPAWN_MULTIPLIER); suppressed
+	 * during teardown.  Reporter thread only - no lock needed.
+	 */
+	if (p != NULL && !p->abort_flag && !p->stopped &&
+	    !p->churn_notice_emitted &&
+	    n >= (uint64_t)p->cfg.num_streams * HPN_PATH_CHURN_NOTICE_MULT) {
+		p->churn_notice_emitted = 1;
+		logit("this transfer has required %llu worker reconnections; "
+		    "the network path may be unreliable",
+		    (unsigned long long)n);
+	}
 }
 
 /*
@@ -873,7 +828,6 @@ parallel_reporter_thread(void *arg)
 		if (++slow_tick_counter >= 5) {
 			slow_tick_counter = 0;
 
-			reporter_emit_stats_csv(p);
 			reporter_emit_fleetsample(p);
 
 			/* Watchdog classifies workers HEALTHY/STALLED/DEAD

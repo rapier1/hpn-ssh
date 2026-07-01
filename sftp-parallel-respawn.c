@@ -438,6 +438,12 @@ respawn_worker_thread(void *arg)
 		return NULL;
 	}
 
+	/*
+	 * Once spawn_one_worker returns, w is owned by the fleet (already
+	 * inserted into p->workers[] and running its thread), so the reporter
+	 * reap can pthread_join + destroy + free it at any moment.  Do NOT
+	 * dereference w here - a success only needs the NULL check.
+	 */
 	struct sftp_worker *w = spawn_one_worker(p);
 	if (w == NULL) {
 		/* Under an abort the failure is manufactured (we killed the
@@ -446,20 +452,6 @@ respawn_worker_thread(void *arg)
 			debug_ft("worker respawn abandoned (abort)");
 		else
 			error_ft("worker respawn failed");
-	} else {
-		uint64_t now = monotime_ns();
-		pthread_mutex_lock(&w->mu);
-		w->reconnect_count++;
-		if (w->first_reconnect_ns == 0)
-			w->first_reconnect_ns = now;
-		w->last_reconnect_ns = now;
-		pthread_mutex_unlock(&w->mu);
-		if (w->reconnect_count == HPN_WORKER_CHURN_NOTICE)
-			logit("worker %d has reconnected %llu times; this "
-			    "path may be unreliable", w->id,
-			    (unsigned long long)w->reconnect_count);
-		debug_ft("worker %d respawned (reconnect_count=%llu)",
-		    w->id, (unsigned long long)w->reconnect_count);
 	}
 	pthread_mutex_lock(&p->workers_mu);
 	p->pending_respawns--;
@@ -502,13 +494,12 @@ respawn_worker_thread(void *arg)
  *   no cooldown.  Only a fleet-wide burst trips the back-off.
  *
  * Per-worker scope (deliberate, retained from 2026-05-30):
- *   The gate is session-wide, not per-worker.  Per-worker observability
- *   (first/last_reconnect_ns in the stats CSV) attributes churn post-hoc.  If
- *   one bad worker is ever shown to starve the budget, add a per-worker
- *   sliding-window thrash detector (time-windowed, not lifetime-capped) - do
- *   not add until the data shows it matters.  A respawn-EFFECTIVENESS trigger
- *   ("last K probes each re-stalled within T") is the truer signal than
- *   fleet-fraction and is the next candidate; deferred for now.
+ *   The gate is session-wide, not per-worker.  If one bad worker is ever
+ *   shown to starve the budget, add a per-worker sliding-window thrash
+ *   detector (time-windowed, not lifetime-capped) - do not add until the
+ *   data shows it matters.  A respawn-EFFECTIVENESS trigger ("last K probes
+ *   each re-stalled within T") is the truer signal than fleet-fraction and
+ *   is the next candidate; deferred for now.
  */
 int
 parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)

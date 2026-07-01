@@ -857,11 +857,6 @@ sftp_parallel_stop(struct sftp_parallel *p)
 		}
 	}
 
-	if (p->stats_csv != NULL) {
-		fclose(p->stats_csv);
-		p->stats_csv = NULL;
-	}
-
 	if (p->workers) {
 		/* Reporter is now joined - no more concurrent reaping. We
 		 * own everything still in p->workers; tear it down. */

@@ -363,14 +363,6 @@ struct sftp_parallel;
 #define FLARE_WARN_SEC          300   /* escalate notice -> warning after this */
 
 /*
- * After a worker has reconnected this many times, emit a one-time
- * user-visible notice that the path may be unreliable.  The cause of each
- * individual respawn is already reported as it happens; this is the
- * cumulative "churn" signal.
- */
-#define HPN_WORKER_CHURN_NOTICE   3
-
-/*
  * (Removed 2026-06-07: RANGE_CHUNK_MULTIPLIER.  It fed a per-file range-count
  * ceiling, min(file/floor, num_streams*4), whose stated job was tail-balancing
  * oversubscription.  In practice it acted as a cap that forced absurdly large
@@ -430,6 +422,11 @@ struct sftp_parallel;
 				    * triggering a cooldown pause.  Cause-
 				    * agnostic backstop alongside the peer-
 				    * stall systemic trigger below. */
+
+#define HPN_PATH_CHURN_NOTICE_MULT 2  /* one-time "path may be unreliable"
+				    * notice fires once the cumulative involuntary
+				    * reconnect count reaches this * num_streams -
+				    * a heads-up ahead of the give-up thresholds. */
 
 /*
  * Respawn cooldown is escalating + decaying, not count-capped.  On each
@@ -887,26 +884,7 @@ struct sftp_worker {
 	uint64_t           units_started;     /* dispatched, may be in flight */
 	uint64_t           units_completed;
 	uint64_t           units_failed;
-	uint64_t           reconnect_count;
 	uint64_t           last_completion_ns; /* monotonic ns of last finish */
-
-	/*
-	 * Per-worker respawn timing - observability only, no gating decision
-	 * is made on these.  Respawn limits today are session-wide (see the
-	 * comment block at the respawn dispatch site).  These fields exist
-	 * so post-mortem forensics on a stats CSV can answer "which worker
-	 * respawned and when," which we wanted while debugging the 2026-05-30
-	 * br008 Pattern 2 wedges.  Set under w->mu at the same site as
-	 * reconnect_count++.  Zero values mean "never respawned this session."
-	 *
-	 * If we ever discover one persistently-bad worker is starving healthy
-	 * workers of the session's respawn budget, the right answer is a
-	 * per-worker time-windowed thrash detector (sliding window, cooldown
-	 * on burst) - see the design discussion at the respawn dispatch site.
-	 * Until then these are read-only stats fields.
-	 */
-	uint64_t           first_reconnect_ns;  /* ns of this worker's first respawn */
-	uint64_t           last_reconnect_ns;   /* ns of this worker's most recent respawn */
 
 	/* Adaptive throughput-based stall detection state.  See
 	 * cfg.tput_path_healthy_kbps in sftp-parallel.h for the algorithm.
@@ -1143,6 +1121,10 @@ struct sftp_parallel {
 						 * so it matches the summary
 						 * count (reporter thread
 						 * only) */
+	int                         churn_notice_emitted; /* one-shot: the
+						 * "path may be unreliable" notice
+						 * has fired once this transfer
+						 * (reporter thread only) */
 	int                         wedge_terminations;	/* workers reaped with
 							 * HPN_EXIT_TCP_WEDGE */
 	int                         peer_stall_terminations; /* ditto, PEER_STALL */
@@ -1526,12 +1508,6 @@ struct sftp_parallel {
 	                                  * reap (-1 = none) */
 	int      born_dead_stuck_count;  /* consecutive born-dead reaps on that
 	                                  * offset */
-
-	/* Optional per-worker stats CSV (enabled via HPN_WORKER_STATS_CSV env).
-	 * Opened lazily by the reporter on first tick; closed at orchestrator
-	 * stop.  Touched only by the reporter thread. */
-	FILE    *stats_csv;
-	uint64_t stats_csv_start_ns;
 };
 
 /*
