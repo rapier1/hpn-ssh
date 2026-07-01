@@ -13,8 +13,9 @@
  *
  * Detection layers (each falls back to the next):
  *   1. statfs() f_type magic number → filesystem type string
- *   2. Lustre: invoke "lfs getstripe -d --yaml <path>" as subprocess
- *      (safe: path is passed as argv, not interpolated into a shell command)
+ *   2. Lustre: read the "lustre.lov" extended attribute via getxattr()
+ *      (lustre_get_stripe -> read_lov_layout, sftp-lustre.c) - a plain
+ *      syscall, no fork/exec or subprocess
  *   3. GPFS:   type detected via magic; block_size from statvfs()
  *   4. Fallback: block_size from statvfs(), zeros for stripe fields
  *

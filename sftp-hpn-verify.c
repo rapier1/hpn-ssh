@@ -290,8 +290,17 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 		return -1;
 		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &rid)) != 0)
-			fatal_fr(r, "parse");
+		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+			/* A malformed reply must not abort the client - fatal
+			 * here crashes the whole orchestrator when this is one
+			 * of N parallel workers.  Mark the conn dead and return
+			 * -1, matching the ID-mismatch / wrong-type cases below. */
+			sftp_conn_die(conn, "hpn-check-file \"%s\": parse reply "
+			    "header: %s", path, ssh_err(r));
+			sftp_conn_watchdog_resume(conn);
+			sshbuf_free(msg);
+		return -1;
+		}
 		debug3_f("got response type=%u rid=%u (expected id=%u)",
 		    type, rid, id);
 		if (rid != id) {
@@ -312,8 +321,13 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 			u_int status;
 			char *errmsg = NULL;
 
-			if ((r = sshbuf_get_u32(msg, &status)) != 0)
-				fatal_fr(r, "parse status");
+			if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+				sftp_conn_die(conn, "hpn-check-file \"%s\": "
+				    "parse status: %s", path, ssh_err(r));
+				sftp_conn_watchdog_resume(conn);
+				sshbuf_free(msg);
+			return -1;
+			}
 			/* consume error-message and language-tag to leave
 			 * msg clean */
 			(void)sshbuf_get_cstring(msg, &errmsg, NULL);
@@ -342,8 +356,13 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 		return -1;
 		}
 
-		if ((r = sshbuf_get_u64(msg, hash_out)) != 0)
-			fatal_fr(r, "parse hash");
+		if ((r = sshbuf_get_u64(msg, hash_out)) != 0) {
+			sftp_conn_die(conn, "hpn-check-file \"%s\": parse hash: "
+			    "%s", path, ssh_err(r));
+			sftp_conn_watchdog_resume(conn);
+			sshbuf_free(msg);
+		return -1;
+		}
 
 		/*
 		 * Heartbeat reply: refresh the watchdog pause and wait for
@@ -1026,9 +1045,38 @@ sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
 	 * verify) pass an explicit [off, len).
 	 */
 	if (len <= 0) {
+		Attrib ra;
+		off_t remote_size;
+
 		if (stat(local_path, &sb) == -1) {
 			error_f("stat \"%s\": %s", local_path, strerror(errno));
 			return -1;
+		}
+		/*
+		 * Whole-file verify must confirm the two files are the SAME
+		 * SIZE, not merely that their common prefix matches.  len was
+		 * derived from the local size alone and both ends hash [0,len),
+		 * so a dest shorter than the source (a truncated download that
+		 * completed on an early / adversarial EOF) or longer (a dest
+		 * overwritten out of band) would pass because only
+		 * min(local,remote) is ever hashed.  Stat the remote and require
+		 * the sizes to agree; a divergence is a definitive mismatch.
+		 * (A size mismatch is not the localized-corruption case the
+		 * span repair below handles, so it is reported, not repaired.)
+		 */
+		if (sftp_stat(conn, remote_path, 1, &ra) != 0 ||
+		    (ra.flags & SSH2_FILEXFER_ATTR_SIZE) == 0) {
+			error_f("verify \"%s\": cannot determine remote size",
+			    remote_path);
+			return -1;	/* unverifiable: fail closed */
+		}
+		remote_size = (off_t)ra.size;
+		if (sb.st_size != remote_size) {
+			logit("verify: \"%s\" size mismatch "
+			    "(local %lld, remote %lld)",
+			    local_is_target ? local_path : remote_path,
+			    (long long)sb.st_size, (long long)remote_size);
+			return 1;	/* definitive mismatch */
 		}
 		if (sb.st_size == 0)
 			return 0;	/* empty file: trivially matches */
