@@ -1678,6 +1678,20 @@ compute_range_split(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (have_stripe && info.stripe_size > 0) {
 		off_t stripe = (off_t)info.stripe_size;
 		*range_size = ((per_range + stripe - 1) / stripe) * stripe;
+		/*
+		 * The stripe round-up inflates range_size above per_range, so the
+		 * original n ranges of range_size would overshoot EOF - ranges
+		 * that start past EOF and a negative-length final range (the
+		 * submit_*_ranges path takes the last length as file_size -
+		 * offset).  Recompute the range COUNT from the inflated size so
+		 * the ranges tile the file exactly (each stripe-aligned; the last
+		 * is the remainder).  n only shrinks here since range_size >=
+		 * per_range; if it drops below 2 the stripe-aligned split is not
+		 * worth doing, so fall back to the whole-file path.
+		 */
+		n = (int)((file_size + *range_size - 1) / *range_size);
+		if (n < 2)
+			return 0;
 	} else {
 		/* No stripe geometry from hpn-fs-info.  The server now resolves
 		 * the Lustre default (sftp-lustre.c lustre_get_stripe walks up to
