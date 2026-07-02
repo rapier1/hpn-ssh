@@ -635,7 +635,17 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 
 	send_msg(ret, msg);
 
-	get_msg_extended(ret, msg, 1);
+	if (get_msg_extended(ret, msg, 1) < 0) {
+		/*
+		 * The transport closed the connection before the SFTP
+		 * handshake completed (e.g. it refused the requested cipher
+		 * and exited with its own message). Let that message stand
+		 * rather than reporting a bogus "type 0" packet.
+		 */
+		sshbuf_free(ret->msg);
+		free(ret);
+		return(NULL);
+	}
 
 	/* Expecting a VERSION reply */
 	if ((r = sshbuf_get_u8(msg, &type)) != 0)

@@ -1025,6 +1025,22 @@ kex_choose_conf(struct ssh *ssh, uint32_t seq)
 		sprop=peer;
 	}
 
+	if (!kex->server) {
+		/*
+		 * Record whether the server offered the none cipher/MAC
+		 * (HPN NoneEnabled/NoneMacEnabled) so the client can refuse
+		 * a none request up front rather than desyncing a rekey.
+		 */
+		char *m;
+
+		m = match_list("none", sprop[PROPOSAL_ENC_ALGS_STOC], NULL);
+		kex->server_offered_none_cipher = (m != NULL);
+		free(m);
+		m = match_list("none", sprop[PROPOSAL_MAC_ALGS_STOC], NULL);
+		kex->server_offered_none_mac = (m != NULL);
+		free(m);
+	}
+
 	/* Check whether peer supports ext_info/kex_strict */
 	if ((kex->flags & KEX_INITIAL) != 0) {
 		if (kex->server) {

@@ -497,6 +497,18 @@ ssh_userauth2(struct ssh *ssh, const char *local_user,
 		char *s = NULL;
 		const char *none_cipher = "none";
 		if (!tty_flag) { /* no null on tty sessions */
+			/*
+			 * Refuse up front if the server did not advertise
+			 * the none cipher (NoneEnabled), rather than
+			 * committing to a rekey that negotiates a normal
+			 * cipher, desyncs, and corrupts the stream.
+			 */
+			if (!ssh->kex->server_offered_none_cipher)
+				fatal("Server does not permit the none cipher. Exiting.");
+			if (options.nonemac_enabled == 1 &&
+			    !ssh->kex->server_offered_none_mac)
+				fatal("Server does not permit none MAC. Exiting.");
+
 			debug("Requesting none rekeying...");
 			kex_proposal_populate_entries(ssh, myproposal, s, none_cipher,
 						      options.macs,
@@ -517,9 +529,14 @@ ssh_userauth2(struct ssh *ssh, const char *local_user,
 			kex_prop2buf(ssh->kex->my, myproposal);
 			packet_request_rekeying();
 		} else {
-			/* requested NONE cipher when in a tty */
-			debug("Cannot switch to NONE cipher with tty allocated");
-			fprintf(stderr, "NONE cipher switch disabled when a TTY is allocated\n");
+			/*
+			 * The user asked for the none cipher but a TTY is
+			 * allocated. none over an interactive session is not
+			 * permitted; do not silently fall back to an encrypted
+			 * session - drop with a clear reason, consistent with
+			 * the non-TTY refusal above.
+			 */
+			fatal("The none cipher cannot be used with a TTY or interactive session. Exiting.");
 		}
 	}
 

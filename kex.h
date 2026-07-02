@@ -159,6 +159,8 @@ struct kex {
 	int	ext_info_s;
 	int	kex_strict;
 	int	ext_info_received;
+	int	server_offered_none_cipher;
+	int	server_offered_none_mac;
 	struct sshbuf *my;
 	struct sshbuf *peer;
 	struct sshbuf *client_version;

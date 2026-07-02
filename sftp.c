@@ -3409,7 +3409,7 @@ connect_to_server(char *path, char **args, int *in, int *out)
 	 * tell it apart from worker PIDs (worker PIDs are logged by the
 	 * parallel orchestrator's watchdog as "worker N: ... pid=...").
 	 * Useful when investigating control-connection deaths in -j mode. */
-	logit("hpnsftp control: ssh child pid=%ld", (long)sshpid);
+	debug("hpnsftp control: ssh child pid=%ld", (long)sshpid);
 }
 
 static void
