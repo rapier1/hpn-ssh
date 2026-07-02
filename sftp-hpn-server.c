@@ -26,7 +26,18 @@
  *   block_size   uint64   optimal I/O block size (always present)
  *
  * Copyright (c) 2024-2026 Pittsburgh Supercomputing Center / HPN-SSH project.
- * See LICENCE for redistribution terms.
+ *
+ * This library or code is free software; you can redistribute it and/or
+ * modify it under the terms of the BSD 2 Clause License.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+ * for more details.
+ *
+ * You should have received a copy of the BSD 2-Clause License along with this
+ * code, if not, see https://opensource.org/license/bsd-2-clause.
+ *
  */
 
 #include "includes.h"

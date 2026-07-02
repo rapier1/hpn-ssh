@@ -3,15 +3,16 @@
  *
  *  Author: Chris Rapier <rapier@psc.edu>
  *
- * This library is free software; you can redistribute it and/or modify it
- * under the terms of the MIT License.
+ * This library or code is free software; you can redistribute it and/or
+ * modify it under the terms of the BSD 2 Clause License.
  *
- * This library is distributed in the hope that it will be useful, but WITHOUT
+ * This code is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the MIT License for more details.
+ * FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+ * for more details.
  *
- * You should have received a copy of the MIT License along with this library;
- * if not, see http://opensource.org/licenses/MIT.
+ * You should have received a copy of the BSD 2-Clause License along with this
+ * code, if not, see https://opensource.org/license/bsd-2-clause.
  *
  */
 
