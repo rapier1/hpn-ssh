@@ -326,7 +326,7 @@ fill_default_server_options(ServerOptions *options)
 	}
 	/* No certificates by default */
 	if (options->num_ports == 0)
-		options->ports[options->num_ports++] = SSH_DEFAULT_PORT;
+		options->ports[options->num_ports++] = HPNSSH_DEFAULT_PORT;
 	if (options->address_family == -1)
 		options->address_family = AF_UNSPEC;
 	if (options->listen_addrs == NULL)
@@ -1002,7 +1002,7 @@ process_queued_listen_addrs(ServerOptions *options)
 	struct queued_listenaddr *qla;
 
 	if (options->num_ports == 0)
-		options->ports[options->num_ports++] = SSH_DEFAULT_PORT;
+		options->ports[options->num_ports++] = HPNSSH_DEFAULT_PORT;
 	if (options->address_family == -1)
 		options->address_family = AF_UNSPEC;
 

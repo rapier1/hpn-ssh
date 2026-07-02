@@ -761,6 +761,11 @@ If set to a time in seconds, or a time in any of the formats documented in
 then the backgrounded master connection will automatically terminate
 after it has remained idle (with no client connections) for the
 specified time.
+.It Cm DisableMTAES
+Switch the encryption cipher being used from the multithreaded
+MT-AES-CTR cipher back to the stock single-threaded AES-CTR cipher.
+Default is
+.Cm no. HPNSSH only.
 .It Cm DynamicForward
 Specifies that a TCP port on the local machine be forwarded
 over the secure channel, and the application
@@ -846,6 +851,16 @@ The argument must be
 or
 .Cm no
 (the default).
+.It Cm Fallback
+Specifies whether hpnssh, if it fails to connect to the default hpnsshd
+port of 2222, should retry on the port given by
+.Cm FallbackPort .
+The argument must be
+.Cm yes
+(the default)
+or
+.Cm no .
+HPN-SSH only.
 .It Cm FallbackPort
 Specifies the port hpnssh should try to connect to if it fails connecting to the
 default hpnsshd port of 2222. The default is port 22. HPN-SSH only.
@@ -1861,7 +1876,8 @@ and server side of the connection. When the connection switches to the NONE
 cipher a warning is sent to STDERR. The connection attempt will fail with an
 error if a client requests a NoneSwitch from the server that does not explicitly
 have NoneEnabled set to yes. Note: The NONE cipher cannot be used in
-interactive (shell) sessions and it will fail silently. Set to
+interactive (shell) sessions and a requested switch will fail with an
+error. Set to
 .Cm no
 by default.
 .Cm HPNSSH only.
