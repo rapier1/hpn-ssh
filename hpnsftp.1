@@ -62,6 +62,15 @@ compression.
 is binary compatible with OpenSSH's sftp and uses the same directive and configuration
 options except where noted. 
 .Pp
+Several HPN-SSH acceleration features (small-file bundling, verified
+transfer, hash-verified resume, and filesystem-aware layout) rely on
+SFTP protocol extensions that require an HPN-SSH 19.0 or later server on
+the far end.
+Against a non-HPN or older server these extensions are not advertised,
+so
+.Nm
+automatically skips the affected features and uses standard SFTP.
+.Pp
 The
 .Ar destination
 may be specified either as

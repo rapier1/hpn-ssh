@@ -953,6 +953,9 @@ on high-bandwidth, high-latency paths. Accepted values are
 .Cm max
 (512 MB). Larger limits raise throughput on long fat networks at the cost of
 more memory per channel.
+The limit applies to each channel independently, so a connection that
+opens several channels may use up to this amount on each; it is not an
+aggregate cap across the whole connection.
 .It Cm HPNUseBundle
 Operator master toggle for the HPN-SSH small-file bundling SFTP extensions
 (the
