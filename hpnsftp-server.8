@@ -247,13 +247,21 @@ to align byte-range parallel transfers
 .Pq Fl j , Fl M
 to stripe boundaries on the destination.
 .It Sy hpn-bundle@hpnssh.org
-Capability advertisement for tar-stream bundling of small files; the
-actual bundle upload is driven by SSH_FXP_OPEN with bundle-specific
-attributes.
+Capability advertisement for tar-stream bundling of small files on
+upload, carried out by the
+.Sy hpn-bundle-open@hpnssh.org
+request below.
+.It Sy hpn-bundle-open@hpnssh.org
+Open a destination bundle for upload.
+The client names the target directory, which the server creates if
+necessary, and then streams a whole set of small files into it as a
+single tar stream instead of transferring each file separately.
+This is the upload counterpart to
+.Sy hpn-bundle-fetch@hpnssh.org .
+Reduces per-file round trips on high-RTT uploads of many small files.
 .It Sy hpn-bundle-fetch@hpnssh.org
 Server-side bundling of small files for download: the server tar-streams
-a set of files into a single bundle handle that the client then drains
-with SSH_FXP_READ.
+a set of files into a single bundle that the client then reads back.
 Reduces per-file open/close round trips on high-RTT downloads of many
 small files.
 .It Sy hpn-file-layout@hpnssh.org
@@ -285,6 +293,26 @@ On non-Lustre filesystems the server reports
 without modifying anything;
 .Xr hpnsftp 1
 treats that response as a silent no-op.
+.It Sy hpn-max-workers@hpnssh.org
+Advertise the operator's per-user cap on the number of concurrent
+parallel-transfer workers.
+The value is a decimal count;
+.Dq 0
+means no cap, which is also what a standalone server with no configured
+limit sends.
+The advertisement is advisory: an
+.Xr hpnsftp 1
+client uses it to self-limit a parallel
+.Pq Fl j
+transfer so it does not open more workers than the operator permits.
+A stock OpenSSH server never sends it, which the client reads as
+.Dq no policy
+and applies its own conservative default.
+See
+.Cm HPNMaxConcurrentWorkers
+in
+.Xr hpnsshd_config 5
+for the server-side configuration.
 .El
 .Pp
 For long-running hash extensions
