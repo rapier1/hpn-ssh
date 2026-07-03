@@ -856,10 +856,11 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
  *
  * Error model: bundle is all-or-nothing.  A per-path stat() failure or
  * non-regular file is logged and skipped (matching upload-side per-
- * entry skip), but the per-bundle size cap is enforced before the
- * handle is installed so an abusive client can't pin too much server
- * memory.  Mid-pack failures surface in bundle_read as
- * SSH2_FX_FAILURE.
+ * entry skip).  There is no per-bundle byte cap and none is needed:
+ * streaming keeps server memory O(1) regardless of total bundle size
+ * (only one input file is open at a time).  The single client-scaled
+ * allocation is the path list, hard-bounded to 65535 entries below.
+ * Mid-pack failures surface in bundle_read as SSH2_FX_FAILURE.
  */
 void
 process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
