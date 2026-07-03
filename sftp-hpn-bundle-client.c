@@ -308,7 +308,11 @@ bundle_dl_entry_cb(void *ctx, const char *path, uint64_t size,
 	 * mirroring the upload extractor.  The authoritative size is set by
 	 * ftruncate() in bundle_dl_entry_end_cb (only a completed entry reaches
 	 * it), so a never-completed partial can only overwrite a prefix with
-	 * identical bytes and can never shrink the file.
+	 * identical bytes and can never shrink the file.  An aborted stream
+	 * instead truncates the in-flight entry to the bytes it actually wrote
+	 * (see the fetch cleanup path), so the partial ends visibly short
+	 * rather than fallocate-padded to full size, which a size-only resume
+	 * would mistake for a complete file.
 	 */
 	s->cur_fd = open(s->cur_local, O_WRONLY | O_CREAT, perm);
 	if (s->cur_fd < 0) {
@@ -357,8 +361,6 @@ bundle_dl_data_cb(void *ctx, const u_char *data, size_t len)
 	if (s->cur_fd < 0)
 		return -1;
 
-	s->cur_written += (uint64_t)len;
-
 	remaining = len;
 	while (remaining > 0) {
 		ssize_t n = write(s->cur_fd, data, remaining);
@@ -372,6 +374,10 @@ bundle_dl_data_cb(void *ctx, const u_char *data, size_t len)
 		data      += n;
 		remaining -= (size_t)n;
 	}
+	/* Count only bytes actually on disk: the abort-path ftruncate in the
+	 * fetch cleanup uses cur_written as the resume point, which must
+	 * never overshoot what was written. */
+	s->cur_written += (uint64_t)len;
 	return 0;
 }
 
@@ -810,8 +816,16 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	free(stream.cur_buf);		/* a file buffered but not yet enqueued */
 	if (parser != NULL)
 		sftp_hpn_tar_parser_free(parser);
-	if (stream.cur_fd >= 0)
+	if (stream.cur_fd >= 0) {
+		/* Aborted mid-entry (a completed entry closes its fd in
+		 * entry_end_cb).  Truncate to the bytes actually written:
+		 * drops the posix_fallocate padding and any stale tail of a
+		 * pre-existing file, so the partial is visibly short and a
+		 * later size-only resume appends from the right offset - the
+		 * same state an aborted plain-SFTP download leaves. */
+		(void)ftruncate(stream.cur_fd, (off_t)stream.cur_written);
 		(void)close(stream.cur_fd);
+	}
 	free(stream.last_mkdir_dir);
 
 	/* Resync before CLOSE: a mid-stream failure (e.g. a refused read that
