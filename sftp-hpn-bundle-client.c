@@ -1330,9 +1330,8 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		if (entries[i].local_path == NULL ||
 		    entries[i].remote_path == NULL)
 			continue;
-		/* (F) skip stat if the walker already provided size+mtime -
-		 * not currently in the entry struct, so stat() until that
-		 * field gets added.  TODO: extend the entry struct. */
+		/* Deliberate re-stat: cheap (attr cache is warm from the
+		 * walk) and keeps the tar header's size/mtime fresh. */
 		if (stat(entries[i].local_path, &sb) < 0) {
 			error("hpn-bundle: stat local \"%s\": %s",
 			    entries[i].local_path, strerror(errno));
