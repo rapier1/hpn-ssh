@@ -160,7 +160,8 @@ typedef enum {
 	oTcpRcvBufPoll, oTcpRcvBufRescue, oHPNDisabled, oHPNMemoryLimit,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch, oHPNUseBundle, oHPNWriterPool,
 	oHPNTailRedistribute,
-	oHPNMaxRetries, oHPNBundleSize, oHPNMaxAuthConcurrent,
+	oHPNMaxRetries, oHPNStallAbortTimeout, oHPNBundleSize,
+	oHPNMaxAuthConcurrent,
 	oHPNLustreStripeCount,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
@@ -306,6 +307,7 @@ static struct {
 	{ "hpnwriterpool", oHPNWriterPool },
 	{ "hpntailredistribute", oHPNTailRedistribute },
 	{ "hpnmaxretries", oHPNMaxRetries },
+	{ "hpnstallaborttimeout", oHPNStallAbortTimeout },
 	{ "hpnbundlesize", oHPNBundleSize },
 	{ "hpnmaxauthconcurrent", oHPNMaxAuthConcurrent },
 	{ "hpnlustrestripecount", oHPNLustreStripeCount },
@@ -1408,6 +1410,10 @@ parse_time:
 
 	case oHPNMaxRetries:
 		intptr = &options->hpn_max_retries;
+		goto parse_int;
+
+	case oHPNStallAbortTimeout:
+		intptr = &options->hpn_stall_abort_timeout;
 		goto parse_int;
 
 	case oHPNBundleSize:
@@ -2993,6 +2999,7 @@ initialize_options(Options * options)
 	options->hpn_writer_pool = -1;
 	options->hpn_tail_redistribute = -1;
 	options->hpn_max_retries = -1;
+	options->hpn_stall_abort_timeout = -1;
 	options->hpn_bundle_size = -1;
 	options->hpn_max_auth_concurrent = -1;
 	/*
@@ -3222,6 +3229,10 @@ fill_default_options(Options * options)
 		    "clamping to 20.\n", options->hpn_max_retries);
 		options->hpn_max_retries = 20;
 	}
+	if (options->hpn_stall_abort_timeout == -1)
+		options->hpn_stall_abort_timeout = 60;	/* default 60 s; 0 disables.
+							 * parse_int already floors
+							 * explicit values at 0. */
 	if (options->hpn_bundle_size == -1)
 		options->hpn_bundle_size = HPN_BUNDLE_SIZE_DEFAULT;
 	else if (options->hpn_bundle_size < HPN_BUNDLE_SIZE_MIN) {
@@ -4124,6 +4135,7 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oHPNWriterPool, o->hpn_writer_pool);
 	dump_cfg_fmtint(oHPNTailRedistribute, o->hpn_tail_redistribute);
 	dump_cfg_int(oHPNMaxRetries, o->hpn_max_retries);
+	dump_cfg_int(oHPNStallAbortTimeout, o->hpn_stall_abort_timeout);
 	dump_cfg_int(oHPNMaxAuthConcurrent, o->hpn_max_auth_concurrent);
 	/* oHPNBundleSize - int64 byte count; printed plain (operator can
 	 * compare against the K/M/G suffix they configured). */

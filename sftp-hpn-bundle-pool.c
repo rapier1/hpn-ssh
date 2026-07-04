@@ -265,30 +265,14 @@ bundle_write_pool_new(int n_threads, int preserve, int do_fsync,
 	return NULL;
 }
 
-/* HPN_BUNDLE_STATS_FILE: dev/exploration only.  When set, append one line per
- * pool - "threads=N depth=D peak_bytes=B" - so a harness can read the pool's
- * peak buffered memory without parsing server logs or debug output.  Off by
- * default; never part of normal operation. */
+/* Log the pool's final geometry + peak buffered memory at -vvv, for tuning
+ * writer-pool sizing without instrumenting a live server. */
 static void
 bundle_pool_emit_stats(const struct bundle_write_pool *pool)
 {
-	const char *path = getenv("HPN_BUNDLE_STATS_FILE");
-	char        line[128];
-	int         fd, n;
-
-	if (path == NULL || *path == '\0')
-		return;
-	n = snprintf(line, sizeof(line),
-	    "threads=%d depth=%d peak_bytes=%llu\n",
+	debug3("hpn-bundle writer pool: threads=%d depth=%d peak_bytes=%llu",
 	    pool->n_threads, pool->max_depth,
 	    (unsigned long long)pool->peak_bytes);
-	if (n <= 0 || (size_t)n >= sizeof(line))
-		return;
-	fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0644);
-	if (fd < 0)
-		return;
-	(void)write(fd, line, (size_t)n);
-	(void)close(fd);
 }
 
 /* Shut down, join all threads, free any leftover jobs, then destroy + free the

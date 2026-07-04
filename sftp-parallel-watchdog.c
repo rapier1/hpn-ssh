@@ -703,7 +703,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			if (endgame_idle && s > (uint64_t)ENDGAME_STUCK_SEC) {
 				/* Endgame stuck-straggler reap (captured-level
 				 * log so we can actually observe it fire). */
-				if (getenv("HPN_BUNDLE_TIMING") != NULL)
+				if (getenv("HPN_PARALLEL_TRACE") != NULL)
 					logit("HPN ENDGAME-REAP worker=%d "
 					    "silence=%llus - reaping stuck "
 					    "endgame straggler", w->id,
@@ -833,14 +833,14 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 
 	inactivity_checks_done:
 		/*
-		 * ENDGAME-TRACE (HPN_BUNDLE_TIMING): one captured line per
+		 * ENDGAME-TRACE (HPN_PARALLEL_TRACE): one captured line per
 		 * endgame-straggler tick at the convergence point - reached on
 		 * EVERY path (including the pause-goto skip) - showing every
 		 * decision input and the final outcome, so we can see exactly
 		 * why the reaper does or does not fire.
 		 */
 		if (endgame_idle && in_flight > 0 &&
-		    getenv("HPN_BUNDLE_TIMING") != NULL) {
+		    getenv("HPN_PARALLEL_TRACE") != NULL) {
 			uint64_t pu =
 			    sftp_conn_watchdog_pause_until_ns(w->conn);
 			logit("HPN ENDGAME-TRACE worker=%d egi=%d qhw=%d "

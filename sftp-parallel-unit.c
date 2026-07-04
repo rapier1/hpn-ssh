@@ -326,7 +326,7 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 	t->remaining--;
 	was_last   = (t->remaining == 0);
 	incomplete = was_last && t->any_failed;
-	if (was_last && getenv("HPN_BUNDLE_TIMING") != NULL)
+	if (was_last && getenv("HPN_PARALLEL_TRACE") != NULL)
 		logit("HPN CAP-COUNTERS \"%s\": grants=%llu denials=%llu "
 		    "(cap=%d total_ranges=%d)", t->path,
 		    (unsigned long long)t->cap_grants,
@@ -828,31 +828,17 @@ parallel_unit_max_retries(struct sftp_parallel *p)
 	return HPN_MAX_RETRIES_DEFAULT;
 }
 
-static int pending_trace_enabled = -1;
-
-int
-parallel_unit_pending_trace_on(void)
-{
-	if (pending_trace_enabled < 0) {
-		/* ENV-VAR SFTP_PENDING_TRACE - developer-only: enable verbose
-		 * pending-counter trace logging for debugging work-unit
-		 * lifecycle issues.  Not user-facing. */
-		const char *e = getenv("SFTP_PENDING_TRACE");
-		pending_trace_enabled = (e && e[0] == '1') ? 1 : 0;
-	}
-	return pending_trace_enabled;
-}
-
+/* Pending-counter lifecycle trace at -vvv: one line per inc/dec so a leak (a
+ * unit incremented but never decremented -> a hang at teardown) can be paired
+ * and traced.  debug3 self-gates, so callers invoke it unconditionally. */
 void
 parallel_unit_pending_trace(const char *action, struct sftp_parallel *p,
     const struct sftp_work_unit *u, int worker_id, const char *site)
 {
-	if (!parallel_unit_pending_trace_on())
-		return;
 	const char *src = (u && u->src_path) ? u->src_path : "(null)";
 	const char *dst = (u && u->dst_path) ? u->dst_path : "(null)";
 	int op = u ? (int)u->op : -1;
-	logit_f("PTRACE %s pending=%llu op=%d u=%p w=%d site=%s src=%s dst=%s",
+	debug3_f("PTRACE %s pending=%llu op=%d u=%p w=%d site=%s src=%s dst=%s",
 	    action, (unsigned long long)p->pending, op, (const void *)u,
 	    worker_id, site, src, dst);
 }
@@ -868,16 +854,13 @@ parallel_unit_pending_dec(struct sftp_parallel *p)
 	pthread_mutex_unlock(&p->pending_mu);
 }
 
-/* Traced variant: pass the unit and a call-site label so the trace can
- * pair each dec with the corresponding inc.  Production callers should
- * use the macro PENDING_DEC defined below, which expands to the traced
- * variant when parallel_unit_pending_trace_on(). */
+/* Traced variant: pass the unit and a call-site label so the -vvv trace can
+ * pair each dec with the corresponding inc. */
 void
 parallel_unit_pending_dec_traced(struct sftp_parallel *p, const struct sftp_work_unit *u,
     int worker_id, const char *site)
 {
-	if (parallel_unit_pending_trace_on())
-		parallel_unit_pending_trace("DEC", p, u, worker_id, site);
+	parallel_unit_pending_trace("DEC", p, u, worker_id, site);
 	parallel_unit_pending_dec(p);
 }
 
@@ -919,9 +902,7 @@ parallel_bundle_member_pushfail(struct sftp_parallel *p,
 	pthread_mutex_lock(&p->pending_mu);
 	if (p->pending > 0) p->pending--;
 	pthread_mutex_unlock(&p->pending_mu);
-	if (parallel_unit_pending_trace_on())
-		parallel_unit_pending_trace("DEC_PUSHFAIL", p, u, -1,
-		    "bundle/pushfail");
+	parallel_unit_pending_trace("DEC_PUSHFAIL", p, u, -1, "bundle/pushfail");
 	if (u->size > 0)
 		__atomic_fetch_sub(&p->queued_bytes, (uint64_t)u->size,
 		    __ATOMIC_RELAXED);
@@ -990,8 +971,7 @@ parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
 	pthread_mutex_lock(&p->pending_mu);
 	p->pending++;
 	pthread_mutex_unlock(&p->pending_mu);
-	if (parallel_unit_pending_trace_on())
-		parallel_unit_pending_trace("INC", p, u, -1, "bundle-add");
+	parallel_unit_pending_trace("INC", p, u, -1, "bundle-add");
 	if (add_bytes)
 		__atomic_fetch_add(&p->queued_bytes, add_bytes,
 		    __ATOMIC_RELAXED);
@@ -1071,8 +1051,7 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 	pthread_mutex_lock(&p->pending_mu);
 	p->pending++;
 	pthread_mutex_unlock(&p->pending_mu);
-	if (parallel_unit_pending_trace_on())
-		parallel_unit_pending_trace("INC", p, u, -1, "submit");
+	parallel_unit_pending_trace("INC", p, u, -1, "submit");
 	if (add_bytes)
 		__atomic_fetch_add(&p->queued_bytes, add_bytes,
 		    __ATOMIC_RELAXED);
@@ -1080,9 +1059,8 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 		pthread_mutex_lock(&p->pending_mu);
 		if (p->pending > 0) p->pending--;
 		pthread_mutex_unlock(&p->pending_mu);
-		if (parallel_unit_pending_trace_on())
-			parallel_unit_pending_trace("DEC_PUSHFAIL", p, u, -1,
-			    "submit/pushfail");
+		parallel_unit_pending_trace("DEC_PUSHFAIL", p, u, -1,
+		    "submit/pushfail");
 		if (add_bytes)
 			__atomic_fetch_sub(&p->queued_bytes, add_bytes,
 			    __ATOMIC_RELAXED);
@@ -1673,7 +1651,6 @@ compute_range_split(struct sftp_parallel *p, struct sftp_conn *conn,
     off_t *range_size, int *num_ranges)
 {
 	struct sftp_fs_info info;
-	const char *no_split;
 	int max_ranges, n, have_stripe;
 	off_t per_range;
 
@@ -1684,12 +1661,6 @@ compute_range_split(struct sftp_parallel *p, struct sftp_conn *conn,
 	if ((uint64_t)file_size < RANGE_SPLIT_MIN_SIZE_FLOOR)
 		return 0;
 	if ((uint64_t)file_size < parallel_unit_split_min_size(p))
-		return 0;
-
-	/* ENV-VAR HPN_NO_RANGE_SPLIT - developer-only kill switch (force the
-	 * whole-file path to A/B multi-file parallelism vs range-splitting). */
-	no_split = getenv("HPN_NO_RANGE_SPLIT");
-	if (no_split && *no_split && *no_split != '0')
 		return 0;
 
 	max_ranges = (int)(file_size / parallel_unit_split_min_size(p));

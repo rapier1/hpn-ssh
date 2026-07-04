@@ -242,9 +242,8 @@ hpn_strlist_drain(struct hpn_strlist *l, char ***out, size_t *out_used)
 /* ---------- Worker thread ---------- */
 
 /*
- * Pending-counter trace: enabled when SFTP_PENDING_TRACE=1 in the
- * environment.  Writes one line per inc/dec to stderr so we can pair
- * them post-run and find any leaks.  Cheap when disabled.
+ * Pending-counter trace: one line per inc/dec at -vvv (debug3) so we can pair
+ * them post-run and find any work-unit leaks.  Self-gating; cheap when off.
  */
 /* ── BEGIN Phase 4 gap 1: pipelined-batch helpers ─────────────────────────
  *
@@ -262,16 +261,11 @@ hpn_strlist_drain(struct hpn_strlist *l, char ***out, size_t *out_used)
  *     before handling any non-batch work and at parallel_worker_thread exit.
  *
  *   worker_run_batch_pipelined
- *     Replaces the synchronous sftp_upload_batch() call.  Allocates heap
- *     entry/unit arrays so they survive across the next iteration, calls
- *     sftp_upload_batch_send (which drains prev as part of its phase 1),
- *     finalises prev (if there was one), then saves THIS batch as the
- *     new prev.  On send failure, finalises this batch inline (no carry).
- *
- * HPN_NO_BATCH_PIPELINE=1 in the environment disables the pipelining at
- * worker startup; the worker falls back to the legacy sftp_upload_batch
- * call.  Useful for A/B testing and for bisecting regressions without a
- * rebuild.
+ *     Runs one upload batch.  Allocates heap entry/unit arrays so they
+ *     survive across the next iteration, calls sftp_upload_batch_send
+ *     (which drains prev as part of its phase 1), finalises prev (if there
+ *     was one), then saves THIS batch as the new prev.  On send failure,
+ *     finalises this batch inline (no carry).
  * ──────────────────────────────────────────────────────────────────────── */
 
 /* ── END Phase 4 gap 1 ────────────────────────────────────────────────── */
@@ -372,49 +366,26 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	pthread_mutex_init(&p->retry_overflow_mu, NULL);
 
 	/* Parked-verify memory gate: fleet-wide budget on parked-path bytes.
-	 * Default 64 MiB; ENV-VAR HPN_VERIFY_PARK_BUDGET_MB overrides (floor 1
-	 * MiB).  When the parked set crosses this the submitter runs a verify
-	 * wave (parallel_verify_maybe_wave). */
-	{
-		const char *ev = getenv("HPN_VERIFY_PARK_BUDGET_MB");
-		unsigned long mb = 64;
-
-		if (ev != NULL) {
-			char *end = NULL;
-			unsigned long v = strtoul(ev, &end, 10);
-			if (end != ev && *end == '\0' && v >= 1)
-				mb = v;
-		}
-		p->verify_park_budget = (uint64_t)mb * 1024ULL * 1024ULL;
-	}
+	 * When the parked set crosses this the submitter runs a verify wave
+	 * (parallel_verify_maybe_wave).  64 MiB, validated across a range of
+	 * values as a reasonable batching-vs-RAM balance. */
+	p->verify_park_budget = (uint64_t)64 * 1024ULL * 1024ULL;
 
 	p->session_start_ns = monotime_ns();
 
-	/* Fleet-abort zero-progress window (HPN_NOPROGRESS_ABORT_SEC, default
-	 * FLEET_ABORT_NOPROGRESS_SEC).  The abort also requires no worker heart-
-	 * beating and FLEET_ABORT_UNPRODUCTIVE_MULT * num_streams unproductive
-	 * respawns (see parallel_watchdog_sync_check); this knob only sizes the
-	 * window.  0 disables
-	 * the abort entirely. */
-	{
-		const char *e = getenv("HPN_NOPROGRESS_ABORT_SEC");
-		p->noprogress_abort_s = (e && *e) ? atoi(e)
-		    : FLEET_ABORT_NOPROGRESS_SEC;
-		if (p->noprogress_abort_s < 0) p->noprogress_abort_s = 0;
-	}
+	/* Fleet-abort zero-progress window, resolved from ssh_config
+	 * HPNStallAbortTimeout (default 60 s).  The abort also requires no worker
+	 * heartbeating and FLEET_ABORT_UNPRODUCTIVE_MULT * num_streams
+	 * unproductive respawns (see parallel_watchdog_sync_check); this knob
+	 * only sizes the window.  0 disables the abort entirely. */
+	p->noprogress_abort_s = cfg->stall_abort_timeout;
+	if (p->noprogress_abort_s < 0)
+		p->noprogress_abort_s = 0;
 
 	/* Phase-C tail redistribution (cooperative yield of a confirmed-lagging
 	 * endgame holder), resolved from ssh_config HPNTailRedistribute.  Default
 	 * ON; HPNTailRedistribute no leaves the tail detector telemetry-only. */
 	p->tail_redistribute = cfg->tail_redistribute;
-
-	/* ENV-VAR HPN_RESPAWN_SCAN_IDLE=1: defer fleet-restoring respawns
-	 * while READY healthy workers cover the queued demand.  Default off;
-	 * see parallel_respawn_dispatch. */
-	{
-		const char *e = getenv("HPN_RESPAWN_SCAN_IDLE");
-		p->respawn_scan_idle = (e != NULL && *e == '1');
-	}
 
 	/* Auto-repair (#6): on a post-transfer verify mismatch, re-transfer the
 	 * bad ranges and re-verify, bounded by a per-range attempt cap.  ON by

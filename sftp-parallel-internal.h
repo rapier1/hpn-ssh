@@ -418,7 +418,8 @@ struct sftp_parallel;
  * many consecutive respawns must die without producing a byte (this multiplier
  * times num_streams) before we conclude reconnects are not taking hold.
  */
-#define FLEET_ABORT_NOPROGRESS_SEC    60  /* default zero-progress window (s) */
+/* Zero-progress window default (60 s) now lives in readconf.c as the
+ * HPNStallAbortTimeout default; the runtime value is cfg->stall_abort_timeout. */
 #define FLEET_ABORT_UNPRODUCTIVE_MULT  2  /* abort after this * num_streams worker
                                            * deaths that never produced a byte */
 
@@ -519,7 +520,7 @@ enum worker_avail {
  * Tail trend detector (phase B, 2026-06-12): TELEMETRY ONLY - detects
  * the condition a human watching the meter flags (sustained aggregate
  * decline / an imminent long crawl) and logs would-arm episodes under
- * HPN_BUNDLE_TIMING for tuning.  No actuation; the endgame split stays
+ * HPN_PARALLEL_TRACE for tuning.  No actuation; the endgame split stays
  * env-gated off.  ALL FOUR CONSTANTS ARE TUNING CANDIDATES - the
  * telemetry campaign exists to validate them (acceptance gate: zero
  * episodes across clean S and M runs).
@@ -572,7 +573,7 @@ enum worker_avail {
 				     * median counts (either side) */
 
 /*
- * ENV-VAR HPN_BUNDLE_TIMING midstream-freeze probe (2026-06-05).  Each worker
+ * ENV-VAR HPN_PARALLEL_TRACE midstream-freeze probe (2026-06-05).  Each worker
  * publishes its current phase (relaxed atomic) so the reporter's per-second
  * FLEETSAMPLE shows WHERE all workers are at the instant of a freeze: blocked
  * waiting for work (popwait) vs assembling a batch vs inside a transfer.
@@ -732,7 +733,7 @@ struct sftp_range_tracker {
 	 * dispatch-path model question from the 2026-06-11 pacing
 	 * post-mortem (predicted ~5 grants per single-file transfer;
 	 * observed behavior implied far more).  Emitted at last-finalize
-	 * under HPN_BUNDLE_TIMING. */
+	 * under HPN_PARALLEL_TRACE. */
 	uint64_t               cap_grants;
 	uint64_t               cap_denials;
 	/* Lazy file creation: first writer to dispatch a range for this
@@ -898,7 +899,7 @@ struct sftp_worker {
 					       * when file completes */
 	volatile int       phase;             /* enum worker_phase; relaxed
 					       * atomic, reporter reads for the
-					       * HPN_BUNDLE_TIMING FLEETSAMPLE */
+					       * HPN_PARALLEL_TRACE FLEETSAMPLE */
 	uint64_t           units_started;     /* dispatched, may be in flight */
 	uint64_t           units_completed;
 	uint64_t           units_failed;
@@ -1071,13 +1072,6 @@ struct sftp_worker {
 	struct sftp_work_unit           **batch_prev_units;
 	struct sftp_upload_batch_entry   *batch_prev_entries;
 	int                               batch_prev_n;
-	int                               batch_pipe_disabled; /* per-worker
-	                                                        * HPN_NO_BATCH_PIPELINE */
-	int                               range_warm_disabled; /* per-worker
-	                                                        * HPN_NO_RANGE_WARM
-	                                                        * (A/B kill switch
-	                                                        * for the warm range
-	                                                        * handle) */
 
 	/* -- Phase 5: bundle-mode state (hpn-bundle@hpnssh.org) -----
 	 * bundle_enabled is set once at worker startup when
@@ -1177,13 +1171,6 @@ struct sftp_parallel {
 	int                         tail_redistribute;
 	int                         tail_yield_fired;  /* one yield per
 						         * episode latch */
-	/* ENV-VAR HPN_RESPAWN_SCAN_IDLE=1: defer fleet-restoring respawns
-	 * while READY healthy workers cover the queued demand (a respawn is
-	 * a fresh connection into a possibly penalty-counting server; idle
-	 * capacity restarts work instantly with no penalty exposure).
-	 * respawn_owed persists, so deferred respawns fire when demand
-	 * outgrows the idle pool.  Default off. */
-	int                         respawn_scan_idle;
 	uint64_t                    session_start_ns;  /* monotime_ns() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in
@@ -1297,8 +1284,7 @@ struct sftp_parallel {
 	 * keeps the wave's quiesce (hence the peak) bounded by the budget.
 	 * Fleet-wide (one shared counter, not per worker).  Reset to 0 in
 	 * parallel_verify_phase_submit, not decremented per free.  Shares
-	 * verify_pending_mu.  Budget set once at start from ENV-VAR
-	 * HPN_VERIFY_PARK_BUDGET_MB (default 64 MiB). */
+	 * verify_pending_mu.  Budget is a fixed 64 MiB, set once at start. */
 	uint64_t                    verify_parked_bytes;
 	uint64_t                    verify_park_budget;
 
@@ -1509,8 +1495,8 @@ struct sftp_parallel {
 	 * never while one worker is still moving data or heart-beating.  Fires
 	 * only when ALL hold: zero aggregate progress for noprogress_abort_s,
 	 * no worker watchdog-paused, unproductive_deaths >= FLEET_ABORT_UNPRODUCTIVE_MULT
-	 * * num_streams, and units pending.  HPN_NOPROGRESS_ABORT_SEC overrides the
-	 * window; 0 disables the abort entirely.
+	 * * num_streams, and units pending.  ssh_config HPNStallAbortTimeout sizes
+	 * the window (default 60 s); 0 disables the abort entirely.
 	 */
 	int      noprogress_abort_s;     /* zero-progress window (s); 0 = abort off */
 	int      noprogress_consec_ticks;/* consecutive whole-fleet zero-progress ticks */
@@ -1582,7 +1568,6 @@ void	 parallel_unit_writer_release(struct sftp_range_tracker *);
 int	 parallel_unit_max_retries(struct sftp_parallel *);
 void	 parallel_unit_pending_trace(const char *, struct sftp_parallel *,
 	    const struct sftp_work_unit *, int, const char *);
-int	 parallel_unit_pending_trace_on(void);
 int	 parallel_unit_submit(struct sftp_parallel *, struct sftp_work_unit *);
 /* Worker-context re-queue: non-blocking.  Tries p->q (front when front!=0);
  * on a full queue parks the unit on the retry-overflow list rather than

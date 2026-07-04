@@ -126,6 +126,12 @@ struct sftp_parallel_config {
 	 * fill_default_options. */
 	int          max_retries;
 
+	/* Fleet zero-progress abort window in seconds, resolved from ssh_config
+	 * HPNStallAbortTimeout.  Default 60; 0 disables the abort.  Sizes one of
+	 * the four conjunctive fleet-abort conditions (see
+	 * parallel_watchdog_sync_check). */
+	int          stall_abort_timeout;
+
 	/* Bundle-mode accumulator target size in bytes, resolved from
 	 * ssh_config HPNBundleSize.  Default 32 MiB (HPN_BUNDLE_SIZE_DEFAULT),
 	 * clamped to [1 MiB, 256 MiB].  0 = unset / use default. */
@@ -336,7 +342,7 @@ void sftp_parallel_walker_record_failure(struct sftp_parallel *p,
     const char *path, const char *err);
 
 /*
- * ENV-VAR HPN_BUNDLE_TIMING midstream-freeze probe (2026-06-05): the walker
+ * ENV-VAR HPN_PARALLEL_TRACE midstream-freeze probe (2026-06-05): the walker
  * publishes its current phase so the reporter's per-second FLEETSAMPLE can
  * show whether a producer stall (blocked mkdir/fsinfo/layout, or blocked
  * pushing to a full queue) is what starves the fleet.  Set via the accessor

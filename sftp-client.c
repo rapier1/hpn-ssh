@@ -293,13 +293,13 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 		else
 			debug("sftp: read: %s", strerror(e));
 		/*
-		 * ENV-VAR HPN_BUNDLE_TIMING: surface who closed the transport
+		 * ENV-VAR HPN_PARALLEL_TRACE: surface who closed the transport
 		 * pipe.  got=0 between messages = clean peer EOF (transport
 		 * exited / server closed the channel); a partial read = peer
 		 * vanished mid-message.  The pipe to the ssh child is local,
 		 * so this is almost always EOF, not a TCP errno.
 		 */
-		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+		if (getenv("HPN_PARALLEL_TRACE") != NULL)
 			logit("sftp CONN-DIAG: get_msg hdr-read got=%zu/4 "
 			    "errno=%d(%s)", got, e,
 			    e == 0 ? "EOF" : strerror(e));
@@ -328,7 +328,7 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 			debug("sftp: connection closed");
 		else
 			debug("sftp: read: %s", strerror(e));
-		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+		if (getenv("HPN_PARALLEL_TRACE") != NULL)
 			logit("sftp CONN-DIAG: get_msg body-read got=%zu/%u "
 			    "errno=%d(%s)", gotb, msg_len, e,
 			    e == 0 ? "EOF" : strerror(e));
@@ -2592,8 +2592,8 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 }
 
 /*
- * Core write loop shared by sftp_upload and sftp_upload_batch.
- * See sftp-client.h sftp_upload_batch for design notes.
+ * Core write loop shared by sftp_upload and the pipelined batch upload path.
+ * See sftp-client.h (sftp_upload_batch_send/finish) for design notes.
  *
  * Does NOT close local_fd or call sftp_close on the remote handle.
  * resume_offset: 0 for normal uploads; caller has already seeked local_fd
@@ -3950,7 +3950,7 @@ struct batch_file {
 
 /*
  * Mark every entry in the batch that has not already been recorded as
- * failed as failed.  Used by sftp_upload_batch when a collection phase
+ * failed as failed.  Used by the batch upload path when a collection phase
  * hits a dead connection or a protocol problem mid-batch: rather than
  * calling fatal_fr (which terminates the entire process - catastrophic
  * for parallel workers handling unrelated transfers), we abandon the
@@ -3973,8 +3973,8 @@ batch_fail_all_remaining(struct batch_file *bs,
 
 /* ── BEGIN Phase 4 gap 1: sliding-window batch send/finish ────────────────
  *
- * Implementation note: the original sftp_upload_batch did all 5 phases
- * back-to-back.  Splitting into send (phases 1-4) and finish (phase 5)
+ * Implementation note: an unsplit batch would do all 5 phases back-to-back.
+ * Splitting into send (phases 1-4) and finish (phase 5)
  * lets the caller pipeline: the next batch's OPENs (phase 1) can be on
  * the wire while the previous batch's CLOSE STATUSes (phase 5) are still
  * coming back.  Saves ~1 RTT per batch boundary.
@@ -3989,10 +3989,6 @@ batch_fail_all_remaining(struct batch_file *bs,
  * The overlap: between step 1 (we send opens) and step 2 (we read close
  * statuses), the server is processing both - sending close statuses for
  * prev AND opening files for the current batch - concurrently.
- *
- * To disable at runtime: HPN_NO_BATCH_PIPELINE=1.  Forces the worker to
- * fall back to the un-pipelined sftp_upload_batch() entry point.  Useful
- * for A/B testing or for bisecting regressions.
  */
 
 struct sftp_upload_batch_pending {
@@ -4418,9 +4414,9 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	}
 
 	/* Phase 5 is deferred to sftp_upload_batch_finish - packaged into
-	 * a pending struct and returned to the caller, who calls finish
-	 * either inline (legacy sftp_upload_batch wrapper) or later, after
-	 * sending the next batch's phase 1 OPENs (sliding-window pipelining). */
+	 * a pending struct and returned to the caller, who calls finish later,
+	 * after sending the next batch's phase 1 OPENs (sliding-window
+	 * pipelining). */
 	new_p = xcalloc(1, sizeof(*new_p));
 	new_p->entries  = entries;
 	new_p->bs       = bs;
@@ -4443,21 +4439,6 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	return NULL;
 }
 
-int
-sftp_upload_batch(struct sftp_conn *conn,
-    struct sftp_upload_batch_entry *entries, int n,
-    int preserve_flag, int fsync_flag, int inplace_flag)
-{
-	struct sftp_upload_batch_pending *p;
-
-	p = sftp_upload_batch_send(conn, entries, n,
-	    preserve_flag, fsync_flag, inplace_flag, NULL);
-	if (p == NULL) {
-		/* send_failed marked entries; if n was 0, also -1 with no work */
-		return n > 0 ? -1 : 0;
-	}
-	return sftp_upload_batch_finish(conn, p);
-}
 /* ── END Phase 4 gap 1 ──────────────────────────────────────────────────── */
 
 /* ── BEGIN Phase 5: hpn-bundle accessors ─────────────────────────────────

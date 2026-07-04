@@ -1297,6 +1297,30 @@ regardless of this option. Consulted only by
 .Xr hpnsftp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
+.It Cm HPNStallAbortTimeout
+Sets how many seconds the
+.Xr hpnsftp 1
+parallel-streams fleet may make zero aggregate progress before the transfer
+is aborted as unrecoverable. The abort is deliberately conservative: it fires
+only when the whole fleet has moved no data for this many seconds
+.Em and
+no stream is briefly paused by the health watchdog
+.Em and
+repeated reconnection attempts keep producing streams that transfer nothing,
+so it distinguishes a genuinely wedged transfer (for example, the server has
+gone away and no worker can re-establish a working connection) from a slow or
+briefly stalled one. When it fires, the reason is reported on standard error.
+The argument is a non-negative integer number of seconds; a value of
+.Cm 0
+disables the abort entirely, so a transfer will wait indefinitely. The default
+is
+.Cm 60 .
+Operators on backends that legitimately pause for long periods (for example
+a filesystem recovering, or tape-backed storage staging data) may wish to
+raise it. Consulted only by
+.Xr hpnsftp 1 ;
+.Xr hpnssh 1
+itself ignores this option. HPNSSH only.
 .It Cm HPNTailRedistribute
 Controls whether
 .Xr hpnsftp 1 ,

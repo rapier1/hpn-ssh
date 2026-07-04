@@ -569,7 +569,7 @@ tcp_health_tick(void)
 	hpn_last_health_s = monotime();
 
 	/*
-	 * ENV-VAR HPN_BUNDLE_TIMING per-second TCP sample (midstream-freeze
+	 * ENV-VAR HPN_PARALLEL_TRACE per-second TCP sample (midstream-freeze
 	 * probe).  Promotes the existing 1s poll from debug2 to a captured
 	 * line so each worker transport yields a longitudinal cwnd/rtt/rwnd/
 	 * retrans/notsent/delivery_rate series.  pid correlates with the
@@ -578,7 +578,7 @@ tcp_health_tick(void)
 	{
 		static int sample_on = -1;
 		if (sample_on < 0)
-			sample_on = (getenv("HPN_BUNDLE_TIMING") != NULL);
+			sample_on = (getenv("HPN_PARALLEL_TRACE") != NULL);
 		if (sample_on)
 			logit("HPN TCPSAMPLE pid=%ld t=%.3f cwnd=%u rtt=%uus "
 			    "rcv_space=%u retrans=%llu notsent=%u drate=%llu "
@@ -599,7 +599,7 @@ tcp_health_tick(void)
 		 * unless a harness asked for it.  The peer-stall / brake /
 		 * path-degraded cases below stay loud: they have no
 		 * orchestrator-side twin. */
-		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+		if (getenv("HPN_PARALLEL_TRACE") != NULL)
 			logit("HPN: worker TCP connection wedged (cwnd=%u "
 			    "rtt=%uus retrans=%llu) - self-terminating",
 			    h.raw.snd_cwnd, h.raw.rtt,
@@ -3391,9 +3391,9 @@ cleanup_exit(int i)
 		 * the exit stats stay at debug - even for self-diagnosed TCP
 		 * exits (the diagnosis reaches the user via the orchestrator
 		 * heartbeat; the numbers are for developers).  ENV-VAR
-		 * HPN_BUNDLE_TIMING (developer-only) re-promotes it for
+		 * HPN_PARALLEL_TRACE (developer-only) re-promotes it for
 		 * harness runs whose log analysis greps these lines. */
-		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+		if (getenv("HPN_PARALLEL_TRACE") != NULL)
 			logit("%s", hbuf);
 		else
 			debug("%s", hbuf);

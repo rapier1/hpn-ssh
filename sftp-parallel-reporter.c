@@ -441,7 +441,7 @@ reporter_flare(struct sftp_parallel *p)
  * the decline/projection signals AND the structural conjunction hold
  * (queue empty, walker done, READY capacity, holder lagging the
  * busy-fleet median), and closes when any condition clears.  Episode
- * boundaries are logged under HPN_BUNDLE_TIMING for tuning; nothing is
+ * boundaries are logged under HPN_PARALLEL_TRACE for tuning; nothing is
  * actuated.  Constants and rationale: sftp-parallel-internal.h.
  */
 /* Median over a worker's personal rate window (all valid samples).
@@ -506,7 +506,7 @@ tail_fire_yield(struct sftp_parallel *p, struct sftp_worker *tgt,
 		return;
 	__atomic_store_n(&tgt->yield_req, 1, __ATOMIC_RELAXED);
 	p->tail_yield_fired = 1;
-	if (getenv("HPN_BUNDLE_TIMING") != NULL)
+	if (getenv("HPN_PARALLEL_TRACE") != NULL)
 		logit("HPN TAIL-YIELD worker=%d holder_med=%llu proj=%llus",
 		    tgt->id, (unsigned long long)tgt_med,
 		    (unsigned long long)tgt_proj);
@@ -687,7 +687,7 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 				if (!p->tail_episode &&
 				    now - p->tail_lag_start_ns >=
 				    TAIL_CONFIRM_SEC * 1000000000ULL) {
-					if (getenv("HPN_BUNDLE_TIMING") != NULL)
+					if (getenv("HPN_PARALLEL_TRACE") != NULL)
 						logit("HPN TAIL-DETECT t=%.3f "
 						    "confirm=%.1fs trend=%d "
 						    "proj=%llus "
@@ -718,7 +718,7 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 	if (!would_arm)
 		p->tail_lag_start_ns = 0;	/* condition broke: re-confirm */
 	if (p->tail_episode && !would_arm) {
-		if (getenv("HPN_BUNDLE_TIMING") != NULL)
+		if (getenv("HPN_PARALLEL_TRACE") != NULL)
 			logit("HPN TAIL-EPISODE-END t=%.3f dur=%.1fs "
 			    "pending=%llu",
 			    (double)now / 1e9,
@@ -730,7 +730,7 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 }
 
 /*
- * ENV-VAR HPN_BUNDLE_TIMING per-tick fleet sample (2026-06-05 midstream-freeze
+ * ENV-VAR HPN_PARALLEL_TRACE per-tick fleet sample (2026-06-05 midstream-freeze
  * probe).  One line: absolute time, work-queue depth, walker phase, then each
  * worker's phase + cumulative bytes + ssh child pid, plus the fleet total.
  * Per-worker and total bytes are cumulative, so consecutive samples give the
@@ -747,7 +747,7 @@ reporter_emit_fleetsample(struct sftp_parallel *p)
 	int i;
 
 	if (on < 0)
-		on = (getenv("HPN_BUNDLE_TIMING") != NULL);
+		on = (getenv("HPN_PARALLEL_TRACE") != NULL);
 	if (!on)
 		return;
 

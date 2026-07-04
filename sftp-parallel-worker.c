@@ -347,10 +347,7 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		struct sftp_range_warm warm = {
 			w->warm_handle, w->warm_handle_len, w->warm_dst_path
 		};
-		/* HPN_NO_RANGE_WARM kill switch: NULL disables the warm cache
-		 * (open+close every range, the pre-warm-handle behaviour). */
-		struct sftp_range_warm *warmp =
-		    w->range_warm_disabled ? NULL : &warm;
+		struct sftp_range_warm *warmp = &warm;
 		rc = sftp_upload_range(w->conn, u->src_path, u->dst_path,
 		    u->range_offset, u->range_length, &u->acked_bytes, warmp,
 		    (u->range_tracker != NULL && u->range_tracker->verify)
@@ -588,10 +585,9 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 			if (u->size > 0)
 				__atomic_fetch_add(&p->queued_bytes,
 				    (uint64_t)u->size, __ATOMIC_RELAXED);
-			if (parallel_unit_pending_trace_on())
-				parallel_unit_pending_trace("REQUEUE", p, u, w->id,
-				    yielded ? "wpr/yield" :
-				    transient ? "wpr/transient" : "wpr/retry");
+			parallel_unit_pending_trace("REQUEUE", p, u, w->id,
+			    yielded ? "wpr/yield" :
+			    transient ? "wpr/transient" : "wpr/retry");
 			/* Yields jump the queue like transients: the parked
 			 * READY fleet should pick the remainder up NOW.  Non-
 			 * blocking: a worker must never block on a full queue it
@@ -650,9 +646,8 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 		if (u->size > 0)
 			__atomic_fetch_add(&p->queued_bytes,
 			    (uint64_t)u->size, __ATOMIC_RELAXED);
-		if (parallel_unit_pending_trace_on())
-			parallel_unit_pending_trace("REQUEUE", p, u, w->id,
-			    transient ? "batch/transient" : "batch/retry");
+		parallel_unit_pending_trace("REQUEUE", p, u, w->id,
+		    transient ? "batch/transient" : "batch/retry");
 		/* Non-blocking: a failed bundle re-queues all its members here,
 		 * and a blocking push on a full queue the sole consumer also
 		 * drains is the -j1 self-deadlock this whole path exists to
@@ -695,25 +690,6 @@ worker_run_batch_pipelined(struct sftp_worker *w,
 
 	/* HPN: scope the permanent-denial signal to this batch's drain. */
 	sftp_conn_clear_perm_denied(w->conn);
-
-	if (w->batch_pipe_disabled) {
-		/* Legacy un-pipelined path - kept verbatim from the
-		 * pre-Phase-4 implementation for A/B comparison. */
-		struct sftp_upload_batch_entry stack_entries[UPLOAD_BATCH_SIZE];
-		for (int i = 0; i < bn; i++) {
-			stack_entries[i].local_path  = batch[i]->src_path;
-			stack_entries[i].remote_path = batch[i]->dst_path;
-			stack_entries[i].result      = 0;
-			worker_record_start(w);
-		}
-		sftp_upload_batch(w->conn, stack_entries, bn,
-		    p->cfg.preserve_flag, p->cfg.fsync_flag,
-		    p->cfg.inplace_flag);
-		for (int i = 0; i < bn; i++)
-			worker_finalize_one_entry(p, w, batch[i],
-			    stack_entries[i].result);
-		return;
-	}
 
 	/* Pipelined path: heap-allocate the entry and unit arrays so they
 	 * survive across the next parallel_worker_thread iteration. */
@@ -1030,27 +1006,6 @@ worker_thread_init(struct sftp_worker *w)
 	 * stuck-range detector compares against this. */
 	__atomic_store_n(&w->unit_offset, (int64_t)-1, __ATOMIC_RELAXED);
 
-	/* Phase 4 gap 1: read the HPN_NO_BATCH_PIPELINE env once per worker.
-	 * Disables the pipelined batch path; falls back to legacy
-	 * sftp_upload_batch.  Useful for A/B testing and bisecting. */
-	{
-		/* ENV-VAR HPN_NO_BATCH_PIPELINE - developer-only: kill switch
-		 * for Phase-4 pipelined upload batch.  Forces the legacy
-		 * synchronous path for A/B testing.  Not user-facing. */
-		const char *e = getenv("HPN_NO_BATCH_PIPELINE");
-		if (e != NULL && *e != '\0' && *e != '0')
-			w->batch_pipe_disabled = 1;
-	}
-	{
-		/* ENV-VAR HPN_NO_RANGE_WARM - developer-only: kill switch for
-		 * the warm range handle (reuse across same-file ranges).  When
-		 * set, execute_unit passes a NULL warm cache so sftp_upload_range
-		 * opens+closes every range as before.  For A/B testing. */
-		const char *e = getenv("HPN_NO_RANGE_WARM");
-		if (e != NULL && *e != '\0' && *e != '0')
-			w->range_warm_disabled = 1;
-	}
-
 	/* Phase 5 bundle-mode: ON by default when the server advertises
 	 * hpn-bundle@hpnssh.org.  Disabled when:
 	 *   - HPNUseBundle no   in ssh_config (resolved by sftp.c via
@@ -1296,9 +1251,9 @@ parallel_worker_thread(void *arg)
 		/*
 		 * Batch-open optimisation for uploads: accumulate up to
 		 * UPLOAD_BATCH_SIZE upload units using non-blocking trypop,
-		 * then call sftp_upload_batch to pipeline all N SSH_FXP_OPEN
-		 * requests before waiting for any handle (1 RTT for N opens
-		 * instead of 1 RTT each).  Same pipelining for closes.
+		 * then pipeline all N SSH_FXP_OPEN requests before waiting for
+		 * any handle (1 RTT for N opens instead of 1 RTT each).  Same
+		 * pipelining for closes.
 		 * Falls back to single-unit execution if the first unit is
 		 * not an upload or if the batch stays at size 1.
 		 */
@@ -1473,12 +1428,8 @@ parallel_worker_thread(void *arg)
 				 * True batch.  Phase 4 gap 1:
 				 * worker_run_batch_pipelined handles the entries
 				 * array, send/finish, and per-entry finalisation.
-				 * In pipelined mode (default) the THIS batch's
-				 * phase 5 is deferred; the PREVIOUS batch's
-				 * results are finalised inside the helper.  In
-				 * the kill-switch path (HPN_NO_BATCH_PIPELINE=1)
-				 * it falls back to a synchronous sftp_upload_batch
-				 * call with the same finalisation logic inline.
+				 * THIS batch's phase 5 is deferred; the PREVIOUS
+				 * batch's results are finalised inside the helper.
 				 */
 				worker_run_batch_pipelined(w, batch, bn);
 			}

@@ -196,6 +196,7 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	pcfg->writer_pool = 1;
 	pcfg->tail_redistribute = 1;
 	pcfg->max_retries = 3;
+	pcfg->stall_abort_timeout = 60;
 	pcfg->bundle_size = 0;  /* 0 = let worker use compile-time default */
 	pcfg->max_auth_concurrent = 0;  /* 0 = auto */
 	pcfg->verify_transfer = 0;  /* default off */
@@ -212,6 +213,7 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	pcfg->writer_pool = (options.hpn_writer_pool != 0);
 	pcfg->tail_redistribute = (options.hpn_tail_redistribute != 0);
 	pcfg->max_retries = options.hpn_max_retries;
+	pcfg->stall_abort_timeout = options.hpn_stall_abort_timeout;
 	pcfg->bundle_size = (options.hpn_bundle_size > 0)
 	    ? (uint64_t)options.hpn_bundle_size : 0;
 	pcfg->max_auth_concurrent = options.hpn_max_auth_concurrent;
@@ -220,11 +222,12 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	 * here, toggled later by the caller. */
 
 	debug_f("ssh_config: host=\"%s\" HPNUseBundle=%s HPNWriterPool=%s "
-	    "HPNTailRedistribute=%s HPNMaxRetries=%d HPNBundleSize=%llu "
-	    "HPNMaxAuthConcurrent=%d",
+	    "HPNTailRedistribute=%s HPNMaxRetries=%d HPNStallAbortTimeout=%d "
+	    "HPNBundleSize=%llu HPNMaxAuthConcurrent=%d",
 	    host, pcfg->use_bundle ? "yes" : "no",
 	    pcfg->writer_pool ? "yes" : "no",
 	    pcfg->tail_redistribute ? "yes" : "no", pcfg->max_retries,
+	    pcfg->stall_abort_timeout,
 	    (unsigned long long)pcfg->bundle_size,
 	    pcfg->max_auth_concurrent);
 
@@ -266,22 +269,8 @@ sftp_resolve_hpn_lustre_stripe_count(const char *host,
 void
 sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg)
 {
-	/* ENV-VAR SFTP_TPUT_HEALTHY_KBPS - developer-only: adaptive stall
-	 * detector path-health floor (kbps); 0 disables the detector. */
-	const char *e_h = getenv("SFTP_TPUT_HEALTHY_KBPS");
-	/* ENV-VAR SFTP_TPUT_FRACTION - developer-only: outlier fraction (0-1). */
-	const char *e_f = getenv("SFTP_TPUT_FRACTION");
-	/* ENV-VAR SFTP_TPUT_CONSEC - developer-only: consecutive-tick count. */
-	const char *e_c = getenv("SFTP_TPUT_CONSEC");
-	/* ENV-VAR SFTP_TPUT_EMA_ALPHA - developer-only: EMA smoothing factor. */
-	const char *e_a = getenv("SFTP_TPUT_EMA_ALPHA");
-
-	pcfg->tput_path_healthy_kbps =
-	    (e_h && *e_h) ? strtoull(e_h, NULL, 10) : 2000;
-	pcfg->tput_outlier_fraction =
-	    (e_f && *e_f) ? strtod(e_f, NULL) : 0.25;
-	pcfg->tput_consec_required =
-	    (e_c && *e_c) ? atoi(e_c) : 5;
-	pcfg->tput_ema_alpha =
-	    (e_a && *e_a) ? strtod(e_a, NULL) : 0.0;
+	pcfg->tput_path_healthy_kbps = 2000;	/* path-health floor (kbps) */
+	pcfg->tput_outlier_fraction  = 0.25;	/* outlier fraction */
+	pcfg->tput_consec_required   = 5;	/* consecutive stalled ticks */
+	pcfg->tput_ema_alpha         = 0.0;	/* 0 = use the 0.2 default downstream */
 }

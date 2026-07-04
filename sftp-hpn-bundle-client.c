@@ -187,16 +187,11 @@ struct bundle_dl_stream {
 };
 
 /*
- * ENV-VAR HPN_BUNDLE_QUEUE_MAX_BYTES - developer-only: per-worker
- * memory ceiling on in-flight READ requests for the bundle download
- * path.  Bounds in_flight_count × BUNDLE_DL_CHUNK_BYTES ≤ this value.
- *
- * Default: BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT (32 MiB).  Accepts K/M/G
- * suffix (parsed via the openbsd-compat scan_scaled helper).  Values
- * below one chunk are clamped up.  Higher values let us saturate
- * fatter BDPs; lower values bound memory (and indirectly, server-side
- * bundle accumulator commitment) at the cost of throughput when
- * extract can't keep up with the wire.
+ * Per-worker memory ceiling on in-flight READ requests for the bundle
+ * download path.  Bounds in_flight_count x BUNDLE_DL_CHUNK_BYTES <= this
+ * value; BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT (32 MiB), clamped up to at
+ * least one chunk.  Higher would saturate fatter BDPs; lower bounds
+ * memory at the cost of throughput when extract can't keep up.
  *
  * Renamed from HPN_BUNDLE_DL_QUEUE_MAX_BYTES (2026-05-31) when the
  * upload path gained the symmetric cap.  See benchmark/env-vars-reference.md.
@@ -212,19 +207,11 @@ bundle_dl_queue_max_bytes(void)
 {
 	static size_t cached     = 0;
 	static int    initialized = 0;
-	const char   *ev;
-	long long     llv;
-	size_t        v = 0;
+	size_t        v;
 
 	if (initialized)
 		return cached;
-	ev = getenv("HPN_BUNDLE_QUEUE_MAX_BYTES");
-	if (ev != NULL && *ev != '\0' &&
-	    scan_scaled((char *)ev, &llv) == 0 &&
-	    llv > 0 && (unsigned long long)llv <= SIZE_MAX)
-		v = (size_t)llv;
-	if (v == 0)
-		v = BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT;
+	v = BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT;
 	if (v < BUNDLE_DL_CHUNK_BYTES)
 		v = BUNDLE_DL_CHUNK_BYTES;
 	cached     = v;
@@ -981,7 +968,7 @@ struct bundle_write_ctx {
 	uint32_t      wsizes_cap;
 
 	/*
-	 * ENV-VAR HPN_BUNDLE_TIMING drain-stall timeline (per-bundle; ctx is
+	 * ENV-VAR HPN_PARALLEL_TRACE drain-stall timeline (per-bundle; ctx is
 	 * zeroed per upload).  drain_last_ok_s is the monotime of the most
 	 * recent good STATUS; drain_gap_ring holds the last DRAIN_GAP_RING
 	 * inter-STATUS waits so a stuck drain's shape can be reconstructed.
@@ -1259,7 +1246,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	int i, r;
 	int rc = -1;   /* generic failure; reclassified to SERVER_CANT vs
 			* TRANSPORT_FAILED at cleanup.  0 = success (OK). */
-	/* ENV-VAR HPN_BUNDLE_TIMING per-bundle timing breakdown (seconds). */
+	/* ENV-VAR HPN_PARALLEL_TRACE per-bundle timing breakdown (seconds). */
 	double t_enter = 0, t_open_done = 0, t_send_start = 0;
 	double t_send_done = 0, t_drain_done = 0, t_close_done = 0;
 	uint64_t bytes_total = 0;
@@ -1444,11 +1431,11 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	}
 
 	t_close_done = monotime_double();
-	if (getenv("HPN_BUNDLE_TIMING") != NULL) {
+	if (getenv("HPN_PARALLEL_TRACE") != NULL) {
 		uint32_t cap_final =
 		    sftp_conn_rdahead_cap(conn, BUNDLE_MAX_INFLIGHT);
 		/*
-		 * ENV-VAR HPN_BUNDLE_TIMING: developer-only per-bundle timing
+		 * ENV-VAR HPN_PARALLEL_TRACE: developer-only per-bundle timing
 		 * breakdown.  `enter` is absolute monotonic seconds, so the
 		 * inter-bundle idle for a given worker (conn) in post-
 		 * processing is enter[k+1] - (enter[k] + total[k]).  open/

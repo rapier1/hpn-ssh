@@ -255,8 +255,8 @@ int sftp_upload(struct sftp_conn *, const char *, const char *,
  */
 
 /*
- * Per-file descriptor for sftp_upload_batch.  Caller fills local_path and
- * remote_path; result is written by the function (0 = success, -1 = failure).
+ * Per-file descriptor for a pipelined upload batch.  Caller fills local_path
+ * and remote_path; result is written by the function (0 = success, -1 = fail).
  */
 struct sftp_upload_batch_entry {
 	const char *local_path;
@@ -264,25 +264,15 @@ struct sftp_upload_batch_entry {
 	int         result;
 };
 
-/*
- * Upload N files with pipelined SSH_FXP_OPEN and SSH_FXP_CLOSE: all N
- * opens are sent in a single burst (1 RTT for all handles), files are
- * transferred sequentially, then all N closes are sent in a single burst
- * (1 RTT for all status replies). Amortises per-file open/close RTT from
- * 2*N RTTs down to 2 RTTs for the batch, which matters greatly for
- * many-small-file workloads at high latency.
- *
- * resume is not supported; all other flags apply to every entry.
- * Returns 0 if every file succeeded, -1 if any failed (check entry->result
- * for per-file status).
- */
-int sftp_upload_batch(struct sftp_conn *, struct sftp_upload_batch_entry *,
-    int n, int preserve_flag, int fsync_flag, int inplace_flag);
-
 /* ── BEGIN Phase 4 gap 1: pipelined batch send/finish ──────────────────────
  *
- * Split-call form of sftp_upload_batch.  Lets the caller pipeline
- * back-to-back batches: send the next batch's OPENs (phase 1) while the
+ * Upload N files with pipelined SSH_FXP_OPEN/CLOSE (all N opens in one burst,
+ * transfer sequentially, all N closes in one burst) so per-file open/close RTT
+ * is amortised from 2*N down to 2 - critical for many-small-file workloads at
+ * high latency.  resume is not supported; all other flags apply to every entry.
+ *
+ * The send/finish split lets the caller pipeline back-to-back batches: send the
+ * next batch's OPENs (phase 1) while the
  * previous batch's CLOSE STATUSes are still being collected (phase 5).
  *
  *   pending = sftp_upload_batch_send(conn, entries, n, ..., prev_pending);
@@ -298,11 +288,7 @@ int sftp_upload_batch(struct sftp_conn *, struct sftp_upload_batch_entry *,
  * On error during send (connection dies, protocol violation), all entries
  * in BOTH the current batch and prev (if drain failed) are marked failed
  * and the function returns NULL.  Caller must NOT call finish on a
- * NULL pending.
- *
- * The legacy sftp_upload_batch() is now a wrapper: send(NULL) + finish().
- * Identical end-to-end behaviour and identical error semantics when called
- * with prev=NULL - existing call sites need no changes. */
+ * NULL pending. */
 struct sftp_upload_batch_pending;
 
 struct sftp_upload_batch_pending *sftp_upload_batch_send(

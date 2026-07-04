@@ -983,18 +983,10 @@ void
 sftp_hpn_verify_repair_resolve(int no_verify_repair_cli, int *enabled_out,
     int *attempts_out)
 {
-	const char *e = getenv("HPN_NO_VERIFY_REPAIR");
-	int attempts;
-
 	if (enabled_out != NULL)
-		*enabled_out = !no_verify_repair_cli &&
-		    !(e != NULL && *e != '\0');
-	e = getenv("HPN_VERIFY_REPAIR_ATTEMPTS");
-	attempts = (e != NULL && *e != '\0') ? atoi(e) : 3;
-	if (attempts < 1)
-		attempts = 1;
+		*enabled_out = !no_verify_repair_cli;
 	if (attempts_out != NULL)
-		*attempts_out = attempts;
+		*attempts_out = 3;	/* per-range re-transfer attempt cap */
 }
 
 /*

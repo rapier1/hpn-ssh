@@ -143,6 +143,10 @@ typedef struct {
 				    * parallel orchestrator.  Default 3,
 				    * clamped to [1, 20].  Only consulted by
 				    * hpnsftp; hpnssh ignores. */
+	int     hpn_stall_abort_timeout; /* hpnsftp fleet zero-progress abort
+				    * window in seconds.  Default 60; 0
+				    * disables the abort.  Only consulted by
+				    * hpnsftp; hpnssh ignores. */
 	int64_t hpn_bundle_size;   /* Bundle-mode target accumulator size in
 				    * bytes, hpnsftp client side.  Default
 				    * 4 MiB, clamped to [64 KiB, 64 MiB].

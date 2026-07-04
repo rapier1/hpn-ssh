@@ -265,8 +265,6 @@ sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
 void
 sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
 {
-	const char *e;
-
 	if (hpn == NULL)
 		return;
 	memset(&hpn->rd, 0, sizeof(hpn->rd));
@@ -276,14 +274,6 @@ sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
 	hpn->rd.last_rising = hpn->rd.floor;
 	hpn->rd.win_start = monotime_double();
 	hpn->rd.enabled = 1;
-	/* ENV-VAR HPN_RDAHEAD - developer-only: kill switch for the
-	 * adaptive read-ahead controller.  Setting HPN_RDAHEAD=fixed
-	 * reverts to the legacy flat num_requests pipeline (a fixed
-	 * in-flight window equal to the -R ceiling).  Any other value or
-	 * the unset case keeps the controller adaptive.  See
-	 * benchmark/env-vars-reference.md. */
-	if ((e = getenv("HPN_RDAHEAD")) != NULL && strcmp(e, "fixed") == 0)
-		hpn->rd.enabled = 0;
 }
 
 /*
