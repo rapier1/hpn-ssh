@@ -40,9 +40,14 @@
 #ifdef WITH_OPENSSL3
 
 /*-------------------- TUNABLES --------------------*/
-/* maximum number of threads and queues */
-#define MAX_THREADS      32
-#define MAX_NUMKQ        (MAX_THREADS + 1)
+/* Fixed keystream producer-thread count and queue count.  Testing on loopback
+ * (the maximum-throughput regime - a networked path can only be slower) showed
+ * one producer thread already keeps the queues full at any rate ssh can reach,
+ * so this is a compile-time constant, not a runtime knob.  NUMKQ must stay
+ * >= 2: the consumer drains one queue while a producer fills the next
+ * (numkq = threads + 1). */
+#define SSH_CIPHER_THREADS 1
+#define NUMKQ              (SSH_CIPHER_THREADS + 1)
 
 /* one queue holds 8192 * 4 * 16B (512KB)  of key data 
  * being that the queues are destroyed after a rekey
@@ -105,13 +110,13 @@ struct aes_mt_ctx_st {
 	int		        state;
 	int		        qidx;
 	int		        ridx;
-	int                     id[MAX_THREADS]; /* 32 */
+	int                     id[SSH_CIPHER_THREADS];
 	AES_KEY                 aes_key;
 	const u_char           *orig_key;
 	u_char		        aes_counter[AES_BLOCK_SIZE]; /* 16B */
-	pthread_t	        tid[MAX_THREADS]; /* 32 */
+	pthread_t	        tid[SSH_CIPHER_THREADS];
 	pthread_rwlock_t        tid_lock;
-	struct kq	        q[MAX_NUMKQ]; /* 33 */
+	struct kq	        q[NUMKQ];
 #ifdef __APPLE__
 	pthread_rwlock_t        stop_lock;
 	int		        exit_flag;
