@@ -4500,17 +4500,17 @@ sftp_conn_set_dead(struct sftp_conn *conn)
 		conn->hpn->dead = 1;
 }
 
-/* Atomic read of the watchdog-pause deadline.  Public accessor so the
+/* Atomic read of the watchdog-pause deadline (monotonic ms).  Public accessor so the
  * parallel orchestrator (which only sees an opaque struct sftp_conn *)
  * can consult it from the watchdog thread without reaching into the
  * struct directly.  Returns 0 if no pause is active or hpn is missing.
  * Declared in sftp-client-internal.h. */
 uint64_t
-sftp_conn_watchdog_pause_until_ns(struct sftp_conn *conn)
+sftp_conn_watchdog_pause_until_ms(struct sftp_conn *conn)
 {
 	if (conn == NULL || conn->hpn == NULL)
 		return 0;
-	return __atomic_load_n(&conn->hpn->watchdog_pause_until_ns,
+	return __atomic_load_n(&conn->hpn->watchdog_pause_until_ms,
 	    __ATOMIC_RELAXED);
 }
 

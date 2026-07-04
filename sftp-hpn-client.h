@@ -126,7 +126,7 @@ struct sftp_hpn_conn {
 	 * normal (non-parallel) mode. */
 	volatile int *yield_flag;
 
-	/* Watchdog pause: monotonic-ns deadline before which the parallel
+	/* Watchdog pause: monotonic-ms deadline before which the parallel
 	 * orchestrator's inactivity-based heuristics (born-dead, silence,
 	 * isolation, throughput-outlier, born-slow) suppress for this
 	 * worker.  The SSH-child-gone check still fires regardless.  Set by
@@ -134,7 +134,7 @@ struct sftp_hpn_conn {
 	 * operation (verify-hash, fsync after large write, bundle
 	 * accumulate/extract, etc.), cleared by sftp_hpn_watchdog_resume()
 	 * or auto-expires.  Atomic load/store; safe from any thread. */
-	volatile uint64_t watchdog_pause_until_ns;
+	volatile uint64_t watchdog_pause_until_ms;
 
 	/* HPNVerifyTransfer state, propagated from ssh_config at sftp_init
 	 * time.  Gates the inline source-hash tee (so the post-transfer verify

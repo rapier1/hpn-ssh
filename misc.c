@@ -1929,6 +1929,19 @@ monotime_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+/* HPN: millisecond monotonic clock.  The parallel-transfer bookkeeping
+ * (watchdog, throughput estimation, idle accounting) needs sub-second
+ * resolution but nothing near nanoseconds; millisecond values keep those
+ * timestamps in atomic-friendly integers without the ns unit noise. */
+uint64_t
+monotime_ms(void)
+{
+	struct timespec ts;
+
+	monotime_ts(&ts);
+	return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
 void
 bandwidth_limit_init(struct bwlimit *bw, uint64_t kbps, size_t buflen)
 {

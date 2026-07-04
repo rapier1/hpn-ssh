@@ -179,14 +179,13 @@ sftp_hpn_set_yield_flag(struct sftp_hpn_conn *hpn, volatile int *flag)
 void
 sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds)
 {
-	uint64_t deadline_ns;
+	uint64_t deadline_ms;
 	uint64_t cur;
 
 	if (hpn == NULL)
 		return;
 
-	deadline_ns = monotime_ns() +
-	    (uint64_t)seconds * 1000000000ULL;
+	deadline_ms = monotime_ms() + (uint64_t)seconds * 1000ULL;
 
 	/*
 	 * Extend, never shrink.  A shorter pause arriving while a longer
@@ -194,11 +193,11 @@ sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds)
 	 * different code paths each declaring their grace; whichever needs
 	 * more time should win).
 	 */
-	cur = __atomic_load_n(&hpn->watchdog_pause_until_ns,
+	cur = __atomic_load_n(&hpn->watchdog_pause_until_ms,
 	    __ATOMIC_RELAXED);
-	if (deadline_ns > cur) {
-		__atomic_store_n(&hpn->watchdog_pause_until_ns,
-		    deadline_ns, __ATOMIC_RELAXED);
+	if (deadline_ms > cur) {
+		__atomic_store_n(&hpn->watchdog_pause_until_ms,
+		    deadline_ms, __ATOMIC_RELAXED);
 	}
 }
 
@@ -207,7 +206,7 @@ sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
 {
 	if (hpn == NULL)
 		return;
-	__atomic_store_n(&hpn->watchdog_pause_until_ns, 0,
+	__atomic_store_n(&hpn->watchdog_pause_until_ms, 0,
 	    __ATOMIC_RELAXED);
 }
 

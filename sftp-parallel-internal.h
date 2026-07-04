@@ -279,7 +279,7 @@ struct sftp_parallel;
  * worker needs ~60 s to transfer 256 MiB, so without this cap a
  * genuinely-slow respawned worker stays protected from outlier detection
  * for its entire slow lifetime.  After RAMP_MAX_WARMUP_SEC seconds from
- * unit_start_ns the gate lifts unconditionally - a healthy TCP slow-start
+ * unit_start_ms the gate lifts unconditionally - a healthy TCP slow-start
  * always completes in well under this.
  */
 #define RAMP_MAX_WARMUP_SEC       15
@@ -903,27 +903,27 @@ struct sftp_worker {
 	uint64_t           units_started;     /* dispatched, may be in flight */
 	uint64_t           units_completed;
 	uint64_t           units_failed;
-	uint64_t           last_completion_ns; /* monotonic ns of last finish */
+	uint64_t           last_completion_ms; /* monotonic ms of last finish */
 
 	/* Adaptive throughput-based stall detection state.  See
 	 * cfg.tput_path_healthy_kbps in sftp-parallel.h for the algorithm.
 	 * Updated at each watchdog tick. */
 	/*
-	 * Bytes-based progress signal for the watchdog.  last_progress_ns is
+	 * Bytes-based progress signal for the watchdog.  last_progress_ms is
 	 * updated by the watchdog every tick that (bytes_total + live_bytes)
 	 * increases; the silence threshold (STALL/DEAD) is measured against
-	 * this timestamp rather than against last_completion_ns.  Lets us
+	 * this timestamp rather than against last_completion_ms.  Lets us
 	 * detect actually-stalled workers without misfiring on long-running
 	 * units (a whole-file upload of a multi-GiB file may run for minutes
 	 * without a completion event, but live_bytes climbs throughout).
 	 *
 	 * Only touched by the reporter/watchdog thread - no locking needed.
 	 */
-	uint64_t           last_progress_ns;
+	uint64_t           last_progress_ms;
 	uint64_t           last_progress_bytes;
 
 	uint64_t           tput_check_bytes;     /* bytes_total at last check */
-	uint64_t           tput_check_ns;        /* monotime of last check */
+	uint64_t           tput_check_ms;        /* monotime of last check */
 	uint64_t           tput_current_kbps;    /* most recent raw estimate */
 	uint64_t           tput_ema_kbps;        /* EMA-smoothed estimate */
 	int                tput_ema_warmup_ticks; /* ticks since EMA cold-start */
@@ -932,32 +932,32 @@ struct sftp_worker {
 	                                          * EMA < BORN_SLOW_FLOOR_FRAC ×
 	                                          * cfg.tput_path_healthy_kbps;
 	                                          * drives born-slow fast-kill */
-	uint64_t           tput_last_unit_start_ns; /* unit_start_ns at last tick;
+	uint64_t           tput_last_unit_start_ms; /* unit_start_ms at last tick;
 	                                         * used to detect new-unit starts
 	                                         * and reset EMA so stale frozen
 	                                         * values don't suppress outlier
 	                                         * detection on the new unit */
 
-	uint64_t           idle_ns;            /* ns blocked on workqueue pop,
+	uint64_t           idle_ms;            /* ms blocked on workqueue pop,
 					        * for completed pops only */
-	uint64_t           work_ns;            /* ns actively processing */
-	/* Set to monotime_ns() immediately before each blocking pop call,
+	uint64_t           work_ms;            /* ms actively processing */
+	/* Set to monotime_ms() immediately before each blocking pop call,
 	 * cleared to 0 immediately after.  The reporter adds (now -
-	 * pop_start_ns) to idle_ns when computing idle fraction so that
+	 * pop_start_ms) to idle_ms when computing idle fraction so that
 	 * an in-progress blocking wait is included even though the pop has
 	 * not yet returned.  Written/read with relaxed atomics - a brief
 	 * race between clearing and the accounting update causes at most
 	 * a single-tick undercount, which is harmless for a 35% threshold. */
-	uint64_t           pop_start_ns;
-	/* Set to monotime_ns() when a unit is popped off the workqueue
-	 * (after pop_start_ns is cleared), reset to 0 when the unit's
+	uint64_t           pop_start_ms;
+	/* Set to monotime_ms() when a unit is popped off the workqueue
+	 * (after pop_start_ms is cleared), reset to 0 when the unit's
 	 * execute_unit returns.  Lets the watchdog measure how long the
 	 * worker has been holding its current unit even when
-	 * last_completion_ns is still 0 (worker wedged on its very first
-	 * unit - last_completion_ns never gets set, so the existing
-	 * since_completion_ns gate misses this case).  Atomic ACQUIRE/
+	 * last_completion_ms is still 0 (worker wedged on its very first
+	 * unit - last_completion_ms never gets set, so the existing
+	 * since_completion_ms gate misses this case).  Atomic ACQUIRE/
 	 * RELEASE so the reporter sees a coherent value. */
-	uint64_t           unit_start_ns;
+	uint64_t           unit_start_ms;
 	/* -- Worker state lattice ----------------------------------------
 	 *
 	 * Three orthogonal state machines.  Each flag below tracks ONE of
@@ -973,7 +973,7 @@ struct sftp_worker {
 	 *       not_doomed -→ doomed (SIGTERM sent) -→ [SIGKILL escalation
 	 *                                                if not yet exited]
 	 *     The `doomed` flag prevents double-SIGTERM across ticks.
-	 *     `doom_ns` is the SIGTERM timestamp, consulted by the
+	 *     `doom_ms` is the SIGTERM timestamp, consulted by the
 	 *     SIGKILL-escalation deadline.
 	 *
 	 * (C) Exit lifecycle (worker-owned):
@@ -1006,7 +1006,7 @@ struct sftp_worker {
 						* and fleet-median computation */
 	uint64_t           unit_size;          /* relaxed atomic; size of the
 						* currently-held unit (set at
-						* dispatch beside unit_start_ns,
+						* dispatch beside unit_start_ms,
 						* 0 when idle); feeds the tail
 						* detector's projected-tail */
 	int64_t            unit_offset;        /* relaxed atomic; range_offset
@@ -1033,7 +1033,7 @@ struct sftp_worker {
 	int                rate_ring_idx;
 	int                rate_ring_count;
 	uint64_t           rate_prev_bytes;
-	uint64_t           rate_prev_ns;
+	uint64_t           rate_prev_ms;
 	/* Cooperative yield request (phase C tail redistribution).  Set to 1
 	 * by the reporter when the detector confirms this worker is the
 	 * lagging endgame holder (HPNTailRedistribute only); the range
@@ -1054,7 +1054,7 @@ struct sftp_worker {
 						* it (born_dead/isolation/stall/
 						* dead/tput_outlier/born_slow);
 						* emitted in the reap trace */
-	uint64_t           doom_ns;            /* (B) monotonic ns when
+	uint64_t           doom_ms;            /* (B) monotonic ms when
 						* SIGTERM was sent; consulted by
 						* SIGKILL-escalation deadline when
 						* SSH hangs in its clean-shutdown
@@ -1155,10 +1155,10 @@ struct sftp_parallel {
 	int                         tail_ring_idx;
 	int                         tail_ring_count;
 	uint64_t                    tail_prev_bytes;
-	uint64_t                    tail_prev_ns;
+	uint64_t                    tail_prev_ms;
 	int                         tail_episode;      /* latch: in episode */
-	uint64_t                    tail_episode_ns;   /* episode start */
-	uint64_t                    tail_lag_start_ns; /* when the arm condition
+	uint64_t                    tail_episode_ms;   /* episode start */
+	uint64_t                    tail_lag_start_ms; /* when the arm condition
 						         * became continuously
 						         * true; episode latches
 						         * only after it holds
@@ -1171,7 +1171,7 @@ struct sftp_parallel {
 	int                         tail_redistribute;
 	int                         tail_yield_fired;  /* one yield per
 						         * episode latch */
-	uint64_t                    session_start_ns;  /* monotime_ns() at
+	uint64_t                    session_start_ms;  /* monotime_ms() at
 						       * sftp_parallel_start;
 						       * elapsed surfaced in
 						       * stats for the

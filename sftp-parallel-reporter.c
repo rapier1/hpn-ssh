@@ -518,22 +518,22 @@ tail_fire_yield(struct sftp_parallel *p, struct sftp_worker *tgt,
 static void
 tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 {
-	uint64_t now = monotime_ns();
+	uint64_t now = monotime_ms();
 	uint64_t rate = 0;
 	int would_arm = 0;
 
 	/* Per-tick rate sample into the ring. */
-	if (p->tail_prev_ns != 0 && now > p->tail_prev_ns &&
+	if (p->tail_prev_ms != 0 && now > p->tail_prev_ms &&
 	    bytes_now >= p->tail_prev_bytes) {
-		rate = (bytes_now - p->tail_prev_bytes) * 1000000000ULL /
-		    (now - p->tail_prev_ns);
+		rate = (bytes_now - p->tail_prev_bytes) * 1000ULL /
+		    (now - p->tail_prev_ms);
 		p->tail_rate_ring[p->tail_ring_idx] = rate;
 		p->tail_ring_idx = (p->tail_ring_idx + 1) % TAIL_RING_TICKS;
 		if (p->tail_ring_count < TAIL_RING_TICKS)
 			p->tail_ring_count++;
 	}
 	p->tail_prev_bytes = bytes_now;
-	p->tail_prev_ns = now;
+	p->tail_prev_ms = now;
 
 	if (p->tail_ring_count < TAIL_RING_TICKS)
 		return;	/* window not full yet */
@@ -581,12 +581,12 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 			/* Window sampling: BUSY workers only; idle workers
 			 * keep their last demonstrated samples. */
 			if (av == WORKER_AVAIL_BUSY) {
-				if (w->rate_prev_ns != 0 &&
-				    now > w->rate_prev_ns &&
+				if (w->rate_prev_ms != 0 &&
+				    now > w->rate_prev_ms &&
 				    cur >= w->rate_prev_bytes) {
 					uint64_t r = (cur - w->rate_prev_bytes)
-					    * 1000000000ULL /
-					    (now - w->rate_prev_ns);
+					    * 1000ULL /
+					    (now - w->rate_prev_ms);
 					w->rate_ring[w->rate_ring_idx] = r;
 					w->rate_ring_idx =
 					    (w->rate_ring_idx + 1) %
@@ -596,9 +596,9 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 						w->rate_ring_count++;
 				}
 				w->rate_prev_bytes = cur;
-				w->rate_prev_ns = now;
+				w->rate_prev_ms = now;
 			} else {
-				w->rate_prev_ns = 0; /* re-baseline on next BUSY */
+				w->rate_prev_ms = 0; /* re-baseline on next BUSY */
 			}
 
 			if (!healthy)
@@ -682,11 +682,11 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 				 * episode start backdates to when the lag
 				 * began, so reported durations stay true.
 				 */
-				if (p->tail_lag_start_ns == 0)
-					p->tail_lag_start_ns = now;
+				if (p->tail_lag_start_ms == 0)
+					p->tail_lag_start_ms = now;
 				if (!p->tail_episode &&
-				    now - p->tail_lag_start_ns >=
-				    TAIL_CONFIRM_SEC * 1000000000ULL) {
+				    now - p->tail_lag_start_ms >=
+				    TAIL_CONFIRM_SEC * 1000ULL) {
 					if (getenv("HPN_PARALLEL_TRACE") != NULL)
 						logit("HPN TAIL-DETECT t=%.3f "
 						    "confirm=%.1fs trend=%d "
@@ -695,9 +695,9 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 						    "ready=%d ready_hist=%d "
 						    "lagging=%d holder_med=%llu "
 						    "ready_baseline=%llu",
-						    (double)now / 1e9,
+						    (double)now / 1e3,
 						    (double)(now -
-						    p->tail_lag_start_ns) / 1e9,
+						    p->tail_lag_start_ms) / 1e3,
 						    trend,
 						    (unsigned long long)worst_proj_sec,
 						    (unsigned long long)med_old,
@@ -706,7 +706,7 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 						    (unsigned long long)worst_holder_med,
 						    (unsigned long long)baseline);
 					p->tail_episode = 1;
-					p->tail_episode_ns = p->tail_lag_start_ns;
+					p->tail_episode_ms = p->tail_lag_start_ms;
 					tail_fire_yield(p, yield_tgt,
 					    yield_tgt_med, yield_tgt_proj);
 				}
@@ -716,13 +716,13 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 
  resolve:
 	if (!would_arm)
-		p->tail_lag_start_ns = 0;	/* condition broke: re-confirm */
+		p->tail_lag_start_ms = 0;	/* condition broke: re-confirm */
 	if (p->tail_episode && !would_arm) {
 		if (getenv("HPN_PARALLEL_TRACE") != NULL)
 			logit("HPN TAIL-EPISODE-END t=%.3f dur=%.1fs "
 			    "pending=%llu",
-			    (double)now / 1e9,
-			    (double)(now - p->tail_episode_ns) / 1e9,
+			    (double)now / 1e3,
+			    (double)(now - p->tail_episode_ms) / 1e3,
 			    (unsigned long long)p->pending);
 		p->tail_episode = 0;
 		p->tail_yield_fired = 0;	/* re-arm for the next episode */

@@ -61,7 +61,7 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
-#include "sftp-client-internal.h"	/* sftp_conn_watchdog_pause_until_ns */
+#include "sftp-client-internal.h"	/* sftp_conn_watchdog_pause_until_ms */
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair[_resolve] */
 #include "sftp-workqueue.h"
 #include "sftp-parallel.h"
@@ -371,7 +371,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	 * values as a reasonable batching-vs-RAM balance. */
 	p->verify_park_budget = (uint64_t)64 * 1024ULL * 1024ULL;
 
-	p->session_start_ns = monotime_ns();
+	p->session_start_ms = monotime_ms();
 
 	/* Fleet-abort zero-progress window, resolved from ssh_config
 	 * HPNStallAbortTimeout (default 60 s).  The abort also requires no worker
@@ -1160,9 +1160,8 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	out->units_pending = (uint64_t)p->pending;
 	pthread_mutex_unlock(&p->pending_mu);
 
-	if (p->session_start_ns != 0)
-		out->elapsed_ms =
-		    (monotime_ns() - p->session_start_ns) / 1000000ULL;
+	if (p->session_start_ms != 0)
+		out->elapsed_ms = monotime_ms() - p->session_start_ms;
 	if (p->q) {
 		out->queue_depth = sftp_workqueue_depth(p->q);
 		out->queue_high_watermark = sftp_workqueue_high_watermark(p->q);

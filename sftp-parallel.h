@@ -528,7 +528,7 @@ struct sftp_parallel_stats {
 	int      peer_stall_terminations;
 	int      endgame_straggler_reaps;  /* stuck-at-endgame reaps */
 	/* Wall-clock duration of the parallel-streams session in
-	 * milliseconds.  start_ns is captured in sftp_parallel_start();
+	 * milliseconds.  session_start_ms is captured in sftp_parallel_start();
 	 * elapsed_ms is computed against the monotonic clock at
 	 * sftp_parallel_get_stats() call time. */
 	uint64_t elapsed_ms;

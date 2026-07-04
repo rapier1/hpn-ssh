@@ -114,7 +114,7 @@ worker_record_completion(struct sftp_worker *w, off_t bytes, int success)
 	/* Reset live_bytes so the completed file's bytes aren't counted twice
 	 * (once here in bytes_total and once via the live_counter hook). */
 	__atomic_store_n(&w->live_bytes, 0, __ATOMIC_RELAXED);
-	w->last_completion_ns = monotime_ns();
+	w->last_completion_ms = monotime_ms();
 	pthread_mutex_unlock(&w->mu);
 }
 
@@ -755,10 +755,10 @@ static void
 worker_finish_bundle(struct sftp_parallel *p, struct sftp_worker *w,
     struct sftp_work_unit **batch, int bn, int bundle_rc,
     const int *results, uint64_t total_bytes,
-    uint64_t t_start_ns, uint64_t t_end_ns,
+    uint64_t t_start_ms, uint64_t t_end_ms,
     const char *label, int use_logit)
 {
-	uint64_t elapsed_us = (t_end_ns - t_start_ns) / 1000ULL;
+	uint64_t elapsed_ms = t_end_ms - t_start_ms;
 	off_t wired_data = 0;
 	double mibps = 0.0;
 	int i, ok_count = 0;
@@ -773,21 +773,21 @@ worker_finish_bundle(struct sftp_parallel *p, struct sftp_worker *w,
 	 * overhead - and is not mislabeled "skipped via resume".  Only the ok
 	 * members; failed ones re-transfer and are counted on that path. */
 	sftp_conn_bytes_wired_add(w->conn, (uint64_t)wired_data);
-	if (elapsed_us > 0)
+	if (elapsed_ms > 0)
 		mibps = ((double)total_bytes / (1024.0 * 1024.0)) /
-		    ((double)elapsed_us / 1e6);
+		    ((double)elapsed_ms / 1e3);
 	/* One stderr line per bundle; format chosen so the harness can grep
 	 * the tag and parse the key=value fields. */
 	if (use_logit)
-		logit("%s worker=%d files=%d ok=%d bytes=%llu elapsed_us=%llu "
+		logit("%s worker=%d files=%d ok=%d bytes=%llu elapsed_ms=%llu "
 		    "MiBps=%.2f", label, w->id, bn, ok_count,
 		    (unsigned long long)total_bytes,
-		    (unsigned long long)elapsed_us, mibps);
+		    (unsigned long long)elapsed_ms, mibps);
 	else
-		debug("%s worker=%d files=%d ok=%d bytes=%llu elapsed_us=%llu "
+		debug("%s worker=%d files=%d ok=%d bytes=%llu elapsed_ms=%llu "
 		    "MiBps=%.2f", label, w->id, bn, ok_count,
 		    (unsigned long long)total_bytes,
-		    (unsigned long long)elapsed_us, mibps);
+		    (unsigned long long)elapsed_ms, mibps);
 
 	/*
 	 * Downgrade to single-file ONLY when the server itself can't bundle
@@ -848,7 +848,7 @@ worker_run_bundle(struct sftp_worker *w,
 	struct sftp_parallel *p = w->parent;
 	struct sftp_hpn_bundle_upload_entry *entries;
 	int *results;
-	uint64_t total_bytes = 0, t_start_ns, t_end_ns;
+	uint64_t total_bytes = 0, t_start_ms, t_end_ms;
 	int i, bundle_rc;
 
 	entries = xcalloc(bn, sizeof(*entries));
@@ -862,7 +862,7 @@ worker_run_bundle(struct sftp_worker *w,
 		worker_record_start(w);
 	}
 
-	t_start_ns = monotime_ns();
+	t_start_ms = monotime_ms();
 	/* dest_dir = "" - each remote_path is treated as an absolute path by
 	 * the server-side bundle handler.  This avoids computing a common
 	 * prefix across the batch; the server's bundle extractor calls mkdir_p
@@ -872,12 +872,12 @@ worker_run_bundle(struct sftp_worker *w,
 	bundle_rc = sftp_hpn_bundle_upload(w->conn, "", entries, bn,
 	    p->cfg.preserve_flag, p->cfg.fsync_flag, p->cfg.writer_pool,
 	    p->cfg.bundle_size);
-	t_end_ns = monotime_ns();
+	t_end_ms = monotime_ms();
 
 	for (i = 0; i < bn; i++)
 		results[i] = entries[i].result;
 	worker_finish_bundle(p, w, batch, bn, bundle_rc, results, total_bytes,
-	    t_start_ns, t_end_ns, "BUNDLE", 0);
+	    t_start_ms, t_end_ms, "BUNDLE", 0);
 
 	free(entries);
 	free(results);
@@ -899,7 +899,7 @@ worker_run_bundle_download(struct sftp_worker *w,
 	struct sftp_parallel *p = w->parent;
 	struct sftp_hpn_bundle_download_entry *entries;
 	int *results;
-	uint64_t total_bytes = 0, t_start_ns, t_end_ns;
+	uint64_t total_bytes = 0, t_start_ms, t_end_ms;
 	int i, bundle_rc;
 
 	entries = xcalloc(bn, sizeof(*entries));
@@ -913,15 +913,15 @@ worker_run_bundle_download(struct sftp_worker *w,
 		worker_record_start(w);
 	}
 
-	t_start_ns = monotime_ns();
+	t_start_ms = monotime_ms();
 	bundle_rc = sftp_hpn_bundle_download(w->conn, entries, bn,
 	    p->cfg.preserve_flag, p->cfg.writer_pool);
-	t_end_ns = monotime_ns();
+	t_end_ms = monotime_ms();
 
 	for (i = 0; i < bn; i++)
 		results[i] = entries[i].result;
 	worker_finish_bundle(p, w, batch, bn, bundle_rc, results, total_bytes,
-	    t_start_ns, t_end_ns, "BUNDLE-DL", 1);
+	    t_start_ms, t_end_ms, "BUNDLE-DL", 1);
 
 	free(entries);
 	free(results);
@@ -1110,9 +1110,9 @@ parallel_worker_thread(void *arg)
 		if (p->abort_flag)
 			break;
 		void *item = NULL;
-		uint64_t t_idle_start = monotime_ns();
+		uint64_t t_idle_start = monotime_ms();
 		__atomic_store_n(&w->phase, WPH_POP_WAIT, __ATOMIC_RELAXED);
-		__atomic_store_n(&w->pop_start_ns, t_idle_start,
+		__atomic_store_n(&w->pop_start_ms, t_idle_start,
 		    __ATOMIC_RELEASE);
 		/* Phase 4 gap 1 deadlock guard: if we have a deferred
 		 * pipelined batch with pending CLOSE-STATUSes in the
@@ -1134,22 +1134,22 @@ parallel_worker_thread(void *arg)
 		__atomic_store_n(&w->avail, WORKER_AVAIL_READY,
 		    __ATOMIC_RELAXED);
 		if (item == NULL && sftp_workqueue_pop(p->q, &item) != 0) {
-			__atomic_store_n(&w->pop_start_ns, 0,
+			__atomic_store_n(&w->pop_start_ms, 0,
 			    __ATOMIC_RELEASE);
 			break;	/* shutdown && empty */
 		}
-		uint64_t t_work_start = monotime_ns();
-		__atomic_store_n(&w->pop_start_ns, 0, __ATOMIC_RELEASE);
+		uint64_t t_work_start = monotime_ms();
+		__atomic_store_n(&w->pop_start_ms, 0, __ATOMIC_RELEASE);
 		/* Mark when this worker took possession of a unit so the
 		 * watchdog can measure "how long has this worker been
 		 * holding the current unit" even if the worker has never
 		 * completed a previous unit.  Cleared at the end of this
 		 * iteration after the unit (or batch) has been processed. */
-		__atomic_store_n(&w->unit_start_ns, t_work_start,
+		__atomic_store_n(&w->unit_start_ms, t_work_start,
 		    __ATOMIC_RELEASE);
 		struct sftp_work_unit *u0 = item;
 		if (u0 == NULL) {
-			__atomic_store_n(&w->unit_start_ns, 0,
+			__atomic_store_n(&w->unit_start_ms, 0,
 			    __ATOMIC_RELEASE);
 			continue;
 		}
@@ -1167,11 +1167,11 @@ parallel_worker_thread(void *arg)
 			if (parallel_worker_requeue(p, u0, /*front=*/1) != 0) {
 				worker_give_up_pushfail(p, w, u0,
 				    "yield/pushfail");
-				__atomic_store_n(&w->unit_start_ns, 0,
+				__atomic_store_n(&w->unit_start_ms, 0,
 				    __ATOMIC_RELEASE);
 				continue;
 			}
-			__atomic_store_n(&w->unit_start_ns, 0,
+			__atomic_store_n(&w->unit_start_ms, 0,
 			    __ATOMIC_RELEASE);
 			sftp_workqueue_kick(p->q);
 			sftp_workqueue_wait_activity(p->q, 250);
@@ -1212,7 +1212,7 @@ parallel_worker_thread(void *arg)
 			if (parallel_worker_requeue(p, u0, /*front=*/0) != 0)
 				worker_give_up_pushfail(p, w, u0,
 				    "capgate/pushfail");
-			__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
+			__atomic_store_n(&w->unit_start_ms, 0, __ATOMIC_RELEASE);
 			/* Availability intent: cap-gate parking = available for
 			 * OTHER files, blocked on this one's writer cap. */
 			__atomic_store_n(&w->avail, WORKER_AVAIL_CAPPED,
@@ -1233,7 +1233,7 @@ parallel_worker_thread(void *arg)
 		capped_passes = 0;
 		__atomic_store_n(&w->phase, WPH_ASSEMBLE, __ATOMIC_RELAXED);
 		/* Availability intent + unit size for the tail detector's
-		 * projected-tail (size published beside unit_start_ns). */
+		 * projected-tail (size published beside unit_start_ms). */
 		__atomic_store_n(&w->avail, WORKER_AVAIL_BUSY,
 		    __ATOMIC_RELAXED);
 		__atomic_store_n(&w->unit_size, (uint64_t)u0->size,
@@ -1473,17 +1473,17 @@ parallel_worker_thread(void *arg)
 
 		/* Account for this iteration's idle and work time. */
 		{
-			uint64_t t_work_end = monotime_ns();
+			uint64_t t_work_end = monotime_ms();
 			pthread_mutex_lock(&w->mu);
-			w->idle_ns += t_work_start - t_idle_start;
-			w->work_ns += t_work_end - t_work_start;
+			w->idle_ms += t_work_start - t_idle_start;
+			w->work_ms += t_work_end - t_work_start;
 			pthread_mutex_unlock(&w->mu);
 		}
 
 		/* Unit (or batch) finished - clear the wedge-detection
 		 * timestamp so the watchdog only ever counts time spent
 		 * actually holding work. */
-		__atomic_store_n(&w->unit_start_ns, 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&w->unit_start_ms, 0, __ATOMIC_RELEASE);
 		__atomic_store_n(&w->unit_size, 0, __ATOMIC_RELAXED);
 		__atomic_store_n(&w->unit_offset, (int64_t)-1, __ATOMIC_RELAXED);
 
