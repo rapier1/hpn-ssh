@@ -60,6 +60,7 @@ typedef void EditLine;
 #include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
 #include "sftp-usergroup.h"
+#include "sftp-lustre-client.h"	/* maybe_apply_lustre_layout{,_local} */
 #include "sftp-parallel.h"
 
 /* File to read commands from */

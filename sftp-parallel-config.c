@@ -253,18 +253,13 @@ sftp_resolve_hpn_lustre_stripe_count(const char *host,
 
 /*
  * Adaptive throughput-outlier stall detection defaults, shared by hpnsftp
- * and hpnscp so the two stay in lockstep (the defaults used to be copy-pasted
- * into both, and only sftp.c honoured the env overrides).  On by default in
- * parallel mode with conservative WAN-bulk settings; each knob is overridable
- * via a developer-only env var:
- *
- *   SFTP_TPUT_HEALTHY_KBPS=N  minimum path rate (kbps) seen before outlier
- *                             classification fires; 0 disables the feature
- *   SFTP_TPUT_FRACTION=F      worker is an outlier if its kbps < F * max_kbps
- *   SFTP_TPUT_CONSEC=N        consecutive outlier ticks before STALLED
- *                             (DEAD at 2N)
- *   SFTP_TPUT_EMA_ALPHA=F     EMA smoothing factor (0 = use the 0.2 default
- *                             at evaluation time)
+ * and hpnscp so the two stay in lockstep.  On by default in parallel mode
+ * with conservative WAN-bulk settings (the values were settled by testing;
+ * the env-var overrides that once existed were removed in the 19.0 dev-knob
+ * cull): path-health floor in kbps (0 disables the detector), the outlier
+ * fraction of the fastest peer's EMA, the consecutive outlier ticks before
+ * STALLED (DEAD at 2N), and the EMA smoothing factor (0 = use the 0.2
+ * default at evaluation time).
  */
 void
 sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg)

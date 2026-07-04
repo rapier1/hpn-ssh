@@ -305,32 +305,8 @@ int sftp_parallel_user_abort(const struct sftp_parallel *p);
  * `p` is NULL (i.e. parallel mode is not engaged). */
 int sftp_parallel_num_streams(const struct sftp_parallel *p);
 
-/*
- * HPNLustreStripeCount entry point.  Called by the recursive walker after
- * mkdir of a destination subdirectory, and by sftp.c's single-file upload
- * dispatch on the destination directory.  No-op when the feature is
- * disabled (HPNLustreStripeCount=0), not in parallel mode, the server
- * does not advertise hpn-file-layout, the destination is not on Lustre,
- * the current stripe count already meets or exceeds the desired count,
- * or a prior call on the same conn returned a non-success status (the
- * declined-latch is checked first so subsequent calls short-circuit).
- * On success emits one INFO log line.  Safe to call repeatedly on the
- * same directory - Lustre setstripe is idempotent.
- */
-void maybe_apply_lustre_layout(struct sftp_parallel *p,
-    struct sftp_conn *conn, const char *dst);
-
-/*
- * Local twin of maybe_apply_lustre_layout for DOWNLOADS: dst is a LOCAL
- * destination directory and this process is the writer, so the layout is
- * applied directly via sftp-lustre.c instead of the wire extension.  Same
- * HPNLustreStripeCount policy (0=off, unset=tiered composite sized to the
- * worker count, N=plain N-stripe with an exact-match skip).  Non-Lustre
- * destinations are skipped silently.  conn supplies only the resolved
- * config value.
- */
-void maybe_apply_lustre_layout_local(struct sftp_parallel *p,
-    struct sftp_conn *conn, const char *dst);
+/* The HPNLustreStripeCount layout-policy entry points
+ * (maybe_apply_lustre_layout / _local) moved to sftp-lustre-client.h. */
 
 /*
  * Walker-side failure recorder.  Bumps the orchestrator's
