@@ -69,14 +69,6 @@ static OSSL_FUNC_provider_teardown_fn aes_mt_prov_teardown;
 static OSSL_FUNC_provider_get_params_fn aes_mt_prov_get_params; 
 OSSL_provider_init_fn OSSL_provider_init; /* need this? */
 
-/* error functions */
-OSSL_FUNC_core_new_error_fn *c_new_error;
-OSSL_FUNC_core_set_error_debug_fn *c_set_error_debug;
-OSSL_FUNC_core_vset_error_fn *c_vset_error;
-OSSL_FUNC_core_set_error_mark_fn *c_set_error_mark;
-OSSL_FUNC_core_clear_last_error_mark_fn *c_clear_last_error_mark;
-OSSL_FUNC_core_pop_error_to_mark_fn *c_pop_error_to_mark;
-
 /* Errors used in this provider */
 #define AES_MT_E_MALLOC           1
 #define AES_MT_BAD_KEYLEN         2

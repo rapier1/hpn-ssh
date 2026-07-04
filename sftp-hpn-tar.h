@@ -155,22 +155,6 @@ ssize_t sftp_hpn_tar_writer_pack_next(struct sftp_hpn_tar_writer *w,
  * a static string; do not free.  NULL if no error has been recorded. */
 const char *sftp_hpn_tar_writer_error(struct sftp_hpn_tar_writer *w);
 
-/*
- * Optional per-entry data observer.  As each entry is packed, on_data() is
- * invoked with the bytes just read from the source (before the caller sends
- * them), the entry's archive_path, and `final` nonzero on the entry's last
- * chunk.  An empty file emits one call with data=NULL, len=0, final=1.  The
- * codec interprets nothing - this is how the verify layer taps source bytes
- * to hash them without the codec knowing about hashing.
- */
-struct sftp_hpn_tar_data_tap {
-	void (*on_data)(void *arg, const char *archive_path,
-	    const u_char *data, size_t len, int final);
-	void *arg;
-};
-void sftp_hpn_tar_writer_set_data_tap(struct sftp_hpn_tar_writer *w,
-    const struct sftp_hpn_tar_data_tap *tap);
-
 /* ── Parser ──────────────────────────────────────────────────────────────── */
 
 struct sftp_hpn_tar_parser;

@@ -1110,10 +1110,7 @@ parallel_worker_thread(void *arg)
 		if (p->abort_flag)
 			break;
 		void *item = NULL;
-		uint64_t t_idle_start = monotime_ms();
 		__atomic_store_n(&w->phase, WPH_POP_WAIT, __ATOMIC_RELAXED);
-		__atomic_store_n(&w->pop_start_ms, t_idle_start,
-		    __ATOMIC_RELEASE);
 		/* Phase 4 gap 1 deadlock guard: if we have a deferred
 		 * pipelined batch with pending CLOSE-STATUSes in the
 		 * SSH socket buffer, we cannot block on the workqueue
@@ -1133,13 +1130,9 @@ parallel_worker_thread(void *arg)
 		 * idle, healthy, ready for work (see enum worker_avail). */
 		__atomic_store_n(&w->avail, WORKER_AVAIL_READY,
 		    __ATOMIC_RELAXED);
-		if (item == NULL && sftp_workqueue_pop(p->q, &item) != 0) {
-			__atomic_store_n(&w->pop_start_ms, 0,
-			    __ATOMIC_RELEASE);
+		if (item == NULL && sftp_workqueue_pop(p->q, &item) != 0)
 			break;	/* shutdown && empty */
-		}
 		uint64_t t_work_start = monotime_ms();
-		__atomic_store_n(&w->pop_start_ms, 0, __ATOMIC_RELEASE);
 		/* Mark when this worker took possession of a unit so the
 		 * watchdog can measure "how long has this worker been
 		 * holding the current unit" even if the worker has never
@@ -1469,15 +1462,6 @@ parallel_worker_thread(void *arg)
 			/* Download (no bundle) or any range op - all bypass
 			 * the upload-batch path. */
 			worker_execute_single(w, u0);
-		}
-
-		/* Account for this iteration's idle and work time. */
-		{
-			uint64_t t_work_end = monotime_ms();
-			pthread_mutex_lock(&w->mu);
-			w->idle_ms += t_work_start - t_idle_start;
-			w->work_ms += t_work_end - t_work_start;
-			pthread_mutex_unlock(&w->mu);
 		}
 
 		/* Unit (or batch) finished - clear the wedge-detection

@@ -938,20 +938,9 @@ struct sftp_worker {
 	                                         * values don't suppress outlier
 	                                         * detection on the new unit */
 
-	uint64_t           idle_ms;            /* ms blocked on workqueue pop,
-					        * for completed pops only */
-	uint64_t           work_ms;            /* ms actively processing */
-	/* Set to monotime_ms() immediately before each blocking pop call,
-	 * cleared to 0 immediately after.  The reporter adds (now -
-	 * pop_start_ms) to idle_ms when computing idle fraction so that
-	 * an in-progress blocking wait is included even though the pop has
-	 * not yet returned.  Written/read with relaxed atomics - a brief
-	 * race between clearing and the accounting update causes at most
-	 * a single-tick undercount, which is harmless for a 35% threshold. */
-	uint64_t           pop_start_ms;
-	/* Set to monotime_ms() when a unit is popped off the workqueue
-	 * (after pop_start_ms is cleared), reset to 0 when the unit's
-	 * execute_unit returns.  Lets the watchdog measure how long the
+	/* Set to monotime_ms() when a unit is popped off the workqueue,
+	 * reset to 0 when the unit's execute_unit returns.  Lets the
+	 * watchdog measure how long the
 	 * worker has been holding its current unit even when
 	 * last_completion_ms is still 0 (worker wedged on its very first
 	 * unit - last_completion_ms never gets set, so the existing

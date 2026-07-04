@@ -52,20 +52,15 @@ void sftp_workqueue_free(struct sftp_workqueue *q);
 int sftp_workqueue_push(struct sftp_workqueue *q, void *item);
 
 /*
- * Like sftp_workqueue_push but inserts at the head (LIFO): the item is the
- * next one popped. Used for transient unit re-queues so a failed byte-range
- * jumps ahead of fresh work and its file completes promptly. Blocks if full;
- * returns 0 on success, -1 if shutdown was signaled before the push.
- */
-int sftp_workqueue_push_front(struct sftp_workqueue *q, void *item);
-
-/*
- * Non-blocking variants of push / push_front: never wait on a full queue.
- * Return 0 if the item was queued, 1 if the queue is full (item NOT queued),
- * -1 if the queue is shut down.  A worker re-queueing units onto the same
- * queue it also drains must use these: a blocking push there can self-deadlock
- * (the blocked worker stops consuming, so nothing ever drains the queue) -
- * fatal at -j1, where that worker is the only consumer.
+ * Non-blocking pushes: trypush inserts at the tail; trypush_front at the
+ * HEAD (LIFO - the item is the next one popped), used for transient unit
+ * re-queues so a failed byte-range jumps ahead of fresh work and its file
+ * completes promptly.  Never wait on a full queue.  Return 0 if the item
+ * was queued, 1 if the queue is full (item NOT queued), -1 if the queue is
+ * shut down.  A worker re-queueing units onto the same queue it also drains
+ * must use these: a blocking push there can self-deadlock (the blocked
+ * worker stops consuming, so nothing ever drains the queue) - fatal at -j1,
+ * where that worker is the only consumer.
  */
 int sftp_workqueue_trypush(struct sftp_workqueue *q, void *item);
 int sftp_workqueue_trypush_front(struct sftp_workqueue *q, void *item);

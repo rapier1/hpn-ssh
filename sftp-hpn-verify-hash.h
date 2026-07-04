@@ -20,10 +20,8 @@
  * sftp-hpn-verify-hash.h - shared verify hashing primitives for
  * HPNVerifyTransfer, linked into both the client and the server.
  *
- * Target side: sftp_hpn_hash_file_ondisk hashes what actually landed on the
- * platter (fsync + O_DIRECT), not the page cache.  Source side:
- * sftp_hpn_src_hashset accumulates per-entry XXH3 of bundled files as they
- * are packed (it implements the tar writer's data tap).
+ * sftp_hpn_hash_file_ondisk hashes what actually landed on the platter
+ * (fsync + O_DIRECT), not the page cache.
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
  */
@@ -74,23 +72,5 @@ int sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset,
  * by "on-disk".  `path` is used only for log messages.
  */
 int sftp_hpn_fd_set_ondisk(int fd, const char *path);
-
-/*
- * Per-entry source-hash accumulator (bundle integrity, source side).
- * Implements the tar writer's data tap: XXH3 each bundled file's source bytes
- * as they are packed, keyed by archive_path.  Plug sftp_hpn_src_hashset_tap
- * (with the set as arg) into a struct sftp_hpn_tar_data_tap; after packing,
- * look hashes up by path with _get.  Matches the tap's on_data signature.
- */
-struct sftp_hpn_src_hashset;
-struct sftp_hpn_src_hashset *sftp_hpn_src_hashset_new(void);
-void sftp_hpn_src_hashset_free(struct sftp_hpn_src_hashset *s);
-void sftp_hpn_src_hashset_tap(void *arg, const char *archive_path,
-    const u_char *data, size_t len, int final);
-int  sftp_hpn_src_hashset_get(struct sftp_hpn_src_hashset *s,
-    const char *archive_path, uint64_t *hash_out);
-/* Iterate every (archive_path, hash) pair in insertion order. */
-void sftp_hpn_src_hashset_foreach(struct sftp_hpn_src_hashset *s,
-    void (*cb)(void *arg, const char *archive_path, uint64_t hash), void *arg);
 
 #endif /* SFTP_HPN_VERIFY_HASH_H */
