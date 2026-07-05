@@ -79,6 +79,8 @@ LTESTS= 	connect \
 		sftp-verified-resume \
 		sftp-uri \
 		sftp-parallel \
+		sftp-parallel-resume \
+		sftp-parallel-respawn \
 		sftp-bundle \
 		sftp-bundle-caps \
 		sftp-range-split \

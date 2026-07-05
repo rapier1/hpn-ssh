@@ -20,7 +20,10 @@ start_sshd
 # Build a many-small-files dataset that comfortably hits the bundle
 # accumulator (default 4 MiB target).  Twenty 16 KiB files = 320 KiB
 # total - small enough to pack as a single bundle per worker, large
-# enough that the directory walk exercises the batch path.
+# enough that the directory walk exercises the batch path.  The empty
+# files ride along to pin the tar codec's zero-size entry path (header
+# with no data phase on pack; entry creation with no data callbacks on
+# extract) - a bundle-only special case that plain transfers never hit.
 make_dataset() {
 	for i in 01 02 03 04 05 06 07 08 09 10 \
 	         11 12 13 14 15 16 17 18 19 20; do
@@ -28,6 +31,8 @@ make_dataset() {
 		    status=none 2>/dev/null || \
 		    fail "could not seed bundle dataset"
 	done
+	touch ${SRCDIR}/empty1 ${SRCDIR}/f00 ${SRCDIR}/zzz-empty || \
+	    fail "could not seed empty files"
 }
 
 # Each test pass: recursive put -r then recursive get -r, with a
