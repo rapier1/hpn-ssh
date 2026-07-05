@@ -155,6 +155,21 @@ The default is 1
 useful values for a high bandwidth-delay path are typically 4 to 8.
 Large files are additionally split across workers by byte range
 .Pq see Fl M .
+.Pp
+Each worker authenticates its own connection with no terminal attached,
+so
+.Fl j
+requires a
+.Em non-interactive
+authentication method \(em typically public-key authentication,
+including keys held by
+.Xr hpnssh-agent 1 .
+Authentication that requires an interactive prompt \(em a password,
+keyboard-interactive, or a one-time-password / two-factor challenge
+\(em cannot be used with parallel streams, since each worker would need
+its own prompt and a one-time password cannot be reused across workers.
+If only interactive authentication is available, run without
+.Fl j .
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
 .It Fl M Ar range_split_min

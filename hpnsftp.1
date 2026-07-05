@@ -228,6 +228,21 @@ files) across them.
 Must be between 1 and 24; values outside this range are clamped at
 parse time.
 .Pp
+Each worker authenticates its own connection with no terminal attached,
+so
+.Fl j
+requires a
+.Em non-interactive
+authentication method \(em typically public-key authentication,
+including keys held by
+.Xr hpnssh-agent 1 .
+Authentication that requires an interactive prompt \(em a password,
+keyboard-interactive, or a one-time-password / two-factor challenge
+\(em cannot be used with parallel streams, since each worker would need
+its own prompt and a one-time password cannot be reused across workers.
+If only interactive authentication is available, run without
+.Fl j .
+.Pp
 There is no universally-correct setting.
 More streams is not always faster:
 once the path or server reaches saturation, additional workers compete
