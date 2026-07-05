@@ -181,7 +181,6 @@ struct Channel {
 	u_int	local_consumed;
 	u_int	local_maxpacket;
 	int	dynamic_window;
-	int	rcvbuf_rescue;	/* forcibly grow SO_RCVBUF when autotune stuck */
 	int     extended_usage;
 	int	agent_new;	/* For agent listeners, use RFC XXX reqests */
 	int	single_connection;

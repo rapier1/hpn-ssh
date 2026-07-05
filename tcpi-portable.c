@@ -288,24 +288,3 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 }
 
 #endif /* TCPI_PORTABLE_SUPPORTED */
-
-/*
- * Clamp the advertised receive window to `bytes`.  Compiled on every platform
- * (independent of the read path above): where TCP_WINDOW_CLAMP exists (Linux)
- * it applies the clamp; elsewhere it is a silent no-op.  Returns 0 on success
- * or no-op, -1 only if an attempted setsockopt failed.
- */
-int
-tcpi_portable_clamp_rcvwnd(int fd, u_int32_t bytes)
-{
-#ifdef TCP_WINDOW_CLAMP
-	int clamp = (int)bytes;
-
-	return setsockopt(fd, IPPROTO_TCP, TCP_WINDOW_CLAMP,
-	    &clamp, sizeof(clamp));
-#else
-	(void)fd;
-	(void)bytes;
-	return 0;	/* no such option on this platform: silent no-op */
-#endif
-}

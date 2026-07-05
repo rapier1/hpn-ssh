@@ -2289,10 +2289,6 @@ ssh_session2_open(struct ssh *ssh)
 		ssh_packet_enable_hpn_bulk(ssh);
 		channel_set_hpn_memlimit(options.hpn_memory_limit);
 		debug("Enabled Dynamic Window Scaling");
-		if (options.tcp_rcv_buf_rescue > 0) {
-			c->rcvbuf_rescue = 1;
-			debug("Enabled SO_RCVBUF rescue");
-		}
 	}
 
 	if (tty_flag)

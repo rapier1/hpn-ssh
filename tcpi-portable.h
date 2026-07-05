@@ -120,15 +120,4 @@ int	tcpi_portable_get(int fd, struct tcpi_portable *out);
  */
 int	tcpi_portable_supported(void);
 
-/*
- * Best-effort write op: clamp the advertised receive window on a connected
- * TCP socket to `bytes` (Linux: setsockopt(TCP_WINDOW_CLAMP)).  Returns 0
- * when the clamp was applied, and also when the platform has no such option
- * (a silent no-op -- e.g. the BSDs and macOS); returns -1 (errno set) only
- * if an attempt was made and the setsockopt failed.  This is the first write
- * member of the interface: tcpi-portable is the portable TCP-stack accessor,
- * reads and the few tuning writes HPN needs, not a read-only metrics view.
- */
-int	tcpi_portable_clamp_rcvwnd(int fd, u_int32_t bytes);
-
 #endif /* TCPI_PORTABLE_H */

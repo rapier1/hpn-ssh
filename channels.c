@@ -614,7 +614,6 @@ channel_new(struct ssh *ssh, char *ctype, int type, int rfd, int wfd, int efd,
 	c->local_window_max = window;
 	c->local_maxpacket = maxpack;
 	c->dynamic_window = 0;
-	c->rcvbuf_rescue = 0;
 	c->remote_name = xstrdup(remote_name);
 	c->ctl_chan = -1;
 	c->delayed = 1;		/* prevent call to channel_post handler */
@@ -1389,134 +1388,6 @@ channel_pre_connecting(struct ssh *ssh, Channel *c)
 	c->io_want = SSH_CHAN_IO_SOCK_W;
 }
 
-/*
- * Attempt to forcibly grow SO_RCVBUF on a stuck connection.
- *
- * Kernel autotune is reactive: it grows the receive buffer in response to
- * observed demand. On a lossy path, cwnd collapses → very little data is
- * delivered per RTT → autotune never sees pressure → the receive buffer
- * stays small → peer's advertised-window-to-us stays small → cwnd recovery
- * can't make use of any extra capacity. The connection gets stuck in a
- * pathologically small-window state for the rest of its life.
- *
- * This routine breaks that trap by forcibly setting SO_RCVBUF larger when
- * we see the signature: non-trivial RTT (not a LAN) AND retransmits seen.
- * Setting SO_RCVBUF sets SOCK_RCVBUF_LOCK in the kernel, which disables
- * native autotune for this socket - so subsequent calls here act as a
- * userspace autotune that can grow further if needed.
- *
- * Returns the (possibly grown) SO_RCVBUF size.
- */
-static u_int32_t
-channel_rescue_rcvbuf(int sockfd, u_int32_t current_size)
-{
-	static time_t last_check = 0;
-	struct tcpi_portable t;
-	u_int32_t target, new_size;
-	socklen_t nslen;
-	time_t now;
-	u_int32_t min_rtt, total_retrans, rtt, rcv_space;
-	unsigned long long bytes_recv;
-
-	/* cooldown: probe the stack at most once per second */
-	now = monotime();
-	if (now - last_check < 1)
-		return current_size;
-	last_check = now;
-
-	/*
-	 * Stack metrics via tcpi-portable (TCP_INFO on Linux/BSD,
-	 * TCP_CONNECTION_INFO on macOS).  On a platform with no usable accessor
-	 * this returns nonzero and the rescue no-ops, so this routine carries no
-	 * per-OS conditionals.
-	 */
-	if (tcpi_portable_get(sockfd, &t) != 0) {
-		debug_f("rcvbuf check: stack metrics unavailable: %s",
-		    strerror(errno));
-		return current_size;
-	}
-
-	/*
-	 * min_rtt / total_retrans / bytes_received are gated by avail_flags:
-	 * Linux supplies all three; the BSDs and macOS have no min_rtt, so the
-	 * LAN gate falls back to smoothed rtt (the value the BSDs always used
-	 * here).
-	 */
-	min_rtt = (t.avail_flags & TCPI_AVAIL_MIN_RTT) ? t.min_rtt : t.rtt;
-	total_retrans = (t.avail_flags & TCPI_AVAIL_TOTAL_RETRANS) ?
-	    (u_int32_t)t.total_retrans : 0;
-	bytes_recv = (t.avail_flags & TCPI_AVAIL_BYTES_RECEIVED) ?
-	    t.bytes_received : 0;
-	rtt = t.rtt;
-	rcv_space = t.rcv_space;
-
-	/* Diagnostic snapshot every check so we can see why rescue does or
-	 * doesn't fire. total_retrans is sender-side, so on the receiver
-	 * it's typically 0 - we don't gate on it. */
-	debug_f("rcvbuf check: cur=%u min_rtt=%uus rtt=%uus retrans=%u "
-	    "rcv_space=%u bytes_recv=%llu",
-	    current_size, min_rtt, rtt,
-	    total_retrans, rcv_space, bytes_recv);
-
-	/* skip LAN paths: rescuing on a sub-ms RTT path is pointless */
-	if (min_rtt < 5000) {	/* microseconds; 5 ms */
-		debug_f("rcvbuf check: skip (LAN: min_rtt=%uus)",
-		    min_rtt);
-		return current_size;
-	}
-
-	/* skip already-comfortable buffers to avoid runaway growth on
-	 * healthy connections */
-	if (current_size >= 16 * 1024 * 1024) {
-		debug_f("rcvbuf check: skip (already large: %u)",
-		    current_size);
-		return current_size;
-	}
-
-	/* target: double, capped at SSHBUF_SIZE_MAX (512 MB) */
-	target = current_size * 2;
-	if (target > SSHBUF_SIZE_MAX)
-		target = SSHBUF_SIZE_MAX;
-	if (target <= current_size) {
-		debug_f("rcvbuf check: skip (at SSHBUF cap)");
-		return current_size;
-	}
-
-	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &target,
-	    sizeof(target)) != 0) {
-		debug_f("rcvbuf rescue: setsockopt(SO_RCVBUF=%u) failed: %s",
-		    target, strerror(errno));
-		return current_size;
-	}
-
-	/*
-	 * Setting SO_RCVBUF also sets SOCK_RCVBUF_LOCK, which freezes
-	 * tcp_rcv_space_adjust() - so rcv_ssthresh (which the kernel uses
-	 * to clamp the *advertised* window) stays at whatever autotune
-	 * had it at the moment of rescue. Force the window clamp up to
-	 * the new buffer size so subsequent ACKs can actually advertise
-	 * the larger window to the peer. Non-fatal on failure.
-	 */
-	if (tcpi_portable_clamp_rcvwnd(sockfd, target) != 0)
-		debug_f("rcvbuf rescue: window clamp to %u failed: %s",
-		    target, strerror(errno));
-
-	/* re-read; kernel caps at net.core.rmem_max */
-	nslen = sizeof(new_size);
-	if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &new_size,
-	    &nslen) != 0)
-		return current_size;
-
-	if (new_size > current_size) {
-		debug_f("rcvbuf rescued: %u -> %u (min_rtt=%uus)",
-		    current_size, new_size, min_rtt);
-	} else {
-		debug_f("rcvbuf rescue: kernel kept it at %u "
-		    "(likely net.core.rmem_max cap)", new_size);
-	}
-	return new_size;
-}
-
 static int
 channel_tcpwinsz(struct ssh *ssh, Channel *c)
 {
@@ -1540,16 +1411,6 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 	if (ret != 0) {
 		debug_f("getsockopt SO_RCVBUF failed: %s", strerror(errno));
 		return (2 * 1024 * 1024);
-	}
-
-	/* If this channel has rcvbuf rescue enabled, try to forcibly grow
-	 * SO_RCVBUF when the connection looks stuck on a lossy path.  Runs
-	 * before the memlimit / SSHBUF_SIZE_MAX clamps below so the rescue
-	 * result is subject to the same upper bounds. */
-	if (c != NULL && c->rcvbuf_rescue) {
-		u_int32_t rescued = channel_rescue_rcvbuf(sockfd, tcpwinsz);
-		if (rescued > tcpwinsz)
-			tcpwinsz = rescued;
 	}
 
 	/* Cap the window at CHANNEL_WINDOW_RCVSPACE_PCT% of tcpi_rcv_space - the

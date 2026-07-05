@@ -217,7 +217,6 @@ typedef struct {
 
 	/* hpnssh options */
         int     tcp_rcv_buf_poll;       /* poll tcp rcv window in autotuning kernels*/
-        int     tcp_rcv_buf_rescue;     /* forcibly grow SO_RCVBUF when autotune stuck on lossy paths */
 	int	hpn_disabled;		/* disable hpn functionality. false by default */
 	int	hpn_workers_die;	/* let the server terminate a parallel
 					 * worker's connection on a confirmed TCP

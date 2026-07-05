@@ -157,7 +157,7 @@ typedef enum {
 	oHashKnownHosts,
 	oTunnel, oTunnelDevice,
 	oLocalCommand, oPermitLocalCommand, oRemoteCommand,
-	oTcpRcvBufPoll, oTcpRcvBufRescue, oHPNDisabled, oHPNMemoryLimit,
+	oTcpRcvBufPoll, oHPNDisabled, oHPNMemoryLimit,
 	oNoneEnabled, oNoneMacEnabled, oNoneSwitch, oHPNUseBundle, oHPNWriterPool,
 	oHPNTailRedistribute,
 	oHPNMaxRetries, oHPNStallAbortTimeout, oHPNBundleSize,
@@ -343,7 +343,6 @@ static struct {
 	{ "securitykeyprovider", oSecurityKeyProvider },
 	{ "knownhostscommand", oKnownHostsCommand },
 	{ "tcprcvbufpoll", oTcpRcvBufPoll },
-	{ "tcprcvbufrescue", oTcpRcvBufRescue },
 	{ "hpndisabled", oHPNDisabled },
 	{ "hpnmemorylimit", oHPNMemoryLimit },
 	{ "requiredrsasize", oRequiredRSASize },
@@ -1382,10 +1381,6 @@ parse_time:
 
 	case oTcpRcvBufPoll:
 		intptr = &options->tcp_rcv_buf_poll;
-		goto parse_flag;
-
-	case oTcpRcvBufRescue:
-		intptr = &options->tcp_rcv_buf_rescue;
 		goto parse_flag;
 
 	case oNoneEnabled:
@@ -3021,7 +3016,6 @@ initialize_options(Options * options)
 	options->fallback = -1;
 	options->fallback_port = -1;
 	options->tcp_rcv_buf_poll = -1;
-	options->tcp_rcv_buf_rescue = -1;
 	options->session_type = -1;
 	options->stdin_null = -1;
 	options->fork_after_authentication = -1;
@@ -3200,8 +3194,6 @@ fill_default_options(Options * options)
 		options->hpn_memory_limit = 0;
 	if (options->tcp_rcv_buf_poll == -1)
 		options->tcp_rcv_buf_poll = 1;
-	if (options->tcp_rcv_buf_rescue == -1)
-		options->tcp_rcv_buf_rescue = 0; /* opt-in until validated */
 	if (options->none_switch == -1)
 		options->none_switch = 0;
 	if (options->none_enabled == -1)
@@ -4125,7 +4117,6 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oUpdateHostkeys, o->update_hostkeys);
 	dump_cfg_fmtint(oEnableEscapeCommandline, o->enable_escape_commandline);
 	dump_cfg_fmtint(oTcpRcvBufPoll, o->tcp_rcv_buf_poll);
-	dump_cfg_fmtint(oTcpRcvBufRescue, o->tcp_rcv_buf_rescue);
 	dump_cfg_fmtint(oHPNDisabled, o->hpn_disabled);
 	dump_cfg_fmtint(oHPNMemoryLimit, o->hpn_memory_limit);
 	/* NoneSwitch is command-line only; omit from -G dump to allow reparse */
