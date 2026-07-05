@@ -1552,6 +1552,8 @@ struct sftp_work_unit *parallel_unit_make_range(const char *, const char *,
 	    off_t, off_t, struct sftp_range_tracker *);
 int	 parallel_unit_tracker_finalize(struct sftp_range_tracker *, int,
 	    struct sftp_worker *);
+int	 parallel_unit_tracker_finalize_n(struct sftp_range_tracker *, int,
+	    int, struct sftp_worker *);
 int	 parallel_unit_writer_acquire(struct sftp_range_tracker *);
 void	 parallel_unit_writer_release(struct sftp_range_tracker *);
 int	 parallel_unit_max_retries(struct sftp_parallel *);

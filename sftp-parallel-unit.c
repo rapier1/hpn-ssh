@@ -293,10 +293,16 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
 }
 
 /*
- * One range's final completion: `failed` = 1 on permanent give-up
- * (after MAX_RETRIES) or 0 on success.  Must be called exactly once
- * per range unit, on its final outcome only - see invariants (I1)
- * and (I2) at struct sftp_range_tracker.
+ * Batch completion: retire `n` ranges in one call, all with the same
+ * outcome (`failed` = 1 on permanent give-up, 0 on success).  The
+ * submit-error paths use this to synthesise failures for every range
+ * they never submitted: ONE decrement under ONE lock acquisition, so
+ * the call that drops remaining to 0 (and frees the tracker) is
+ * unambiguous - the caller treats the pointer as dead after the call,
+ * unconditionally.  This replaced a finalize-in-a-loop pattern whose
+ * safety relied on the loop count being arithmetically exact
+ * (scan-build flagged it as a potential UAF; see
+ * SECURITY_REVIEW_19.0_FINDINGS.md LOW-1).
  *
  * `w` is the worker reporting completion; used only for sftp_rm on
  * REMOTE-target trackers when the corrupt-file cleanup fires.  May
@@ -306,24 +312,24 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
  * failed (informational - the cleanup happened inside this call
  * regardless).  Returns 0 otherwise.
  *
- * Tracker is freed when remaining hits 0; callers that saw a 0
- * return value have a dead pointer and must not deref it (I3).
+ * Tracker is freed when remaining hits 0; after any call the caller
+ * must assume the pointer is dead (I3).
  *
- * No-op on NULL t (I5).
+ * No-op on NULL t or n <= 0 (I5).
  */
 int
-parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
-    struct sftp_worker *w)
+parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
+    int failed, struct sftp_worker *w)
 {
 	int was_last, incomplete;
 
-	if (t == NULL)
+	if (t == NULL || n <= 0)
 		return 0;
 
 	pthread_mutex_lock(&t->mu);
 	if (failed)
 		t->any_failed = 1;
-	t->remaining--;
+	t->remaining -= n;
 	was_last   = (t->remaining == 0);
 	incomplete = was_last && t->any_failed;
 	if (was_last && getenv("HPN_PARALLEL_TRACE") != NULL)
@@ -390,6 +396,20 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 	free(t->src_path);
 	free(t);
 	return incomplete;
+}
+
+/*
+ * One range's final completion: `failed` = 1 on permanent give-up
+ * (after MAX_RETRIES) or 0 on success.  Must be called exactly once
+ * per range unit, on its final outcome only - see invariants (I1)
+ * and (I2) at struct sftp_range_tracker.  Thin n=1 wrapper over the
+ * batch form above; all the ownership rules there apply.
+ */
+int
+parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
+    struct sftp_worker *w)
+{
+	return parallel_unit_tracker_finalize_n(t, 1, failed, w);
 }
 
 /*
@@ -1509,19 +1529,14 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 			else
 				error("submit range %d of \"%s\" failed",
 				    i, local_path);
-			/* Synthesise failures for ranges we never submitted
-			 * so the tracker reaches remaining=0 and removes the
-			 * (now-corrupt) remote file.  NULL worker is fine -
-			 * the REMOTE branch logs loudly if it can't remove.
-			 *
-			 * Safety: see the matching download-side comment in
-			 * submit_download_range_split - total finalize count
-			 * across workers + this loop is bounded by
-			 * effective_ranges, so if our final call frees the
-			 * tracker, the loop bound prevents re-dereference. */
-			int unsent;
-			for (unsent = i; unsent < effective_ranges; unsent++)
-				(void)parallel_unit_tracker_finalize(tracker, 1, NULL);
+			/* Synthesise failures for the ranges we never
+			 * submitted so the tracker reaches remaining=0 and
+			 * the incomplete-file reporting runs (the file is
+			 * left in place, resumable).  NULL worker is fine.
+			 * One batch call; the tracker may be freed inside
+			 * and is dead to this function afterwards. */
+			(void)parallel_unit_tracker_finalize_n(tracker,
+			    effective_ranges - i, 1, NULL);
 			return -1;
 		}
 	}
@@ -1605,26 +1620,15 @@ submit_download_ranges(struct sftp_parallel *p,
 			else
 				error("submit download range %d of \"%s\" "
 				    "failed", i, remote_path);
-			/* Synthesise failures for ranges we never submitted
-			 * so the tracker reaches remaining=0 and unlinks the
-			 * corrupt local file.  Without this the tracker
-			 * leaks and the file is silently left behind.  No
-			 * worker context here, so pass NULL - local target
-			 * uses unlink() and doesn't need it.
-			 *
-			 * Safety: workers finalize at most `i` times (they
-			 * only received ranges 0..i-1); this loop adds
-			 * exactly (effective_ranges - i) more.  Total ≤
-			 * effective_ranges, so if our final iteration is the
-			 * one that drops remaining to 0 and frees the
-			 * tracker, the loop condition `unsent <
-			 * effective_ranges` fails immediately after - we
-			 * never re-dereference `tracker`.  Scan-build flags
-			 * this as a potential UAF because it can't see the
-			 * X ≤ i worker-finalize invariant. */
-			int unsent;
-			for (unsent = i; unsent < effective_ranges; unsent++)
-				(void)parallel_unit_tracker_finalize(tracker, 1, NULL);
+			/* Synthesise failures for the ranges we never
+			 * submitted so the tracker reaches remaining=0 and
+			 * the incomplete-file reporting runs (the file is
+			 * left in place, resumable).  Without this the
+			 * tracker leaks.  No worker context here, so pass
+			 * NULL.  One batch call; the tracker may be freed
+			 * inside and is dead to this function afterwards. */
+			(void)parallel_unit_tracker_finalize_n(tracker,
+			    effective_ranges - i, 1, NULL);
 			return -1;
 		}
 	}
