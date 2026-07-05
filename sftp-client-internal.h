@@ -94,6 +94,13 @@ uint32_t sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback);
 void     sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes);
 
 /*
+ * Per-worker live-byte counter bump (no-op when conn/hpn/counter is NULL).
+ * The bundle codec feeds the parallel watchdog's liveness classifiers
+ * through this; the non-bundle transfer paths bump the counter inline.
+ */
+void     sftp_conn_live_account(struct sftp_conn *conn, size_t nbytes);
+
+/*
  * Backpressure signal - caller observed a STATUS read that blocked longer
  * than the controller's wedge-detection threshold (RDAHEAD_BP_THRESHOLD_SEC
  * in sftp-hpn-client.c, currently 10 s).  Forwards to

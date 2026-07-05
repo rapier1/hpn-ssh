@@ -4559,6 +4559,23 @@ sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn)
 		sftp_hpn_rdahead_backpressure_signal(conn->hpn);
 }
 
+/* Live-byte accounting wrapper.  The per-worker live counter (armed via
+ * sftp_set_live_counter) is what the parallel watchdog's liveness
+ * classifiers read; the per-file/range/batch paths bump it inline where
+ * their acks are processed.  The bundle codec works through the opaque
+ * struct sftp_conn * and uses this wrapper - without it a worker mid-
+ * bundle reads as 0 bytes moved and is killed as born-dead/wedged on
+ * any bundle slower than the detection window (throttled or low-
+ * bandwidth paths). */
+void
+sftp_conn_live_account(struct sftp_conn *conn, size_t nbytes)
+{
+	if (conn != NULL && conn->hpn != NULL &&
+	    conn->hpn->live_counter != NULL)
+		__atomic_fetch_add(conn->hpn->live_counter, nbytes,
+		    __ATOMIC_RELAXED);
+}
+
 /* HPNVerifyTransfer state accessors.  Declared in sftp-client-internal.h.
  * Set from sftp.c after ssh_config resolution; read where verify is gated -
  * arming the inline source-hash tee and the classic post-transfer verify

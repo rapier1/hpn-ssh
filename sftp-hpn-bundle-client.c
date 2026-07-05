@@ -548,6 +548,10 @@ bundle_dl_stream_drain_one(struct bundle_dl_stream *s,
 		}
 		sshbuf_free(msg);
 		sftp_conn_rdahead_account(s->conn, dlen);
+		/* Live-byte counter for the watchdog: received tar-stream
+		 * bytes are the download twin of the upload send-side bump
+		 * in bundle_ul_send_write. */
+		sftp_conn_live_account(s->conn, dlen);
 		pr = sftp_hpn_tar_parser_feed(parser, data, dlen);
 		free(data);
 		if (pr < 0) {
@@ -1223,6 +1227,17 @@ bundle_ul_send_write(struct bundle_write_ctx *ctx,
 		ctx->wsizes[ctx->n_sent % ctx->wsizes_cap] = (uint32_t)length;
 	send_msg(ctx->conn, msg);
 	sshbuf_free(msg);
+
+	/* Feed the per-worker live-byte counter the watchdog's liveness
+	 * classifiers read.  Send-side rather than drain-side (where the
+	 * other upload paths ack-count) because STATUSes arrive here in
+	 * cap/2-sized drain bursts: on a throttled or low-bandwidth path
+	 * the first burst can land beyond the watchdog's born-dead window
+	 * and the worker is killed at "0 bytes" while streaming normally.
+	 * send_msg paces inside the bandwidth limit, so this counts from
+	 * the first second; a genuinely wedged server still goes silent
+	 * once the inflight cap fills. */
+	sftp_conn_live_account(ctx->conn, length);
 
 	ctx->n_sent++;
 	ctx->offset += (off_t)length;
