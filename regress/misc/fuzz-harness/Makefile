@@ -15,8 +15,10 @@ COMMON_DEPS=../../../libssh.a $(COMMON_OBJS)
 TARGETS=pubkey_fuzz sig_fuzz authopt_fuzz authkeys_fuzz sshsig_fuzz \
 	sshsigopt_fuzz privkey_fuzz kex_fuzz agent_fuzz \
 	mkcorpus_sntrup761 sntrup761_enc_fuzz sntrup761_dec_fuzz \
-	sftp_bundle_extract_fuzz sftp_fs_info_fuzz \
-	mkcorpus_sftp_bundle_extract mkcorpus_sftp_fs_info
+	sftp_fs_info_fuzz \
+	sftp_tar_parser_fuzz sftp_bundle_fetch_parse_fuzz \
+	mkcorpus_sftp_fs_info mkcorpus_sftp_tar_parser \
+	mkcorpus_sftp_bundle_fetch_parse
 
 all: $(TARGETS)
 
@@ -68,28 +70,45 @@ sntrup761_enc_fuzz: sntrup761_enc_fuzz.o
 	$(CXX) -o $@ sntrup761_enc_fuzz.o $(LDFLAGS) $(FUZZ_FLAGS) $(FUZZ_LIBS) -lcrypto
 
 # HPN-SSH SFTP extension fuzzers (not present upstream).
-# sftp_bundle_extract_fuzz: links libarchive for the tar reader path.
-sftp_bundle_extract_fuzz: sftp_bundle_extract_fuzz.o
-	$(CXX) -o $@ sftp_bundle_extract_fuzz.o $(LDFLAGS) $(FUZZ_FLAGS) $(FUZZ_LIBS) -larchive
-
 # sftp_fs_info_fuzz: pure sshbuf parser, only needs libssh + compat.
 sftp_fs_info_fuzz: sftp_fs_info_fuzz.o $(COMMON_DEPS)
 	$(CXX) -o $@ sftp_fs_info_fuzz.o $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
 
+# sftp_tar_parser_fuzz: the in-tree USTAR parser the product actually
+# runs (replaces the libarchive reader the stale sftp_bundle_extract_fuzz
+# still targets).  Links sftp-hpn-tar.o directly - it is not in libssh.a
+# but its only deps (xmalloc/log/sshbuf) are.  Build ../../../sftp-hpn-tar.o
+# with the same sanitizer opts as libssh (see the top-of-file NB).
+sftp_tar_parser_fuzz: sftp_tar_parser_fuzz.o ../../../sftp-hpn-tar.o $(COMMON_DEPS)
+	$(CXX) -o $@ sftp_tar_parser_fuzz.o ../../../sftp-hpn-tar.o $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
+
+# sftp_bundle_fetch_parse_fuzz: pure sshbuf request parser, only needs
+# libssh + compat.
+sftp_bundle_fetch_parse_fuzz: sftp_bundle_fetch_parse_fuzz.o $(COMMON_DEPS)
+	$(CXX) -o $@ sftp_bundle_fetch_parse_fuzz.o $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
+
 # Corpus generators - built with plain CFLAGS (no sanitizer/fuzzer).
 # These are dev tools, not fuzz targets; they emit binary seed files
-# into ./sftp_bundle_extract_corpus/ and ./sftp_fs_info_corpus/.
-mkcorpus_sftp_bundle_extract: mkcorpus_sftp_bundle_extract.c
-	$(CC) $(CFLAGS) -o $@ mkcorpus_sftp_bundle_extract.c -larchive
-
+# into the matching ./*_corpus/ directory.
 mkcorpus_sftp_fs_info: mkcorpus_sftp_fs_info.c
 	$(CC) $(CFLAGS) -o $@ mkcorpus_sftp_fs_info.c
 
+# Drives the in-tree writer to emit matched-pair tar seeds; links the
+# codec object (built with plain CFLAGS is fine - this is not a fuzz
+# target).
+mkcorpus_sftp_tar_parser: mkcorpus_sftp_tar_parser.c ../../../sftp-hpn-tar.o
+	$(CC) $(CFLAGS) -o $@ mkcorpus_sftp_tar_parser.c ../../../sftp-hpn-tar.o $(LDFLAGS) -lssh -lopenbsd-compat -lcrypto
+
+mkcorpus_sftp_bundle_fetch_parse: mkcorpus_sftp_bundle_fetch_parse.c
+	$(CC) $(CFLAGS) -o $@ mkcorpus_sftp_bundle_fetch_parse.c
+
 # Build seeds for the HPN-SSH SFTP-extension fuzzers.  Run this once
 # before invoking the corresponding ./*_fuzz binaries.
-corpus: mkcorpus_sftp_bundle_extract mkcorpus_sftp_fs_info
-	./mkcorpus_sftp_bundle_extract
+corpus: mkcorpus_sftp_fs_info mkcorpus_sftp_tar_parser \
+	mkcorpus_sftp_bundle_fetch_parse
 	./mkcorpus_sftp_fs_info
+	./mkcorpus_sftp_tar_parser
+	./mkcorpus_sftp_bundle_fetch_parse
 
 .PHONY: corpus
 
