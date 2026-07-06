@@ -1,4 +1,4 @@
-/* $OpenBSD: sftp-client.c,v 1.185 2026/03/03 09:57:25 dtucker Exp $ */
+/* $OpenBSD: sftp-client.c,v 1.186 2026/06/29 01:53:21 djm Exp $ */
 /*
  * Copyright (c) 2001-2004 Damien Miller <djm@openbsd.org>
  *
@@ -1920,7 +1920,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 {
 	struct sshbuf *msg = conn->msg;
 	u_char *handle;
-	int local_fd = -1, write_error;
+	int local_fd = -1, write_error, seen_zerolen = 0;
 	int read_error, write_errno, lmodified = 0, reordered = 0, r;
 	uint64_t offset = 0, size, highwater = 0, maxack = 0;
 	u_int mode, id, buflen, num_req, max_req, status = SSH2_FX_OK;
@@ -2249,6 +2249,11 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				fatal("Received more data than asked for "
 				    "%zu > %zu", len, req->len);
 			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
+			if (len == 0) {
+				if (seen_zerolen)
+					fatal_f("server sent zero data length");
+				seen_zerolen = 1;
+			}
 			lmodified = 1;
 			if ((lseek(local_fd, req->offset, SEEK_SET) == -1 ||
 			    atomicio(vwrite, local_fd, data, len) != len) &&
@@ -4908,7 +4913,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
     Attrib *a, int preserve_flag)
 {
 	struct sshbuf *msg = from->msg;
-	int write_error, read_error, r;
+	int write_error, read_error, r, seen_zerolen = 0;
 	uint64_t offset = 0, size;
 	u_int id, buflen, num_req, max_req, status = SSH2_FX_OK;
 	u_int num_upload_req;
@@ -5046,6 +5051,11 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 				fatal("Received more data than asked for "
 				    "%zu > %zu", len, req->len);
 			sftp_hpn_bytes_wired_add(from->hpn, (uint64_t)len);
+			if (len == 0) {
+				if (seen_zerolen)
+					fatal_f("server sent zero data length");
+				seen_zerolen = 1;
+			}
 
 			/* Write this chunk out to the destination */
 			sshbuf_reset(msg);

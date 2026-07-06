@@ -58,7 +58,6 @@ hpnsshd-auth
 tags
 *.0
 benchmark/*
-
 # compiled unittest drivers (build artifacts); keep sources + Makefiles tracked
 regress/unittests/*/test_*
 !regress/unittests/*/*.c

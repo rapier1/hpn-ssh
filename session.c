@@ -1,4 +1,4 @@
-/* $OpenBSD: session.c,v 1.348 2026/03/05 05:40:36 djm Exp $ */
+/* $OpenBSD: session.c,v 1.350 2026/06/05 08:53:07 djm Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -1633,44 +1633,40 @@ do_child(struct ssh *ssh, Session *s, const char *command)
 		exit(1);
 	} else if (s->is_subsystem == SUBSYSTEM_INT_SFTP) {
 		extern int optind, optreset;
-		int i;
-		char *p, *args;
-		char hpn_b[16], hpn_o[16], hpn_w[16];
+		int sftp_argc;
+		char **sftp_argv;
+		char *sftp_cmd;
 
 		setproctitle("%s@%s", s->pw->pw_name, INTERNAL_SFTP_NAME);
-		args = xstrdup(command ? command : "sftp-server");
-		for (i = 0, (p = strtok(args, " ")); p; (p = strtok(NULL, " ")))
-			if (i < ARGV_MAX - 1)
-				argv[i++] = p;
 		/*
-		 * HPN: inject the operator's sshd_config controls so internal-sftp
-		 * honors them too, matching the external sftp subsystem in
-		 * session_subsystem_req: -B HPNUseBundle, -O HPNWriterPool, and -W
-		 * the per-user worker cap when configured (>0).  argv, not env, so
-		 * a user cannot override them under PermitUserEnvironment.  These
-		 * buffers stay in scope through the sftp_server_main() call below.
+		 * HPN: append the operator's sshd_config controls so
+		 * internal-sftp honors them too, matching the external sftp
+		 * subsystem in session_subsystem_req: -B HPNUseBundle, -O
+		 * HPNWriterPool, and -W the per-user worker cap when configured
+		 * (>0).  Passed as argv (not env) so a user cannot override them
+		 * under PermitUserEnvironment.
 		 */
-		snprintf(hpn_b, sizeof(hpn_b), "%d", options.hpn_use_bundle);
-		snprintf(hpn_o, sizeof(hpn_o), "%d", options.hpn_writer_pool);
-		snprintf(hpn_w, sizeof(hpn_w), "%d",
-		    options.hpn_max_concurrent_workers);
-		if (i < ARGV_MAX - 7) {
-			argv[i++] = "-B";
-			argv[i++] = hpn_b;
-			argv[i++] = "-O";
-			argv[i++] = hpn_o;
-			if (options.hpn_max_concurrent_workers > 0) {
-				argv[i++] = "-W";
-				argv[i++] = hpn_w;
-			}
+		if (options.hpn_max_concurrent_workers > 0)
+			xasprintf(&sftp_cmd, "%s -B %d -O %d -W %d",
+			    command == NULL ? "sftp-server" : command,
+			    options.hpn_use_bundle, options.hpn_writer_pool,
+			    options.hpn_max_concurrent_workers);
+		else
+			xasprintf(&sftp_cmd, "%s -B %d -O %d",
+			    command == NULL ? "sftp-server" : command,
+			    options.hpn_use_bundle, options.hpn_writer_pool);
+		if (argv_split(sftp_cmd, &sftp_argc, &sftp_argv, 1) != 0) {
+			error("internal error: can't split internal-sftp "
+			    "arguments");
+			exit(1);
 		}
-		argv[i] = NULL;
+		free(sftp_cmd);
 		optind = optreset = 1;
-		__progname = argv[0];
+		__progname = sftp_argv[0];
 #ifdef WITH_SELINUX
 		ssh_selinux_change_context("sftpd_t");
 #endif
-		exit(sftp_server_main(i, argv, s->pw));
+		exit(sftp_server_main(sftp_argc, sftp_argv, s->pw));
 	}
 
 	fflush(NULL);
@@ -1956,7 +1952,7 @@ static int
 session_subsystem_req(struct ssh *ssh, Session *s)
 {
 	struct stat st;
-	int r, success = 0;
+	int r, success = 0, found = 0;
 	char *prog, *cmd, *type;
 	u_int i;
 
@@ -1967,61 +1963,58 @@ session_subsystem_req(struct ssh *ssh, Session *s)
 	    s->pw->pw_name);
 
 	for (i = 0; i < options.num_subsystems; i++) {
-		if (strcmp(s->subsys, options.subsystem_name[i]) == 0) {
-			prog = options.subsystem_command[i];
-			cmd = options.subsystem_args[i];
-			if (strcmp(INTERNAL_SFTP_NAME, prog) == 0) {
-				s->is_subsystem = SUBSYSTEM_INT_SFTP;
-				debug("subsystem: %s", prog);
-			} else {
-				if (stat(prog, &st) == -1)
-					debug("subsystem: cannot stat %s: %s",
-					    prog, strerror(errno));
-				s->is_subsystem = SUBSYSTEM_EXT;
-				debug("subsystem: exec() %s", cmd);
-			}
-			xasprintf(&type, "session:subsystem:%s",
-			    options.subsystem_name[i]);
-			channel_set_xtype(ssh, s->chanid, type);
-			free(type);
-			if (s->is_subsystem == SUBSYSTEM_EXT &&
-			    strcmp(s->subsys, "sftp") == 0) {
-				/*
-				 * HPN: hand the operator's sshd_config controls to
-				 * the hpnsftp-server via argv (not environment vars,
-				 * so a user cannot override them under
-				 * PermitUserEnvironment):
-				 *   -B  HPNUseBundle       (bundle path master toggle)
-				 *   -O  HPNWriterPool      (server writer-pool toggle)
-				 *   -W  HPNMaxConcurrentWorkers (per-user cap, only
-				 *       when configured >0)
-				 * This couples the sftp subsystem to an hpnsftp-server
-				 * that understands these flags, which is expected when
-				 * running hpnsshd.
-				 */
-				char *hpncmd;
-				if (options.hpn_max_concurrent_workers > 0)
-					xasprintf(&hpncmd,
-					    "%s -B %d -O %d -W %d", cmd,
-					    options.hpn_use_bundle,
-					    options.hpn_writer_pool,
-					    options.hpn_max_concurrent_workers);
-				else
-					xasprintf(&hpncmd, "%s -B %d -O %d", cmd,
-					    options.hpn_use_bundle,
-					    options.hpn_writer_pool);
-				success = do_exec(ssh, s, hpncmd) == 0;
-				free(hpncmd);
-			} else {
-				success = do_exec(ssh, s, cmd) == 0;
-			}
-			break;
+		if (strcmp(s->subsys, options.subsystem_name[i]) != 0)
+			continue;
+		found = 1;
+		prog = options.subsystem_command[i];
+		cmd = options.subsystem_args[i];
+		if (strcmp(INTERNAL_SFTP_NAME, prog) == 0) {
+			s->is_subsystem = SUBSYSTEM_INT_SFTP;
+			debug("subsystem: %s", prog);
+		} else {
+			if (stat(prog, &st) == -1)
+				debug("subsystem: cannot stat %s: %s",
+				    prog, strerror(errno));
+			s->is_subsystem = SUBSYSTEM_EXT;
+			debug("subsystem: exec() %s", cmd);
 		}
+		xasprintf(&type, "session:subsystem:%s",
+		    options.subsystem_name[i]);
+		channel_set_xtype(ssh, s->chanid, type);
+		free(type);
+		if (s->is_subsystem == SUBSYSTEM_EXT &&
+		    strcmp(s->subsys, "sftp") == 0) {
+			/*
+			 * HPN: hand the operator's sshd_config controls to the
+			 * hpnsftp-server via argv (not env, so a user cannot
+			 * override them under PermitUserEnvironment): -B
+			 * HPNUseBundle, -O HPNWriterPool, and -W the per-user
+			 * worker cap when configured (>0).  Assumes the "sftp"
+			 * subsystem binary is HPN-aware (expected under hpnsshd).
+			 */
+			char *hpncmd;
+			if (options.hpn_max_concurrent_workers > 0)
+				xasprintf(&hpncmd, "%s -B %d -O %d -W %d", cmd,
+				    options.hpn_use_bundle,
+				    options.hpn_writer_pool,
+				    options.hpn_max_concurrent_workers);
+			else
+				xasprintf(&hpncmd, "%s -B %d -O %d", cmd,
+				    options.hpn_use_bundle,
+				    options.hpn_writer_pool);
+			success = do_exec(ssh, s, hpncmd) == 0;
+			free(hpncmd);
+		} else {
+			success = do_exec(ssh, s, cmd) == 0;
+		}
+		break;
 	}
 
-	if (!success)
-		logit("subsystem request for %.100s by user %s failed, "
-		    "subsystem not found", s->subsys, s->pw->pw_name);
+	if (!success) {
+		logit("subsystem request for %.100s by user %s failed, %s",
+		    s->subsys, s->pw->pw_name,
+		    found ? "execution failed" : "subsystem not found");
+	}
 
 	return success;
 }
