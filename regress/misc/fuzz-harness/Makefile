@@ -103,13 +103,13 @@ mkcorpus_sftp_tar_parser: mkcorpus_sftp_tar_parser.c ../../../sftp-hpn-tar.o
 mkcorpus_sftp_bundle_fetch_parse: mkcorpus_sftp_bundle_fetch_parse.c
 	$(CC) $(CFLAGS) -o $@ mkcorpus_sftp_bundle_fetch_parse.c
 
-# hpn_status_frame_fuzz: self-contained header-only parser (the status
-# relay consumer in scp.c); no tree objects needed.
-hpn_status_frame_fuzz: hpn_status_frame_fuzz.o
-	$(CXX) -o $@ hpn_status_frame_fuzz.o $(FUZZ_FLAGS)
+# hpn_status_frame_fuzz: the status-relay frame parser (consumer side in
+# scp.c).  hpn-status-frame.o is libc-only; no other tree objects needed.
+hpn_status_frame_fuzz: hpn_status_frame_fuzz.o ../../../hpn-status-frame.o
+	$(CXX) -o $@ hpn_status_frame_fuzz.o ../../../hpn-status-frame.o $(FUZZ_FLAGS)
 
-mkcorpus_hpn_status_frame: mkcorpus_hpn_status_frame.c
-	$(CC) $(CFLAGS) -o $@ mkcorpus_hpn_status_frame.c
+mkcorpus_hpn_status_frame: mkcorpus_hpn_status_frame.c ../../../hpn-status-frame.o
+	$(CC) $(CFLAGS) -o $@ mkcorpus_hpn_status_frame.c ../../../hpn-status-frame.o
 
 # Build seeds for the HPN-SSH SFTP-extension fuzzers.  Run this once
 # before invoking the corresponding ./*_fuzz binaries.
