@@ -1534,11 +1534,6 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 				++errs;
 				continue;
 			}
-			if (tport != -1 && tport != SSH_DEFAULT_PORT) {
-				/* This would require the remote support URIs */
-				fatal("target port not supported with two "
-				    "remote hosts and the -R option");
-			}
 
 			freeargs(&alist);
 			addargs(&alist, "%s", ssh_program);
@@ -1561,6 +1556,20 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 			addargs(&alist, "--");
 			addargs(&alist, "%s", host);
 			addargs(&alist, "%s", cmd);
+			/*
+			 * HPN: make -R a parallel, direct source->target transfer --
+			 * forward -j (parallel streams) and a non-default target port
+			 * into the source's scp.  The source connects to the target,
+			 * so its -P is the target port (tport).
+			 */
+			if (parallel_num_streams > 1) {
+				addargs(&alist, "-j");
+				addargs(&alist, "%d", parallel_num_streams);
+			}
+			if (tport != -1 && tport != SSH_DEFAULT_PORT) {
+				addargs(&alist, "-P");
+				addargs(&alist, "%d", tport);
+			}
 			addargs(&alist, "%s", src);
 			addargs(&alist, "%s%s%s:%s",
 			    tuser ? tuser : "", tuser ? "@" : "",
