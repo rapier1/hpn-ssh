@@ -81,7 +81,7 @@ MKDIR_P=@MKDIR_P@
 
 .SUFFIXES: .lo
 
-TARGETS=hpnssh$(EXEEXT) hpnsshd$(EXEEXT) hpnsshd-session$(EXEEXT) hpnsshd-auth$(EXEEXT) hpnssh-add$(EXEEXT) hpnssh-keygen$(EXEEXT) hpnssh-keyscan${EXEEXT} hpnssh-keysign${EXEEXT} hpnssh-pkcs11-helper$(EXEEXT) hpnssh-agent$(EXEEXT) hpnscp$(EXEEXT) hpnsftp-server$(EXEEXT) hpnsftp$(EXEEXT) hpnssh-sk-helper$(EXEEXT)
+TARGETS=hpnssh$(EXEEXT) hpnsshd$(EXEEXT) hpnsshd-session$(EXEEXT) hpnsshd-auth$(EXEEXT) hpnssh-add$(EXEEXT) hpnssh-keygen$(EXEEXT) hpnssh-keyscan${EXEEXT} hpnssh-keysign${EXEEXT} hpnssh-pkcs11-helper$(EXEEXT) hpnssh-agent$(EXEEXT) hpnscp$(EXEEXT) hpn3scp$(EXEEXT) hpnsftp-server$(EXEEXT) hpnsftp$(EXEEXT) hpnssh-sk-helper$(EXEEXT)
 
 LIBOPENSSH_OBJS=\
 	ssh_api.o \
@@ -163,9 +163,11 @@ SSHD_AUTH_OBJS=sshd-auth.o \
 
 SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-hpn-verify.o sftp-hpn-verify-hash.o sftp-fault-inject.o sftp-lustre.o sftp-lustre-client.o sftp-hpn-bundle-client.o sftp-hpn-tar.o sftp-hpn-bundle-pool.o sftp-glob.o ssherr-nolibcrypto.o
 
-SCP_OBJS=	scp.o progressmeter.o hpn-status-frame.o $(SFTP_CLIENT_OBJS) \
+SCP_OBJS=	scp.o progressmeter.o hpn-status-frame.o hpn3scp-run.o $(SFTP_CLIENT_OBJS) \
 		sftp-workqueue.o sftp-parallel.o sftp-parallel-respawn.o sftp-parallel-watchdog.o sftp-parallel-reporter.o sftp-parallel-unit.o sftp-parallel-worker.o sftp-parallel-walk.o \
 		sftp-parallel-config.o readconf.o $(P11OBJS) $(SKOBJS)
+
+HPN3SCP_OBJS=	hpn3scp.o hpn3scp-proto.o hpn3scp-run.o hpn-status-frame.o
 
 SSHADD_OBJS=	ssh-add.o $(P11OBJS) $(SKOBJS)
 
@@ -248,6 +250,9 @@ hpnsshd-auth$(EXEEXT): libssh.a $(LIBCOMPAT) $(SSHD_AUTH_OBJS)
 
 hpnscp$(EXEEXT): $(LIBCOMPAT) libssh.a $(SCP_OBJS)
 	$(LD) -o $@ $(SCP_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(CHANNELLIBS) $(LIBARCHIVE)
+
+hpn3scp$(EXEEXT): $(LIBCOMPAT) libssh.a $(HPN3SCP_OBJS)
+	$(LD) -o $@ $(HPN3SCP_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(CHANNELLIBS) $(LIBARCHIVE)
 
 hpnssh-add$(EXEEXT): $(LIBCOMPAT) libssh.a $(SSHADD_OBJS)
 	$(LD) -o $@ $(SSHADD_OBJS) $(LDFLAGS) -lssh -lopenbsd-compat $(LIBS) $(CHANNELLIBS)

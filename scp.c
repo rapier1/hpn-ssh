@@ -112,6 +112,7 @@
 #include "pathnames.h"
 #include "log.h"
 #include "hpn-status-frame.h"
+#include "hpn3scp-run.h"
 #include "misc.h"
 #include "progressmeter.h"
 #include "utf8.h"
@@ -315,79 +316,90 @@ do_local_cmd(arglist *a)
 }
 
 /*
- * HPN status relay, consumer side (hpn-status-relay-design.md).  State
- * shared between the frame callback and the launch-and-render loop in
- * do_local_cmd_status().
+ * HPN status relay, consumer side (hpn-status-relay-design.md).  scp drives
+ * a local ANSI progress meter from the frames the shared runner decodes.
+ * The meter's byte counter is fed from PROGRESS frames; the meter starts on
+ * the first PROGRESS (only if showprogress) and its target grows as the
+ * remote total is learned.
  */
-struct hpns_relay_state {
-	const char *label;	/* meter label (built from local argv only) */
+struct scp_meter {
+	const char *label;	/* built from local argv only, never remote bytes */
 	off_t ctr;		/* meter counter, fed from frames */
 	off_t total;		/* last known remote total */
-	int got_hello;		/* peer speaks frames */
-	int got_progress;	/* at least one PROGRESS seen */
-	int meter_on;		/* local meter started */
+	int meter_on;
 };
 
-/*
- * Frame callback: fold one frame into the relay state.  Numbers only by
- * design; frame types we don't know are skipped (forward compatibility).
- */
 static void
-hpns_relay_frame(u_char type, const u_char *payload, uint16_t plen, void *ctx)
+scp_meter_hello(const struct hpns_hello *h, void *ctx)
 {
-	struct hpns_relay_state *st = ctx;
-	struct hpns_hello h;
-	struct hpns_progress pr;
-	struct hpns_end e;
+	struct scp_meter *m = ctx;
 
-	switch (type) {
-	case HPNS_T_HELLO:
-		if (hpns_decode_hello(payload, plen, &h) == 0) {
-			st->got_hello = 1;
-			if (h.total_bytes > 0)
-				st->total = (off_t)h.total_bytes;
-		}
-		break;
-	case HPNS_T_PROGRESS:
-		if (hpns_decode_progress(payload, plen, &pr) == 0) {
-			st->got_hello = 1;	/* implied */
-			st->got_progress = 1;
-			st->ctr = (off_t)pr.bytes_done;
-			if (pr.bytes_total > 0)
-				st->total = (off_t)pr.bytes_total;
-		}
-		break;
-	case HPNS_T_END:
-		if (hpns_decode_end(payload, plen, &e) == 0)
-			st->ctr = (off_t)e.bytes_done;
-		break;
-	default:
-		break;
+	if (h->total_bytes > 0)
+		m->total = (off_t)h->total_bytes;
+}
+
+static void
+scp_meter_progress(const struct hpns_progress *p, void *ctx)
+{
+	struct scp_meter *m = ctx;
+
+	m->ctr = (off_t)p->bytes_done;
+	if (p->bytes_total > 0)
+		m->total = (off_t)p->bytes_total;
+	if (!m->meter_on && showprogress) {
+		start_progress_meter(m->label, m->total, &m->ctr);
+		m->meter_on = 1;
+	}
+	if (m->meter_on) {
+		progress_meter_set_total(m->total);
+		refresh_progress_meter(0);
 	}
 }
 
+static void
+scp_meter_end(const struct hpns_end *e, void *ctx)
+{
+	struct scp_meter *m = ctx;
+
+	m->ctr = (off_t)e->bytes_done;
+}
+
+static void
+scp_meter_tick(void *ctx)
+{
+	struct scp_meter *m = ctx;
+
+	if (m->meter_on)
+		refresh_progress_meter(0);
+}
+
+static void
+scp_meter_degrade(void *ctx)
+{
+	struct scp_meter *m = ctx;
+
+	if (m->meter_on) {
+		stop_progress_meter();
+		m->meter_on = 0;
+	}
+	error("remote status stream garbled; continuing without progress "
+	    "display");
+}
+
 /*
- * Variant of do_local_cmd() for -R transfers with the status relay
- * armed: launch the ssh with a piped stdout, parse HPNS frames from it
- * and render a local progress meter.  Strictly telemetry: any protocol
- * problem degrades to verbatim passthrough of the child's output, and
- * the return value comes from the child's exit status exactly as in
- * do_local_cmd().  A source that never speaks frames (old or stock scp)
- * produces silence or raw output; both are handled.
+ * Variant of do_local_cmd() for -R transfers with the status relay armed:
+ * launch the ssh with a piped stdout via the shared runner, which parses
+ * HPNS frames and drives the meter through the hooks above; raw output from
+ * a source that does not speak frames passes through to our stdout.  Return
+ * value is the child exit status, exactly as do_local_cmd().
  */
 static int
 do_local_cmd_status(arglist *a, const char *label)
 {
-	struct hpns_relay_state st;
-	struct hpns_parser ps;
-	struct pollfd pfd;
-	u_char rb[4096];
+	struct scp_meter m;
+	struct hpn_run_hooks h;
 	char *cp;
-	double t0;
-	size_t left;
-	ssize_t n;
-	int pfds[2], status, passthrough = 0;
-	pid_t pid;
+	int r;
 
 	if (a->num == 0)
 		fatal("do_local_cmd_status: no arguments");
@@ -398,117 +410,29 @@ do_local_cmd_status(arglist *a, const char *label)
 		free(cp);
 	}
 
-	if (pipe(pfds) == -1)
-		fatal("do_local_cmd_status: pipe: %s", strerror(errno));
-	if ((pid = fork()) == -1)
-		fatal("do_local_cmd_status: fork: %s", strerror(errno));
-
-	if (pid == 0) {
-		if (dup2(pfds[1], STDOUT_FILENO) == -1) {
-			perror("dup2");
-			exit(1);
-		}
-		close(pfds[0]);
-		close(pfds[1]);
-		execvp(a->list[0], a->list);
-		perror(a->list[0]);
-		exit(1);
-	}
-	close(pfds[1]);
-
-	do_cmd_pid = pid;
+	/* the runner sets/clears do_cmd_pid; our killchild handler reads it */
 	ssh_signal(SIGTERM, killchild);
 	ssh_signal(SIGINT, killchild);
 	ssh_signal(SIGHUP, killchild);
 
-	memset(&st, 0, sizeof(st));
-	memset(&ps, 0, sizeof(ps));
-	st.label = label;
-	t0 = monotime_double();
+	memset(&m, 0, sizeof(m));
+	m.label = label;
+	memset(&h, 0, sizeof(h));
+	h.on_hello = scp_meter_hello;
+	h.on_progress = scp_meter_progress;
+	h.on_end = scp_meter_end;
+	h.on_tick = scp_meter_tick;
+	h.on_degrade = scp_meter_degrade;
+	h.passthrough_fd = STDOUT_FILENO;
+	h.ctx = &m;
 
-	for (;;) {
-		pfd.fd = pfds[0];
-		pfd.events = POLLIN;
-		if (poll(&pfd, 1, 1000) == -1) {
-			if (errno == EINTR) {
-				/* SIGALRM tick: repaint if one is due */
-				if (st.meter_on)
-					refresh_progress_meter(0);
-				continue;
-			}
-			fatal("do_local_cmd_status: poll: %s",
-			    strerror(errno));
-		}
-		if (!(pfd.revents & (POLLIN|POLLHUP|POLLERR))) {
-			/* quiet second: degrade if the peer never spoke */
-			if (!passthrough && !st.got_hello &&
-			    monotime_double() - t0 > 5.0)
-				passthrough = 1;
-			if (st.meter_on)
-				refresh_progress_meter(0);
-			continue;
-		}
-		n = read(pfds[0], rb, sizeof(rb));
-		if (n == -1) {
-			if (errno == EINTR || errno == EAGAIN)
-				continue;
-			break;
-		}
-		if (n == 0)
-			break;			/* EOF: child is done */
-		if (passthrough) {
-			(void)atomicio(vwrite, STDOUT_FILENO, rb, (size_t)n);
-			continue;
-		}
-		if (hpns_parser_feed(&ps, rb, (size_t)n, hpns_relay_frame,
-		    &st, &left) != 0) {
-			/* Garbled stream: warn once, flush what the parser
-			 * holds plus the unbuffered tail, then pass all
-			 * later output through verbatim.  The transfer is
-			 * unaffected (telemetry, never control). */
-			if (st.meter_on) {
-				stop_progress_meter();
-				st.meter_on = 0;
-			}
-			error("remote status stream garbled; continuing "
-			    "without progress display");
-			if (ps.have > 0)
-				(void)atomicio(vwrite, STDOUT_FILENO,
-				    ps.buf, ps.have);
-			if (left > 0)
-				(void)atomicio(vwrite, STDOUT_FILENO,
-				    rb + ((size_t)n - left), left);
-			ps.have = 0;
-			passthrough = 1;
-			continue;
-		}
-		if (st.got_progress && !st.meter_on && showprogress) {
-			start_progress_meter(st.label, st.total, &st.ctr);
-			st.meter_on = 1;
-		}
-		if (st.meter_on) {
-			progress_meter_set_total(st.total);
-			refresh_progress_meter(0);
-		}
-	}
-	close(pfds[0]);
+	r = hpn_run_status(a, &do_cmd_pid, &h);
 
-	if (st.meter_on) {
+	if (m.meter_on) {
 		refresh_progress_meter(1);
 		stop_progress_meter();
 	}
-
-	while (waitpid(pid, &status, 0) == -1)
-		if (errno != EINTR)
-			fatal("do_local_cmd_status: waitpid: %s",
-			    strerror(errno));
-
-	do_cmd_pid = -1;
-
-	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-		return (-1);
-
-	return (0);
+	return (r);
 }
 
 /*
