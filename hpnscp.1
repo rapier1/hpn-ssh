@@ -328,6 +328,20 @@ This requires that
 .Nm
 running on the origin host can authenticate to the destination host without
 requiring a password.
+.Pp
+A non-default destination port may be given by writing the destination
+as an
+.Ar scp://
+URI; it is forwarded to the origin host's
+.Nm
+along with any
+.Fl j
+parallel-streams request.
+When run from a terminal, a progress meter for the remote transfer is
+displayed when the origin host runs a current HPN-SSH
+.Nm ;
+against older or stock OpenSSH origin hosts the transfer proceeds
+without a meter.
 .It Fl r
 Recursively copy entire directories.
 Note that

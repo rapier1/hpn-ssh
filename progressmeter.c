@@ -42,6 +42,7 @@
 
 #include "progressmeter.h"
 #include "atomicio.h"
+#include "hpn-status-frame.h"
 #include "log.h"
 #include "misc.h"
 #include "utf8.h"
@@ -79,6 +80,28 @@ static int win_size;		/* terminal window size */
 static volatile sig_atomic_t win_resized; /* for window resizing */
 static volatile sig_atomic_t alarm_fired;
 
+/*
+ * HPN status relay (hpn-status-relay-design.md): when frame mode is
+ * armed the meter machinery runs as usual but refresh() emits binary
+ * status frames on stdout instead of ANSI meter text.  Serial transfers
+ * run one meter per file, so completed meters fold into an aggregate
+ * accumulator here; the parallel path runs a single aggregate meter and
+ * pushes fleet telemetry in via the setters below.  Emission is rate
+ * limited so per-file meter start/stop churn from many small files
+ * cannot flood the channel - the 1 Hz alarm cadence carries the truth.
+ */
+#define FRAME_MIN_INTERVAL	0.2	/* seconds between PROGRESS frames */
+static int frame_mode;			/* emit frames instead of text */
+static double frame_last_emit;		/* rate limiter timestamp */
+static off_t frames_acc_bytes;		/* bytes from completed meters */
+static u_int32_t frames_files_done;	/* completed meters (serial) */
+static u_int32_t frames_files_total;	/* external, 0 = unknown */
+static int frames_files_ext;		/* setter overrides meter counts */
+static u_int32_t frames_streams = 1;	/* effective -j for HELLO */
+static u_int16_t frames_workers_active;
+static u_int16_t frames_workers_stalled;
+static u_int16_t frames_flags;
+
 /* units for format_size */
 static const char unit[] = " KMGT";
 
@@ -86,6 +109,47 @@ static int
 can_output(void)
 {
 	return (getpgrp() == tcgetpgrp(STDOUT_FILENO));
+}
+
+/*
+ * Emit one PROGRESS frame from the current meter state (frame mode
+ * only).  Called from refresh_progress_meter() after the shared
+ * rate/EMA math, and from stop_progress_meter() at meter boundaries.
+ * Rate limited unless forced; the periodic 1 Hz alarm tick always
+ * carries current totals, so dropped boundary frames lose nothing.
+ */
+static void
+frames_emit_progress(int force)
+{
+	struct hpns_progress pr;
+	u_char fbuf[HPNS_HDR_LEN + HPNS_PROGRESS_LEN];
+	off_t bytes_left;
+	double now;
+
+	now = monotime_double();
+	if (!force && now - frame_last_emit < FRAME_MIN_INTERVAL)
+		return;
+	frame_last_emit = now;
+
+	memset(&pr, 0, sizeof(pr));
+	pr.bytes_done = (uint64_t)(frames_acc_bytes + cur_pos);
+	pr.bytes_total = end_pos > 0 ?
+	    (uint64_t)(frames_acc_bytes + end_pos) : 0;
+	pr.rate_bps = bytes_per_second > 0 ?
+	    (uint64_t)bytes_per_second : 0;
+	bytes_left = end_pos - cur_pos;
+	if (bytes_left > 0 && bytes_per_second > 0)
+		pr.eta_sec = (uint32_t)(bytes_left / bytes_per_second);
+	else
+		pr.eta_sec = HPNS_ETA_UNKNOWN;
+	pr.files_done = frames_files_done;
+	pr.files_total = frames_files_total;
+	pr.workers_active = frames_workers_active;
+	pr.workers_stalled = frames_workers_stalled;
+	pr.flags = frames_flags;
+
+	atomicio(vwrite, STDOUT_FILENO, fbuf,
+	    hpns_encode_progress(fbuf, &pr));
 }
 
 /* size needed to format integer type v, using (nbits(v) * log2(10) / 10) */
@@ -141,12 +205,13 @@ refresh_progress_meter(int force_update)
 	off_t delta_pos;
 
 	if (file == NULL || (!force_update && !alarm_fired && !win_resized) ||
-	    !can_output())
+	    (!frame_mode && !can_output()))
 		return;
 	alarm_fired = 0;
 
 	if (win_resized) {
-		setscreensize();
+		if (!frame_mode)
+			setscreensize();
 		win_resized = 0;
 	}
 
@@ -196,6 +261,15 @@ refresh_progress_meter(int force_update)
 		bytes_per_second = cur_speed;
 
 	last_update = now;
+
+	/* HPN status relay: frame mode replaces the ANSI paint entirely -
+	 * emit a binary PROGRESS frame from the freshly computed state and
+	 * skip all terminal work below. */
+	if (frame_mode) {
+		frames_emit_progress(force_update);
+		last_pos = cur_pos;
+		return;
+	}
 
 	/* Don't bother if we can't even display the completion percentage */
 	if (win_size < 4)
@@ -315,16 +389,25 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 	stalled = 0;
 	bytes_per_second = 0;
 
-	pthread_mutex_lock(&meter_mu);
-	meter_active = 1;
-	pthread_mutex_unlock(&meter_mu);
-	log_set_output_guard(meter_log_enter, meter_log_exit);
+	/*
+	 * Frame mode never paints the terminal, so skip the TTY-only setup:
+	 * the log/meter interleave guard writes "\r\033[K" to stdout, which
+	 * would corrupt the frame stream, and the screen-size ioctl is
+	 * meaningless on a pipe.
+	 */
+	if (!frame_mode) {
+		pthread_mutex_lock(&meter_mu);
+		meter_active = 1;
+		pthread_mutex_unlock(&meter_mu);
+		log_set_output_guard(meter_log_enter, meter_log_exit);
 
-	setscreensize();
+		setscreensize();
+	}
 	refresh_progress_meter(1);
 
 	ssh_signal(SIGALRM, sig_alarm);
-	ssh_signal(SIGWINCH, sig_winch);
+	if (!frame_mode)
+		ssh_signal(SIGWINCH, sig_winch);
 	alarm(UPDATE_INTERVAL);
 }
 
@@ -337,6 +420,27 @@ stop_progress_meter(void)
 	meter_active = 0;
 	pthread_mutex_unlock(&meter_mu);
 
+	/*
+	 * Frame mode: fold the finished meter into the aggregate so the
+	 * next meter's frames continue the running totals (serial scp runs
+	 * one meter per file).  A boundary frame is emitted through the
+	 * regular limiter - if it is dropped, the next 1 Hz tick or the
+	 * final END frame carries the totals.
+	 */
+	if (frame_mode) {
+		if (file != NULL) {
+			if (counter != NULL)
+				cur_pos = *counter;
+			frames_emit_progress(0);
+			frames_acc_bytes += cur_pos;
+			if (!frames_files_ext)
+				frames_files_done++;
+			cur_pos = 0;
+		}
+		file = NULL;
+		return;
+	}
+
 	if (!can_output())
 		return;
 
@@ -346,6 +450,88 @@ stop_progress_meter(void)
 
 	atomicio(vwrite, STDOUT_FILENO, "\n", 1);
 	file = NULL;
+}
+
+/*
+ * Arm HPN status-relay frame mode (A side; see hpn-status-relay-design.md).
+ * Called once at startup when HPN_ENABLE_REMOTE_PROGRESS is set and stdout
+ * is not a TTY.  Emits the HELLO frame (version + capability advertisement;
+ * totals mostly unknown this early) so the consumer can distinguish "peer
+ * speaks frames" from an old peer's silence.
+ */
+void
+progressmeter_frame_mode(u_int streams)
+{
+	struct hpns_hello h;
+	u_char fbuf[HPNS_HDR_LEN + HPNS_HELLO_LEN];
+
+	frame_mode = 1;
+	frames_streams = streams > 0 ? (u_int32_t)streams : 1;
+
+	memset(&h, 0, sizeof(h));
+	h.proto_ver = HPNS_VERSION;
+	h.caps = 0;			/* no pull support in v1 */
+	h.total_bytes = 0;
+	h.total_files = 0;
+	h.streams = frames_streams;
+	atomicio(vwrite, STDOUT_FILENO, fbuf, hpns_encode_hello(fbuf, &h));
+}
+
+/*
+ * Fleet telemetry for PROGRESS frames, pushed by the parallel reporter
+ * tick.  No-op storage unless frame mode is armed (the reporter calls
+ * unconditionally).
+ */
+void
+progressmeter_frames_set_workers(u_int active, u_int stalled)
+{
+	frames_workers_active = (u_int16_t)(active > 0xffff ? 0xffff : active);
+	frames_workers_stalled =
+	    (u_int16_t)(stalled > 0xffff ? 0xffff : stalled);
+}
+
+/*
+ * External file counts (parallel path), overriding the serial
+ * one-meter-per-file accounting.
+ */
+void
+progressmeter_frames_set_files(u_int done, u_int total)
+{
+	frames_files_ext = 1;
+	frames_files_done = (u_int32_t)done;
+	frames_files_total = (u_int32_t)total;
+}
+
+/*
+ * Emit the final END frame (A side, once, on the way out of main).
+ * Advisory only: the consumer takes success/failure from the transport
+ * exit status.  No-op unless frame mode is armed.
+ */
+void
+progressmeter_frames_end(int ok, u_int files_failed)
+{
+	struct hpns_end e;
+	u_char fbuf[HPNS_HDR_LEN + HPNS_END_LEN];
+
+	if (!frame_mode)
+		return;
+	memset(&e, 0, sizeof(e));
+	e.bytes_done = (uint64_t)frames_acc_bytes;
+	e.files_done = frames_files_done;
+	e.files_failed = (u_int32_t)files_failed;
+	e.ok = ok ? 1 : 0;
+	atomicio(vwrite, STDOUT_FILENO, fbuf, hpns_encode_end(fbuf, &e));
+}
+
+/*
+ * Adjust a running meter's target size (B side: the relay consumer
+ * learns/grows the remote total from PROGRESS frames after the meter
+ * has started).
+ */
+void
+progress_meter_set_total(off_t total)
+{
+	end_pos = total;
 }
 
 static void

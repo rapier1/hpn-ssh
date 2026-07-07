@@ -17,8 +17,9 @@ TARGETS=pubkey_fuzz sig_fuzz authopt_fuzz authkeys_fuzz sshsig_fuzz \
 	mkcorpus_sntrup761 sntrup761_enc_fuzz sntrup761_dec_fuzz \
 	sftp_fs_info_fuzz \
 	sftp_tar_parser_fuzz sftp_bundle_fetch_parse_fuzz \
+	hpn_status_frame_fuzz \
 	mkcorpus_sftp_fs_info mkcorpus_sftp_tar_parser \
-	mkcorpus_sftp_bundle_fetch_parse
+	mkcorpus_sftp_bundle_fetch_parse mkcorpus_hpn_status_frame
 
 all: $(TARGETS)
 
@@ -101,6 +102,14 @@ mkcorpus_sftp_tar_parser: mkcorpus_sftp_tar_parser.c ../../../sftp-hpn-tar.o
 
 mkcorpus_sftp_bundle_fetch_parse: mkcorpus_sftp_bundle_fetch_parse.c
 	$(CC) $(CFLAGS) -o $@ mkcorpus_sftp_bundle_fetch_parse.c
+
+# hpn_status_frame_fuzz: self-contained header-only parser (the status
+# relay consumer in scp.c); no tree objects needed.
+hpn_status_frame_fuzz: hpn_status_frame_fuzz.o
+	$(CXX) -o $@ hpn_status_frame_fuzz.o $(FUZZ_FLAGS)
+
+mkcorpus_hpn_status_frame: mkcorpus_hpn_status_frame.c
+	$(CC) $(CFLAGS) -o $@ mkcorpus_hpn_status_frame.c
 
 # Build seeds for the HPN-SSH SFTP-extension fuzzers.  Run this once
 # before invoking the corresponding ./*_fuzz binaries.

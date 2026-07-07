@@ -26,3 +26,11 @@
 void	start_progress_meter(const char *, off_t, off_t *);
 void	refresh_progress_meter(int);
 void	stop_progress_meter(void);
+
+/* HPN status relay (hpn-status-relay-design.md): binary frame emission
+ * in place of the ANSI meter when stdout is a pipe and the peer asked. */
+void	progressmeter_frame_mode(u_int);
+void	progressmeter_frames_set_workers(u_int, u_int);
+void	progressmeter_frames_set_files(u_int, u_int);
+void	progressmeter_frames_end(int, u_int);
+void	progress_meter_set_total(off_t);

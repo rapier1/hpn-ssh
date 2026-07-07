@@ -3259,15 +3259,49 @@ client_session2_setup(struct ssh *ssh, int id, int want_tty, int want_subsystem,
 			 * sshbuf_dup_string returns a NUL-terminated copy (and NULL
 			 * on an embedded NUL or OOM), so we never sprintf/strstr over
 			 * a non-NUL-terminated sshbuf_ptr.  Only rewrite a command
-			 * that actually starts with "scp".
+			 * whose program token is "scp".
 			 */
 			char *cur_cmd = sshbuf_dup_string(cmd);
+			const char *prog = cur_cmd;
 
-			if (cur_cmd != NULL && strncmp(cur_cmd, "scp", 3) == 0) {
+			/*
+			 * HPN status relay: the launching hpnscp may prefix
+			 * the command with "env NAME=VAL ..." (e.g.
+			 * HPN_ENABLE_REMOTE_PROGRESS for -R transfers).  Skip
+			 * "env" and its NAME=VAL assignments so the program
+			 * token behind the prefix is what gets rewritten.
+			 */
+			if (prog != NULL && strncmp(prog, "env ", 4) == 0) {
+				const char *tok = prog + 4, *sp, *eq;
+
+				while (*tok == ' ')
+					tok++;
+				while (*tok != '\0') {
+					sp = strchr(tok, ' ');
+					eq = strchr(tok, '=');
+					/* first token without '=' is the
+					 * program */
+					if (eq == NULL ||
+					    (sp != NULL && eq > sp))
+						break;
+					if (sp == NULL) {
+						tok += strlen(tok);
+						break;
+					}
+					tok = sp + 1;
+					while (*tok == ' ')
+						tok++;
+				}
+				prog = tok;
+			}
+
+			if (cur_cmd != NULL && strncmp(prog, "scp", 3) == 0 &&
+			    (prog[3] == ' ' || prog[3] == '\0')) {
 				char *new_cmd = NULL;
 
 				debug_f("Rewriting scp command for hpnscp.");
-				xasprintf(&new_cmd, "hpn%s", cur_cmd);
+				xasprintf(&new_cmd, "%.*shpn%s",
+				    (int)(prog - cur_cmd), cur_cmd, prog);
 				debug_f("Command was: %s and is now %s",
 				      cur_cmd, new_cmd);
 				/* free the existing sshbuf 'cmd', recreate it and

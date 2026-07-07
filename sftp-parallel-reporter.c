@@ -850,6 +850,29 @@ parallel_reporter_thread(void *arg)
 			p->aggregate_progress_counter =
 			    (off_t)(bytes - p->progress_bytes_baseline);
 		}
+		/* HPN status relay: keep the frame emitter's fleet telemetry
+		 * fresh (stored unconditionally; only read when frame mode
+		 * is armed).  Same lock discipline as the sibling fleet
+		 * loops. */
+		{
+			u_int fr_active = 0, fr_stalled = 0;
+
+			pthread_mutex_lock(&p->workers_mu);
+			for (int wi = 0; wi < p->num_workers; wi++) {
+				struct sftp_worker *w = p->workers[wi];
+
+				if (w == NULL || w->exited)
+					continue;
+				if (w->health == WORKER_STALLED)
+					fr_stalled++;
+				else if (w->health != WORKER_DEAD)
+					fr_active++;
+			}
+			pthread_mutex_unlock(&p->workers_mu);
+			progressmeter_frames_set_workers(fr_active,
+			    fr_stalled);
+		}
+
 		if (p->progress_meter_started)
 			refresh_progress_meter(0);
 
