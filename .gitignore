@@ -53,6 +53,7 @@ hpnssh-sk-helper
 hpnsshd
 hpnsshd-session
 hpnsshd-auth
+hpn3scp
 !regress/misc/**/Makefile
 !regress/unittests/**/Makefile
 tags
