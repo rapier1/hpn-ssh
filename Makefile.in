@@ -167,7 +167,7 @@ SCP_OBJS=	scp.o progressmeter.o hpn-status-frame.o hpn3scp-run.o $(SFTP_CLIENT_O
 		sftp-workqueue.o sftp-parallel.o sftp-parallel-respawn.o sftp-parallel-watchdog.o sftp-parallel-reporter.o sftp-parallel-unit.o sftp-parallel-worker.o sftp-parallel-walk.o \
 		sftp-parallel-config.o readconf.o $(P11OBJS) $(SKOBJS)
 
-HPN3SCP_OBJS=	hpn3scp.o hpn3scp-proto.o hpn3scp-run.o hpn-status-frame.o
+HPN3SCP_OBJS=	hpn3scp.o hpn3scp-proto.o hpn3scp-run.o hpn3scp-hostkey.o hpn-status-frame.o $(P11OBJS) $(SKOBJS)
 
 SSHADD_OBJS=	ssh-add.o $(P11OBJS) $(SKOBJS)
 

@@ -78,4 +78,11 @@ int	hpn_run_status(struct arglist *a, pid_t *pidp,
 int	hpn_run_capture(struct arglist *a, char *buf, size_t buflen,
 	    int timeout_ms);
 
+/*
+ * Fork+exec a->list[0] feeding `input` to its stdin, then reap.  Returns 0
+ * if the child exited 0, -1 otherwise.  For pushing a small payload (e.g.
+ * known_hosts lines) to a remote command via ssh.
+ */
+int	hpn_run_feed(struct arglist *a, const char *input);
+
 #endif /* HPN3SCP_RUN_H */

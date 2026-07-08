@@ -75,6 +75,7 @@ struct launch_session {
 	int		 streams;	/* -j */
 	int		 forward_agent;	/* -A: opt-in agent forwarding */
 	int		 verbosity;	/* -v count, propagated to ssh + hpnscp */
+	int		 addr_family;	/* -4/-6: 4, 6, or 0 (default) - all hops */
 	struct arglist	*hpnscp_extra;	/* -r/-o/-X/-Y forwarded to source hpnscp */
 	enum decision_policy policy;
 	char		*identity;	/* chosen A->C key, or NULL */
@@ -84,5 +85,10 @@ struct launch_session {
 };
 
 const char	*phase_name(enum launch_phase p);
+
+/* build the ssh command that reaches the source A (defined in hpn3scp.c);
+ * with_n adds -n, with_agent adds -A.  Shared with the host-key broker. */
+void		 ssh_base_args(struct launch_session *s, struct arglist *a,
+		    int with_n, int with_agent);
 
 #endif /* HPN3SCP_H */

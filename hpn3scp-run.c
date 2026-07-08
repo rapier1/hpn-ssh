@@ -274,3 +274,45 @@ hpn_run_capture(struct arglist *a, char *buf, size_t buflen, int timeout_ms)
 		return (-1);
 	return (0);
 }
+
+int
+hpn_run_feed(struct arglist *a, const char *input)
+{
+	int pfds[2], status;
+	pid_t pid;
+	size_t len;
+
+	if (a->num == 0)
+		fatal_f("no arguments");
+	len = strlen(input);
+
+	if (pipe(pfds) == -1)
+		fatal_f("pipe: %s", strerror(errno));
+	if ((pid = fork()) == -1)
+		fatal_f("fork: %s", strerror(errno));
+
+	if (pid == 0) {
+		if (dup2(pfds[0], STDIN_FILENO) == -1) {
+			perror("dup2");
+			exit(1);
+		}
+		close(pfds[0]);
+		close(pfds[1]);
+		execvp(a->list[0], a->list);
+		perror(a->list[0]);
+		exit(1);
+	}
+	close(pfds[0]);
+	/* SIGPIPE is ignored process-wide (hpn3scp main); a short write is
+	 * caught by the child's nonzero exit below. */
+	(void)atomicio(vwrite, pfds[1], (void *)input, len);
+	close(pfds[1]);
+
+	while (waitpid(pid, &status, 0) == -1)
+		if (errno != EINTR)
+			break;
+
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return (-1);
+	return (0);
+}

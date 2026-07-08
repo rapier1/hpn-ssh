@@ -31,6 +31,7 @@
 
 #include <sys/types.h>
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,7 @@
 #include "misc.h"
 #include "pathnames.h"
 #include "hpn3scp.h"
+#include "hpn3scp-hostkey.h"
 #include "hpn3scp-proto.h"
 #include "hpn3scp-run.h"
 
@@ -65,7 +67,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: hpn3scp [-Arv] [-j streams] [-o ssh_option] [-X sftp_option]\n"
+	    "usage: hpn3scp [-46Arv] [-j streams] [-o ssh_option] [-X sftp_option]\n"
 	    "               [-Y \"hpnscp switches\"] source target\n");
 	exit(1);
 }
@@ -170,7 +172,7 @@ endpoint_desc(const struct endpoint *ep, char *buf, size_t len)
  * host - the caller appends the remote command.  with_n adds -n (no stdin,
  * for the launch); with_agent adds -A (opt-in forwarding, section 0).
  */
-static void
+void
 ssh_base_args(struct launch_session *s, arglist *a, int with_n, int with_agent)
 {
 	int i;
@@ -186,6 +188,10 @@ ssh_base_args(struct launch_session *s, arglist *a, int with_n, int with_agent)
 		addargs(a, "-A");
 	for (i = 0; i < s->verbosity; i++)	/* -v propagates to the launch ssh */
 		addargs(a, "-v");
+	if (s->addr_family == 4)		/* -4/-6 applies to every hop */
+		addargs(a, "-4");
+	else if (s->addr_family == 6)
+		addargs(a, "-6");
 	if (s->src.port != -1) {
 		addargs(a, "-p");
 		addargs(a, "%d", s->src.port);
@@ -289,8 +295,16 @@ do_launch(struct launch_session *s, const char *abs_hpnscp)
 	addargs(&a, "env");
 	addargs(&a, "HPN_ENABLE_REMOTE_PROGRESS=1");
 	addargs(&a, "%s", abs_hpnscp);
+	/* the target key is trusted by now (broker or pre-existing), so hold
+	 * the workers to strict checking; a user -o after this can override */
+	addargs(&a, "-o");
+	addargs(&a, "StrictHostKeyChecking=yes");
 	for (i = 0; i < s->verbosity; i++)	/* -v propagates to the source hpnscp */
 		addargs(&a, "-v");
+	if (s->addr_family == 4)		/* the A->C transfer hop */
+		addargs(&a, "-4");
+	else if (s->addr_family == 6)
+		addargs(&a, "-6");
 	for (i = 0; i < (int)s->hpnscp_extra->num; i++)	/* -o/-X/-Y/-r */
 		addargs(&a, "%s", s->hpnscp_extra->list[i]);
 	if (s->streams > 1) {
@@ -343,11 +357,45 @@ run_session(struct launch_session *s)
 	proto_emit_resolved(sd, dd, s->streams);
 
 	/*
-	 * Stage 1 (happy path): the trust broker (Stage 2) and the A->C auth
-	 * preflight (Stage 3) are not wired yet, so this assumes the source
-	 * already trusts the target's host key and can authenticate to it -
-	 * exactly the manual precondition today.
+	 * Stage 2 - host-key trust broker.  If the source already trusts the
+	 * target (target in its known_hosts) there is nothing to do; otherwise
+	 * fetch the target key, verify it (SSHFP or an ssh-style prompt), and
+	 * add it to the source's known_hosts before we launch with strict
+	 * checking.  The A->C auth preflight (Stage 3) is still ahead.
 	 */
+	if (hpn3scp_source_knows_target(s) != 1) {
+		struct target_keyset set;
+
+		s->phase = LP_FETCH_TARGET_KEY;
+		proto_emit_phase(phase_name(s->phase));
+		if (hpn3scp_fetch_target_keys(s, &set) != 0) {
+			proto_emit_error("could not retrieve the target host key "
+			    "from the source");
+			proto_emit_done(0, 1);
+			return 1;
+		}
+		s->phase = LP_CONFIRM_KEY;
+		proto_emit_phase(phase_name(s->phase));
+		if (hpn3scp_confirm_target(s, &set) != 0) {
+			hpn3scp_free_keyset(&set);
+			proto_emit_done(0, 1);
+			return 1;
+		}
+		s->phase = LP_PROVISION;
+		proto_emit_phase(phase_name(s->phase));
+		if (hpn3scp_provision_target(s, &set) != 0) {
+			hpn3scp_free_keyset(&set);
+			proto_emit_error("could not add the target host key to "
+			    "the source's known_hosts");
+			proto_emit_done(0, 1);
+			return 1;
+		}
+		hpn3scp_free_keyset(&set);
+	} else {
+		debug("source already trusts %s; skipping host-key brokering",
+		    s->dst.host);
+	}
+
 	s->phase = LP_LAUNCH;
 	proto_emit_phase(phase_name(s->phase));
 	if (discover_remote_hpnscp(s, abs_hpnscp, sizeof(abs_hpnscp)) != 0) {
@@ -376,6 +424,7 @@ main(int argc, char **argv)
 
 	/* logs to stderr; stdout is reserved for the control protocol */
 	log_init(argv[0], SYSLOG_LEVEL_INFO, SYSLOG_FACILITY_USER, 1);
+	signal(SIGPIPE, SIG_IGN);	/* we write to child stdins (provision) */
 
 	memset(&s, 0, sizeof(s));
 	s.streams = 1;
@@ -391,12 +440,18 @@ main(int argc, char **argv)
 	 * hatch for hpnscp's native switches - one quoted string, split with
 	 * quote/escape handling so dashes travel intact.
 	 */
-	while ((ch = getopt(argc, argv, "j:Arvo:X:Y:")) != -1) {
+	while ((ch = getopt(argc, argv, "j:Arvo:X:Y:46")) != -1) {
 		switch (ch) {
 		case 'j':
 			s.streams = (int)strtol(optarg, NULL, 10);
 			if (s.streams < 1)
 				usage();
+			break;
+		case '4':
+			s.addr_family = 4;
+			break;
+		case '6':
+			s.addr_family = 6;
 			break;
 		case 'A':
 			s.forward_agent = 1;
