@@ -17,9 +17,10 @@ TARGETS=pubkey_fuzz sig_fuzz authopt_fuzz authkeys_fuzz sshsig_fuzz \
 	mkcorpus_sntrup761 sntrup761_enc_fuzz sntrup761_dec_fuzz \
 	sftp_fs_info_fuzz \
 	sftp_tar_parser_fuzz sftp_bundle_fetch_parse_fuzz \
-	hpn_status_frame_fuzz \
+	hpn_status_frame_fuzz hpn3scp_keyscan_fuzz \
 	mkcorpus_sftp_fs_info mkcorpus_sftp_tar_parser \
-	mkcorpus_sftp_bundle_fetch_parse mkcorpus_hpn_status_frame
+	mkcorpus_sftp_bundle_fetch_parse mkcorpus_hpn_status_frame \
+	mkcorpus_hpn3scp_keyscan
 
 all: $(TARGETS)
 
@@ -110,6 +111,17 @@ hpn_status_frame_fuzz: hpn_status_frame_fuzz.o ../../../hpn-status-frame.o
 
 mkcorpus_hpn_status_frame: mkcorpus_hpn_status_frame.c ../../../hpn-status-frame.o
 	$(CC) $(CFLAGS) -o $@ mkcorpus_hpn_status_frame.c ../../../hpn-status-frame.o
+
+# hpn3scp_keyscan_fuzz: the launcher's keyscan-line parser - remote-facing
+# (the SOURCE host controls every byte of the keyscan capture).  Links the
+# real hostkey/proto/run objects; sshkey parsing comes from libssh, so build
+# the tree with the same sanitizer opts (see the top-of-file NB).
+# ssh_base_args is stubbed in the .cc (its home, hpn3scp.c, has main()).
+hpn3scp_keyscan_fuzz: hpn3scp_keyscan_fuzz.o $(SK_NULL_OBJS) ../../../hpn3scp-hostkey.o ../../../hpn3scp-proto.o ../../../hpn3scp-run.o ../../../hpn-status-frame.o $(COMMON_DEPS)
+	$(CXX) -o $@ hpn3scp_keyscan_fuzz.o $(SK_NULL_OBJS) ../../../hpn3scp-hostkey.o ../../../hpn3scp-proto.o ../../../hpn3scp-run.o ../../../hpn-status-frame.o $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
+
+mkcorpus_hpn3scp_keyscan: mkcorpus_hpn3scp_keyscan.c fixed-keys.h
+	$(CC) $(CFLAGS) -o $@ mkcorpus_hpn3scp_keyscan.c
 
 # Build seeds for the HPN-SSH SFTP-extension fuzzers.  Run this once
 # before invoking the corresponding ./*_fuzz binaries.
