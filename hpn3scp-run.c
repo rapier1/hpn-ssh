@@ -28,6 +28,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -190,6 +191,85 @@ hpn_run_status(struct arglist *a, pid_t *pidp, const struct hpn_run_hooks *h)
 	if (pidp != NULL)
 		*pidp = -1;
 
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return (-1);
+	return (0);
+}
+
+int
+hpn_run_capture(struct arglist *a, char *buf, size_t buflen, int timeout_ms)
+{
+	struct pollfd pfd;
+	double deadline, rem;
+	size_t off = 0;
+	ssize_t r;
+	int pfds[2], status, killed = 0;
+	pid_t pid;
+
+	if (buflen == 0)
+		return (-1);
+	buf[0] = '\0';
+	if (a->num == 0)
+		fatal_f("no arguments");
+
+	if (pipe(pfds) == -1)
+		fatal_f("pipe: %s", strerror(errno));
+	if ((pid = fork()) == -1)
+		fatal_f("fork: %s", strerror(errno));
+
+	if (pid == 0) {
+		if (dup2(pfds[1], STDOUT_FILENO) == -1) {
+			perror("dup2");
+			exit(1);
+		}
+		close(pfds[0]);
+		close(pfds[1]);
+		execvp(a->list[0], a->list);
+		perror(a->list[0]);
+		exit(1);
+	}
+	close(pfds[1]);
+
+	deadline = monotime_double() + timeout_ms / 1000.0;
+	for (;;) {
+		rem = deadline - monotime_double();
+		if (rem <= 0.0) {
+			if (!killed) {
+				kill(pid, SIGTERM);
+				killed = 1;
+			}
+			break;			/* timed out */
+		}
+		pfd.fd = pfds[0];
+		pfd.events = POLLIN;
+		if (poll(&pfd, 1, (int)(rem * 1000)) == -1) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR)))
+			continue;
+		if (off >= buflen - 1)
+			break;			/* full: stop reading */
+		r = read(pfds[0], buf + off, buflen - 1 - off);
+		if (r == -1) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			break;
+		}
+		if (r == 0)
+			break;			/* EOF */
+		off += (size_t)r;
+	}
+	buf[off] = '\0';
+	close(pfds[0]);
+
+	while (waitpid(pid, &status, 0) == -1)
+		if (errno != EINTR)
+			break;
+
+	if (killed)
+		return (-1);
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		return (-1);
 	return (0);

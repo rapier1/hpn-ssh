@@ -68,4 +68,14 @@ struct hpn_run_hooks {
 int	hpn_run_status(struct arglist *a, pid_t *pidp,
 	    const struct hpn_run_hooks *h);
 
+/*
+ * Fork+exec a->list[0] with a piped stdout, capture up to buflen-1 bytes of
+ * its output into buf (always NUL-terminated), enforce a wall-clock timeout,
+ * and reap.  Returns 0 if the child exited 0 within the timeout, -1 otherwise
+ * (timeout, nonzero exit, or spawn failure).  For short one-shot probes (the
+ * source-binary discovery), not streaming transfers.
+ */
+int	hpn_run_capture(struct arglist *a, char *buf, size_t buflen,
+	    int timeout_ms);
+
 #endif /* HPN3SCP_RUN_H */

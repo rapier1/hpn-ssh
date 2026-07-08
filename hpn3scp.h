@@ -32,6 +32,8 @@
 
 #include <sys/types.h>
 
+struct arglist;			/* misc.h; only pointers needed here */
+
 /* Phase state machine (hpn-launcher-design.md sec 7). */
 enum launch_phase {
 	LP_RESOLVE,		/* parse the endpoint specs */
@@ -71,6 +73,9 @@ struct launch_session {
 	struct endpoint	 src;
 	struct endpoint	 dst;
 	int		 streams;	/* -j */
+	int		 forward_agent;	/* -A: opt-in agent forwarding */
+	int		 verbosity;	/* -v count, propagated to ssh + hpnscp */
+	struct arglist	*hpnscp_extra;	/* -r/-o/-X/-Y forwarded to source hpnscp */
 	enum decision_policy policy;
 	char		*identity;	/* chosen A->C key, or NULL */
 	/* runtime */
