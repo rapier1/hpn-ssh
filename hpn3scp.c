@@ -66,8 +66,7 @@ usage(void)
 {
 	fprintf(stderr,
 	    "usage: hpn3scp [-Arv] [-j streams] [-o ssh_option] [-X sftp_option]\n"
-	    "               [-Y \"hpnscp switches\"] source target\n"
-	    "       third-party (direct A->C) copy, orchestrated from here.\n");
+	    "               [-Y \"hpnscp switches\"] source target\n");
 	exit(1);
 }
 
