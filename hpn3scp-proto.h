@@ -36,6 +36,16 @@
 /* Direct emit at a specific stream (defaults to stdout if never set). */
 void	proto_init(FILE *out);
 
+/*
+ * Output mode.  Protocol mode (default) emits machine EVENT lines on stdout
+ * for a driving front-end/GUI.  Human mode - selected when stdout is a
+ * terminal - renders for a person instead: errors/warnings as plain text on
+ * stderr, phases only under -v, and progress via the local meter (driven in
+ * hpn3scp.c, which checks proto_human()).
+ */
+void	proto_set_human(int on);
+int	proto_human(void);
+
 /* --- events out (engine -> front-end) --- */
 void	proto_emit_phase(const char *name);
 void	proto_emit_resolved(const char *src, const char *dst, int streams);

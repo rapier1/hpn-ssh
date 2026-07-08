@@ -30,14 +30,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "log.h"
 #include "hpn3scp-proto.h"
 
 static FILE *proto_out = NULL;
+static int human_mode = 0;
 
 void
 proto_init(FILE *out)
 {
 	proto_out = out;
+}
+
+void
+proto_set_human(int on)
+{
+	human_mode = on;
+}
+
+int
+proto_human(void)
+{
+	return human_mode;
 }
 
 static FILE *
@@ -128,6 +142,10 @@ proto_emit_phase(const char *name)
 {
 	char enc[128];
 
+	if (human_mode) {
+		debug("phase %s", name);	/* visible under -v */
+		return;
+	}
 	pct_encode(enc, sizeof(enc), name);
 	fprintf(po(), "EVENT phase name=%s\n", enc);
 	fflush(po());
@@ -138,6 +156,10 @@ proto_emit_resolved(const char *src, const char *dst, int streams)
 {
 	char es[512], ed[512];
 
+	if (human_mode) {
+		debug("%s -> %s (%d streams)", src, dst, streams);
+		return;
+	}
 	pct_encode(es, sizeof(es), src);
 	pct_encode(ed, sizeof(ed), dst);
 	fprintf(po(), "EVENT resolved src=%s dst=%s streams=%d\n",
@@ -151,6 +173,13 @@ proto_emit_need_decision_hostkey(const char *fp, const char *sshfp,
 {
 	char efp[256], esf[64], etok[256];
 
+	if (human_mode) {
+		/* human-mode decisions are prompted interactively before this
+		 * point; reaching here means no prompt was possible */
+		fprintf(stderr, "hpn3scp: host key %s needs confirmation "
+		    "(sshfp: %s)\n", fp, sshfp);
+		return;
+	}
 	pct_encode(efp, sizeof(efp), fp);
 	pct_encode(esf, sizeof(esf), sshfp);
 	pct_encode(etok, sizeof(etok), token);
@@ -164,6 +193,10 @@ proto_emit_need_decision_identity(const char *reason)
 {
 	char er[256];
 
+	if (human_mode) {
+		fprintf(stderr, "hpn3scp: an identity is needed: %s\n", reason);
+		return;
+	}
 	pct_encode(er, sizeof(er), reason);
 	fprintf(po(), "EVENT need_decision kind=use_identity reason=%s\n", er);
 	fflush(po());
@@ -174,6 +207,8 @@ proto_emit_progress(uint64_t bytes, uint64_t total, uint64_t rate,
     uint32_t eta, uint32_t files_done, uint32_t files_total,
     uint16_t workers, uint16_t stalled)
 {
+	if (human_mode)
+		return;		/* the local meter renders progress instead */
 	fprintf(po(), "EVENT progress bytes=%" PRIu64 " total=%" PRIu64
 	    " rate=%" PRIu64 " eta=%" PRIu32 " files_done=%" PRIu32
 	    " files_total=%" PRIu32 " workers=%u stalled=%u\n",
@@ -187,6 +222,10 @@ proto_emit_warning(const char *msg)
 {
 	char em[512];
 
+	if (human_mode) {
+		fprintf(stderr, "hpn3scp: warning: %s\n", msg);
+		return;
+	}
 	pct_encode(em, sizeof(em), msg);
 	fprintf(po(), "EVENT warning msg=%s\n", em);
 	fflush(po());
@@ -197,6 +236,10 @@ proto_emit_error(const char *msg)
 {
 	char em[512];
 
+	if (human_mode) {
+		fprintf(stderr, "hpn3scp: %s\n", msg);
+		return;
+	}
 	pct_encode(em, sizeof(em), msg);
 	fprintf(po(), "EVENT error msg=%s\n", em);
 	fflush(po());
@@ -205,6 +248,8 @@ proto_emit_error(const char *msg)
 void
 proto_emit_done(int ok, int exit_status)
 {
+	if (human_mode)
+		return;		/* the exit status says it for a human */
 	fprintf(po(), "EVENT done ok=%d exit=%d\n", ok ? 1 : 0, exit_status);
 	fflush(po());
 }

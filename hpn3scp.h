@@ -73,12 +73,12 @@ struct launch_session {
 	struct endpoint	 src;
 	struct endpoint	 dst;
 	int		 streams;	/* -j */
-	int		 forward_agent;	/* -A: opt-in agent forwarding */
+	int		 use_ambient;	/* -A: forward the ambient agent (unmanaged,
+					 * unconstrained) instead of a managed one */
 	int		 verbosity;	/* -v count, propagated to ssh + hpnscp */
 	int		 addr_family;	/* -4/-6: 4, 6, or 0 (default) - all hops */
 	struct arglist	*hpnscp_extra;	/* -r/-o/-X/-Y forwarded to source hpnscp */
 	enum decision_policy policy;
-	char		*identity;	/* chosen A->C key, or NULL */
 	/* runtime */
 	enum launch_phase phase;
 	pid_t		 child;		/* launch ssh pid, or -1 */

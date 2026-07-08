@@ -207,7 +207,8 @@ hpn3scp_source_knows_target(struct launch_session *s)
 	ssh_base_args(s, &a, 0, 0);
 	addargs(&a, "ssh-keygen");
 	addargs(&a, "-F");
-	addargs(&a, "%s", spec);
+	addargs(&a, "'%s'", spec);	/* quote: [host]:port brackets are
+					 * glob metacharacters to the remote shell */
 	rc = hpn_run_capture(&a, buf, sizeof(buf), 15000);
 	freeargs(&a);
 	/* ssh-keygen -F exits 0 only when a matching host entry is found */
@@ -276,10 +277,14 @@ hpn3scp_confirm_target(struct launch_session *s, struct target_keyset *set)
 
 	/* layer 3: interactive confirmation, or fail-closed (Q3) */
 	if (!isatty(STDIN_FILENO)) {
-		proto_emit_error("target host key is not verified (no DNSSEC "
+		char *m;
+
+		xasprintf(&m, "%s's host key is not verified (no DNSSEC "
 		    "SSHFP) and no terminal is available to confirm it; run "
-		    "interactively or pre-add the key to the source's "
-		    "known_hosts");
+		    "interactively or pre-add the key to %s's known_hosts",
+		    s->dst.host, s->src.host);
+		proto_emit_error(m);
+		free(m);
 		return -1;
 	}
 	fprintf(stderr, "The authenticity of target host '%s' can't be "
