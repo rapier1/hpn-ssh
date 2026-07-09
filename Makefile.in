@@ -189,8 +189,8 @@ SFTP_OBJS=	sftp.o sftp-usergroup.o progressmeter.o hpn-status-frame.o $(SFTP_CLI
 		sftp-workqueue.o sftp-parallel.o sftp-parallel-respawn.o sftp-parallel-watchdog.o sftp-parallel-reporter.o sftp-parallel-unit.o sftp-parallel-worker.o sftp-parallel-walk.o \
 		sftp-parallel-config.o readconf.o $(P11OBJS) $(SKOBJS)
 
-MANPAGES	= hpnmoduli.5.out hpnscp.1.out hpnssh-add.1.out hpnssh-agent.1.out hpnssh-keygen.1.out hpnssh-keyscan.1.out hpnssh.1.out hpnsshd.8.out hpnsftp-server.8.out hpnsftp.1.out hpnssh-keysign.8.out hpnssh-pkcs11-helper.8.out hpnssh-sk-helper.8.out hpnsshd_config.5.out hpnssh_config.5.out
-MANPAGES_IN	= hpnmoduli.5 hpnscp.1 hpnssh-add.1 hpnssh-agent.1 hpnssh-keygen.1 hpnssh-keyscan.1 hpnssh.1 hpnsshd.8 hpnsftp-server.8 hpnsftp.1 hpnssh-keysign.8 hpnssh-pkcs11-helper.8 hpnssh-sk-helper.8 hpnsshd_config.5 hpnssh_config.5
+MANPAGES	= hpnmoduli.5.out hpnscp.1.out hpn3scp.1.out hpnssh-add.1.out hpnssh-agent.1.out hpnssh-keygen.1.out hpnssh-keyscan.1.out hpnssh.1.out hpnsshd.8.out hpnsftp-server.8.out hpnsftp.1.out hpnssh-keysign.8.out hpnssh-pkcs11-helper.8.out hpnssh-sk-helper.8.out hpnsshd_config.5.out hpnssh_config.5.out
+MANPAGES_IN	= hpnmoduli.5 hpnscp.1 hpn3scp.1 hpnssh-add.1 hpnssh-agent.1 hpnssh-keygen.1 hpnssh-keyscan.1 hpnssh.1 hpnsshd.8 hpnsftp-server.8 hpnsftp.1 hpnssh-keysign.8 hpnssh-pkcs11-helper.8 hpnssh-sk-helper.8 hpnsshd_config.5 hpnssh_config.5
 MANTYPE		= @MANTYPE@
 
 CONFIGFILES=sshd_config.out ssh_config.out moduli.out
@@ -512,6 +512,7 @@ install-files:
 	$(MKDIR_P) -m 0755 $(DESTDIR)$(PRIVSEP_PATH)
 	$(INSTALL) -m 0755 $(STRIP_OPT) hpnssh$(EXEEXT) $(DESTDIR)$(bindir)/hpnssh$(EXEEXT)
 	$(INSTALL) -m 0755 $(STRIP_OPT) hpnscp$(EXEEXT) $(DESTDIR)$(bindir)/hpnscp$(EXEEXT)
+	$(INSTALL) -m 0755 $(STRIP_OPT) hpn3scp$(EXEEXT) $(DESTDIR)$(bindir)/hpn3scp$(EXEEXT)
 	$(INSTALL) -m 0755 $(STRIP_OPT) hpnssh-add$(EXEEXT) $(DESTDIR)$(bindir)/hpnssh-add$(EXEEXT)
 	$(INSTALL) -m 0755 $(STRIP_OPT) hpnssh-agent$(EXEEXT) $(DESTDIR)$(bindir)/hpnssh-agent$(EXEEXT)
 	$(INSTALL) -m 0755 $(STRIP_OPT) hpnssh-keygen$(EXEEXT) $(DESTDIR)$(bindir)/hpnssh-keygen$(EXEEXT)
@@ -526,6 +527,7 @@ install-files:
 	$(INSTALL) -m 0755 $(STRIP_OPT) hpnsftp-server$(EXEEXT) $(DESTDIR)$(SFTP_SERVER)$(EXEEXT)
 	$(INSTALL) -m 644 hpnssh.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh.1
 	$(INSTALL) -m 644 hpnscp.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/hpnscp.1
+	$(INSTALL) -m 644 hpn3scp.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/hpn3scp.1
 	$(INSTALL) -m 644 hpnssh-add.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh-add.1
 	$(INSTALL) -m 644 hpnssh-agent.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh-agent.1
 	$(INSTALL) -m 644 hpnssh-keygen.1.out $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh-keygen.1
@@ -589,6 +591,7 @@ uninstallall:	uninstall
 uninstall:
 	-rm -f $(DESTDIR)$(bindir)/hpnssh$(EXEEXT)
 	-rm -f $(DESTDIR)$(bindir)/hpnscp$(EXEEXT)
+	-rm -f $(DESTDIR)$(bindir)/hpn3scp$(EXEEXT)
 	-rm -f $(DESTDIR)$(bindir)/hpnssh-add$(EXEEXT)
 	-rm -f $(DESTDIR)$(bindir)/hpnssh-agent$(EXEEXT)
 	-rm -f $(DESTDIR)$(bindir)/hpnssh-keygen$(EXEEXT)
@@ -601,6 +604,7 @@ uninstall:
 	-rm -f $(DESTDIR)$(SSH_SK_HELPER)$(EXEEXT)
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh.1
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/hpnscp.1
+	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/hpn3scp.1
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh-add.1
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh-agent.1
 	-rm -f $(DESTDIR)$(mandir)/$(mansubdir)1/hpnssh-keygen.1
