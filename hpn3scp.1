@@ -1,0 +1,244 @@
+.\"
+.\" Copyright (c) 2026 The Board of Trustees of Carnegie Mellon University.
+.\"
+.\"  Author: Chris Rapier <rapier@psc.edu>
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the conditions of the
+.\" BSD 2-Clause License are met.  See https://opensource.org/license/bsd-2-clause.
+.\"
+.Dd $Mdocdate: July 8 2026 $
+.Dt HPN3SCP 1
+.Os
+.Sh NAME
+.Nm hpn3scp
+.Nd guided third-party (direct source-to-target) file copy for HPN-SSH
+.Sh SYNOPSIS
+.Nm hpn3scp
+.Op Fl 46Arv
+.Op Fl j Ar streams
+.Op Fl o Ar ssh_option
+.Op Fl X Ar sftp_option
+.Op Fl Y Ar switches
+.Ar source
+.Ar target
+.Sh DESCRIPTION
+.Nm
+copies files directly between two remote hosts \(en the
+.Ar source
+and the
+.Ar target
+\(en without the data passing through the local machine.
+It is a front end for the
+.Xr hpnscp 1
+.Fl R
+third-party transport: it arranges the pieces that a direct
+remote-to-remote transfer needs \(en target host-key trust, a
+source-to-target authentication check, and live progress \(en then
+launches the transfer and relays its status.
+.Pp
+Three hosts take part:
+.Bl -tag -width Ds
+.It the launcher
+The machine where you run
+.Nm .
+It orchestrates the transfer but never carries the file data.
+.It the source
+The host named by
+.Ar source ,
+which reads the files and connects onward to the target.
+The
+.Nm
+launcher reaches it over
+.Xr hpnssh 1
+and runs
+.Xr hpnscp 1
+there.
+.It the target
+The host named by
+.Ar target ,
+which the source writes to.
+.El
+.Pp
+Because the data flows source-to-target directly, the source must be able
+to reach and authenticate to the target on its own.
+How that authentication is arranged is described under
+.Sx AUTHENTICATION .
+.Pp
+The
+.Ar source
+and
+.Ar target
+are each given as
+.Sm off
+.Oo Ar user No @ Oc Ar host : Op Ar path
+.Sm on
+or as an
+.Ar scp://
+URI
+.Po
+.Sm off
+.No scp:// Oo Ar user No @ Oc Ar host Op : Ar port Oo / Ar path Oc
+.Sm on
+.Pc .
+A missing
+.Ar path
+means the remote login directory; a missing
+.Ar port
+uses the default from
+.Xr hpnssh_config 5 .
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl 4
+Use IPv4 addresses only.
+The address family applies to every connection
+.Nm
+makes: the target host-key scan, the authentication preflight, and the
+transfer itself.
+.It Fl 6
+Use IPv6 addresses only.
+.It Fl A
+Forward the local
+.Xr hpnssh-agent 1
+to the source so it can authenticate to the target with your keys.
+This is an explicit opt-in for the case where the source has no key of
+its own on the target; see
+.Sx AUTHENTICATION
+for the trade-off it carries.
+.It Fl j Ar streams
+Use
+.Ar streams
+parallel data streams for the transfer
+.Pq default 1 .
+Larger values raise throughput on high-bandwidth, high-latency paths.
+.It Fl o Ar ssh_option
+Pass an
+.Xr hpnssh 1
+option, in the format used in
+.Xr hpnssh_config 5 ,
+to the source-to-target connection.
+May be repeated.
+.It Fl r
+Copy directories recursively.
+.It Fl v
+Raise the verbosity.
+May be repeated for more detail; passed through to the underlying
+programs.
+.It Fl X Ar sftp_option
+Pass an SFTP-level option
+.Pq for example Cm bundle=yes
+to the source-to-target transfer.
+May be repeated.
+.It Fl Y Ar switches
+Forward a quoted string of raw
+.Xr hpnscp 1
+switches to the transfer on the source, for options that
+.Nm
+does not expose directly.
+.El
+.Sh AUTHENTICATION
+.Nm
+runs on the launcher, but the file data moves source-to-target, so it is
+the
+.Em source
+that must authenticate to the target.
+.Nm
+does this without ever placing your private key on the source:
+.Bl -tag -width Ds
+.It source-key-only (default)
+The source authenticates to the target with a key of its
+.Em own
+\(en a key held on the source whose public half is in the target's
+.Pa authorized_keys .
+Your launcher key never leaves the launcher, and no agent is forwarded.
+This is the most contained arrangement and requires no extra flags.
+Before any data streams start,
+.Nm
+runs a preflight check of the source-to-target login; if it fails,
+.Nm
+stops immediately and prints the fix \(en typically a single
+.Xr ssh-copy-id 1
+run on the source \(en rather than letting the workers fail one by one.
+.It agent forwarding Pq Fl A
+If the source has no key of its own on the target, but you can reach the
+target yourself,
+.Fl A
+forwards your
+.Xr hpnssh-agent 1
+to the source so it can borrow your credentials for the duration of the
+transfer.
+This is convenient but less contained: while the transfer runs, a
+compromised source could use the forwarded keys to authenticate as you
+to any host that accepts them.
+It is therefore an explicit opt-in, never the default.
+.El
+.Pp
+In both cases the launcher authenticates to the source using your normal
+.Xr hpnssh 1
+credentials.
+Authentication must be non-interactive (public key or a forwarded agent);
+.Nm
+does not prompt for passwords on the source-to-target hop.
+.Sh HOST KEY TRUST
+For the source to connect to the target under strict host-key checking,
+the source must already trust the target's host key.
+When it does not,
+.Nm
+brokers that trust before launching:
+it has the source scan the target's host key, verifies it, and \(en only
+on success \(en records it in the source's
+.Pa known_hosts .
+Verification is fail-closed: the key is accepted only if it is
+authenticated by a DNSSEC-signed SSHFP record, or if you confirm its
+fingerprint at an interactive prompt.
+There is no blind-accept mode.
+.Sh OUTPUT
+When standard output is a terminal,
+.Nm
+prints human-readable progress \(en a live meter during the transfer and
+plain-text errors \(en to the terminal.
+When standard output is redirected or piped,
+.Nm
+instead emits a line-structured event protocol on standard output,
+intended for a driving front end.
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev HPN3SCP_REMOTE_HPNSCP
+Absolute path to
+.Xr hpnscp 1
+on the source.
+By default
+.Nm
+discovers it on the source's
+.Ev PATH ;
+set this when it is installed outside the default search path.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+Copy a file directly from one remote host to another, using four streams:
+.Bd -literal -offset indent
+$ hpn3scp -j4 user@src.example.org:/data/big.tar \e
+    user@dst.example.org:/incoming/
+.Ed
+.Pp
+Same transfer when the source has no key of its own on the target,
+forwarding your agent instead:
+.Bd -literal -offset indent
+$ hpn3scp -A -j4 scp://user@src.example.org:2222/data/big.tar \e
+    scp://user@dst.example.org:2222/incoming/
+.Ed
+.Sh SEE ALSO
+.Xr hpnscp 1 ,
+.Xr hpnsftp 1 ,
+.Xr hpnssh 1 ,
+.Xr hpnssh-add 1 ,
+.Xr hpnssh-agent 1 ,
+.Xr ssh-copy-id 1 ,
+.Xr hpnssh_config 5
+.Sh HISTORY
+.Nm
+first appeared in HPN-SSH 19.0.
+.Sh AUTHORS
+.An Chris Rapier Aq Mt rapier@psc.edu
