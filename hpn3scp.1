@@ -15,7 +15,7 @@
 .Nd guided third-party (direct source-to-target) file copy for HPN-SSH
 .Sh SYNOPSIS
 .Nm hpn3scp
-.Op Fl 46Arv
+.Op Fl 46AVZrv
 .Op Fl j Ar streams
 .Op Fl o Ar ssh_option
 .Op Fl X Ar sftp_option
@@ -125,6 +125,28 @@ Copy directories recursively.
 Raise the verbosity.
 May be repeated for more detail; passed through to the underlying
 programs.
+.It Fl V
+Verify the integrity of every transferred file
+.Pq an HPN-SSH extension, effective only against an HPN-SSH 19.0 or later target .
+After each file is copied, its source and target copies are hashed with XXH3
+and compared.
+On a terminal
+.Nm
+prints a one-line completion summary when the transfer finishes \(en
+.Dq verified: N files OK ,
+or a warning naming how many files failed (the per-file paths are reported as
+they occur).
+A verification failure sets a nonzero exit status but does not abort the
+transfer.
+Note the capital letter:
+.Fl v
+is verbose.
+.It Fl Z
+Resume an interrupted transfer with integrity verification: only the byte
+ranges that differ between the source and target copies are re-sent, and the
+repaired file is re-verified.
+Implies
+.Fl V .
 .It Fl X Ar sftp_option
 Pass an SFTP-level option
 .Pq for example Cm bundle=yes

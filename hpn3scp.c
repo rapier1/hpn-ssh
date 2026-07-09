@@ -70,7 +70,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: hpn3scp [-46Arv] [-j streams] [-o ssh_option] [-X sftp_option]\n"
+	    "usage: hpn3scp [-46AVZrv] [-j streams] [-o ssh_option] [-X sftp_option]\n"
 	    "               [-Y \"hpnscp switches\"] source target\n");
 	exit(1);
 }
@@ -275,6 +275,12 @@ static struct {
 	unsigned int	transfer;
 } failtally;
 
+/* the END frame's authoritative counts, for the completion summary */
+static struct {
+	uint32_t	files_done;
+	int		got;
+} endinfo;
+
 static void
 ev_hello(const struct hpns_hello *hl, void *ctx)
 {
@@ -309,6 +315,8 @@ static void
 ev_end(const struct hpns_end *e, void *ctx)
 {
 	(void)ctx;
+	endinfo.files_done = e->files_done;
+	endinfo.got = 1;
 	if (proto_human()) {
 		meter.ctr = (off_t)e->bytes_done;
 		return;
@@ -349,6 +357,26 @@ ev_degrade(void *ctx)
 	}
 	proto_emit_warning("source is not sending status; the transfer "
 	    "continues without progress");
+}
+
+/*
+ * Human-mode completion summary (walk-away confidence): only when -V/-Z was
+ * requested.  A clean run confirms verification; a verify failure points at
+ * the per-file detail the source already printed above.  No-op in protocol
+ * mode - the front end builds its own summary from the file_fail + done events.
+ */
+static void
+emit_completion_summary(struct launch_session *s)
+{
+	if (!proto_human() || !s->verify_requested)
+		return;
+	if (failtally.verify > 0)
+		fprintf(stderr, "hpn3scp: WARNING: %u file%s failed "
+		    "verification (see above)\n", failtally.verify,
+		    failtally.verify == 1 ? "" : "s");
+	else if (failtally.transfer == 0 && endinfo.got)
+		fprintf(stderr, "hpn3scp: verified: %u file%s OK\n",
+		    endinfo.files_done, endinfo.files_done == 1 ? "" : "s");
 }
 
 /*
@@ -625,6 +653,7 @@ run_session(struct launch_session *s)
 	s->phase = LP_MONITOR;
 	proto_emit_phase(phase_name(s->phase));
 	r = do_launch(s, abs_hpnscp);
+	emit_completion_summary(s);
 
 	s->phase = LP_COMPLETE;
 	proto_emit_phase(phase_name(s->phase));
@@ -666,7 +695,7 @@ main(int argc, char **argv)
 	 * hatch for hpnscp's native switches - one quoted string, split with
 	 * quote/escape handling so dashes travel intact.
 	 */
-	while ((ch = getopt(argc, argv, "j:Arvo:X:Y:46")) != -1) {
+	while ((ch = getopt(argc, argv, "j:Arvo:X:Y:46VZ")) != -1) {
 		switch (ch) {
 		case 'j':
 			s.streams = (int)strtol(optarg, NULL, 10);
@@ -690,6 +719,14 @@ main(int argc, char **argv)
 			break;
 		case 'r':
 			addargs(&hpnscp_extra, "-r");
+			break;
+		case 'V':
+			addargs(&hpnscp_extra, "-V");
+			s.verify_requested = 1;
+			break;
+		case 'Z':
+			addargs(&hpnscp_extra, "-Z");
+			s.verify_requested = 1;	/* resume implies verification */
 			break;
 		case 'o':
 			addargs(&hpnscp_extra, "-o");

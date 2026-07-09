@@ -77,7 +77,8 @@ struct launch_session {
 					 * unconstrained) instead of a managed one */
 	int		 verbosity;	/* -v count, propagated to ssh + hpnscp */
 	int		 addr_family;	/* -4/-6: 4, 6, or 0 (default) - all hops */
-	struct arglist	*hpnscp_extra;	/* -r/-o/-X/-Y forwarded to source hpnscp */
+	int		 verify_requested;	/* -V/-Z given: emit a verify summary */
+	struct arglist	*hpnscp_extra;	/* -r/-o/-X/-Y/-V/-Z forwarded to source hpnscp */
 	enum decision_policy policy;
 	/* runtime */
 	enum launch_phase phase;
