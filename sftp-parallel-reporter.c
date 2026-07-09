@@ -871,6 +871,11 @@ parallel_reporter_thread(void *arg)
 			pthread_mutex_unlock(&p->workers_mu);
 			progressmeter_frames_set_workers(fr_active,
 			    fr_stalled);
+			progressmeter_frames_set_files(
+			    (u_int)__atomic_load_n(&p->files_submitted,
+			        __ATOMIC_RELAXED),
+			    (u_int)__atomic_load_n(&p->files_total,
+			        __ATOMIC_RELAXED));
 		}
 
 		if (p->progress_meter_started)

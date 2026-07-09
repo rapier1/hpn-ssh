@@ -962,6 +962,15 @@ sftp_parallel_scan_upload_total(const char *src, long *file_count_out)
 	return bytes;
 }
 
+/* Record the scan-time total file count for the progress frames/meter. */
+void
+sftp_parallel_set_file_total(struct sftp_parallel *p, long total)
+{
+	if (p != NULL)
+		__atomic_store_n(&p->files_total,
+		    total > 0 ? (uint64_t)total : 0, __ATOMIC_RELAXED);
+}
+
 void
 sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
     off_t total_bytes)

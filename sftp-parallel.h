@@ -447,6 +447,9 @@ void sftp_parallel_progress_stop(struct sftp_parallel *p);
  * optionally the file count via file_count_out (may be NULL). */
 off_t sftp_parallel_scan_upload_total(const char *src, long *file_count_out);
 
+/* Store the scan-time total file count (for the progress frames/meter). */
+void sftp_parallel_set_file_total(struct sftp_parallel *p, long total);
+
 /*
  * Tear down: signal workers to exit, join all threads, close worker SSH
  * subprocesses, free everything. Idempotent.

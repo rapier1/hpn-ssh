@@ -1216,6 +1216,14 @@ struct sftp_parallel {
 	 */
 	uint64_t                    walker_failures;
 
+	/* Per-file progress counter (status relay + local meter): bumped once
+	 * as each file is submitted for transfer, BEFORE any range-splitting,
+	 * so it counts FILES not work units.  files_total is the scan-time
+	 * total.  Both relaxed-atomic: written from the submit path / setup,
+	 * read by the reporter. */
+	uint64_t                    files_submitted;
+	uint64_t                    files_total;
+
 	/* enum sftp_walker_phase; relaxed atomic, set by the walker via
 	 * sftp_parallel_set_walker_phase, read by the reporter FLEETSAMPLE. */
 	volatile int                walker_phase;

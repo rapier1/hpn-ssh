@@ -1805,6 +1805,8 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 						sftp_parallel_progress_start(
 						    parallel_orch, label,
 						    total_bytes);
+						sftp_parallel_set_file_total(
+						    parallel_orch, total_files);
 					}
 				}
 

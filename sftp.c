@@ -1505,6 +1505,7 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		    "Uploading %ld file%s in parallel", total_files,
 		    total_files == 1 ? "" : "s");
 		sftp_parallel_progress_start(parallel_orch, label, total_bytes);
+		sftp_parallel_set_file_total(parallel_orch, total_files);
 	}
 
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {

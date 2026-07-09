@@ -374,9 +374,14 @@ emit_completion_summary(struct launch_session *s)
 		fprintf(stderr, "hpn3scp: WARNING: %u file%s failed "
 		    "verification (see above)\n", failtally.verify,
 		    failtally.verify == 1 ? "" : "s");
-	else if (failtally.transfer == 0 && endinfo.got)
+	else if (endinfo.got) {
+		/* OK = files sent minus those that failed to transfer */
+		u_int ok = endinfo.files_done > failtally.transfer ?
+		    endinfo.files_done - failtally.transfer : 0;
+
 		fprintf(stderr, "hpn3scp: verified: %u file%s OK\n",
-		    endinfo.files_done, endinfo.files_done == 1 ? "" : "s");
+		    ok, ok == 1 ? "" : "s");
+	}
 }
 
 /*
