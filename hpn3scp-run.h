@@ -53,6 +53,10 @@ struct hpn_run_hooks {
 	void (*on_hello)(const struct hpns_hello *, void *ctx);
 	void (*on_progress)(const struct hpns_progress *, void *ctx);
 	void (*on_end)(const struct hpns_end *, void *ctx);
+	/* on_file_fail fires once per failed file, before on_end.  The path in
+	 * the struct is a borrowed pointer valid only for the duration of the
+	 * call - the hook must copy or encode it before returning. */
+	void (*on_file_fail)(const struct hpns_filefail *, void *ctx);
 	void (*on_tick)(void *ctx);
 	void (*on_degrade)(void *ctx);
 	int  passthrough_fd;	/* raw bytes after degrade go here; <0 = discard */

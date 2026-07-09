@@ -77,29 +77,38 @@ pct_safe(u_char c)
 	    c == '/' || c == '@' || c == '+');
 }
 
+/* encode exactly inlen bytes (may contain NUL/high-bit); truncates to fit out */
 static void
-pct_encode(char *out, size_t outlen, const char *in)
+pct_encode_n(char *out, size_t outlen, const u_char *in, size_t inlen)
 {
 	static const char hex[] = "0123456789ABCDEF";
-	const u_char *p = (const u_char *)in;
-	size_t o = 0;
+	size_t i, o = 0;
 
 	if (outlen == 0)
 		return;
-	for (; *p != '\0'; p++) {
-		if (pct_safe(*p)) {
+	for (i = 0; i < inlen; i++) {
+		u_char c = in[i];
+
+		if (pct_safe(c)) {
 			if (o + 1 >= outlen)
 				break;
-			out[o++] = (char)*p;
+			out[o++] = (char)c;
 		} else {
 			if (o + 3 >= outlen)
 				break;
 			out[o++] = '%';
-			out[o++] = hex[*p >> 4];
-			out[o++] = hex[*p & 0x0f];
+			out[o++] = hex[c >> 4];
+			out[o++] = hex[c & 0x0f];
 		}
 	}
 	out[o] = '\0';
+}
+
+/* NUL-terminated convenience wrapper over pct_encode_n */
+static void
+pct_encode(char *out, size_t outlen, const char *in)
+{
+	pct_encode_n(out, outlen, (const u_char *)in, strlen(in));
 }
 
 static int
@@ -242,6 +251,19 @@ proto_emit_error(const char *msg)
 	}
 	pct_encode(em, sizeof(em), msg);
 	fprintf(po(), "EVENT error msg=%s\n", em);
+	fflush(po());
+}
+
+void
+proto_emit_file_fail(unsigned int kind, const unsigned char *path,
+    size_t path_len)
+{
+	char enc[2048];		/* >= 3 * max frame path (509) + 1, all escaped */
+
+	if (human_mode)
+		return;		/* the source's stderr already shows the detail */
+	pct_encode_n(enc, sizeof(enc), path, path_len);
+	fprintf(po(), "EVENT file_fail kind=%u path=%s\n", kind, enc);
 	fflush(po());
 }
 

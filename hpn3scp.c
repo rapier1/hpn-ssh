@@ -269,6 +269,12 @@ static struct {
 	int	 on;
 } meter;
 
+/* per-transfer failure tally, for the completion summary */
+static struct {
+	unsigned int	verify;
+	unsigned int	transfer;
+} failtally;
+
 static void
 ev_hello(const struct hpns_hello *hl, void *ctx)
 {
@@ -309,6 +315,20 @@ ev_end(const struct hpns_end *e, void *ctx)
 	}
 	proto_emit_progress(e->bytes_done, e->bytes_done, 0, 0, e->files_done,
 	    e->files_done + e->files_failed, 0, 0);
+}
+
+static void
+ev_file_fail(const struct hpns_filefail *ff, void *ctx)
+{
+	(void)ctx;
+	if ((ff->kind & HPNS_FF_KINDMASK) == HPNS_FF_VERIFY)
+		failtally.verify++;
+	else
+		failtally.transfer++;
+	/* structured emit; the borrowed path is consumed now (percent-encoded)
+	 * and not retained.  Human mode is a no-op here - the source's stderr
+	 * already carries the per-file detail. */
+	proto_emit_file_fail(ff->kind, ff->path, ff->path_len);
 }
 
 static void
@@ -391,6 +411,7 @@ do_launch(struct launch_session *s, const char *abs_hpnscp)
 	h.on_hello = ev_hello;
 	h.on_progress = ev_progress;
 	h.on_end = ev_end;
+	h.on_file_fail = ev_file_fail;
 	h.on_tick = ev_tick;
 	h.on_degrade = ev_degrade;
 	h.passthrough_fd = -1;

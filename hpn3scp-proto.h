@@ -57,6 +57,14 @@ void	proto_emit_progress(uint64_t bytes, uint64_t total, uint64_t rate,
 	    uint16_t workers, uint16_t stalled);
 void	proto_emit_warning(const char *msg);
 void	proto_emit_error(const char *msg);
+/*
+ * One failed file.  kind is the FILEFAIL kind byte (reason in the low bits,
+ * HPNS_FF_TRUNCATED in the high bit); path is opaque bytes of length path_len
+ * (NOT NUL-terminated) - percent-encoded onto the wire so arbitrary/UTF-8
+ * bytes cross safely.
+ */
+void	proto_emit_file_fail(unsigned int kind, const unsigned char *path,
+	    size_t path_len);
 void	proto_emit_done(int ok, int exit_status);
 
 /* --- decisions in (front-end -> engine) --- */
