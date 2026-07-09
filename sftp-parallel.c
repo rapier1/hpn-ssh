@@ -551,6 +551,7 @@ sftp_parallel_wait(struct sftp_parallel *p)
 				    sizeof(p->progress_label));
 				start_progress_meter(p->progress_label, vtotal,
 				    &p->aggregate_progress_counter);
+				progressmeter_frames_set_verifying(1);
 				p->progress_meter_started = 1;
 				p->verify_phase_active = 1;
 			}

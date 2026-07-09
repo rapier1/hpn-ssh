@@ -54,7 +54,7 @@ void	proto_emit_need_decision_hostkey(const char *fp, const char *sshfp,
 void	proto_emit_need_decision_identity(const char *reason);
 void	proto_emit_progress(uint64_t bytes, uint64_t total, uint64_t rate,
 	    uint32_t eta, uint32_t files_done, uint32_t files_total,
-	    uint16_t workers, uint16_t stalled);
+	    uint16_t workers, uint16_t stalled, int verifying);
 void	proto_emit_warning(const char *msg);
 void	proto_emit_error(const char *msg);
 /*
@@ -65,7 +65,8 @@ void	proto_emit_error(const char *msg);
  */
 void	proto_emit_file_fail(unsigned int kind, const unsigned char *path,
 	    size_t path_len);
-void	proto_emit_done(int ok, int exit_status);
+void	proto_emit_done(int ok, int exit_status, unsigned files,
+	    unsigned verify_failed, unsigned transfer_failed);
 
 /* --- decisions in (front-end -> engine) --- */
 enum proto_decision_kind {

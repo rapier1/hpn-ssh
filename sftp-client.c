@@ -4675,6 +4675,7 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 	if (showprogress && total > 0) {
 		start_progress_meter("verify", total, &counter);
 		progressmeter_frames_meter_not_a_file();	/* not a file */
+		progressmeter_frames_set_verifying(1);		/* verify phase */
 		meter_on = 1;
 	}
 	for (i = 0; i < conn->hpn->verify_pending_count; i++) {

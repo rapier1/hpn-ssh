@@ -385,6 +385,7 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 	start = last_update = monotime_double();
 	file = f;
 	frame_meter_is_file = 1;	/* each meter is a file unless cleared */
+	frames_flags &= ~HPNS_F_VERIFY;	/* verify meters re-arm this per meter */
 	start_pos = *ctr;
 	end_pos = filesize;
 	cur_pos = 0;
@@ -502,6 +503,21 @@ void
 progressmeter_frames_meter_not_a_file(void)
 {
 	frame_meter_is_file = 0;
+}
+
+/*
+ * Mark the current meter as the verification phase, so PROGRESS frames carry
+ * HPNS_F_VERIFY and a front-end can label the phase "verifying".  Cleared by
+ * the next start_progress_meter; both the serial and parallel verify meters
+ * set it right after starting.
+ */
+void
+progressmeter_frames_set_verifying(int on)
+{
+	if (on)
+		frames_flags |= HPNS_F_VERIFY;
+	else
+		frames_flags &= ~HPNS_F_VERIFY;
 }
 
 /*

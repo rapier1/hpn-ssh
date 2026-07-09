@@ -308,7 +308,7 @@ ev_progress(const struct hpns_progress *p, void *ctx)
 	}
 	proto_emit_progress(p->bytes_done, p->bytes_total, p->rate_bps,
 	    p->eta_sec, p->files_done, p->files_total, p->workers_active,
-	    p->workers_stalled);
+	    p->workers_stalled, (p->flags & HPNS_F_VERIFY) ? 1 : 0);
 }
 
 static void
@@ -322,7 +322,7 @@ ev_end(const struct hpns_end *e, void *ctx)
 		return;
 	}
 	proto_emit_progress(e->bytes_done, e->bytes_done, 0, 0, e->files_done,
-	    e->files_done + e->files_failed, 0, 0);
+	    e->files_done + e->files_failed, 0, 0, 0);	/* verify done at END */
 }
 
 static void
@@ -662,12 +662,13 @@ run_session(struct launch_session *s)
 
 	s->phase = LP_COMPLETE;
 	proto_emit_phase(phase_name(s->phase));
-	proto_emit_done(r == 0, r == 0 ? 0 : 1);
+	proto_emit_done(r == 0, r == 0 ? 0 : 1, endinfo.files_done,
+	    failtally.verify, failtally.transfer);
 	ret = (r == 0) ? 0 : 1;
 	goto out;
 
  fail:
-	proto_emit_done(0, 1);
+	proto_emit_done(0, 1, 0, 0, 0);
 	ret = 1;
  out:
 	hpn3scp_free_keyset(&set);

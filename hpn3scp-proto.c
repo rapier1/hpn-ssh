@@ -214,15 +214,15 @@ proto_emit_need_decision_identity(const char *reason)
 void
 proto_emit_progress(uint64_t bytes, uint64_t total, uint64_t rate,
     uint32_t eta, uint32_t files_done, uint32_t files_total,
-    uint16_t workers, uint16_t stalled)
+    uint16_t workers, uint16_t stalled, int verifying)
 {
 	if (human_mode)
 		return;		/* the local meter renders progress instead */
 	fprintf(po(), "EVENT progress bytes=%" PRIu64 " total=%" PRIu64
 	    " rate=%" PRIu64 " eta=%" PRIu32 " files_done=%" PRIu32
-	    " files_total=%" PRIu32 " workers=%u stalled=%u\n",
+	    " files_total=%" PRIu32 " workers=%u stalled=%u verifying=%d\n",
 	    bytes, total, rate, eta, files_done, files_total,
-	    (unsigned)workers, (unsigned)stalled);
+	    (unsigned)workers, (unsigned)stalled, verifying ? 1 : 0);
 	fflush(po());
 }
 
@@ -268,11 +268,14 @@ proto_emit_file_fail(unsigned int kind, const unsigned char *path,
 }
 
 void
-proto_emit_done(int ok, int exit_status)
+proto_emit_done(int ok, int exit_status, unsigned files,
+    unsigned verify_failed, unsigned transfer_failed)
 {
 	if (human_mode)
 		return;		/* the exit status says it for a human */
-	fprintf(po(), "EVENT done ok=%d exit=%d\n", ok ? 1 : 0, exit_status);
+	fprintf(po(), "EVENT done ok=%d exit=%d files=%u verify_failed=%u "
+	    "transfer_failed=%u\n", ok ? 1 : 0, exit_status, files,
+	    verify_failed, transfer_failed);
 	fflush(po());
 }
 
