@@ -30,6 +30,7 @@ frame_cb(u_char type, const u_char *payload, uint16_t plen, void *ctx)
 	struct hpns_hello h;
 	struct hpns_progress pr;
 	struct hpns_end e;
+	struct hpns_filefail ff;
 	volatile uint64_t sink = 0;
 
 	st->frames++;
@@ -55,6 +56,15 @@ frame_cb(u_char type, const u_char *payload, uint16_t plen, void *ctx)
 		if (hpns_decode_end(payload, plen, &e) == 0)
 			sink = e.bytes_done + e.files_done +
 			    e.files_failed + e.ok;
+		break;
+	case HPNS_T_FILEFAIL:
+		if (hpns_decode_filefail(payload, plen, &ff) == 0) {
+			/* read every declared path byte so ASan catches an
+			 * over-read if the decoder ever trusts a bad length */
+			for (uint16_t i = 0; i < ff.path_len; i++)
+				sink += ff.path[i];
+			sink += ff.kind + ff.path_len;
+		}
 		break;
 	default:
 		/* unknown type: consumer skips it */

@@ -34,10 +34,12 @@ int
 main(int argc, char **argv)
 {
 	u_char buf[4096];
+	u_char longpath[1024];
 	size_t o;
 	struct hpns_hello h;
 	struct hpns_progress p;
 	struct hpns_end e;
+	struct hpns_filefail ff;
 
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <outdir>\n", argv[0]);
@@ -96,6 +98,55 @@ main(int argc, char **argv)
 	buf[o++] = 3;
 	o += hpns_encode_end(buf + o, &e);
 	write_seed(argv[1], "truncated", buf, o - 5);
+
+	/* failing session: HELLO, PROGRESS, two FILEFAILs, END(ok=0).  The
+	 * verify path is UTF-8 (non-Latin) to seed the byte-transparent case. */
+	memset(&ff, 0, sizeof(ff));
+	o = 0;
+	buf[o++] = 7;
+	o += hpns_encode_hello(buf + o, &h);
+	o += hpns_encode_progress(buf + o, &p);
+	ff.kind = HPNS_FF_VERIFY;
+	ff.path = (const u_char *)"/data/\346\227\245\346\234\254\350\252\236.bin";
+	ff.path_len = (uint16_t)strlen((const char *)ff.path);
+	o += hpns_encode_filefail(buf + o, &ff);
+	ff.kind = HPNS_FF_TRANSFER;
+	ff.path = (const u_char *)"/data/incomplete.tar";
+	ff.path_len = (uint16_t)strlen((const char *)ff.path);
+	o += hpns_encode_filefail(buf + o, &ff);
+	e.files_failed = 1;
+	e.ok = 0;
+	o += hpns_encode_end(buf + o, &e);
+	write_seed(argv[1], "session-failed", buf, o);
+
+	/* single FILEFAIL, byte-at-a-time */
+	o = 0;
+	buf[o++] = 1;
+	ff.kind = HPNS_FF_VERIFY;
+	ff.path = (const u_char *)"file.dat";
+	ff.path_len = 8;
+	o += hpns_encode_filefail(buf + o, &ff);
+	write_seed(argv[1], "filefail", buf, o);
+
+	/* empty path (path_len 0, path NULL) */
+	o = 0;
+	buf[o++] = 1;
+	ff.kind = HPNS_FF_TRANSFER;
+	ff.path = NULL;
+	ff.path_len = 0;
+	o += hpns_encode_filefail(buf + o, &ff);
+	write_seed(argv[1], "filefail-empty", buf, o);
+
+	/* over-cap path: encoder must clamp to HPNS_FILEFAIL_MAXPATH so the
+	 * emitted frame stays parseable (caller sets HPNS_FF_TRUNCATED) */
+	memset(longpath, 'A', sizeof(longpath));
+	o = 0;
+	buf[o++] = 5;
+	ff.kind = HPNS_FF_VERIFY | HPNS_FF_TRUNCATED;
+	ff.path = longpath;
+	ff.path_len = (uint16_t)sizeof(longpath);
+	o += hpns_encode_filefail(buf + o, &ff);
+	write_seed(argv[1], "filefail-clamped", buf, o);
 
 	return 0;
 }
