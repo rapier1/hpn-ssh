@@ -503,6 +503,32 @@ progressmeter_frames_set_files(u_int done, u_int total)
 }
 
 /*
+ * Emit a FILEFAIL frame (A side): one per failed file, sent before the END
+ * frame.  kind is HPNS_FF_TRANSFER or HPNS_FF_VERIFY; path is copied verbatim
+ * as opaque bytes, clamped to the payload cap with HPNS_FF_TRUNCATED flagged
+ * (the consumer neutralizes it before any display).  No-op unless frame mode
+ * is armed.
+ */
+void
+progressmeter_frames_filefail(u_int kind, const char *path, size_t path_len)
+{
+	struct hpns_filefail ff;
+	u_char fbuf[HPNS_HDR_LEN + HPNS_MAX_PAYLOAD];
+
+	if (!frame_mode)
+		return;
+	memset(&ff, 0, sizeof(ff));
+	ff.kind = (u_char)(kind & HPNS_FF_KINDMASK);
+	if (path_len > HPNS_FILEFAIL_MAXPATH) {
+		path_len = HPNS_FILEFAIL_MAXPATH;
+		ff.kind |= HPNS_FF_TRUNCATED;
+	}
+	ff.path = (const u_char *)path;
+	ff.path_len = (uint16_t)path_len;
+	atomicio(vwrite, STDOUT_FILENO, fbuf, hpns_encode_filefail(fbuf, &ff));
+}
+
+/*
  * Emit the final END frame (A side, once, on the way out of main).
  * Advisory only: the consumer takes success/failure from the transport
  * exit status.  No-op unless frame mode is armed.

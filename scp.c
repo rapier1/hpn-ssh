@@ -1523,6 +1523,8 @@ scp_parallel_finish(struct sftp_conn *conn)
 			for (i = 0; i < used; i++) {
 				fmprintf(stderr,
 				    "scp: transfer incomplete: %s\n", paths[i]);
+				progressmeter_frames_filefail(HPNS_FF_TRANSFER,
+				    paths[i], strlen(paths[i]));
 				free(paths[i]);
 			}
 			free(paths);
@@ -1535,6 +1537,8 @@ scp_parallel_finish(struct sftp_conn *conn)
 			for (i = 0; i < used; i++) {
 				fmprintf(stderr,
 				    "HPNVerifyTransfer: FAILED: %s\n", paths[i]);
+				progressmeter_frames_filefail(HPNS_FF_VERIFY,
+				    paths[i], strlen(paths[i]));
 				free(paths[i]);
 			}
 			free(paths);
@@ -1548,6 +1552,8 @@ scp_parallel_finish(struct sftp_conn *conn)
 			for (i = 0; i < used; i++) {
 				fmprintf(stderr,
 				    "HPNVerifyTransfer: FAILED: %s\n", paths[i]);
+				progressmeter_frames_filefail(HPNS_FF_VERIFY,
+				    paths[i], strlen(paths[i]));
 				free(paths[i]);
 			}
 			free(paths);
