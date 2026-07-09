@@ -30,59 +30,17 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "sshbuf.h"	/* PEEK/POKE big-endian buffer accessors */
 #include "hpn-status-frame.h"
-
-/* byte-order helpers (explicit shifts; no struct punning) */
-static void
-hpns_put_u16(u_char *p, uint16_t v)
-{
-	p[0] = (u_char)(v >> 8);
-	p[1] = (u_char)v;
-}
-
-static void
-hpns_put_u32(u_char *p, uint32_t v)
-{
-	p[0] = (u_char)(v >> 24);
-	p[1] = (u_char)(v >> 16);
-	p[2] = (u_char)(v >> 8);
-	p[3] = (u_char)v;
-}
-
-static void
-hpns_put_u64(u_char *p, uint64_t v)
-{
-	hpns_put_u32(p, (uint32_t)(v >> 32));
-	hpns_put_u32(p + 4, (uint32_t)v);
-}
-
-static uint16_t
-hpns_get_u16(const u_char *p)
-{
-	return (uint16_t)((p[0] << 8) | p[1]);
-}
-
-static uint32_t
-hpns_get_u32(const u_char *p)
-{
-	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-	    ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-}
-
-static uint64_t
-hpns_get_u64(const u_char *p)
-{
-	return ((uint64_t)hpns_get_u32(p) << 32) | hpns_get_u32(p + 4);
-}
 
 /* write the 8-byte header; returns HPNS_HDR_LEN */
 static size_t
 hpns_put_hdr(u_char *buf, u_char type, uint16_t plen)
 {
-	hpns_put_u32(buf, HPNS_MAGIC);
+	POKE_U32(buf, HPNS_MAGIC);
 	buf[4] = HPNS_VERSION;
 	buf[5] = type;
-	hpns_put_u16(buf + 6, plen);
+	POKE_U16(buf + 6, plen);
 	return HPNS_HDR_LEN;
 }
 
@@ -94,10 +52,10 @@ hpns_encode_hello(u_char *buf, const struct hpns_hello *h)
 	size_t o = hpns_put_hdr(buf, HPNS_T_HELLO, HPNS_HELLO_LEN);
 
 	buf[o] = h->proto_ver;
-	hpns_put_u32(buf + o + 1, h->caps);
-	hpns_put_u64(buf + o + 5, h->total_bytes);
-	hpns_put_u32(buf + o + 13, h->total_files);
-	hpns_put_u32(buf + o + 17, h->streams);
+	POKE_U32(buf + o + 1, h->caps);
+	POKE_U64(buf + o + 5, h->total_bytes);
+	POKE_U32(buf + o + 13, h->total_files);
+	POKE_U32(buf + o + 17, h->streams);
 	return o + HPNS_HELLO_LEN;
 }
 
@@ -107,16 +65,16 @@ hpns_encode_progress(u_char *buf, const struct hpns_progress *p)
 {
 	size_t o = hpns_put_hdr(buf, HPNS_T_PROGRESS, HPNS_PROGRESS_LEN);
 
-	hpns_put_u64(buf + o, p->bytes_done);
-	hpns_put_u64(buf + o + 8, p->bytes_total);
-	hpns_put_u64(buf + o + 16, p->rate_bps);
-	hpns_put_u32(buf + o + 24, p->eta_sec);
-	hpns_put_u32(buf + o + 28, p->files_done);
-	hpns_put_u32(buf + o + 32, p->files_total);
-	hpns_put_u16(buf + o + 36, p->workers_active);
-	hpns_put_u16(buf + o + 38, p->workers_stalled);
-	hpns_put_u16(buf + o + 40, p->flags);
-	hpns_put_u16(buf + o + 42, 0);		/* pad */
+	POKE_U64(buf + o, p->bytes_done);
+	POKE_U64(buf + o + 8, p->bytes_total);
+	POKE_U64(buf + o + 16, p->rate_bps);
+	POKE_U32(buf + o + 24, p->eta_sec);
+	POKE_U32(buf + o + 28, p->files_done);
+	POKE_U32(buf + o + 32, p->files_total);
+	POKE_U16(buf + o + 36, p->workers_active);
+	POKE_U16(buf + o + 38, p->workers_stalled);
+	POKE_U16(buf + o + 40, p->flags);
+	POKE_U16(buf + o + 42, 0);		/* pad */
 	return o + HPNS_PROGRESS_LEN;
 }
 
@@ -126,11 +84,34 @@ hpns_encode_end(u_char *buf, const struct hpns_end *e)
 {
 	size_t o = hpns_put_hdr(buf, HPNS_T_END, HPNS_END_LEN);
 
-	hpns_put_u64(buf + o, e->bytes_done);
-	hpns_put_u32(buf + o + 8, e->files_done);
-	hpns_put_u32(buf + o + 12, e->files_failed);
+	POKE_U64(buf + o, e->bytes_done);
+	POKE_U32(buf + o + 8, e->files_done);
+	POKE_U32(buf + o + 12, e->files_failed);
 	buf[o + 16] = e->ok;
 	return o + HPNS_END_LEN;
+}
+
+/*
+ * encode a FILEFAIL frame; path_len is clamped to HPNS_FILEFAIL_MAXPATH so a
+ * caller bug can never emit an over-cap (unparseable) frame - the caller sets
+ * HPNS_FF_TRUNCATED in kind when it clips.  buf must be >= HPNS_HDR_LEN +
+ * HPNS_FILEFAIL_HDR + path_len.  Returns the total frame length.
+ */
+size_t
+hpns_encode_filefail(u_char *buf, const struct hpns_filefail *ff)
+{
+	uint16_t n = ff->path_len;
+	size_t o;
+
+	if (n > HPNS_FILEFAIL_MAXPATH)
+		n = HPNS_FILEFAIL_MAXPATH;
+	o = hpns_put_hdr(buf, HPNS_T_FILEFAIL,
+	    (uint16_t)(HPNS_FILEFAIL_HDR + n));
+	buf[o] = ff->kind;
+	POKE_U16(buf + o + 1, n);
+	if (n > 0 && ff->path != NULL)
+		memcpy(buf + o + HPNS_FILEFAIL_HDR, ff->path, n);
+	return o + HPNS_FILEFAIL_HDR + n;
 }
 
 /* strict decoder: payload length must match exactly; -1 on mismatch */
@@ -140,10 +121,10 @@ hpns_decode_hello(const u_char *p, uint16_t plen, struct hpns_hello *h)
 	if (plen != HPNS_HELLO_LEN)
 		return -1;
 	h->proto_ver = p[0];
-	h->caps = hpns_get_u32(p + 1);
-	h->total_bytes = hpns_get_u64(p + 5);
-	h->total_files = hpns_get_u32(p + 13);
-	h->streams = hpns_get_u32(p + 17);
+	h->caps = PEEK_U32(p + 1);
+	h->total_bytes = PEEK_U64(p + 5);
+	h->total_files = PEEK_U32(p + 13);
+	h->streams = PEEK_U32(p + 17);
 	return 0;
 }
 
@@ -153,15 +134,15 @@ hpns_decode_progress(const u_char *p, uint16_t plen, struct hpns_progress *o)
 {
 	if (plen != HPNS_PROGRESS_LEN)
 		return -1;
-	o->bytes_done = hpns_get_u64(p);
-	o->bytes_total = hpns_get_u64(p + 8);
-	o->rate_bps = hpns_get_u64(p + 16);
-	o->eta_sec = hpns_get_u32(p + 24);
-	o->files_done = hpns_get_u32(p + 28);
-	o->files_total = hpns_get_u32(p + 32);
-	o->workers_active = hpns_get_u16(p + 36);
-	o->workers_stalled = hpns_get_u16(p + 38);
-	o->flags = hpns_get_u16(p + 40);
+	o->bytes_done = PEEK_U64(p);
+	o->bytes_total = PEEK_U64(p + 8);
+	o->rate_bps = PEEK_U64(p + 16);
+	o->eta_sec = PEEK_U32(p + 24);
+	o->files_done = PEEK_U32(p + 28);
+	o->files_total = PEEK_U32(p + 32);
+	o->workers_active = PEEK_U16(p + 36);
+	o->workers_stalled = PEEK_U16(p + 38);
+	o->flags = PEEK_U16(p + 40);
 	return 0;
 }
 
@@ -171,10 +152,31 @@ hpns_decode_end(const u_char *p, uint16_t plen, struct hpns_end *e)
 {
 	if (plen != HPNS_END_LEN)
 		return -1;
-	e->bytes_done = hpns_get_u64(p);
-	e->files_done = hpns_get_u32(p + 8);
-	e->files_failed = hpns_get_u32(p + 12);
+	e->bytes_done = PEEK_U64(p);
+	e->files_done = PEEK_U32(p + 8);
+	e->files_failed = PEEK_U32(p + 12);
 	e->ok = p[16];
+	return 0;
+}
+
+/*
+ * strict decoder: the declared path_len must account for exactly the payload
+ * (plen == HPNS_FILEFAIL_HDR + path_len); -1 otherwise.  path is left as an
+ * opaque borrowed pointer into the caller's buffer - never interpreted here.
+ */
+int
+hpns_decode_filefail(const u_char *p, uint16_t plen, struct hpns_filefail *ff)
+{
+	uint16_t path_len;
+
+	if (plen < HPNS_FILEFAIL_HDR)
+		return -1;
+	path_len = PEEK_U16(p + 1);
+	if ((size_t)plen != (size_t)HPNS_FILEFAIL_HDR + path_len)
+		return -1;
+	ff->kind = p[0];
+	ff->path_len = path_len;
+	ff->path = path_len > 0 ? p + HPNS_FILEFAIL_HDR : NULL;
 	return 0;
 }
 
@@ -212,12 +214,12 @@ hpns_parser_feed(struct hpns_parser *ps, const u_char *data, size_t len,
 
 		/* drain complete frames */
 		while (ps->have >= HPNS_HDR_LEN) {
-			if (hpns_get_u32(ps->buf) != HPNS_MAGIC ||
+			if (PEEK_U32(ps->buf) != HPNS_MAGIC ||
 			    ps->buf[4] != HPNS_VERSION) {
 				ps->failed = 1;
 				return -1;
 			}
-			plen = hpns_get_u16(ps->buf + 6);
+			plen = PEEK_U16(ps->buf + 6);
 			if (plen > HPNS_MAX_PAYLOAD) {
 				ps->failed = 1;
 				return -1;

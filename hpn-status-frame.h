@@ -60,11 +60,26 @@
 #define HPNS_T_HELLO		1
 #define HPNS_T_PROGRESS		2
 #define HPNS_T_END		3
+#define HPNS_T_FILEFAIL		4
 
 /* fixed payload sizes */
 #define HPNS_HELLO_LEN		21
 #define HPNS_PROGRESS_LEN	44
 #define HPNS_END_LEN		17
+
+/*
+ * FILEFAIL is variable-length: a 3-byte fixed head (kind + path_len)
+ * plus up to HPNS_FILEFAIL_MAXPATH opaque path bytes.  One frame per
+ * failed file.
+ */
+#define HPNS_FILEFAIL_HDR	3
+#define HPNS_FILEFAIL_MAXPATH	(HPNS_MAX_PAYLOAD - HPNS_FILEFAIL_HDR)
+
+/* FILEFAIL kind byte: reason in the low 7 bits, flags in the high bit */
+#define HPNS_FF_KINDMASK	0x7f
+#define HPNS_FF_TRANSFER	0		/* transfer never completed */
+#define HPNS_FF_VERIFY		1	/* transferred but failed verification */
+#define HPNS_FF_TRUNCATED	0x80		/* path too long, clipped */
 
 /* HELLO capability bits (advertised by the emitter; all reserved) */
 #define HPNS_CAP_PULL		0x00000001u	/* future request/response */
@@ -105,6 +120,20 @@ struct hpns_end {
 };
 
 /*
+ * Per-file failure detail: one frame per failed file, emitted before END
+ * when the relay is armed.  Variable length.  path is carried as OPAQUE
+ * bytes - the parser never interprets or renders them; the consumer must
+ * neutralize (percent-encode) before the path is ever displayed.  On
+ * decode, path borrows into the parser's frame buffer: not owned, not
+ * NUL-terminated, valid only for the duration of the frame callback.
+ */
+struct hpns_filefail {
+	u_char		kind;		/* HPNS_FF_* reason | flags */
+	uint16_t	path_len;	/* opaque bytes at path (<= MAXPATH) */
+	const u_char	*path;		/* borrowed; copy/encode before reuse */
+};
+
+/*
  * Incremental frame parser (the consumer side; this is the one piece of
  * code that faces remote input, so it is deliberately tiny and is the
  * fuzz target).  Holds at most one frame of buffered bytes.  On any
@@ -126,12 +155,15 @@ typedef void (*hpns_frame_cb)(u_char type, const u_char *payload,
 size_t	hpns_encode_hello(u_char *, const struct hpns_hello *);
 size_t	hpns_encode_progress(u_char *, const struct hpns_progress *);
 size_t	hpns_encode_end(u_char *, const struct hpns_end *);
+size_t	hpns_encode_filefail(u_char *, const struct hpns_filefail *);
 
 /* strict decoders: payload length must match exactly; -1 on mismatch */
 int	hpns_decode_hello(const u_char *, uint16_t, struct hpns_hello *);
 int	hpns_decode_progress(const u_char *, uint16_t,
 	    struct hpns_progress *);
 int	hpns_decode_end(const u_char *, uint16_t, struct hpns_end *);
+int	hpns_decode_filefail(const u_char *, uint16_t,
+	    struct hpns_filefail *);
 
 /*
  * Feed input bytes.  Returns 0 and consumes all input on success (any
