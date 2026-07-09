@@ -97,6 +97,8 @@ static off_t frames_acc_bytes;		/* bytes from completed meters */
 static u_int32_t frames_files_done;	/* completed meters (serial) */
 static u_int32_t frames_files_total;	/* external, 0 = unknown */
 static int frames_files_ext;		/* setter overrides meter counts */
+static int frame_meter_is_file = 1;	/* current meter counts as a file; the
+					 * verify meter clears it (not a file) */
 static u_int32_t frames_streams = 1;	/* effective -j for HELLO */
 static u_int16_t frames_workers_active;
 static u_int16_t frames_workers_stalled;
@@ -382,6 +384,7 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 {
 	start = last_update = monotime_double();
 	file = f;
+	frame_meter_is_file = 1;	/* each meter is a file unless cleared */
 	start_pos = *ctr;
 	end_pos = filesize;
 	cur_pos = 0;
@@ -433,7 +436,7 @@ stop_progress_meter(void)
 				cur_pos = *counter;
 			frames_emit_progress(0);
 			frames_acc_bytes += cur_pos;
-			if (!frames_files_ext)
+			if (!frames_files_ext && frame_meter_is_file)
 				frames_files_done++;
 			cur_pos = 0;
 		}
@@ -488,6 +491,17 @@ progressmeter_frames_set_workers(u_int active, u_int stalled)
 	frames_workers_active = (u_int16_t)(active > 0xffff ? 0xffff : active);
 	frames_workers_stalled =
 	    (u_int16_t)(stalled > 0xffff ? 0xffff : stalled);
+}
+
+/*
+ * Mark the current meter as NOT a file transfer (e.g. the post-transfer
+ * verify meter), so stopping it does not bump the serial per-file count.
+ * The next start_progress_meter resets it back to "is a file".
+ */
+void
+progressmeter_frames_meter_not_a_file(void)
+{
+	frame_meter_is_file = 0;
 }
 
 /*

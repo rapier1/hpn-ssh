@@ -971,6 +971,21 @@ sftp_parallel_set_file_total(struct sftp_parallel *p, long total)
 		    total > 0 ? (uint64_t)total : 0, __ATOMIC_RELAXED);
 }
 
+/* Walker-authoritative per-file counts, for a final END-frame publish. */
+u_int
+sftp_parallel_files_submitted(struct sftp_parallel *p)
+{
+	return p != NULL
+	    ? (u_int)__atomic_load_n(&p->files_submitted, __ATOMIC_RELAXED) : 0;
+}
+
+u_int
+sftp_parallel_files_total(struct sftp_parallel *p)
+{
+	return p != NULL
+	    ? (u_int)__atomic_load_n(&p->files_total, __ATOMIC_RELAXED) : 0;
+}
+
 void
 sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
     off_t total_bytes)

@@ -212,6 +212,12 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 					    new_src, "submit failed");
 				}
 				ret = -1;
+			} else {
+				/* the single authoritative file count: one per
+				 * file, upstream of bundling / range-splitting /
+				 * verify re-submits (relayed via the frames) */
+				__atomic_add_fetch(&p->files_submitted, 1,
+				    __ATOMIC_RELAXED);
 			}
 		} else {
 			/* Non-regular file (socket / fifo / device): SFTP
@@ -365,6 +371,12 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 					    new_src, "submit failed");
 				}
 				ret = -1;
+			} else {
+				/* the single authoritative file count (see the
+				 * upload walker) - one per file, upstream of all
+				 * bundling / splitting / verify re-submits */
+				__atomic_add_fetch(&p->files_submitted, 1,
+				    __ATOMIC_RELAXED);
 			}
 		} else {
 			/* Non-regular remote entry: SFTP cannot transfer

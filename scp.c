@@ -1511,6 +1511,12 @@ scp_parallel_finish(struct sftp_conn *conn)
 		struct sftp_parallel_stats pstats;
 
 		sftp_parallel_wait(parallel_orch);
+		/* Authoritative final file count for the END frame: the async
+		 * reporter's last tick can lag a fast transfer, so publish the
+		 * walker's tally directly before the meter (and END) are read. */
+		progressmeter_frames_set_files(
+		    sftp_parallel_files_submitted(parallel_orch),
+		    sftp_parallel_files_total(parallel_orch));
 		sftp_parallel_progress_stop(parallel_orch);
 		sftp_parallel_get_stats(parallel_orch, &pstats);
 		if (showprogress && pstats.bytes_wired_aggregate > 0) {

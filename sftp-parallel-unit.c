@@ -1291,10 +1291,6 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 		pthread_mutex_unlock(&p->verify_pending_mu);
 		parallel_verify_maybe_wave(p);
 	}
-	/* One file handed off for transfer (counts files, not the range units a
-	 * split may produce).  Feeds the per-file progress count. */
-	if (p != NULL && rc == 0)
-		__atomic_add_fetch(&p->files_submitted, 1, __ATOMIC_RELAXED);
 	return rc;
 }
 
@@ -1334,8 +1330,6 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
 		pthread_mutex_unlock(&p->verify_pending_mu);
 		parallel_verify_maybe_wave(p);
 	}
-	if (p != NULL && rc == 0)
-		__atomic_add_fetch(&p->files_submitted, 1, __ATOMIC_RELAXED);
 	return rc;
 }
 

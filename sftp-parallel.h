@@ -450,6 +450,10 @@ off_t sftp_parallel_scan_upload_total(const char *src, long *file_count_out);
 /* Store the scan-time total file count (for the progress frames/meter). */
 void sftp_parallel_set_file_total(struct sftp_parallel *p, long total);
 
+/* Walker-authoritative per-file counts (for a final END-frame publish). */
+u_int sftp_parallel_files_submitted(struct sftp_parallel *p);
+u_int sftp_parallel_files_total(struct sftp_parallel *p);
+
 /*
  * Tear down: signal workers to exit, join all threads, close worker SSH
  * subprocesses, free everything. Idempotent.
