@@ -185,4 +185,17 @@ void sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n);
 void     sftp_conn_verify_inflight_set(struct sftp_conn *conn, uint64_t bytes);
 uint64_t sftp_conn_verify_inflight_get(struct sftp_conn *conn);
 
+/*
+ * Remote-hash-op marker + serial meter feed (resume-check UX).  The hash
+ * engines mark entry with the byte total and refresh the stamp per heartbeat;
+ * live_total reads 0 once the stamp goes stale (~3s), so abandoned ops
+ * self-clear.  The meter-feed pointer, when registered by a serial caller,
+ * receives the remote side's cumulative hashed bytes at heartbeat cadence.
+ */
+void     sftp_conn_hash_op_mark(struct sftp_conn *conn, uint64_t total);
+uint64_t sftp_conn_hash_op_live_total(struct sftp_conn *conn);
+void     sftp_conn_set_hash_meter_ctr(struct sftp_conn *conn,
+             volatile off_t *ctr);
+void     sftp_conn_hash_meter_feed(struct sftp_conn *conn, uint64_t bytes);
+
 #endif /* _SFTP_CLIENT_INTERNAL_H */

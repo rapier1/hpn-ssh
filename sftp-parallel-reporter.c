@@ -778,6 +778,25 @@ reporter_emit_fleetsample(struct sftp_parallel *p)
 	logit("%s total_bytes=%llu", line, (unsigned long long)total);
 }
 
+/*
+ * Leave the resume-check stretch: restore the transfer meter's label and
+ * total (the stretch swapped them for the "resume check" sub-meter), clear
+ * the frame flag, and restart the display ratchet - hash bytes are not
+ * transfer bytes, so the published counter must not carry over.  Idempotent.
+ */
+static void
+resume_stretch_restore(struct sftp_parallel *p)
+{
+	if (!p->resume_stretch_on)
+		return;
+	p->resume_stretch_on = 0;
+	strlcpy(p->progress_label, p->progress_label_saved,
+	    sizeof(p->progress_label));
+	progress_meter_set_total(p->progress_total_bytes);
+	p->aggregate_progress_counter = 0;
+	progressmeter_frames_set_resuming(0);
+}
+
 void *
 parallel_reporter_thread(void *arg)
 {
@@ -808,6 +827,7 @@ parallel_reporter_thread(void *arg)
 		parallel_stats_snapshot(p, &bytes, NULL, NULL);
 		p->aggregate_bytes_for_meter = bytes;
 		if (p->verify_phase_active && p->verify_total_units > 0) {
+			resume_stretch_restore(p);	/* safety: never both */
 			/* Post-transfer verify phase: byte-granular meter.  Counter
 			 * = bytes of fully-verified files (verify_done_bytes) + every
 			 * worker's in-flight count for the file it is hashing right
@@ -846,7 +866,50 @@ parallel_reporter_thread(void *arg)
 					hashed = (uint64_t)p->verify_meter_total;
 				newpos = (off_t)hashed;
 			}
+		} else if (bytes == p->progress_bytes_baseline &&
+		    p->progress_meter_started) {
+			/*
+			 * Resume-check stretch (-Z UX): no transfer byte has
+			 * moved yet, but workers may be hashing existing
+			 * partials (chunked resume).  Render that as a
+			 * "resume check" sub-meter - total from the conn
+			 * hash-op markers, progress from the same inflight
+			 * feed the verify meter uses - instead of a frozen
+			 * 0% transfer bar.  Markers self-clear on staleness,
+			 * so a finished or abandoned hash drops out alone.
+			 * Same workers_mu discipline as the sibling loops.
+			 */
+			uint64_t rtotal = 0, rdone = 0;
+
+			pthread_mutex_lock(&p->workers_mu);
+			for (int wi = 0; wi < p->num_workers; wi++) {
+				struct sftp_worker *w = p->workers[wi];
+
+				if (w == NULL || w->conn == NULL)
+					continue;
+				rtotal += sftp_conn_hash_op_live_total(w->conn);
+				rdone += sftp_conn_verify_inflight_get(w->conn);
+			}
+			pthread_mutex_unlock(&p->workers_mu);
+			if (rtotal > 0) {
+				if (!p->resume_stretch_on) {
+					p->resume_stretch_on = 1;
+					strlcpy(p->progress_label,
+					    "resume check",
+					    sizeof(p->progress_label));
+					p->aggregate_progress_counter = 0;
+					progressmeter_frames_set_resuming(1);
+				}
+				progress_meter_set_total((off_t)rtotal);
+				if (rdone > rtotal)
+					rdone = rtotal;
+				newpos = (off_t)rdone;
+			} else {
+				resume_stretch_restore(p);
+				newpos = 0;
+			}
 		} else {
+			resume_stretch_restore(p);
 			newpos = bytes > p->progress_bytes_baseline ?
 			    (off_t)(bytes - p->progress_bytes_baseline) : 0;
 		}

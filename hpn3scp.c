@@ -302,7 +302,8 @@ ev_progress(const struct hpns_progress *p, void *ctx)
 	proto_emit_progress(p->bytes_done, p->bytes_total, p->rate_bps,
 	    p->rate_inst_bps, p->eta_sec, p->files_done, p->files_total,
 	    p->workers_active, p->workers_stalled,
-	    (p->flags & HPNS_F_VERIFY) ? 1 : 0);
+	    (p->flags & HPNS_F_VERIFY) ? 1 : 0,
+	    (p->flags & HPNS_F_RESUME) ? 1 : 0);
 }
 
 static void
@@ -317,8 +318,8 @@ ev_end(const struct hpns_end *e, void *ctx)
 		return;
 	}
 	proto_emit_progress(e->bytes_done, e->bytes_done, 0, 0, 0,
-	    e->files_done, e->files_done + e->files_failed, 0, 0, 0);
-	/* verify is over by END; rates unknowable, reported as 0 */
+	    e->files_done, e->files_done + e->files_failed, 0, 0, 0, 0);
+	/* phases are over by END; rates unknowable, reported as 0 */
 }
 
 static void

@@ -1446,6 +1446,16 @@ struct sftp_parallel {
 	char                        progress_label[128];        /* stable storage
 								   * for the meter
 								   * label string */
+	/* Resume-check stretch (HPN -Z UX): before any transfer byte moves,
+	 * workers may be hashing existing partials (chunked resume).  The
+	 * reporter detects fresh hash-op markers on the worker conns, swaps
+	 * the meter to a "resume check" sub-meter driven by the summed hash
+	 * progress, and restores the transfer meter (saved label + total)
+	 * when bytes start moving. */
+	int                         resume_stretch_on;
+	off_t                       progress_total_bytes;       /* transfer total
+								   * to restore */
+	char                        progress_label_saved[128];
 	/* Post-transfer verify-phase meter (HPN).  When active, the reporter
 	 * drives aggregate_progress_counter from the verify pending count rather
 	 * than the transfer-byte snapshot, so the meter shows verify progress

@@ -1913,6 +1913,44 @@ progress_meter_path(const char *path)
 	return progresspath;
 }
 
+/*
+ * Serial resume-check meter (HPN): spans the pre-transfer hash work in the
+ * verify branches of sftp_upload/sftp_download, so a -Z user sees progress
+ * instead of a silent stretch while both ends hash the existing partial.
+ * The hash engines feed the counter at heartbeat cadence through the
+ * registered pointer (sftp_conn_set_hash_meter_ctr), which is what lets the
+ * meter advance while this single thread is blocked in the hash protocol
+ * loop.  No-op when showprogress is off (quiet, batch, parallel workers -
+ * the orchestrator renders its own aggregate resume-check stretch).
+ * end() is idempotent, so convergent exit paths may all call it.
+ */
+static volatile off_t resume_meter_ctr;
+static int resume_meter_on;
+
+static void
+resume_check_meter_begin(struct sftp_conn *conn, off_t total)
+{
+	if (!showprogress || total <= 0)
+		return;
+	resume_meter_ctr = 0;
+	start_progress_meter("resume check", total,
+	    (off_t *)&resume_meter_ctr);
+	progressmeter_frames_meter_not_a_file();	/* not a file */
+	progressmeter_frames_set_resuming(1);		/* phase flag */
+	sftp_conn_set_hash_meter_ctr(conn, &resume_meter_ctr);
+	resume_meter_on = 1;
+}
+
+static void
+resume_check_meter_end(struct sftp_conn *conn)
+{
+	if (!resume_meter_on)
+		return;
+	sftp_conn_set_hash_meter_ctr(conn, NULL);
+	stop_progress_meter();
+	resume_meter_on = 0;
+}
+
 int
 sftp_download(struct sftp_conn *conn, const char *remote_path,
     const char *local_path, Attrib *a, int preserve_flag, int resume_flag,
@@ -2001,6 +2039,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0)
 				fatal("\"%s\": %s", remote_path,
 				    RESUME_INCOMPAT_MSG);
+			/* Resume-check meter: spans the hash work below;
+			 * total = the overlap both ends will hash. */
+			resume_check_meter_begin(conn,
+			    MINIMUM(st.st_size, (off_t)size));
 			if ((uint64_t)st.st_size == size) {
 				/*
 				 * Chunked-resume fast path: when the server
@@ -2145,13 +2187,14 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		}
 		goto resume_done;
  resume_fail:
+		resume_check_meter_end(conn);
 		sftp_close(conn, handle, handle_len);
 		free(handle);
 		if (local_fd != -1)
 			close(local_fd);
 		return skip_ret;
  resume_done:
-		;
+		resume_check_meter_end(conn);
 	}
 
 	/* Read from remote and write to local */
@@ -2878,6 +2921,10 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			debug3_f("remote file exists, size=%llu local_size=%llu",
 			    (unsigned long long)c.size,
 			    (unsigned long long)sb.st_size);
+			/* Resume-check meter: spans the hash work below;
+			 * total = the overlap both ends will hash. */
+			resume_check_meter_begin(conn,
+			    MINIMUM((off_t)c.size, sb.st_size));
 			if ((off_t)c.size == sb.st_size) {
 				/*
 				 * Chunked-resume fast path: when the server
@@ -2894,6 +2941,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				    conn, local_fd, local_path, remote_path,
 				    sb.st_size);
 				if (chunked >= 0) {
+					resume_check_meter_end(conn);
 					close(local_fd);
 					return chunked; /* 1=skip, 0=success */
 				}
@@ -2937,6 +2985,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 					debug("verified transfer: full-file hash "
 					    "match, \"%s\" already complete",
 					    local_path);
+					resume_check_meter_end(conn);
 					close(local_fd);
 					return 1; /* identical */
 				}
@@ -2946,6 +2995,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				resume = 0;           /* fresh upload */
 				effective_inplace = 0; /* force TRUNC */
 			} else if ((off_t)c.size > sb.st_size) {
+				resume_check_meter_end(conn);
 				close(local_fd);
 				return 2; /* target larger than source */
 			} else {
@@ -2967,6 +3017,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				    conn, local_fd, local_path, remote_path,
 				    sb.st_size);
 				if (chunked >= 0) {
+					resume_check_meter_end(conn);
 					close(local_fd);
 					return chunked; /* 1=skip, 0=success */
 				}
@@ -3007,6 +3058,9 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 					effective_inplace = 0; /* force TRUNC */
 				}
 			}
+			/* fall-through paths (mismatch -> fresh upload,
+			 * prefix decision) converge here */
+			resume_check_meter_end(conn);
 		} else {
 			debug3_f("remote file absent or empty; fresh upload");
 		}
@@ -4803,6 +4857,55 @@ sftp_conn_verify_inflight_get(struct sftp_conn *conn)
 		return 0;
 	return __atomic_load_n(&conn->hpn->verify_inflight_bytes,
 	    __ATOMIC_RELAXED);
+}
+
+/*
+ * Remote-hash-op marker (resume-check UX; see sftp-hpn-client.h).  The hash
+ * engines mark entry with the byte total and refresh the stamp on every
+ * heartbeat; the reporter treats a marker as live only while the stamp is
+ * fresh, so an engine exiting on any path self-clears within seconds.
+ */
+void
+sftp_conn_hash_op_mark(struct sftp_conn *conn, uint64_t total)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return;
+	__atomic_store_n(&conn->hpn->hash_op_total, total, __ATOMIC_RELAXED);
+	__atomic_store_n(&conn->hpn->hash_op_stamp_ms, (uint64_t)monotime_ms(),
+	    __ATOMIC_RELAXED);
+}
+
+/* Live total: 0 unless the marker was refreshed within the last 3 seconds. */
+uint64_t
+sftp_conn_hash_op_live_total(struct sftp_conn *conn)
+{
+	uint64_t stamp;
+
+	if (conn == NULL || conn->hpn == NULL)
+		return 0;
+	stamp = __atomic_load_n(&conn->hpn->hash_op_stamp_ms,
+	    __ATOMIC_RELAXED);
+	if (stamp == 0 || (uint64_t)monotime_ms() - stamp > 3000)
+		return 0;
+	return __atomic_load_n(&conn->hpn->hash_op_total, __ATOMIC_RELAXED);
+}
+
+/* Serial resume-check meter feed registration (see sftp-hpn-client.h). */
+void
+sftp_conn_set_hash_meter_ctr(struct sftp_conn *conn, volatile off_t *ctr)
+{
+	if (conn != NULL && conn->hpn != NULL)
+		conn->hpn->hash_meter_ctr = ctr;
+}
+
+/* Heartbeat-cadence write into the registered serial meter counter; no-op
+ * when nothing is registered (parallel workers, non-resume hashing). */
+void
+sftp_conn_hash_meter_feed(struct sftp_conn *conn, uint64_t bytes)
+{
+	if (conn != NULL && conn->hpn != NULL &&
+	    conn->hpn->hash_meter_ctr != NULL)
+		*conn->hpn->hash_meter_ctr = (off_t)bytes;
 }
 
 void

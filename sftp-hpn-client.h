@@ -184,6 +184,23 @@ struct sftp_hpn_conn {
 	 * done-bytes total at each file's completion.  Atomic; any thread. */
 	volatile uint64_t verify_inflight_bytes;
 
+	/* Remote-hash-op marker (HPN resume-check UX): total bytes the hash
+	 * engine is currently hashing on this conn, plus a monotime stamp the
+	 * heartbeats refresh.  The parallel reporter sums fresh markers to
+	 * render a "resume check" stretch before any transfer bytes move; a
+	 * stale stamp (engine exited on any path) self-clears the marker, so
+	 * no exit-point discipline is needed.  Atomic; any thread. */
+	volatile uint64_t hash_op_total;
+	volatile uint64_t hash_op_stamp_ms;
+
+	/* Direct meter feed for the SERIAL resume-check meter: when non-NULL,
+	 * the hash engines write the remote side's cumulative hashed-bytes
+	 * progress here (heartbeat cadence), so a meter whose counter points
+	 * at this location advances while the single thread is blocked in the
+	 * engine.  Registered/cleared only by the serial call sites (parallel
+	 * workers run with showprogress off and never set it). */
+	volatile off_t  *hash_meter_ctr;
+
 	/* HPNLustreStripeCount resolved from ssh_config at sftp_init time.
 	 *   -1  : auto (use -j N as the desired count when destination is
 	 *         on Lustre and currently has stripe_count < N)

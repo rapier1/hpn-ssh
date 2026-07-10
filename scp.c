@@ -2053,13 +2053,18 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 		 * Parallel mode (-j N): the orchestrator walks the tree and
 		 * fans the regular files across worker connections; the
 		 * post-transfer verify phase runs inside sftp_parallel_wait.
-		 * The per-call verify arg is resume-verify intent (regetv/-Z
-		 * verified resume), distinct from HPNVerifyTransfer which is
-		 * carried in the orchestrator config - so it stays 0 here.
+		 * The per-call verify arg is resume-verify intent (-Z verified
+		 * resume), distinct from HPNVerifyTransfer which is carried in
+		 * the orchestrator config - so it follows resume_flag, exactly
+		 * like the download sites.  Passing 0 here sent workers down
+		 * the plain size-only resume path: fresh destinations failed
+		 * loudly (ENOENT stat) and sparse partials were blind-appended
+		 * without a hash check (silent corruption).
 		 */
 		if (parallel_orch != NULL) {
 			if (sftp_parallel_upload_dir(parallel_orch, conn, src,
-			    abs_dst, SFTP_PROGRESS_ONLY, resume_flag, 0) != 0) {
+			    abs_dst, SFTP_PROGRESS_ONLY, resume_flag,
+			    resume_flag) != 0) {
 				error("failed to upload directory %s to %s",
 				    src, targ);
 				errs = 1;
@@ -2072,7 +2077,7 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 	} else if (parallel_orch != NULL) {
 		if (sftp_parallel_submit_upload(parallel_orch, conn, src,
 		    abs_dst, st.st_size, st.st_mode & 07777,
-		    resume_flag, 0) != 0) {
+		    resume_flag, resume_flag) != 0) {
 			error("failed to upload file %s to %s", src, targ);
 			errs = 1;
 		}

@@ -132,6 +132,7 @@ static struct {
 					 * impossible network rate there */
 	uint32_t eta_sec;
 	int	 verifying;	/* HPNS_F_VERIFY seen: label the phase */
+	int	 resuming;	/* HPNS_F_RESUME live: label the phase */
 	int	 done;		/* END received: paint the 100% line */
 	double	 last_frame;	/* monotime of the last sample (stall aging) */
 	double	 started;
@@ -170,12 +171,14 @@ frames_emit_progress(int force)
 	memset(&pr, 0, sizeof(pr));
 	/*
 	 * frames_acc_bytes is the transfer total (completed per-file meters).
-	 * The verify phase reuses the meter machinery but its bytes are a
-	 * distinct quantity; adding the transfer total to the verify meter would
-	 * double-count.  Verify is a single 0..vtotal meter with nothing to
-	 * accumulate, so use a zero base there and let its own counter stand.
+	 * The verify and resume-check phases reuse the meter machinery but
+	 * their bytes are hash-domain quantities; adding the transfer total
+	 * to those meters would double-count.  Each is a single 0..total
+	 * meter with nothing to accumulate, so use a zero base and let its
+	 * own counter stand.
 	 */
-	acc = (frames_flags & HPNS_F_VERIFY) ? 0 : frames_acc_bytes;
+	acc = (frames_flags & (HPNS_F_VERIFY | HPNS_F_RESUME)) ?
+	    0 : frames_acc_bytes;
 	pr.bytes_done = (uint64_t)(acc + cur_pos);
 	pr.bytes_total = end_pos > 0 ?
 	    (uint64_t)(acc + end_pos) : 0;
@@ -364,8 +367,13 @@ relay_render(void)
 	}
 
 	/* PREFIX the phase tag: the label field truncates at the right edge
-	 * (win_size - 45), so a suffix vanishes on narrow terminals. */
-	if (relay.verifying && label != NULL) {
+	 * (win_size - 45), so a suffix vanishes on narrow terminals.  The
+	 * resume check precedes transfer; verify follows it - mutually
+	 * exclusive in practice, resume checked first. */
+	if (relay.resuming && label != NULL) {
+		snprintf(vlabel, sizeof(vlabel), "resume check: %s", label);
+		label = vlabel;
+	} else if (relay.verifying && label != NULL) {
 		snprintf(vlabel, sizeof(vlabel), "verify: %s", label);
 		label = vlabel;
 	}
@@ -534,7 +542,8 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 	start = last_update = monotime_double();
 	file = f;
 	frame_meter_is_file = 1;	/* each meter is a file unless cleared */
-	frames_flags &= ~HPNS_F_VERIFY;	/* verify meters re-arm this per meter */
+	frames_flags &= ~(HPNS_F_VERIFY | HPNS_F_RESUME);
+					/* phase meters re-arm these per meter */
 	relay_mode = 0;			/* local meter unless the relay APIs
 					 * re-arm it (progress_meter_relay_*) */
 	max_delta_pos = 0;		/* peak-inst is per meter; carrying it
@@ -591,9 +600,10 @@ stop_progress_meter(void)
 				cur_pos = *counter;
 			frames_emit_progress(0);
 			/* Only transfer meters feed the running total; verify
-			 * bytes are a separate quantity (see frames_emit_progress)
-			 * and must not inflate it or the END frame. */
-			if (!(frames_flags & HPNS_F_VERIFY))
+			 * and resume-check bytes are hash-domain quantities
+			 * (see frames_emit_progress) and must not inflate it
+			 * or the END frame. */
+			if (!(frames_flags & (HPNS_F_VERIFY | HPNS_F_RESUME)))
 				frames_acc_bytes += cur_pos;
 			if (!frames_files_ext && frame_meter_is_file)
 				frames_files_done++;
@@ -681,6 +691,14 @@ progress_meter_relay_sample(const struct hpns_progress *p)
 {
 	if (!relay_mode)
 		return;
+	if ((p->flags & HPNS_F_RESUME) && !relay.resuming)
+		relay.resuming = 1;
+	else if (relay.resuming && !(p->flags & HPNS_F_RESUME)) {
+		/* resume check over, transfer begins: drop the hash peaks
+		 * so the completion line reflects transfer rates only */
+		relay.resuming = 0;
+		relay.rate_inst_max = 0;
+	}
 	if ((p->flags & HPNS_F_VERIFY) && !relay.verifying) {
 		relay.verifying = 1;
 		/* latch the transfer peak for the completion line, then
@@ -768,6 +786,17 @@ progressmeter_frames_set_verifying(int on)
 		frames_flags |= HPNS_F_VERIFY;
 	else
 		frames_flags &= ~HPNS_F_VERIFY;
+}
+
+/* Same contract as set_verifying, for the resume-check phase (hashing an
+ * existing partial before deciding what to re-transfer). */
+void
+progressmeter_frames_set_resuming(int on)
+{
+	if (on)
+		frames_flags |= HPNS_F_RESUME;
+	else
+		frames_flags &= ~HPNS_F_RESUME;
 }
 
 /*

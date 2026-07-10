@@ -89,6 +89,11 @@
 
 /* PROGRESS flag bits */
 #define HPNS_F_VERIFY		0x0001		/* verify phase in progress */
+#define HPNS_F_RESUME		0x0002		/* resume check (hashing the
+						 * existing partial).  New bits
+						 * are NOT a wire break -
+						 * consumers ignore unknown
+						 * bits. */
 
 #define HPNS_ETA_UNKNOWN	0xffffffffu
 

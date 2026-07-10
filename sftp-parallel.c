@@ -1003,6 +1003,12 @@ sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
 	if (label == NULL)
 		label = "transfer";
 	strlcpy(p->progress_label, label, sizeof(p->progress_label));
+	/* Saved for the reporter's resume-check stretch, which swaps the
+	 * label/total and must restore them when transfer bytes move. */
+	strlcpy(p->progress_label_saved, label,
+	    sizeof(p->progress_label_saved));
+	p->progress_total_bytes = total_bytes;
+	p->resume_stretch_on = 0;
 	/* Snapshot current accumulated bytes across all workers so the meter
 	 * shows only bytes moved in this transfer, not prior transfers in the
 	 * same session. */

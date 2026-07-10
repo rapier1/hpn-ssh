@@ -293,6 +293,9 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 	 * progress.  See sftp-hpn-server.h for the protocol.
 	 */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	/* Resume-check UX: mark the hash op so the reporter/meter can show
+	 * "hashing N bytes"; heartbeats below refresh the stamp. */
+	sftp_conn_hash_op_mark(conn, length);
 
 	/* Heartbeats renew the lease (liveness) but carry a progress
 	 * figure precisely because liveness is not enough: a stalled
@@ -398,6 +401,9 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 			    (unsigned long long)hb_prog);
 			/* Feed the verify progress meter: server bytes hashed. */
 			sftp_conn_verify_inflight_set(conn, hb_prog);
+			/* Refresh the hash-op marker + serial meter feed. */
+			sftp_conn_hash_op_mark(conn, length);
+			sftp_conn_hash_meter_feed(conn, hb_prog);
 			if (hb_prog > hb_prog_last) {
 				hb_prog_last = hb_prog;
 				hb_advance_sec = hb_now;
@@ -649,6 +655,13 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 	 * sftp-hpn-server.h for the protocol.
 	 */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	/* Resume-check UX: mark the hash op with the summed range bytes so
+	 * the reporter/meter can show it; heartbeats refresh the stamp. */
+	u_int64_t hash_total = 0;
+
+	for (i = 0; i < n; i++)
+		hash_total += ranges[i].len;
+	sftp_conn_hash_op_mark(conn, hash_total);
 
 	/* Heartbeats renew the lease (liveness) but carry a progress
 	 * figure precisely because liveness is not enough: a stalled
@@ -733,6 +746,9 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 			    (unsigned long long)hb_prog);
 			/* Feed the verify progress meter: server bytes hashed. */
 			sftp_conn_verify_inflight_set(conn, hb_prog);
+			/* Refresh the hash-op marker + serial meter feed. */
+			sftp_conn_hash_op_mark(conn, hash_total);
+			sftp_conn_hash_meter_feed(conn, hb_prog);
 			if (hb_prog > hb_prog_last) {
 				hb_prog_last = hb_prog;
 				hb_advance_sec = hb_now;
