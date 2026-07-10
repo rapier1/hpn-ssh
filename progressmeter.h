@@ -30,6 +30,7 @@ void	stop_progress_meter(void);
 /* HPN status relay (hpn-status-relay-design.md): binary frame emission
  * in place of the ANSI meter when stdout is a pipe and the peer asked. */
 void	progressmeter_frame_mode(u_int);
+int	progressmeter_frames_active(void);
 void	progressmeter_frames_set_workers(u_int, u_int);
 void	progressmeter_frames_set_files(u_int, u_int);
 void	progressmeter_frames_meter_not_a_file(void);

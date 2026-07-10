@@ -514,7 +514,11 @@ sftp_parallel_wait(struct sftp_parallel *p)
 	 * workers verify them in parallel on their own conns - off the transfer
 	 * path - then wait for those units to drain before returning. */
 	if (!p->abort_flag) {
-		int vn = p->verify_pending_n;	/* peek before submit drains it */
+		/* All verify units: range-split trackers (verify_pending) plus
+		 * whole-file items (verify_whole_pending).  Whole-file transfers
+		 * park only in the latter, so gating the meter on verify_pending_n
+		 * alone left the common case with no verify progress at all. */
+		int vn = p->verify_pending_n + p->verify_whole_pending_n;
 
 		if (vn > 0) {
 			/*
@@ -539,7 +543,10 @@ sftp_parallel_wait(struct sftp_parallel *p)
 			    ? (off_t)(moved - p->progress_bytes_baseline) : 0;
 			if (p->progress_meter_started)
 				sftp_parallel_progress_stop(p);
-			if (p->cfg.print_flag != SFTP_QUIET)
+			/* Suppress in frame mode: stdout is the binary status
+			 * channel there, so this text would corrupt frames. */
+			if (p->cfg.print_flag != SFTP_QUIET &&
+			    !progressmeter_frames_active())
 				mprintf("Verifying %d file(s)...\n", vn);
 			if (p->saved_showprogress && vtotal > 0) {
 				p->verify_total_units = (uint64_t)vn;

@@ -482,6 +482,17 @@ progressmeter_frame_mode(u_int streams)
 }
 
 /*
+ * Is binary frame emission armed?  When it is, stdout is the frame channel,
+ * so callers must not write human text (mprintf/printf) to it - that would
+ * corrupt the stream.  Gate any such phase message on !this.
+ */
+int
+progressmeter_frames_active(void)
+{
+	return frame_mode;
+}
+
+/*
  * Fleet telemetry for PROGRESS frames, pushed by the parallel reporter
  * tick.  No-op storage unless frame mode is armed (the reporter calls
  * unconditionally).
@@ -510,21 +521,18 @@ progressmeter_frames_meter_not_a_file(void)
  * HPNS_F_VERIFY and a front-end can label the phase "verifying".  Cleared by
  * the next start_progress_meter; both the serial and parallel verify meters
  * set it right after starting.
+ *
+ * Only sets the flag - it does NOT emit a frame.  In the parallel path the
+ * reporter thread is the sole frame writer; emitting from this (main) thread
+ * too would interleave two atomicio writes to stdout and corrupt a frame.
+ * The reporter's next tick (and the serial meter's alarm) carry the flag out.
  */
 void
 progressmeter_frames_set_verifying(int on)
 {
-	if (on) {
+	if (on)
 		frames_flags |= HPNS_F_VERIFY;
-		/*
-		 * Force one frame at the phase boundary.  A short parallel
-		 * verify can finish inside the 0.2s rate limit before any 1 Hz
-		 * alarm tick, so without this the front-end would never see the
-		 * verify phase; the forced frame guarantees it does.
-		 */
-		if (frame_mode)
-			frames_emit_progress(1);
-	} else
+	else
 		frames_flags &= ~HPNS_F_VERIFY;
 }
 
