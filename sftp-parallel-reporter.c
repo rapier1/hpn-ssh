@@ -804,6 +804,7 @@ parallel_reporter_thread(void *arg)
 		}
 
 		uint64_t bytes;
+		off_t newpos;
 		parallel_stats_snapshot(p, &bytes, NULL, NULL);
 		p->aggregate_bytes_for_meter = bytes;
 		if (p->verify_phase_active && p->verify_total_units > 0) {
@@ -819,8 +820,7 @@ parallel_reporter_thread(void *arg)
 			uint64_t done_units = __atomic_load_n(
 			    &p->verify_done_units, __ATOMIC_RELAXED);
 			if (done_units >= p->verify_total_units) {
-				p->aggregate_progress_counter =
-				    p->verify_meter_total;
+				newpos = p->verify_meter_total;
 			} else {
 				uint64_t hashed = __atomic_load_n(
 				    &p->verify_done_bytes, __ATOMIC_RELAXED);
@@ -844,12 +844,27 @@ parallel_reporter_thread(void *arg)
 				pthread_mutex_unlock(&p->workers_mu);
 				if (hashed > (uint64_t)p->verify_meter_total)
 					hashed = (uint64_t)p->verify_meter_total;
-				p->aggregate_progress_counter = (off_t)hashed;
+				newpos = (off_t)hashed;
 			}
 		} else {
-			p->aggregate_progress_counter =
-			    (off_t)(bytes - p->progress_bytes_baseline);
+			newpos = bytes > p->progress_bytes_baseline ?
+			    (off_t)(bytes - p->progress_bytes_baseline) : 0;
 		}
+		/*
+		 * Monotonic publish.  The raw aggregate steps BACKWARD when a
+		 * worker dies or a unit is requeued mid-transfer: its live_bytes
+		 * leave the sum until the redo re-transfers them.  Publishing
+		 * the dip makes the meter show a 0-rate tick and then absorb the
+		 * whole recovery in one interval - an impossible rate spike
+		 * (0 then multi-GB/s).  Ratchet the DISPLAY counter instead: the
+		 * meter holds through the redo and resumes at the true rate.
+		 * Detectors are unaffected - they read the raw snapshot (bytes),
+		 * not this counter.  Meter restarts (new command, verify phase)
+		 * reset the counter outside this tick, so the ratchet only
+		 * applies within one meter's lifetime.
+		 */
+		if (newpos > p->aggregate_progress_counter)
+			p->aggregate_progress_counter = newpos;
 		/* HPN status relay: keep the frame emitter's fleet telemetry
 		 * fresh (stored unconditionally; only read when frame mode
 		 * is armed).  Same lock discipline as the sibling fleet

@@ -1486,6 +1486,15 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 		return;
 	}
 	/*
+	 * Ignore SIGPIPE once the orchestrator is live (mirrors sftp.c).
+	 * scp's default handler, lostconn, exits the whole process - so a
+	 * write to one dead worker's pipe killed the entire transfer before
+	 * the requeue/respawn machinery could react.  Ignored, the write
+	 * fails with EPIPE, the conn is marked dead, and the unit requeues
+	 * onto a respawned worker as designed.
+	 */
+	(void)ssh_signal(SIGPIPE, SIG_IGN);
+	/*
 	 * No interrupt flag is registered with the orchestrator: scp tears down
 	 * bluntly on SIGINT - killchild SIGTERMs the control connection and
 	 * _exit()s, and the worker connections die as their pipes close.  That
