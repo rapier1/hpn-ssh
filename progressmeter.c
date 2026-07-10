@@ -125,7 +125,7 @@ frames_emit_progress(int force)
 {
 	struct hpns_progress pr;
 	u_char fbuf[HPNS_HDR_LEN + HPNS_PROGRESS_LEN];
-	off_t bytes_left;
+	off_t bytes_left, acc;
 	double now;
 
 	now = monotime_double();
@@ -134,9 +134,17 @@ frames_emit_progress(int force)
 	frame_last_emit = now;
 
 	memset(&pr, 0, sizeof(pr));
-	pr.bytes_done = (uint64_t)(frames_acc_bytes + cur_pos);
+	/*
+	 * frames_acc_bytes is the transfer total (completed per-file meters).
+	 * The verify phase reuses the meter machinery but its bytes are a
+	 * distinct quantity; adding the transfer total to the verify meter would
+	 * double-count.  Verify is a single 0..vtotal meter with nothing to
+	 * accumulate, so use a zero base there and let its own counter stand.
+	 */
+	acc = (frames_flags & HPNS_F_VERIFY) ? 0 : frames_acc_bytes;
+	pr.bytes_done = (uint64_t)(acc + cur_pos);
 	pr.bytes_total = end_pos > 0 ?
-	    (uint64_t)(frames_acc_bytes + end_pos) : 0;
+	    (uint64_t)(acc + end_pos) : 0;
 	pr.rate_bps = bytes_per_second > 0 ?
 	    (uint64_t)bytes_per_second : 0;
 	bytes_left = end_pos - cur_pos;
@@ -436,7 +444,11 @@ stop_progress_meter(void)
 			if (counter != NULL)
 				cur_pos = *counter;
 			frames_emit_progress(0);
-			frames_acc_bytes += cur_pos;
+			/* Only transfer meters feed the running total; verify
+			 * bytes are a separate quantity (see frames_emit_progress)
+			 * and must not inflate it or the END frame. */
+			if (!(frames_flags & HPNS_F_VERIFY))
+				frames_acc_bytes += cur_pos;
 			if (!frames_files_ext && frame_meter_is_file)
 				frames_files_done++;
 			cur_pos = 0;
