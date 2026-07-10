@@ -38,3 +38,10 @@ void	progressmeter_frames_set_verifying(int);
 void	progressmeter_frames_filefail(u_int, const char *, size_t);
 void	progressmeter_frames_end(int, u_int);
 void	progress_meter_set_total(off_t);
+
+/* HPN status relay, consumer side: meter rendered from remote telemetry
+ * only (no local rate/ETA derivation - frame arrival timing aliases). */
+struct hpns_progress;
+void	progress_meter_relay_start(const char *);
+void	progress_meter_relay_sample(const struct hpns_progress *);
+void	progress_meter_relay_end(u_int64_t);

@@ -53,8 +53,9 @@ void	proto_emit_need_decision_hostkey(const char *fp, const char *sshfp,
 	    const char *token);
 void	proto_emit_need_decision_identity(const char *reason);
 void	proto_emit_progress(uint64_t bytes, uint64_t total, uint64_t rate,
-	    uint32_t eta, uint32_t files_done, uint32_t files_total,
-	    uint16_t workers, uint16_t stalled, int verifying);
+	    uint64_t rate_inst, uint32_t eta, uint32_t files_done,
+	    uint32_t files_total, uint16_t workers, uint16_t stalled,
+	    int verifying);
 void	proto_emit_warning(const char *msg);
 void	proto_emit_error(const char *msg);
 /*

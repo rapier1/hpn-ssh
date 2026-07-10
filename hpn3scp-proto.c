@@ -213,15 +213,16 @@ proto_emit_need_decision_identity(const char *reason)
 
 void
 proto_emit_progress(uint64_t bytes, uint64_t total, uint64_t rate,
-    uint32_t eta, uint32_t files_done, uint32_t files_total,
-    uint16_t workers, uint16_t stalled, int verifying)
+    uint64_t rate_inst, uint32_t eta, uint32_t files_done,
+    uint32_t files_total, uint16_t workers, uint16_t stalled, int verifying)
 {
 	if (human_mode)
 		return;		/* the local meter renders progress instead */
 	fprintf(po(), "EVENT progress bytes=%" PRIu64 " total=%" PRIu64
-	    " rate=%" PRIu64 " eta=%" PRIu32 " files_done=%" PRIu32
-	    " files_total=%" PRIu32 " workers=%u stalled=%u verifying=%d\n",
-	    bytes, total, rate, eta, files_done, files_total,
+	    " rate=%" PRIu64 " rate_inst=%" PRIu64 " eta=%" PRIu32
+	    " files_done=%" PRIu32 " files_total=%" PRIu32
+	    " workers=%u stalled=%u verifying=%d\n",
+	    bytes, total, rate, rate_inst, eta, files_done, files_total,
 	    (unsigned)workers, (unsigned)stalled, verifying ? 1 : 0);
 	fflush(po());
 }

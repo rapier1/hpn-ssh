@@ -259,13 +259,12 @@ discover_remote_hpnscp(struct launch_session *s, char *out, size_t outlen)
 
 /*
  * Decoded frames -> output.  Protocol mode relays them as EVENT lines;
- * human mode (stdout is a terminal) drives a local progress meter instead,
- * exactly as hpnscp's -R consumer does.
+ * human mode (stdout is a terminal) drives a local progress meter rendered
+ * entirely from the frames (progress_meter_relay_*), exactly as hpnscp's
+ * -R consumer does - no rate/ETA is re-derived from frame arrival times.
  */
 static struct {
 	char	 label[1100];	/* "srchost => dsthost", local argv data only */
-	off_t	 ctr;		/* meter counter, fed from frames */
-	off_t	 total;
 	int	 on;
 } meter;
 
@@ -285,8 +284,7 @@ static void
 ev_hello(const struct hpns_hello *hl, void *ctx)
 {
 	(void)ctx;
-	if (hl->total_bytes > 0)
-		meter.total = (off_t)hl->total_bytes;
+	(void)hl;	/* totals arrive in PROGRESS frames */
 }
 
 static void
@@ -294,21 +292,17 @@ ev_progress(const struct hpns_progress *p, void *ctx)
 {
 	(void)ctx;
 	if (proto_human()) {
-		meter.ctr = (off_t)p->bytes_done;
-		if (p->bytes_total > 0)
-			meter.total = (off_t)p->bytes_total;
 		if (!meter.on) {
-			start_progress_meter(meter.label, meter.total,
-			    &meter.ctr);
+			progress_meter_relay_start(meter.label);
 			meter.on = 1;
 		}
-		progress_meter_set_total(meter.total);
-		refresh_progress_meter(0);
+		progress_meter_relay_sample(p);
 		return;
 	}
 	proto_emit_progress(p->bytes_done, p->bytes_total, p->rate_bps,
-	    p->eta_sec, p->files_done, p->files_total, p->workers_active,
-	    p->workers_stalled, (p->flags & HPNS_F_VERIFY) ? 1 : 0);
+	    p->rate_inst_bps, p->eta_sec, p->files_done, p->files_total,
+	    p->workers_active, p->workers_stalled,
+	    (p->flags & HPNS_F_VERIFY) ? 1 : 0);
 }
 
 static void
@@ -318,11 +312,13 @@ ev_end(const struct hpns_end *e, void *ctx)
 	endinfo.files_done = e->files_done;
 	endinfo.got = 1;
 	if (proto_human()) {
-		meter.ctr = (off_t)e->bytes_done;
+		if (meter.on)
+			progress_meter_relay_end(e->bytes_done);
 		return;
 	}
-	proto_emit_progress(e->bytes_done, e->bytes_done, 0, 0, e->files_done,
-	    e->files_done + e->files_failed, 0, 0, 0);	/* verify done at END */
+	proto_emit_progress(e->bytes_done, e->bytes_done, 0, 0, 0,
+	    e->files_done, e->files_done + e->files_failed, 0, 0, 0);
+	/* verify is over by END; rates unknowable, reported as 0 */
 }
 
 static void

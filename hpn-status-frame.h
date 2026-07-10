@@ -64,7 +64,7 @@
 
 /* fixed payload sizes */
 #define HPNS_HELLO_LEN		21
-#define HPNS_PROGRESS_LEN	44
+#define HPNS_PROGRESS_LEN	52
 #define HPNS_END_LEN		17
 
 /*
@@ -103,6 +103,10 @@ struct hpns_progress {
 	uint64_t	bytes_done;
 	uint64_t	bytes_total;	/* may grow; 0 = unknown */
 	uint64_t	rate_bps;	/* smoothed */
+	uint64_t	rate_inst_bps;	/* last-interval rate, unsmoothed.
+					 * Measured at the source against its
+					 * own clock; a consumer cannot derive
+					 * it from frame arrival times. */
 	uint32_t	eta_sec;	/* HPNS_ETA_UNKNOWN = unknown */
 	uint32_t	files_done;
 	uint32_t	files_total;	/* 0 = unknown */

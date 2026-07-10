@@ -68,13 +68,14 @@ hpns_encode_progress(u_char *buf, const struct hpns_progress *p)
 	POKE_U64(buf + o, p->bytes_done);
 	POKE_U64(buf + o + 8, p->bytes_total);
 	POKE_U64(buf + o + 16, p->rate_bps);
-	POKE_U32(buf + o + 24, p->eta_sec);
-	POKE_U32(buf + o + 28, p->files_done);
-	POKE_U32(buf + o + 32, p->files_total);
-	POKE_U16(buf + o + 36, p->workers_active);
-	POKE_U16(buf + o + 38, p->workers_stalled);
-	POKE_U16(buf + o + 40, p->flags);
-	POKE_U16(buf + o + 42, 0);		/* pad */
+	POKE_U64(buf + o + 24, p->rate_inst_bps);
+	POKE_U32(buf + o + 32, p->eta_sec);
+	POKE_U32(buf + o + 36, p->files_done);
+	POKE_U32(buf + o + 40, p->files_total);
+	POKE_U16(buf + o + 44, p->workers_active);
+	POKE_U16(buf + o + 46, p->workers_stalled);
+	POKE_U16(buf + o + 48, p->flags);
+	POKE_U16(buf + o + 50, 0);		/* pad */
 	return o + HPNS_PROGRESS_LEN;
 }
 
@@ -137,12 +138,13 @@ hpns_decode_progress(const u_char *p, uint16_t plen, struct hpns_progress *o)
 	o->bytes_done = PEEK_U64(p);
 	o->bytes_total = PEEK_U64(p + 8);
 	o->rate_bps = PEEK_U64(p + 16);
-	o->eta_sec = PEEK_U32(p + 24);
-	o->files_done = PEEK_U32(p + 28);
-	o->files_total = PEEK_U32(p + 32);
-	o->workers_active = PEEK_U16(p + 36);
-	o->workers_stalled = PEEK_U16(p + 38);
-	o->flags = PEEK_U16(p + 40);
+	o->rate_inst_bps = PEEK_U64(p + 24);
+	o->eta_sec = PEEK_U32(p + 32);
+	o->files_done = PEEK_U32(p + 36);
+	o->files_total = PEEK_U32(p + 40);
+	o->workers_active = PEEK_U16(p + 44);
+	o->workers_stalled = PEEK_U16(p + 46);
+	o->flags = PEEK_U16(p + 48);
 	return 0;
 }
 

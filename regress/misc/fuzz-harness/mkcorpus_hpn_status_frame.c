@@ -57,6 +57,7 @@ main(int argc, char **argv)
 	p.bytes_done = 1073741824ULL;
 	p.bytes_total = 2147483648ULL;
 	p.rate_bps = 250000000ULL;
+	p.rate_inst_bps = 300000000ULL;
 	p.eta_sec = 4;
 	p.files_done = 30;
 	p.files_total = 60;

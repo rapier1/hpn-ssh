@@ -201,6 +201,7 @@ static size_t parallel_extra_o_count = 0;
 static size_t parallel_extra_o_cap = 0;
 static int hpn_verify_transfer = 0;		/* HPNVerifyTransfer resolved */
 static int verify_flag = 0;			/* -V: force HPNVerifyTransfer on */
+static int family_flag = 0;			/* -4/-6: forward to -R source scp */
 static int hpn_verify_failed = 0;		/* a transfer failed verify -> exit 57 */
 static int range_split_min_mb_user = 0;		/* -M: range-split min file size, MiB */
 static int writers_cap_user = 0;		/* -w: max range-writers per inode */
@@ -317,25 +318,20 @@ do_local_cmd(arglist *a)
 
 /*
  * HPN status relay, consumer side (hpn-status-relay-design.md).  scp drives
- * a local ANSI progress meter from the frames the shared runner decodes.
- * The meter's byte counter is fed from PROGRESS frames; the meter starts on
- * the first PROGRESS (only if showprogress) and its target grows as the
- * remote total is learned.
+ * a local ANSI progress meter rendered entirely from the frames the shared
+ * runner decodes (progress_meter_relay_*): every displayed value comes from
+ * the source's own measurements, never re-derived from frame arrival times.
+ * The meter starts on the first PROGRESS (only if showprogress).
  */
 struct scp_meter {
 	const char *label;	/* built from local argv only, never remote bytes */
-	off_t ctr;		/* meter counter, fed from frames */
-	off_t total;		/* last known remote total */
 	int meter_on;
 };
 
 static void
 scp_meter_hello(const struct hpns_hello *h, void *ctx)
 {
-	struct scp_meter *m = ctx;
-
-	if (h->total_bytes > 0)
-		m->total = (off_t)h->total_bytes;
+	/* totals arrive in PROGRESS frames; nothing to seed yet */
 }
 
 static void
@@ -343,17 +339,12 @@ scp_meter_progress(const struct hpns_progress *p, void *ctx)
 {
 	struct scp_meter *m = ctx;
 
-	m->ctr = (off_t)p->bytes_done;
-	if (p->bytes_total > 0)
-		m->total = (off_t)p->bytes_total;
 	if (!m->meter_on && showprogress) {
-		start_progress_meter(m->label, m->total, &m->ctr);
+		progress_meter_relay_start(m->label);
 		m->meter_on = 1;
 	}
-	if (m->meter_on) {
-		progress_meter_set_total(m->total);
-		refresh_progress_meter(0);
-	}
+	if (m->meter_on)
+		progress_meter_relay_sample(p);
 }
 
 static void
@@ -361,7 +352,8 @@ scp_meter_end(const struct hpns_end *e, void *ctx)
 {
 	struct scp_meter *m = ctx;
 
-	m->ctr = (off_t)e->bytes_done;
+	if (m->meter_on)
+		progress_meter_relay_end(e->bytes_done);
 }
 
 static void
@@ -700,11 +692,13 @@ main(int argc, char **argv)
 			addargs(&args, "-%c", ch);
 			addargs(&remote_remote_args, "-%c", ch);
 			parallel_extra_o_add("AddressFamily=inet");
+			family_flag = 4;
 			break;
 		case '6':
 			addargs(&args, "-%c", ch);
 			addargs(&remote_remote_args, "-%c", ch);
 			parallel_extra_o_add("AddressFamily=inet6");
+			family_flag = 6;
 			break;
 		case 'C':
 			addargs(&args, "-%c", ch);
@@ -1750,6 +1744,19 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 				addargs(&alist, "-P");
 				addargs(&alist, "%d", tport);
 			}
+			/*
+			 * The source runs the actual source->target transfer,
+			 * so its address family and verify/resume requests must
+			 * travel with it: remote_remote_args above only
+			 * decorates the ssh hop to the source, and cmd carries
+			 * none of these flags.
+			 */
+			if (family_flag)
+				addargs(&alist, "-%d", family_flag);
+			if (verify_flag)
+				addargs(&alist, "-V");
+			if (resume_flag)
+				addargs(&alist, "-Z");
 			addargs(&alist, "%s", src);
 			addargs(&alist, "%s%s%s:%s",
 			    tuser ? tuser : "", tuser ? "@" : "",
