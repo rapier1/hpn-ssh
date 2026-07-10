@@ -129,10 +129,29 @@ hpns_decode_hello(const u_char *p, uint16_t plen, struct hpns_hello *h)
 	return 0;
 }
 
-/* strict decoder: payload length must match exactly; -1 on mismatch */
+/*
+ * Strict decoder: payload length must match a known layout exactly; -1
+ * otherwise.  Two layouts are accepted - current, and the legacy V0
+ * (44-byte, before rate_inst_bps) so a new consumer still renders a
+ * meter against an older HPN source.  V0 has no instantaneous rate;
+ * the smoothed rate stands in (slightly wrong beats no meter).
+ */
 int
 hpns_decode_progress(const u_char *p, uint16_t plen, struct hpns_progress *o)
 {
+	if (plen == HPNS_PROGRESS_LEN_V0) {
+		o->bytes_done = PEEK_U64(p);
+		o->bytes_total = PEEK_U64(p + 8);
+		o->rate_bps = PEEK_U64(p + 16);
+		o->rate_inst_bps = o->rate_bps;		/* best available */
+		o->eta_sec = PEEK_U32(p + 24);
+		o->files_done = PEEK_U32(p + 28);
+		o->files_total = PEEK_U32(p + 32);
+		o->workers_active = PEEK_U16(p + 36);
+		o->workers_stalled = PEEK_U16(p + 38);
+		o->flags = PEEK_U16(p + 40);
+		return 0;
+	}
 	if (plen != HPNS_PROGRESS_LEN)
 		return -1;
 	o->bytes_done = PEEK_U64(p);

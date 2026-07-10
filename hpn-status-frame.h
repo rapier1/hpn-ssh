@@ -65,6 +65,9 @@
 /* fixed payload sizes */
 #define HPNS_HELLO_LEN		21
 #define HPNS_PROGRESS_LEN	52
+#define HPNS_PROGRESS_LEN_V0	44	/* legacy, before rate_inst_bps: the
+					 * decoder still accepts it so a new
+					 * consumer meters an older HPN source */
 #define HPNS_END_LEN		17
 
 /*

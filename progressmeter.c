@@ -115,12 +115,21 @@ static long long frames_rate_inst;	/* last-interval rate for PROGRESS */
  * touch it and their math path is unchanged.
  */
 static int relay_mode;
+static int relay_arming;	/* suppress the initial local paint while
+				 * relay_start reuses start_progress_meter
+				 * (relay_mode is not set yet at that point) */
 static struct {
 	uint64_t bytes_done;
 	uint64_t bytes_total;
 	uint64_t rate;		/* source-smoothed */
 	uint64_t rate_inst;	/* source last-interval */
-	uint64_t rate_inst_max;	/* peak inst, for the completion line */
+	uint64_t rate_inst_max;	/* peak inst within the current phase */
+	uint64_t rate_inst_peak_xfer;	/* transfer-phase peak, latched at the
+					 * verify transition: the completion
+					 * line summarizes the TRANSFER, and a
+					 * verify-phase hash peak (legitimately
+					 * above link speed) would read as an
+					 * impossible network rate there */
 	uint32_t eta_sec;
 	int	 verifying;	/* HPNS_F_VERIFY seen: label the phase */
 	int	 done;		/* END received: paint the 100% line */
@@ -338,7 +347,10 @@ relay_render(void)
 	if (relay.done) {
 		tail = METER_TAIL_DONE;
 		tsec = (long)(now - relay.started);
-		inst = (off_t)relay.rate_inst_max;	/* peak, like local */
+		/* peak, like local - the TRANSFER peak when a verify phase
+		 * followed (its hash peak is not a network rate) */
+		inst = (off_t)(relay.rate_inst_peak_xfer > 0 ?
+		    relay.rate_inst_peak_xfer : relay.rate_inst_max);
 	} else if (now - relay.last_frame >= STALL_TIME) {
 		tail = METER_TAIL_STALLED;
 		inst = 0;
@@ -351,8 +363,10 @@ relay_render(void)
 		inst = (off_t)relay.rate_inst;
 	}
 
+	/* PREFIX the phase tag: the label field truncates at the right edge
+	 * (win_size - 45), so a suffix vanishes on narrow terminals. */
 	if (relay.verifying && label != NULL) {
-		snprintf(vlabel, sizeof(vlabel), "%s (verify)", label);
+		snprintf(vlabel, sizeof(vlabel), "verify: %s", label);
 		label = vlabel;
 	}
 	render_meter_line(label, percent, (off_t)relay.bytes_done,
@@ -372,6 +386,8 @@ refresh_progress_meter(int force_update)
 	enum meter_tail tail;
 	off_t delta_pos;
 
+	if (relay_arming)
+		return;		/* relay meter arming: nothing to paint yet */
 	if (file == NULL || (!force_update && !alarm_fired && !win_resized) ||
 	    (!frame_mode && !can_output()))
 		return;
@@ -648,7 +664,12 @@ void
 progress_meter_relay_start(const char *label)
 {
 	relay_ctr = 0;
+	/* The meter core paints once inside start; suppress it - relay_mode
+	 * is not set yet, and the local path with end_pos 0 would render a
+	 * bogus "100% 0.0KB/s" line before the first frame arrives. */
+	relay_arming = 1;
 	start_progress_meter(label, 0, &relay_ctr);
+	relay_arming = 0;
 	memset(&relay, 0, sizeof(relay));
 	relay.started = relay.last_frame = monotime_double();
 	relay_mode = 1;
@@ -662,7 +683,10 @@ progress_meter_relay_sample(const struct hpns_progress *p)
 		return;
 	if ((p->flags & HPNS_F_VERIFY) && !relay.verifying) {
 		relay.verifying = 1;
-		relay.rate_inst_max = 0;	/* new phase, new peak */
+		/* latch the transfer peak for the completion line, then
+		 * track the verify phase's own peak separately */
+		relay.rate_inst_peak_xfer = relay.rate_inst_max;
+		relay.rate_inst_max = 0;
 	}
 	relay.bytes_done = p->bytes_done;
 	if (p->bytes_total > 0)

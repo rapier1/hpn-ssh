@@ -30,6 +30,17 @@ write_seed(const char *dir, const char *name, const u_char *buf, size_t len)
 	printf("%s: %zu bytes\n", path, len);
 }
 
+/* big-endian byte writer for hand-rolled legacy frames (the encoders
+ * only produce the current layout) */
+static void
+put_be(u_char *p, unsigned long long v, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		p[i] = (u_char)(v >> (8 * (n - 1 - i)));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -93,6 +104,28 @@ main(int argc, char **argv)
 	buf[o++] = 1;
 	o += hpns_encode_progress(buf + o, &p);
 	write_seed(argv[1], "progress", buf, o);
+
+	/* legacy 44-byte PROGRESS (pre rate_inst_bps): hand-rolled since the
+	 * encoder can no longer produce it; seeds the V0 compat branch of
+	 * hpns_decode_progress */
+	o = 0;
+	buf[o++] = 1;
+	put_be(buf + o, HPNS_MAGIC, 4);
+	buf[o + 4] = HPNS_VERSION;
+	buf[o + 5] = HPNS_T_PROGRESS;
+	put_be(buf + o + 6, HPNS_PROGRESS_LEN_V0, 2);
+	put_be(buf + o + 8, 1073741824ULL, 8);		/* bytes_done */
+	put_be(buf + o + 16, 2147483648ULL, 8);		/* bytes_total */
+	put_be(buf + o + 24, 250000000ULL, 8);		/* rate_bps */
+	put_be(buf + o + 32, 4, 4);			/* eta_sec */
+	put_be(buf + o + 36, 30, 4);			/* files_done */
+	put_be(buf + o + 40, 60, 4);			/* files_total */
+	put_be(buf + o + 44, 4, 2);			/* workers_active */
+	put_be(buf + o + 46, 1, 2);			/* workers_stalled */
+	put_be(buf + o + 48, HPNS_F_VERIFY, 2);		/* flags */
+	put_be(buf + o + 50, 0, 2);			/* pad */
+	o += HPNS_HDR_LEN + HPNS_PROGRESS_LEN_V0;
+	write_seed(argv[1], "progress-legacy", buf, o);
 
 	/* truncated frame (valid header, missing payload tail) */
 	o = 0;
