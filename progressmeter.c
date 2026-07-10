@@ -514,9 +514,17 @@ progressmeter_frames_meter_not_a_file(void)
 void
 progressmeter_frames_set_verifying(int on)
 {
-	if (on)
+	if (on) {
 		frames_flags |= HPNS_F_VERIFY;
-	else
+		/*
+		 * Force one frame at the phase boundary.  A short parallel
+		 * verify can finish inside the 0.2s rate limit before any 1 Hz
+		 * alarm tick, so without this the front-end would never see the
+		 * verify phase; the forced frame guarantees it does.
+		 */
+		if (frame_mode)
+			frames_emit_progress(1);
+	} else
 		frames_flags &= ~HPNS_F_VERIFY;
 }
 
