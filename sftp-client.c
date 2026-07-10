@@ -2058,7 +2058,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				int chunked =
 				    sftp_hpn_try_chunked_resume_download(
 				        conn, local_fd, local_path,
-				        remote_path, (off_t)size);
+				        remote_path, (off_t)size,
+				        st.st_size /* dest-EOF clamp */);
 				if (chunked >= 0) {
 					skip_ret = chunked == 1 ? 1 : 0;
 					goto resume_fail;
@@ -2128,7 +2129,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				int dchunked =
 				    sftp_hpn_try_chunked_resume_download(
 				        conn, local_fd, local_path,
-				        remote_path, (off_t)size);
+				        remote_path, (off_t)size,
+				        st.st_size /* dest-EOF clamp */);
 				if (dchunked >= 0) {
 					skip_ret = dchunked == 1 ? 1 : 0;
 					goto resume_fail;
@@ -2939,7 +2941,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 */
 				int chunked = sftp_hpn_try_chunked_resume_upload(
 				    conn, local_fd, local_path, remote_path,
-				    sb.st_size);
+				    sb.st_size, (off_t)c.size /* dest clamp */);
 				if (chunked >= 0) {
 					resume_check_meter_end(conn);
 					close(local_fd);
@@ -3015,7 +3017,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 */
 				int chunked = sftp_hpn_try_chunked_resume_upload(
 				    conn, local_fd, local_path, remote_path,
-				    sb.st_size);
+				    sb.st_size, (off_t)c.size /* dest clamp */);
 				if (chunked >= 0) {
 					resume_check_meter_end(conn);
 					close(local_fd);

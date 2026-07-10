@@ -816,17 +816,17 @@ out:
 static int
 chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
     const char *local_path, const char *remote_path,
-    off_t span_off, off_t span_len, int local_is_target)
+    off_t span_off, off_t span_len, off_t dest_size, int local_is_target)
 {
 	struct sftp_hash_range	*ranges = NULL;
 	u_int64_t		*local_hashes = NULL;
 	u_int64_t		*remote_hashes = NULL;
-	u_int64_t		 slen, soff, bytes_moved = 0;
+	u_int64_t		 slen, soff, bytes_moved = 0, checked_bytes;
 	const char		*ing = local_is_target ? "re-fetching"
 				    : "re-transferring";
 	const char		*ed = local_is_target ? "re-fetched"
 				    : "re-transferred";
-	u_int			 n_chunks, n_mismatched = 0;
+	u_int			 n_chunks, n_check, n_mismatched = 0;
 	u_int			 i;
 	int			 rc = -1;
 
@@ -877,17 +877,53 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 		    ? remain : CHUNK_HASH_CHUNK_SIZE;
 	}
 
+	/*
+	 * Destination-EOF clamp: a chunk that extends past the DESTINATION's
+	 * current size cannot match - the dest side hashes only up to its
+	 * EOF, so a straddling or wholly-absent chunk is a guaranteed
+	 * mismatch.  Skip hashing those on BOTH sides (a 5 GB partial of a
+	 * 20 GB file used to cost a 20 GB source hash) and send them straight
+	 * to the refill list.  dest_size 0 = unknown/full: check everything
+	 * (the repair path and equal-size resumes).  Chunks are ordered, so
+	 * the checked set is the prefix [0, n_check).
+	 */
+	n_check = n_chunks;
+	if (dest_size > 0) {
+		for (i = 0; i < n_chunks; i++) {
+			if (ranges[i].off + ranges[i].len >
+			    (u_int64_t)dest_size) {
+				n_check = i;
+				break;
+			}
+		}
+		if (n_check < n_chunks)
+			debug_f("dest-EOF clamp for \"%s\": checking %u/%u "
+			    "chunks (dest size %llu); %u known-missing",
+			    local_path, n_check, n_chunks,
+			    (unsigned long long)dest_size,
+			    n_chunks - n_check);
+	}
+	checked_bytes = 0;
+	for (i = 0; i < n_check; i++)
+		checked_bytes += ranges[i].len;
+
 	/* Pause the orchestrator watchdog for the combined local+remote
-	 * hash phase.  Auto-expires; explicit resume on every exit path. */
+	 * hash phase.  Auto-expires; explicit resume on every exit path.
+	 * Also raise the hash-op marker NOW: the local hash phase below is
+	 * byte-silent for tens of seconds on a big span, and the marker is
+	 * what gates the watchdog's kill classifiers off a working hasher
+	 * (the pause alone does not gate born-dead).  Refreshed per chunk. */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	sftp_conn_hash_op_mark(conn, checked_bytes);
 
 	/* Local hashing.  Refresh the pause EVERY chunk: hashing a large span
 	 * locally takes minutes of byte-silence, far past one pause window,
 	 * and the watchdog/endgame reaper would otherwise kill a worker that
 	 * is working hard - then the requeued unit re-hashes from scratch
 	 * (churn, or a livelock for a single-file reputv). */
-	for (i = 0; i < n_chunks; i++) {
+	for (i = 0; i < n_check; i++) {
 		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+		sftp_conn_hash_op_mark(conn, checked_bytes);
 		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
 		    ranges[i].len, &local_hashes[i]) != 0) {
 			error_f("local hash failed at chunk %u offset %llu "
@@ -898,14 +934,21 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 		}
 	}
 
-	/* Remote hashing: all-or-nothing.  Helper emits the user-visible
-	 * warning on failure. */
-	if (sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n_chunks,
+	/* Remote hashing: all-or-nothing over the CHECKED prefix.  Helper
+	 * emits the user-visible warning on failure.  Skipped entirely when
+	 * the clamp left nothing to compare. */
+	if (n_check > 0 &&
+	    sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n_check,
 	    remote_hashes) != 0) {
 		sftp_conn_watchdog_resume(conn);
 		goto out;
 	}
 	sftp_conn_watchdog_resume(conn);
+
+	/* Chunks past the dest EOF: force-mismatch so the splice loop below
+	 * re-sends them (calloc left local == remote == 0). */
+	for (i = n_check; i < n_chunks; i++)
+		remote_hashes[i] = 1;
 
 	for (i = 0; i < n_chunks; i++) {
 		if (local_hashes[i] != remote_hashes[i])
@@ -963,8 +1006,10 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	}
 
 	logit("verified resume \"%s\": %s %u/%u chunks "
-	    "(%llu / %llu bytes, %.1f%% of span)",
+	    "(%u hashed, %u known-missing past dest EOF; "
+	    "%llu / %llu bytes, %.1f%% of span)",
 	    local_path, ed, n_mismatched, n_chunks,
+	    n_check, n_chunks - n_check,
 	    (unsigned long long)bytes_moved, (unsigned long long)slen,
 	    100.0 * (double)bytes_moved / (double)slen);
 	rc = 0;
@@ -977,22 +1022,24 @@ out:
 
 int
 sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
-    const char *local_path, const char *remote_path, off_t file_size)
+    const char *local_path, const char *remote_path, off_t file_size,
+    off_t dest_size)
 {
 	if (file_size <= 0)
 		return -1;
 	return chunked_reconcile_span(conn, local_fd, local_path, remote_path,
-	    0, file_size, /*local_is_target=*/0);
+	    0, file_size, dest_size, /*local_is_target=*/0);
 }
 
 int
 sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
-    const char *local_path, const char *remote_path, off_t file_size)
+    const char *local_path, const char *remote_path, off_t file_size,
+    off_t dest_size)
 {
 	if (file_size <= 0)
 		return -1;
 	return chunked_reconcile_span(conn, local_fd, local_path, remote_path,
-	    0, file_size, /*local_is_target=*/1);
+	    0, file_size, dest_size, /*local_is_target=*/1);
 }
 
 void
@@ -1030,7 +1077,7 @@ verify_repair_one_pass(struct sftp_conn *conn, const char *local_path,
 			return -1;
 		}
 		rc = chunked_reconcile_span(conn, fd, local_path, remote_path,
-		    span_off, span_len, local_is_target);
+		    span_off, span_len, /*dest_size=*/0, local_is_target);
 		close(fd);
 		/*
 		 * 1 = nothing mismatched at chunk granularity, 0 = spliced;

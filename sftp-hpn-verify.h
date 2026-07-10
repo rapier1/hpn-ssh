@@ -114,9 +114,14 @@ int sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
  *       declined-by-policy paths.
  *
  * The fd's position after return is undefined; caller re-seeks as needed.
+ *
+ * dest_size: the DESTINATION's current size (remote for upload, local for
+ * download) when known; chunks extending past it are guaranteed mismatches
+ * and skip hashing on both sides (dest-EOF clamp).  0 = unknown: hash all.
  */
 int sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
-    const char *local_path, const char *remote_path, off_t file_size);
+    const char *local_path, const char *remote_path, off_t file_size,
+    off_t dest_size);
 
 /*
  * Symmetric download-side helper to sftp_hpn_try_chunked_resume_upload.
@@ -141,7 +146,8 @@ int sftp_hpn_try_chunked_resume_upload(struct sftp_conn *conn, int local_fd,
  * The fd's position after return is undefined.
  */
 int sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
-    const char *local_path, const char *remote_path, off_t file_size);
+    const char *local_path, const char *remote_path, off_t file_size,
+    off_t dest_size);
 
 /*
  * Resolve the verify auto-repair (#6) settings from the CLI/env precedence,

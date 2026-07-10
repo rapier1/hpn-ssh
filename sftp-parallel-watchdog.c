@@ -285,6 +285,20 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 			}
 		}
 
+		/* Hash-op gate: a worker mid-hash (fresh marker on its conn)
+		 * is byte-silent by design - zero kbps is not evidence.  Zero
+		 * BOTH streak counters rather than merely holding the kill:
+		 * ticks accumulated across a long hash would otherwise fire
+		 * the instant the marker goes stale (~3s after the engine
+		 * exits), executing a worker that just did legitimate work
+		 * and is ramping its first post-hash writes. */
+		if (w->conn != NULL &&
+		    sftp_conn_hash_op_live_total(w->conn) > 0) {
+			w->tput_outlier_ticks = 0;
+			w->tput_below_floor_ticks = 0;
+			continue;
+		}
+
 		if (w->tput_ema_kbps < threshold_kbps) {
 			w->tput_outlier_ticks++;
 			debug_ft("worker %d tput-outlier: "
@@ -475,6 +489,24 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 	uint64_t w_live_bytes = __atomic_load_n(&w->live_bytes,
 	    __ATOMIC_RELAXED);
 
+	/*
+	 * Hash-op gate (HPN): a conn with a FRESH hash-op marker is mid-hash
+	 * (resume check / verify / repair) - byte-silent by design but
+	 * provably alive, since the marker is refreshed every second by the
+	 * server hash heartbeat (or per-chunk locally) and self-clears ~3s
+	 * after the engine stops.  The watchdog pause already gates the
+	 * per-tick classifiers below while its lease is held; this marker
+	 * adds what the pause does not cover: the throughput-streak
+	 * accumulators in watchdog_sample_throughput (which never consult
+	 * the pause), the short tail between the engine's explicit
+	 * watchdog_resume and the first post-hash bytes, and defense in
+	 * depth should a lease ever lapse mid-op.  Hard evidence (ssh child
+	 * exit, reap) is unaffected; a genuinely wedged hash stops
+	 * refreshing and the gate reopens within seconds.
+	 */
+	int hashing = (w->conn != NULL &&
+	    sftp_conn_hash_op_live_total(w->conn) > 0);
+
 	uint64_t unit_start = __atomic_load_n(&w->unit_start_ms,
 	    __ATOMIC_ACQUIRE);
 	uint64_t since_unit_start_ms = (unit_start > 0 &&
@@ -625,7 +657,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		int64_t off = __atomic_load_n(&w->unit_offset, __ATOMIC_RELAXED);
 		int bd_fresh = (w_units_completed == 0 && w_bytes_total == 0);
 		int bd_on_stuck = (off >= 0 && off == p->born_dead_stuck_offset);
-		if (next != WORKER_DEAD && in_flight > 0
+		if (next != WORKER_DEAD && !hashing && in_flight > 0
 		    && w_live_bytes == 0
 		    && (bd_fresh || bd_on_stuck)
 		    && since_unit_start_ms > (uint64_t)p->born_dead_sec
@@ -750,7 +782,8 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 * pause rather than aborting immediately - see the
 		 * respawn section in the reporter thread for details.
 		 */
-		if (next != WORKER_DEAD && p->cfg.tput_path_healthy_kbps > 0) {
+		if (next != WORKER_DEAD && !hashing &&
+		    p->cfg.tput_path_healthy_kbps > 0) {
 			int consec = w->tput_outlier_ticks;
 			int req = p->cfg.tput_consec_required > 0
 			    ? p->cfg.tput_consec_required : 5;
@@ -789,6 +822,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 */
 		if (next != WORKER_DEAD
 		    && !w->doomed
+		    && !hashing
 		    && p->cfg.tput_path_healthy_kbps > 0
 		    && w->tput_below_floor_ticks >= BORN_SLOW_TICKS) {
 			/* Worker qualifies as born-slow (persistently below floor).
