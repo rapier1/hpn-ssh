@@ -454,6 +454,10 @@ void sftp_parallel_set_file_total(struct sftp_parallel *p, long total);
 u_int sftp_parallel_files_submitted(struct sftp_parallel *p);
 u_int sftp_parallel_files_total(struct sftp_parallel *p);
 
+/* Non-zero after wait if the run was aborted (interrupt / control-session
+ * loss / fatal error) - callers must not report success. */
+int sftp_parallel_was_aborted(struct sftp_parallel *p);
+
 /*
  * Tear down: signal workers to exit, join all threads, close worker SSH
  * subprocesses, free everything. Idempotent.

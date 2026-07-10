@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -820,6 +821,37 @@ parallel_reporter_thread(void *arg)
 			p->abort_user = 1;
 			parallel_user_abort_flag = 1;
 			sftp_parallel_abort(p);
+		}
+
+		/*
+		 * Transport liveness (the cancel path): when the launching
+		 * session dies (^C on a -R launcher), no signal crosses the
+		 * ssh hop - the client sends none on death, sshd refuses
+		 * session signals, and sshd never kills no-tty children on
+		 * connection loss.  The only observable is the session's
+		 * plumbing dying: sshd-session's exit closes the read ends of
+		 * BOTH our stdout and stderr together.  Poll both (no I/O, no
+		 * display dependency - works under -q with no meter): both
+		 * dead means our session is gone, so cancel instead of
+		 * orphaning a transfer the user just aborted.  One dead pipe
+		 * alone (stdout piped to a reader that exited) keeps stock
+		 * pass-through behavior.
+		 */
+		if (!p->abort_flag) {
+			struct pollfd lfd[2];
+
+			lfd[0].fd = STDOUT_FILENO;
+			lfd[0].events = 0;
+			lfd[1].fd = STDERR_FILENO;
+			lfd[1].events = 0;
+			if (poll(lfd, 2, 0) > 0 &&
+			    (lfd[0].revents & (POLLERR | POLLHUP | POLLNVAL)) &&
+			    (lfd[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+				logit("control session closed; "
+				    "canceling transfer");
+				p->abort_user = 1;
+				sftp_parallel_abort(p);
+			}
 		}
 
 		uint64_t bytes;

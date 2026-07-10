@@ -149,6 +149,25 @@ can_output(void)
 }
 
 /*
+ * All binary frame writes route through here.  A failed write (EPIPE -
+ * the relay consumer is gone) latches the channel dead so we stop
+ * writing instead of spamming a broken pipe.  Output hygiene ONLY: the
+ * meter displays data, it does not carry control.  Cancellation of an
+ * orphaned transfer is a transport concern, handled by the parallel
+ * reporter's session-liveness poll on stdout+stderr.
+ */
+static int frames_channel_dead;
+
+static void
+frames_write(u_char *buf, size_t len)
+{
+	if (frames_channel_dead)
+		return;
+	if (atomicio(vwrite, STDOUT_FILENO, buf, len) != len)
+		frames_channel_dead = 1;
+}
+
+/*
  * Emit one PROGRESS frame from the current meter state (frame mode
  * only).  Called from refresh_progress_meter() after the shared
  * rate/EMA math, and from stop_progress_meter() at meter boundaries.
@@ -197,8 +216,7 @@ frames_emit_progress(int force)
 	pr.workers_stalled = frames_workers_stalled;
 	pr.flags = frames_flags;
 
-	atomicio(vwrite, STDOUT_FILENO, fbuf,
-	    hpns_encode_progress(fbuf, &pr));
+	frames_write(fbuf, hpns_encode_progress(fbuf, &pr));
 }
 
 /* size needed to format integer type v, using (nbits(v) * log2(10) / 10) */
@@ -650,7 +668,7 @@ progressmeter_frame_mode(u_int streams)
 	h.total_bytes = 0;
 	h.total_files = 0;
 	h.streams = frames_streams;
-	atomicio(vwrite, STDOUT_FILENO, fbuf, hpns_encode_hello(fbuf, &h));
+	frames_write(fbuf, hpns_encode_hello(fbuf, &h));
 }
 
 /*
@@ -834,7 +852,7 @@ progressmeter_frames_filefail(u_int kind, const char *path, size_t path_len)
 	}
 	ff.path = (const u_char *)path;
 	ff.path_len = (uint16_t)path_len;
-	atomicio(vwrite, STDOUT_FILENO, fbuf, hpns_encode_filefail(fbuf, &ff));
+	frames_write(fbuf, hpns_encode_filefail(fbuf, &ff));
 }
 
 /*
@@ -855,7 +873,7 @@ progressmeter_frames_end(int ok, u_int files_failed)
 	e.files_done = frames_files_done;
 	e.files_failed = (u_int32_t)files_failed;
 	e.ok = ok ? 1 : 0;
-	atomicio(vwrite, STDOUT_FILENO, fbuf, hpns_encode_end(fbuf, &e));
+	frames_write(fbuf, hpns_encode_end(fbuf, &e));
 }
 
 /*

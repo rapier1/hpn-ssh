@@ -1514,6 +1514,12 @@ scp_parallel_finish(struct sftp_conn *conn)
 		struct sftp_parallel_stats pstats;
 
 		sftp_parallel_wait(parallel_orch);
+		/* A canceled run (interrupt / control-session loss) must not
+		 * exit 0: the destination is incomplete by design. */
+		if (sftp_parallel_was_aborted(parallel_orch)) {
+			fmprintf(stderr, "scp: transfer aborted\n");
+			++errs;
+		}
 		/* Authoritative final file count for the END frame: the async
 		 * reporter's last tick can lag a fast transfer, so publish the
 		 * walker's tally directly before the meter (and END) are read. */

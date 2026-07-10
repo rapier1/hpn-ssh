@@ -994,6 +994,17 @@ sftp_parallel_files_total(struct sftp_parallel *p)
 	    ? (u_int)__atomic_load_n(&p->files_total, __ATOMIC_RELAXED) : 0;
 }
 
+/*
+ * Was the run aborted (user interrupt, control-session loss, fatal
+ * error)?  Read after sftp_parallel_wait so callers can refuse to
+ * report success for a canceled, incomplete transfer.
+ */
+int
+sftp_parallel_was_aborted(struct sftp_parallel *p)
+{
+	return p != NULL && p->abort_flag;
+}
+
 void
 sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
     off_t total_bytes)
