@@ -277,6 +277,9 @@ static struct {
 /* the END frame's authoritative counts, for the completion summary */
 static struct {
 	uint32_t	files_done;
+	int		ok;	/* END's ok byte: 0 = the source reported
+				 * failure, even if no FILEFAIL arrived
+				 * (serial transfer errors emit none) */
 	int		got;
 } endinfo;
 
@@ -311,6 +314,7 @@ ev_end(const struct hpns_end *e, void *ctx)
 {
 	(void)ctx;
 	endinfo.files_done = e->files_done;
+	endinfo.ok = e->ok;
 	endinfo.got = 1;
 	if (proto_human()) {
 		if (meter.on)
@@ -371,7 +375,13 @@ emit_completion_summary(struct launch_session *s)
 		fprintf(stderr, "hpn3scp: WARNING: %u file%s failed "
 		    "verification (see above)\n", failtally.verify,
 		    failtally.verify == 1 ? "" : "s");
-	else if (endinfo.got) {
+	else if (endinfo.got && !endinfo.ok) {
+		/* The source reported failure without per-file FILEFAIL
+		 * detail (serial transfer errors emit none): never claim
+		 * anything was verified OK. */
+		fprintf(stderr, "hpn3scp: WARNING: the source reported the "
+		    "transfer incomplete (see errors above)\n");
+	} else if (endinfo.got) {
 		/* OK = files sent minus those that failed to transfer */
 		u_int ok = endinfo.files_done > failtally.transfer ?
 		    endinfo.files_done - failtally.transfer : 0;

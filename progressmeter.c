@@ -570,6 +570,11 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 	start_pos = *ctr;
 	end_pos = filesize;
 	cur_pos = 0;
+	/* Seed last_pos at the starting position: a resumed transfer's
+	 * counter begins at the resume offset, and a zero last_pos would
+	 * paint that whole offset as the first instantaneous rate (then
+	 * latch it as the run's peak via max_delta_pos). */
+	last_pos = *ctr;
 	counter = ctr;
 	stalled = 0;
 	bytes_per_second = 0;
@@ -588,7 +593,16 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 
 		setscreensize();
 	}
-	refresh_progress_meter(1);
+	/*
+	 * Frame mode: skip the initial forced paint.  Phase callers set
+	 * their flag (set_verifying/set_resuming) only AFTER this returns
+	 * (the reset above would clear it), so a frame emitted here would
+	 * carry cleared flags and the wrong byte base - one mislabeled
+	 * frame at every phase boundary.  The alarm / reporter tick emits
+	 * a correctly-flagged frame within a second; nothing is lost.
+	 */
+	if (!frame_mode)
+		refresh_progress_meter(1);
 
 	ssh_signal(SIGALRM, sig_alarm);
 	if (!frame_mode)
@@ -752,6 +766,10 @@ progress_meter_relay_end(u_int64_t bytes_done)
 	if (bytes_done > relay.bytes_total)
 		relay.bytes_total = bytes_done;
 	relay.done = 1;
+	/* Phases are over at END: the completion line summarizes the
+	 * transfer and must not carry a "verify:"/"resume check:" prefix. */
+	relay.verifying = 0;
+	relay.resuming = 0;
 	/* Whole-run average for the completion line, matching the local
 	 * meter.  Computed over the full local duration, so per-tick frame
 	 * quantization cannot alias it. */

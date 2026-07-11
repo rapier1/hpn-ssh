@@ -114,6 +114,14 @@ worker_record_completion(struct sftp_worker *w, off_t bytes, int success)
 	/* Reset live_bytes so the completed file's bytes aren't counted twice
 	 * (once here in bytes_total and once via the live_counter hook). */
 	__atomic_store_n(&w->live_bytes, 0, __ATOMIC_RELAXED);
+	/* Clear the hash-progress feed too: a transfer unit that ran a
+	 * chunked resume check leaves the last server heartbeat value here,
+	 * and the reporter sums this across workers for the verify meter and
+	 * the resume-check stretch - GBs of stale "progress" that the
+	 * monotonic display ratchet would then lock in.  (Verify units
+	 * already clear it inline at their fold sites; this is the
+	 * transfer-unit analogue, and re-clearing is harmless.) */
+	sftp_conn_verify_inflight_set(w->conn, 0);
 	w->last_completion_ms = monotime_ms();
 	pthread_mutex_unlock(&w->mu);
 }

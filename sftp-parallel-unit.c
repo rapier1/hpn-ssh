@@ -1291,6 +1291,12 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 		pthread_mutex_unlock(&p->verify_pending_mu);
 		parallel_verify_maybe_wave(p);
 	}
+	/* The single authoritative file count: every caller - walker,
+	 * glob, direct single-file - funnels through this chokepoint, one
+	 * count per successfully submitted file, upstream of bundling /
+	 * range-splitting / verify re-submits (relayed via the frames). */
+	if (rc == 0 && p != NULL)
+		__atomic_add_fetch(&p->files_submitted, 1, __ATOMIC_RELAXED);
 	return rc;
 }
 
@@ -1330,6 +1336,9 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
 		pthread_mutex_unlock(&p->verify_pending_mu);
 		parallel_verify_maybe_wave(p);
 	}
+	/* Single authoritative file count - see the upload sibling. */
+	if (rc == 0 && p != NULL)
+		__atomic_add_fetch(&p->files_submitted, 1, __ATOMIC_RELAXED);
 	return rc;
 }
 
