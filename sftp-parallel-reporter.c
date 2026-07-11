@@ -888,10 +888,13 @@ parallel_reporter_thread(void *arg)
 				pthread_mutex_lock(&p->workers_mu);
 				for (int wi = 0; wi < p->num_workers; wi++) {
 					struct sftp_worker *w = p->workers[wi];
-					if (w != NULL && w->conn != NULL)
-						hashed +=
-						    sftp_conn_verify_inflight_get(
-						        w->conn);
+					uint64_t d, t;
+
+					if (w == NULL || w->conn == NULL)
+						continue;
+					sftp_conn_hash_work_live(w->conn,
+					    &d, &t);
+					hashed += d;
 				}
 				pthread_mutex_unlock(&p->workers_mu);
 				if (hashed > (uint64_t)p->verify_meter_total)
@@ -916,11 +919,13 @@ parallel_reporter_thread(void *arg)
 			pthread_mutex_lock(&p->workers_mu);
 			for (int wi = 0; wi < p->num_workers; wi++) {
 				struct sftp_worker *w = p->workers[wi];
+				uint64_t d, t;
 
 				if (w == NULL || w->conn == NULL)
 					continue;
-				rtotal += sftp_conn_hash_op_live_total(w->conn);
-				rdone += sftp_conn_verify_inflight_get(w->conn);
+				sftp_conn_hash_work_live(w->conn, &d, &t);
+				rtotal += t;
+				rdone += d;
 			}
 			pthread_mutex_unlock(&p->workers_mu);
 			if (rtotal > 0) {

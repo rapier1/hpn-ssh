@@ -219,6 +219,9 @@ sftp_hpn_xxhash_local_fd(struct sftp_conn *conn, int fd, uint64_t length,
 		if (conn != NULL && since_refresh >= (64ULL << 20)) {
 			sftp_conn_watchdog_pause(conn,
 			    HPN_HEARTBEAT_REFRESH_SEC);
+			/* Feed the hash-work op: this local leg's cumulative
+			 * bytes (callers set the leg base). */
+			sftp_conn_hash_op_progress(conn, length - remaining);
 			since_refresh = 0;
 		}
 		nread = read(fd, buf, toread);
@@ -293,9 +296,8 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 	 * progress.  See sftp-hpn-server.h for the protocol.
 	 */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-	/* Resume-check UX: mark the hash op so the reporter/meter can show
-	 * "hashing N bytes"; heartbeats below refresh the stamp. */
-	sftp_conn_hash_op_mark(conn, length);
+	/* Hash-work op (begin/leg) is owned by the CALLER; the heartbeats
+	 * below feed progress into it. */
 
 	/* Heartbeats renew the lease (liveness) but carry a progress
 	 * figure precisely because liveness is not enough: a stalled
@@ -399,11 +401,9 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 			debug3_f("hpn-check-file heartbeat for \"%s\" id=%u "
 			    "progress=%llu", path, id,
 			    (unsigned long long)hb_prog);
-			/* Feed the verify progress meter: server bytes hashed. */
-			sftp_conn_verify_inflight_set(conn, hb_prog);
-			/* Refresh the hash-op marker + serial meter feed. */
-			sftp_conn_hash_op_mark(conn, length);
-			sftp_conn_hash_meter_feed(conn, hb_prog);
+			/* Server bytes hashed: feed the hash-work op (also
+			 * refreshes the liveness stamp + serial meter). */
+			sftp_conn_hash_op_progress(conn, hb_prog);
 			if (hb_prog > hb_prog_last) {
 				hb_prog_last = hb_prog;
 				hb_advance_sec = hb_now;
@@ -523,6 +523,14 @@ sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
  * across the worker pool.  Returns 0 = match, 1 = MISMATCH (corruption), -1 =
  * could not verify (local read error or server hash-range failure).
  */
+/* Read-back progress shim: land the local leg's cumulative bytes on the
+ * conn's hash-work op (sftp_hpn_readback_progress contract). */
+static void
+verify_readback_progress(void *arg, uint64_t bytes)
+{
+	sftp_conn_hash_op_progress((struct sftp_conn *)arg, bytes);
+}
+
 int
 sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, off_t off, off_t len, int local_is_target,
@@ -537,11 +545,16 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 	if (!sftp_conn_has_hash_range(conn))
 		return -1;	/* submit only chunks supported servers; defensive */
 
+	/* Hash-work op: local + remote legs of this span (work-bytes).
+	 * Ended by the unit-completion fold sites, not here. */
+	sftp_conn_hash_op_begin(conn, 2 * (uint64_t)len);
+
 	/*
 	 * Local range hash.  When have_local_hash is set (an upload range whose
-	 * source XXH3 was teed during the transfer) re-use it - no re-read.
+	 * source XXH3 was teed during the transfer) re-use it - no re-read
+	 * (the leg's work was prepaid by the transfer tee; credit it whole).
 	 * Otherwise read the local range back from disk (download dest, or an
-	 * untee'd upload range).
+	 * untee'd upload range), feeding the leg per read buffer.
 	 */
 	if (!have_local_hash) {
 		if (local_path == NULL)
@@ -555,7 +568,7 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 		 */
 		if (sftp_hpn_hash_range_ondisk(local_path, (uint64_t)off,
 		    (uint64_t)len, /*ondisk=*/local_is_target, &local_hash,
-		    NULL, NULL) != 0) {
+		    verify_readback_progress, conn) != 0) {
 			error_f("verify: local range hash failed at %llu+%llu "
 			    "for \"%s\"", (unsigned long long)off,
 			    (unsigned long long)len, local_path);
@@ -563,10 +576,12 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 			return -1;
 		}
 		sftp_conn_watchdog_resume(conn);
-	}
+	} else
+		sftp_conn_hash_op_progress(conn, (uint64_t)len);
 
 	range.off = (uint64_t)off;
 	range.len = (uint64_t)len;
+	sftp_conn_hash_op_leg(conn, (uint64_t)len);
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 	if (sftp_hpn_hash_remote_ranges(conn, remote_path, &range, 1,
 	    &remote_hash) != 0) {
@@ -655,13 +670,8 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 	 * sftp-hpn-server.h for the protocol.
 	 */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-	/* Resume-check UX: mark the hash op with the summed range bytes so
-	 * the reporter/meter can show it; heartbeats refresh the stamp. */
-	u_int64_t hash_total = 0;
-
-	for (i = 0; i < n; i++)
-		hash_total += ranges[i].len;
-	sftp_conn_hash_op_mark(conn, hash_total);
+	/* Hash-work op (begin/leg) is owned by the CALLER; the heartbeats
+	 * below feed progress into it. */
 
 	/* Heartbeats renew the lease (liveness) but carry a progress
 	 * figure precisely because liveness is not enough: a stalled
@@ -744,11 +754,9 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 			debug3_f("sftp-hash-range \"%s\" id=%u heartbeat "
 			    "progress=%llu", path, id,
 			    (unsigned long long)hb_prog);
-			/* Feed the verify progress meter: server bytes hashed. */
-			sftp_conn_verify_inflight_set(conn, hb_prog);
-			/* Refresh the hash-op marker + serial meter feed. */
-			sftp_conn_hash_op_mark(conn, hash_total);
-			sftp_conn_hash_meter_feed(conn, hb_prog);
+			/* Server bytes hashed: feed the hash-work op (also
+			 * refreshes the liveness stamp + serial meter). */
+			sftp_conn_hash_op_progress(conn, hb_prog);
 			if (hb_prog > hb_prog_last) {
 				hb_prog_last = hb_prog;
 				hb_advance_sec = hb_now;
@@ -914,7 +922,8 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	 * what gates the watchdog's kill classifiers off a working hasher
 	 * (the pause alone does not gate born-dead).  Refreshed per chunk. */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-	sftp_conn_hash_op_mark(conn, checked_bytes);
+	/* Hash-work op: both legs of the checked span (work-bytes). */
+	sftp_conn_hash_op_begin(conn, 2 * checked_bytes);
 
 	/* Leg notices: the local leg feeds no meter (only the remote
 	 * heartbeats do), so without these the display sits still while
@@ -929,9 +938,10 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	 * and the watchdog/endgame reaper would otherwise kill a worker that
 	 * is working hard - then the requeued unit re-hashes from scratch
 	 * (churn, or a livelock for a single-file reputv). */
+	u_int64_t local_done = 0;
+
 	for (i = 0; i < n_check; i++) {
 		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-		sftp_conn_hash_op_mark(conn, checked_bytes);
 		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
 		    ranges[i].len, &local_hashes[i]) != 0) {
 			error_f("local hash failed at chunk %u offset %llu "
@@ -940,11 +950,14 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 			sftp_conn_watchdog_resume(conn);
 			goto out;
 		}
+		local_done += ranges[i].len;
+		sftp_conn_hash_op_progress(conn, local_done);
 	}
 
 	/* Remote hashing: all-or-nothing over the CHECKED prefix.  Helper
 	 * emits the user-visible warning on failure.  Skipped entirely when
-	 * the clamp left nothing to compare. */
+	 * the clamp left nothing to compare.  Second leg of the work op. */
+	sftp_conn_hash_op_leg(conn, checked_bytes);
 	if (n_check > 0)
 		logit("hashing the remote copy of \"%s\"", remote_path);
 	if (n_check > 0 &&

@@ -2039,10 +2039,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0)
 				fatal("\"%s\": %s", remote_path,
 				    RESUME_INCOMPAT_MSG);
-			/* Resume-check meter: spans the hash work below;
-			 * total = the overlap both ends will hash. */
+			/* Resume-check meter: spans the hash work below in
+			 * WORK-bytes - the overlap is hashed on both ends. */
 			resume_check_meter_begin(conn,
-			    MINIMUM(st.st_size, (off_t)size));
+			    2 * MINIMUM(st.st_size, (off_t)size));
 			if ((uint64_t)st.st_size == size) {
 				/*
 				 * Chunked-resume fast path: when the server
@@ -2087,8 +2087,11 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
+				/* hash-work op: remote leg first here */
+				sftp_conn_hash_op_begin(conn, 2 * size);
 				rret = sftp_hpn_hash_remote_file(conn,
 				    remote_path, size, &remote_hash);
+				sftp_conn_hash_op_leg(conn, size);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    size, &local_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
@@ -2149,8 +2152,13 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 */
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
+				/* hash-work op: local leg first here */
+				sftp_conn_hash_op_begin(conn,
+				    2 * (uint64_t)st.st_size);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    (uint64_t)st.st_size, &local_hash);
+				sftp_conn_hash_op_leg(conn,
+				    (uint64_t)st.st_size);
 				rret = sftp_hpn_hash_remote_file(conn,
 				    remote_path, (uint64_t)st.st_size,
 				    &remote_hash);
@@ -2923,10 +2931,10 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			debug3_f("remote file exists, size=%llu local_size=%llu",
 			    (unsigned long long)c.size,
 			    (unsigned long long)sb.st_size);
-			/* Resume-check meter: spans the hash work below;
-			 * total = the overlap both ends will hash. */
+			/* Resume-check meter: spans the hash work below in
+			 * WORK-bytes - the overlap is hashed on both ends. */
 			resume_check_meter_begin(conn,
-			    MINIMUM((off_t)c.size, sb.st_size));
+			    2 * MINIMUM((off_t)c.size, sb.st_size));
 			if ((off_t)c.size == sb.st_size) {
 				/*
 				 * Chunked-resume fast path: when the server
@@ -2976,9 +2984,14 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * content.  STRICT is always sent so a pre-Phase-1
 				 * server still hashes instead of returning the
 				 * (removed) fully-allocated sentinel.
+				 * Hash-work op: remote leg first here.
 				 */
+				sftp_conn_hash_op_begin(conn,
+				    2 * (uint64_t)sb.st_size);
 				rret = sftp_hpn_hash_remote_file(conn, remote_path,
 				    sb.st_size, &remote_hash);
+				sftp_conn_hash_op_leg(conn,
+				    (uint64_t)sb.st_size);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    sb.st_size, &local_hash);
 				sftp_hpn_watchdog_resume(conn->hpn);
@@ -3032,8 +3045,11 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 
 				sftp_hpn_watchdog_pause(conn->hpn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
+				/* hash-work op: local leg first here */
+				sftp_conn_hash_op_begin(conn, 2 * c.size);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    c.size, &local_hash);
+				sftp_conn_hash_op_leg(conn, c.size);
 				/* Prefix-resume: the server always returns the
 				 * real XXH3 of the requested prefix off the
 				 * platter, so the compare below is exact. */
@@ -4726,12 +4742,18 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 	for (i = 0; i < conn->hpn->verify_pending_count; i++) {
 		if (stat(conn->hpn->verify_pending[i].local_path, &sb) == 0)
 			conn->hpn->verify_pending[i].size = sb.st_size;
-		total += conn->hpn->verify_pending[i].size;
+		/* WORK-bytes: both ends hash each byte, so the meter total
+		 * is 2x (project_hash_work_meter_design). */
+		total += 2 * conn->hpn->verify_pending[i].size;
 	}
 	if (showprogress && total > 0) {
 		start_progress_meter("verify", total, &counter);
 		progressmeter_frames_meter_not_a_file();	/* not a file */
 		progressmeter_frames_set_verifying(1);		/* verify phase */
+		/* Bridge the hash engines' per-op progress into the meter
+		 * counter so a single big file moves smoothly instead of
+		 * jumping 0->100 at completion. */
+		sftp_conn_set_hash_meter_ctr(conn, &counter);
 		meter_on = 1;
 	}
 	for (i = 0; i < conn->hpn->verify_pending_count; i++) {
@@ -4766,13 +4788,18 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 				    "(server lacks hpn-check-file@hpnssh.org or "
 				    "read error)", e->remote_path);
 			}
-			counter += e->size;
+			/* Fold this file's completed work into the bridge
+			 * base; the next op's progress continues from it. */
+			sftp_conn_hash_meter_base_add(conn,
+			    2 * (uint64_t)e->size);
 		}
 		free(e->local_path);
 		free(e->remote_path);
 	}
-	if (meter_on)
+	if (meter_on) {
+		sftp_conn_set_hash_meter_ctr(conn, NULL);
 		stop_progress_meter();
+	}
 	conn->hpn->verify_pending_count = 0;
 }
 
@@ -4837,77 +4864,139 @@ sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n)
 }
 
 /*
- * Per-connection "bytes hashed so far for the file this worker is currently
- * verifying."  The verify code SETS it to the cumulative figure the server
- * heartbeat (or the local read-back callback) reports; the orchestrator's
- * reporter sums it across workers to drive the verify progress meter, and the
- * worker moves it into the phase's done-bytes total at each file's completion.
- * Atomic; safe from any thread; no-op / 0 when conn or conn->hpn is NULL.
+ * Unified hash-work accounting (see sftp-hpn-client.h for the model).
+ * Engines call begin/leg/progress; unit-completion sites call end; the
+ * reporter and watchdog read the stamp-gated live values.
  */
 void
-sftp_conn_verify_inflight_set(struct sftp_conn *conn, uint64_t bytes)
-{
-	if (conn != NULL && conn->hpn != NULL)
-		__atomic_store_n(&conn->hpn->verify_inflight_bytes, bytes,
-		    __ATOMIC_RELAXED);
-}
-
-uint64_t
-sftp_conn_verify_inflight_get(struct sftp_conn *conn)
-{
-	if (conn == NULL || conn->hpn == NULL)
-		return 0;
-	return __atomic_load_n(&conn->hpn->verify_inflight_bytes,
-	    __ATOMIC_RELAXED);
-}
-
-/*
- * Remote-hash-op marker (resume-check UX; see sftp-hpn-client.h).  The hash
- * engines mark entry with the byte total and refresh the stamp on every
- * heartbeat; the reporter treats a marker as live only while the stamp is
- * fresh, so an engine exiting on any path self-clears within seconds.
- */
-void
-sftp_conn_hash_op_mark(struct sftp_conn *conn, uint64_t total)
+sftp_conn_hash_op_begin(struct sftp_conn *conn, uint64_t total_work)
 {
 	if (conn == NULL || conn->hpn == NULL)
 		return;
-	__atomic_store_n(&conn->hpn->hash_op_total, total, __ATOMIC_RELAXED);
-	__atomic_store_n(&conn->hpn->hash_op_stamp_ms, (uint64_t)monotime_ms(),
+	__atomic_store_n(&conn->hpn->hash_work_done, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&conn->hpn->hash_work_leg_base, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&conn->hpn->hash_work_total, total_work,
 	    __ATOMIC_RELAXED);
+	__atomic_store_n(&conn->hpn->hash_work_stamp_ms,
+	    (uint64_t)monotime_ms(), __ATOMIC_RELAXED);
 }
 
-/* Live total: 0 unless the marker was refreshed within the last 3 seconds. */
-uint64_t
-sftp_conn_hash_op_live_total(struct sftp_conn *conn)
+/* Entering a leg: subsequent progress reports are offset by `base`
+ * (0 for the first leg, the span for the second). */
+void
+sftp_conn_hash_op_leg(struct sftp_conn *conn, uint64_t base)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return;
+	__atomic_store_n(&conn->hpn->hash_work_leg_base, base,
+	    __ATOMIC_RELAXED);
+	__atomic_store_n(&conn->hpn->hash_work_stamp_ms,
+	    (uint64_t)monotime_ms(), __ATOMIC_RELAXED);
+}
+
+/*
+ * Cumulative progress within the current leg (heartbeat figures, local
+ * read loops).  Publishes done = leg_base + leg_bytes (clamped to the op
+ * total), refreshes the liveness stamp, and lands the value on the serial
+ * meter bridge when one is registered.
+ */
+void
+sftp_conn_hash_op_progress(struct sftp_conn *conn, uint64_t leg_bytes)
+{
+	uint64_t done, total;
+
+	if (conn == NULL || conn->hpn == NULL)
+		return;
+	done = __atomic_load_n(&conn->hpn->hash_work_leg_base,
+	    __ATOMIC_RELAXED) + leg_bytes;
+	total = __atomic_load_n(&conn->hpn->hash_work_total, __ATOMIC_RELAXED);
+	if (total > 0 && done > total)
+		done = total;
+	__atomic_store_n(&conn->hpn->hash_work_done, done, __ATOMIC_RELAXED);
+	__atomic_store_n(&conn->hpn->hash_work_stamp_ms,
+	    (uint64_t)monotime_ms(), __ATOMIC_RELAXED);
+	if (conn->hpn->hash_meter_ctr != NULL)
+		*conn->hpn->hash_meter_ctr =
+		    (off_t)(conn->hpn->hash_meter_base + done);
+}
+
+/* Unit completion: retire the op.  Callers that fold the op's work into a
+ * phase accumulator must capture hash_work_done BEFORE this (the same
+ * clear-before-fold discipline as the old inflight handoff). */
+void
+sftp_conn_hash_op_end(struct sftp_conn *conn)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return;
+	__atomic_store_n(&conn->hpn->hash_work_done, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&conn->hpn->hash_work_leg_base, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&conn->hpn->hash_work_total, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&conn->hpn->hash_work_stamp_ms, 0, __ATOMIC_RELAXED);
+	if (conn->hpn->hash_meter_ctr != NULL)
+		*conn->hpn->hash_meter_ctr = (off_t)conn->hpn->hash_meter_base;
+}
+
+/* Stamp-gated live pair for the reporter: zeros unless refreshed within
+ * the last 3 seconds (an engine gone on any path self-clears). */
+void
+sftp_conn_hash_work_live(struct sftp_conn *conn, uint64_t *done_out,
+    uint64_t *total_out)
 {
 	uint64_t stamp;
 
+	*done_out = 0;
+	*total_out = 0;
 	if (conn == NULL || conn->hpn == NULL)
-		return 0;
-	stamp = __atomic_load_n(&conn->hpn->hash_op_stamp_ms,
+		return;
+	stamp = __atomic_load_n(&conn->hpn->hash_work_stamp_ms,
 	    __ATOMIC_RELAXED);
 	if (stamp == 0 || (uint64_t)monotime_ms() - stamp > 3000)
-		return 0;
-	return __atomic_load_n(&conn->hpn->hash_op_total, __ATOMIC_RELAXED);
+		return;
+	*done_out = __atomic_load_n(&conn->hpn->hash_work_done,
+	    __ATOMIC_RELAXED);
+	*total_out = __atomic_load_n(&conn->hpn->hash_work_total,
+	    __ATOMIC_RELAXED);
 }
 
-/* Serial resume-check meter feed registration (see sftp-hpn-client.h). */
+/* Live total only - the watchdog's "provably hashing" gate. */
+uint64_t
+sftp_conn_hash_op_live_total(struct sftp_conn *conn)
+{
+	uint64_t done, total;
+
+	sftp_conn_hash_work_live(conn, &done, &total);
+	return total;
+}
+
+/* Capture the current op's done figure (for completion folds). */
+uint64_t
+sftp_conn_hash_work_done_get(struct sftp_conn *conn)
+{
+	if (conn == NULL || conn->hpn == NULL)
+		return 0;
+	return __atomic_load_n(&conn->hpn->hash_work_done, __ATOMIC_RELAXED);
+}
+
+/* Serial meter bridge registration; resets the completed-work base. */
 void
 sftp_conn_set_hash_meter_ctr(struct sftp_conn *conn, volatile off_t *ctr)
 {
-	if (conn != NULL && conn->hpn != NULL)
-		conn->hpn->hash_meter_ctr = ctr;
+	if (conn == NULL || conn->hpn == NULL)
+		return;
+	conn->hpn->hash_meter_ctr = ctr;
+	conn->hpn->hash_meter_base = 0;
 }
 
-/* Heartbeat-cadence write into the registered serial meter counter; no-op
- * when nothing is registered (parallel workers, non-resume hashing). */
+/* Serial multi-op meters (verify phase): fold a completed op's work into
+ * the bridge base so the next op's progress continues from it. */
 void
-sftp_conn_hash_meter_feed(struct sftp_conn *conn, uint64_t bytes)
+sftp_conn_hash_meter_base_add(struct sftp_conn *conn, uint64_t work)
 {
-	if (conn != NULL && conn->hpn != NULL &&
-	    conn->hpn->hash_meter_ctr != NULL)
-		*conn->hpn->hash_meter_ctr = (off_t)bytes;
+	if (conn == NULL || conn->hpn == NULL)
+		return;
+	conn->hpn->hash_meter_base += work;
+	if (conn->hpn->hash_meter_ctr != NULL)
+		*conn->hpn->hash_meter_ctr = (off_t)conn->hpn->hash_meter_base;
 }
 
 void

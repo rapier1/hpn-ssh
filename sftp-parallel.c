@@ -552,11 +552,16 @@ sftp_parallel_wait(struct sftp_parallel *p)
 				p->verify_total_units = (uint64_t)vn;
 				p->verify_done_units = 0;
 				p->verify_done_bytes = 0;
-				p->verify_meter_total = vtotal;
+				/* WORK-bytes: each transferred byte is hashed
+				 * on both ends (project_hash_work_meter_design),
+				 * so the verify meter total is 2x the moved
+				 * bytes and both legs advance it. */
+				p->verify_meter_total = 2 * vtotal;
 				p->aggregate_progress_counter = 0;
 				strlcpy(p->progress_label, "verify",
 				    sizeof(p->progress_label));
-				start_progress_meter(p->progress_label, vtotal,
+				start_progress_meter(p->progress_label,
+				    2 * vtotal,
 				    &p->aggregate_progress_counter);
 				progressmeter_frames_set_verifying(1);
 				/* verify_phase_active BEFORE meter_started: a
@@ -1025,6 +1030,9 @@ sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
 	    sizeof(p->progress_label_saved));
 	p->progress_total_bytes = total_bytes;
 	p->resume_stretch_on = 0;
+	p->verify_meter_total = 0;	/* this is a TRANSFER meter; a stale
+					 * verify total would hijack the stop
+					 * snapshot (work-byte domain) */
 	/* Snapshot current accumulated bytes across all workers so the meter
 	 * shows only bytes moved in this transfer, not prior transfers in the
 	 * same session. */
@@ -1043,13 +1051,19 @@ sftp_parallel_progress_stop(struct sftp_parallel *p)
 	if (p == NULL || !p->progress_meter_started)
 		return;
 	/* The reporter advances the aggregate counter only on its tick, so
-	 * a transfer's final bytes land between ticks and the meter's
-	 * forced last refresh paints a stale 99%.  Snapshot once more here
-	 * so stop_progress_meter's completion refresh shows true 100%. */
-	parallel_stats_snapshot(p, &bytes, NULL, NULL);
-	if (bytes >= p->progress_bytes_baseline)
-		p->aggregate_progress_counter =
-		    (off_t)(bytes - p->progress_bytes_baseline);
+	 * the final units land between ticks and the meter's forced last
+	 * refresh paints a stale 99%.  Snap to the LIVE meter's own total:
+	 * the verify meter counts hash WORK-bytes (2x the moved bytes -
+	 * project_hash_work_meter_design), so painting the transfer-byte
+	 * snapshot onto it would land the completion line at 50%. */
+	if (p->verify_meter_total > 0) {
+		p->aggregate_progress_counter = p->verify_meter_total;
+	} else {
+		parallel_stats_snapshot(p, &bytes, NULL, NULL);
+		if (bytes >= p->progress_bytes_baseline)
+			p->aggregate_progress_counter =
+			    (off_t)(bytes - p->progress_bytes_baseline);
+	}
 	p->progress_meter_started = 0;
 	stop_progress_meter();
 }

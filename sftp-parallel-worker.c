@@ -114,14 +114,11 @@ worker_record_completion(struct sftp_worker *w, off_t bytes, int success)
 	/* Reset live_bytes so the completed file's bytes aren't counted twice
 	 * (once here in bytes_total and once via the live_counter hook). */
 	__atomic_store_n(&w->live_bytes, 0, __ATOMIC_RELAXED);
-	/* Clear the hash-progress feed too: a transfer unit that ran a
-	 * chunked resume check leaves the last server heartbeat value here,
-	 * and the reporter sums this across workers for the verify meter and
-	 * the resume-check stretch - GBs of stale "progress" that the
-	 * monotonic display ratchet would then lock in.  (Verify units
-	 * already clear it inline at their fold sites; this is the
-	 * transfer-unit analogue, and re-clearing is harmless.) */
-	sftp_conn_verify_inflight_set(w->conn, 0);
+	/* Retire any hash-work op the unit ran (chunked resume check):
+	 * stale op progress would otherwise pollute the reporter's sums
+	 * and the ratchet would lock it in.  (Verify units end theirs at
+	 * the fold sites; re-ending is harmless.) */
+	sftp_conn_hash_op_end(w->conn);
 	w->last_completion_ms = monotime_ms();
 	pthread_mutex_unlock(&w->mu);
 }
@@ -256,15 +253,14 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 				__atomic_store_n(&j->failed, 1, __ATOMIC_RELAXED);
 			u->verify_job = NULL;
 
-			/* Meter: this chunk's bytes are now hashed.  Clear
-			 * in-flight BEFORE folding into done-bytes - the
-			 * opposite order lets a reporter tick land between the
-			 * two and count the chunk twice (a rate spike); the
-			 * dip this order leaves is absorbed by the reporter's
-			 * monotonic publish. */
-			sftp_conn_verify_inflight_set(w->conn, 0);
+			/* Meter: this chunk's WORK (both legs) is done.  End
+			 * the op BEFORE folding - the opposite order lets a
+			 * reporter tick count the chunk twice (a rate spike);
+			 * the dip this order leaves is absorbed by the
+			 * reporter's monotonic publish. */
+			sftp_conn_hash_op_end(w->conn);
 			__atomic_fetch_add(&p->verify_done_bytes,
-			    (uint64_t)j->lens[k], __ATOMIC_RELAXED);
+			    2 * (uint64_t)j->lens[k], __ATOMIC_RELAXED);
 
 			/*
 			 * Last chunk to finish (the ACQ_REL barrier makes every
@@ -317,18 +313,16 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		/* Drive the verify-phase meter: count completed verifies (the
 		 * submit interleaves with draining, so pending is ambiguous). */
 		__atomic_fetch_add(&p->verify_done_units, 1, __ATOMIC_RELAXED);
-		/* Byte-granular meter: this file is fully hashed now, so fold its
-		 * final in-flight count into the phase's done-bytes total and
-		 * clear in-flight for this worker's next file (also leaves it 0
-		 * for the next unit's start).  Clear BEFORE folding - the
-		 * opposite order lets a reporter tick count the file twice
-		 * (rate spike); the dip this order leaves is absorbed by the
-		 * reporter's monotonic publish. */
+		/* Byte-granular meter: this file's hash work is done.  Capture
+		 * the op's work-bytes, END the op, then fold - capture-end-fold
+		 * is the required order (ending first loses the figure; folding
+		 * first lets a reporter tick count the file twice).  The dip
+		 * between end and fold is absorbed by the monotonic publish. */
 		{
-			uint64_t hashed =
-			    sftp_conn_verify_inflight_get(w->conn);
-			sftp_conn_verify_inflight_set(w->conn, 0);
-			__atomic_fetch_add(&p->verify_done_bytes, hashed,
+			uint64_t work =
+			    sftp_conn_hash_work_done_get(w->conn);
+			sftp_conn_hash_op_end(w->conn);
+			__atomic_fetch_add(&p->verify_done_bytes, work,
 			    __ATOMIC_RELAXED);
 		}
 		return 0;

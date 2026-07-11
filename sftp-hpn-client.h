@@ -177,29 +177,31 @@ struct sftp_hpn_conn {
 	 * Atomic add; safe from any thread. */
 	volatile uint64_t bytes_wired_payload;
 
-	/* Verify progress meter (HPN): bytes hashed so far for the file this
-	 * worker is currently verifying.  Set to the cumulative figure the
-	 * server hash heartbeat / local read-back callback reports; the reporter
-	 * sums it across workers and the worker folds it into the phase's
-	 * done-bytes total at each file's completion.  Atomic; any thread. */
-	volatile uint64_t verify_inflight_bytes;
+	/*
+	 * Unified hash-work accounting (HPN; project_hash_work_meter_design).
+	 * Every hash phase - -Z resume check, -V verify, auto-repair - meters
+	 * in WORK-BYTES: checking one byte of overlap costs 2 (one local, one
+	 * remote), so a two-leg op's total is 2x its span and BOTH legs feed
+	 * the same monotone counter (done = leg_base + leg progress).  The
+	 * stamp is refreshed by every progress write: the watchdog's kill
+	 * classifiers treat a fresh stamp as "provably hashing", and the
+	 * reporter treats a stale one (~3s) as op-gone - engines do NOT need
+	 * exit-point discipline; the explicit end lives at unit-completion
+	 * sites.  Atomic; any thread.
+	 */
+	volatile uint64_t hash_work_done;
+	volatile uint64_t hash_work_total;
+	volatile uint64_t hash_work_leg_base;
+	volatile uint64_t hash_work_stamp_ms;
 
-	/* Remote-hash-op marker (HPN resume-check UX): total bytes the hash
-	 * engine is currently hashing on this conn, plus a monotime stamp the
-	 * heartbeats refresh.  The parallel reporter sums fresh markers to
-	 * render a "resume check" stretch before any transfer bytes move; a
-	 * stale stamp (engine exited on any path) self-clears the marker, so
-	 * no exit-point discipline is needed.  Atomic; any thread. */
-	volatile uint64_t hash_op_total;
-	volatile uint64_t hash_op_stamp_ms;
-
-	/* Direct meter feed for the SERIAL resume-check meter: when non-NULL,
-	 * the hash engines write the remote side's cumulative hashed-bytes
-	 * progress here (heartbeat cadence), so a meter whose counter points
-	 * at this location advances while the single thread is blocked in the
-	 * engine.  Registered/cleared only by the serial call sites (parallel
-	 * workers run with showprogress off and never set it). */
+	/* Serial meter bridge: when registered, every progress write also
+	 * lands meter_base + done at this location, so a meter counter
+	 * advances while the single thread is blocked in an engine.
+	 * meter_base carries completed prior ops (multi-file serial verify).
+	 * Registered/cleared only by serial call sites (parallel workers run
+	 * with showprogress off and never set it). */
 	volatile off_t  *hash_meter_ctr;
+	volatile uint64_t hash_meter_base;
 
 	/* HPNLustreStripeCount resolved from ssh_config at sftp_init time.
 	 *   -1  : auto (use -j N as the desired count when destination is

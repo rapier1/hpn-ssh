@@ -176,26 +176,25 @@ uint64_t sftp_conn_bytes_wired(struct sftp_conn *conn);
 void sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n);
 
 /*
- * Verify progress feed: the verify module (sftp-hpn-verify.c) SETS the
- * cumulative bytes-hashed for the file currently under verification on this
- * connection; the orchestrator reads it to drive the verify progress meter.
- * Atomic; any thread; set is a no-op and get returns 0 when conn/conn->hpn is
- * NULL.
+ * Unified hash-work accounting (project_hash_work_meter_design): every
+ * hash phase meters in work-bytes (1 byte of overlap = 2 work-bytes, one
+ * per leg).  Engines drive begin/leg/progress; unit-completion sites call
+ * end (capture done BEFORE end when folding); the reporter reads the
+ * stamp-gated live pair; the watchdog gate reads live_total.  The meter
+ * bridge lets a serial meter counter advance while the thread is blocked
+ * inside an engine.
  */
-void     sftp_conn_verify_inflight_set(struct sftp_conn *conn, uint64_t bytes);
-uint64_t sftp_conn_verify_inflight_get(struct sftp_conn *conn);
-
-/*
- * Remote-hash-op marker + serial meter feed (resume-check UX).  The hash
- * engines mark entry with the byte total and refresh the stamp per heartbeat;
- * live_total reads 0 once the stamp goes stale (~3s), so abandoned ops
- * self-clear.  The meter-feed pointer, when registered by a serial caller,
- * receives the remote side's cumulative hashed bytes at heartbeat cadence.
- */
-void     sftp_conn_hash_op_mark(struct sftp_conn *conn, uint64_t total);
+void     sftp_conn_hash_op_begin(struct sftp_conn *conn, uint64_t total_work);
+void     sftp_conn_hash_op_leg(struct sftp_conn *conn, uint64_t base);
+void     sftp_conn_hash_op_progress(struct sftp_conn *conn,
+             uint64_t leg_bytes);
+void     sftp_conn_hash_op_end(struct sftp_conn *conn);
+void     sftp_conn_hash_work_live(struct sftp_conn *conn, uint64_t *done_out,
+             uint64_t *total_out);
 uint64_t sftp_conn_hash_op_live_total(struct sftp_conn *conn);
+uint64_t sftp_conn_hash_work_done_get(struct sftp_conn *conn);
 void     sftp_conn_set_hash_meter_ctr(struct sftp_conn *conn,
              volatile off_t *ctr);
-void     sftp_conn_hash_meter_feed(struct sftp_conn *conn, uint64_t bytes);
+void     sftp_conn_hash_meter_base_add(struct sftp_conn *conn, uint64_t work);
 
 #endif /* _SFTP_CLIENT_INTERNAL_H */
