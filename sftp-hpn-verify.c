@@ -916,6 +916,14 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
 	sftp_conn_hash_op_mark(conn, checked_bytes);
 
+	/* Leg notices: the local leg feeds no meter (only the remote
+	 * heartbeats do), so without these the display sits still while
+	 * work is happening.  logit self-gates under -q; worded neutrally
+	 * because this engine also runs verify auto-repair.  Skipped when
+	 * the dest-EOF clamp left nothing to hash. */
+	if (n_check > 0)
+		logit("hashing the local copy of \"%s\"", local_path);
+
 	/* Local hashing.  Refresh the pause EVERY chunk: hashing a large span
 	 * locally takes minutes of byte-silence, far past one pause window,
 	 * and the watchdog/endgame reaper would otherwise kill a worker that
@@ -937,6 +945,8 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	/* Remote hashing: all-or-nothing over the CHECKED prefix.  Helper
 	 * emits the user-visible warning on failure.  Skipped entirely when
 	 * the clamp left nothing to compare. */
+	if (n_check > 0)
+		logit("hashing the remote copy of \"%s\"", remote_path);
 	if (n_check > 0 &&
 	    sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n_check,
 	    remote_hashes) != 0) {

@@ -559,8 +559,13 @@ sftp_parallel_wait(struct sftp_parallel *p)
 				start_progress_meter(p->progress_label, vtotal,
 				    &p->aggregate_progress_counter);
 				progressmeter_frames_set_verifying(1);
-				p->progress_meter_started = 1;
+				/* verify_phase_active BEFORE meter_started: a
+				 * reporter tick between the two would take the
+				 * transfer branch against the verify meter's
+				 * freshly-zeroed counter and the ratchet would
+				 * pin the bogus publish for the whole phase. */
 				p->verify_phase_active = 1;
+				p->progress_meter_started = 1;
 			}
 		}
 		(void)parallel_verify_phase_submit(p);

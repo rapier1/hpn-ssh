@@ -958,7 +958,13 @@ parallel_reporter_thread(void *arg)
 		 * reset the counter outside this tick, so the ratchet only
 		 * applies within one meter's lifetime.
 		 */
-		if (newpos > p->aggregate_progress_counter)
+		/* Publish only while a meter is running: the main thread
+		 * resets the counter at meter boundaries (progress_start,
+		 * verify start) with no lock, and a raciness-window publish
+		 * would be pinned by the ratchet for the whole next meter
+		 * instead of self-correcting on the following tick. */
+		if (p->progress_meter_started &&
+		    newpos > p->aggregate_progress_counter)
 			p->aggregate_progress_counter = newpos;
 		/* HPN status relay: keep the frame emitter's fleet telemetry
 		 * fresh (stored unconditionally; only read when frame mode

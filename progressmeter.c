@@ -102,7 +102,12 @@ static int frame_meter_is_file = 1;	/* current meter counts as a file; the
 static u_int32_t frames_streams = 1;	/* effective -j for HELLO */
 static u_int16_t frames_workers_active;
 static u_int16_t frames_workers_stalled;
-static u_int16_t frames_flags;
+static u_int16_t frames_flags;	/* HPNS_F_* - written by BOTH the main
+					 * thread (set_verifying, meter starts)
+					 * and the reporter (set_resuming), so
+					 * every access is atomic: a lost-update
+					 * RMW would misfile hash bytes into the
+					 * transfer accumulator */
 static long long frames_rate_inst;	/* last-interval rate for PROGRESS */
 
 /*
@@ -196,8 +201,9 @@ frames_emit_progress(int force)
 	 * meter with nothing to accumulate, so use a zero base and let its
 	 * own counter stand.
 	 */
-	acc = (frames_flags & (HPNS_F_VERIFY | HPNS_F_RESUME)) ?
-	    0 : frames_acc_bytes;
+	u_int16_t fl = __atomic_load_n(&frames_flags, __ATOMIC_RELAXED);
+
+	acc = (fl & (HPNS_F_VERIFY | HPNS_F_RESUME)) ? 0 : frames_acc_bytes;
 	pr.bytes_done = (uint64_t)(acc + cur_pos);
 	pr.bytes_total = end_pos > 0 ?
 	    (uint64_t)(acc + end_pos) : 0;
@@ -214,7 +220,7 @@ frames_emit_progress(int force)
 	pr.files_total = frames_files_total;
 	pr.workers_active = frames_workers_active;
 	pr.workers_stalled = frames_workers_stalled;
-	pr.flags = frames_flags;
+	pr.flags = fl;
 
 	frames_write(fbuf, hpns_encode_progress(fbuf, &pr));
 }
@@ -494,8 +500,10 @@ refresh_progress_meter(int force_update)
 		return;
 	}
 
-	/* percent of transfer done */
-	if (end_pos == 0 || cur_pos == end_pos)
+	/* percent of transfer done.  Clamp at 100: the resume-check stretch
+	 * can shrink the total (a hash-op marker going stale) under a
+	 * ratcheted counter, and >100% must never render. */
+	if (end_pos == 0 || cur_pos >= end_pos)
 		percent = 100;
 	else
 		percent = ((float)cur_pos / end_pos) * 100;
@@ -560,7 +568,8 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 	start = last_update = monotime_double();
 	file = f;
 	frame_meter_is_file = 1;	/* each meter is a file unless cleared */
-	frames_flags &= ~(HPNS_F_VERIFY | HPNS_F_RESUME);
+	__atomic_fetch_and(&frames_flags,
+	    (u_int16_t)~(HPNS_F_VERIFY | HPNS_F_RESUME), __ATOMIC_RELAXED);
 					/* phase meters re-arm these per meter */
 	relay_mode = 0;			/* local meter unless the relay APIs
 					 * re-arm it (progress_meter_relay_*) */
@@ -635,7 +644,9 @@ stop_progress_meter(void)
 			 * and resume-check bytes are hash-domain quantities
 			 * (see frames_emit_progress) and must not inflate it
 			 * or the END frame. */
-			if (!(frames_flags & (HPNS_F_VERIFY | HPNS_F_RESUME)))
+			if (!(__atomic_load_n(&frames_flags,
+			    __ATOMIC_RELAXED) &
+			    (HPNS_F_VERIFY | HPNS_F_RESUME)))
 				frames_acc_bytes += cur_pos;
 			if (!frames_files_ext && frame_meter_is_file)
 				frames_files_done++;
@@ -819,9 +830,11 @@ void
 progressmeter_frames_set_verifying(int on)
 {
 	if (on)
-		frames_flags |= HPNS_F_VERIFY;
+		__atomic_fetch_or(&frames_flags, HPNS_F_VERIFY,
+		    __ATOMIC_RELAXED);
 	else
-		frames_flags &= ~HPNS_F_VERIFY;
+		__atomic_fetch_and(&frames_flags, (u_int16_t)~HPNS_F_VERIFY,
+		    __ATOMIC_RELAXED);
 }
 
 /* Same contract as set_verifying, for the resume-check phase (hashing an
@@ -830,9 +843,11 @@ void
 progressmeter_frames_set_resuming(int on)
 {
 	if (on)
-		frames_flags |= HPNS_F_RESUME;
+		__atomic_fetch_or(&frames_flags, HPNS_F_RESUME,
+		    __ATOMIC_RELAXED);
 	else
-		frames_flags &= ~HPNS_F_RESUME;
+		__atomic_fetch_and(&frames_flags, (u_int16_t)~HPNS_F_RESUME,
+		    __ATOMIC_RELAXED);
 }
 
 /*
