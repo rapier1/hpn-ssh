@@ -160,6 +160,14 @@ can_output(void)
  * meter displays data, it does not carry control.  Cancellation of an
  * orphaned transfer is a transport concern, handled by the parallel
  * reporter's session-liveness poll on stdout+stderr.
+ *
+ * Frame integrity rests on pipe-write atomicity: the largest frame is
+ * HPNS_HDR_LEN + HPNS_MAX_PAYLOAD (520) bytes, within PIPE_BUF on every
+ * supported platform (4096 on Linux and the BSDs; only the POSIX 512
+ * floor would be marginal), so each frame lands in one write() that the
+ * kernel never splits and atomicio never has to resume.  That is what
+ * keeps the reporter thread's periodic ticks and the main thread's
+ * meter-boundary frames from interleaving mid-frame on shared stdout.
  */
 static int frames_channel_dead;
 
@@ -910,9 +918,10 @@ progressmeter_frames_end(int ok, u_int files_failed)
 }
 
 /*
- * Adjust a running meter's target size (B side: the relay consumer
- * learns/grows the remote total from PROGRESS frames after the meter
- * has started).
+ * Adjust a running meter's target size.  Used by the parallel reporter
+ * (source side) when a live meter's denominator legitimately changes:
+ * it tracks the aggregate hash-work total during the resume-check
+ * stretch, then restores the transfer total when the stretch ends.
  */
 void
 progress_meter_set_total(off_t total)

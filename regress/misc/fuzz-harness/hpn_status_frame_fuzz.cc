@@ -6,7 +6,7 @@
  * over-read, or loop on arbitrary bytes, and every delivered frame must
  * satisfy the header contract (validated in the callback below).
  *
- * Input layout: first byte selects the feed chunk size (1..256) so the
+ * Input layout: first byte selects the feed chunk size (1..255) so the
  * fuzzer exercises resumption across arbitrary split points, mirroring
  * short pipe reads; the rest is the byte stream.
  */
@@ -49,8 +49,9 @@ frame_cb(u_char type, const u_char *payload, uint16_t plen, void *ctx)
 	case HPNS_T_PROGRESS:
 		if (hpns_decode_progress(payload, plen, &pr) == 0)
 			sink = pr.bytes_done + pr.bytes_total + pr.rate_bps +
-			    pr.eta_sec + pr.files_done + pr.files_total +
-			    pr.workers_active + pr.workers_stalled + pr.flags;
+			    pr.rate_inst_bps + pr.eta_sec + pr.files_done +
+			    pr.files_total + pr.workers_active +
+			    pr.workers_stalled + pr.flags;
 		break;
 	case HPNS_T_END:
 		if (hpns_decode_end(payload, plen, &e) == 0)

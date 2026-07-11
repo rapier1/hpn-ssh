@@ -38,8 +38,9 @@
  *     u8  ver    1
  *     u8  type   HPNS_T_*
  *     u16 payload_len   (hard cap HPNS_MAX_PAYLOAD)
- * Payloads are fixed-size per type; unknown types with a sane header
- * must be skipped by consumers (forward compatibility).
+ * Payloads are fixed-size per type, except FILEFAIL, which carries a
+ * variable-length opaque path; unknown types with a sane header must be
+ * skipped by consumers (forward compatibility).
  *
  * Implementation is in hpn-status-frame.c, which deliberately depends
  * on libc only so the fuzz harness can link the parser directly.

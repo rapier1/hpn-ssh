@@ -25,13 +25,21 @@
  * ASCII-only (every value percent-encoded), and all fields are integers or
  * validated strings formatted/parsed locale-independently (no %f/strtod,
  * explicit ASCII ctype - never the locale isalnum/isdigit).
+ *
+ * EVENT contract (binding on every front-end): fields are key=value
+ * tokens.  Parse by key - ignore unrecognized keys, do not depend on key
+ * order, and expect new keys to appear in any event as the protocol
+ * grows.  Existing keys are never renamed or repurposed.  A positional
+ * parser WILL break on the next field addition.
  */
 
 #ifndef HPN3SCP_PROTO_H
 #define HPN3SCP_PROTO_H
 
-#include <stdint.h>
 #include <stdio.h>
+
+struct hpns_progress;
+struct hpns_filefail;
 
 /* Direct emit at a specific stream (defaults to stdout if never set). */
 void	proto_init(FILE *out);
@@ -52,20 +60,22 @@ void	proto_emit_resolved(const char *src, const char *dst, int streams);
 void	proto_emit_need_decision_hostkey(const char *fp, const char *sshfp,
 	    const char *token);
 void	proto_emit_need_decision_identity(const char *reason);
-void	proto_emit_progress(uint64_t bytes, uint64_t total, uint64_t rate,
-	    uint64_t rate_inst, uint32_t eta, uint32_t files_done,
-	    uint32_t files_total, uint16_t workers, uint16_t stalled,
-	    int verifying, int resuming);
+/*
+ * Aggregate progress, straight from a decoded PROGRESS frame; callers may
+ * also synthesize one (ev_end builds the final 100% snapshot).  The
+ * verifying=/resuming= fields render from p->flags.
+ */
+void	proto_emit_progress(const struct hpns_progress *p);
 void	proto_emit_warning(const char *msg);
 void	proto_emit_error(const char *msg);
 /*
- * One failed file.  kind is the FILEFAIL kind byte (reason in the low bits,
- * HPNS_FF_TRUNCATED in the high bit); path is opaque bytes of length path_len
- * (NOT NUL-terminated) - percent-encoded onto the wire so arbitrary/UTF-8
+ * One failed file, straight from a decoded FILEFAIL frame.  ff->kind is
+ * the kind byte (reason in the low bits, HPNS_FF_TRUNCATED in the high
+ * bit); ff->path is opaque bytes of length ff->path_len (NOT
+ * NUL-terminated) - percent-encoded onto the wire so arbitrary/UTF-8
  * bytes cross safely.
  */
-void	proto_emit_file_fail(unsigned int kind, const unsigned char *path,
-	    size_t path_len);
+void	proto_emit_file_fail(const struct hpns_filefail *ff);
 void	proto_emit_done(int ok, int exit_status, unsigned files,
 	    unsigned verify_failed, unsigned transfer_failed);
 

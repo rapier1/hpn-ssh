@@ -302,16 +302,14 @@ ev_progress(const struct hpns_progress *p, void *ctx)
 		progress_meter_relay_sample(p);
 		return;
 	}
-	proto_emit_progress(p->bytes_done, p->bytes_total, p->rate_bps,
-	    p->rate_inst_bps, p->eta_sec, p->files_done, p->files_total,
-	    p->workers_active, p->workers_stalled,
-	    (p->flags & HPNS_F_VERIFY) ? 1 : 0,
-	    (p->flags & HPNS_F_RESUME) ? 1 : 0);
+	proto_emit_progress(p);
 }
 
 static void
 ev_end(const struct hpns_end *e, void *ctx)
 {
+	struct hpns_progress last;
+
 	(void)ctx;
 	endinfo.files_done = e->files_done;
 	endinfo.ok = e->ok;
@@ -321,9 +319,14 @@ ev_end(const struct hpns_end *e, void *ctx)
 			progress_meter_relay_end(e->bytes_done);
 		return;
 	}
-	proto_emit_progress(e->bytes_done, e->bytes_done, 0, 0, 0,
-	    e->files_done, e->files_done + e->files_failed, 0, 0, 0, 0);
-	/* phases are over by END; rates unknowable, reported as 0 */
+	/* synthesize the final 100% snapshot; phases are over by END and
+	 * rates are unknowable, so flags, rates, and eta stay zero */
+	memset(&last, 0, sizeof(last));
+	last.bytes_done = e->bytes_done;
+	last.bytes_total = e->bytes_done;
+	last.files_done = e->files_done;
+	last.files_total = e->files_done + e->files_failed;
+	proto_emit_progress(&last);
 }
 
 static void
@@ -337,7 +340,7 @@ ev_file_fail(const struct hpns_filefail *ff, void *ctx)
 	/* structured emit; the borrowed path is consumed now (percent-encoded)
 	 * and not retained.  Human mode is a no-op here - the source's stderr
 	 * already carries the per-file detail. */
-	proto_emit_file_fail(ff->kind, ff->path, ff->path_len);
+	proto_emit_file_fail(ff);
 }
 
 static void
@@ -424,7 +427,7 @@ do_launch(struct launch_session *s, const char *abs_hpnscp)
 		addargs(&a, "-4");
 	else if (s->addr_family == 6)
 		addargs(&a, "-6");
-	for (i = 0; i < (int)s->hpnscp_extra->num; i++)	/* -o/-X/-Y/-r */
+	for (i = 0; i < (int)s->hpnscp_extra->num; i++)	/* -r/-V/-Z/-o/-X/-Y */
 		addargs(&a, "%s", s->hpnscp_extra->list[i]);
 	if (s->streams > 1) {
 		addargs(&a, "-j");

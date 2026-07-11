@@ -31,6 +31,7 @@
 #include <string.h>
 
 #include "log.h"
+#include "hpn-status-frame.h"
 #include "hpn3scp-proto.h"
 
 static FILE *proto_out = NULL;
@@ -212,10 +213,7 @@ proto_emit_need_decision_identity(const char *reason)
 }
 
 void
-proto_emit_progress(uint64_t bytes, uint64_t total, uint64_t rate,
-    uint64_t rate_inst, uint32_t eta, uint32_t files_done,
-    uint32_t files_total, uint16_t workers, uint16_t stalled,
-    int verifying, int resuming)
+proto_emit_progress(const struct hpns_progress *p)
 {
 	if (human_mode)
 		return;		/* the local meter renders progress instead */
@@ -223,9 +221,11 @@ proto_emit_progress(uint64_t bytes, uint64_t total, uint64_t rate,
 	    " rate=%" PRIu64 " rate_inst=%" PRIu64 " eta=%" PRIu32
 	    " files_done=%" PRIu32 " files_total=%" PRIu32
 	    " workers=%u stalled=%u verifying=%d resuming=%d\n",
-	    bytes, total, rate, rate_inst, eta, files_done, files_total,
-	    (unsigned)workers, (unsigned)stalled, verifying ? 1 : 0,
-	    resuming ? 1 : 0);
+	    p->bytes_done, p->bytes_total, p->rate_bps, p->rate_inst_bps,
+	    p->eta_sec, p->files_done, p->files_total,
+	    (unsigned)p->workers_active, (unsigned)p->workers_stalled,
+	    (p->flags & HPNS_F_VERIFY) ? 1 : 0,
+	    (p->flags & HPNS_F_RESUME) ? 1 : 0);
 	fflush(po());
 }
 
@@ -258,15 +258,15 @@ proto_emit_error(const char *msg)
 }
 
 void
-proto_emit_file_fail(unsigned int kind, const unsigned char *path,
-    size_t path_len)
+proto_emit_file_fail(const struct hpns_filefail *ff)
 {
 	char enc[2048];		/* >= 3 * max frame path (509) + 1, all escaped */
 
 	if (human_mode)
 		return;		/* the source's stderr already shows the detail */
-	pct_encode_n(enc, sizeof(enc), path, path_len);
-	fprintf(po(), "EVENT file_fail kind=%u path=%s\n", kind, enc);
+	pct_encode_n(enc, sizeof(enc), ff->path, ff->path_len);
+	fprintf(po(), "EVENT file_fail kind=%u path=%s\n",
+	    (unsigned)ff->kind, enc);
 	fflush(po());
 }
 

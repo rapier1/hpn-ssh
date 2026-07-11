@@ -2124,8 +2124,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * partial grows to its pwrite highwater and
 				 * may hold interior holes below that size -
 				 * prefix resume would append past them and
-				 * corrupt.  Chunks past local EOF hash as
-				 * absent and re-fetch.  Declines fall through
+				 * corrupt.  Chunks past local EOF are clamped
+				 * as known-missing (never hashed) and
+				 * re-fetched directly.  Declines fall through
 				 * to prefix resume (sequential partials,
 				 * sub-threshold files).
 				 */
@@ -3020,13 +3021,14 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * range-split partial grows to its pwrite
 				 * highwater and may hold interior holes below
 				 * that size - prefix resume would append past
-				 * them and corrupt.  The server clamps ranges
-				 * at remote EOF, so interior holes and the
-				 * missing tail all hash-mismatch and re-send.
-				 * Declines (-1) fall through to prefix
-				 * resume, reached only for sequentially
-				 * written partials and files below the chunk
-				 * threshold.
+				 * them and corrupt.  Interior holes
+				 * hash-mismatch and re-send; chunks past
+				 * remote EOF are clamped client-side as
+				 * known-missing (never hashed on either end)
+				 * and re-sent directly.  Declines (-1) fall
+				 * through to prefix resume, reached only for
+				 * sequentially written partials and files
+				 * below the chunk threshold.
 				 */
 				int chunked = sftp_hpn_try_chunked_resume_upload(
 				    conn, local_fd, local_path, remote_path,
