@@ -23,6 +23,8 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "hpn-status-frame.h"
+
 void	start_progress_meter(const char *, off_t, off_t *);
 void	refresh_progress_meter(int);
 void	stop_progress_meter(void);
@@ -35,15 +37,13 @@ void	progressmeter_frames_set_workers(u_int, u_int);
 void	progressmeter_frames_set_files(u_int, u_int);
 void	progressmeter_frames_meter_not_a_file(void);
 void	progressmeter_frames_count_file(void);
-void	progressmeter_frames_set_verifying(int);
-void	progressmeter_frames_set_resuming(int);
+void	progressmeter_frames_set_phase(u_int, int);
 void	progressmeter_frames_filefail(u_int, const char *, size_t);
 void	progressmeter_frames_end(int, u_int);
 void	progress_meter_set_total(off_t);
 
 /* HPN status relay, consumer side: meter rendered from remote telemetry
  * only (no local rate/ETA derivation - frame arrival timing aliases). */
-struct hpns_progress;
 void	progress_meter_relay_start(const char *);
 void	progress_meter_relay_sample(const struct hpns_progress *);
 void	progress_meter_relay_end(u_int64_t);

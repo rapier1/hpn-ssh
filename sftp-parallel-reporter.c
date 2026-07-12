@@ -795,7 +795,7 @@ resume_stretch_restore(struct sftp_parallel *p)
 	    sizeof(p->progress_label));
 	progress_meter_set_total(p->progress_total_bytes);
 	p->aggregate_progress_counter = 0;
-	progressmeter_frames_set_resuming(0);
+	progressmeter_frames_set_phase(HPNS_F_RESUME, 0);
 }
 
 void *
@@ -935,7 +935,8 @@ parallel_reporter_thread(void *arg)
 					    "resume check",
 					    sizeof(p->progress_label));
 					p->aggregate_progress_counter = 0;
-					progressmeter_frames_set_resuming(1);
+					progressmeter_frames_set_phase(
+					    HPNS_F_RESUME, 1);
 				}
 				progress_meter_set_total((off_t)rtotal);
 				if (rdone > rtotal)

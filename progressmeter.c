@@ -103,10 +103,10 @@ static u_int32_t frames_streams = 1;	/* effective -j for HELLO */
 static u_int16_t frames_workers_active;
 static u_int16_t frames_workers_stalled;
 static u_int16_t frames_flags;	/* HPNS_F_* - written by BOTH the main
-					 * thread (set_verifying, meter starts)
-					 * and the reporter (set_resuming), so
-					 * every access is atomic: a lost-update
-					 * RMW would misfile hash bytes into the
+					 * thread and the reporter (set_phase,
+					 * meter starts), so every access is
+					 * atomic: a lost-update RMW would
+					 * misfile hash bytes into the
 					 * transfer accumulator */
 static long long frames_rate_inst;	/* last-interval rate for PROGRESS */
 
@@ -120,9 +120,6 @@ static long long frames_rate_inst;	/* last-interval rate for PROGRESS */
  * touch it and their math path is unchanged.
  */
 static int relay_mode;
-static int relay_arming;	/* suppress the initial local paint while
-				 * relay_start reuses start_progress_meter
-				 * (relay_mode is not set yet at that point) */
 static struct {
 	uint64_t bytes_done;
 	uint64_t bytes_total;
@@ -426,8 +423,6 @@ refresh_progress_meter(int force_update)
 	enum meter_tail tail;
 	off_t delta_pos;
 
-	if (relay_arming)
-		return;		/* relay meter arming: nothing to paint yet */
 	if (file == NULL || (!force_update && !alarm_fired && !win_resized) ||
 	    (!frame_mode && !can_output()))
 		return;
@@ -570,6 +565,23 @@ sig_alarm(int ignore)
 	alarm(UPDATE_INTERVAL);
 }
 
+/*
+ * TTY-side arming shared by the local and relay meter starts: log/meter
+ * interleave guard, window sizing, and the WINCH handler.  Frame mode
+ * never calls this - stdout is its binary channel, and the guard's
+ * "\r\033[K" or a screen-size ioctl make no sense on a pipe.
+ */
+static void
+meter_tty_arm(void)
+{
+	pthread_mutex_lock(&meter_mu);
+	meter_active = 1;
+	pthread_mutex_unlock(&meter_mu);
+	log_set_output_guard(meter_log_enter, meter_log_exit);
+	setscreensize();
+	ssh_signal(SIGWINCH, sig_winch);
+}
+
 void
 start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 {
@@ -597,33 +609,20 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 	bytes_per_second = 0;
 
 	/*
-	 * Frame mode never paints the terminal, so skip the TTY-only setup:
-	 * the log/meter interleave guard writes "\r\033[K" to stdout, which
-	 * would corrupt the frame stream, and the screen-size ioctl is
-	 * meaningless on a pipe.
+	 * Frame mode skips the TTY arming (stdout is its binary channel)
+	 * AND the initial forced paint: phase callers set their flag
+	 * (set_phase) only AFTER this returns (the reset above would clear
+	 * it), so a frame emitted here would carry cleared flags and the
+	 * wrong byte base - one mislabeled frame at every phase boundary.
+	 * The alarm / reporter tick emits a correctly-flagged frame within
+	 * a second; nothing is lost.
 	 */
 	if (!frame_mode) {
-		pthread_mutex_lock(&meter_mu);
-		meter_active = 1;
-		pthread_mutex_unlock(&meter_mu);
-		log_set_output_guard(meter_log_enter, meter_log_exit);
-
-		setscreensize();
-	}
-	/*
-	 * Frame mode: skip the initial forced paint.  Phase callers set
-	 * their flag (set_verifying/set_resuming) only AFTER this returns
-	 * (the reset above would clear it), so a frame emitted here would
-	 * carry cleared flags and the wrong byte base - one mislabeled
-	 * frame at every phase boundary.  The alarm / reporter tick emits
-	 * a correctly-flagged frame within a second; nothing is lost.
-	 */
-	if (!frame_mode)
+		meter_tty_arm();
 		refresh_progress_meter(1);
+	}
 
 	ssh_signal(SIGALRM, sig_alarm);
-	if (!frame_mode)
-		ssh_signal(SIGWINCH, sig_winch);
 	alarm(UPDATE_INTERVAL);
 }
 
@@ -724,16 +723,25 @@ progressmeter_frames_active(void)
 void
 progress_meter_relay_start(const char *label)
 {
+	/*
+	 * Own initialization instead of borrowing start_progress_meter():
+	 * its local path would paint a bogus "100% 0.0KB/s" line before
+	 * the first frame arrives.  cur_pos == end_pos == 0 also keeps the
+	 * final local repaint in stop_progress_meter() skipped - relay_end
+	 * paints the completion line itself.
+	 */
 	relay_ctr = 0;
-	/* The meter core paints once inside start; suppress it - relay_mode
-	 * is not set yet, and the local path with end_pos 0 would render a
-	 * bogus "100% 0.0KB/s" line before the first frame arrives. */
-	relay_arming = 1;
-	start_progress_meter(label, 0, &relay_ctr);
-	relay_arming = 0;
+	file = label;
+	counter = &relay_ctr;
+	start_pos = end_pos = cur_pos = last_pos = 0;
+	stalled = 0;
+	bytes_per_second = 0;
+	meter_tty_arm();
 	memset(&relay, 0, sizeof(relay));
 	relay.started = relay.last_frame = monotime_double();
 	relay_mode = 1;
+	ssh_signal(SIGALRM, sig_alarm);
+	alarm(UPDATE_INTERVAL);
 }
 
 /* Store one PROGRESS frame's telemetry and repaint (alarm-gated). */
@@ -840,10 +848,9 @@ progressmeter_frames_count_file(void)
 }
 
 /*
- * Mark the current meter as the verification phase, so PROGRESS frames carry
- * HPNS_F_VERIFY and a front-end can label the phase "verifying".  Cleared by
- * the next start_progress_meter; both the serial and parallel verify meters
- * set it right after starting.
+ * Set or clear a phase flag (HPNS_F_VERIFY / HPNS_F_RESUME) so PROGRESS
+ * frames carry it and a front-end can label the phase.  Cleared by the
+ * next start_progress_meter; phase meters set it right after starting.
  *
  * Only sets the flag - it does NOT emit a frame.  In the parallel path the
  * reporter thread is the sole frame writer; emitting from this (main) thread
@@ -851,26 +858,13 @@ progressmeter_frames_count_file(void)
  * The reporter's next tick (and the serial meter's alarm) carry the flag out.
  */
 void
-progressmeter_frames_set_verifying(int on)
+progressmeter_frames_set_phase(u_int flag, int on)
 {
 	if (on)
-		__atomic_fetch_or(&frames_flags, HPNS_F_VERIFY,
+		__atomic_fetch_or(&frames_flags, (u_int16_t)flag,
 		    __ATOMIC_RELAXED);
 	else
-		__atomic_fetch_and(&frames_flags, (u_int16_t)~HPNS_F_VERIFY,
-		    __ATOMIC_RELAXED);
-}
-
-/* Same contract as set_verifying, for the resume-check phase (hashing an
- * existing partial before deciding what to re-transfer). */
-void
-progressmeter_frames_set_resuming(int on)
-{
-	if (on)
-		__atomic_fetch_or(&frames_flags, HPNS_F_RESUME,
-		    __ATOMIC_RELAXED);
-	else
-		__atomic_fetch_and(&frames_flags, (u_int16_t)~HPNS_F_RESUME,
+		__atomic_fetch_and(&frames_flags, (u_int16_t)~flag,
 		    __ATOMIC_RELAXED);
 }
 

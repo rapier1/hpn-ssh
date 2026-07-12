@@ -563,7 +563,7 @@ sftp_parallel_wait(struct sftp_parallel *p)
 				start_progress_meter(p->progress_label,
 				    2 * vtotal,
 				    &p->aggregate_progress_counter);
-				progressmeter_frames_set_verifying(1);
+				progressmeter_frames_set_phase(HPNS_F_VERIFY, 1);
 				/* verify_phase_active BEFORE meter_started: a
 				 * reporter tick between the two would take the
 				 * transfer branch against the verify meter's

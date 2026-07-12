@@ -1936,7 +1936,7 @@ resume_check_meter_begin(struct sftp_conn *conn, off_t total)
 	start_progress_meter("resume check", total,
 	    (off_t *)&resume_meter_ctr);
 	progressmeter_frames_meter_not_a_file();	/* not a file */
-	progressmeter_frames_set_resuming(1);		/* phase flag */
+	progressmeter_frames_set_phase(HPNS_F_RESUME, 1);	/* phase flag */
 	sftp_conn_set_hash_meter_ctr(conn, &resume_meter_ctr);
 	resume_meter_on = 1;
 }
@@ -4769,7 +4769,7 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 	if (showprogress && total > 0) {
 		start_progress_meter("verify", total, &counter);
 		progressmeter_frames_meter_not_a_file();	/* not a file */
-		progressmeter_frames_set_verifying(1);		/* verify phase */
+		progressmeter_frames_set_phase(HPNS_F_VERIFY, 1); /* verify phase */
 		/* Bridge the hash engines' per-op progress into the meter
 		 * counter so a single big file moves smoothly instead of
 		 * jumping 0->100 at completion. */
