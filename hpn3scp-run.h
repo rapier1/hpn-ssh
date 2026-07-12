@@ -57,6 +57,10 @@ struct hpn_run_hooks {
 	 * the struct is a borrowed pointer valid only for the duration of the
 	 * call - the hook must copy or encode it before returning. */
 	void (*on_file_fail)(const struct hpns_filefail *, void *ctx);
+	/* on_filedone fires once per file with its final transfer-log status
+	 * (source armed with the "log" env value; older sources never emit
+	 * it).  Same borrowed-path contract as on_file_fail. */
+	void (*on_filedone)(const struct hpns_filedone *, void *ctx);
 	void (*on_tick)(void *ctx);
 	void (*on_degrade)(void *ctx);
 	int  passthrough_fd;	/* raw bytes after degrade go here; <0 = discard */

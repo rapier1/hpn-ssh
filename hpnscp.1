@@ -200,6 +200,28 @@ command-line flag.
 For full details of the options listed below, and their possible values, see
 .Xr hpnssh_config 5 .
 .Pp
+One option is consumed by
+.Nm
+itself rather than passed to
+.Nm hpnssh :
+.Cm TransferLog Ns Op = Ns Ar path
+appends one tab-delimited line per file
+.Pq status, size, path
+to
+.Ar path
+(default
+.Pa ./hpnssh-transfer.log ) ,
+ending with a run total.
+Statuses are
+.Cm success , skipped , verified , repaired ,
+and
+.Cm failed ;
+verified and repaired imply a successful transfer.
+The log target must be writable or
+.Nm
+exits before any connection is made.
+The log is purely informational: nothing ever reads it back.
+.Pp
 .Bl -tag -width Ds -offset indent -compact
 .It AddKeysToAgent
 .It AddressFamily

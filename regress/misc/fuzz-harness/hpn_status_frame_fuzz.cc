@@ -31,6 +31,7 @@ frame_cb(u_char type, const u_char *payload, uint16_t plen, void *ctx)
 	struct hpns_progress pr;
 	struct hpns_end e;
 	struct hpns_filefail ff;
+	struct hpns_filedone fd;
 	volatile uint64_t sink = 0;
 
 	st->frames++;
@@ -65,6 +66,13 @@ frame_cb(u_char type, const u_char *payload, uint16_t plen, void *ctx)
 			for (uint16_t i = 0; i < ff.path_len; i++)
 				sink += ff.path[i];
 			sink += ff.kind + ff.path_len;
+		}
+		break;
+	case HPNS_T_FILEDONE:
+		if (hpns_decode_filedone(payload, plen, &fd) == 0) {
+			for (uint16_t i = 0; i < fd.path_len; i++)
+				sink += fd.path[i];
+			sink += fd.status + fd.size + fd.path_len;
 		}
 		break;
 	default:

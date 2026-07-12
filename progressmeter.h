@@ -39,6 +39,7 @@ void	progressmeter_frames_meter_not_a_file(void);
 void	progressmeter_frames_count_file(void);
 void	progressmeter_frames_set_phase(u_int, int);
 void	progressmeter_frames_filefail(u_int, const char *, size_t);
+void	progressmeter_frames_filedone(u_int, long long, const char *, size_t);
 void	progressmeter_frames_end(int, u_int);
 void	progress_meter_set_total(off_t);
 

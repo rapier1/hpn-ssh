@@ -119,6 +119,20 @@ option, in the format used in
 .Xr hpnssh_config 5 ,
 to the source-to-target connection.
 May be repeated.
+.Pp
+The
+.Cm TransferLog Ns Op = Ns Ar path
+option is consumed by
+.Nm
+itself: the per-file log is written on THIS host (default
+.Pa ./hpnssh-transfer.log ) ,
+built from the source's per-file status stream, with remote file names
+percent-encoded before they are written.
+See the
+.Fl o
+entry in
+.Xr hpnscp 1
+for the format.
 .It Fl r
 Copy directories recursively.
 .It Fl v

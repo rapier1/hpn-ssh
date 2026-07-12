@@ -1128,12 +1128,15 @@ int
 sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, int local_is_target, off_t off, off_t len,
     int have_local_hash, uint64_t local_hash,
-    int repair_enabled, int max_attempts)
+    int repair_enabled, int max_attempts, int *repaired_out)
 {
 	struct stat sb;
 	uint64_t lh = 0, rh = 0, dest_hash, prev_hash;
 	const char *side, *dst;
 	int r, attempt;
+
+	if (repaired_out != NULL)
+		*repaired_out = 0;
 
 	/*
 	 * Whole-file mode: callers pass len <= 0 to mean "the entire file" and
@@ -1225,6 +1228,8 @@ sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
 		if (r == 0) {
 			logit("repaired %s file \"%s\" (attempt %d)",
 			    side, dst, attempt);
+			if (repaired_out != NULL)
+				*repaired_out = 1;
 			return 0;
 		}
 		if (r < 0) {

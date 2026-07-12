@@ -46,6 +46,7 @@
 #include "hpn3scp.h"
 #include "hpn3scp-hostkey.h"
 #include "hpn3scp-proto.h"
+#include "sftp-hpn-transferlog.h"
 #include "hpn3scp-run.h"
 
 const char *
@@ -344,6 +345,19 @@ ev_file_fail(const struct hpns_filefail *ff, void *ctx)
 }
 
 static void
+ev_filedone(const struct hpns_filedone *fd, void *ctx)
+{
+	(void)ctx;
+	/* Launcher-side transfer log: the path is opaque remote bytes; the
+	 * module percent-encodes before it lands in the log.  Protocol mode
+	 * additionally emits the EVENT (no-op for a human - the log and the
+	 * meter cover that case). */
+	transferlog_file_bytes(transferlog_status_from_wire(fd->status),
+	    (long long)fd->size, fd->path, fd->path_len);
+	proto_emit_file_status(fd);
+}
+
+static void
 ev_tick(void *ctx)
 {
 	(void)ctx;
@@ -419,7 +433,11 @@ do_launch(struct launch_session *s, const char *abs_hpnscp)
 	 * forwarding the user's ambient agent instead. */
 	ssh_base_args(s, &a, 1, s->use_ambient);
 	addargs(&a, "env");
-	addargs(&a, "HPN_ENABLE_REMOTE_PROGRESS=1");
+	/* "log" additionally asks the source for per-file FILEDONE frames
+	 * (the transfer log / GUI file list); old sources treat any value
+	 * as plain arming and the log degrades to header + footer. */
+	addargs(&a, transferlog_active() ?
+	    "HPN_ENABLE_REMOTE_PROGRESS=log" : "HPN_ENABLE_REMOTE_PROGRESS=1");
 	addargs(&a, "%s", abs_hpnscp);
 	/* the target key is trusted by now (broker or pre-existing), so hold
 	 * the workers to strict checking; a user -o after this can override */
@@ -459,6 +477,7 @@ do_launch(struct launch_session *s, const char *abs_hpnscp)
 	h.on_progress = ev_progress;
 	h.on_end = ev_end;
 	h.on_file_fail = ev_file_fail;
+	h.on_filedone = ev_filedone;
 	h.on_tick = ev_tick;
 	h.on_degrade = ev_degrade;
 	h.passthrough_fd = -1;
@@ -750,6 +769,11 @@ main(int argc, char **argv)
 			s.verify_requested = 1;	/* resume implies verification */
 			break;
 		case 'o':
+			/* TransferLog is consumed here (the log lives on
+			 * THIS host); everything else forwards to the
+			 * source hpnscp. */
+			if (transferlog_option(optarg))
+				break;
 			addargs(&hpnscp_extra, "-o");
 			addargs(&hpnscp_extra, "%s", optarg);
 			break;
@@ -783,5 +807,9 @@ main(int argc, char **argv)
 	/* a terminal gets the human rendering; a pipe gets the EVENT protocol */
 	if (isatty(STDOUT_FILENO))
 		proto_set_human(1);
-	return run_session(&s);
+	/* -oTransferLog: open (writability-check) BEFORE any connection */
+	transferlog_begin();
+	i = run_session(&s);
+	transferlog_close();
+	return i;
 }

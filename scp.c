@@ -122,6 +122,7 @@
 #include "sftp-client.h"
 #include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
+#include "sftp-hpn-transferlog.h"
 #include "sftp-parallel.h"
 #include "hpn-exit-codes.h"
 
@@ -379,6 +380,16 @@ scp_meter_degrade(void *ctx)
 	    "display");
 }
 
+/* -R + -oTransferLog: the source mirrors each file's final status as a
+ * FILEDONE frame; write it to the launcher-side log.  The path is opaque
+ * remote bytes - the module percent-encodes before it hits the log. */
+static void
+scp_meter_filedone(const struct hpns_filedone *fd, void *ctx)
+{
+	transferlog_file_bytes(transferlog_status_from_wire(fd->status),
+	    (long long)fd->size, fd->path, fd->path_len);
+}
+
 /*
  * Variant of do_local_cmd() for -R transfers with the status relay armed:
  * launch the ssh with a piped stdout via the shared runner, which parses
@@ -414,6 +425,7 @@ do_local_cmd_status(arglist *a, const char *label)
 	h.on_hello = scp_meter_hello;
 	h.on_progress = scp_meter_progress;
 	h.on_end = scp_meter_end;
+	h.on_filedone = scp_meter_filedone;
 	h.on_tick = scp_meter_tick;
 	h.on_degrade = scp_meter_degrade;
 	h.passthrough_fd = STDOUT_FILENO;
@@ -717,6 +729,9 @@ main(int argc, char **argv)
 			throughlocal = 0;
 			break;
 		case 'o':
+			if (transferlog_option(optarg))
+				break;
+			/* FALLTHROUGH */
 		case 'c':
 		case 'i':
 		case 'F':
@@ -946,11 +961,22 @@ main(int argc, char **argv)
 		 * behavior (no meter on pipes).  An env var, not a flag, so
 		 * old/stock binaries ignore the request instead of failing.
 		 */
-		if (getenv("HPN_ENABLE_REMOTE_PROGRESS") != NULL)
+		const char *rprog = getenv("HPN_ENABLE_REMOTE_PROGRESS");
+
+		if (rprog != NULL) {
 			progressmeter_frame_mode((u_int)parallel_num_streams);
-		else
+			/* "log" value: the consumer also wants per-file
+			 * FILEDONE frames for its transfer log / GUI. */
+			if (strcmp(rprog, "log") == 0)
+				transferlog_frames(1);
+		} else
 			showprogress = 0;
 	}
+
+	/* -oTransferLog: open (and thereby writability-check) the log NOW,
+	 * before any connection is established - a bad path must fail the
+	 * run before work starts. */
+	transferlog_begin();
 
 	if (pflag) {
 		/* Cannot pledge: -p allows setuid/setgid files... */
@@ -1027,6 +1053,7 @@ main(int argc, char **argv)
 	 * The consumer takes the authoritative result from our exit status. */
 	progressmeter_frames_end(errs == 0 && !hpn_verify_failed,
 	    (u_int)(errs > 0 ? errs : 0));
+	transferlog_close();
 
 	if (hpn_verify_failed)
 		exit(SFTP_EX_VERIFY_FAILED);
@@ -1756,10 +1783,17 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 			 * rewrites the scp token behind the prefix to hpnscp
 			 * (clientloop.c).
 			 */
-			relay = showprogress != 0;
+			/* Arm the relay for the meter, for the transfer log,
+			 * or both.  The "log" value additionally asks the
+			 * source for per-file FILEDONE frames; old sources
+			 * treat any value as plain arming (frames without
+			 * the per-file stream - the log degrades to header
+			 * + failures + footer). */
+			relay = showprogress != 0 || transferlog_active();
 			if (relay) {
 				addargs(&alist, "env");
-				addargs(&alist,
+				addargs(&alist, transferlog_active() ?
+				    "HPN_ENABLE_REMOTE_PROGRESS=log" :
 				    "HPN_ENABLE_REMOTE_PROGRESS=1");
 			}
 			addargs(&alist, "%s", cmd);
@@ -2122,17 +2156,28 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 		if (ur == -1) {
 			error("failed to upload file %s to %s", src, targ);
 			errs = 1;
+			transferlog_file(TRANSFERLOG_FAILED,
+			    (long long)st.st_size, abs_dst);
 		} else if (ur == 1) {
 			/* frame mode: stdout carries binary frames, text on it
 			 * corrupts the relay stream - divert to stderr */
 			fmprintf(progressmeter_frames_active() ?
 			    stderr : stdout,
 			    "File skipped: %s: Identical.\n", src);
+			transferlog_file(TRANSFERLOG_SKIPPED,
+			    (long long)st.st_size, abs_dst);
 		} else if (ur == 2) {
 			fmprintf(progressmeter_frames_active() ?
 			    stderr : stdout,
 			    "File skipped: %s: Target is larger than source.\n",
 			    src);
+			transferlog_file(TRANSFERLOG_SKIPPED,
+			    (long long)st.st_size, abs_dst);
+		} else if (!hpn_verify_transfer) {
+			/* TransferLog: success is final only when no verify
+			 * phase follows (with -V the line defers there). */
+			transferlog_file(TRANSFERLOG_SUCCESS,
+			    (long long)st.st_size, abs_dst);
 		}
 	}
 
@@ -2457,6 +2502,19 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 				    stderr : stdout,
 				    "File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
+			/* TransferLog: size from the local dest (present on
+			 * success/skip; -1 when the failure left nothing).
+			 * Success defers to the verify phase under -V. */
+			if (transferlog_active() &&
+			    (dr != 0 || !hpn_verify_transfer)) {
+				struct stat lsb;
+				long long sz = (stat(abs_dst, &lsb) == 0) ?
+				    (long long)lsb.st_size : -1;
+
+				transferlog_file(dr == -1 ? TRANSFERLOG_FAILED :
+				    (dr == 0 ? TRANSFERLOG_SUCCESS :
+				    TRANSFERLOG_SKIPPED), sz, abs_dst);
+			}
 		}
 		free(abs_dst);
 		abs_dst = NULL;

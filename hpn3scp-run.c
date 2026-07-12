@@ -56,6 +56,7 @@ run_frame(u_char type, const u_char *payload, uint16_t plen, void *ctx)
 	struct hpns_progress pr;
 	struct hpns_end e;
 	struct hpns_filefail ff;
+	struct hpns_filedone fd;
 
 	switch (type) {
 	case HPNS_T_HELLO:
@@ -76,6 +77,11 @@ run_frame(u_char type, const u_char *payload, uint16_t plen, void *ctx)
 		if (hpns_decode_filefail(payload, plen, &ff) == 0 &&
 		    d->h->on_file_fail != NULL)
 			d->h->on_file_fail(&ff, d->h->ctx);
+		break;
+	case HPNS_T_FILEDONE:
+		if (hpns_decode_filedone(payload, plen, &fd) == 0 &&
+		    d->h->on_filedone != NULL)
+			d->h->on_filedone(&fd, d->h->ctx);
 		break;
 	case HPNS_T_END:
 		if (hpns_decode_end(payload, plen, &e) == 0 &&

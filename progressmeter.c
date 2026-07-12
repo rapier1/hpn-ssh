@@ -907,6 +907,34 @@ progressmeter_frames_filefail(u_int kind, const char *path, size_t path_len)
 }
 
 /*
+ * Emit a FILEDONE frame (A side): one per file with its final
+ * transfer-log status, sent only when the consumer armed the relay with
+ * the "log" value (the transferlog module gates the call).  Same clamp
+ * and opaque-path discipline as FILEFAIL.  No-op unless frame mode is
+ * armed.
+ */
+void
+progressmeter_frames_filedone(u_int status, long long size, const char *path,
+    size_t path_len)
+{
+	struct hpns_filedone fd;
+	u_char fbuf[HPNS_HDR_LEN + HPNS_MAX_PAYLOAD];
+
+	if (!frame_mode)
+		return;
+	memset(&fd, 0, sizeof(fd));
+	fd.status = (u_char)(status & HPNS_FD_STATUSMASK);
+	fd.size = size > 0 ? (uint64_t)size : 0;
+	if (path_len > HPNS_FILEDONE_MAXPATH) {
+		path_len = HPNS_FILEDONE_MAXPATH;
+		fd.status |= HPNS_FD_TRUNCATED;
+	}
+	fd.path = (const u_char *)path;
+	fd.path_len = (uint16_t)path_len;
+	frames_write(fbuf, hpns_encode_filedone(fbuf, &fd));
+}
+
+/*
  * Emit the final END frame (A side, once, on the way out of main).
  * Advisory only: the consumer takes success/failure from the transport
  * exit status.  No-op unless frame mode is armed.

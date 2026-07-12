@@ -720,6 +720,8 @@ struct sftp_range_tracker {
 	int                    remaining;  /* finalize calls still owed */
 	int                    any_failed; /* sticky: 1 if any range failed */
 	enum sftp_range_target target;
+	off_t                  file_bytes; /* whole-file size, for the
+					    * TransferLog line at finalize */
 	char                  *path;       /* TARGET path (the file written):
 					    * local on download, remote on
 					    * upload (xstrdup'd in new) */
@@ -782,6 +784,8 @@ struct verify_job {
 	int      *valid;		/* whether hashes[i] is usable */
 	int       ranges_left;		/* atomic refcount */
 	int       failed;		/* atomic: any chunk's inline repair failed */
+	int       any_repaired;		/* atomic: any chunk needed a repair */
+	int       any_unverified;	/* atomic: any chunk was unverifiable */
 };
 
 /*
@@ -850,6 +854,9 @@ struct sftp_work_unit {
 	off_t    range_offset;
 	off_t    range_length;
 	int      range_index;  /* this range's slot in the tracker (0-based) */
+	int      skipped;      /* whole-file resume gate returned identical /
+				* target-larger: TransferLog "skipped", set
+				* before the rc collapse in execute_unit */
 	uint64_t range_hash;   /* HPNVerifyTransfer: XXH3 of the source bytes,
 				* teed during a clean send; consumed into the
 				* tracker slot when acked == range_length. */

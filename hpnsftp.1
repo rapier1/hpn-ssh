@@ -342,6 +342,22 @@ For example, to specify an alternate port use:
 For full details of the options listed below, and their possible values, see
 .Xr hpnssh_config 5 .
 .Pp
+One option is consumed by
+.Nm
+itself rather than passed on:
+.Cm TransferLog Ns Op = Ns Ar path
+appends one tab-delimited line per file
+.Pq status, size, path
+to
+.Ar path
+(default
+.Pa ./hpnssh-transfer.log ) ,
+ending with a run total; see the
+.Fl o
+entry in
+.Xr hpnscp 1
+for the full description.
+.Pp
 .Bl -tag -width Ds -offset indent -compact
 .It AddKeysToAgent
 .It AddressFamily

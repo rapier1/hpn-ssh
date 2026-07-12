@@ -115,6 +115,29 @@ hpns_encode_filefail(u_char *buf, const struct hpns_filefail *ff)
 	return o + HPNS_FILEFAIL_HDR + n;
 }
 
+/*
+ * encode a FILEDONE frame; same clamp discipline as FILEFAIL (the caller
+ * sets HPNS_FD_TRUNCATED when it clips).  buf must be >= HPNS_HDR_LEN +
+ * HPNS_FILEDONE_HDR + path_len.  Returns the total frame length.
+ */
+size_t
+hpns_encode_filedone(u_char *buf, const struct hpns_filedone *fd)
+{
+	uint16_t n = fd->path_len;
+	size_t o;
+
+	if (n > HPNS_FILEDONE_MAXPATH)
+		n = HPNS_FILEDONE_MAXPATH;
+	o = hpns_put_hdr(buf, HPNS_T_FILEDONE,
+	    (uint16_t)(HPNS_FILEDONE_HDR + n));
+	buf[o] = fd->status;
+	POKE_U64(buf + o + 1, fd->size);
+	POKE_U16(buf + o + 9, n);
+	if (n > 0 && fd->path != NULL)
+		memcpy(buf + o + HPNS_FILEDONE_HDR, fd->path, n);
+	return o + HPNS_FILEDONE_HDR + n;
+}
+
 /* strict decoder: payload length must match exactly; -1 on mismatch */
 int
 hpns_decode_hello(const u_char *p, uint16_t plen, struct hpns_hello *h)
@@ -198,6 +221,27 @@ hpns_decode_filefail(const u_char *p, uint16_t plen, struct hpns_filefail *ff)
 	ff->kind = p[0];
 	ff->path_len = path_len;
 	ff->path = path_len > 0 ? p + HPNS_FILEFAIL_HDR : NULL;
+	return 0;
+}
+
+/*
+ * strict decoder, FILEFAIL's twin: plen must equal HPNS_FILEDONE_HDR +
+ * path_len exactly; path is an opaque borrowed pointer, never interpreted.
+ */
+int
+hpns_decode_filedone(const u_char *p, uint16_t plen, struct hpns_filedone *fd)
+{
+	uint16_t path_len;
+
+	if (plen < HPNS_FILEDONE_HDR)
+		return -1;
+	path_len = PEEK_U16(p + 9);
+	if ((size_t)plen != (size_t)HPNS_FILEDONE_HDR + path_len)
+		return -1;
+	fd->status = p[0];
+	fd->size = PEEK_U64(p + 1);
+	fd->path_len = path_len;
+	fd->path = path_len > 0 ? p + HPNS_FILEDONE_HDR : NULL;
 	return 0;
 }
 

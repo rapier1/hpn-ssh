@@ -161,13 +161,13 @@ SSHD_AUTH_OBJS=sshd-auth.o \
 	sftp-server.o sftp-hpn-server.o sftp-hpn-verify-hash.o sftp-lustre.o sftp-hpn-bundle-server.o sftp-hpn-tar.o sftp-hpn-bundle-pool.o sftp-common.o \
 	uidswap.o cipher-switch.o $(P11OBJS) $(SKOBJS)
 
-SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-hpn-verify.o sftp-hpn-verify-hash.o sftp-fault-inject.o sftp-lustre.o sftp-lustre-client.o sftp-hpn-bundle-client.o sftp-hpn-tar.o sftp-hpn-bundle-pool.o sftp-glob.o ssherr-nolibcrypto.o
+SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-hpn-client.o sftp-hpn-verify.o sftp-hpn-verify-hash.o sftp-hpn-transferlog.o sftp-fault-inject.o sftp-lustre.o sftp-lustre-client.o sftp-hpn-bundle-client.o sftp-hpn-tar.o sftp-hpn-bundle-pool.o sftp-glob.o ssherr-nolibcrypto.o
 
 SCP_OBJS=	scp.o progressmeter.o hpn-status-frame.o hpn3scp-run.o $(SFTP_CLIENT_OBJS) \
 		sftp-workqueue.o sftp-parallel.o sftp-parallel-respawn.o sftp-parallel-watchdog.o sftp-parallel-reporter.o sftp-parallel-unit.o sftp-parallel-worker.o sftp-parallel-walk.o \
 		sftp-parallel-config.o readconf.o $(P11OBJS) $(SKOBJS)
 
-HPN3SCP_OBJS=	hpn3scp.o hpn3scp-proto.o hpn3scp-run.o hpn3scp-hostkey.o hpn-status-frame.o progressmeter.o $(P11OBJS) $(SKOBJS)
+HPN3SCP_OBJS=	hpn3scp.o hpn3scp-proto.o hpn3scp-run.o hpn3scp-hostkey.o hpn-status-frame.o progressmeter.o sftp-hpn-transferlog.o $(P11OBJS) $(SKOBJS)
 
 SSHADD_OBJS=	ssh-add.o $(P11OBJS) $(SKOBJS)
 

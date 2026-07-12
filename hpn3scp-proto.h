@@ -40,6 +40,7 @@
 
 struct hpns_progress;
 struct hpns_filefail;
+struct hpns_filedone;
 
 /* Direct emit at a specific stream (defaults to stdout if never set). */
 void	proto_init(FILE *out);
@@ -76,6 +77,12 @@ void	proto_emit_error(const char *msg);
  * bytes cross safely.
  */
 void	proto_emit_file_fail(const struct hpns_filefail *ff);
+/*
+ * One file's final transfer-log status, straight from a decoded FILEDONE
+ * frame (sources armed with the "log" env value).  Same opaque-path
+ * handling as file_fail.
+ */
+void	proto_emit_file_status(const struct hpns_filedone *fd);
 void	proto_emit_done(int ok, int exit_status, unsigned files,
 	    unsigned verify_failed, unsigned transfer_failed);
 

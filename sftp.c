@@ -58,6 +58,7 @@ typedef void EditLine;
 #include "sshbuf.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
+#include "sftp-hpn-transferlog.h"
 #include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
 #include "sftp-usergroup.h"
@@ -1407,6 +1408,17 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 				    " than source.\n", g.gl_pathv[i]);
 			/* dr==0: parked by sftp_download for the classic
 			 * post-transfer verify phase run below. */
+			if (transferlog_active() && (dr != 0 ||
+			    !sftp_conn_verify_transfer_enabled(conn))) {
+				struct stat lsb;
+				long long sz = (stat(abs_dst, &lsb) == 0) ?
+				    (long long)lsb.st_size : -1;
+
+				transferlog_file(dr == -1 ?
+				    TRANSFERLOG_FAILED : (dr == 0 ?
+				    TRANSFERLOG_SUCCESS : TRANSFERLOG_SKIPPED),
+				    sz, abs_dst);
+			}
 		}
 		free(abs_dst);
 		abs_dst = NULL;
@@ -1614,6 +1626,12 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 				    " than source.\n", g.gl_pathv[i]);
 			/* ur==0: parked by sftp_upload for the classic
 			 * post-transfer verify phase run below. */
+			if (transferlog_active() && (ur != 0 ||
+			    !sftp_conn_verify_transfer_enabled(conn)))
+				transferlog_file(ur == -1 ?
+				    TRANSFERLOG_FAILED : (ur == 0 ?
+				    TRANSFERLOG_SUCCESS : TRANSFERLOG_SKIPPED),
+				    (long long)sb.st_size, abs_dst);
 		}
 	}
 
@@ -3603,6 +3621,10 @@ main(int argc, char **argv)
 			parallel_identity = optarg;
 			break;
 		case 'o':
+			/* TransferLog is ours, not ssh's: consume it here
+			 * or ssh rejects the unknown keyword. */
+			if (transferlog_option(optarg))
+				break;
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
 			parallel_extra_o_add(optarg);
@@ -3844,6 +3866,9 @@ main(int argc, char **argv)
 
 	log_init(argv[0], ll, SYSLOG_FACILITY_USER, 1);
 
+	/* -oTransferLog: open (writability-check) BEFORE any connection */
+	transferlog_begin();
+
 	if (sftp_direct == NULL) {
 		if (optind == argc || argc > (optind + 2))
 			usage();
@@ -4070,6 +4095,7 @@ main(int argc, char **argv)
 	 * transfer itself was not aborted.  This takes precedence over the
 	 * generic error code since it flags data integrity specifically.
 	 */
+	transferlog_close();
 	if (verify_print_summary() > 0)
 		exit(SFTP_EX_VERIFY_FAILED);
 

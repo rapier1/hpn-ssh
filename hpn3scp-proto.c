@@ -271,6 +271,28 @@ proto_emit_file_fail(const struct hpns_filefail *ff)
 }
 
 void
+proto_emit_file_status(const struct hpns_filedone *fd)
+{
+	char enc[2048];		/* >= 3 * max frame path + 1, all escaped */
+	const char *word;
+
+	if (human_mode)
+		return;		/* the transfer log / meter covers a human */
+	switch (fd->status & HPNS_FD_STATUSMASK) {
+	case HPNS_FD_SUCCESS:	word = "success"; break;
+	case HPNS_FD_SKIPPED:	word = "skipped"; break;
+	case HPNS_FD_VERIFIED:	word = "verified"; break;
+	case HPNS_FD_REPAIRED:	word = "repaired"; break;
+	case HPNS_FD_FAILED:	word = "failed"; break;
+	default:		word = "unknown"; break;
+	}
+	pct_encode_n(enc, sizeof(enc), fd->path, fd->path_len);
+	fprintf(po(), "EVENT file_status status=%s size=%llu path=%s\n",
+	    word, (unsigned long long)fd->size, enc);
+	fflush(po());
+}
+
+void
 proto_emit_done(int ok, int exit_status, unsigned files,
     unsigned verify_failed, unsigned transfer_failed)
 {

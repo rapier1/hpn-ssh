@@ -55,6 +55,7 @@
 #include "sftp-client.h"
 #include "sftp-hpn-client.h" /* HPN */
 #include "sftp-hpn-server.h" /* hpn-check-file + heartbeat protocol constants */
+#include "sftp-hpn-transferlog.h"
 #include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
 
 #define XXH_INLINE_ALL
@@ -2595,6 +2596,8 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 				error("Download of file %s to %s failed",
 				    new_src, new_dst);
 				ret = -1;
+				transferlog_file(TRANSFERLOG_FAILED,
+				    (long long)a->size, new_dst);
 			} else if (dr == 1) {
 				/* frame mode: stdout carries binary frames,
 				 * text on it corrupts the relay stream */
@@ -2602,11 +2605,20 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 				    stderr : stdout,
 				    "File skipped: %s: Identical.\n",
 				    new_src);
+				transferlog_file(TRANSFERLOG_SKIPPED,
+				    (long long)a->size, new_dst);
 			} else if (dr == 2) {
 				fmprintf(progressmeter_frames_active() ?
 				    stderr : stdout,
 				    "File skipped: %s: Target is larger"
 				    " than source.\n", new_src);
+				transferlog_file(TRANSFERLOG_SKIPPED,
+				    (long long)a->size, new_dst);
+			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
+				/* TransferLog: success is final only when no
+				 * verify phase follows to resolve it. */
+				transferlog_file(TRANSFERLOG_SUCCESS,
+				    (long long)a->size, new_dst);
 			}
 		} else
 			logit("download \"%s\": not a regular file", new_src);
@@ -3293,16 +3305,25 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 				error("upload \"%s\" to \"%s\" failed",
 				    new_src, new_dst);
 				ret = -1;
+				transferlog_file(TRANSFERLOG_FAILED,
+				    (long long)sb.st_size, new_dst);
 			} else if (ur == 1) {
 				fmprintf(progressmeter_frames_active() ?
 				    stderr : stdout,	/* keep frames clean */
 				    "File skipped: %s: Identical.\n",
 				    new_src);
+				transferlog_file(TRANSFERLOG_SKIPPED,
+				    (long long)sb.st_size, new_dst);
 			} else if (ur == 2) {
 				fmprintf(progressmeter_frames_active() ?
 				    stderr : stdout,
 				    "File skipped: %s: Target is larger"
 				    " than source.\n", new_src);
+				transferlog_file(TRANSFERLOG_SKIPPED,
+				    (long long)sb.st_size, new_dst);
+			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
+				transferlog_file(TRANSFERLOG_SUCCESS,
+				    (long long)sb.st_size, new_dst);
 			}
 		} else
 			logit("%s: not a regular file", filename);
@@ -4786,12 +4807,30 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 		 * interrupt unwinds promptly to the prompt / exit.
 		 */
 		if (!interrupted) {
+			int repaired = 0;
 			int r = sftp_hpn_verify_repair(conn, e->local_path,
 			    e->remote_path, e->local_is_target,
 			    /*off=*/0, /*len=*/e->size,
 			    /*have_local_hash=*/0, /*local_hash=*/0,
 			    conn->hpn->verify_repair_enabled,
-			    conn->hpn->verify_repair_attempts);
+			    conn->hpn->verify_repair_attempts, &repaired);
+			/* TransferLog: the file's final status under -V (the
+			 * serial transfer line deferred to here).  Unverifiable
+			 * transferred fine - plain success. */
+			if (transferlog_active()) {
+				enum transferlog_status st;
+
+				if (r == 1)
+					st = TRANSFERLOG_FAILED;
+				else if (r < 0)
+					st = TRANSFERLOG_SUCCESS;
+				else
+					st = repaired ? TRANSFERLOG_REPAIRED :
+					    TRANSFERLOG_VERIFIED;
+				transferlog_file(st, (long long)e->size,
+				    e->local_is_target ? e->local_path :
+				    e->remote_path);
+			}
 			if (r == 1) {
 				error("VERIFY FAILED: \"%s\" (post-transfer hash "
 				    "mismatch - the transferred file does NOT "

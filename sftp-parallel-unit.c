@@ -55,6 +55,7 @@
 #include "sftp-client-internal.h"
 #include "sftp-workqueue.h"
 #include "sftp-parallel.h"
+#include "sftp-hpn-transferlog.h"
 #include "sftp-parallel-internal.h"
 
 static struct sftp_work_unit *
@@ -377,6 +378,10 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 			debug("range-split: \"%s\": at least one byte-range "
 			    "failed permanently after retries", t->path);
 		}
+		/* TransferLog: the file's final status (interrupt included -
+		 * an aborted file is still not delivered). */
+		transferlog_file(TRANSFERLOG_FAILED,
+		    (long long)t->file_bytes, t->path);
 	} else if (t->verify && w != NULL) {
 		/*
 		 * HPNVerifyTransfer: the file's last range just finished
@@ -389,6 +394,11 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 		 */
 		parallel_verify_park(w->parent, t);
 		return incomplete;
+	} else {
+		/* TransferLog: clean range/span completion with no verify
+		 * phase to defer to - final here. */
+		transferlog_file(TRANSFERLOG_SUCCESS,
+		    (long long)t->file_bytes, t->path);
 	}
 	pthread_mutex_destroy(&t->mu);
 	free(t->vslots);
@@ -1284,6 +1294,7 @@ submit_resume_split(struct sftp_parallel *p, struct sftp_conn *conn,
 	    op == SFTP_OP_UPLOAD ? SFTP_RANGE_TARGET_REMOTE :
 	    SFTP_RANGE_TARGET_LOCAL, /*path=*/dst, /*src=*/src,
 	    /*verify=*/p->cfg.verify_transfer, p->cfg.writers_per_inode_cap);
+	tracker->file_bytes = src_size;
 
 	for (i = 0; i < n; i++) {
 		struct sftp_work_unit *ru;
@@ -1648,6 +1659,7 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 	tracker = range_tracker_new(effective_ranges,
 	    SFTP_RANGE_TARGET_REMOTE, remote_path, /*src=*/local_path,
 	    /*verify=*/p->cfg.verify_transfer, p->cfg.writers_per_inode_cap);
+	tracker->file_bytes = file_size;
 
 	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
 	for (i = 0; i < effective_ranges; i++) {
@@ -1739,6 +1751,7 @@ submit_download_ranges(struct sftp_parallel *p,
 	tracker = range_tracker_new(effective_ranges,
 	    SFTP_RANGE_TARGET_LOCAL, local_path, /*src=*/remote_path,
 	    /*verify=*/p->cfg.verify_transfer, p->cfg.writers_per_inode_cap);
+	tracker->file_bytes = file_size;
 
 	for (i = 0; i < effective_ranges; i++) {
 		off_t offset = (off_t)i * range_size;

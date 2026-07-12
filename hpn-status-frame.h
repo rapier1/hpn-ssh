@@ -62,6 +62,7 @@
 #define HPNS_T_PROGRESS		2
 #define HPNS_T_END		3
 #define HPNS_T_FILEFAIL		4
+#define HPNS_T_FILEDONE		5
 
 /* fixed payload sizes */
 #define HPNS_HELLO_LEN		21
@@ -84,6 +85,28 @@
 #define HPNS_FF_TRANSFER	0		/* transfer never completed */
 #define HPNS_FF_VERIFY		1	/* transferred but failed verification */
 #define HPNS_FF_TRUNCATED	0x80		/* path too long, clipped */
+
+/*
+ * FILEDONE: one frame per file with its FINAL transfer-log status,
+ * emitted only when the relay was armed with the "log" value
+ * (HPN_ENABLE_REMOTE_PROGRESS=log) - the per-file event stream the
+ * consumer's transfer log and a GUI's file list are built from.  Same
+ * shape and discipline as FILEFAIL: an 11-byte fixed head plus opaque
+ * path bytes the parser never interprets; the consumer neutralizes
+ * (percent-encodes) before the path lands anywhere displayable,
+ * including a log file.  Status values mirror the transfer-log words.
+ */
+#define HPNS_FILEDONE_HDR	11	/* status u8 + size u64 + path_len u16 */
+#define HPNS_FILEDONE_MAXPATH	(HPNS_MAX_PAYLOAD - HPNS_FILEDONE_HDR)
+
+/* FILEDONE status byte: value in the low 7 bits, flags in the high bit */
+#define HPNS_FD_STATUSMASK	0x7f
+#define HPNS_FD_SUCCESS		0
+#define HPNS_FD_SKIPPED		1
+#define HPNS_FD_VERIFIED	2
+#define HPNS_FD_REPAIRED	3
+#define HPNS_FD_FAILED		4
+#define HPNS_FD_TRUNCATED	0x80		/* path too long, clipped */
 
 /* HELLO capability bits (advertised by the emitter; all reserved) */
 #define HPNS_CAP_PULL		0x00000001u	/* future request/response */
@@ -146,6 +169,15 @@ struct hpns_filefail {
 	const u_char	*path;		/* borrowed; copy/encode before reuse */
 };
 
+/* Per-file final status (see the HPNS_FD_* block above); path carries
+ * the same opaque-borrowed contract as hpns_filefail. */
+struct hpns_filedone {
+	u_char		status;		/* HPNS_FD_* value | flags */
+	uint64_t	size;		/* file size in bytes */
+	uint16_t	path_len;	/* opaque bytes at path (<= MAXPATH) */
+	const u_char	*path;		/* borrowed; copy/encode before reuse */
+};
+
 /*
  * Incremental frame parser (the consumer side; this is the one piece of
  * code that faces remote input, so it is deliberately tiny and is the
@@ -169,6 +201,7 @@ size_t	hpns_encode_hello(u_char *, const struct hpns_hello *);
 size_t	hpns_encode_progress(u_char *, const struct hpns_progress *);
 size_t	hpns_encode_end(u_char *, const struct hpns_end *);
 size_t	hpns_encode_filefail(u_char *, const struct hpns_filefail *);
+size_t	hpns_encode_filedone(u_char *, const struct hpns_filedone *);
 
 /* strict decoders: payload length must match exactly; -1 on mismatch */
 int	hpns_decode_hello(const u_char *, uint16_t, struct hpns_hello *);
@@ -177,6 +210,8 @@ int	hpns_decode_progress(const u_char *, uint16_t,
 int	hpns_decode_end(const u_char *, uint16_t, struct hpns_end *);
 int	hpns_decode_filefail(const u_char *, uint16_t,
 	    struct hpns_filefail *);
+int	hpns_decode_filedone(const u_char *, uint16_t,
+	    struct hpns_filedone *);
 
 /*
  * Feed input bytes.  Returns 0 and consumes all input on success (any

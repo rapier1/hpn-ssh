@@ -48,6 +48,7 @@
 #include "sftp-client.h"
 #include "sftp-client-internal.h"
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair, _chunk */
+#include "sftp-hpn-transferlog.h"
 #include "sftp-workqueue.h"
 #include "sftp-parallel.h"
 #include "sftp-parallel-internal.h"
@@ -143,11 +144,33 @@ parallel_verify_one(struct sftp_worker *w, const char *local_path,
 	 * decoupled verify may run on a different worker than the uploader (the
 	 * size-keyed accumulator could hold another same-size file's hash).
 	 */
+	int repaired = 0;
 	int r = sftp_hpn_verify_repair(w->conn, local_path, remote_path,
 	    local_is_target, /*off=*/0, /*len=*/0,
 	    /*have_local_hash=*/0, /*local_hash=*/0,
-	    p->verify_repair_enabled, p->verify_repair_attempts);
+	    p->verify_repair_enabled, p->verify_repair_attempts, &repaired);
 
+	/* TransferLog: under -V the transfer line was deferred to this,
+	 * the file's FINAL status.  Unverifiable (r < 0) transferred fine
+	 * but cannot claim "verified" - log it as plain success.  Size
+	 * from the local side, which exists in both directions.  The
+	 * DESTINATION path names the file. */
+	if (transferlog_active()) {
+		struct stat lsb;
+		long long sz = (stat(local_path, &lsb) == 0) ?
+		    (long long)lsb.st_size : -1;
+		enum transferlog_status st;
+
+		if (r > 0)
+			st = TRANSFERLOG_FAILED;
+		else if (r < 0)
+			st = TRANSFERLOG_SUCCESS;
+		else
+			st = repaired ? TRANSFERLOG_REPAIRED :
+			    TRANSFERLOG_VERIFIED;
+		transferlog_file(st, sz,
+		    local_is_target ? local_path : remote_path);
+	}
 	if (r == 0)
 		return;	/* verified good (possibly after repair) */
 	if (r < 0) {
@@ -244,13 +267,22 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 			 * content failure).  Each chunk worker repairs only its own
 			 * index k - no cross-worker coordination.
 			 */
+			int repaired = 0;
+
 			r = sftp_hpn_verify_repair(w->conn, j->local_path,
 			    j->remote_path, j->local_is_target,
 			    j->offs[k], j->lens[k],
 			    have_teed, have_teed ? j->hashes[k] : 0,
-			    p->verify_repair_enabled, p->verify_repair_attempts);
+			    p->verify_repair_enabled, p->verify_repair_attempts,
+			    &repaired);
 			if (r == 1)	/* unrepairable mismatch */
 				__atomic_store_n(&j->failed, 1, __ATOMIC_RELAXED);
+			else if (r < 0)	/* couldn't verify this chunk */
+				__atomic_store_n(&j->any_unverified, 1,
+				    __ATOMIC_RELAXED);
+			if (repaired)
+				__atomic_store_n(&j->any_repaired, 1,
+				    __ATOMIC_RELAXED);
 			u->verify_job = NULL;
 
 			/* Meter: this chunk's WORK (both legs) is done.  End
@@ -271,7 +303,10 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 			 */
 			if (__atomic_sub_fetch(&j->ranges_left, 1,
 			    __ATOMIC_ACQ_REL) == 0) {
-				if (__atomic_load_n(&j->failed, __ATOMIC_RELAXED)) {
+				int j_failed = __atomic_load_n(&j->failed,
+				    __ATOMIC_RELAXED);
+
+				if (j_failed) {
 					error_f("worker %d VERIFY FAILED: %s file "
 					    "\"%s\" does NOT match source", w->id,
 					    j->local_is_target ? "local" : "remote",
@@ -280,6 +315,30 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 					parallel_verify_fail_record(p,
 					    j->local_is_target, j->local_path,
 					    j->remote_path);
+				}
+				/* TransferLog: FINAL status for a range-split
+				 * file under -V.  Any unverifiable chunk
+				 * demotes "verified" to plain success. */
+				if (transferlog_active()) {
+					struct stat lsb;
+					long long sz =
+					    (stat(j->local_path, &lsb) == 0) ?
+					    (long long)lsb.st_size : -1;
+					enum transferlog_status st;
+
+					if (j_failed)
+						st = TRANSFERLOG_FAILED;
+					else if (__atomic_load_n(
+					    &j->any_repaired, __ATOMIC_RELAXED))
+						st = TRANSFERLOG_REPAIRED;
+					else if (__atomic_load_n(
+					    &j->any_unverified, __ATOMIC_RELAXED))
+						st = TRANSFERLOG_SUCCESS;
+					else
+						st = TRANSFERLOG_VERIFIED;
+					transferlog_file(st, sz,
+					    j->local_is_target ?
+					    j->local_path : j->remote_path);
 				}
 				parallel_verify_job_free(j);
 			}
@@ -345,8 +404,10 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		if (rc == 0 && p->cfg.verify_transfer)
 			parallel_verify_park_whole_file(p, u->src_path,
 			    u->dst_path, /*local_is_target=*/0);  /* local = source */
-		if (rc == 1 || rc == 2)
+		if (rc == 1 || rc == 2) {
+			u->skipped = 1;	/* TransferLog: final at completion */
 			rc = 0;	/* identical / target-larger: complete */
+		}
 		break;
 	case SFTP_OP_UPLOAD_RANGE: {
 		/* Range-split resume gate + post-transfer verify happen at
@@ -415,7 +476,8 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		    lit ? u->src_path : u->dst_path,
 		    lit, u->range_offset, u->range_length,
 		    /*have_local_hash=*/0, /*local_hash=*/0,
-		    /*repair_enabled=*/1, parallel_unit_max_retries(p));
+		    /*repair_enabled=*/1, parallel_unit_max_retries(p),
+		    /*repaired_out=*/NULL);
 		debug3("unit-exec: worker %d RESUME_SPAN [%lld+%lld) rc=%d "
 		    "attempt=%d", w->id, (long long)u->range_offset,
 		    (long long)u->range_length, rc, u->attempt);
@@ -430,8 +492,10 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		if (rc == 0 && p->cfg.verify_transfer)
 			parallel_verify_park_whole_file(p, u->dst_path,
 			    u->src_path, /*local_is_target=*/1);  /* local = downloaded */
-		if (rc == 1 || rc == 2)
+		if (rc == 1 || rc == 2) {
+			u->skipped = 1;	/* TransferLog: final at completion */
 			rc = 0;	/* identical / target-larger: complete */
+		}
 		break;
 	case SFTP_OP_VERIFY:
 		/* Handled before the switch via an early return; reaching the
@@ -482,6 +546,11 @@ worker_give_up_unit(struct sftp_parallel *p, struct sftp_worker *w,
 	    u->src_path ? u->src_path : "(null)");
 	worker_record_completion(w, 0, 0);
 	parallel_unit_pending_dec_traced(p, u, w->id, trace_tag);
+	/* TransferLog: whole-file give-up is the file's final status;
+	 * range/span give-ups log once at tracker finalize instead. */
+	if (u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_DOWNLOAD)
+		transferlog_file(TRANSFERLOG_FAILED, (long long)u->size,
+		    u->dst_path);
 	(void)parallel_unit_tracker_finalize(u->range_tracker, 1, w);
 	worker_record_failed_path(p, u, cause);
 	parallel_unit_free(u);
@@ -506,6 +575,9 @@ worker_give_up_pushfail(struct sftp_parallel *p, struct sftp_worker *w,
 		    (uint64_t)u->size, __ATOMIC_RELAXED);
 	worker_record_completion(w, 0, 0);
 	parallel_unit_pending_dec_traced(p, u, w->id, trace_tag);
+	if (u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_DOWNLOAD)
+		transferlog_file(TRANSFERLOG_FAILED, (long long)u->size,
+		    u->dst_path);
 	(void)parallel_unit_tracker_finalize(u->range_tracker, 1, w);
 	worker_record_failed_path(p, u, "queue shutdown");
 	parallel_unit_free(u);
@@ -537,6 +609,15 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 
 	if (rc == 0) {
 		worker_record_completion(w, u->size, 1);
+		/* TransferLog: a whole-file unit's status is final here -
+		 * skipped always (never parked), success when no verify
+		 * phase follows (with -V the line defers to the verify
+		 * resolution).  Range/span files log at tracker finalize. */
+		if ((u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_DOWNLOAD) &&
+		    (u->skipped || !p->cfg.verify_transfer))
+			transferlog_file(u->skipped ? TRANSFERLOG_SKIPPED :
+			    TRANSFERLOG_SUCCESS, (long long)u->size,
+			    u->dst_path);
 		/*
 		 * Range tracker: this range finished cleanly.  Finalize BEFORE
 		 * decrementing pending.  For the last range of a verified file,
@@ -649,6 +730,11 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 {
 	if (rc == 0) {
 		worker_record_completion(w, u->size, 1);
+		/* TransferLog: batched/bundled member success is final here
+		 * unless the verify phase will resolve it. */
+		if (!p->cfg.verify_transfer)
+			transferlog_file(TRANSFERLOG_SUCCESS,
+			    (long long)u->size, u->dst_path);
 		/*
 		 * HPNVerifyTransfer: park every completed batched/bundled member
 		 * for the post-transfer verify phase.  This is the one point the

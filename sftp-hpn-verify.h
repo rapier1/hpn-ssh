@@ -177,10 +177,13 @@ void sftp_hpn_verify_repair_resolve(int no_verify_repair_cli,
  * Returns 0 (verified good, after any repair), 1 (unrepairable: converged,
  * hit the attempt cap, or repair disabled + mismatch), or -1 (unverifiable -
  * server lacks hpn-check-file or a read error; caller treats as "skipped").
+ * repaired_out (NULL-safe): set to 1 when the 0 return came via a repair
+ * pass rather than a clean first verify - the transfer log's "repaired"
+ * vs "verified" distinction.
  */
 int sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, int local_is_target, off_t off, off_t len,
     int have_local_hash, uint64_t local_hash,
-    int repair_enabled, int max_attempts);
+    int repair_enabled, int max_attempts, int *repaired_out);
 
 #endif /* SFTP_HPN_VERIFY_H */
