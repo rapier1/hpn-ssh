@@ -208,7 +208,7 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 			/* Pause - don't reset.  A persistently slow worker
 			 * oscillates between in-flight and idle between units;
 			 * resetting here wipes the accumulated consec count and
-			 * prevents the detector from ever reaching the DEAD
+			 * prevents the detector from ever reaching the STALLED
 			 * threshold.  Skipping the tick (without clearing) lets
 			 * consec carry across unit boundaries, so a worker that
 			 * is consistently slow across multiple units gets caught.
@@ -454,14 +454,10 @@ parallel_watchdog_sync_check(struct sftp_parallel *p)
  *
  * Caller must hold workers_mu; this function acquires per-worker mu
  * only for short critical sections (state read + transition).
- *
- * `tput_dead_this_tick` is the in/out throttle flag - at most one
- * throughput-outlier DEAD promotion per tick across all workers.
  */
 static int
 watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
-    uint64_t now, int queue_has_work, int endgame_idle,
-    int *tput_dead_this_tick)
+    uint64_t now, int queue_has_work, int endgame_idle)
 {
 	enum worker_health prev, next;
 	const char *doom_reason = NULL;	/* set at whichever DEAD site fires */
@@ -756,52 +752,34 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		}
 
 		/*
-		 * Adaptive throughput-outlier escalation. tput_outlier_ticks
-		 * is set by watchdog_sample_throughput above and is non-zero
+		 * Adaptive throughput-outlier flag. tput_outlier_ticks is
+		 * set by watchdog_sample_throughput above and is non-zero
 		 * only when (a) the feature is enabled and (b) the fastest
-		 * worker meets the path-healthy floor (so we know respawning
-		 * could help). This catches cwnd-collapsed workers that the
-		 * time-based detector misses because they're still completing
-		 * the occasional file, just slowly.
+		 * worker meets the path-healthy floor.  It surfaces workers
+		 * running far below their siblings - the cwnd-collapse
+		 * signature the time-based detector misses because such a
+		 * worker still completes the occasional file, just slowly.
 		 *
-		 * Only ESCALATE here, never de-escalate: if the SSH child or
-		 * time-based path already classified DEAD, leave it DEAD.
-		 *
-		 * Throttle: kill at most ONE worker per tick via the
-		 * throughput path.  Multiple workers may simultaneously hit
-		 * the consec=2*req threshold on the same tick (when the
-		 * tputs are uniformly low against a fast peer); killing
-		 * them all at once stresses any server-side rate limit and
-		 * burns the respawn budget faster than necessary.  The
-		 * holdover workers stay STALLED and will be re-evaluated next
-		 * tick - by then one respawn may already be in flight.
-		 *
-		 * Respawn budget: triggered respawns count against the
-		 * epoch budget (RESPAWN_MULTIPLIER * num_streams). On
-		 * budget exhaustion the orchestrator enters a cooldown
-		 * pause rather than aborting immediately - see the
-		 * respawn section in the reporter thread for details.
+		 * STALLED only, NEVER a kill (wait-not-kill, 2026-07-12).
+		 * Slower-than-sibling is not evidence of death: on a
+		 * saturated path TCP fairness starves some streams while
+		 * their siblings run at line rate (observed 2026-07-09: 2 of
+		 * 4 range-split workers at ~20 Mbps against ~500 Mbps peers,
+		 * silence=0s, actively transferring - the old kill here
+		 * aborted the whole single-file transfer).  A respawn
+		 * inherits the same contention, so killing buys nothing and
+		 * risks the transfer.  Genuinely degraded sessions are still
+		 * killed by born-slow below (absolute floor + healthy-peer +
+		 * cooldown gates); genuinely wedged ones by the silence
+		 * paths above.  STALLED keeps the condition visible in the
+		 * reporter's worker telemetry.
 		 */
-		if (next != WORKER_DEAD && !hashing &&
+		if (next == WORKER_HEALTHY && !hashing &&
 		    p->cfg.tput_path_healthy_kbps > 0) {
-			int consec = w->tput_outlier_ticks;
 			int req = p->cfg.tput_consec_required > 0
 			    ? p->cfg.tput_consec_required : 5;
-			if (consec >= 2 * req) {
-				if (!*tput_dead_this_tick) {
-					next = WORKER_DEAD;
-					doom_reason = "tput_outlier";
-					*tput_dead_this_tick = 1;
-				} else {
-					/* Throttle: another worker already
-					 * promoted to DEAD this tick.  Stay
-					 * STALLED. */
-					if (next == WORKER_HEALTHY)
-						next = WORKER_STALLED;
-				}
-			} else if (consec >= req && next == WORKER_HEALTHY) {
+			if (w->tput_outlier_ticks >= req)
 				next = WORKER_STALLED;
-			}
 		}
 
 		/*
@@ -1030,13 +1008,9 @@ parallel_watchdog_check(struct sftp_parallel *p)
 	 * cfg.tput_path_healthy_kbps == 0).  Sets w->tput_outlier_ticks. */
 	watchdog_sample_throughput(p, now);
 
-	/* Throttle: at most one DEAD promotion per tick from the
-	 * throughput-outlier path. */
-	int tput_dead_this_tick = 0;
-
 	for (int i = 0; i < p->num_workers; i++) {
 		if (watchdog_check_one_worker(p, p->workers[i], now,
-		    queue_has_work, endgame_idle, &tput_dead_this_tick))
+		    queue_has_work, endgame_idle))
 			any_dead = 1;
 	}
 	pthread_mutex_unlock(&p->workers_mu);

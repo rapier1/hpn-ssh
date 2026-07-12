@@ -158,8 +158,7 @@ classify_worker_death(const struct sftp_worker *w, int have_status, int status)
 		}
 		else if (strcmp(r, "endgame_straggler") == 0)
 			cause = "worker stalled at the endgame";
-		else if (strcmp(r, "tput_outlier") == 0 ||
-		    strcmp(r, "born_slow") == 0) {
+		else if (strcmp(r, "born_slow") == 0) {
 			cause = "worker persistently slow";
 			quiet = 1;
 		}

@@ -1041,8 +1041,8 @@ struct sftp_worker {
 						* SIGTERM; prevents double-kill */
 	const char        *doom_reason;        /* (B) which watchdog path doomed
 						* it (born_dead/isolation/stall/
-						* dead/tput_outlier/born_slow);
-						* emitted in the reap trace */
+						* dead/born_slow); emitted in
+						* the reap trace */
 	uint64_t           doom_ms;            /* (B) monotonic ms when
 						* SIGTERM was sent; consulted by
 						* SIGKILL-escalation deadline when

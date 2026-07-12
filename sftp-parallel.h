@@ -196,8 +196,12 @@ struct sftp_parallel_config {
 	 *   3. If raw max_kbps < tput_path_healthy_kbps, skip (path-limited).
 	 *   4. threshold = max_ema_kbps * tput_outlier_fraction.
 	 *   5. A worker is an outlier if its ema_kbps < threshold. After
-	 *      tput_consec_required consecutive outlier ticks, STALLED;
-	 *      after 2 * tput_consec_required, DEAD.
+	 *      tput_consec_required consecutive outlier ticks it is marked
+	 *      STALLED (surfaced in worker telemetry) - never killed.
+	 *      Slower-than-sibling is not death: on a saturated path TCP
+	 *      fairness starves some streams while peers run at line rate,
+	 *      and a respawn inherits the contention.  Kills come only from
+	 *      the silence paths and born-slow (absolute floor).
 	 *
 	 * Reasonable starting values for WAN bulk transfer:
 	 *   tput_path_healthy_kbps = 2000   (best worker must clear 2 MB/s)

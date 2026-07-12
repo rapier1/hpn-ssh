@@ -246,9 +246,10 @@ If only interactive authentication is available, run without
 There is no universally-correct setting.
 More streams is not always faster:
 once the path or server reaches saturation, additional workers compete
-for the same bottleneck, individual workers fall below the
-fastest-peer throughput threshold, and the orchestrator's
-outlier-detection machinery reaps and respawns them.
+for the same bottleneck and individual workers fall below the
+fastest-peer throughput threshold; the orchestrator marks them stalled
+(a slow but progressing worker is never reaped) and respawns only
+genuinely degraded or silent connections.
 The end-of-transfer summary line includes the worker-respawn count;
 when that count climbs above roughly 25 % of
 .Fl j ,
