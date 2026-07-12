@@ -461,6 +461,10 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 {
 	enum worker_health prev, next;
 	const char *doom_reason = NULL;	/* set at whichever DEAD site fires */
+	int stalled_slow = 0;		/* STALLED via the outlier flag: the
+					 * worker is progressing, just slow -
+					 * the transition log must not claim
+					 * "no progress" for it */
 
 	pthread_mutex_lock(&w->mu);
 	prev = w->health;
@@ -778,8 +782,10 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		    p->cfg.tput_path_healthy_kbps > 0) {
 			int req = p->cfg.tput_consec_required > 0
 			    ? p->cfg.tput_consec_required : 5;
-			if (w->tput_outlier_ticks >= req)
+			if (w->tput_outlier_ticks >= req) {
 				next = WORKER_STALLED;
+				stalled_slow = 1;
+			}
 		}
 
 		/*
@@ -879,7 +885,17 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			pthread_mutex_lock(&w->mu);
 			w->health = next;
 			pthread_mutex_unlock(&w->mu);
-			if (next == WORKER_STALLED) {
+			if (next == WORKER_STALLED && stalled_slow) {
+				/* Outlier flag: progressing, just slow -
+				 * saying "no progress" here is what sent us
+				 * chasing a phantom wedge on 2026-07-09. */
+				debug_ft("worker %d slow vs fleet: ema=%llu "
+				    "kbps, %d consecutive outlier ticks - "
+				    "progressing, flagged only",
+				    w->id,
+				    (unsigned long long)w->tput_ema_kbps,
+				    w->tput_outlier_ticks);
+			} else if (next == WORKER_STALLED) {
 				debug_ft("worker %d stalled: no progress in "
 				    "%llu sec (since_completion=%llus, "
 				    "since_unit_start=%llus)",
@@ -891,11 +907,13 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 				    (unsigned long long)
 				    (since_unit_start_ms / 1000ULL));
 			} else if (next == WORKER_DEAD) {
-				debug_ft("worker %d declared dead: "
+				debug_ft("worker %d declared dead (%s): "
 				    "ssh_pid=%ld silence=%llus "
 				    "(since_completion=%llus, "
 				    "since_unit_start=%llus)",
-				    w->id, (long)w->ssh_pid,
+				    w->id,
+				    doom_reason ? doom_reason : "?",
+				    (long)w->ssh_pid,
 				    (unsigned long long)
 				    (effective_silence_ms / 1000ULL),
 				    (unsigned long long)
