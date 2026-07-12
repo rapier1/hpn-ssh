@@ -319,11 +319,16 @@ messages from
 .Xr hpnssh 1 .
 .It Fl R
 Copies between two remote hosts are transferred through the local host
-by default.
+by default; such through-local transfers do not support
+.Fl j ,
+.Fl V ,
+or
+.Fl Z ,
+and refuse to run rather than silently ignore them.
 This option instead copies between two remote hosts by connecting to the origin
 host and executing
 .Nm
-there.
+there, and supports all three.
 This requires that
 .Nm
 running on the origin host can authenticate to the destination host without

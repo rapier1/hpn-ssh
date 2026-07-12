@@ -1630,6 +1630,31 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 		}
 		if (host && throughlocal) {	/* extended remote to remote */
 			if (mode == MODE_SFTP) {
+				/*
+				 * HPN options that do not apply to the
+				 * through-local (crossload) data path.
+				 * Refuse loudly rather than silently
+				 * degrade: a user who asked for parallel
+				 * streams, verification, or verified resume
+				 * must not believe they got them.  The -R
+				 * direct source-to-destination path
+				 * supports all three.
+				 */
+				if (parallel_num_streams > 1)
+					fatal("-j does not apply to a "
+					    "through-local (crossload) "
+					    "transfer; use -R for a direct "
+					    "source-to-destination transfer");
+				if (verify_flag)
+					fatal("-V does not apply to a "
+					    "through-local (crossload) "
+					    "transfer; use -R for a direct "
+					    "source-to-destination transfer");
+				if (resume_flag)
+					fatal("-Z does not apply to a "
+					    "through-local (crossload) "
+					    "transfer; use -R for a direct "
+					    "source-to-destination transfer");
 				if (remin == -1 || conn == NULL) {
 					/* Connect to dest now */
 					sftp_free(conn);
