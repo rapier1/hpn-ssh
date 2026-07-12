@@ -202,6 +202,7 @@ static size_t parallel_extra_o_cap = 0;
 static int hpn_verify_transfer = 0;		/* HPNVerifyTransfer resolved */
 static int verify_flag = 0;			/* -V: force HPNVerifyTransfer on */
 static int family_flag = 0;			/* -4/-6: forward to -R source scp */
+static int compress_flag = 0;			/* -C: forward to -R source scp */
 static int hpn_verify_failed = 0;		/* a transfer failed verify -> exit 57 */
 static int range_split_min_mb_user = 0;		/* -M: range-split min file size, MiB */
 static int writers_cap_user = 0;		/* -w: max range-writers per inode */
@@ -704,6 +705,7 @@ main(int argc, char **argv)
 			addargs(&args, "-%c", ch);
 			addargs(&remote_remote_args, "-%c", ch);
 			parallel_extra_o_add("Compression=yes");
+			compress_flag = 1;
 			break;
 		case 'D':
 			sftp_direct = optarg;
@@ -1759,6 +1761,8 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 			 */
 			if (family_flag)
 				addargs(&alist, "-%d", family_flag);
+			if (compress_flag)
+				addargs(&alist, "-C");
 			if (verify_flag)
 				addargs(&alist, "-V");
 			if (resume_flag)
@@ -2094,9 +2098,16 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 			error("failed to upload file %s to %s", src, targ);
 			errs = 1;
 		} else if (ur == 1) {
-			mprintf("File skipped: %s: Identical.\n", src);
+			/* frame mode: stdout carries binary frames, text on it
+			 * corrupts the relay stream - divert to stderr */
+			fmprintf(progressmeter_frames_active() ?
+			    stderr : stdout,
+			    "File skipped: %s: Identical.\n", src);
 		} else if (ur == 2) {
-			mprintf("File skipped: %s: Target is larger than source.\n", src);
+			fmprintf(progressmeter_frames_active() ?
+			    stderr : stdout,
+			    "File skipped: %s: Target is larger than source.\n",
+			    src);
 		}
 	}
 
@@ -2412,10 +2423,14 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 			if (dr == -1)
 				err = -1;
 			else if (dr == 1)
-				mprintf("File skipped: %s: Identical.\n",
+				fmprintf(progressmeter_frames_active() ?
+				    stderr : stdout,	/* keep frames clean */
+				    "File skipped: %s: Identical.\n",
 				    g.gl_pathv[i]);
 			else if (dr == 2)
-				mprintf("File skipped: %s: Target is larger"
+				fmprintf(progressmeter_frames_active() ?
+				    stderr : stdout,
+				    "File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);
 		}
 		free(abs_dst);

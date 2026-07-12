@@ -34,6 +34,7 @@ int	progressmeter_frames_active(void);
 void	progressmeter_frames_set_workers(u_int, u_int);
 void	progressmeter_frames_set_files(u_int, u_int);
 void	progressmeter_frames_meter_not_a_file(void);
+void	progressmeter_frames_count_file(void);
 void	progressmeter_frames_set_verifying(int);
 void	progressmeter_frames_set_resuming(int);
 void	progressmeter_frames_filefail(u_int, const char *, size_t);

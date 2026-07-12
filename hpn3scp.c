@@ -389,8 +389,12 @@ emit_completion_summary(struct launch_session *s)
 		u_int ok = endinfo.files_done > failtally.transfer ?
 		    endinfo.files_done - failtally.transfer : 0;
 
-		fprintf(stderr, "hpn3scp: verified: %u file%s OK\n",
-		    ok, ok == 1 ? "" : "s");
+		if (s->verify_full)
+			fprintf(stderr, "hpn3scp: verified: %u file%s OK\n",
+			    ok, ok == 1 ? "" : "s");
+		else
+			fprintf(stderr, "hpn3scp: %u file%s OK\n",
+			    ok, ok == 1 ? "" : "s");
 	}
 }
 
@@ -739,6 +743,7 @@ main(int argc, char **argv)
 		case 'V':
 			addargs(&hpnscp_extra, "-V");
 			s.verify_requested = 1;
+			s.verify_full = 1;
 			break;
 		case 'Z':
 			addargs(&hpnscp_extra, "-Z");

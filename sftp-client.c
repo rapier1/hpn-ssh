@@ -2203,6 +2203,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		free(handle);
 		if (local_fd != -1)
 			close(local_fd);
+		if (skip_ret >= 0)	/* resolved, no transfer meter ran */
+			progressmeter_frames_count_file();
 		return skip_ret;
  resume_done:
 		resume_check_meter_end(conn);
@@ -2594,10 +2596,16 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 				    new_src, new_dst);
 				ret = -1;
 			} else if (dr == 1) {
-				mprintf("File skipped: %s: Identical.\n",
+				/* frame mode: stdout carries binary frames,
+				 * text on it corrupts the relay stream */
+				fmprintf(progressmeter_frames_active() ?
+				    stderr : stdout,
+				    "File skipped: %s: Identical.\n",
 				    new_src);
 			} else if (dr == 2) {
-				mprintf("File skipped: %s: Target is larger"
+				fmprintf(progressmeter_frames_active() ?
+				    stderr : stdout,
+				    "File skipped: %s: Target is larger"
 				    " than source.\n", new_src);
 			}
 		} else
@@ -2954,6 +2962,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				if (chunked >= 0) {
 					resume_check_meter_end(conn);
 					close(local_fd);
+					progressmeter_frames_count_file();
 					return chunked; /* 1=skip, 0=success */
 				}
 
@@ -3003,6 +3012,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 					    local_path);
 					resume_check_meter_end(conn);
 					close(local_fd);
+					progressmeter_frames_count_file();
 					return 1; /* identical */
 				}
 				debug("verified transfer: same size but hash "
@@ -3013,6 +3023,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			} else if ((off_t)c.size > sb.st_size) {
 				resume_check_meter_end(conn);
 				close(local_fd);
+				progressmeter_frames_count_file();
 				return 2; /* target larger than source */
 			} else {
 				/*
@@ -3036,6 +3047,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				if (chunked >= 0) {
 					resume_check_meter_end(conn);
 					close(local_fd);
+					progressmeter_frames_count_file();
 					return chunked; /* 1=skip, 0=success */
 				}
 				/*
@@ -3104,10 +3116,12 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			}
 			if ((off_t)c.size == sb.st_size) {
 				close(local_fd);
+				progressmeter_frames_count_file();
 				return 1; /* identical */
 			}
 			if ((off_t)c.size > sb.st_size) {
 				close(local_fd);
+				progressmeter_frames_count_file();
 				return 2; /* target larger than source */
 			}
 		}
@@ -3280,10 +3294,14 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 				    new_src, new_dst);
 				ret = -1;
 			} else if (ur == 1) {
-				mprintf("File skipped: %s: Identical.\n",
+				fmprintf(progressmeter_frames_active() ?
+				    stderr : stdout,	/* keep frames clean */
+				    "File skipped: %s: Identical.\n",
 				    new_src);
 			} else if (ur == 2) {
-				mprintf("File skipped: %s: Target is larger"
+				fmprintf(progressmeter_frames_active() ?
+				    stderr : stdout,
+				    "File skipped: %s: Target is larger"
 				    " than source.\n", new_src);
 			}
 		} else

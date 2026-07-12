@@ -78,6 +78,7 @@ struct launch_session {
 	int		 verbosity;	/* -v count, propagated to ssh + hpnscp */
 	int		 addr_family;	/* -4/-6: 4, 6, or 0 (default) - all hops */
 	int		 verify_requested;	/* -V/-Z given: emit a verify summary */
+	int		 verify_full;		/* -V given */
 	struct arglist	*hpnscp_extra;	/* -r/-o/-X/-Y/-V/-Z forwarded to source hpnscp */
 	enum decision_policy policy;
 	/* runtime */

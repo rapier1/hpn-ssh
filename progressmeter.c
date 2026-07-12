@@ -824,6 +824,22 @@ progressmeter_frames_meter_not_a_file(void)
 }
 
 /*
+ * Count a file the resume gate resolved without a transfer meter:
+ * skipped as identical/diverged, or refilled by the (unmetered) chunked
+ * path.  Keeps serial frame counts consistent with the parallel walker
+ * tally, which counts every submitted file.  If the refill leg ever
+ * gains a file meter, the refilled case must stop being counted here.
+ * No-op when the parallel reporter owns the counts.
+ */
+void
+progressmeter_frames_count_file(void)
+{
+	if (!frame_mode || frames_files_ext)
+		return;
+	frames_files_done++;
+}
+
+/*
  * Mark the current meter as the verification phase, so PROGRESS frames carry
  * HPNS_F_VERIFY and a front-end can label the phase "verifying".  Cleared by
  * the next start_progress_meter; both the serial and parallel verify meters
