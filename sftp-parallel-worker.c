@@ -392,6 +392,36 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
 		    (long long)u->range_offset, (long long)u->range_length,
 		    rc, (long long)u->acked_bytes, u->attempt);
 		break;
+	case SFTP_OP_RESUME_SPAN: {
+		/*
+		 * Verified-resume overlap span: reconcile [offset, length) of
+		 * the existing partial against the source through the shared
+		 * verify+repair engine - hash-compare in chunks, splice only
+		 * the mismatched runs.  Repair is FORCED on regardless of the
+		 * user's verify-repair setting: for resume, the repair IS the
+		 * transfer.  The engine's hash legs bracket the conn's
+		 * hash-op accessors, so the resume-check meter and the
+		 * watchdog's hash gate cover this exactly like the serial
+		 * gate.  0 = span now matches the source (possibly after
+		 * splicing); anything else takes the normal retry path
+		 * (verify_repair is idempotent, so a whole-span retry after a
+		 * worker death re-hashes and re-splices safely).
+		 */
+		int lit = (u->range_tracker != NULL &&
+		    u->range_tracker->target == SFTP_RANGE_TARGET_LOCAL);
+
+		rc = sftp_hpn_verify_repair(w->conn,
+		    lit ? u->dst_path : u->src_path,
+		    lit ? u->src_path : u->dst_path,
+		    lit, u->range_offset, u->range_length,
+		    /*have_local_hash=*/0, /*local_hash=*/0,
+		    /*repair_enabled=*/1, parallel_unit_max_retries(p));
+		debug3("unit-exec: worker %d RESUME_SPAN [%lld+%lld) rc=%d "
+		    "attempt=%d", w->id, (long long)u->range_offset,
+		    (long long)u->range_length, rc, u->attempt);
+		rc = (rc == 0) ? 0 : -1;
+		break;
+	}
 	case SFTP_OP_DOWNLOAD:
 		rc = sftp_download(w->conn, u->src_path, u->dst_path,
 		    /*Attrib*/NULL, p->cfg.preserve_flag,
@@ -1243,7 +1273,8 @@ parallel_worker_thread(void *arg)
 		    __ATOMIC_RELAXED);
 		__atomic_store_n(&w->unit_offset,
 		    (u0->op == SFTP_OP_UPLOAD_RANGE ||
-		     u0->op == SFTP_OP_DOWNLOAD_RANGE)
+		     u0->op == SFTP_OP_DOWNLOAD_RANGE ||
+		     u0->op == SFTP_OP_RESUME_SPAN)
 		    ? (int64_t)u0->range_offset : (int64_t)-1,
 		    __ATOMIC_RELAXED);
 

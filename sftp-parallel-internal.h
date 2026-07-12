@@ -595,6 +595,12 @@ enum sftp_op {
 	SFTP_OP_DOWNLOAD,
 	SFTP_OP_UPLOAD_RANGE,	/* upload a byte range of a large file */
 	SFTP_OP_DOWNLOAD_RANGE,	/* download a byte range of a large file */
+	SFTP_OP_RESUME_SPAN,	/* verified-resume overlap span: hash-compare
+				 * [offset, length) of an existing partial
+				 * against the source and splice only the
+				 * mismatched runs (shared verify+repair
+				 * engine).  Tracker member like the range
+				 * ops; direction from tracker->target. */
 	SFTP_OP_BUNDLE_UPLOAD,	/* container: members[] packed as one tar stream */
 	SFTP_OP_BUNDLE_DOWNLOAD,/* container: members[] fetched as one tar stream */
 	SFTP_OP_VERIFY,		/* post-transfer verify (+ inline auto-repair) of

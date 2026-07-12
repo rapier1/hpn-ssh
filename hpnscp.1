@@ -358,6 +358,11 @@ The local and remote copies are compared by hashing them in ranges; only
 the ranges that differ are re-transferred, and the repaired file is then
 re-verified.
 A file whose contents already match is skipped.
+With parallel streams
+.Pq Fl j ,
+a large partial is divided among the workers: the missing tail transfers
+immediately while the existing data is hash-compared concurrently, so
+both the comparison and the re-transfer run at fleet speed.
 This relies on the SFTP protocol's random-access range hashing and so
 cannot be combined with the legacy SCP protocol
 .Pq Fl O .

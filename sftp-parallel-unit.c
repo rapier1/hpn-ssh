@@ -1233,6 +1233,99 @@ submit_resume_whole_file(struct sftp_parallel *p, struct sftp_conn *conn,
 }
 
 /*
+ * Parallel verified-resume split (project_verify_refill_parallel): an
+ * existing partial destination divides the file at its EOF.  Everything
+ * past dest EOF is KNOWN missing - the pwrite highwater guarantees no
+ * data exists there, the same fact the serial gate's dest-EOF clamp
+ * relies on - so the tail [dest_size, src_size) submits as ordinary
+ * range units, no hashing.  The overlap [0, dest_size) submits as
+ * RESUME_SPAN units that each hash-compare their span and splice only
+ * mismatched runs (the shared verify+repair engine).  Every unit is
+ * built here in the submit thread under ONE range tracker, so
+ * completion, verify parking, retries, and failure semantics are
+ * exactly those of an ordinary range-split file - and the spans hash
+ * concurrently on their workers' connections, dividing the hash phase
+ * as well as the refill (the serial path's two bottlenecks).
+ *
+ * Piece size rides the -M knob (parallel_unit_split_min_size), matching
+ * ordinary range sizing; no stripe alignment on the tail (a resumed
+ * partial's layout is already fixed by its first attempt).
+ *
+ * Returns 0 when the split was submitted, -1 when the caller should
+ * fall back to the whole-file resume unit (too small to split, or a
+ * mid-loop submit refusal - which only happens under queue shutdown,
+ * where the fallback's own submit refuses identically).
+ */
+static int
+submit_resume_split(struct sftp_parallel *p, struct sftp_conn *conn,
+    enum sftp_op op, const char *src, const char *dst, const char *remote,
+    off_t src_size, off_t dest_size, mode_t mode)
+{
+	struct sftp_range_tracker *tracker;
+	off_t span = (off_t)parallel_unit_split_min_size(p);
+	off_t tail_len = src_size - dest_size;
+	enum sftp_op tail_op = (op == SFTP_OP_UPLOAD) ?
+	    SFTP_OP_UPLOAD_RANGE : SFTP_OP_DOWNLOAD_RANGE;
+	int n_spans, n_tail, n, i;
+
+	(void)conn;
+	n_spans = (int)((dest_size + span - 1) / span);
+	n_tail = (int)((tail_len + span - 1) / span);
+	n = n_spans + n_tail;
+	if (n < 2)
+		return -1;
+
+	debug("resume-split %s \"%s\": overlap %lld bytes -> %d span(s), "
+	    "known-missing tail %lld bytes -> %d range(s)",
+	    op == SFTP_OP_UPLOAD ? "upload" : "download", remote,
+	    (long long)dest_size, n_spans, (long long)tail_len, n_tail);
+
+	tracker = range_tracker_new(n,
+	    op == SFTP_OP_UPLOAD ? SFTP_RANGE_TARGET_REMOTE :
+	    SFTP_RANGE_TARGET_LOCAL, /*path=*/dst, /*src=*/src,
+	    /*verify=*/p->cfg.verify_transfer, p->cfg.writers_per_inode_cap);
+
+	for (i = 0; i < n; i++) {
+		struct sftp_work_unit *ru;
+		off_t offset, length;
+
+		if (i < n_spans) {
+			offset = (off_t)i * span;
+			length = (i == n_spans - 1) ?
+			    (dest_size - offset) : span;
+		} else {
+			offset = dest_size + (off_t)(i - n_spans) * span;
+			length = (i == n - 1) ? (src_size - offset) : span;
+		}
+		ru = make_range_unit(i < n_spans ?
+		    SFTP_OP_RESUME_SPAN : tail_op,
+		    src, dst, offset, length, tracker);
+		ru->range_index = i;
+		ru->mode = mode;
+		if (tracker->vslots != NULL) {
+			tracker->vslots[i].off = (u_int64_t)offset;
+			tracker->vslots[i].len = (u_int64_t)length;
+		}
+		if (parallel_unit_submit(p, ru) != 0) {
+			if (p->abort_flag)
+				debug("submit resume piece %d of \"%s\" "
+				    "refused (abort in progress)", i, remote);
+			else
+				error("submit resume piece %d of \"%s\" "
+				    "failed", i, remote);
+			/* Synthesise failures for the unsubmitted pieces so
+			 * the tracker reaches remaining=0 (see the sibling
+			 * comment in submit_upload_ranges).  Tracker is dead
+			 * to this function after the call. */
+			(void)parallel_unit_tracker_finalize_n(tracker,
+			    n - i, 1, NULL);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/*
  * Estimate the parked-verify footprint of a file BEFORE it transfers, so the
  * memory gate can be charged at SUBMIT time (a leading signal the submitter
  * sees) rather than at park time (a lagging signal it misses - on download the
@@ -1265,10 +1358,34 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 		    __ATOMIC_RELAXED);
 	int rc;
 
-	if (resume || verify)
-		rc = submit_resume_whole_file(p, conn, SFTP_OP_UPLOAD,
-		    local_path, remote_path, remote_path, size, mode,
-		    resume, verify);
+	if (resume || verify) {
+		rc = -1;
+		/*
+		 * Resume onto an existing shorter partial: split into
+		 * known-missing tail ranges + overlap reconcile spans (see
+		 * submit_resume_split).  Gated on BOTH resume extensions so
+		 * the whole-file fallback keeps sole ownership of the
+		 * -Z-against-unsupported-server fatal.  Absent/equal/larger
+		 * destinations keep the whole-file gate (fresh, identical-
+		 * skip, and target-larger semantics live there).
+		 */
+		if (resume && conn != NULL &&
+		    sftp_conn_has_hash_range(conn) &&
+		    sftp_conn_has_hpn_check_file(conn)) {
+			Attrib ra;
+
+			if (sftp_stat(conn, remote_path, 1, &ra) == 0 &&
+			    (ra.flags & SSH2_FILEXFER_ATTR_SIZE) != 0 &&
+			    ra.size > 0 && (off_t)ra.size < size)
+				rc = submit_resume_split(p, conn,
+				    SFTP_OP_UPLOAD, local_path, remote_path,
+				    remote_path, size, (off_t)ra.size, mode);
+		}
+		if (rc != 0)
+			rc = submit_resume_whole_file(p, conn, SFTP_OP_UPLOAD,
+			    local_path, remote_path, remote_path, size, mode,
+			    resume, verify);
+	}
 	/* When a control connection is supplied, route through the
 	 * speculative-split decision so a single large file produces
 	 * multiple range work units (feeds the byte-based scale-up
@@ -1314,10 +1431,27 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
 		    __ATOMIC_RELAXED);
 	int rc;
 
-	if (resume || verify)
-		rc = submit_resume_whole_file(p, conn, SFTP_OP_DOWNLOAD,
-		    remote_path, local_path, remote_path, size, mode,
-		    resume, verify);
+	if (resume || verify) {
+		rc = -1;
+		/* Mirror of the upload resume-split (see that comment); the
+		 * partial is local here, so one local stat decides. */
+		if (resume && conn != NULL &&
+		    sftp_conn_has_hash_range(conn) &&
+		    sftp_conn_has_hpn_check_file(conn)) {
+			struct stat st;
+
+			if (stat(local_path, &st) == 0 &&
+			    S_ISREG(st.st_mode) && st.st_size > 0 &&
+			    st.st_size < size)
+				rc = submit_resume_split(p, conn,
+				    SFTP_OP_DOWNLOAD, remote_path, local_path,
+				    remote_path, size, st.st_size, mode);
+		}
+		if (rc != 0)
+			rc = submit_resume_whole_file(p, conn,
+			    SFTP_OP_DOWNLOAD, remote_path, local_path,
+			    remote_path, size, mode, resume, verify);
+	}
 	else if (conn != NULL)
 		rc = submit_download_maybe_split(p, conn, remote_path, local_path,
 		    size, mode);
