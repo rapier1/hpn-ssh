@@ -799,6 +799,11 @@ do_ssh2_kex(struct ssh *ssh)
 		compression = "none";
 	hkalgs = list_hostkey_types();
 
+	/* HPN: server's outbound zstd level (downloads); the client's
+	 * inbound direction is negotiated separately by name, this only
+	 * governs how WE compress.  Harmless unless zstd@hpnssh.org wins. */
+	ssh_packet_set_zstd_level(ssh, options.zstd_level);
+
 	kex_proposal_populate_entries(ssh, myproposal, options.kex_algorithms,
 	    options.ciphers, options.macs, compression, hkalgs);
 

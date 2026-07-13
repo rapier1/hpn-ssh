@@ -281,7 +281,8 @@ SSHCONF_INTFLAG(nonemac_enabled, NoneMacEnabled, SSHCFG_ALL, 0, SSHCFG_COPY_MATC
 SSHCONF_INTFLAG(disable_multithreaded, DisableMTAES, SSHCFG_ALL, 0, SSHCFG_COPY_MATCH) \
 SSHCONF_INTFLAG(use_mptcp, UseMPTCP, SSHCFG_GLOBAL, 0, SSHCFG_COPY_NONE) \
 SSHCONF_INT(hpn_max_concurrent_workers, HPNMaxConcurrentWorkers, SSHCFG_ALL, NULL, 0, SSHCFG_COPY_MATCH) \
-SSHCONF_INT(hpn_memory_limit, HPNMemoryLimit, SSHCFG_ALL, multistate_hpnmemorylimit, 0, SSHCFG_COPY_MATCH)
+SSHCONF_INT(hpn_memory_limit, HPNMemoryLimit, SSHCFG_ALL, multistate_hpnmemorylimit, 0, SSHCFG_COPY_MATCH) \
+SSHCONF_INT(zstd_level, ZstdLevel, SSHCFG_GLOBAL, NULL, 3, SSHCFG_COPY_NONE)
 
 #define SSHD_CONFIG_ENTRIES_BASE \
 	SSHD_CONFIG_ENTRIES_CUSTOM \

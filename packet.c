@@ -78,6 +78,7 @@
 
 #include "xmalloc.h"
 #include "compat.h"
+#include "hpn-compress.h"	/* HPN: zstd@hpnssh.org transport compression */
 #include "ssh2.h"
 #include "cipher.h"
 #include "kex.h"
@@ -168,6 +169,14 @@ struct session_state {
 	int compression_out_started;
 	int compression_in_failures;
 	int compression_out_failures;
+
+	/* HPN zstd@hpnssh.org streams (hpn-compress.c); NULL until the
+	 * method is negotiated and enabled.  zstd_level 0 = unset (the
+	 * module applies its default); set via ssh_packet_set_zstd_level
+	 * from -z (client) / ZstdLevel (server). */
+	struct hpn_zstd_out *zstd_out;
+	struct hpn_zstd_in *zstd_in;
+	int zstd_level;
 
 	/* default maximum packet size */
 	u_int max_packet_size;
@@ -768,6 +777,11 @@ ssh_packet_close_internal(struct ssh *ssh, int do_close)
 		}
 	}
 #endif	/* WITH_ZLIB */
+	/* HPN zstd streams: same once-only rule as the zlib state above */
+	if (do_close) {
+		hpn_zstd_out_free(&state->zstd_out);
+		hpn_zstd_in_free(&state->zstd_in);
+	}
 	cipher_free(state->send_context);
 	cipher_free(state->receive_context);
 	state->send_context = state->receive_context = NULL;
@@ -991,6 +1005,32 @@ uncompress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 }
 #endif	/* WITH_ZLIB */
 
+/*
+ * HPN: start the negotiated compressor for one direction.  comp->type
+ * chooses zstd (zstd@hpnssh.org) or zlib (zlib@openssh.com); both share
+ * the delayed (post-auth) enable path.  Factored out of the two enable
+ * sites below so neither carries the zstd-vs-zlib branch inline.
+ */
+static int
+start_compression(struct ssh *ssh, struct sshcomp *comp, int mode)
+{
+	struct session_state *state = ssh->state;
+
+	if (mode == MODE_OUT) {
+		if (comp->type == COMP_ZSTD_DELAYED) {
+			int level = state->zstd_level;
+
+			if (level == 0)
+				level = HPN_ZSTD_LEVEL_DEFAULT;
+			return hpn_zstd_out_start(&state->zstd_out, level);
+		}
+		return start_compression_out(ssh, 6);
+	}
+	if (comp->type == COMP_ZSTD_DELAYED)
+		return hpn_zstd_in_start(&state->zstd_in);
+	return start_compression_in(ssh);
+}
+
 void
 ssh_clear_newkeys(struct ssh *ssh, int mode)
 {
@@ -1088,17 +1128,13 @@ ssh_set_newkeys(struct ssh *ssh, int mode)
 	/* explicit_bzero(enc->iv,  enc->block_size);
 	   explicit_bzero(enc->key, enc->key_len);
 	   explicit_bzero(mac->key, mac->key_len); */
-	if (((comp->type == COMP_DELAYED && state->after_authentication)) &&
-	    comp->enabled == 0) {
+	if (((comp->type == COMP_DELAYED ||
+	    comp->type == COMP_ZSTD_DELAYED) &&
+	    state->after_authentication) && comp->enabled == 0) {
 		if ((r = ssh_packet_init_compression(ssh)) < 0)
 			return r;
-		if (mode == MODE_OUT) {
-			if ((r = start_compression_out(ssh, 6)) != 0)
-				return r;
-		} else {
-			if ((r = start_compression_in(ssh)) != 0)
-				return r;
-		}
+		if ((r = start_compression(ssh, comp, mode)) != 0)
+			return r;
 		comp->enabled = 1;
 	}
 	/* get the maximum number of blocks the cipher can
@@ -1263,16 +1299,13 @@ ssh_packet_enable_delayed_compress(struct ssh *ssh)
 		if (state->newkeys[mode] == NULL)
 			continue;
 		comp = &state->newkeys[mode]->comp;
-		if (comp && !comp->enabled && comp->type == COMP_DELAYED) {
+		if (comp && !comp->enabled &&
+		    (comp->type == COMP_DELAYED ||
+		    comp->type == COMP_ZSTD_DELAYED)) {
 			if ((r = ssh_packet_init_compression(ssh)) != 0)
 				return r;
-			if (mode == MODE_OUT) {
-				if ((r = start_compression_out(ssh, 6)) != 0)
-					return r;
-			} else {
-				if ((r = start_compression_in(ssh)) != 0)
-					return r;
-			}
+			if ((r = start_compression(ssh, comp, mode)) != 0)
+				return r;
 			comp->enabled = 1;
 		}
 	}
@@ -1336,8 +1369,13 @@ ssh_packet_send2_wrapped(struct ssh *ssh)
 		if ((r = sshbuf_consume(state->outgoing_packet, 5)) != 0)
 			goto out;
 		sshbuf_reset(state->compression_buffer);
-		if ((r = compress_buffer(ssh, state->outgoing_packet,
-		    state->compression_buffer)) != 0)
+		if (comp->type == COMP_ZSTD_DELAYED)
+			r = hpn_zstd_compress(state->zstd_out,
+			    state->outgoing_packet, state->compression_buffer);
+		else
+			r = compress_buffer(ssh, state->outgoing_packet,
+			    state->compression_buffer);
+		if (r != 0)
 			goto out;
 		sshbuf_reset(state->outgoing_packet);
 		if ((r = sshbuf_put(state->outgoing_packet,
@@ -1884,8 +1922,13 @@ ssh_packet_read_poll2(struct ssh *ssh, u_char *typep, uint32_t *seqnr_p)
 	    sshbuf_len(state->incoming_packet)));
 	if (comp && comp->enabled) {
 		sshbuf_reset(state->compression_buffer);
-		if ((r = uncompress_buffer(ssh, state->incoming_packet,
-		    state->compression_buffer)) != 0)
+		if (comp->type == COMP_ZSTD_DELAYED)
+			r = hpn_zstd_uncompress(state->zstd_in,
+			    state->incoming_packet, state->compression_buffer);
+		else
+			r = uncompress_buffer(ssh, state->incoming_packet,
+			    state->compression_buffer);
+		if (r != 0)
 			goto out;
 		sshbuf_reset(state->incoming_packet);
 		if ((r = sshbuf_putb(state->incoming_packet,
@@ -2515,6 +2558,17 @@ ssh_packet_set_server(struct ssh *ssh)
 {
 	ssh->state->server_side = 1;
 	ssh->kex->server = 1; /* XXX unify? */
+}
+
+/*
+ * HPN: set the LOCAL outbound zstd compression level (client -z, server
+ * ZstdLevel).  Level is not negotiated - each side compresses its own
+ * direction at its own setting; 0 means the module default.
+ */
+void
+ssh_packet_set_zstd_level(struct ssh *ssh, int level)
+{
+	ssh->state->zstd_level = level;
 }
 
 /* Set the state of the connection to post auth

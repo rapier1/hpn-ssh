@@ -103,7 +103,11 @@
 	"rsa-sha2-512," \
 	"rsa-sha2-256"
 
+#ifdef HAVE_LIBZSTD
+#define	KEX_DEFAULT_COMP	"none,zlib@openssh.com,zstd@hpnssh.org"
+#else
 #define	KEX_DEFAULT_COMP	"none,zlib@openssh.com"
+#endif
 #define	KEX_DEFAULT_LANG	""
 
 #define KEX_CLIENT \

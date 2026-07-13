@@ -167,6 +167,9 @@ typedef struct {
         char   *metrics_path; /* path for the metrics files */
 	int     fallback; /* en|disable fallback port (def: true) */
 	int     fallback_port; /* port to fallback to (def: 22) */
+	int     zstd_level; /* -z / ZstdLevel: request zstd@hpnssh.org
+			     * transport compression at this level for our
+			     * outbound direction; -1 = not requested */
         int     use_mptcp; /* use MultiPath TCP */
         int     use_happyeyes; /* use RFC 8305 - Happy Eyeballs */
 	int     happy_delay; /* user defined dleay for RFC 8305 */

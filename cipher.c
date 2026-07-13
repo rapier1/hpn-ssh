@@ -150,12 +150,26 @@ cipher_alg_list(char sep, int auth_only)
 	return ret;
 }
 
+/*
+ * HPN: zstd@hpnssh.org is always appended when built in - it only
+ * activates when the peer asks for it, so there is nothing for an
+ * admin to disable (matching how zlib@openssh.com is always offered
+ * on the server side).  A client that REQUIRES zstd (-z) does not use
+ * this list; it proposes "zstd@hpnssh.org" alone so a peer without
+ * support fails the KEX cleanly instead of silently degrading.
+ */
 const char *
 compression_alg_list(int compression)
 {
-#ifdef WITH_ZLIB
+#if defined(WITH_ZLIB) && defined(HAVE_LIBZSTD)
+	return compression ? "zlib@openssh.com,zstd@hpnssh.org,none" :
+	    "none,zlib@openssh.com,zstd@hpnssh.org";
+#elif defined(WITH_ZLIB)
 	return compression ? "zlib@openssh.com,none" :
 	    "none,zlib@openssh.com";
+#elif defined(HAVE_LIBZSTD)
+	return compression ? "zstd@hpnssh.org,none" :
+	    "none,zstd@hpnssh.org";
 #else
 	return "none";
 #endif

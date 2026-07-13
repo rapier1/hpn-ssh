@@ -1650,6 +1650,51 @@ See http://www.gzip.org/zlib/ for details.])
     LIBS="$saved_LIBS"
 fi
 
+dnl HPN: optional libzstd for the zstd@hpnssh.org transport compression
+dnl method (-z / ZstdLevel).  Auto-detected; absence just means the
+dnl method is never offered.  --without-zstd disables explicitly.
+zstd=yes
+AC_ARG_WITH([zstd],
+	[  --with-zstd=PATH        Use libzstd in PATH (default: auto-detect)],
+	[ if test "x$withval" = "xno" ; then
+		zstd=no
+	  elif test "x$withval" != "xyes"; then
+		if test -d "$withval/lib"; then
+			if test -n "${rpath_opt}"; then
+				LDFLAGS="-L${withval}/lib ${rpath_opt}${withval}/lib ${LDFLAGS}"
+			else
+				LDFLAGS="-L${withval}/lib ${LDFLAGS}"
+			fi
+		else
+			if test -n "${rpath_opt}"; then
+				LDFLAGS="-L${withval} ${rpath_opt}${withval} ${LDFLAGS}"
+			else
+				LDFLAGS="-L${withval} ${LDFLAGS}"
+			fi
+		fi
+		if test -d "$withval/include"; then
+			CPPFLAGS="-I${withval}/include ${CPPFLAGS}"
+		else
+			CPPFLAGS="-I${withval} ${CPPFLAGS}"
+		fi
+	fi ]
+)
+AC_MSG_CHECKING([for libzstd])
+if test "x${zstd}" = "xno"; then
+	AC_MSG_RESULT([no (disabled)])
+else
+	AC_MSG_RESULT([checking])
+	AC_CHECK_HEADER([zstd.h],
+	    [AC_CHECK_LIB([zstd], [ZSTD_compressStream2],
+		[
+			AC_DEFINE([HAVE_LIBZSTD], [1],
+			    [Define if libzstd is available])
+			CHANNELLIBS="$CHANNELLIBS -lzstd"
+		],
+		[AC_MSG_WARN([libzstd not usable; zstd compression disabled])])],
+	    [AC_MSG_WARN([zstd.h not found; zstd compression disabled])])
+fi
+
 dnl UnixWare 2.x
 AC_CHECK_FUNC([strcasecmp],
 	[], [ AC_CHECK_LIB([resolv], [strcasecmp], [LIBS="$LIBS -lresolv"]) ]

@@ -68,6 +68,8 @@
 
 #define COMP_NONE	0
 #define COMP_DELAYED	2
+#define COMP_ZSTD_DELAYED 3	/* HPN zstd@hpnssh.org: zlib@openssh.com
+				 * delayed semantics, zstd algorithm */
 
 #define CURVE25519_SIZE 32
 

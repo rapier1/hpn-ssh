@@ -89,6 +89,7 @@
 #include "log.h"
 #include "misc.h"
 #include "readconf.h"
+#include "hpn-compress.h"	/* HPN: -z zstd level bounds */
 #include "sshconnect.h"
 #include "kex.h"
 #include "mac.h"
@@ -701,8 +702,8 @@ main(int ac, char **av)
 	argv0 = av[0];
 
  again:
-	while ((opt = getopt(ac, av, "1246ab:c:e:fgi:kl:m:no:p:qstvx"
-	    "AB:CD:E:F:GI:J:KL:MNO:P:Q:R:S:TVw:W:XYy")) != -1) { /* HUZdhjruz */
+	while ((opt = getopt(ac, av, "1246ab:c:e:fgi:kl:m:no:p:qstvxz:"
+	    "AB:CD:E:F:GI:J:KL:MNO:P:Q:R:S:TVw:W:XYy")) != -1) { /* HUZdhjru */
 		switch (opt) {
 		case '1':
 			fatal("SSH protocol v.1 is no longer supported");
@@ -1061,6 +1062,20 @@ main(int ac, char **av)
 		case 'B':
 			options.bind_interface = optarg;
 			break;
+		case 'z': {
+			/* HPN: require zstd transport compression at this
+			 * level (our outbound direction; the peer's level
+			 * is its own).  A peer without zstd fails the KEX. */
+			const char *zerr = NULL;
+
+			options.zstd_level = (int)strtonum(optarg,
+			    HPN_ZSTD_LEVEL_MIN, HPN_ZSTD_LEVEL_MAX, &zerr);
+			if (zerr != NULL)
+				fatal("Invalid -z zstd level \"%s\": %s "
+				    "(range %d-%d)", optarg, zerr,
+				    HPN_ZSTD_LEVEL_MIN, HPN_ZSTD_LEVEL_MAX);
+			break;
+		}
 		case 'F':
 			config = optarg;
 			break;
@@ -1267,6 +1282,13 @@ main(int ac, char **av)
 	/* Fill configuration defaults. */
 	if (fill_default_options(&options) != 0)
 		cleanup_exit(255);
+
+	/* HPN: -z proposes zstd@hpnssh.org ALONE; -C builds a zlib-first
+	 * list.  Requesting both is contradictory - refuse rather than
+	 * pick one. */
+	if (options.zstd_level > 0 && options.compression > 0)
+		fatal("-z (zstd) and -C (zlib compression) are "
+		    "mutually exclusive");
 
 	if (options.user == NULL) {
 		user_was_default = 1;

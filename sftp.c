@@ -59,6 +59,7 @@ typedef void EditLine;
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-hpn-transferlog.h"
+#include "hpn-compress.h"		/* HPN: -z zstd level bounds */
 #include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
 #include "sftp-usergroup.h"
@@ -3444,7 +3445,7 @@ usage(void)
 	    "          [-J destination] [-j parallel_streams] [-l limit]\n"
 	    "          [-M range_split_min_mb] [-o ssh_option] [-P port]\n"
 	    "          [-R num_requests] [-S program] [-w writers_per_file]\n"
-	    "          [-s subsystem | sftp_server] [-X sftp_option]\n"
+	    "          [-s subsystem | sftp_server] [-X sftp_option] [-z level]\n"
 	    "          [--bundle-size N[KMG]] destination\n",
 	    __progname);
 	exit(1);
@@ -3476,6 +3477,7 @@ main(int argc, char **argv)
 	 * file scope (parallel_extra_o*, appended via parallel_extra_o_add). */
 	const char *parallel_identity = NULL;
 	const char *parallel_config_file = NULL;
+	int zstd_level = 0;			/* -z: zstd@hpnssh.org level */
 
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
@@ -3568,7 +3570,7 @@ main(int argc, char **argv)
 	}
 
 	while ((ch = getopt(argc, argv,
-	    "1246AVafhNpqrvCc:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:w:X:")) != -1) {
+	    "1246AVafhNpqrvCz:c:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:w:X:")) != -1) {
 		switch (ch) {
 		/* Passed through to ssh(1).  The connection-shaping flags also
 		 * propagate to parallel-streams workers via their -o
@@ -3620,6 +3622,23 @@ main(int argc, char **argv)
 			addargs(&args, "%s", optarg);
 			parallel_identity = optarg;
 			break;
+		case 'z': {
+			/* HPN: zstd@hpnssh.org at this level on the control/
+			 * serial ssh, and forwarded to workers via ZstdLevel. */
+			const char *zerr = NULL;
+			char zo[32];
+
+			zstd_level = (int)strtonum(optarg, HPN_ZSTD_LEVEL_MIN,
+			    HPN_ZSTD_LEVEL_MAX, &zerr);
+			if (zerr != NULL)
+				fatal("Invalid -z zstd level \"%s\": %s "
+				    "(range %d-%d)", optarg, zerr,
+				    HPN_ZSTD_LEVEL_MIN, HPN_ZSTD_LEVEL_MAX);
+			addargs(&args, "-oZstdLevel=%d", zstd_level);
+			snprintf(zo, sizeof(zo), "ZstdLevel=%d", zstd_level);
+			parallel_extra_o_add(zo);
+			break;
+		}
 		case 'o':
 			/* TransferLog is ours, not ssh's: consume it here
 			 * or ssh rejects the unknown keyword. */

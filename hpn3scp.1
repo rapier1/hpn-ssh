@@ -161,6 +161,17 @@ ranges that differ between the source and target copies are re-sent, and the
 repaired file is re-verified.
 Implies
 .Fl V .
+.It Fl z Ar level
+HPN: use zstd transport compression
+.Pq Cm zstd@hpnssh.org
+at the given
+.Ar level
+.Pq 1 No to No 19
+on the source-to-target transfer.
+Forwarded to the source
+.Xr hpnscp 1 ;
+a peer without zstd support fails the transfer rather than silently
+falling back.
 .It Fl X Ar sftp_option
 Pass an SFTP-level option
 .Pq for example Cm bundle=yes

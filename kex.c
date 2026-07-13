@@ -921,6 +921,11 @@ choose_comp(struct sshcomp *comp, char *client, char *server)
 		comp->type = COMP_DELAYED;
 	} else
 #endif	/* WITH_ZLIB */
+#ifdef HAVE_LIBZSTD
+	if (strcmp(name, "zstd@hpnssh.org") == 0) {
+		comp->type = COMP_ZSTD_DELAYED;
+	} else
+#endif	/* HAVE_LIBZSTD */
 	if (strcmp(name, "none") == 0) {
 		comp->type = COMP_NONE;
 	} else {

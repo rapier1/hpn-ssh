@@ -112,6 +112,25 @@ Passes the
 flag to
 .Xr hpnssh 1
 to enable compression.
+.It Fl z Ar level
+HPN: use zstd transport compression
+.Pq Cm zstd@hpnssh.org
+at the given
+.Ar level
+.Pq 1 No to No 19
+instead of
+.Fl C
+zlib \(em faster, aimed at being a throughput win on bandwidth-limited
+paths.
+Applies to the control connection and, with
+.Fl j ,
+to every worker connection.
+A peer without zstd support fails the transfer rather than silently
+falling back;
+.Fl z
+and
+.Fl C
+are mutually exclusive.
 .It Fl c Ar cipher
 Selects the cipher to use for encrypting the data transfer.
 This option is directly passed to

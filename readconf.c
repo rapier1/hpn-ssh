@@ -165,6 +165,7 @@ typedef enum {
 	oHPNLustreStripeCount,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
+	oZstdLevel,
 	oVisualHostKey,
 	oKexAlgorithms, oIPQoS, oRequestTTY, oSessionType, oStdinNull,
 	oForkAfterAuthentication, oIgnoreUnknown, oProxyUseFdpass,
@@ -320,6 +321,7 @@ static struct {
 	{ "metricsinterval", oMetricsInterval },
 	{ "fallback", oFallback },
 	{ "fallbackport", oFallbackPort },
+	{ "zstdlevel", oZstdLevel },
 	{ "sessiontype", oSessionType },
 	{ "stdinnull", oStdinNull },
 	{ "forkafterauthentication", oForkAfterAuthentication },
@@ -1502,6 +1504,13 @@ parse_time:
 
 	case oFallbackPort:
 		intptr = &options->fallback_port;
+		goto parse_int;
+
+	case oZstdLevel:
+		/* HPN: requesting a level REQUESTS zstd - the client then
+		 * proposes zstd@hpnssh.org alone and a peer without it
+		 * fails the KEX rather than silently degrading. */
+		intptr = &options->zstd_level;
 		goto parse_int;
 
 	/*
@@ -3015,6 +3024,7 @@ initialize_options(Options * options)
 	options->hpn_memory_limit = -1;
 	options->fallback = -1;
 	options->fallback_port = -1;
+	options->zstd_level = -1;	/* -1 = zstd not requested */
 	options->tcp_rcv_buf_poll = -1;
 	options->session_type = -1;
 	options->stdin_null = -1;

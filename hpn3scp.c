@@ -71,7 +71,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: hpn3scp [-46AVZrv] [-j streams] [-o ssh_option] [-X sftp_option]\n"
+	    "usage: hpn3scp [-46AVZrv] [-j streams] [-o ssh_option] [-X sftp_option] [-z level]\n"
 	    "               [-Y \"hpnscp switches\"] source target\n");
 	exit(1);
 }
@@ -734,7 +734,7 @@ main(int argc, char **argv)
 	 * hatch for hpnscp's native switches - one quoted string, split with
 	 * quote/escape handling so dashes travel intact.
 	 */
-	while ((ch = getopt(argc, argv, "j:Arvo:X:Y:46VZ")) != -1) {
+	while ((ch = getopt(argc, argv, "j:Arvo:X:Y:46VZz:")) != -1) {
 		switch (ch) {
 		case 'j':
 			s.streams = (int)strtol(optarg, NULL, 10);
@@ -767,6 +767,12 @@ main(int argc, char **argv)
 		case 'Z':
 			addargs(&hpnscp_extra, "-Z");
 			s.verify_requested = 1;	/* resume implies verification */
+			break;
+		case 'z':
+			/* HPN: zstd on the source->target transfer; forward
+			 * the level to the source hpnscp verbatim. */
+			addargs(&hpnscp_extra, "-z");
+			addargs(&hpnscp_extra, "%s", optarg);
 			break;
 		case 'o':
 			/* TransferLog is consumed here (the log lives on

@@ -172,6 +172,28 @@ configuration files; see the
 option in
 .Xr ssh_config 5 .
 .Pp
+.It Fl z Ar level
+HPN: request zstd transport compression
+.Pq Cm zstd@hpnssh.org
+at the given
+.Ar level
+.Pq 1 No fastest to No 19 No best
+for this connection's outbound direction.
+This is a faster alternative to
+.Fl C
+zlib compression, intended to be a throughput win on bandwidth-limited
+paths rather than only a CPU cost.
+A peer that does not support zstd causes the connection to fail rather
+than silently fall back, so
+.Fl z
+is a deliberate request, not a hint;
+.Fl z
+and
+.Fl C
+are mutually exclusive.
+The peer's own outbound level is set independently
+.Pq Cm ZstdLevel No on a server .
+.Pp
 .It Fl c Ar cipher_spec
 Selects the cipher specification for encrypting the session.
 .Ar cipher_spec

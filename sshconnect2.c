@@ -60,6 +60,7 @@
 #include "log.h"
 #include "misc.h"
 #include "readconf.h"
+#include "hpn-compress.h"	/* HPN: zstd@hpnssh.org proposal */
 #include "match.h"
 #include "dispatch.h"
 #include "canohost.h"
@@ -223,6 +224,20 @@ order_hostkeyalgs(char *host, struct sockaddr *hostaddr, u_short port,
 	return ret;
 }
 
+/*
+ * HPN: the client's compression proposal.  -z / ZstdLevel means zstd is
+ * REQUIRED: propose zstd@hpnssh.org alone, so a peer without it fails
+ * the KEX with a clear no-match instead of silently degrading to the
+ * slow zlib or to nothing.  Otherwise the stock zlib/none list.
+ */
+static const char *
+client_compression_list(void)
+{
+	if (options.zstd_level > 0)
+		return HPN_ZSTD_COMP_NAME;
+	return compression_alg_list(options.compression);
+}
+
 void
 ssh_kex2(struct ssh *ssh, char *host, struct sockaddr_storage *hostaddr,
     u_short port, const struct ssh_conn_info *cinfo)
@@ -234,6 +249,10 @@ ssh_kex2(struct ssh *ssh, char *host, struct sockaddr_storage *hostaddr,
 	xxx_host = xstrdup(host);
 	xxx_hostaddr = *hostaddr;
 	xxx_conn_info = ssh_conn_info_dup(cinfo);
+
+	/* HPN: our outbound zstd level (the peer's is its own affair) */
+	if (options.zstd_level > 0)
+		ssh_packet_set_zstd_level(ssh, options.zstd_level);
 
 	if (options.rekey_limit || options.rekey_interval)
 		ssh_packet_set_rekey_limits(ssh, options.rekey_limit,
@@ -263,7 +282,7 @@ ssh_kex2(struct ssh *ssh, char *host, struct sockaddr_storage *hostaddr,
 
 	kex_proposal_populate_entries(ssh, myproposal,
 	    options.kex_algorithms, options.ciphers, options.macs,
-	    compression_alg_list(options.compression),
+	    client_compression_list(),
 	    hkalgs ? hkalgs : options.hostkeyalgorithms);
 
 	free(hkalgs);
@@ -514,7 +533,7 @@ ssh_userauth2(struct ssh *ssh, const char *local_user,
 			debug("Requesting none rekeying...");
 			kex_proposal_populate_entries(ssh, myproposal, s, none_cipher,
 						      options.macs,
-						      compression_alg_list(options.compression),
+						      client_compression_list(),
 						      options.hostkeyalgorithms);
 			fprintf(stderr, "WARNING: ENABLED NONE CIPHER!!!\n");
 
@@ -524,7 +543,7 @@ ssh_userauth2(struct ssh *ssh, const char *local_user,
 				kex_proposal_free_entries(myproposal);  /* free first call's allocations */
 				kex_proposal_populate_entries(ssh, myproposal, s, none_cipher,
 							      none_mac,
-							      compression_alg_list(options.compression),
+							      client_compression_list(),
 							      options.hostkeyalgorithms);
 				fprintf(stderr, "WARNING: ENABLED NONE MAC\n");
 			}

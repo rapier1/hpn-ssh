@@ -123,6 +123,7 @@
 #include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
 #include "sftp-hpn-transferlog.h"
+#include "hpn-compress.h"		/* HPN: -z zstd level bounds */
 #include "sftp-parallel.h"
 #include "hpn-exit-codes.h"
 
@@ -204,6 +205,7 @@ static int hpn_verify_transfer = 0;		/* HPNVerifyTransfer resolved */
 static int verify_flag = 0;			/* -V: force HPNVerifyTransfer on */
 static int family_flag = 0;			/* -4/-6: forward to -R source scp */
 static int compress_flag = 0;			/* -C: forward to -R source scp */
+static int zstd_level = 0;			/* -z: zstd@hpnssh.org level */
 static int hpn_verify_failed = 0;		/* a transfer failed verify -> exit 57 */
 static int range_split_min_mb_user = 0;		/* -M: range-split min file size, MiB */
 static int writers_cap_user = 0;		/* -w: max range-writers per inode */
@@ -682,7 +684,7 @@ main(int argc, char **argv)
 
 	fflag = Tflag = tflag = 0;
 	while ((ch = getopt(argc, argv,
-	    "12346ABCTVdfOpqRrstvZD:F:J:M:P:S:c:i:j:l:o:w:X:")) != -1) {
+	    "12346ABCTVdfOpqRrstvZz:D:F:J:M:P:S:c:i:j:l:o:w:X:")) != -1) {
 		switch (ch) {
 		/* User-visible flags. */
 		case '1':
@@ -719,6 +721,27 @@ main(int argc, char **argv)
 			parallel_extra_o_add("Compression=yes");
 			compress_flag = 1;
 			break;
+		case 'z': {
+			/* HPN: zstd@hpnssh.org at this level.  Set it on the
+			 * control/serial ssh AND forward ZstdLevel to the
+			 * workers (which are their own hpnssh sessions). */
+			const char *zerr = NULL;
+
+			zstd_level = (int)strtonum(optarg, HPN_ZSTD_LEVEL_MIN,
+			    HPN_ZSTD_LEVEL_MAX, &zerr);
+			if (zerr != NULL)
+				fatal("Invalid -z zstd level \"%s\": %s "
+				    "(range %d-%d)", optarg, zerr,
+				    HPN_ZSTD_LEVEL_MIN, HPN_ZSTD_LEVEL_MAX);
+			addargs(&args, "-oZstdLevel=%d", zstd_level);
+			{
+				char zo[32];
+				snprintf(zo, sizeof(zo), "ZstdLevel=%d",
+				    zstd_level);
+				parallel_extra_o_add(zo);
+			}
+			break;
+		}
 		case 'D':
 			sftp_direct = optarg;
 			break;
@@ -1822,6 +1845,8 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 				addargs(&alist, "-%d", family_flag);
 			if (compress_flag)
 				addargs(&alist, "-C");
+			if (zstd_level > 0)
+				addargs(&alist, "-z%d", zstd_level);
 			if (verify_flag)
 				addargs(&alist, "-V");
 			if (resume_flag)
@@ -3064,7 +3089,7 @@ usage(void)
 	    "usage: hpnscp [-346ABCOpqRrsTVvZ] [-c cipher] [-D sftp_server_path]\n"
 	    "              [-F ssh_config] [-i identity_file] [-J destination] [-j streams]\n"
 	    "              [-l limit] [-M range_split_min] [-o ssh_option] [-P port]\n"
-	    "              [-S program] [-w writers_per_file] [-X sftp_option]\n"
+	    "              [-S program] [-w writers_per_file] [-X sftp_option] [-z level]\n"
 	    "              source ... target\n");
 	exit(1);
 
