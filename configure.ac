@@ -5640,8 +5640,8 @@ otherwise scp will not work.])
 		if test $? -ne 0  ; then
 			echo $user_path | grep "^$t_bindir"  > /dev/null 2>&1
 			if test $? -ne 0  ; then
-				user_path=$user_path:$t_bindir
-				AC_MSG_RESULT([Adding $t_bindir to USER_PATH so scp will work])
+				user_path=$t_bindir:$user_path
+				AC_MSG_RESULT([Prepending $t_bindir to USER_PATH so scp will work])
 			fi
 		fi
 	fi ]
