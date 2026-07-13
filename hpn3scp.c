@@ -209,56 +209,6 @@ ssh_base_args(struct launch_session *s, arglist *a, int with_n, int with_agent)
 }
 
 /*
- * Discover the absolute path of hpnscp on the source and return it in out.
- * An explicit override wins (documented escape hatch); otherwise probe the
- * source's PATH with `command -v hpnscp` and require an absolute path -
- * never a bare name, so PATH shadowing on the source becomes an early,
- * legible failure instead of a mid-transfer surprise.
- */
-static int
-discover_remote_hpnscp(struct launch_session *s, char *out, size_t outlen)
-{
-	arglist a;
-	char buf[1024], *m;
-	const char *env;
-	int r;
-
-	if ((env = getenv("HPN3SCP_REMOTE_HPNSCP")) != NULL && *env != '\0') {
-		if (*env != '/') {
-			proto_emit_error("HPN3SCP_REMOTE_HPNSCP must be an "
-			    "absolute path");
-			return -1;
-		}
-		strlcpy(out, env, outlen);
-		return 0;
-	}
-
-	ssh_base_args(s, &a, 0, 0);
-	addargs(&a, "command -v hpnscp");
-	r = hpn_run_capture(&a, buf, sizeof(buf), 20000);
-	freeargs(&a);
-	if (r != 0) {
-		xasprintf(&m, "could not probe %s for hpnscp (is it "
-		    "reachable? set HPN3SCP_REMOTE_HPNSCP to override)",
-		    s->src.host);
-		proto_emit_error(m);
-		free(m);
-		return -1;
-	}
-	buf[strcspn(buf, "\r\n")] = '\0';
-	if (buf[0] != '/') {
-		xasprintf(&m, "%s has no hpnscp on its PATH (set "
-		    "HPN3SCP_REMOTE_HPNSCP to its absolute path)",
-		    s->src.host);
-		proto_emit_error(m);
-		free(m);
-		return -1;
-	}
-	strlcpy(out, buf, outlen);
-	return 0;
-}
-
-/*
  * Decoded frames -> output.  Protocol mode relays them as EVENT lines;
  * human mode (stdout is a terminal) drives a local progress meter rendered
  * entirely from the frames (progress_meter_relay_*), exactly as hpnscp's
@@ -413,15 +363,16 @@ emit_completion_summary(struct launch_session *s)
 }
 
 /*
- * Launch the source's hpnscp (by absolute path) to push directly to the
- * target, and relay its status frames as events.  Mirrors scp.c's proven -R
- * command build: env-armed frames, -j / -P forwarded into the source's
- * hpnscp, target as user@host:path.  Raw bytes from a source that does not
- * speak frames are discarded (passthrough_fd = -1), never written to our
- * protocol stdout.  Returns the child exit status.
+ * Launch the source's hpnscp (a bare word, resolved by the source's PATH
+ * exactly as stock scp resolves its remote command) to push directly to
+ * the target, and relay its status frames as events.  Mirrors scp.c's
+ * proven -R command build: env-armed frames, -j / -P forwarded into the
+ * source's hpnscp, target as user@host:path.  Raw bytes from a source that
+ * does not speak frames are discarded (passthrough_fd = -1), never written
+ * to our protocol stdout.  Returns the child exit status.
  */
 static int
-do_launch(struct launch_session *s, const char *abs_hpnscp)
+do_launch(struct launch_session *s)
 {
 	arglist a;
 	struct hpn_run_hooks h;
@@ -438,7 +389,7 @@ do_launch(struct launch_session *s, const char *abs_hpnscp)
 	 * as plain arming and the log degrades to header + footer. */
 	addargs(&a, transferlog_active() ?
 	    "HPN_ENABLE_REMOTE_PROGRESS=log" : "HPN_ENABLE_REMOTE_PROGRESS=1");
-	addargs(&a, "%s", abs_hpnscp);
+	addargs(&a, "hpnscp");
 	/* the target key is trusted by now (broker or pre-existing), so hold
 	 * the workers to strict checking; a user -o after this can override */
 	addargs(&a, "-o");
@@ -612,7 +563,7 @@ static int
 run_session(struct launch_session *s)
 {
 	const char *why = NULL;
-	char sd[512], dd[512], abs_hpnscp[1024], *m;
+	char sd[512], dd[512], *m;
 	struct target_keyset set;
 	int r, ret = 1, knows;
 
@@ -684,13 +635,10 @@ run_session(struct launch_session *s)
 
 	s->phase = LP_LAUNCH;
 	proto_emit_phase(phase_name(s->phase));
-	if (discover_remote_hpnscp(s, abs_hpnscp, sizeof(abs_hpnscp)) != 0)
-		goto fail;
-	debug("source hpnscp: %s", abs_hpnscp);	/* visible under -v */
 
 	s->phase = LP_MONITOR;
 	proto_emit_phase(phase_name(s->phase));
-	r = do_launch(s, abs_hpnscp);
+	r = do_launch(s);
 	emit_completion_summary(s);
 
 	s->phase = LP_COMPLETE;
