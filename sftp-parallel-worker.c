@@ -1047,7 +1047,7 @@ worker_run_bundle_download(struct sftp_worker *w,
 	for (i = 0; i < bn; i++)
 		results[i] = entries[i].result;
 	worker_finish_bundle(p, w, batch, bn, bundle_rc, results, total_bytes,
-	    t_start_ms, t_end_ms, "BUNDLE-DL", 1);
+	    t_start_ms, t_end_ms, "BUNDLE-DL", 0);
 
 	free(entries);
 	free(results);

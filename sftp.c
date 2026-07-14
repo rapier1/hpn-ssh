@@ -936,6 +936,18 @@ parallel_flush(void)
 			    (unsigned long long)pstats.walker_failures_aggregate);
 			rc = -1;
 		}
+		/* A fleet abort (stall abort, dead-end respawn, control-
+		 * session loss) abandons queued units without recording
+		 * per-unit failures - the same shape as a user interrupt
+		 * above - so the aggregates alone miss it and the run
+		 * would exit 0.  Refuse to report success for an aborted,
+		 * incomplete transfer. */
+		if (rc == 0 && sftp_parallel_was_aborted(parallel_orch)) {
+			error("TRANSFER INCOMPLETE: transfer aborted with "
+			    "%llu unit(s) unfinished",
+			    (unsigned long long)pstats.units_pending);
+			rc = -1;
+		}
 	}
 
 	/* Drain the failed-paths list and print it.  This is the

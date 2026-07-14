@@ -376,6 +376,16 @@ parallel_watchdog_sync_check(struct sftp_parallel *p)
 	    ? (now_bytes - p->sync_stall_prev_bytes) : 0;
 	p->sync_stall_prev_bytes = now_bytes;
 
+	/* First sample: prev_bytes was 0, so delta spans all bytes ever
+	 * moved - not an interval.  Skip both accruals below via a
+	 * dedicated flag, NOT the window position: window_pos wraps to 0
+	 * every SYNC_STALL_WINDOW ticks, and guarding on it zeroed
+	 * noprogress_consec_ticks at each wrap - capping it at
+	 * SYNC_STALL_WINDOW-1, below every HPNStallAbortTimeout, so the
+	 * fleet abort could never fire. */
+	int first_tick = !p->sync_seen_first_tick;
+	p->sync_seen_first_tick = 1;
+
 	pthread_mutex_lock(&p->pending_mu);
 	uint64_t pending = p->pending;
 	pthread_mutex_unlock(&p->pending_mu);
@@ -383,7 +393,7 @@ parallel_watchdog_sync_check(struct sftp_parallel *p)
 	/* Sync-stall observer (write-cache saturation signal): zero aggregate
 	 * progress WHILE a unit is in flight.  First tick: prev_bytes was 0 so
 	 * delta = all bytes ever, not a stall. */
-	int stalled_now = (p->sync_stall_window_pos > 0 && delta == 0 &&
+	int stalled_now = (!first_tick && delta == 0 &&
 	    total_in_flight > 0);
 	if (stalled_now)
 		p->sync_stall_ticks++;
@@ -393,7 +403,7 @@ parallel_watchdog_sync_check(struct sftp_parallel *p)
 	 * does NOT require a unit in flight, so it still accrues when every worker
 	 * is failing to connect (bad keys, dead backend) and holds no unit - the
 	 * case total_in_flight == 0 would otherwise mask. */
-	if (p->sync_stall_window_pos > 0 && delta == 0 && pending > 0 &&
+	if (!first_tick && delta == 0 && pending > 0 &&
 	    !any_paused)
 		p->noprogress_consec_ticks++;
 	else

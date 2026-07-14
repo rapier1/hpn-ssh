@@ -2307,8 +2307,22 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				    "%zu > %zu", len, req->len);
 			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
 			if (len == 0) {
-				if (seen_zerolen)
-					fatal_f("server sent zero data length");
+				/* Anti-livelock guard (upstream c1cebbc7c):
+				 * tolerate one zero-length DATA reply, rule
+				 * a second a broken server.  Was fatal_f() -
+				 * from a worker thread that kills the whole
+				 * orchestrator (cf. the "Unexpected reply"
+				 * conversion above), so mark the connection
+				 * dead and bail to the safety net; the
+				 * in-flight drain below sets read_error. */
+				if (seen_zerolen) {
+					sftp_conn_die(conn,
+					    "server sent zero data length");
+					free(data);
+					max_req = 0;
+					num_req = 0;
+					break;
+				}
 				seen_zerolen = 1;
 			}
 			lmodified = 1;
@@ -2445,7 +2459,15 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			    strerror(errno));
 	}
 	if (read_error) {
-		error("read remote \"%s\" : %s", remote_path, fx2txt(status));
+		/* status can still be SSH2_FX_OK here when the failure was
+		 * a connection death (cause already logged by
+		 * sftp_conn_die) - fx2txt would print a baffling
+		 * "No error", so omit the status clause. */
+		if (status == SSH2_FX_OK)
+			error("read remote \"%s\" failed", remote_path);
+		else
+			error("read remote \"%s\": %s", remote_path,
+			    fx2txt(status));
 		if (status == SSH2_FX_PERMISSION_DENIED)
 			conn->saw_perm_denied = 1; /* HPN: no-retry */
 		status = -1;
@@ -5307,8 +5329,19 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 				    "%zu > %zu", len, req->len);
 			sftp_hpn_bytes_wired_add(from->hpn, (uint64_t)len);
 			if (len == 0) {
-				if (seen_zerolen)
-					fatal_f("server sent zero data length");
+				/* Same anti-livelock guard and fail-soft
+				 * bail as sftp_download (see the comment
+				 * there); the post-loop drain sets
+				 * read_error and the dest truncates to
+				 * zero as on any crossload read failure. */
+				if (seen_zerolen) {
+					sftp_conn_die(from,
+					    "server sent zero data length");
+					free(data);
+					max_req = 0;
+					num_req = 0;
+					break;
+				}
 				seen_zerolen = 1;
 			}
 
@@ -5421,7 +5454,13 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 		}
 	}
 	if (read_error) {
-		error("read origin \"%s\": %s", from_path, fx2txt(status));
+		/* Same as sftp_download: SSH2_FX_OK here means the origin
+		 * connection died (already logged); no status clause. */
+		if (status == SSH2_FX_OK)
+			error("read origin \"%s\" failed", from_path);
+		else
+			error("read origin \"%s\": %s", from_path,
+			    fx2txt(status));
 		status = -1;
 		sftp_close(from, from_handle, from_handle_len);
 		if (to_handle != NULL)

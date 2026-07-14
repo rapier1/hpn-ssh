@@ -1498,6 +1498,8 @@ struct sftp_parallel {
 	uint32_t sync_stall_ticks;      /* stall slow-ticks in current window */
 	uint32_t sync_stall_window_pos; /* slow-ticks elapsed in current window */
 	uint64_t sync_stall_prev_bytes; /* aggregate bytes at previous slow-tick */
+	int      sync_seen_first_tick;  /* first-sample guard: delta on the very
+					 * first slow-tick spans all bytes ever */
 
 	/* Operator flare episode tracking (reporter_flare).  See FLARE_*. */
 	int      flare_in_episode;       /* currently inside a degraded episode */
