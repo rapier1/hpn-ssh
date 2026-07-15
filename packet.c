@@ -2571,6 +2571,19 @@ ssh_packet_set_zstd_level(struct ssh *ssh, int level)
 	ssh->state->zstd_level = level;
 }
 
+/*
+ * Incoming decompression expansion ratio (plaintext/wire) x1000, or 1000
+ * (1.0x) when zstd decompression is not active.  channel_tcpwinsz uses it
+ * to convert the wire-level rcv_space BDP into a plaintext channel window.
+ */
+u_int
+ssh_packet_get_decomp_ratio_milli(struct ssh *ssh)
+{
+	if (ssh->state->zstd_in == NULL)
+		return 1000;
+	return hpn_zstd_in_ratio_milli(ssh->state->zstd_in);
+}
+
 /* Set the state of the connection to post auth
  * While we are here also decrease the size of
  * packet_max_size to something more reasonable.

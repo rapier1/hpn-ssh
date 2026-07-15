@@ -57,6 +57,8 @@ struct hpn_zstd_out {
 
 struct hpn_zstd_in {
 	ZSTD_DCtx *dctx;
+	unsigned long long comp_in;	/* wire (compressed) bytes seen */
+	unsigned long long raw_out;	/* plaintext (decompressed) bytes */
 };
 
 static int
@@ -199,6 +201,7 @@ hpn_zstd_uncompress(struct hpn_zstd_in *i, struct sshbuf *in,
 		return SSH_ERR_INTERNAL_ERROR;
 	if (sshbuf_len(in) == 0)
 		return 0;
+	i->comp_in += sshbuf_len(in);
 	zin.src = sshbuf_ptr(in);
 	zin.size = sshbuf_len(in);
 	zin.pos = 0;
@@ -211,16 +214,46 @@ hpn_zstd_uncompress(struct hpn_zstd_in *i, struct sshbuf *in,
 			error_f("zstd uncompress: %s", ZSTD_getErrorName(ret));
 			return SSH_ERR_INVALID_FORMAT;
 		}
-		if (zout.pos > 0 &&
-		    (r = sshbuf_put(out, buf, zout.pos)) != 0)
-			return r;
+		if (zout.pos > 0) {
+			i->raw_out += zout.pos;
+			if ((r = sshbuf_put(out, buf, zout.pos)) != 0)
+				return r;
+		}
 		/* Loop while input remains, or while the last call filled
 		 * the whole output buffer (more may be buffered inside). */
 	} while (zin.pos < zin.size || zout.pos == zout.size);
 	return 0;
 }
 
+/*
+ * Decompression expansion ratio (plaintext / wire) as fixed point scaled
+ * by 1000 - so 2:1 returns 2000.  Returns 1000 (1.0x) until >=1 MiB has
+ * been decompressed so window sizing does not act on a noisy early
+ * estimate; clamped to [1.0x, 100x].  Used to convert the receiver's
+ * wire-level rcv_space BDP into a plaintext channel-window BDP.
+ */
+u_int
+hpn_zstd_in_ratio_milli(struct hpn_zstd_in *i)
+{
+	unsigned long long r;
+
+	if (i == NULL || i->comp_in < (1ULL << 20))
+		return 1000;
+	r = i->raw_out * 1000ULL / i->comp_in;
+	if (r < 1000ULL)
+		r = 1000ULL;		/* never size below the wire BDP */
+	if (r > 100000ULL)
+		r = 100000ULL;
+	return (u_int)r;
+}
+
 #else /* !HAVE_LIBZSTD */
+
+u_int
+hpn_zstd_in_ratio_milli(struct hpn_zstd_in *i)
+{
+	return 1000;
+}
 
 int
 hpn_zstd_out_start(struct hpn_zstd_out **outp, int level)

@@ -64,5 +64,6 @@ int	hpn_zstd_compress(struct hpn_zstd_out *o, struct sshbuf *in,
 	    struct sshbuf *out);
 int	hpn_zstd_uncompress(struct hpn_zstd_in *i, struct sshbuf *in,
 	    struct sshbuf *out);
+u_int	hpn_zstd_in_ratio_milli(struct hpn_zstd_in *i);
 
 #endif /* HPN_COMPRESS_H */

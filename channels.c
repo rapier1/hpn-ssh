@@ -1427,8 +1427,14 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 		struct tcpi_portable t;
 
 		if (tcpi_portable_get(sockfd, &t) == 0 && t.rcv_space > 0) {
+			/* HPN: rcv_space is a WIRE (post-compression) BDP
+			 * estimate, but the channel window flow-controls
+			 * PLAINTEXT data.  Scale by the measured decompression
+			 * ratio (x1000; 1000 = no compression) so the window
+			 * reflects the plaintext BDP, not the smaller wire one. */
+			u_int ratio_m = ssh_packet_get_decomp_ratio_milli(ssh);
 			u_int32_t bdp_cap = (u_int32_t)MINIMUM(
-			    (uint64_t)t.rcv_space *
+			    (uint64_t)t.rcv_space * ratio_m / 1000 *
 			    CHANNEL_WINDOW_RCVSPACE_PCT / 100,
 			    (uint64_t)0xffffffffU);
 			if (bdp_cap < CHANNEL_OUTPUT_HWM_FLOOR)
