@@ -1353,7 +1353,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 			continue;
 		}
 		if (!S_ISREG(sb.st_mode)) {
-			debug_f("hpn-bundle: \"%s\" not regular, skip",
+			debug2_f("hpn-bundle: \"%s\" not regular, skip",
 			    entries[i].local_path);
 			continue;
 		}

@@ -930,7 +930,7 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		}
 		(void)close(fd);
 		if (!S_ISREG(sb.st_mode)) {
-			debug_f("hpn-bundle-fetch: \"%s\" not regular, skip",
+			debug2_f("hpn-bundle-fetch: \"%s\" not regular, skip",
 			    paths[i]);
 			continue;
 		}

@@ -9,8 +9,6 @@
  *   - sftp_hpn_conn_init / sftp_hpn_conn_free
  *   - sftp_conn_is_dead      (public API declared in sftp-client.h)
  *   - sftp_set_live_counter  (public API declared in sftp-client.h)
- *   - Fault injection (TEST/DEBUG only): fi_state, fi_pv_state,
- *     fi_state_init, fi_pv_state_init, sftp_hpn_check_fault
  *
  * Copyright (c) 2024-2026 Pittsburgh Supercomputing Center / HPN-SSH project.
  *

@@ -28,7 +28,6 @@
  *   sftp_hpn_conn_init/free calls in sftp_init/sftp_free
  *   conn->hpn->dead  replacements for conn->dead
  *   conn->hpn->live_counter  replacements for conn->live_counter
- *   sftp_hpn_check_fault() call and fd-close in send_msg (TEST/DEBUG)
  */
 
 #ifndef _SFTP_CLIENT_HPN_H

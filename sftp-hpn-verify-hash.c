@@ -108,11 +108,8 @@ sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset, uint64_t length,
 		error_f("posix_memalign failed");
 		goto out;
 	}
-	if (ondisk) {
+	if (ondisk)
 		direct = sftp_hpn_fd_set_ondisk(fd, path);
-		debug_f("on-disk read-back of \"%s\" via %s", path,
-		    direct ? "O_DIRECT" : "buffered");
-	}
 	if ((state = XXH3_createState()) == NULL ||
 	    XXH3_64bits_reset(state) == XXH_ERROR) {
 		error_f("XXH3 state init failed");
