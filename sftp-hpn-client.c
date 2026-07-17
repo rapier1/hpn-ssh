@@ -208,6 +208,32 @@ sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
 	    __ATOMIC_RELAXED);
 }
 
+/* Conn-side wrappers around the watchdog primitives, reaching HPN state
+ * through the opaque struct sftp_conn * via sftp_conn_hpn().  Declared in
+ * sftp-client-internal.h; moved here from sftp-client.c so the upstream file
+ * carries no per-field HPN accessor. */
+uint64_t
+sftp_conn_watchdog_pause_until_ms(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
+	if (hpn == NULL)
+		return 0;
+	return __atomic_load_n(&hpn->watchdog_pause_until_ms, __ATOMIC_RELAXED);
+}
+
+void
+sftp_conn_watchdog_pause(struct sftp_conn *conn, unsigned int seconds)
+{
+	sftp_hpn_watchdog_pause(sftp_conn_hpn(conn), seconds);
+}
+
+void
+sftp_conn_watchdog_resume(struct sftp_conn *conn)
+{
+	sftp_hpn_watchdog_resume(sftp_conn_hpn(conn));
+}
+
 /*
  * sftp_hpn_grace_for_hash() was retired in favour of the heartbeat
  * protocol (see sftp-hpn-server.h: HPN_HEARTBEAT_*).  The watchdog pause
@@ -495,10 +521,6 @@ sftp_hpn_rdahead_window(struct sftp_hpn_conn *hpn, size_t nbytes,
 	return (cur < cap) ? cur + 1 : cur;	/* legacy +1 ramp (disabled) */
 }
 
-
-
-
-
 /* ── BEGIN hpn-file-layout: Lustre auto-stripe (EXPERIMENTAL) ────────────
  *
  * Client side of the hpn-file-layout@hpnssh.org extension.  The caller
@@ -613,3 +635,372 @@ out:
 }
 
 /* ── END hpn-file-layout ──────────────────────────────────────────────── */
+
+/* ==========================================================================
+ * Conn-side bridge wrappers (moved out of sftp-client.c).
+ *
+ * Each takes the opaque struct sftp_conn * and reaches HPN per-connection
+ * state through sftp_conn_hpn().  The bodies are behavior-identical to the
+ * originals: sftp_conn_hpn(conn) is NULL exactly when conn was NULL or
+ * conn->hpn was NULL, so the same guards hold.  Moved here so the upstream
+ * sftp-client.c carries no per-field HPN accessor.  All are declared in
+ * sftp-client-internal.h; call sites are unchanged.
+ * ========================================================================== */
+
+int
+sftp_conn_is_dead(struct sftp_conn *conn)
+{
+	return conn != NULL && sftp_hpn_is_dead(sftp_conn_hpn(conn));
+}
+
+int
+sftp_conn_is_protocol_violation(struct sftp_conn *conn)
+{
+	return conn != NULL &&
+	    sftp_hpn_is_protocol_violation(sftp_conn_hpn(conn));
+}
+
+void
+sftp_conn_die(struct sftp_conn *conn, const char *fmt, ...)
+{
+	char buf[1024];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	sftp_hpn_conn_die(sftp_conn_hpn(conn), "%s", buf);
+}
+
+/* Mark `conn` as dead due to a non-recoverable I/O failure - same effect as
+ * the direct conn->hpn->dead = 1 that in-file code can do. */
+void
+sftp_conn_set_dead(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h != NULL)
+		h->dead = 1;
+}
+
+/* Adaptive read-ahead controller wrappers.  The bundle path works through
+ * the opaque struct sftp_conn * and feeds the controller / reads its cap
+ * through these; all forward to the sftp_hpn_rdahead_* primitives. */
+uint32_t
+sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback)
+{
+	if (conn == NULL)
+		return fallback;
+	return sftp_hpn_rdahead_cap(sftp_conn_hpn(conn), fallback);
+}
+
+void
+sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes)
+{
+	if (conn != NULL)
+		sftp_hpn_rdahead_account(sftp_conn_hpn(conn), nbytes);
+}
+
+void
+sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn)
+{
+	if (conn != NULL)
+		sftp_hpn_rdahead_backpressure_signal(sftp_conn_hpn(conn));
+}
+
+/* Live-byte accounting wrapper.  The per-worker live counter (armed via
+ * sftp_set_live_counter) is what the parallel watchdog's liveness classifiers
+ * read; the bundle codec bumps it through this wrapper - without it a worker
+ * mid-bundle reads as 0 bytes moved and is killed as born-dead/wedged on any
+ * bundle slower than the detection window. */
+void
+sftp_conn_live_account(struct sftp_conn *conn, size_t nbytes)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h != NULL && h->live_counter != NULL)
+		__atomic_fetch_add(h->live_counter, nbytes, __ATOMIC_RELAXED);
+}
+
+uint64_t
+sftp_conn_bytes_wired(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h == NULL)
+		return 0;
+	return __atomic_load_n(&h->bytes_wired_payload, __ATOMIC_RELAXED);
+}
+
+/* Conn-level bridge so the bundle module can count wire payload the per-file
+ * write loops already count via sftp_hpn_bytes_wired_add - without it,
+ * bundle-moved bytes never register as "wired" and the run summary mislabels
+ * them as "skipped via resume". */
+void
+sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h != NULL)
+		sftp_hpn_bytes_wired_add(h, n);
+}
+
+/* Unified hash-work accounting (see sftp-hpn-client.h for the model).
+ * Engines call begin/leg/progress; unit-completion sites call end; the
+ * reporter and watchdog read the stamp-gated live values. */
+void
+sftp_conn_hash_op_begin(struct sftp_conn *conn, uint64_t total_work)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h == NULL)
+		return;
+	__atomic_store_n(&h->hash_work_done, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&h->hash_work_leg_base, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&h->hash_work_total, total_work, __ATOMIC_RELAXED);
+	__atomic_store_n(&h->hash_work_stamp_ms, (uint64_t)monotime_ms(),
+	    __ATOMIC_RELAXED);
+}
+
+/* Entering a leg: subsequent progress reports are offset by `base`
+ * (0 for the first leg, the span for the second). */
+void
+sftp_conn_hash_op_leg(struct sftp_conn *conn, uint64_t base)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h == NULL)
+		return;
+	__atomic_store_n(&h->hash_work_leg_base, base, __ATOMIC_RELAXED);
+	__atomic_store_n(&h->hash_work_stamp_ms, (uint64_t)monotime_ms(),
+	    __ATOMIC_RELAXED);
+}
+
+/* Cumulative progress within the current leg (heartbeat figures, local
+ * read loops).  Publishes done = leg_base + leg_bytes (clamped to the op
+ * total), refreshes the liveness stamp, and lands the value on the serial
+ * meter bridge when one is registered. */
+void
+sftp_conn_hash_op_progress(struct sftp_conn *conn, uint64_t leg_bytes)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+	uint64_t done, total;
+
+	if (h == NULL)
+		return;
+	done = __atomic_load_n(&h->hash_work_leg_base, __ATOMIC_RELAXED) +
+	    leg_bytes;
+	total = __atomic_load_n(&h->hash_work_total, __ATOMIC_RELAXED);
+	if (total > 0 && done > total)
+		done = total;
+	__atomic_store_n(&h->hash_work_done, done, __ATOMIC_RELAXED);
+	__atomic_store_n(&h->hash_work_stamp_ms, (uint64_t)monotime_ms(),
+	    __ATOMIC_RELAXED);
+	if (h->hash_meter_ctr != NULL)
+		*h->hash_meter_ctr = (off_t)(h->hash_meter_base + done);
+}
+
+/* Unit completion: retire the op.  Callers that fold the op's work into a
+ * phase accumulator must capture hash_work_done BEFORE this (the same
+ * clear-before-fold discipline as the old inflight handoff). */
+void
+sftp_conn_hash_op_end(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h == NULL)
+		return;
+	__atomic_store_n(&h->hash_work_done, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&h->hash_work_leg_base, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&h->hash_work_total, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&h->hash_work_stamp_ms, 0, __ATOMIC_RELAXED);
+	if (h->hash_meter_ctr != NULL)
+		*h->hash_meter_ctr = (off_t)h->hash_meter_base;
+}
+
+/* Stamp-gated live pair for the reporter: zeros unless refreshed within
+ * the last 3 seconds (an engine gone on any path self-clears). */
+void
+sftp_conn_hash_work_live(struct sftp_conn *conn, uint64_t *done_out,
+    uint64_t *total_out)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+	uint64_t stamp;
+
+	*done_out = 0;
+	*total_out = 0;
+	if (h == NULL)
+		return;
+	stamp = __atomic_load_n(&h->hash_work_stamp_ms, __ATOMIC_RELAXED);
+	if (stamp == 0 || (uint64_t)monotime_ms() - stamp > 3000)
+		return;
+	*done_out = __atomic_load_n(&h->hash_work_done, __ATOMIC_RELAXED);
+	*total_out = __atomic_load_n(&h->hash_work_total, __ATOMIC_RELAXED);
+}
+
+/* Live total only - the watchdog's "provably hashing" gate. */
+uint64_t
+sftp_conn_hash_op_live_total(struct sftp_conn *conn)
+{
+	uint64_t done, total;
+
+	sftp_conn_hash_work_live(conn, &done, &total);
+	return total;
+}
+
+/* Capture the current op's done figure (for completion folds). */
+uint64_t
+sftp_conn_hash_work_done_get(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h == NULL)
+		return 0;
+	return __atomic_load_n(&h->hash_work_done, __ATOMIC_RELAXED);
+}
+
+/* Serial meter bridge registration; resets the completed-work base. */
+void
+sftp_conn_set_hash_meter_ctr(struct sftp_conn *conn, volatile off_t *ctr)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h == NULL)
+		return;
+	h->hash_meter_ctr = ctr;
+	h->hash_meter_base = 0;
+}
+
+/* Serial multi-op meters (verify phase): fold a completed op's work into
+ * the bridge base so the next op's progress continues from it. */
+void
+sftp_conn_hash_meter_base_add(struct sftp_conn *conn, uint64_t work)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h == NULL)
+		return;
+	h->hash_meter_base += work;
+	if (h->hash_meter_ctr != NULL)
+		*h->hash_meter_ctr = (off_t)h->hash_meter_base;
+}
+
+/* HPN permanent/policy-denied signal accessors, moved from sftp-client.c.
+ * The backing flags now live on struct sftp_hpn_conn (migrated out of the
+ * upstream struct sftp_conn); these reach them through sftp_conn_hpn().
+ * Declared in sftp-client.h; call sites unchanged. */
+int
+sftp_conn_saw_perm_denied(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	return h != NULL && h->saw_perm_denied;
+}
+
+/* Latch the sticky permission-denied flag (called at the internal set-sites
+ * that previously assigned conn->saw_perm_denied = 1 directly). */
+void
+sftp_conn_set_perm_denied(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h != NULL)
+		h->saw_perm_denied = 1;
+}
+
+void
+sftp_conn_clear_perm_denied(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h != NULL)
+		h->saw_perm_denied = 0;
+}
+
+int
+sftp_conn_saw_policy_denied(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	return h != NULL && h->saw_policy_denied;
+}
+
+void
+sftp_conn_clear_policy_denied(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h != NULL)
+		h->saw_policy_denied = 0;
+}
+
+/*
+ * Called right after a PERMISSION_DENIED status code is read, with `msg`
+ * positioned at the status reply's error-message string.  If that message
+ * carries HPN_POLICY_DENIED_TAG the refusal came from the server's -P/-p
+ * request policy (not a filesystem error), so latch saw_policy_denied.
+ * Consumes the message string from `msg`; harmless on a buffer that has none.
+ */
+void
+sftp_conn_check_policy_tag(struct sftp_conn *conn, struct sshbuf *msg)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+	char *errmsg = NULL;
+
+	if (h == NULL || msg == NULL)
+		return;
+	if (sshbuf_get_cstring(msg, &errmsg, NULL) == 0 && errmsg != NULL &&
+	    strstr(errmsg, HPN_POLICY_DENIED_TAG) != NULL)
+		h->saw_policy_denied = 1;
+	free(errmsg);
+}
+
+/* HPN SFTP-extension predicates (server-advertised bits), moved from
+ * sftp-client.c.  They read the upstream conn->exts bitmask through the
+ * sftp_conn_exts() bridge; the SFTP_EXT_HPN_* bits live in sftp-hpn-client.h.
+ * Declared in sftp-client.h; call sites unchanged. */
+int
+sftp_conn_has_hpn_bundle(struct sftp_conn *conn)
+{
+	return (sftp_conn_exts(conn) & SFTP_EXT_HPN_BUNDLE) != 0;
+}
+
+int
+sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn)
+{
+	return (sftp_conn_exts(conn) & SFTP_EXT_HPN_BUNDLE_FETCH) != 0;
+}
+
+int
+sftp_conn_has_hpn_check_file(struct sftp_conn *conn)
+{
+	return (sftp_conn_exts(conn) & SFTP_EXT_HPN_CHECK_FILE) != 0;
+}
+
+int
+sftp_conn_has_hash_range(struct sftp_conn *conn)
+{
+	return (sftp_conn_exts(conn) & SFTP_EXT_HASH_RANGE) != 0;
+}
+
+int
+sftp_conn_has_file_layout(struct sftp_conn *conn)
+{
+	return (sftp_conn_exts(conn) & SFTP_EXT_HPN_FILE_LAYOUT) != 0;
+}
+
+/*
+ * HPN: the operator's per-user parallel-worker cap as advertised by the
+ * server (hpn-max-workers@hpnssh.org).  Returns -1 when the server did not
+ * advertise it (a stock / non-HPN server), 0 when advertised with no cap,
+ * or the positive cap otherwise.  The orchestrator uses this to clamp -j.
+ * Moved from sftp-client.c; declared in sftp-client.h.
+ */
+int
+sftp_hpn_max_workers_cap(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	return h != NULL ? h->hpn_max_workers_cap : -1;
+}

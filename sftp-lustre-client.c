@@ -280,3 +280,46 @@ maybe_apply_lustre_layout_local(struct sftp_parallel *p,
 		break;
 	}
 }
+
+/* ==========================================================================
+ * Conn-side lustre/layout bridge wrappers (moved from sftp-client.c).
+ *
+ * Reach HPN per-connection state through sftp_conn_hpn(); behavior-identical
+ * to the originals.  Declared in sftp-client-internal.h; call sites unchanged.
+ * ========================================================================== */
+
+void
+sftp_conn_set_lustre_stripe_count(struct sftp_conn *conn, int value)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h != NULL)
+		h->lustre_stripe_count = value;
+}
+
+int
+sftp_conn_lustre_stripe_count(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h == NULL)
+		return 0;
+	return h->lustre_stripe_count;
+}
+
+int
+sftp_conn_layout_set_declined(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	return h != NULL && h->layout_set_declined;
+}
+
+void
+sftp_conn_set_layout_set_declined(struct sftp_conn *conn, int v)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h != NULL)
+		h->layout_set_declined = v ? 1 : 0;
+}

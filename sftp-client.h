@@ -113,6 +113,8 @@ int sftp_conn_is_dead(struct sftp_conn *);
  * clear; clear resets it.  Used to make a refused op non-retryable. */
 int sftp_conn_saw_perm_denied(struct sftp_conn *);
 void sftp_conn_clear_perm_denied(struct sftp_conn *);
+/* HPN: latch the sticky permission-denied flag (the internal set-sites). */
+void sftp_conn_set_perm_denied(struct sftp_conn *);
 
 /* HPN: a refused op was a -P/-p request-policy denial (server-tagged), not a
  * filesystem error.  check_policy_tag reads the SSH_FXP_STATUS error-message

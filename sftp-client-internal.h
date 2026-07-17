@@ -9,8 +9,9 @@
  *
  * Upstream merge note: sftp-client.c gains only:
  *   - `static` qualifier removed from send_msg / get_msg / get_handle
- *   - two trivial accessor functions at end of file
- *     (sftp_conn_alloc_msg_id, sftp_conn_has_hpn_bundle_fetch)
+ *   - three bridge accessors (sftp_conn_alloc_msg_id, sftp_conn_hpn,
+ *     sftp_conn_exts); every other per-connection HPN accessor lives in the
+ *     HPN modules and reaches state through sftp_conn_hpn().
  * Nothing in this header is needed by upstream code paths.
  */
 
@@ -21,7 +22,23 @@
 #include <stdarg.h>
 
 struct sftp_conn;
+struct sftp_hpn_conn;
 struct sshbuf;
+
+/*
+ * The single bridge from the opaque upstream struct sftp_conn to the HPN
+ * per-connection state (struct sftp_hpn_conn) hung off it.  HPN files call
+ * this and then operate on struct sftp_hpn_conn directly, so no per-field
+ * accessor needs to be defined inside the upstream sftp-client.c.
+ */
+struct sftp_hpn_conn *sftp_conn_hpn(struct sftp_conn *conn);
+
+/*
+ * Read the server-advertised SFTP extension bitmask (conn->exts) through the
+ * opaque struct sftp_conn, so the HPN has_*() predicates can live outside
+ * sftp-client.c.
+ */
+u_int sftp_conn_exts(struct sftp_conn *conn);
 
 /*
  * Send an SFTP message over the connection.  Returns 0 on success,

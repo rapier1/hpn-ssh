@@ -22,18 +22,33 @@
  * All HPN-specific per-connection state is isolated here so that
  * sftp-client.c carries a minimal diff against upstream.
  *
- * Upstream merge note: sftp-client.c gains only:
- *   #include "sftp-hpn-client.h"
- *   struct sftp_hpn_conn *hpn;   (one field in struct sftp_conn)
- *   sftp_hpn_conn_init/free calls in sftp_init/sftp_free
- *   conn->hpn->dead  replacements for conn->dead
- *   conn->hpn->live_counter  replacements for conn->live_counter
+ * Upstream merge note: struct sftp_conn gains exactly ONE HPN line -
+ *   struct sftp_hpn_conn *hpn;
+ * All HPN per-connection state (dead flag, live counter, verify/hash/rdahead/
+ * watchdog state, last_status, saw_perm/policy_denied, worker cap) lives on
+ * struct sftp_hpn_conn and is reached via conn->hpn->... or the sftp_conn_hpn()
+ * bridge.  sftp-client.c also gains the include, sftp_hpn_conn_init/free calls
+ * in sftp_init/sftp_free, and send_msg/get_msg/get_handle un-static'd.
  */
 
 #ifndef _SFTP_CLIENT_HPN_H
 #define _SFTP_CLIENT_HPN_H
 
 #include <stdint.h>
+
+/*
+ * HPN's SFTP extension bits (server-advertised in SSH2_FXP_VERSION), split out
+ * of the SFTP_EXT_* block in sftp-client.c so struct sftp_conn's upstream
+ * define block carries only stock OpenSSH extensions.  sftp-client.c (the
+ * `exts |=` setters) and sftp-hpn-client.c (the has_*() predicates) both see
+ * these through this header.
+ */
+#define SFTP_EXT_HPN_CHECK_FILE		0x00000400
+#define SFTP_EXT_HPN_FS_INFO		0x00000800
+#define SFTP_EXT_HPN_BUNDLE		0x00001000
+#define SFTP_EXT_HPN_BUNDLE_FETCH	0x00002000
+#define SFTP_EXT_HASH_RANGE		0x00004000
+#define SFTP_EXT_HPN_FILE_LAYOUT	0x00008000
 
 /*
  * Uncomment to enable fault injection (SFTP_FAULT_INJECT / SFTP_FAULT_PROTOCOL
@@ -109,6 +124,30 @@ struct sftp_hpn_conn {
 	 * connection drop.  In parallel mode the orchestrator aborts the
 	 * entire transfer rather than retrying. */
 	int              protocol_violation;
+
+	/* HPN: sticky "server refused with PERMISSION_DENIED" signal, set by
+	 * get_status/get_handle and read by the parallel worker's retry
+	 * deciders to set u->no_retry (a refusal is permanent).  Survives the
+	 * post-failure CLOSE; reset at each unit/batch status-read boundary.
+	 * Migrated here from struct sftp_conn. */
+	int              saw_perm_denied;
+
+	/* HPN: the refusal above was tagged by the server as a -P/-p
+	 * request-policy denial (HPN_POLICY_DENIED_TAG), not a filesystem
+	 * error, letting the bundle path abort the whole transfer.  Reset at
+	 * each bundle attempt.  Migrated here from struct sftp_conn. */
+	int              saw_policy_denied;
+
+	/* HPN: most recent SSH2_FXP_STATUS code seen by get_status/get_handle;
+	 * lets callers classify permanent failures.  Migrated from
+	 * struct sftp_conn. */
+	u_int            last_status;
+
+	/* HPN: operator's per-user parallel-worker cap advertised by the server
+	 * in SSH2_FXP_VERSION (hpn-max-workers@hpnssh.org).  -1 = not advertised
+	 * (stock/non-HPN server); 0 = advertised with no cap; N>0 = the cap.
+	 * Migrated from struct sftp_conn. */
+	int              hpn_max_workers_cap;
 
 	/* Incremental progress hook for the parallel orchestrator.
 	 * Updated atomically per chunk during transfer; NULL in normal
