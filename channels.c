@@ -1433,20 +1433,8 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 			 * ratio (x1000; 1000 = no compression) so the window
 			 * reflects the plaintext BDP, not the smaller wire one. */
 			u_int ratio_m = ssh_packet_get_decomp_ratio_milli(ssh);
-			/* HPN-TEST knob: extra multiplier headroom on the ratio,
-			 * x1000 (1000 = 1.0x = shipped behaviour).  Lets us sweep
-			 * whether a more aggressive window kills the C/z1 stall. */
-			u_int boost = 1000;
-			{
-				const char *be = getenv("HPN_WIN_RATIO_BOOST");
-				if (be != NULL) {
-					int b = atoi(be);
-					if (b >= 1000 && b <= 100000)
-						boost = (u_int)b;
-				}
-			}
 			u_int32_t bdp_cap = (u_int32_t)MINIMUM(
-			    (uint64_t)t.rcv_space * ratio_m / 1000 * boost / 1000 *
+			    (uint64_t)t.rcv_space * ratio_m / 1000 *
 			    CHANNEL_WINDOW_RCVSPACE_PCT / 100,
 			    (uint64_t)0xffffffffU);
 			if (bdp_cap < CHANNEL_OUTPUT_HWM_FLOOR)
