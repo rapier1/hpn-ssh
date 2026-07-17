@@ -144,7 +144,7 @@ transferlog_file(enum transferlog_status st, long long size, const char *path)
 	/* Source side of a relay armed with "log": mirror the status as a
 	 * FILEDONE frame for the consumer's log / GUI file list. */
 	if (tl_frames && path != NULL)
-		progressmeter_frames_filedone((u_int)st, size, path,
+		hpn_pm_filedone((u_int)st, size, path,
 		    strlen(path));
 }
 

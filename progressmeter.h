@@ -24,27 +24,20 @@
  */
 
 #include "hpn-status-frame.h"
+/*
+ * The binary status-frame API (hpn_pm_*) lives in hpn-progressmeter.c; its
+ * declarations are in hpn-progressmeter.h, included here so existing
+ * "progressmeter.h" call sites still see them.
+ */
+#include "hpn-progressmeter.h"
 
 void	start_progress_meter(const char *, off_t, off_t *);
 void	refresh_progress_meter(int);
 void	stop_progress_meter(void);
-
-/* HPN status relay (hpn-status-relay-design.md): binary frame emission
- * in place of the ANSI meter when stdout is a pipe and the peer asked. */
-void	progressmeter_frame_mode(u_int);
-int	progressmeter_frames_active(void);
-void	progressmeter_frames_set_workers(u_int, u_int);
-void	progressmeter_frames_set_files(u_int, u_int);
-void	progressmeter_frames_meter_not_a_file(void);
-void	progressmeter_frames_count_file(void);
-void	progressmeter_frames_set_phase(u_int, int);
-void	progressmeter_frames_filefail(u_int, const char *, size_t);
-void	progressmeter_frames_filedone(u_int, long long, const char *, size_t);
-void	progressmeter_frames_end(int, u_int);
-void	progress_meter_set_total(off_t);
+void	pm_set_total(off_t);
 
 /* HPN status relay, consumer side: meter rendered from remote telemetry
  * only (no local rate/ETA derivation - frame arrival timing aliases). */
-void	progress_meter_relay_start(const char *);
-void	progress_meter_relay_sample(const struct hpns_progress *);
-void	progress_meter_relay_end(u_int64_t);
+void	pm_relay_start(const char *);
+void	pm_relay_sample(const struct hpns_progress *);
+void	pm_relay_end(u_int64_t);

@@ -1422,8 +1422,8 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 	}
 	if (showprogress && total > 0) {
 		start_progress_meter("verify", total, &counter);
-		progressmeter_frames_meter_not_a_file();	/* not a file */
-		progressmeter_frames_set_phase(HPNS_F_VERIFY, 1); /* verify phase */
+		hpn_pm_meter_not_a_file();	/* not a file */
+		hpn_pm_set_phase(HPNS_F_VERIFY, 1); /* verify phase */
 		/* Bridge the hash engines' per-op progress into the meter
 		 * counter so a single big file moves smoothly instead of
 		 * jumping 0->100 at completion. */

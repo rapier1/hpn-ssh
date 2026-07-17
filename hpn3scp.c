@@ -211,7 +211,7 @@ ssh_base_args(struct launch_session *s, arglist *a, int with_n, int with_agent)
 /*
  * Decoded frames -> output.  Protocol mode relays them as EVENT lines;
  * human mode (stdout is a terminal) drives a local progress meter rendered
- * entirely from the frames (progress_meter_relay_*), exactly as hpnscp's
+ * entirely from the frames (pm_relay_*), exactly as hpnscp's
  * -R consumer does - no rate/ETA is re-derived from frame arrival times.
  */
 static struct {
@@ -247,10 +247,10 @@ ev_progress(const struct hpns_progress *p, void *ctx)
 	(void)ctx;
 	if (proto_human()) {
 		if (!meter.on) {
-			progress_meter_relay_start(meter.label);
+			pm_relay_start(meter.label);
 			meter.on = 1;
 		}
-		progress_meter_relay_sample(p);
+		pm_relay_sample(p);
 		return;
 	}
 	proto_emit_progress(p);
@@ -267,7 +267,7 @@ ev_end(const struct hpns_end *e, void *ctx)
 	endinfo.got = 1;
 	if (proto_human()) {
 		if (meter.on)
-			progress_meter_relay_end(e->bytes_done);
+			pm_relay_end(e->bytes_done);
 		return;
 	}
 	/* synthesize the final 100% snapshot; phases are over by END and

@@ -1820,8 +1820,8 @@ resume_check_meter_begin(struct sftp_conn *conn, off_t total)
 	resume_meter_ctr = 0;
 	start_progress_meter("resume check", total,
 	    (off_t *)&resume_meter_ctr);
-	progressmeter_frames_meter_not_a_file();	/* not a file */
-	progressmeter_frames_set_phase(HPNS_F_RESUME, 1);	/* phase flag */
+	hpn_pm_meter_not_a_file();	/* not a file */
+	hpn_pm_set_phase(HPNS_F_RESUME, 1);	/* phase flag */
 	sftp_conn_set_hash_meter_ctr(conn, &resume_meter_ctr);
 	resume_meter_on = 1;
 }
@@ -2089,7 +2089,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		if (local_fd != -1)
 			close(local_fd);
 		if (skip_ret >= 0)	/* resolved, no transfer meter ran */
-			progressmeter_frames_count_file();
+			hpn_pm_count_file();
 		return skip_ret;
  resume_done:
 		resume_check_meter_end(conn);
@@ -2507,14 +2507,14 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			} else if (dr == 1) {
 				/* frame mode: stdout carries binary frames,
 				 * text on it corrupts the relay stream */
-				fmprintf(progressmeter_frames_active() ?
+				fmprintf(hpn_pm_active() ?
 				    stderr : stdout,
 				    "File skipped: %s: Identical.\n",
 				    new_src);
 				transferlog_file(TRANSFERLOG_SKIPPED,
 				    (long long)a->size, new_dst);
 			} else if (dr == 2) {
-				fmprintf(progressmeter_frames_active() ?
+				fmprintf(hpn_pm_active() ?
 				    stderr : stdout,
 				    "File skipped: %s: Target is larger"
 				    " than source.\n", new_src);
@@ -2880,7 +2880,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				if (chunked >= 0) {
 					resume_check_meter_end(conn);
 					close(local_fd);
-					progressmeter_frames_count_file();
+					hpn_pm_count_file();
 					return chunked; /* 1=skip, 0=success */
 				}
 
@@ -2930,7 +2930,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 					    local_path);
 					resume_check_meter_end(conn);
 					close(local_fd);
-					progressmeter_frames_count_file();
+					hpn_pm_count_file();
 					return 1; /* identical */
 				}
 				debug("verified transfer: same size but hash "
@@ -2941,7 +2941,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			} else if ((off_t)c.size > sb.st_size) {
 				resume_check_meter_end(conn);
 				close(local_fd);
-				progressmeter_frames_count_file();
+				hpn_pm_count_file();
 				return 2; /* target larger than source */
 			} else {
 				/*
@@ -2965,7 +2965,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				if (chunked >= 0) {
 					resume_check_meter_end(conn);
 					close(local_fd);
-					progressmeter_frames_count_file();
+					hpn_pm_count_file();
 					return chunked; /* 1=skip, 0=success */
 				}
 				/*
@@ -3034,12 +3034,12 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 			}
 			if ((off_t)c.size == sb.st_size) {
 				close(local_fd);
-				progressmeter_frames_count_file();
+				hpn_pm_count_file();
 				return 1; /* identical */
 			}
 			if ((off_t)c.size > sb.st_size) {
 				close(local_fd);
-				progressmeter_frames_count_file();
+				hpn_pm_count_file();
 				return 2; /* target larger than source */
 			}
 		}
@@ -3214,14 +3214,14 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 				transferlog_file(TRANSFERLOG_FAILED,
 				    (long long)sb.st_size, new_dst);
 			} else if (ur == 1) {
-				fmprintf(progressmeter_frames_active() ?
+				fmprintf(hpn_pm_active() ?
 				    stderr : stdout,	/* keep frames clean */
 				    "File skipped: %s: Identical.\n",
 				    new_src);
 				transferlog_file(TRANSFERLOG_SKIPPED,
 				    (long long)sb.st_size, new_dst);
 			} else if (ur == 2) {
-				fmprintf(progressmeter_frames_active() ?
+				fmprintf(hpn_pm_active() ?
 				    stderr : stdout,
 				    "File skipped: %s: Target is larger"
 				    " than source.\n", new_src);

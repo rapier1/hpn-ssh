@@ -323,7 +323,7 @@ do_local_cmd(arglist *a)
 /*
  * HPN status relay, consumer side (hpn-status-relay-design.md).  scp drives
  * a local ANSI progress meter rendered entirely from the frames the shared
- * runner decodes (progress_meter_relay_*): every displayed value comes from
+ * runner decodes (pm_relay_*): every displayed value comes from
  * the source's own measurements, never re-derived from frame arrival times.
  * The meter starts on the first PROGRESS (only if showprogress).
  */
@@ -344,11 +344,11 @@ scp_meter_progress(const struct hpns_progress *p, void *ctx)
 	struct scp_meter *m = ctx;
 
 	if (!m->meter_on && showprogress) {
-		progress_meter_relay_start(m->label);
+		pm_relay_start(m->label);
 		m->meter_on = 1;
 	}
 	if (m->meter_on)
-		progress_meter_relay_sample(p);
+		pm_relay_sample(p);
 }
 
 static void
@@ -357,7 +357,7 @@ scp_meter_end(const struct hpns_end *e, void *ctx)
 	struct scp_meter *m = ctx;
 
 	if (m->meter_on)
-		progress_meter_relay_end(e->bytes_done);
+		pm_relay_end(e->bytes_done);
 }
 
 static void
@@ -987,7 +987,7 @@ main(int argc, char **argv)
 		const char *rprog = getenv("HPN_ENABLE_REMOTE_PROGRESS");
 
 		if (rprog != NULL) {
-			progressmeter_frame_mode((u_int)parallel_num_streams);
+			hpn_pm_frame_mode((u_int)parallel_num_streams);
 			/* "log" value: the consumer also wants per-file
 			 * FILEDONE frames for its transfer log / GUI. */
 			if (strcmp(rprog, "log") == 0)
@@ -1074,7 +1074,7 @@ main(int argc, char **argv)
 	}
 	/* HPN status relay: final END frame (advisory; no-op unless armed).
 	 * The consumer takes the authoritative result from our exit status. */
-	progressmeter_frames_end(errs == 0 && !hpn_verify_failed,
+	hpn_pm_end(errs == 0 && !hpn_verify_failed,
 	    (u_int)(errs > 0 ? errs : 0));
 	transferlog_close();
 
@@ -1575,7 +1575,7 @@ scp_parallel_finish(struct sftp_conn *conn)
 		/* Authoritative final file count for the END frame: the async
 		 * reporter's last tick can lag a fast transfer, so publish the
 		 * walker's tally directly before the meter (and END) are read. */
-		progressmeter_frames_set_files(
+		hpn_pm_set_files(
 		    sftp_parallel_files_submitted(parallel_orch),
 		    sftp_parallel_files_total(parallel_orch));
 		sftp_parallel_progress_stop(parallel_orch);
@@ -1590,7 +1590,7 @@ scp_parallel_finish(struct sftp_conn *conn)
 			for (i = 0; i < used; i++) {
 				fmprintf(stderr,
 				    "scp: transfer incomplete: %s\n", paths[i]);
-				progressmeter_frames_filefail(HPNS_FF_TRANSFER,
+				hpn_pm_filefail(HPNS_FF_TRANSFER,
 				    paths[i], strlen(paths[i]));
 				free(paths[i]);
 			}
@@ -1604,7 +1604,7 @@ scp_parallel_finish(struct sftp_conn *conn)
 			for (i = 0; i < used; i++) {
 				fmprintf(stderr,
 				    "HPNVerifyTransfer: FAILED: %s\n", paths[i]);
-				progressmeter_frames_filefail(HPNS_FF_VERIFY,
+				hpn_pm_filefail(HPNS_FF_VERIFY,
 				    paths[i], strlen(paths[i]));
 				free(paths[i]);
 			}
@@ -1619,7 +1619,7 @@ scp_parallel_finish(struct sftp_conn *conn)
 			for (i = 0; i < used; i++) {
 				fmprintf(stderr,
 				    "HPNVerifyTransfer: FAILED: %s\n", paths[i]);
-				progressmeter_frames_filefail(HPNS_FF_VERIFY,
+				hpn_pm_filefail(HPNS_FF_VERIFY,
 				    paths[i], strlen(paths[i]));
 				free(paths[i]);
 			}
@@ -2186,13 +2186,13 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 		} else if (ur == 1) {
 			/* frame mode: stdout carries binary frames, text on it
 			 * corrupts the relay stream - divert to stderr */
-			fmprintf(progressmeter_frames_active() ?
+			fmprintf(hpn_pm_active() ?
 			    stderr : stdout,
 			    "File skipped: %s: Identical.\n", src);
 			transferlog_file(TRANSFERLOG_SKIPPED,
 			    (long long)st.st_size, abs_dst);
 		} else if (ur == 2) {
-			fmprintf(progressmeter_frames_active() ?
+			fmprintf(hpn_pm_active() ?
 			    stderr : stdout,
 			    "File skipped: %s: Target is larger than source.\n",
 			    src);
@@ -2518,12 +2518,12 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 			if (dr == -1)
 				err = -1;
 			else if (dr == 1)
-				fmprintf(progressmeter_frames_active() ?
+				fmprintf(hpn_pm_active() ?
 				    stderr : stdout,	/* keep frames clean */
 				    "File skipped: %s: Identical.\n",
 				    g.gl_pathv[i]);
 			else if (dr == 2)
-				fmprintf(progressmeter_frames_active() ?
+				fmprintf(hpn_pm_active() ?
 				    stderr : stdout,
 				    "File skipped: %s: Target is larger"
 				    " than source.\n", g.gl_pathv[i]);

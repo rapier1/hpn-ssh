@@ -546,7 +546,7 @@ sftp_parallel_wait(struct sftp_parallel *p)
 			/* Suppress in frame mode: stdout is the binary status
 			 * channel there, so this text would corrupt frames. */
 			if (p->cfg.print_flag != SFTP_QUIET &&
-			    !progressmeter_frames_active())
+			    !hpn_pm_active())
 				mprintf("Verifying %d file(s)...\n", vn);
 			if (p->saved_showprogress && vtotal > 0) {
 				p->verify_total_units = (uint64_t)vn;
@@ -563,7 +563,7 @@ sftp_parallel_wait(struct sftp_parallel *p)
 				start_progress_meter(p->progress_label,
 				    2 * vtotal,
 				    &p->aggregate_progress_counter);
-				progressmeter_frames_set_phase(HPNS_F_VERIFY, 1);
+				hpn_pm_set_phase(HPNS_F_VERIFY, 1);
 				/* verify_phase_active BEFORE meter_started: a
 				 * reporter tick between the two would take the
 				 * transfer branch against the verify meter's

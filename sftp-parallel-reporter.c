@@ -792,9 +792,9 @@ resume_stretch_restore(struct sftp_parallel *p)
 	p->resume_stretch_on = 0;
 	strlcpy(p->progress_label, p->progress_label_saved,
 	    sizeof(p->progress_label));
-	progress_meter_set_total(p->progress_total_bytes);
+	pm_set_total(p->progress_total_bytes);
 	p->aggregate_progress_counter = 0;
-	progressmeter_frames_set_phase(HPNS_F_RESUME, 0);
+	hpn_pm_set_phase(HPNS_F_RESUME, 0);
 }
 
 void *
@@ -934,10 +934,10 @@ parallel_reporter_thread(void *arg)
 					    "resume check",
 					    sizeof(p->progress_label));
 					p->aggregate_progress_counter = 0;
-					progressmeter_frames_set_phase(
+					hpn_pm_set_phase(
 					    HPNS_F_RESUME, 1);
 				}
-				progress_meter_set_total((off_t)rtotal);
+				pm_set_total((off_t)rtotal);
 				if (rdone > rtotal)
 					rdone = rtotal;
 				newpos = (off_t)rdone;
@@ -990,9 +990,9 @@ parallel_reporter_thread(void *arg)
 					fr_active++;
 			}
 			pthread_mutex_unlock(&p->workers_mu);
-			progressmeter_frames_set_workers(fr_active,
+			hpn_pm_set_workers(fr_active,
 			    fr_stalled);
-			progressmeter_frames_set_files(
+			hpn_pm_set_files(
 			    (u_int)__atomic_load_n(&p->files_submitted,
 			        __ATOMIC_RELAXED),
 			    (u_int)__atomic_load_n(&p->files_total,
