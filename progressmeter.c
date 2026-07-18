@@ -63,6 +63,9 @@ static void setscreensize(void);
 /* signal handler for updating the progress meter */
 static void sig_alarm(int);
 
+/* render one meter line from a filled per-meter view (Stage 2) */
+static void render_from_view(const struct meter_view *);
+
 static double start;		/* start progress */
 static double last_update;	/* last progress update */
 static const char *file;	/* name of the file being transferred */
@@ -254,37 +257,10 @@ relay_render(void)
 	char vlabel[512];
 	const char *label = file;
 	double now = monotime_double();
-	enum meter_tail tail;
-	long tsec = 0;
-	off_t inst;
-	int percent;
+	struct meter_view v;
+	int silent = now - relay.last_frame >= STALL_TIME;
 
-	if (relay.done || (relay.bytes_total > 0 &&
-	    relay.bytes_done >= relay.bytes_total))
-		percent = 100;
-	else if (relay.bytes_total > 0)
-		percent = (int)(relay.bytes_done * 100 / relay.bytes_total);
-	else
-		percent = 0;
-
-	if (relay.done) {
-		tail = METER_TAIL_DONE;
-		tsec = (long)(now - relay.started);
-		/* peak, like local - the TRANSFER peak when a verify phase
-		 * followed (its hash peak is not a network rate) */
-		inst = (off_t)(relay.rate_inst_peak_xfer > 0 ?
-		    relay.rate_inst_peak_xfer : relay.rate_inst_max);
-	} else if (now - relay.last_frame >= STALL_TIME) {
-		tail = METER_TAIL_STALLED;
-		inst = 0;
-	} else if (relay.rate == 0 || relay.eta_sec == HPNS_ETA_UNKNOWN) {
-		tail = METER_TAIL_UNKNOWN;
-		inst = (off_t)relay.rate_inst;
-	} else {
-		tail = METER_TAIL_ETA;
-		tsec = (long)relay.eta_sec;
-		inst = (off_t)relay.rate_inst;
-	}
+	memset(&v, 0, sizeof(v));
 
 	/* PREFIX the phase tag: the label field truncates at the right edge
 	 * (win_size - 45), so a suffix vanishes on narrow terminals.  The
@@ -297,9 +273,77 @@ relay_render(void)
 		snprintf(vlabel, sizeof(vlabel), "verify: %s", label);
 		label = vlabel;
 	}
-	render_meter_line(label, percent, (off_t)relay.bytes_done,
-	    tail == METER_TAIL_STALLED ? 0 : (long long)relay.rate,
-	    inst, tail, tsec);
+
+	v.label = label;
+	v.cur = (off_t)relay.bytes_done;
+	v.total = (off_t)relay.bytes_total;
+	v.eta_sec = relay.eta_sec;
+	v.done = relay.done;
+	v.stalled = !relay.done && silent;
+	v.elapsed_sec = (long)(now - relay.started);
+	/* Relay policy: an unknown (0) total reads 0% - do not claim 100%
+	 * before the source has reported a size. */
+	if (relay.done || (relay.bytes_total > 0 &&
+	    relay.bytes_done >= relay.bytes_total))
+		v.percent = 100;
+	else if (relay.bytes_total > 0)
+		v.percent = (int)(relay.bytes_done * 100 / relay.bytes_total);
+	else
+		v.percent = 0;
+
+	/*
+	 * Source-specific display choices live in the fill, not the shared
+	 * renderer.  A silent source: blank the rate/inst - its last value is
+	 * stale (a dead source must not keep showing a healthy rate).  On
+	 * completion: show the TRANSFER-phase peak inst (a verify-phase hash
+	 * peak is not a network rate).  The relay never derives rate/eta
+	 * locally; both ride in the frame (see the relay struct comment).
+	 */
+	if (relay.done)
+		v.inst = (off_t)(relay.rate_inst_peak_xfer > 0 ?
+		    relay.rate_inst_peak_xfer : relay.rate_inst_max);
+	else if (silent)
+		v.inst = 0;
+	else
+		v.inst = (off_t)relay.rate_inst;
+	v.rate = (silent && !relay.done) ? 0 : (long long)relay.rate;
+
+	render_from_view(&v);
+}
+
+/*
+ * Paint one meter line from a filled view: the shared render derivation -
+ * percent, then the stall/unknown/ETA/done tail, then render_meter_line.
+ * The local meter feeds this; the relay consumer will too (Stage 2).  The
+ * decision order matches the historic inline paint exactly.
+ */
+static void
+render_from_view(const struct meter_view *v)
+{
+	enum meter_tail tail;
+	long tsec = 0;
+
+	/*
+	 * Tail selector shared by the local meter and the relay consumer.
+	 * It is a pure selector: each filler has already baked in its
+	 * source-specific choices (the relay blanks rate/inst when its
+	 * source goes silent; both supply their own peak inst, eta_sec, and
+	 * done flag), so no per-source logic lives here.
+	 */
+	if (v->stalled)
+		tail = METER_TAIL_STALLED;
+	else if (v->done) {
+		tail = METER_TAIL_DONE;
+		tsec = v->elapsed_sec;
+	} else if (v->rate == 0 || v->eta_sec == HPNS_ETA_UNKNOWN)
+		tail = METER_TAIL_UNKNOWN;
+	else {
+		tail = METER_TAIL_ETA;
+		tsec = (long)v->eta_sec;
+	}
+
+	render_meter_line(v->label, v->percent, v->cur, v->rate, v->inst,
+	    tail, tsec);
 }
 
 void
@@ -307,12 +351,10 @@ refresh_progress_meter(int force_update)
 {
 	off_t transferred;
 	double elapsed, now;
-	int percent;
 	off_t bytes_left;
 	long long cur_speed;
-	long tail_seconds;
-	enum meter_tail tail;
 	off_t delta_pos;
+	struct meter_view v;
 
 	if (file == NULL || (!force_update && !alarm_fired && !win_resized) ||
 	    (!hpn_pm_active() && !can_output()))
@@ -379,54 +421,45 @@ refresh_progress_meter(int force_update)
 
 	last_update = now;
 
-	/* HPN status relay: frame mode replaces the ANSI paint entirely -
-	 * emit a binary PROGRESS frame from the freshly computed state and
-	 * skip all terminal work below.  The instantaneous rate rides in
-	 * the frame because a consumer cannot derive it from arrival times
-	 * (see relay_render). */
-	if (hpn_pm_active()) {
-		long long rate_inst;
-
-		if (bytes_left > 0 && elapsed >= 0.001)
-			rate_inst = (long long)(delta_pos / elapsed);
-		else
-			rate_inst = 0;
-		hpn_pm_emit(cur_pos, end_pos, bytes_per_second,
-		    rate_inst, force_update);
-		last_pos = cur_pos;
-		return;
-	}
-
-	/* percent of transfer done.  Clamp at 100: the resume-check stretch
-	 * can shrink the total (a hash-op marker going stale) under a
-	 * ratcheted counter, and >100% must never render. */
-	if (end_pos == 0 || cur_pos >= end_pos)
-		percent = 100;
-	else
-		percent = ((float)cur_pos / end_pos) * 100;
-
-	/* ETA tail: same decision order as the historic inline paint */
+	/* Stall accounting is stateful (mutates `stalled`) so it stays in the
+	 * sample step; render_from_view only reads whether we crossed the
+	 * threshold.  (Frame mode ignores it, but it is cheap and per-meter.) */
 	if (!transferred)
 		stalled += elapsed;
 	else
 		stalled = 0;
 
-	if (stalled >= STALL_TIME) {
-		tail = METER_TAIL_STALLED;
-		tail_seconds = 0;
-	} else if (bytes_per_second == 0 && bytes_left) {
-		tail = METER_TAIL_UNKNOWN;
-		tail_seconds = 0;
-	} else if (bytes_left > 0) {
-		tail = METER_TAIL_ETA;
-		tail_seconds = (long)(bytes_left / bytes_per_second);
-	} else {
-		tail = METER_TAIL_DONE;
-		tail_seconds = (long)elapsed;
-	}
+	/*
+	 * Fill the per-meter view once, then dispatch to the active sink: the
+	 * TTY renderer, or the frame emitter.  The frame sink overlays the
+	 * cross-file aggregate and derives its own per-second rate from the
+	 * raw delta/elapsed carried here; the display fields it ignores.
+	 */
+	v.label = file;
+	v.cur = cur_pos;
+	v.total = end_pos;
+	/* Local policy: an unknown (0) total renders 100%, as the historic
+	 * inline paint did (the parallel aggregate meter runs this way). */
+	if (end_pos == 0 || cur_pos >= end_pos)
+		v.percent = 100;
+	else
+		v.percent = (int)((float)cur_pos / end_pos * 100);
+	v.rate = bytes_per_second;
+	v.inst = bytes_left > 0 ? delta_pos : max_delta_pos;
+	v.delta = delta_pos;
+	v.elapsed = elapsed;
+	v.eta_sec = (bytes_left > 0 && bytes_per_second > 0) ?
+	    (uint32_t)(bytes_left / bytes_per_second) : HPNS_ETA_UNKNOWN;
+	v.stalled = stalled >= STALL_TIME;
+	v.done = bytes_left == 0;	/* over-completion (cur>total, rate
+					 * forced to 0) falls to UNKNOWN, as the
+					 * historic inline paint did */
+	v.elapsed_sec = (long)elapsed;
 
-	render_meter_line(file, percent, cur_pos, bytes_per_second,
-	    bytes_left > 0 ? delta_pos : max_delta_pos, tail, tail_seconds);
+	if (hpn_pm_active())
+		hpn_pm_emit_view(&v, force_update);
+	else
+		render_from_view(&v);
 	last_pos = cur_pos;
 }
 

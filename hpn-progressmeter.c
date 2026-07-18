@@ -153,18 +153,21 @@ emit_progress(off_t cur_pos, off_t end_pos, long long bytes_per_second,
 }
 
 /*
- * Emit a PROGRESS frame from the current meter state.  Called from
- * refresh_progress_meter() after the shared rate/EMA math, which passes
- * the freshly computed position, smoothed rate, and instantaneous rate.
- * The instantaneous rate is retained so a later meter-boundary emit
- * (hpn_pm_meter_done) reuses it.
+ * Emit a PROGRESS frame from a filled meter_view (frame mode).  Called from
+ * refresh_progress_meter() after the shared rate/EMA math.  Derives the
+ * instantaneous rate from the view's raw delta/elapsed - a true per-second
+ * rate, distinct from the display inst - and retains it so a later
+ * meter-boundary emit (hpn_pm_meter_done) reuses it.  emit_progress overlays
+ * the cross-file aggregate + phase flags and computes the ETA.
  */
 void
-hpn_pm_emit(off_t cur_pos, off_t end_pos, long long bytes_per_second,
-    long long rate_inst, int force)
+hpn_pm_emit_view(const struct meter_view *v, int force)
 {
-	frames_rate_inst = rate_inst;
-	emit_progress(cur_pos, end_pos, bytes_per_second, force);
+	off_t bytes_left = v->total - v->cur;
+
+	frames_rate_inst = (bytes_left > 0 && v->elapsed >= 0.001) ?
+	    (long long)(v->delta / v->elapsed) : 0;
+	emit_progress(v->cur, v->total, v->rate, force);
 }
 
 /*

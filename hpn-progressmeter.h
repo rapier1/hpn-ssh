@@ -50,20 +50,51 @@ void	hpn_pm_filedone(u_int, long long, const char *, size_t);
 void	hpn_pm_end(int, u_int);
 
 /*
- * Meter -> frame seams (called only from progressmeter.c).  Everything the
- * frame emitter needs from the live meter arrives here by value:
- *   hpn_pm_emit             - build and emit one PROGRESS frame from
- *                                   the meter's current position and rate
- *                                   (rate limited unless forced).
- *   hpn_pm_meter_start - a new per-file meter is starting: mark
- *                                   it a file and clear the phase flags.
- *   hpn_pm_meter_done  - a meter finished: emit a boundary frame
- *                                   and fold its bytes/file into the running
- *                                   totals.
- * Args carry cur_pos, end_pos (off_t) and bytes_per_second + rate_inst
- * (long long) - the meter statics the emitter used to read directly.
+ * Per-meter render currency (Stage 2).  One meter's freshly computed
+ * numbers, filled by whichever producer is live - the local rate math or
+ * the relay's frame ingest - and consumed by the sinks: the TTY renderer
+ * paints a line from it, and the frame sink projects it to the wire
+ * (overlaying the cross-file aggregate + dropping the label).  PER-METER,
+ * never aggregated: the frame sink adds the running total itself, so this
+ * struct stays free of frame-domain state and the wire's "no label"
+ * invariant is preserved at the projection.
  */
-void	hpn_pm_emit(off_t, off_t, long long, long long, int);
+struct meter_view {
+	const char	*label;		/* TTY paints it; the wire drops it */
+	off_t		 cur;		/* this meter's position */
+	off_t		 total;		/* this meter's target (0 = unknown) */
+	long long	 rate;		/* smoothed bytes/sec */
+	long long	 inst;		/* instantaneous; each filler picks its
+					 * own peak scheme and writes it here */
+	off_t		 delta;		/* raw bytes since last sample - the
+					 * frame sink derives its per-second
+					 * rate_inst = delta/elapsed, distinct
+					 * from the display inst above */
+	double		 elapsed;	/* raw seconds since last sample */
+	uint32_t	 eta_sec;	/* HPNS_ETA_UNKNOWN if not derivable */
+	int		 stalled;	/* no progress for STALL_TIME */
+	int		 done;		/* transfer complete */
+	int		 percent;	/* 0..100, filler-computed: an unknown
+					 * (0) total reads 100% for a local
+					 * meter but 0% on the relay, so the
+					 * policy lives in the fill, not the
+					 * shared renderer */
+	long		 elapsed_sec;	/* wall-clock, for the DONE line */
+};
+
+/*
+ * Meter -> frame seams (called only from progressmeter.c):
+ *   hpn_pm_emit_view   - build and emit one PROGRESS frame from a filled
+ *                        meter_view (rate limited unless forced).  Reads the
+ *                        view's cur/total/rate + raw delta/elapsed (for the
+ *                        per-second instantaneous rate) and overlays the
+ *                        cross-file aggregate + phase flags itself.
+ *   hpn_pm_meter_start - a new per-file meter is starting: mark it a file
+ *                        and clear the phase flags.
+ *   hpn_pm_meter_done  - a meter finished: emit a boundary frame and fold
+ *                        its bytes/file into the running totals.
+ */
+void	hpn_pm_emit_view(const struct meter_view *, int);
 void	hpn_pm_meter_start(void);
 void	hpn_pm_meter_done(off_t, off_t, long long);
 
