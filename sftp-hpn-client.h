@@ -109,6 +109,8 @@ struct sftp_verify_pending_entry {
 	int   local_is_target;		/* 0 = upload, 1 = download */
 };
 
+struct bwlimit;		/* misc.h; kept opaque here */
+
 /*
  * HPN per-connection state.  Embedded in struct sftp_conn as a single
  * pointer so the upstream struct definition gains exactly one line.
@@ -290,6 +292,32 @@ struct sftp_hpn_conn {
 	uint64_t  verify_src_hash;
 	int       verify_src_valid;
 	int       verify_src_failed;
+
+	/* Adaptive upload pacing: ack-rate-driven issue ceiling.  WRITE
+	 * status returns arrive at the receiver's true sustained drain rate
+	 * (~1 RTT delayed); pacing sends to slightly above that rate keeps
+	 * the destination's page cache out of the dirty-limit cliff that
+	 * otherwise collapses single-stream high-RTT uploads into a
+	 * stall/recover duty cycle.  See sftp_hpn_pace_ack() for the
+	 * control law; state is per-connection (per-worker in parallel
+	 * mode).  bw is the reused -l token bucket (struct bwlimit),
+	 * allocated on first activation. */
+	struct {
+		int      enabled;      /* -X Pacing=no clears (default on) */
+		int      active;       /* grace passed; limiter engaged */
+		uint64_t acks;         /* WRITE acks seen (startup grace) */
+		uint64_t first_ack_ms; /* monotime_ms of first ack */
+		uint64_t bucket_bytes; /* acked bytes in current bucket */
+		uint64_t bucket_start_ms; /* monotime_ms the bucket opened */
+		/* Sliding window of per-second delivered rates (bytes/sec);
+		 * the ceiling is HEADROOM x the MEAN of these, so stall
+		 * seconds pull the estimate toward the sink's sustained
+		 * rate.  Samples during slow-start are excised. */
+		uint64_t rate_ring[10];
+		u_int    ring_idx;
+		uint64_t bw_rate_bits; /* programmed actuator rate, bits/s */
+		struct bwlimit *bw;    /* actuator; NULL until activated */
+	} pace;
 };
 
 /*
@@ -330,6 +358,18 @@ struct sftp_hpn_conn *sftp_hpn_conn_init(void);
 
 /* Free an sftp_hpn_conn.  Safe to call with NULL. */
 void sftp_hpn_conn_free(struct sftp_hpn_conn *);
+
+/* Adaptive upload pacing (see the pace member above).  set_enabled is the
+ * -X Pacing= switch, consulted at conn init; ack feeds one WRITE status of
+ * len payload bytes to the estimator; bwlimit returns the token bucket the
+ * outbound path should apply - the TIGHTER of the adaptive ceiling and the
+ * user's explicit -l (min composition) - or NULL for no limit. */
+void sftp_hpn_pace_set_enabled(int on);
+void sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len,
+    u_int num_requests);
+void sftp_hpn_pace_file_start(struct sftp_hpn_conn *hpn, size_t buflen);
+struct bwlimit *sftp_hpn_pace_bwlimit(struct sftp_hpn_conn *hpn,
+    struct bwlimit *user_bw, uint64_t user_rate);
 
 /*
  * Internal helpers called by the thin public-API wrappers in sftp-client.c.

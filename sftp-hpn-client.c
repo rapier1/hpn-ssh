@@ -55,10 +55,23 @@
 #include "sftp-hpn-client.h"
 #include "sftp-hpn-bundle.h"	/* HPN_EXT_HASH_RANGE etc. wire names */
 
+/* Adaptive upload pacing master switch (-X Pacing=), applied to each new
+ * connection at init.  Read-only after option parsing, so parallel workers
+ * may consult it without locking. */
+static int sftp_hpn_pace_default = 1;	/* ON by default: wins where the
+					 * duty-cycle pathology lives (j1/j2),
+					 * measured neutral at j4/j8 and on
+					 * fast sinks; -X Pacing=no disables */
+static uint64_t sftp_hpn_pace_mean(struct sftp_hpn_conn *);
+
 struct sftp_hpn_conn *
 sftp_hpn_conn_init(void)
 {
-	return xcalloc(1, sizeof(struct sftp_hpn_conn));
+	struct sftp_hpn_conn *hpn;
+
+	hpn = xcalloc(1, sizeof(struct sftp_hpn_conn));
+	hpn->pace.enabled = sftp_hpn_pace_default;
+	return hpn;
 }
 
 void
@@ -77,6 +90,7 @@ sftp_hpn_conn_free(struct sftp_hpn_conn *hpn)
 	for (size_t i = 0; i < hpn->verify_failed_count; i++)
 		free(hpn->verify_failed_paths[i]);
 	free(hpn->verify_failed_paths);
+	free(hpn->pace.bw);
 	freezero(hpn, sizeof(*hpn));
 }
 
@@ -1003,4 +1017,191 @@ sftp_hpn_max_workers_cap(struct sftp_conn *conn)
 	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
 
 	return h != NULL ? h->hpn_max_workers_cap : -1;
+}
+
+/* ---- Adaptive upload pacing ---------------------------------------------
+ *
+ * Problem: a single-stream upload at real RTT into a destination whose
+ * filesystem sustains less than the path rate collapses into a duty cycle.
+ * Unpaced ingest overfills the receiver's page cache to the dirty-page
+ * cliff; the sink then hard-blocks for seconds, window credit famines, the
+ * sender's TCP decays, and every cycle pays an RTT-scaled recovery.
+ * Measured on both Lustre and ext4/NVMe sinks; reducing offered load below
+ * the destination's sustained flush rate raised throughput 37% and removed
+ * every multi-second stall (2026-07 investigation).
+ *
+ * Signal: WRITE status returns.  Their arrival rate IS the receiver's
+ * sustained consumption rate, delayed ~1 RTT.  The page cache can lie to
+ * the receiver's own flow control (writes complete at memcpy speed until
+ * the cliff), but it cannot lie about the long-run ack rate.
+ *
+ * Control law (continuous; no modes):
+ *
+ *     ceiling = max(HEADROOM x mean(recent per-second rates), FLOOR)
+ *     applied = min(ceiling, explicit -l if set)
+ *
+ * The estimator is the MEAN over a sliding window of per-second delivered
+ * rates, with the first seconds after the first ack excised so TCP's
+ * slow-start ramp never enters the estimate.  The mean - not a max - is
+ * deliberate: famine/stall seconds enter the average, so if the sink does
+ * hit its writeback cliff the estimate converges toward the sink's true
+ * sustained rate (implicit learn-from-stall), whereas a max filter latches
+ * the page-cache absorb rate and un-protects the transfer (measured:
+ * 718 MB/s latched on a ~350 MB/s sink).  A fast sink acks at the send
+ * rate, so the ceiling floats HEADROOM above actual throughput and never
+ * binds; HEADROOM doubles as the upward probe when the sink speeds up.
+ * The actuator is the same token bucket -l uses, cold-armed per file.
+ */
+
+/* Rate-sample bucket: one ring slot per second of delivered bytes. */
+#define SFTP_HPN_PACE_BUCKET_MS		1000
+/* Ring length = the estimator's memory, seconds (array size in .h). */
+#define SFTP_HPN_PACE_RING		10
+/* Ceiling = 5/4 x best recent rate: the overshoot bound and the probe. */
+#define SFTP_HPN_PACE_HEADROOM_NUM	5
+#define SFTP_HPN_PACE_HEADROOM_DEN	4
+/* Startup grace: no pacing until a full request pipeline has been acked
+ * AND this much wall time has passed - short transfers never pace. */
+#define SFTP_HPN_PACE_GRACE_MS		1000
+/* Slow-start excision: samples from the first SKIP_MS after the first ack
+ * are discarded entirely - TCP's ramp would otherwise contaminate the
+ * mean with rates that reflect the ramp, not the path or the sink.
+ * 3s covers slow-start at RTTs up to ~200ms; at higher RTTs the ramp may
+ * leak into the estimate slightly low, which is the safe direction. */
+#define SFTP_HPN_PACE_SKIP_MS		3000
+/* Hard floor, 32 MiB/s: comfortably below any sink worth protecting and
+ * ABOVE the duty-cycle rates the pathology itself produces, so pacing can
+ * never do worse than the disease.  A sink slower than this simply gets
+ * mild overshoot - i.e., today's behaviour. */
+#define SFTP_HPN_PACE_FLOOR_BYTES	(32ULL * 1024 * 1024)
+
+void
+sftp_hpn_pace_set_enabled(int on)
+{
+	sftp_hpn_pace_default = on;
+}
+
+/* Feed one WRITE ack of len payload bytes to the estimator: roll the
+ * per-second rate bucket into the ring and manage startup grace.  Never
+ * touches the actuator - arming happens only at file boundaries
+ * (sftp_hpn_pace_file_start).  Called from the upload ack-reap path
+ * beside the read-ahead controller's hook. */
+void
+sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len, u_int num_requests)
+{
+	uint64_t now_ms, dt_ms, rate;
+
+	if (hpn == NULL || !hpn->pace.enabled)
+		return;
+	now_ms = monotime_ms();
+	if (hpn->pace.acks == 0) {
+		hpn->pace.first_ack_ms = now_ms;
+		hpn->pace.bucket_start_ms = now_ms;
+	}
+	hpn->pace.acks++;
+	hpn->pace.bucket_bytes += len;
+
+	dt_ms = now_ms - hpn->pace.bucket_start_ms;
+	if (dt_ms < SFTP_HPN_PACE_BUCKET_MS)
+		return;
+	/* Slow-start excision: throw the bucket away (roll the window but
+	 * record nothing) until SKIP_MS past the first ack. */
+	if (now_ms - hpn->pace.first_ack_ms < SFTP_HPN_PACE_SKIP_MS) {
+		hpn->pace.bucket_bytes = 0;
+		hpn->pace.bucket_start_ms = now_ms;
+		return;
+	}
+	rate = hpn->pace.bucket_bytes * 1000 / dt_ms;	/* bytes/sec */
+	hpn->pace.rate_ring[hpn->pace.ring_idx++ % SFTP_HPN_PACE_RING] = rate;
+	hpn->pace.bucket_bytes = 0;
+	hpn->pace.bucket_start_ms = now_ms;
+
+	if (!hpn->pace.active) {
+		if (hpn->pace.acks < num_requests ||
+		    now_ms - hpn->pace.first_ack_ms <
+		    SFTP_HPN_PACE_SKIP_MS + SFTP_HPN_PACE_GRACE_MS)
+			return;
+		hpn->pace.active = 1;
+		debug2_f("engaged: mean recent rate %llu bytes/s",
+		    (unsigned long long)sftp_hpn_pace_mean(hpn));
+	}
+	/* Estimator only: the actuator is (re)programmed exclusively at file
+	 * boundaries (sftp_hpn_pace_file_start) with a COLD init, mimicking
+	 * -l exactly.  Mid-flow re-initialisation of the token bucket was
+	 * observed to produce multi-second sleeps and near-zero flow. */
+}
+
+/* Mean of the filled ring slots (bytes/sec); 0 when the ring is empty.
+ * The MEAN - not the max - is the estimator: famine buckets enter the
+ * average, so after a dirty-cliff stall the estimate converges toward the
+ * sink's true sustained rate (implicit learn-from-first-stall).  A max
+ * filter was tried and latched the page-cache absorb rate (718 MB/s on a
+ * ~350 MB/s sink), un-protecting the transfer. */
+static uint64_t
+sftp_hpn_pace_mean(struct sftp_hpn_conn *hpn)
+{
+	uint64_t sum = 0;
+	u_int i, n = 0;
+
+	for (i = 0; i < SFTP_HPN_PACE_RING; i++) {
+		if (hpn->pace.rate_ring[i] == 0)
+			continue;
+		sum += hpn->pace.rate_ring[i];
+		n++;
+	}
+	return n > 0 ? sum / n : 0;
+}
+
+/* At the start of each file upload: if the estimator is warmed up, cold-
+ * initialise the pace token bucket at the current ceiling, exactly as -l
+ * does before a transfer.  The bucket is then untouched for the file's
+ * whole duration; per-file re-arming is the adaptation cadence.  (A single
+ * enormous file therefore runs at the ceiling learned by its start -
+ * accepted limitation, preferable to mid-flow reprogramming.) */
+void
+sftp_hpn_pace_file_start(struct sftp_hpn_conn *hpn, size_t buflen)
+{
+	uint64_t best, target_bytes, rate_bits;
+
+	if (hpn == NULL || !hpn->pace.enabled || !hpn->pace.active)
+		return;
+	best = sftp_hpn_pace_mean(hpn);
+	if (best == 0)
+		return;
+	target_bytes = best *
+	    SFTP_HPN_PACE_HEADROOM_NUM / SFTP_HPN_PACE_HEADROOM_DEN;
+	if (target_bytes < SFTP_HPN_PACE_FLOOR_BYTES)
+		target_bytes = SFTP_HPN_PACE_FLOOR_BYTES;
+	/* bandwidth_limit_init()'s rate field is bits/sec in practice: the
+	 * -l path stores (kbit/s value) x 1024 there (verified live via gdb
+	 * against misc.c's math).  bytes x 8 = bits/s lands ~2.4% below the
+	 * exact -l scaling (1000/1024) - i.e. slightly conservative, well
+	 * inside HEADROOM, and needs no division. */
+	rate_bits = target_bytes * 8;
+	if (hpn->pace.bw == NULL)
+		hpn->pace.bw = xcalloc(1, sizeof(struct bwlimit));
+	bandwidth_limit_init(hpn->pace.bw, rate_bits, buflen);
+	hpn->pace.bw_rate_bits = rate_bits;
+	debug2_f("file ceiling %llu bytes/s (best %llu)",
+	    (unsigned long long)target_bytes, (unsigned long long)best);
+}
+
+/* Select the token bucket the outbound path should apply: the TIGHTER of
+ * the adaptive ceiling and the user's explicit -l (min composition).
+ * Returns NULL when no limit applies.  Request traffic outside uploads is
+ * far below the floor, so the ceiling never binds there. */
+struct bwlimit *
+sftp_hpn_pace_bwlimit(struct sftp_hpn_conn *hpn, struct bwlimit *user_bw,
+    uint64_t user_rate)
+{
+	/* user_rate is conn->limit_kbps, which -l parsing already scaled to
+	 * the same bits/sec-order units the bucket stores (kbit x 1024), so
+	 * comparing it against bw_rate_bits (bytes x 8) is consistent to
+	 * within the same 2.4% noted in sftp_hpn_pace_file_start. */
+	if (hpn == NULL || !hpn->pace.active || hpn->pace.bw == NULL)
+		return user_bw;
+	if (user_bw != NULL && user_rate > 0 &&
+	    user_rate <= hpn->pace.bw_rate_bits)
+		return user_bw;
+	return hpn->pace.bw;
 }

@@ -104,6 +104,10 @@ struct sftp_conn *sftp_init(int, int, u_int, u_int, uint64_t);
 void sftp_free(struct sftp_conn *);
 void sftp_set_live_counter(struct sftp_conn *, volatile uint64_t *);
 void sftp_set_yield_flag(struct sftp_conn *, volatile int *);
+/* HPN adaptive upload pacing master switch (-X Pacing=; default on).
+ * Implemented in sftp-hpn-client.c; declared here so sftp.c/scp.c option
+ * parsing reaches it without the full HPN header. */
+void sftp_hpn_pace_set_enabled(int);
 
 /* Returns non-zero if the connection suffered an unrecoverable I/O error.
  * Workers should check this after a failed transfer and exit their loop. */

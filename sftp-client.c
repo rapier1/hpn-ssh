@@ -204,9 +204,16 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 	u_char mlen[4];
 	struct iovec iov[2];
 	size_t msg_len = sshbuf_len(m);
+	struct bwlimit *bw;
 
 	if (conn->hpn->dead) /* HPN */
 		return -1;
+
+	/* HPN adaptive upload pacing: apply the tighter of the adaptive
+	 * ceiling and the user's explicit -l (NULL when neither binds). */
+	bw = sftp_hpn_pace_bwlimit(conn->hpn,
+	    conn->limit_kbps > 0 ? &conn->bwlimit_out : NULL,
+	    conn->limit_kbps);
 
 	if (msg_len > SFTP_MAX_MSG_LENGTH)
 		fatal("Outbound message too long %zu", msg_len);
@@ -218,8 +225,7 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 	iov[1].iov_base = (u_char *)sshbuf_ptr(m);
 	iov[1].iov_len = msg_len;
 
-	if (atomiciov6(writev, conn->fd_out, iov, 2, sftpio,
-	    conn->limit_kbps > 0 ? &conn->bwlimit_out : NULL) !=
+	if (atomiciov6(writev, conn->fd_out, iov, 2, sftpio, bw) !=
 	    msg_len + sizeof(mlen)) {
 		/* EPIPE/EBADF mean the connection is simply GONE - the ssh
 		 * child died, or the orchestrator's abort closed the fd under
@@ -2608,6 +2614,8 @@ do_upload_body(struct sftp_conn *conn,
 
 	id = conn->msg_id;
 	startid = ackid = id + 1;
+	/* HPN adaptive upload pacing: cold-arm the ceiling for this file. */
+	sftp_hpn_pace_file_start(conn->hpn, conn->upload_buflen);
 	data = xmalloc(conn->upload_buflen);
 
 	offset = progress_counter = resume_offset;
@@ -2736,6 +2744,10 @@ do_upload_body(struct sftp_conn *conn,
 				    __ATOMIC_RELAXED);
 			/* HPN adaptive read-ahead: feed acked bytes. */
 			sftp_hpn_rdahead_account(conn->hpn, ack->len);
+			/* HPN adaptive upload pacing: feed the ack-rate
+			 * estimator (see sftp_hpn_pace_ack). */
+			sftp_hpn_pace_ack(conn->hpn, ack->len,
+			    conn->num_requests);
 			/*
 			 * Track both the highest offset acknowledged and the
 			 * highest *contiguous* offset acknowledged.
@@ -3424,6 +3436,8 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	data = xmalloc(conn->upload_buflen);
 	id = conn->msg_id;
 	ackid = id + 1;
+	/* HPN adaptive upload pacing: cold-arm the ceiling for this range. */
+	sftp_hpn_pace_file_start(conn->hpn, conn->upload_buflen);
 	offset = range_offset;
 	bytes_left = range_length;
 
@@ -3562,6 +3576,10 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		} else {
 			/* HPN adaptive read-ahead: feed acked bytes. */
 			sftp_hpn_rdahead_account(conn->hpn, ack->len);
+			/* HPN adaptive upload pacing: feed the ack-rate
+			 * estimator (see sftp_hpn_pace_ack). */
+			sftp_hpn_pace_ack(conn->hpn, ack->len,
+			    conn->num_requests);
 			if (conn->hpn->live_counter != NULL) {
 				/* Report incremental progress so the
 				 * orchestrator's bps window sees a steady

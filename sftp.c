@@ -3876,6 +3876,17 @@ main(int argc, char **argv)
 				else
 					fatal("Invalid VerifyRepair value "
 					      "\"%s\": use yes or no", v);
+			} else if (strncasecmp(optarg, "Pacing=", 7) == 0) {
+				/* Adaptive upload pacing toggle (default
+				 * yes); see sftp_hpn_pace_ack. */
+				const char *v = optarg + 7;
+				if (strcasecmp(v, "no") == 0)
+					sftp_hpn_pace_set_enabled(0);
+				else if (strcasecmp(v, "yes") == 0)
+					sftp_hpn_pace_set_enabled(1);
+				else
+					fatal("Invalid Pacing value "
+					      "\"%s\": use yes or no", v);
 			} else {
 				fatal("Invalid -X option");
 			}

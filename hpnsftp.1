@@ -614,6 +614,26 @@ The default is
 Setting
 .Cm VerifyRepair Ns = Ns Cm no
 disables auto-repair, so a verification failure exits non-zero as before.
+.It Cm Pacing Ns = Ns Cm yes Ns | Ns Cm no
+Controls adaptive upload pacing.
+When the destination filesystem sustains less throughput than the network
+path can deliver, an unpaced upload overfills the remote system's write
+cache until the operating system stalls the receiving process for seconds
+at a time; at high round-trip times each stall costs an expensive TCP
+recovery, collapsing throughput into a stall-and-recover cycle.
+With pacing enabled the client continuously measures the rate at which the
+server acknowledges writes and limits its sending rate to slightly above
+that measured rate, keeping the destination out of the stall regime.
+The limit adapts per file and only takes effect when the destination is the
+bottleneck; transfers to destinations that can keep up with the network are
+not affected.
+The first seconds of a connection are excluded from measurement and short
+transfers are never paced.
+An explicit
+.Fl l
+limit takes precedence when it is lower.
+The default is
+.Cm yes .
 .El
 .El
 .Sh INTERACTIVE COMMANDS
