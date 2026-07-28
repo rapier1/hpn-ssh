@@ -109,18 +109,17 @@
 #define CHANNEL_OUTPUT_HWM_FLOOR (8 * 1024 * 1024)  /* min no-throttle headroom */
 #define CHANNEL_OUTPUT_CAP_MULT  2u                  /* CAP = MULT x HWM (=BDP) */
 
-/* Cap the advertised window at this PERCENT of tcpi_rcv_space (the kernel's
- * UN-doubled receiver BDP estimate) instead of letting it grow to SO_RCVBUF.
- * SO_RCVBUF over-reports ~2x (kernel doubles it for skb overhead) on top of
- * autotune's ~2-4x-BDP over-allocation, so growing the window to it
- * over-advertises several-fold and just lets c->output over-fill on a slow
- * consumer.  rcv_space tracks the real BDP and scales with the path.
+/* Cap the advertised window at this PERCENT of the TCP_INFO-derived limit
+ * (tcpi_rcv_ssthresh preferred, tcpi_rcv_space as fallback - see
+ * channel_tcpwinsz for the ladder and its history) instead of letting it
+ * grow to SO_RCVBUF.  SO_RCVBUF over-reports ~2x (kernel doubles it for skb
+ * overhead) on top of autotune's ~2-4x-BDP over-allocation, so growing the
+ * window to it over-advertises several-fold and just lets c->output
+ * over-fill on a slow consumer.
  *
- * 110% (1.1x) is the measured knee: the window needs a little headroom over
- * rcv_space to lead it as it converges (1.0x strangles the ramp ~5x and never
- * reaches full speed); 1.1x keeps full throughput with a ~5s ramp and bounds
- * memory near 18.8 levels (~130 MB).  Looser (e.g. 150%) ramps faster (~2.5s)
- * but costs memory (~225 MB) - a memory-vs-ramp trade. */
+ * The 10% headroom lets the channel window lead the kernel signal slightly
+ * as it converges, so SSH flow control does not under-cut what TCP itself
+ * would allow; HPNMemoryLimit remains the hard bound. */
 #define CHANNEL_WINDOW_RCVSPACE_PCT 110u
 
 /* Per-channel callback for pre/post IO actions */
@@ -1397,7 +1396,7 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 {
 	u_int32_t tcpwinsz = 0;
 	u_int32_t memlimit_cap = hpn_memlimit_caps[hpn_memlimit];
-	u_int32_t rcv_space_seen = 0, bdp_cap_seen = 0;
+	u_int32_t cap_src_seen = 0, bdp_cap_seen = 0;
 	static u_int32_t last_reported;
 	socklen_t optsz = sizeof(tcpwinsz);
 	int ret = -1;
@@ -1409,7 +1408,15 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 
 	sockfd = ssh_packet_get_connection_in(ssh);
 
-	/* get the current size of the receive buffer */
+	/*
+	 * SO_RCVBUF is the portable BASE value: it is cheap, exists on every
+	 * platform, and every HPN release before 19 sized the window from it
+	 * ALONE.  It still serves two roles: the early-connection value
+	 * (before TCP_INFO has anything meaningful) and the only signal on
+	 * platforms without a usable TCP_INFO.  Where TCP_INFO is available
+	 * it is capped below, because SO_RCVBUF over-reports usable capacity
+	 * several-fold (see CHANNEL_WINDOW_RCVSPACE_PCT).
+	 */
 	ret = getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &tcpwinsz, &optsz);
 
 	/* error on the socket - this should never happen */
@@ -1419,32 +1426,50 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 		return (2 * 1024 * 1024);
 	}
 
-	/* Cap the window at CHANNEL_WINDOW_RCVSPACE_PCT% of tcpi_rcv_space - the
-	 * kernel's un-doubled receiver BDP estimate - rather than SO_RCVBUF
-	 * (which over-reports ~2x for skb overhead on top of autotune's over-
-	 * allocation).  Growing the window to SO_RCVBUF over-advertises
-	 * several-fold and lets c->output over-fill on a slow consumer; capping
-	 * to ~BDP tracks the path and bounds memory. */
+	/* Cap the window from TCP_INFO where available.  The preferred
+	 * signal is tcpi_rcv_ssthresh: the kernel's OWN allowance for the
+	 * advertised receive window - what TCP itself is prepared to let
+	 * the peer put in flight.  History matters here: hpn19 first
+	 * shipped this cap on tcpi_rcv_space, the consumed-bytes-per-RTT
+	 * estimate, and measurement showed that to be self-referential -
+	 * the window limits consumption, consumption is what rcv_space
+	 * measures, so each feeds the other and the window creeps ~10% per
+	 * refresh from the 8MB floor (8MB -> 67MB over a 108s transfer at
+	 * 100ms; every transfer shorter than the ramp ran window-limited
+	 * at ~28MB/RTT).  rcv_ssthresh is not consumption-coupled, reaches
+	 * path scale in seconds, and HPNMemoryLimit stays the hard bound
+	 * on what a stalled sink can strand in c->output.  rcv_space
+	 * remains the fallback where rcv_ssthresh is not populated
+	 * (non-Linux); plain SO_RCVBUF where TCP_INFO is absent entirely. */
 	{
 		struct tcpi_portable t;
 
-		if (tcpi_portable_get(sockfd, &t) == 0 && t.rcv_space > 0) {
-			/* HPN: rcv_space is a WIRE (post-compression) BDP
-			 * estimate, but the channel window flow-controls
-			 * PLAINTEXT data.  Scale by the measured decompression
-			 * ratio (x1000; 1000 = no compression) so the window
-			 * reflects the plaintext BDP, not the smaller wire one. */
+		if (tcpi_portable_get(sockfd, &t) == 0) {
+			/* HPN: both signals are WIRE (post-compression)
+			 * sizes, but the channel window flow-controls
+			 * PLAINTEXT data.  Scale by the measured
+			 * decompression ratio (x1000; 1000 = none) so the
+			 * window reflects the plaintext BDP. */
 			u_int ratio_m = ssh_packet_get_decomp_ratio_milli(ssh);
-			u_int32_t bdp_cap = (u_int32_t)MINIMUM(
-			    (uint64_t)t.rcv_space * ratio_m / 1000 *
-			    CHANNEL_WINDOW_RCVSPACE_PCT / 100,
-			    (uint64_t)0xffffffffU);
-			rcv_space_seen = t.rcv_space;
-			if (bdp_cap < CHANNEL_OUTPUT_HWM_FLOOR)
-				bdp_cap = CHANNEL_OUTPUT_HWM_FLOOR;
-			bdp_cap_seen = bdp_cap;
-			if (tcpwinsz > bdp_cap)
-				tcpwinsz = bdp_cap;
+			u_int32_t cap_src = 0;
+
+			if ((t.avail_flags & TCPI_AVAIL_RCV_SSTHRESH) &&
+			    t.rcv_ssthresh > 0)
+				cap_src = t.rcv_ssthresh;
+			else if (t.rcv_space > 0)
+				cap_src = t.rcv_space;
+			if (cap_src > 0) {
+				u_int32_t bdp_cap = (u_int32_t)MINIMUM(
+				    (uint64_t)cap_src * ratio_m / 1000 *
+				    CHANNEL_WINDOW_RCVSPACE_PCT / 100,
+				    (uint64_t)0xffffffffU);
+				cap_src_seen = cap_src;
+				if (bdp_cap < CHANNEL_OUTPUT_HWM_FLOOR)
+					bdp_cap = CHANNEL_OUTPUT_HWM_FLOOR;
+				bdp_cap_seen = bdp_cap;
+				if (tcpwinsz > bdp_cap)
+					tcpwinsz = bdp_cap;
+			}
 		}
 	}
 
@@ -1468,8 +1493,8 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 	 * moves, so a DEBUG2 log shows how the rcv_space cap tracks (or
 	 * pins) the window over a connection's life. */
 	if (tcpwinsz != last_reported) {
-		debug2_f("channel %d: rcv_space %u bdp_cap %u tcpwinsz %u",
-		    c->self, rcv_space_seen, bdp_cap_seen, tcpwinsz);
+		debug2_f("channel %d: cap_src %u bdp_cap %u tcpwinsz %u",
+		    c->self, cap_src_seen, bdp_cap_seen, tcpwinsz);
 		last_reported = tcpwinsz;
 	}
 

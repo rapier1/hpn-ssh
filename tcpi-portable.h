@@ -64,6 +64,7 @@
 #define TCPI_AVAIL_RCV_WND		(1u << 7)	/* Linux 6.2+ */
 #define TCPI_AVAIL_TOTAL_RTO		(1u << 8)	/* Linux 6.7+ (the trio) */
 #define TCPI_AVAIL_BYTES_RECEIVED	(1u << 9)	/* Linux tcpi_bytes_received */
+#define TCPI_AVAIL_RCV_SSTHRESH		(1u << 10)	/* Linux tcpi_rcv_ssthresh */
 
 struct tcpi_portable {
 	/*
@@ -92,6 +93,9 @@ struct tcpi_portable {
 	u_int64_t	busy_time;	/* usec the connection spent sending */
 	u_int64_t	rwnd_limited;	/* usec send was limited by recv window */
 	u_int32_t	rcv_wnd;	/* scaled advertised recv window, bytes */
+	u_int32_t	rcv_ssthresh;	/* receive-side slow-start threshold:
+					 * the kernel's current allowance for
+					 * the advertised window, bytes */
 	u_int16_t	total_rto;	/* cumulative RTO timeouts */
 	u_int16_t	total_rto_recoveries; /* cumulative RTO recoveries */
 	u_int32_t	total_rto_time;	/* total time in RTO recovery, ms */

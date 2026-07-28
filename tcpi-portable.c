@@ -180,6 +180,20 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	out->rcv_space = ti.tcpi_rcv_space;
 
 	/*
+	 * Receive-side slow-start threshold: the kernel's current allowance
+	 * for the advertised receive window.  Part of the Linux base set
+	 * (it precedes tcpi_rcv_space), but the FreeBSD/NetBSD headers only
+	 * carry a __tcpi_rcv_ssthresh placeholder, so it is Linux-only in
+	 * practice and flag-gated accordingly.
+	 */
+#if defined(__linux__)
+	if (TCPI_FIELD_IN(tilen, tcpi_rcv_ssthresh)) {
+		out->rcv_ssthresh = ti.tcpi_rcv_ssthresh;
+		out->avail_flags |= TCPI_AVAIL_RCV_SSTHRESH;
+	}
+#endif
+
+	/*
 	 * Tier 1.5 -- cumulative retransmits.  Linux names it
 	 * tcpi_total_retrans (part of the early base set); FreeBSD/NetBSD
 	 * expose the equivalent tcpi_snd_rexmitpack.  OpenBSD also has
