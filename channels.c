@@ -2700,6 +2700,18 @@ channel_check_window(struct ssh *ssh, Channel *c)
 			    (band - over) / band);
 		}
 
+		/* D3 probe (temporary): a partial or zero grant discards the
+		 * un-granted consumed credit when local_consumed resets below
+		 * - the suspected window ratchet.  Log every such event so a
+		 * DEBUG2 server log answers both open questions: whether the
+		 * taper band is reachable at all, and how much credit each
+		 * event leaks. */
+		if (grant < full_grant)
+			debug2_f("channel %d: taper discard %u of %u "
+			    "(output_len %u hwm %u cap %u)", c->self,
+			    full_grant - grant, full_grant, output_len,
+			    hwm, cap);
+
 		/* Always reset local_consumed - no deferral. */
 		c->local_consumed = 0;
 
