@@ -96,18 +96,10 @@
  * throughput. This is not a great solution. */
 #define NON_HPN_WINDOW_MAX (15 * 1024 * 1024)
 
-/* Channel output-buffer backpressure, sized to the path BDP.  The advertised
- * window (c->local_window_max) tracks the TCP receive buffer, which the kernel
- * autotunes to ~the bandwidth-delay product - so it is our per-path BDP estimate
- * (and is already clamped to HPNMemoryLimit, which therefore bounds the buffer
- * automatically).  The output buffer may hold ~one BDP with NO throttle, so a
- * healthy transfer always keeps a full window in flight (no fade).  Throttling
- * engages only as the buffer grows past one BDP toward CHANNEL_OUTPUT_CAP_MULT
- * BDPs, bounding memory to a small multiple of the BDP on every path - cheap on
- * a LAN, generous on a high-BDP WAN, no fixed number to mistune.  The floor
- * keeps a small/early window (before autotune grows it) from throttling. */
-#define CHANNEL_OUTPUT_HWM_FLOOR (8 * 1024 * 1024)  /* min no-throttle headroom */
-#define CHANNEL_OUTPUT_CAP_MULT  2u                  /* CAP = MULT x HWM (=BDP) */
+/* Floor for the TCP_INFO-derived window cap in channel_tcpwinsz(): keeps a
+ * small/early kernel signal (before autotune grows it) from strangling the
+ * window. */
+#define CHANNEL_OUTPUT_HWM_FLOOR (8 * 1024 * 1024)  /* min window cap, bytes */
 
 /* Cap the advertised window at this PERCENT of the TCP_INFO-derived limit
  * (tcpi_rcv_ssthresh preferred, tcpi_rcv_space as fallback - see
@@ -2646,8 +2638,7 @@ channel_check_window(struct ssh *ssh, Channel *c)
 	    c->local_consumed > 0) {
 		int addition = 0;
 		u_int32_t tcpwinsz = channel_tcpwinsz(ssh, c);
-		u_int output_len, full_grant, grant, hwm, cap, band, over;
-
+		u_int grant;
 
 		/* adjust max window size if we are in a dynamic environment
 		 * and the tcp receive buffer is larger than the ssh window */
@@ -2658,65 +2649,12 @@ channel_check_window(struct ssh *ssh, Channel *c)
 			      c->local_window_max, addition);
 		}
 
-		/*
-		 * Backpressure the sender by output-buffer occupancy, sized to
-		 * the path BDP: the no-throttle high-water mark is one window
-		 * (c->local_window_max ~= the autotuned recv buffer ~= BDP), so
-		 * a healthy transfer keeps a full window in flight and does not
-		 * fade.  We only throttle as the buffer grows past one BDP
-		 * toward CAP (= MULT BDPs), tapering to 0 at CAP - which bounds
-		 * memory to a small multiple of the BDP automatically (cheap on
-		 * a LAN, generous on a high-BDP WAN), and local_window_max is
-		 * already clamped to HPNMemoryLimit so that bounds it too.  A
-		 * floor keeps an early/small window from throttling.  Credits
-		 * are not deferred (deferral caused burst-after-stall
-		 * oscillation).  (The earlier version threw the grant to ~0 at
-		 * one window with NO headroom, which is why it throttled
-		 * chronically and faded.)
-		 */
-		output_len = (u_int)sshbuf_len(c->output);
-		full_grant = c->local_consumed + (u_int)addition;
-
-		hwm = c->local_window_max;
-		if (hwm < CHANNEL_OUTPUT_HWM_FLOOR)
-			hwm = CHANNEL_OUTPUT_HWM_FLOOR;
-		cap = hwm * CHANNEL_OUTPUT_CAP_MULT;
-
-		if (output_len <= hwm) {
-			/* Within one BDP of headroom: full grant, no throttle. */
-			grant = full_grant;
-		} else if (output_len >= cap) {
-			/* At the cap: issue no credits this round - bounds
-			 * memory.  Recovery begins once the consumer drains. */
-			grant = 0;
-		} else {
-			/* Taper full -> 0 linearly across the [HWM, CAP] band
-			 * so the sender eases off as the buffer nears the cap
-			 * rather than slamming shut.  uint64_t prevents
-			 * overflow at large grants. */
-			band = cap - hwm;
-			over = output_len - hwm;
-			grant = (u_int)((uint64_t)full_grant *
-			    (band - over) / band);
-		}
-
-		/* D3 probe (temporary): a partial or zero grant discards the
-		 * un-granted consumed credit when local_consumed resets below
-		 * - the suspected window ratchet.  Log every such event so a
-		 * DEBUG2 server log answers both open questions: whether the
-		 * taper band is reachable at all, and how much credit each
-		 * event leaks. */
-		if (grant < full_grant)
-			debug2_f("channel %d: taper discard %u of %u "
-			    "(output_len %u hwm %u cap %u)", c->self,
-			    full_grant - grant, full_grant, output_len,
-			    hwm, cap);
-
-		/* Always reset local_consumed - no deferral. */
+		/* Grant back everything consumed plus any window growth.
+		 * Memory stays bounded without throttling: c->output can hold
+		 * at most one window (credit conservation), and the window is
+		 * clamped to HPNMemoryLimit. */
+		grant = c->local_consumed + (u_int)addition;
 		c->local_consumed = 0;
-
-		if (grant == 0)
-			return 1;
 
 		if (!c->have_remote_id)
 			fatal_f("channel %d: no remote id", c->self);
