@@ -1397,6 +1397,8 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 {
 	u_int32_t tcpwinsz = 0;
 	u_int32_t memlimit_cap = hpn_memlimit_caps[hpn_memlimit];
+	u_int32_t rcv_space_seen = 0, bdp_cap_seen = 0;
+	static u_int32_t last_reported;
 	socklen_t optsz = sizeof(tcpwinsz);
 	int ret = -1;
 	int sockfd;
@@ -1437,8 +1439,10 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 			    (uint64_t)t.rcv_space * ratio_m / 1000 *
 			    CHANNEL_WINDOW_RCVSPACE_PCT / 100,
 			    (uint64_t)0xffffffffU);
+			rcv_space_seen = t.rcv_space;
 			if (bdp_cap < CHANNEL_OUTPUT_HWM_FLOOR)
 				bdp_cap = CHANNEL_OUTPUT_HWM_FLOOR;
+			bdp_cap_seen = bdp_cap;
 			if (tcpwinsz > bdp_cap)
 				tcpwinsz = bdp_cap;
 		}
@@ -1459,6 +1463,15 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 	 */
 	if ((ssh->compat & SSH_RESTRICT_WINDOW) && (tcpwinsz > NON_HPN_WINDOW_MAX))
 		tcpwinsz = NON_HPN_WINDOW_MAX;
+
+	/* Window-sizing visibility: report the inputs whenever the result
+	 * moves, so a DEBUG2 log shows how the rcv_space cap tracks (or
+	 * pins) the window over a connection's life. */
+	if (tcpwinsz != last_reported) {
+		debug2_f("channel %d: rcv_space %u bdp_cap %u tcpwinsz %u",
+		    c->self, rcv_space_seen, bdp_cap_seen, tcpwinsz);
+		last_reported = tcpwinsz;
+	}
 
 	return (tcpwinsz);
 }
