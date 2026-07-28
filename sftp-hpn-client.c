@@ -1050,7 +1050,10 @@ sftp_hpn_max_workers_cap(struct sftp_conn *conn)
  * 718 MB/s latched on a ~350 MB/s sink).  A fast sink acks at the send
  * rate, so the ceiling floats HEADROOM above actual throughput and never
  * binds; HEADROOM doubles as the upward probe when the sink speeds up.
- * The actuator is the same token bucket -l uses, cold-armed per file.
+ * The actuator is the same token bucket -l uses, re-armed on a fixed time
+ * cadence from within the ack path - the design is deliberately blind to
+ * file boundaries, so its behaviour is identical for one huge file or
+ * hundreds of small files per second.
  */
 
 /* Rate-sample bucket: one ring slot per second of delivered bytes. */
@@ -1069,6 +1072,14 @@ sftp_hpn_max_workers_cap(struct sftp_conn *conn)
  * 3s covers slow-start at RTTs up to ~200ms; at higher RTTs the ramp may
  * leak into the estimate slightly low, which is the safe direction. */
 #define SFTP_HPN_PACE_SKIP_MS		3000
+/* Re-arm cadence: the actuator is reprogrammed at most this often.  Also
+ * the recovery clock: after an over-correction the ceiling climbs one
+ * HEADROOM step per interval, so convergence is seconds-scale regardless
+ * of file layout.  Mid-flow bandwidth_limit_init() at correctly-scaled
+ * rates is safe; the earlier "multi-second sleeps" that motivated
+ * boundary-only arming were an artifact of the x1024 rate
+ * under-programming bug, not of re-initialisation itself. */
+#define SFTP_HPN_PACE_ARM_MS		2000
 /* Hard floor, 32 MiB/s: comfortably below any sink worth protecting and
  * ABOVE the duty-cycle rates the pathology itself produces, so pacing can
  * never do worse than the disease.  A sink slower than this simply gets
@@ -1081,15 +1092,15 @@ sftp_hpn_pace_set_enabled(int on)
 	sftp_hpn_pace_default = on;
 }
 
-/* Feed one WRITE ack of len payload bytes to the estimator: roll the
- * per-second rate bucket into the ring and manage startup grace.  Never
- * touches the actuator - arming happens only at file boundaries
- * (sftp_hpn_pace_file_start).  Called from the upload ack-reap path
- * beside the read-ahead controller's hook. */
+/* Feed one WRITE ack of len payload bytes into the controller: roll the
+ * per-second rate bucket into the ring, manage startup grace, and re-arm
+ * the actuator on the ARM_MS cadence.  Called from the upload ack-reap
+ * path beside the read-ahead controller's hook. */
 void
 sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len, u_int num_requests)
 {
-	uint64_t now_ms, dt_ms, rate;
+	uint64_t now_ms, dt_ms, rate, best, target_bytes, rate_bits;
+	uint64_t prev_bytes;
 
 	if (hpn == NULL || !hpn->pace.enabled)
 		return;
@@ -1125,10 +1136,67 @@ sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len, u_int num_requests)
 		debug2_f("engaged: mean recent rate %llu bytes/s",
 		    (unsigned long long)sftp_hpn_pace_mean(hpn));
 	}
-	/* Estimator only: the actuator is (re)programmed exclusively at file
-	 * boundaries (sftp_hpn_pace_file_start) with a COLD init, mimicking
-	 * -l exactly.  Mid-flow re-initialisation of the token bucket was
-	 * observed to produce multi-second sleeps and near-zero flow. */
+
+	/* Time-based re-arm, at most once per ARM interval. */
+	if (now_ms - hpn->pace.last_arm_ms < SFTP_HPN_PACE_ARM_MS)
+		return;
+	best = sftp_hpn_pace_mean(hpn);
+	if (best == 0)
+		return;
+	target_bytes = best *
+	    SFTP_HPN_PACE_HEADROOM_NUM / SFTP_HPN_PACE_HEADROOM_DEN;
+	/* Down-step clamp: one re-arm may cut the ceiling by at most half
+	 * (no clamp on the first arm; bw_rate_bits holds bytes x 8).  The
+	 * increase side is inherently bounded (~x5/4 per re-arm, since the
+	 * mean can only grow as fast as the current ceiling admits); an
+	 * unbounded decrease lets one transient famine window crater a
+	 * healthy ceiling and the x5/4 climb-back takes tens of seconds.
+	 * Halving per re-arm still tracks a genuine sustained slowdown
+	 * within a few ARM intervals. */
+	prev_bytes = hpn->pace.bw_rate_bits / 8;
+	if (prev_bytes > 0 && target_bytes < prev_bytes / 2)
+		target_bytes = prev_bytes / 2;
+	if (target_bytes < SFTP_HPN_PACE_FLOOR_BYTES)
+		target_bytes = SFTP_HPN_PACE_FLOOR_BYTES;
+	/* Post-famine fast reclaim: if the last bucket consumed >=90%
+	 * of the (famine-cut) ceiling, the sink has recovered - jump
+	 * straight to 80% of the last rising-armed ceiling (= the last
+	 * proven mean rate, since 0.8 x 5/4 = 1) instead of compounding
+	 * x5/4 up from the floor.  The ring is flushed with the jump:
+	 * its famine samples are already banked in the cut reclaim
+	 * level, and restarting the estimator from post-jump buckets
+	 * keeps the mean tracking delivery instead of dragging ~10s
+	 * behind it.  A stale reclaim self-corrects: overshoot
+	 * re-famines and each retry targets 20% lower, geometrically
+	 * convergent on the sink's true rate. */
+	if (prev_bytes > 0 && rate * 10 >= prev_bytes * 9 &&
+	    target_bytes < hpn->pace.reclaim_bytes * 4 / 5) {
+		target_bytes = hpn->pace.reclaim_bytes * 4 / 5;
+		memset(hpn->pace.rate_ring, 0,
+		    sizeof(hpn->pace.rate_ring));
+		hpn->pace.ring_idx = 0;
+		debug2_f("reclaim to %llu bytes/s",
+		    (unsigned long long)target_bytes);
+	}
+	/* Rising/holding re-arms mark proven ground for the next
+	 * reclaim; falling ones leave it frozen at the pre-descent
+	 * peak. */
+	if (prev_bytes == 0 || target_bytes >= prev_bytes)
+		hpn->pace.reclaim_bytes = target_bytes;
+	/* bandwidth_limit_init()'s rate field is bits/sec in practice: the
+	 * -l path stores (kbit/s value) x 1024 there (verified live via gdb
+	 * against misc.c's math).  bytes x 8 = bits/s lands ~2.4% below the
+	 * exact -l scaling (1000/1024) - i.e. slightly conservative, well
+	 * inside HEADROOM, and needs no division.  len (this ack's request
+	 * size) is the natural chunk-size hint. */
+	rate_bits = target_bytes * 8;
+	if (hpn->pace.bw == NULL)
+		hpn->pace.bw = xcalloc(1, sizeof(struct bwlimit));
+	bandwidth_limit_init(hpn->pace.bw, rate_bits, len);
+	hpn->pace.bw_rate_bits = rate_bits;
+	hpn->pace.last_arm_ms = now_ms;
+	debug2_f("ceiling %llu bytes/s (mean %llu)",
+	    (unsigned long long)target_bytes, (unsigned long long)best);
 }
 
 /* Mean of the filled ring slots (bytes/sec); 0 when the ring is empty.
@@ -1152,40 +1220,6 @@ sftp_hpn_pace_mean(struct sftp_hpn_conn *hpn)
 	return n > 0 ? sum / n : 0;
 }
 
-/* At the start of each file upload: if the estimator is warmed up, cold-
- * initialise the pace token bucket at the current ceiling, exactly as -l
- * does before a transfer.  The bucket is then untouched for the file's
- * whole duration; per-file re-arming is the adaptation cadence.  (A single
- * enormous file therefore runs at the ceiling learned by its start -
- * accepted limitation, preferable to mid-flow reprogramming.) */
-void
-sftp_hpn_pace_file_start(struct sftp_hpn_conn *hpn, size_t buflen)
-{
-	uint64_t best, target_bytes, rate_bits;
-
-	if (hpn == NULL || !hpn->pace.enabled || !hpn->pace.active)
-		return;
-	best = sftp_hpn_pace_mean(hpn);
-	if (best == 0)
-		return;
-	target_bytes = best *
-	    SFTP_HPN_PACE_HEADROOM_NUM / SFTP_HPN_PACE_HEADROOM_DEN;
-	if (target_bytes < SFTP_HPN_PACE_FLOOR_BYTES)
-		target_bytes = SFTP_HPN_PACE_FLOOR_BYTES;
-	/* bandwidth_limit_init()'s rate field is bits/sec in practice: the
-	 * -l path stores (kbit/s value) x 1024 there (verified live via gdb
-	 * against misc.c's math).  bytes x 8 = bits/s lands ~2.4% below the
-	 * exact -l scaling (1000/1024) - i.e. slightly conservative, well
-	 * inside HEADROOM, and needs no division. */
-	rate_bits = target_bytes * 8;
-	if (hpn->pace.bw == NULL)
-		hpn->pace.bw = xcalloc(1, sizeof(struct bwlimit));
-	bandwidth_limit_init(hpn->pace.bw, rate_bits, buflen);
-	hpn->pace.bw_rate_bits = rate_bits;
-	debug2_f("file ceiling %llu bytes/s (best %llu)",
-	    (unsigned long long)target_bytes, (unsigned long long)best);
-}
-
 /* Select the token bucket the outbound path should apply: the TIGHTER of
  * the adaptive ceiling and the user's explicit -l (min composition).
  * Returns NULL when no limit applies.  Request traffic outside uploads is
@@ -1197,7 +1231,8 @@ sftp_hpn_pace_bwlimit(struct sftp_hpn_conn *hpn, struct bwlimit *user_bw,
 	/* user_rate is conn->limit_kbps, which -l parsing already scaled to
 	 * the same bits/sec-order units the bucket stores (kbit x 1024), so
 	 * comparing it against bw_rate_bits (bytes x 8) is consistent to
-	 * within the same 2.4% noted in sftp_hpn_pace_file_start. */
+	 * within the same 2.4% noted at the arming site in
+	 * sftp_hpn_pace_ack. */
 	if (hpn == NULL || !hpn->pace.active || hpn->pace.bw == NULL)
 		return user_bw;
 	if (user_bw != NULL && user_rate > 0 &&

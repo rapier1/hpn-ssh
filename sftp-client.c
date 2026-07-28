@@ -2614,8 +2614,6 @@ do_upload_body(struct sftp_conn *conn,
 
 	id = conn->msg_id;
 	startid = ackid = id + 1;
-	/* HPN adaptive upload pacing: cold-arm the ceiling for this file. */
-	sftp_hpn_pace_file_start(conn->hpn, conn->upload_buflen);
 	data = xmalloc(conn->upload_buflen);
 
 	offset = progress_counter = resume_offset;
@@ -3436,8 +3434,6 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	data = xmalloc(conn->upload_buflen);
 	id = conn->msg_id;
 	ackid = id + 1;
-	/* HPN adaptive upload pacing: cold-arm the ceiling for this range. */
-	sftp_hpn_pace_file_start(conn->hpn, conn->upload_buflen);
 	offset = range_offset;
 	bytes_left = range_length;
 

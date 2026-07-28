@@ -315,7 +315,10 @@ struct sftp_hpn_conn {
 		 * rate.  Samples during slow-start are excised. */
 		uint64_t rate_ring[10];
 		u_int    ring_idx;
+		uint64_t last_arm_ms;  /* monotime_ms of last actuator arm */
 		uint64_t bw_rate_bits; /* programmed actuator rate, bits/s */
+		uint64_t reclaim_bytes; /* last ceiling armed while rising;
+		                         * post-famine reclaim target */
 		struct bwlimit *bw;    /* actuator; NULL until activated */
 	} pace;
 };
@@ -367,7 +370,6 @@ void sftp_hpn_conn_free(struct sftp_hpn_conn *);
 void sftp_hpn_pace_set_enabled(int on);
 void sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len,
     u_int num_requests);
-void sftp_hpn_pace_file_start(struct sftp_hpn_conn *hpn, size_t buflen);
 struct bwlimit *sftp_hpn_pace_bwlimit(struct sftp_hpn_conn *hpn,
     struct bwlimit *user_bw, uint64_t user_rate);
 
