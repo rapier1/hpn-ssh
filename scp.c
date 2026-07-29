@@ -1529,6 +1529,10 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	    parallel_config_file, parallel_extra_o);
 	if (verify_flag)		/* -V forces verify on regardless of config */
 		pcfg.verify_transfer = 1;
+	/* HPN: latch the resolved bundling knobs on the control connection
+	 * for the serial recursive walks (no -j runs use only this conn). */
+	sftp_conn_set_bundle_config(conn, pcfg.use_bundle,
+	    pcfg.bundle_size, pcfg.writer_pool);
 	/* Adaptive throughput-outlier stall detection: shared defaults +
 	 * SFTP_TPUT_* overrides (was a copy-paste of sftp.c's values that
 	 * silently dropped the env overrides). */

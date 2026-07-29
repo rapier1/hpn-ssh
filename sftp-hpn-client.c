@@ -54,6 +54,8 @@
 #include "sftp-hpn-server.h"	/* hpn-file-layout wire format + status codes */
 #include "sftp-hpn-client.h"
 #include "sftp-hpn-bundle.h"	/* HPN_EXT_HASH_RANGE etc. wire names */
+#include "sftp-hpn-transferlog.h"	/* per-member TransferLog entries */
+#include "utf8.h"		/* mprintf */
 
 /* Adaptive upload pacing master switch (-X Pacing=), applied to each new
  * connection at init.  Read-only after option parsing, so parallel workers
@@ -71,6 +73,8 @@ sftp_hpn_conn_init(void)
 
 	hpn = xcalloc(1, sizeof(struct sftp_hpn_conn));
 	hpn->pace.enabled = sftp_hpn_pace_default;
+	hpn->bundle_cfg.use = 1;	/* HPNUseBundle default: yes */
+	hpn->bundle_cfg.writer_pool = 1;	/* HPNWriterPool default: yes */
 	return hpn;
 }
 
@@ -1239,4 +1243,182 @@ sftp_hpn_pace_bwlimit(struct sftp_hpn_conn *hpn, struct bwlimit *user_bw,
 	    user_rate <= hpn->pace.bw_rate_bits)
 		return user_bw;
 	return hpn->pace.bw;
+}
+
+void
+sftp_conn_set_bundle_config(struct sftp_conn *conn, int use_bundle,
+    uint64_t bundle_size, int writer_pool)
+{
+	struct sftp_hpn_conn *hpn = conn ? sftp_conn_hpn(conn) : NULL;
+
+	if (hpn == NULL)
+		return;
+	hpn->bundle_cfg.use = use_bundle;
+	hpn->bundle_cfg.size = bundle_size;
+	hpn->bundle_cfg.writer_pool = writer_pool;
+}
+
+/*
+ * HPN serial-path bundling: the recursive upload walk accumulates
+ * bundle-eligible small files and ships each batch as one hpn-bundle
+ * stream on the session connection, amortising the per-file OPEN/CLOSE
+ * round trips that dominate small-file transfers at WAN RTTs.  The
+ * eligibility policy is shared with the parallel planner
+ * (sftp-hpn-bundle.h) so both modes make identical decisions.
+ */
+
+void
+sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc, struct sftp_conn *conn,
+    int resume)
+{
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+	uint64_t target;
+
+	memset(acc, 0, sizeof(*acc));
+	if (hpn == NULL || !hpn->bundle_cfg.use ||
+	    hpn->bundle_cfg.server_cant || resume ||
+	    !sftp_conn_has_hpn_bundle(conn))
+		return;
+	target = hpn->bundle_cfg.size > 0 ?
+	    hpn->bundle_cfg.size : HPN_BUNDLE_SIZE_DEFAULT;
+	acc->target = target;
+	acc->enabled = 1;
+}
+
+/* True iff the accumulator is live and this file may join a bundle -
+ * the shared policy test, one source of truth with the parallel
+ * producer's gate. */
+int
+sftp_hpn_bundle_acc_eligible(struct sftp_hpn_bundle_acc *acc, uint64_t size)
+{
+	return acc->enabled &&
+	    hpn_bundle_file_eligible(size, acc->target);
+}
+
+/* Returns 1 when the accumulator must flush (shared policy: framed
+ * bytes reach the target, or the member ceiling).  Frame accounting
+ * matches the parallel producer: header + path + payload per member. */
+int
+sftp_hpn_bundle_acc_add(struct sftp_hpn_bundle_acc *acc, const char *src,
+    const char *dst, long long size)
+{
+	if (acc->n == acc->cap) {
+		acc->cap = acc->cap ? acc->cap * 2 : 64;
+		acc->entries = xreallocarray(acc->entries, acc->cap,
+		    sizeof(*acc->entries));
+		acc->sizes = xreallocarray(acc->sizes, acc->cap,
+		    sizeof(*acc->sizes));
+	}
+	acc->entries[acc->n].local_path = xstrdup(src);
+	acc->entries[acc->n].remote_path = xstrdup(dst);
+	acc->entries[acc->n].result = 0;
+	acc->sizes[acc->n] = size;
+	acc->n++;
+	acc->bytes += BUNDLE_REC_FRAME_BYTES(strlen(dst), (uint64_t)size);
+	return hpn_bundle_should_flush(acc->bytes, acc->n, acc->target);
+}
+
+static void
+sftp_hpn_bundle_acc_reset(struct sftp_hpn_bundle_acc *acc)
+{
+	int i;
+
+	for (i = 0; i < acc->n; i++) {
+		free((void *)acc->entries[i].local_path);
+		free((void *)acc->entries[i].remote_path);
+	}
+	acc->n = 0;
+	acc->bytes = 0;
+}
+
+void
+sftp_hpn_bundle_acc_free(struct sftp_hpn_bundle_acc *acc)
+{
+	sftp_hpn_bundle_acc_reset(acc);
+	free(acc->entries);
+	free(acc->sizes);
+	acc->entries = NULL;
+	acc->sizes = NULL;
+	acc->cap = 0;
+	acc->enabled = 0;
+}
+
+/*
+ * Flush the accumulated members as one bundle and consume the
+ * accumulator.  Returns 0 when the walk may continue cleanly, 1 when
+ * one or more members failed but the walk may continue (caller marks
+ * the transfer failed), and -1 on abort conditions: POLICY_DENIED (the
+ * bundle API contract forbids falling back) or the session connection
+ * dying mid-bundle.
+ */
+int
+sftp_hpn_bundle_acc_flush(struct sftp_conn *conn, struct sftp_hpn_bundle_acc *acc,
+    int preserve_flag, int print_flag, int verify, int fsync_flag,
+    int inplace_flag)
+{
+	int i, rc, failures = 0;
+
+	if (!acc->enabled || acc->n == 0)
+		return 0;
+
+	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
+		mprintf("Uploading bundle: %d files, %llu bytes\n",
+		    acc->n, (unsigned long long)acc->bytes);
+	rc = sftp_hpn_bundle_upload(conn, "", acc->entries, acc->n,
+	    preserve_flag, fsync_flag, sftp_conn_hpn(conn)->bundle_cfg.writer_pool,
+	    acc->target);
+	switch (rc) {
+	case SFTP_HPN_BUNDLE_OK:
+		for (i = 0; i < acc->n; i++) {
+			/* Mirror the per-file path: park for the classic
+			 * verify phase (no-op unless verify is enabled);
+			 * success is logged now only when verify will not
+			 * log it after checking. */
+			sftp_conn_verify_park(conn, acc->entries[i].local_path,
+			    acc->entries[i].remote_path,
+			    /*local_is_target=*/0);
+			if (!sftp_conn_verify_transfer_enabled(conn))
+				transferlog_file(TRANSFERLOG_SUCCESS,
+				    acc->sizes[i],
+				    acc->entries[i].remote_path);
+		}
+		break;
+	case SFTP_HPN_BUNDLE_SERVER_CANT:
+		/* Permanent, connection-agnostic refusal: stop bundling
+		 * for this session and drive these members per-file. */
+		debug_f("server refused bundle; per-file fallback");
+		sftp_conn_hpn(conn)->bundle_cfg.server_cant = 1;
+		acc->enabled = 0;
+		for (i = 0; i < acc->n; i++) {
+			int ur = sftp_upload(conn, acc->entries[i].local_path,
+			    acc->entries[i].remote_path, preserve_flag,
+			    /*resume*/0, verify, fsync_flag,
+			    inplace_flag);
+			if (ur == -1) {
+				error("upload \"%s\" to \"%s\" failed",
+				    acc->entries[i].local_path,
+				    acc->entries[i].remote_path);
+				transferlog_file(TRANSFERLOG_FAILED,
+				    acc->sizes[i],
+				    acc->entries[i].remote_path);
+				failures++;
+			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
+				transferlog_file(TRANSFERLOG_SUCCESS,
+				    acc->sizes[i],
+				    acc->entries[i].remote_path);
+			}
+		}
+		break;
+	case SFTP_HPN_BUNDLE_POLICY_DENIED:
+		error("bundle upload denied by remote policy; aborting");
+		sftp_hpn_bundle_acc_reset(acc);
+		return -1;
+	case SFTP_HPN_BUNDLE_TRANSPORT_FAILED:
+	default:
+		error("bundle upload failed: connection error");
+		sftp_hpn_bundle_acc_reset(acc);
+		return -1;
+	}
+	sftp_hpn_bundle_acc_reset(acc);
+	return failures > 0 ? 1 : 0;
 }

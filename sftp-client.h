@@ -371,6 +371,15 @@ int sftp_hpn_bundle_upload(struct sftp_conn *conn,
 /* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
 int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
 
+/*
+ * Install the resolved bundling knobs (HPNUseBundle, HPNBundleSize,
+ * HPNWriterPool) on the connection for the serial-path recursive walks.
+ * Without this call the connection uses the options' documented defaults
+ * (bundling on, writer pool on, default bundle size).
+ */
+void sftp_conn_set_bundle_config(struct sftp_conn *conn, int use_bundle,
+    uint64_t bundle_size, int writer_pool);
+
 /* True iff the server advertised hpn-bundle-fetch@hpnssh.org (download). */
 int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
 

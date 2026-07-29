@@ -3117,7 +3117,8 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 static int
 upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
     int depth, int preserve_flag, int print_flag, int resume, int verify,
-    int fsync_flag, int follow_link_flag, int inplace_flag)
+    int fsync_flag, int follow_link_flag, int inplace_flag,
+    struct sftp_hpn_bundle_acc *bacc)
 {
 	int created = 0, ret = 0;
 	DIR *dirp;
@@ -3126,6 +3127,7 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	struct stat sb;
 	Attrib a, dirattrib;
 	uint32_t saved_perm;
+	int fr;
 
 	debug2_f("upload local dir \"%s\" to remote \"%s\"", src, dst);
 
@@ -3211,8 +3213,27 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			if (upload_dir_internal(conn, new_src, new_dst,
 			    depth + 1, preserve_flag, print_flag, resume,
 			    verify, fsync_flag, follow_link_flag,
-			    inplace_flag) == -1)
+			    inplace_flag, bacc) == -1)
 				ret = -1;
+		} else if (S_ISREG(sb.st_mode) &&
+		    sftp_hpn_bundle_acc_eligible(bacc,
+		    (uint64_t)sb.st_size)) {
+			/* HPN: bundle-eligible - accumulate; the bundle
+			 * spans directories (matching the parallel
+			 * producer) and ships when the shared policy says
+			 * flush. */
+			if (sftp_hpn_bundle_acc_add(bacc, new_src, new_dst,
+			    (long long)sb.st_size)) {
+				fr = sftp_hpn_bundle_acc_flush(conn, bacc,
+				    preserve_flag, print_flag, verify,
+				    fsync_flag, inplace_flag);
+				if (fr < 0) {
+					ret = -1;
+					break;
+				}
+				if (fr > 0)
+					ret = -1;
+			}
 		} else if (S_ISREG(sb.st_mode)) {
 			int ur = sftp_upload(conn, new_src, new_dst,
 			    preserve_flag, resume, verify, fsync_flag,
@@ -3261,15 +3282,32 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 {
 	char *dst_canon;
 	int ret;
+	struct sftp_hpn_bundle_acc bacc;
 
 	if ((dst_canon = sftp_realpath(conn, dst)) == NULL) {
 		error("upload \"%s\": path canonicalization failed", dst);
 		return -1;
 	}
 
+	/* HPN: one bundle accumulator for the WHOLE walk - bundles span
+	 * directories, matching the parallel producer's grouping, so the
+	 * two modes ship identical bundles for the same corpus.  Disabled
+	 * (a no-op) unless the server supports bundles, HPNUseBundle is
+	 * on, and this is not a resume transfer. */
+	sftp_hpn_bundle_acc_init(&bacc, conn, resume);
+
 	ret = upload_dir_internal(conn, src, dst_canon, 0, preserve_flag,
 	    print_flag, resume, verify, fsync_flag, follow_link_flag,
-	    inplace_flag);
+	    inplace_flag, &bacc);
+
+	/* Ship any members still pending.  Skip when interrupted - a
+	 * re-run re-walks; do not start new work on the way out. */
+	if (!interrupted) {
+		if (sftp_hpn_bundle_acc_flush(conn, &bacc, preserve_flag,
+		    print_flag, verify, fsync_flag, inplace_flag) != 0)
+			ret = -1;
+	}
+	sftp_hpn_bundle_acc_free(&bacc);
 
 	free(dst_canon);
 	return ret;

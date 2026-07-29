@@ -321,7 +321,50 @@ struct sftp_hpn_conn {
 		                         * post-famine reclaim target */
 		struct bwlimit *bw;    /* actuator; NULL until activated */
 	} pace;
+
+	/* Serial-path bundling configuration (HPNUseBundle, HPNBundleSize,
+	 * HPNWriterPool - resolved from ssh_config by the client program
+	 * via sftp_conn_set_bundle_config).  Mirrors the parallel
+	 * planner's pcfg fields so both modes obey the same knobs.
+	 * server_cant latches after a SERVER_CANT bundle result: the
+	 * session stops offering bundles and drives files individually. */
+	struct {
+		int      use;         /* HPNUseBundle; default 1 */
+		int      writer_pool; /* HPNWriterPool; default 1 */
+		uint64_t size;        /* HPNBundleSize bytes; 0 = default */
+		int      server_cant; /* latched: server refused a bundle */
+	} bundle_cfg;
 };
+
+/*
+ * Serial-path bundle accumulator: the recursive upload walk in
+ * sftp-client.c collects bundle-eligible small files here and ships
+ * each batch as one hpn-bundle stream on the session connection.
+ * Implementation in sftp-hpn-client.c; eligibility policy shared with
+ * the parallel planner via sftp-hpn-bundle.h.
+ */
+struct sftp_hpn_bundle_acc {
+	struct sftp_hpn_bundle_upload_entry *entries;
+	long long *sizes;	/* per-member bytes, for TransferLog */
+	int n, cap;
+	uint64_t bytes;		/* accumulated FRAMED bytes (header+path+
+				 * payload per member, matching the
+				 * parallel producer's accounting) */
+	uint64_t target;	/* flush threshold (HPNBundleSize) */
+	int enabled;
+};
+
+struct sftp_conn;
+void sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc,
+    struct sftp_conn *conn, int resume);
+int sftp_hpn_bundle_acc_eligible(struct sftp_hpn_bundle_acc *acc,
+    uint64_t size);
+int sftp_hpn_bundle_acc_add(struct sftp_hpn_bundle_acc *acc,
+    const char *src, const char *dst, long long size);
+int sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
+    struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
+    int verify, int fsync_flag, int inplace_flag);
+void sftp_hpn_bundle_acc_free(struct sftp_hpn_bundle_acc *acc);
 
 /*
  * HPNVerifyTransfer (1b) inline source-hash accumulator (sftp-hpn-verify.c).

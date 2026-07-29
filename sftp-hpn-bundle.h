@@ -60,4 +60,49 @@
  */
 #define HPN_BUNDLE_BLOCK_BYTES     (128 * 1024)
 
+/*
+ * Bundle-eligibility policy, shared by the parallel planner and the
+ * serial recursive walks so both make identical bundling decisions
+ * for the same corpus.  A file at or above BUNDLE_FILE_MAX_BYTES(target)
+ * does not amortise the per-file OPEN/CLOSE round trips a bundle
+ * exists to avoid; it takes the regular single-file path.
+ */
+#define BUNDLE_MIN_FILES_PER_BUNDLE  4
+#define BUNDLE_FILE_MAX_BYTES(target) \
+    ((target) / BUNDLE_MIN_FILES_PER_BUNDLE)
+
+/* Safety ceiling on members per bundle: a pathological stream of tiny
+ * files cannot grow a single batch without bound; the byte cap binds
+ * first for any file >= ~1 KiB. */
+#define BUNDLE_BATCH_MAX_FILES  8192
+
+/* Wire cost of one file in a bundle: the fixed record header (type +
+ * mode + mtime + size + path_len = 23 bytes, see sftp-hpn-tar.h) plus
+ * the archive path plus the file data, with no padding.  Accumulators
+ * size bundles by this framed cost rather than raw payload, so a
+ * bundle's wire size stays near the byte cap even when tiny-file
+ * headers/paths dominate. */
+#define BUNDLE_REC_FRAME_BYTES(plen, sz) \
+    (23ULL + (uint64_t)(plen) + (uint64_t)(sz))
+
+/*
+ * Shared accumulation decisions - one source of truth used by BOTH the
+ * parallel producer (sftp-parallel-unit.c) and the serial walk
+ * accumulator (sftp-hpn-client.c), so the two modes group bundles
+ * identically for the same corpus.
+ */
+static inline int
+hpn_bundle_file_eligible(uint64_t file_size, uint64_t bundle_target)
+{
+	return file_size < BUNDLE_FILE_MAX_BYTES(bundle_target);
+}
+
+static inline int
+hpn_bundle_should_flush(uint64_t framed_bytes, int members,
+    uint64_t bundle_target)
+{
+	return framed_bytes >= bundle_target ||
+	    members >= BUNDLE_BATCH_MAX_FILES;
+}
+
 #endif /* _SFTP_HPN_BUNDLE_H */

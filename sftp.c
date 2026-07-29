@@ -3976,6 +3976,22 @@ main(int argc, char **argv)
 	if (conn == NULL)
 		fatal("Couldn't initialise connection to server");
 
+	/* HPN: resolve the bundling knobs (HPNUseBundle, HPNBundleSize,
+	 * HPNWriterPool) from ssh_config + -o overrides for the serial
+	 * recursive walks.  The parallel path resolves the same options
+	 * into its pcfg at orchestrator launch; this covers no -j runs.
+	 * Skipped for -D direct mode (no host to resolve against): the
+	 * connection keeps the options' documented defaults. */
+	if (sftp_direct == NULL && host != NULL && *host != '\0') {
+		struct sftp_parallel_config bcfg;
+
+		memset(&bcfg, 0, sizeof(bcfg));
+		if (sftp_parallel_apply_ssh_config(&bcfg, host,
+		    parallel_config_file, parallel_extra_o) == 0)
+			sftp_conn_set_bundle_config(conn, bcfg.use_bundle,
+			    bcfg.bundle_size, bcfg.writer_pool);
+	}
+
 	if (!quiet) {
 		if (sftp_direct == NULL)
 			fprintf(stderr, "Connected to %s.\n", host);

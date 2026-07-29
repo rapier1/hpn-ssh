@@ -35,6 +35,7 @@
 #include <stdio.h>
 
 #include "sftp-parallel.h"	/* struct sftp_parallel_config (embedded) */
+#include "sftp-hpn-bundle.h"	/* shared bundle-eligibility policy */
 
 struct sftp_conn;
 struct sftp_workqueue;
@@ -70,7 +71,7 @@ struct sftp_parallel;
  * safety ceiling so a pathological stream of tiny files cannot grow a single
  * batch without bound; the 8 MiB byte cap binds first for any file >= ~1 KiB.
  */
-#define BUNDLE_BATCH_MAX_FILES  8192
+/* BUNDLE_BATCH_MAX_FILES lives in sftp-hpn-bundle.h (shared policy). */
 
 /*
  * Download bundles (hpn-bundle-fetch) list every member's remote path in ONE
@@ -134,13 +135,10 @@ struct sftp_parallel;
 #define BUNDLE_TARGET_BYTES_DEFAULT  HPN_BUNDLE_SIZE_DEFAULT
 #define BUNDLE_TARGET_BYTES_MIN      HPN_BUNDLE_SIZE_MIN
 #define BUNDLE_TARGET_BYTES_MAX      HPN_BUNDLE_SIZE_MAX
-#define BUNDLE_MIN_FILES_PER_BUNDLE  4
 
-/* Maximum size of a single file the walker is willing to place in a
- * bundle.  Computed from the worker's bundle_target_bytes.  Files at
- * or above this size go through the non-bundle path. */
-#define BUNDLE_FILE_MAX_BYTES(target) \
-    ((target) / BUNDLE_MIN_FILES_PER_BUNDLE)
+/* BUNDLE_MIN_FILES_PER_BUNDLE and BUNDLE_FILE_MAX_BYTES(target) - the
+ * eligibility policy - live in sftp-hpn-bundle.h, shared with the
+ * serial recursive walks. */
 
 /* Back-compat: some sites still reference the old un-suffixed name. */
 #define BUNDLE_TARGET_BYTES BUNDLE_TARGET_BYTES_DEFAULT
@@ -152,8 +150,7 @@ struct sftp_parallel;
  * bundles by this framed cost rather than raw payload, so a bundle's wire size
  * stays near the byte cap even when tiny-file headers/paths dominate.
  */
-#define BUNDLE_REC_FRAME_BYTES(plen, sz) \
-    (23ULL + (uint64_t)(plen) + (uint64_t)(sz))
+/* BUNDLE_REC_FRAME_BYTES lives in sftp-hpn-bundle.h (shared policy). */
 
 /*
  * Work-queue (ring) depth.

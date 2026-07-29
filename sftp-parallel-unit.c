@@ -895,22 +895,17 @@ parallel_unit_pending_dec_traced(struct sftp_parallel *p, const struct sftp_work
 }
 
 /*
- * Return the maximum file size (in bytes) eligible for the bundle path
- * given this parallel's bundle target.  Files at or above this size
- * waste the bundle protocol's OPEN/CLOSE amortisation (a "bundle" of
- * one large file is just an SFTP put/get with extra round-trips) and
- * starve other workers while this one packs.  See BUNDLE_MIN_FILES_PER_BUNDLE
- * for the derivation.
- *
- * Computed once per submit; no caching needed (a divide + branch).
+ * Return this parallel's bundle byte target (HPNBundleSize or the
+ * compile-time default).  Eligibility against it is decided by the
+ * shared hpn_bundle_file_eligible() in sftp-hpn-bundle.h, one source
+ * of truth with the serial walk accumulator.
  */
 static uint64_t
-bundle_file_size_max_for(const struct sftp_parallel *p)
+bundle_target_for(const struct sftp_parallel *p)
 {
-	uint64_t target = (p != NULL && p->cfg.bundle_size > 0)
+	return (p != NULL && p->cfg.bundle_size > 0)
 	    ? p->cfg.bundle_size
 	    : BUNDLE_TARGET_BYTES_DEFAULT;
-	return BUNDLE_FILE_MAX_BYTES(target);
 }
 
 static int submit_upload_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
@@ -1026,8 +1021,8 @@ parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
 	if (u->op == SFTP_OP_DOWNLOAD)
 		p->bundle_pending_path_bytes += 4 +
 		    (u->src_path ? strlen(u->src_path) : 0);
-	if (p->bundle_pending_framed >= target ||
-	    p->bundle_pending_n >= BUNDLE_BATCH_MAX_FILES ||
+	if (hpn_bundle_should_flush(p->bundle_pending_framed,
+	    p->bundle_pending_n, target) ||
 	    (p->bundle_pending_op == SFTP_OP_DOWNLOAD &&
 	    p->bundle_pending_path_bytes >= BUNDLE_DL_FETCH_REQ_MAX))
 		parallel_bundle_flush_locked(p);
@@ -1066,7 +1061,8 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 	 * units are never bundle-eligible regardless of size - handled
 	 * by their op-type elsewhere. */
 	if (p->cfg.use_bundle && u->size > 0 &&
-	    (uint64_t)u->size > bundle_file_size_max_for(p)) {
+	    !hpn_bundle_file_eligible((uint64_t)u->size,
+	    bundle_target_for(p))) {
 		u->bundle_ineligible = 1;
 	}
 	/* Producer-side bundle assembly: group eligible small files into whole
