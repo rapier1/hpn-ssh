@@ -1021,10 +1021,12 @@ parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
 	if (u->op == SFTP_OP_DOWNLOAD)
 		p->bundle_pending_path_bytes += 4 +
 		    (u->src_path ? strlen(u->src_path) : 0);
-	if (hpn_bundle_should_flush(p->bundle_pending_framed,
-	    p->bundle_pending_n, target) ||
-	    (p->bundle_pending_op == SFTP_OP_DOWNLOAD &&
-	    p->bundle_pending_path_bytes >= BUNDLE_DL_FETCH_REQ_MAX))
+	if ((p->bundle_pending_op == SFTP_OP_DOWNLOAD ?
+	    hpn_bundle_dl_should_flush(p->bundle_pending_framed,
+	    p->bundle_pending_n, target, p->bundle_pending_path_bytes,
+	    BUNDLE_DL_FETCH_REQ_MAX) :
+	    hpn_bundle_should_flush(p->bundle_pending_framed,
+	    p->bundle_pending_n, target)))
 		parallel_bundle_flush_locked(p);
 	pthread_mutex_unlock(&p->bundle_mu);
 	sftp_workqueue_kick(p->q);

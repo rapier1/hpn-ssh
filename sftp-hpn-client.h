@@ -344,19 +344,22 @@ struct sftp_hpn_conn {
  * the parallel planner via sftp-hpn-bundle.h.
  */
 struct sftp_hpn_bundle_acc {
-	struct sftp_hpn_bundle_upload_entry *entries;
+	char **src_paths;	/* upload: local; download: remote */
+	char **dst_paths;	/* upload: remote; download: local */
 	long long *sizes;	/* per-member bytes, for TransferLog */
 	int n, cap;
 	uint64_t bytes;		/* accumulated FRAMED bytes (header+path+
 				 * payload per member, matching the
 				 * parallel producer's accounting) */
+	uint64_t path_bytes;	/* download only: fetch-request path cost */
 	uint64_t target;	/* flush threshold (HPNBundleSize) */
+	int is_download;
 	int enabled;
 };
 
 struct sftp_conn;
 void sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc,
-    struct sftp_conn *conn, int resume);
+    struct sftp_conn *conn, int resume, int is_download);
 int sftp_hpn_bundle_acc_eligible(struct sftp_hpn_bundle_acc *acc,
     uint64_t size);
 int sftp_hpn_bundle_acc_add(struct sftp_hpn_bundle_acc *acc,

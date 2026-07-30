@@ -2420,9 +2420,9 @@ static int
 download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
     int depth, Attrib *dirattrib, int preserve_flag, int print_flag,
     int resume_flag, int verify, int fsync_flag, int follow_link_flag,
-    int inplace_flag)
+    int inplace_flag, struct sftp_hpn_bundle_acc *bacc)
 {
-	int i, ret = 0;
+	int i, ret = 0, fr;
 	SFTP_DIRENT **dir_entries;
 	char *filename, *new_src = NULL, *new_dst = NULL;
 	mode_t mode = 0777, tmpmode = mode;
@@ -2498,8 +2498,28 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			if (download_dir_internal(conn, new_src, new_dst,
 			    depth + 1, a, preserve_flag,
 			    print_flag, resume_flag, verify,
-			    fsync_flag, follow_link_flag, inplace_flag) == -1)
+			    fsync_flag, follow_link_flag, inplace_flag,
+			    bacc) == -1)
 				ret = -1;
+		} else if (S_ISREG(a->perm) &&
+		    (a->flags & SSH2_FILEXFER_ATTR_SIZE) &&
+		    sftp_hpn_bundle_acc_eligible(bacc, a->size)) {
+			/* HPN: bundle-eligible - accumulate; the bundle
+			 * spans directories (matching the parallel
+			 * producer) and ships when the shared policy says
+			 * flush. */
+			if (sftp_hpn_bundle_acc_add(bacc, new_src, new_dst,
+			    (long long)a->size)) {
+				fr = sftp_hpn_bundle_acc_flush(conn, bacc,
+				    preserve_flag, print_flag, verify,
+				    fsync_flag, inplace_flag);
+				if (fr < 0) {
+					ret = -1;
+					break;
+				}
+				if (fr > 0)
+					ret = -1;
+			}
 		} else if (S_ISREG(a->perm)) {
 			int dr = sftp_download(conn, new_src, new_dst, a,
 			    preserve_flag, resume_flag, fsync_flag,
@@ -2569,15 +2589,34 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 {
 	char *src_canon;
 	int ret;
+	struct sftp_hpn_bundle_acc bacc;
 
 	if ((src_canon = sftp_realpath(conn, src)) == NULL) {
 		error("download \"%s\": path canonicalization failed", src);
 		return -1;
 	}
 
+	/* HPN: one bundle accumulator for the WHOLE walk - download
+	 * bundles span directories, matching the parallel producer, so
+	 * serial and -j modes fetch identical bundles for the same
+	 * corpus.  A no-op unless the server advertises
+	 * hpn-bundle-fetch, HPNUseBundle is on, and this is not a
+	 * resume transfer. */
+	sftp_hpn_bundle_acc_init(&bacc, conn, resume_flag, /*download*/1);
+
 	ret = download_dir_internal(conn, src_canon, dst, 0,
 	    dirattrib, preserve_flag, print_flag, resume_flag, verify,
-	    fsync_flag, follow_link_flag, inplace_flag);
+	    fsync_flag, follow_link_flag, inplace_flag, &bacc);
+
+	/* Fetch any members still pending.  Skip when interrupted - a
+	 * re-run re-walks; do not start new work on the way out. */
+	if (!interrupted) {
+		if (sftp_hpn_bundle_acc_flush(conn, &bacc, preserve_flag,
+		    print_flag, verify, fsync_flag, inplace_flag) != 0)
+			ret = -1;
+	}
+	sftp_hpn_bundle_acc_free(&bacc);
+
 	free(src_canon);
 	return ret;
 }
@@ -3294,7 +3333,7 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	 * two modes ship identical bundles for the same corpus.  Disabled
 	 * (a no-op) unless the server supports bundles, HPNUseBundle is
 	 * on, and this is not a resume transfer. */
-	sftp_hpn_bundle_acc_init(&bacc, conn, resume);
+	sftp_hpn_bundle_acc_init(&bacc, conn, resume, /*download*/0);
 
 	ret = upload_dir_internal(conn, src, dst_canon, 0, preserve_flag,
 	    print_flag, resume, verify, fsync_flag, follow_link_flag,

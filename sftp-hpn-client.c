@@ -1259,29 +1259,31 @@ sftp_conn_set_bundle_config(struct sftp_conn *conn, int use_bundle,
 }
 
 /*
- * HPN serial-path bundling: the recursive upload walk accumulates
- * bundle-eligible small files and ships each batch as one hpn-bundle
- * stream on the session connection, amortising the per-file OPEN/CLOSE
- * round trips that dominate small-file transfers at WAN RTTs.  The
- * eligibility policy is shared with the parallel planner
- * (sftp-hpn-bundle.h) so both modes make identical decisions.
+ * HPN serial-path bundling: the recursive walks in sftp-client.c
+ * accumulate bundle-eligible small files here - spanning directories,
+ * matching the parallel producer's grouping - and ship each batch as
+ * one hpn-bundle (upload) or hpn-bundle-fetch (download) transaction
+ * on the session connection.  All grouping decisions come from the
+ * shared policy in sftp-hpn-bundle.h: one source of truth with the
+ * parallel producer, so the two modes bundle identically.
  */
 
 void
-sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc, struct sftp_conn *conn,
-    int resume)
+sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc,
+    struct sftp_conn *conn, int resume, int is_download)
 {
 	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
-	uint64_t target;
 
 	memset(acc, 0, sizeof(*acc));
 	if (hpn == NULL || !hpn->bundle_cfg.use ||
-	    hpn->bundle_cfg.server_cant || resume ||
+	    hpn->bundle_cfg.server_cant || resume)
+		return;
+	if (is_download ? !sftp_conn_has_hpn_bundle_fetch(conn) :
 	    !sftp_conn_has_hpn_bundle(conn))
 		return;
-	target = hpn->bundle_cfg.size > 0 ?
+	acc->target = hpn->bundle_cfg.size > 0 ?
 	    hpn->bundle_cfg.size : HPN_BUNDLE_SIZE_DEFAULT;
-	acc->target = target;
+	acc->is_download = is_download;
 	acc->enabled = 1;
 }
 
@@ -1295,25 +1297,39 @@ sftp_hpn_bundle_acc_eligible(struct sftp_hpn_bundle_acc *acc, uint64_t size)
 	    hpn_bundle_file_eligible(size, acc->target);
 }
 
-/* Returns 1 when the accumulator must flush (shared policy: framed
- * bytes reach the target, or the member ceiling).  Frame accounting
- * matches the parallel producer: header + path + payload per member. */
+/*
+ * Append one member and return 1 when the accumulator must flush
+ * (shared policy: framed bytes reach the target, the member ceiling,
+ * or - downloads only - the fetch-request path budget).  src/dst are
+ * the transfer-order pair: local,remote for uploads; remote,local for
+ * downloads.  Frame accounting matches the parallel producer.
+ */
 int
 sftp_hpn_bundle_acc_add(struct sftp_hpn_bundle_acc *acc, const char *src,
     const char *dst, long long size)
 {
 	if (acc->n == acc->cap) {
 		acc->cap = acc->cap ? acc->cap * 2 : 64;
-		acc->entries = xreallocarray(acc->entries, acc->cap,
-		    sizeof(*acc->entries));
+		acc->src_paths = xreallocarray(acc->src_paths, acc->cap,
+		    sizeof(*acc->src_paths));
+		acc->dst_paths = xreallocarray(acc->dst_paths, acc->cap,
+		    sizeof(*acc->dst_paths));
 		acc->sizes = xreallocarray(acc->sizes, acc->cap,
 		    sizeof(*acc->sizes));
 	}
-	acc->entries[acc->n].local_path = xstrdup(src);
-	acc->entries[acc->n].remote_path = xstrdup(dst);
-	acc->entries[acc->n].result = 0;
+	acc->src_paths[acc->n] = xstrdup(src);
+	acc->dst_paths[acc->n] = xstrdup(dst);
 	acc->sizes[acc->n] = size;
 	acc->n++;
+	if (acc->is_download) {
+		/* The archive path is the REMOTE (src) path; the fetch
+		 * request also carries it as a string4. */
+		acc->bytes += BUNDLE_REC_FRAME_BYTES(strlen(src),
+		    (uint64_t)size);
+		acc->path_bytes += 4 + strlen(src);
+		return hpn_bundle_dl_should_flush(acc->bytes, acc->n,
+		    acc->target, acc->path_bytes, BUNDLE_DL_FETCH_REQ_MAX);
+	}
 	acc->bytes += BUNDLE_REC_FRAME_BYTES(strlen(dst), (uint64_t)size);
 	return hpn_bundle_should_flush(acc->bytes, acc->n, acc->target);
 }
@@ -1324,49 +1340,47 @@ sftp_hpn_bundle_acc_reset(struct sftp_hpn_bundle_acc *acc)
 	int i;
 
 	for (i = 0; i < acc->n; i++) {
-		free((void *)acc->entries[i].local_path);
-		free((void *)acc->entries[i].remote_path);
+		free(acc->src_paths[i]);
+		free(acc->dst_paths[i]);
 	}
 	acc->n = 0;
 	acc->bytes = 0;
+	acc->path_bytes = 0;
 }
 
 void
 sftp_hpn_bundle_acc_free(struct sftp_hpn_bundle_acc *acc)
 {
 	sftp_hpn_bundle_acc_reset(acc);
-	free(acc->entries);
+	free(acc->src_paths);
+	free(acc->dst_paths);
 	free(acc->sizes);
-	acc->entries = NULL;
+	acc->src_paths = NULL;
+	acc->dst_paths = NULL;
 	acc->sizes = NULL;
 	acc->cap = 0;
 	acc->enabled = 0;
 }
 
-/*
- * Flush the accumulated members as one bundle and consume the
- * accumulator.  Returns 0 when the walk may continue cleanly, 1 when
- * one or more members failed but the walk may continue (caller marks
- * the transfer failed), and -1 on abort conditions: POLICY_DENIED (the
- * bundle API contract forbids falling back) or the session connection
- * dying mid-bundle.
- */
-int
-sftp_hpn_bundle_acc_flush(struct sftp_conn *conn, struct sftp_hpn_bundle_acc *acc,
-    int preserve_flag, int print_flag, int verify, int fsync_flag,
-    int inplace_flag)
+/* Upload flush: one hpn-bundle stream.  Upload has NO per-member wire
+ * status - failure is whole-bundle with a three-way cause (see the
+ * result enum in sftp-client.h). */
+static int
+bundle_acc_flush_upload(struct sftp_conn *conn,
+    struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
+    int verify, int fsync_flag, int inplace_flag)
 {
+	struct sftp_hpn_bundle_upload_entry *entries;
 	int i, rc, failures = 0;
 
-	if (!acc->enabled || acc->n == 0)
-		return 0;
-
-	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Uploading bundle: %d files, %llu bytes\n",
-		    acc->n, (unsigned long long)acc->bytes);
-	rc = sftp_hpn_bundle_upload(conn, "", acc->entries, acc->n,
-	    preserve_flag, fsync_flag, sftp_conn_hpn(conn)->bundle_cfg.writer_pool,
-	    acc->target);
+	entries = xcalloc(acc->n, sizeof(*entries));
+	for (i = 0; i < acc->n; i++) {
+		entries[i].local_path = acc->src_paths[i];
+		entries[i].remote_path = acc->dst_paths[i];
+	}
+	rc = sftp_hpn_bundle_upload(conn, "", entries, acc->n,
+	    preserve_flag, fsync_flag,
+	    sftp_conn_hpn(conn)->bundle_cfg.writer_pool, acc->target);
 	switch (rc) {
 	case SFTP_HPN_BUNDLE_OK:
 		for (i = 0; i < acc->n; i++) {
@@ -1374,13 +1388,11 @@ sftp_hpn_bundle_acc_flush(struct sftp_conn *conn, struct sftp_hpn_bundle_acc *ac
 			 * verify phase (no-op unless verify is enabled);
 			 * success is logged now only when verify will not
 			 * log it after checking. */
-			sftp_conn_verify_park(conn, acc->entries[i].local_path,
-			    acc->entries[i].remote_path,
-			    /*local_is_target=*/0);
+			sftp_conn_verify_park(conn, acc->src_paths[i],
+			    acc->dst_paths[i], /*local_is_target=*/0);
 			if (!sftp_conn_verify_transfer_enabled(conn))
 				transferlog_file(TRANSFERLOG_SUCCESS,
-				    acc->sizes[i],
-				    acc->entries[i].remote_path);
+				    acc->sizes[i], acc->dst_paths[i]);
 		}
 		break;
 	case SFTP_HPN_BUNDLE_SERVER_CANT:
@@ -1390,35 +1402,144 @@ sftp_hpn_bundle_acc_flush(struct sftp_conn *conn, struct sftp_hpn_bundle_acc *ac
 		sftp_conn_hpn(conn)->bundle_cfg.server_cant = 1;
 		acc->enabled = 0;
 		for (i = 0; i < acc->n; i++) {
-			int ur = sftp_upload(conn, acc->entries[i].local_path,
-			    acc->entries[i].remote_path, preserve_flag,
-			    /*resume*/0, verify, fsync_flag,
-			    inplace_flag);
+			int ur = sftp_upload(conn, acc->src_paths[i],
+			    acc->dst_paths[i], preserve_flag,
+			    /*resume*/0, verify, fsync_flag, inplace_flag);
 			if (ur == -1) {
 				error("upload \"%s\" to \"%s\" failed",
-				    acc->entries[i].local_path,
-				    acc->entries[i].remote_path);
+				    acc->src_paths[i], acc->dst_paths[i]);
 				transferlog_file(TRANSFERLOG_FAILED,
-				    acc->sizes[i],
-				    acc->entries[i].remote_path);
+				    acc->sizes[i], acc->dst_paths[i]);
 				failures++;
 			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
 				transferlog_file(TRANSFERLOG_SUCCESS,
-				    acc->sizes[i],
-				    acc->entries[i].remote_path);
+				    acc->sizes[i], acc->dst_paths[i]);
 			}
 		}
 		break;
 	case SFTP_HPN_BUNDLE_POLICY_DENIED:
 		error("bundle upload denied by remote policy; aborting");
-		sftp_hpn_bundle_acc_reset(acc);
+		free(entries);
 		return -1;
 	case SFTP_HPN_BUNDLE_TRANSPORT_FAILED:
 	default:
 		error("bundle upload failed: connection error");
-		sftp_hpn_bundle_acc_reset(acc);
+		free(entries);
 		return -1;
 	}
-	sftp_hpn_bundle_acc_reset(acc);
+	free(entries);
 	return failures > 0 ? 1 : 0;
+}
+
+/* Download flush: one hpn-bundle-fetch transaction.  Downloads return
+ * per-entry results on a successful transaction; entries that failed
+ * are re-driven through the per-file path. */
+static int
+bundle_acc_flush_download(struct sftp_conn *conn,
+    struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
+    int verify, int fsync_flag, int inplace_flag)
+{
+	struct sftp_hpn_bundle_download_entry *entries;
+	int i, rc, dr, failures = 0;
+
+	entries = xcalloc(acc->n, sizeof(*entries));
+	for (i = 0; i < acc->n; i++) {
+		entries[i].remote_path = acc->src_paths[i];
+		entries[i].local_path = acc->dst_paths[i];
+	}
+	rc = sftp_hpn_bundle_download(conn, entries, acc->n,
+	    preserve_flag, sftp_conn_hpn(conn)->bundle_cfg.writer_pool);
+	switch (rc) {
+	case SFTP_HPN_BUNDLE_OK:
+		for (i = 0; i < acc->n; i++) {
+			if (entries[i].result == 0) {
+				sftp_conn_verify_park(conn,
+				    acc->dst_paths[i], acc->src_paths[i],
+				    /*local_is_target=*/1);
+				if (!sftp_conn_verify_transfer_enabled(conn))
+					transferlog_file(TRANSFERLOG_SUCCESS,
+					    acc->sizes[i], acc->dst_paths[i]);
+				continue;
+			}
+			/* Per-entry failure: re-drive individually (the
+			 * per-file path parks for verify internally). */
+			dr = sftp_download(conn, acc->src_paths[i],
+			    acc->dst_paths[i], NULL, preserve_flag,
+			    /*resume*/0, fsync_flag, inplace_flag, verify);
+			if (dr == -1) {
+				error("download \"%s\" to \"%s\" failed",
+				    acc->src_paths[i], acc->dst_paths[i]);
+				transferlog_file(TRANSFERLOG_FAILED,
+				    acc->sizes[i], acc->dst_paths[i]);
+				failures++;
+			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
+				transferlog_file(TRANSFERLOG_SUCCESS,
+				    acc->sizes[i], acc->dst_paths[i]);
+			}
+		}
+		break;
+	case SFTP_HPN_BUNDLE_SERVER_CANT:
+		debug_f("server refused bundle-fetch; per-file fallback");
+		sftp_conn_hpn(conn)->bundle_cfg.server_cant = 1;
+		acc->enabled = 0;
+		for (i = 0; i < acc->n; i++) {
+			dr = sftp_download(conn, acc->src_paths[i],
+			    acc->dst_paths[i], NULL, preserve_flag,
+			    /*resume*/0, fsync_flag, inplace_flag, verify);
+			if (dr == -1) {
+				error("download \"%s\" to \"%s\" failed",
+				    acc->src_paths[i], acc->dst_paths[i]);
+				transferlog_file(TRANSFERLOG_FAILED,
+				    acc->sizes[i], acc->dst_paths[i]);
+				failures++;
+			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
+				transferlog_file(TRANSFERLOG_SUCCESS,
+				    acc->sizes[i], acc->dst_paths[i]);
+			}
+		}
+		break;
+	case SFTP_HPN_BUNDLE_POLICY_DENIED:
+		error("bundle download denied by remote policy; aborting");
+		free(entries);
+		return -1;
+	case SFTP_HPN_BUNDLE_TRANSPORT_FAILED:
+	default:
+		error("bundle download failed: connection error");
+		free(entries);
+		return -1;
+	}
+	free(entries);
+	return failures > 0 ? 1 : 0;
+}
+
+/*
+ * Flush the accumulated members as one bundle transaction and consume
+ * the accumulator.  Returns 0 when the walk may continue cleanly, 1
+ * when one or more members failed but the walk may continue (caller
+ * marks the transfer failed), and -1 on abort conditions:
+ * POLICY_DENIED (the bundle API contract forbids falling back) or the
+ * session connection dying mid-bundle.
+ */
+int
+sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
+    struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
+    int verify, int fsync_flag, int inplace_flag)
+{
+	int r;
+
+	if (!acc->enabled || acc->n == 0)
+		return 0;
+
+	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
+		mprintf("%s bundle: %d files, %llu bytes\n",
+		    acc->is_download ? "Fetching" : "Uploading",
+		    acc->n, (unsigned long long)acc->bytes);
+	if (acc->is_download)
+		r = bundle_acc_flush_download(conn, acc, preserve_flag,
+		    print_flag, verify, fsync_flag, inplace_flag);
+	else
+		r = bundle_acc_flush_upload(conn, acc, preserve_flag,
+		    print_flag, verify, fsync_flag, inplace_flag);
+	sftp_hpn_bundle_acc_reset(acc);
+	return r;
 }

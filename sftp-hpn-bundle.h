@@ -105,4 +105,21 @@ hpn_bundle_should_flush(uint64_t framed_bytes, int members,
 	    members >= BUNDLE_BATCH_MAX_FILES;
 }
 
+/* Download bundles (hpn-bundle-fetch) list every member's remote path
+ * in ONE SFTP request, so a download accumulator must also flush
+ * before that path list overflows SFTP_MAX_MSG_LENGTH; the cap
+ * reserves one PATH_MAX overshoot + the ~44-byte request header.
+ * Expanded at use sites, which have SFTP_MAX_MSG_LENGTH and PATH_MAX.
+ * Upload streams paths inside the tar and is immune. */
+#define BUNDLE_DL_FETCH_REQ_MAX \
+    ((uint64_t)SFTP_MAX_MSG_LENGTH - PATH_MAX - 1024)
+
+static inline int
+hpn_bundle_dl_should_flush(uint64_t framed_bytes, int members,
+    uint64_t bundle_target, uint64_t path_bytes, uint64_t path_bytes_max)
+{
+	return hpn_bundle_should_flush(framed_bytes, members,
+	    bundle_target) || path_bytes >= path_bytes_max;
+}
+
 #endif /* _SFTP_HPN_BUNDLE_H */

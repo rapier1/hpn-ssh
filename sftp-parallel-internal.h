@@ -81,8 +81,7 @@ struct sftp_parallel;
  * and parallel_bundle_add) check it AFTER adding a member, so the cap reserves
  * one PATH_MAX overshoot + the ~44-byte request header.  Expanded at the use
  * sites (worker / unit), which both have SFTP_MAX_MSG_LENGTH and PATH_MAX. */
-#define BUNDLE_DL_FETCH_REQ_MAX \
-    ((uint64_t)SFTP_MAX_MSG_LENGTH - PATH_MAX - 1024)
+/* BUNDLE_DL_FETCH_REQ_MAX lives in sftp-hpn-bundle.h (shared policy). */
 
 /*
  * Soft byte cap on the size of a single upload batch.  Once a worker's
