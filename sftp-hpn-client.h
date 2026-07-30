@@ -361,13 +361,31 @@ struct sftp_hpn_bundle_acc {
  * Shared directory handling for the recursive transfer walks (serial
  * AND parallel-producer; one implementation - the hand-copied versions
  * measurably diverged).  ensure_* creates the destination directory
- * (remote for uploads, local for downloads).  Directory ATTRIBUTE
- * application (setstat / utimes+chmod) is DEFERRED: the walk records
- * each directory here and the owner applies the list once all file
- * content has landed - which both removes 1 synchronous RTT per
- * directory from the walk's critical path and fixes the ordering edge
- * where members extracted after a directory's attrs were applied could
- * clobber times or hit a write-stripped mode.
+ * (remote for uploads, local for downloads).
+ *
+ * Directory ATTRIBUTE application (setstat / utimes+chmod) is DEFERRED
+ * to restore stock OpenSSH's perms-AFTER-data ordering, which small-file
+ * bundling broke.  Stock applies a directory's final mode after its
+ * files are uploaded, so a restrictive mode (e.g. 0555) is set only
+ * once the directory no longer needs writing into.  Bundling accumulates
+ * files and writes them LATER at bundle flush, so an inline setstat ran
+ * perms-BEFORE-data and could lose files under -p into a read-only
+ * directory.  The walk records each directory here and the owner applies
+ * the list only after all file content has landed:
+ *   serial:   end of sftp_upload_dir / sftp_download_dir.
+ *   parallel: end of sftp_parallel_wait, after every unit has drained.
+ *
+ * Applied at END OF TRANSFER, not per-directory: bundles span directory
+ * boundaries, so a directory's files are not guaranteed written when the
+ * walk leaves it - only after the final flush.  Tradeoffs (accepted,
+ * bounded, never data-loss): the list costs one entry per directory for
+ * the whole transfer (memory on pathological million-dir trees), and an
+ * interrupted transfer leaves directories with the temporary writable
+ * perms until a re-run completes.  Files need no such deferral - they
+ * are written through an open fd and fchmod'd last, so the parent-dir
+ * write check at create time is the only ordering hazard.  See
+ * hpn-serial-bundling-design.md section 9 for the full rationale and the
+ * per-bundle-completion mitigation if the tradeoffs ever bite.
  */
 struct sftp_hpn_dirattr {
 	char   *path;
