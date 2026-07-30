@@ -1106,7 +1106,10 @@ struct hpn_strlist {
 	uint64_t         total;     /* total appends seen (may exceed cap) */
 };
 
+struct sftp_hpn_dirattr_list;	/* sftp-hpn-client.h; deferred dir attrs */
+
 struct sftp_parallel {
+
 	struct sftp_parallel_config cfg;
 	char                        cfg_port_buf[16]; /* owns cfg.port string */
 	struct sftp_workqueue      *q;
@@ -1539,6 +1542,15 @@ struct sftp_parallel {
 	                                  * reap (-1 = none) */
 	int      born_dead_stuck_count;  /* consecutive born-dead reaps on that
 	                                  * offset */
+
+	/* HPN: deferred directory attributes recorded by the producer
+	 * walks (shared helpers in sftp-hpn-client.c) and applied on the
+	 * control connection at the end of sftp_parallel_wait, once all
+	 * units have drained.  Written only by the walking (main) thread
+	 * and applied on that same thread; appended at the END of the
+	 * struct so no existing field offset shifts. */
+	struct sftp_hpn_dirattr_list *dirattrs;
+	struct sftp_conn *dirattrs_conn;
 };
 
 /*

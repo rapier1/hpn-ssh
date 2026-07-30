@@ -87,6 +87,7 @@ extern int showprogress;
  *     transport layer hasn't yet self-recovered.  Above this the
  *     retry storm itself becomes the load problem.
  */
+#include "sftp-hpn-client.h"	/* deferred dir attrs */
 #include "sftp-parallel-internal.h"
 
 /* Single definition; declared extern in sftp-parallel-internal.h. */
@@ -584,6 +585,16 @@ sftp_parallel_wait(struct sftp_parallel *p)
 		 * worker splices the bad sub-chunks of its range and re-verifies
 		 * on its own conn), so there is no separate repair phase here.
 		 */
+	}
+
+	/* HPN: apply the deferred directory attributes now that every
+	 * unit has drained (shared machinery with the serial walks). */
+	if (p->dirattrs != NULL) {
+		if (p->dirattrs_conn != NULL)
+			sftp_hpn_dirattrs_apply(p->dirattrs_conn, p->dirattrs);
+		sftp_hpn_dirattrs_free(p->dirattrs);
+		free(p->dirattrs);
+		p->dirattrs = NULL;
 	}
 }
 

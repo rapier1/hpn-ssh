@@ -357,7 +357,45 @@ struct sftp_hpn_bundle_acc {
 	int enabled;
 };
 
+/*
+ * Shared directory handling for the recursive transfer walks (serial
+ * AND parallel-producer; one implementation - the hand-copied versions
+ * measurably diverged).  ensure_* creates the destination directory
+ * (remote for uploads, local for downloads).  Directory ATTRIBUTE
+ * application (setstat / utimes+chmod) is DEFERRED: the walk records
+ * each directory here and the owner applies the list once all file
+ * content has landed - which both removes 1 synchronous RTT per
+ * directory from the walk's critical path and fixes the ordering edge
+ * where members extracted after a directory's attrs were applied could
+ * clobber times or hit a write-stripped mode.
+ */
+struct sftp_hpn_dirattr {
+	char   *path;
+	Attrib  a;          /* desired final attrs (remote) */
+	mode_t  mode;       /* desired final mode (local) */
+	int     is_local;   /* 0: remote setstat; 1: local utimes+chmod */
+	int     set_times;  /* local: dirattrib had ACMODTIME */
+	int64_t atime, mtime;
+};
+
+struct sftp_hpn_dirattr_list {
+	struct sftp_hpn_dirattr *v;
+	int n, cap;
+};
+
 struct sftp_conn;
+int  sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
+    Attrib *a, int *created);
+int  sftp_hpn_ensure_local_dir(const char *dst, Attrib *dirattrib,
+    mode_t *mode_out, mode_t *tmpmode_out);
+void sftp_hpn_dirattrs_defer_remote(struct sftp_hpn_dirattr_list *dl,
+    const char *path, const Attrib *a);
+void sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
+    const char *path, mode_t mode, mode_t tmpmode, const Attrib *dirattrib);
+void sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
+    struct sftp_hpn_dirattr_list *dl);
+void sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl);
+
 void sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc,
     struct sftp_conn *conn, int resume, int is_download);
 int sftp_hpn_bundle_acc_eligible(struct sftp_hpn_bundle_acc *acc,

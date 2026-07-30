@@ -27,12 +27,17 @@
 
 #include "includes.h"
 
+#include <sys/stat.h>
+#include <sys/time.h>
+
+#include <errno.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -1542,4 +1547,145 @@ sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
 		    print_flag, verify, fsync_flag, inplace_flag);
 	sftp_hpn_bundle_acc_reset(acc);
 	return r;
+}
+
+/*
+ * Shared directory handling - see the header comment in
+ * sftp-hpn-client.h.  One implementation for the serial walks
+ * (sftp-client.c) and the parallel producer walks
+ * (sftp-parallel-walk.c).
+ */
+
+/* Create the remote destination directory with write+exec temporarily
+ * forced (restored via the deferred attr application), tolerating an
+ * existing directory.  Mirrors the long-standing walk behaviour. */
+int
+sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
+    Attrib *a, int *created)
+{
+	Attrib dirattrib;
+	u_int32_t saved_perm = a->perm;
+	int r;
+
+	*created = 0;
+	a->perm |= (S_IWUSR|S_IXUSR);
+	r = sftp_mkdir(conn, dst, a, 0);
+	a->perm = saved_perm;
+	if (r == 0) {
+		*created = 1;
+		return 0;
+	}
+	if (sftp_stat(conn, dst, 0, &dirattrib) != 0)
+		return -1;
+	if (!S_ISDIR(dirattrib.perm)) {
+		error("\"%s\" exists but is not a directory", dst);
+		return -1;
+	}
+	return 0;
+}
+
+/* Local (download-side) counterpart: mkdir with write+exec forced,
+ * tolerating an existing directory.  Reports the final and temporary
+ * modes so the caller can defer the chmod. */
+int
+sftp_hpn_ensure_local_dir(const char *dst, Attrib *dirattrib,
+    mode_t *mode_out, mode_t *tmpmode_out)
+{
+	mode_t mode = 0777, tmpmode;
+
+	if (dirattrib->flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
+		mode = dirattrib->perm & 01777;
+	tmpmode = mode | (S_IWUSR|S_IXUSR);
+	if (mkdir(dst, tmpmode) == -1 && errno != EEXIST) {
+		error("mkdir %s: %s", dst, strerror(errno));
+		return -1;
+	}
+	*mode_out = mode;
+	*tmpmode_out = tmpmode;
+	return 0;
+}
+
+static struct sftp_hpn_dirattr *
+dirattrs_grow(struct sftp_hpn_dirattr_list *dl)
+{
+	if (dl->n == dl->cap) {
+		dl->cap = dl->cap ? dl->cap * 2 : 32;
+		dl->v = xreallocarray(dl->v, dl->cap, sizeof(*dl->v));
+	}
+	return &dl->v[dl->n++];
+}
+
+void
+sftp_hpn_dirattrs_defer_remote(struct sftp_hpn_dirattr_list *dl,
+    const char *path, const Attrib *a)
+{
+	struct sftp_hpn_dirattr *d = dirattrs_grow(dl);
+
+	memset(d, 0, sizeof(*d));
+	d->path = xstrdup(path);
+	d->a = *a;
+	d->is_local = 0;
+}
+
+void
+sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
+    const char *path, mode_t mode, mode_t tmpmode, const Attrib *dirattrib)
+{
+	struct sftp_hpn_dirattr *d = dirattrs_grow(dl);
+
+	memset(d, 0, sizeof(*d));
+	d->path = xstrdup(path);
+	d->is_local = 1;
+	d->mode = (mode != tmpmode) ? mode : (mode_t)-1;
+	if (dirattrib->flags & SSH2_FILEXFER_ATTR_ACMODTIME) {
+		d->set_times = 1;
+		d->atime = dirattrib->atime;
+		d->mtime = dirattrib->mtime;
+	}
+}
+
+/* Apply every deferred directory attribute.  Insertion order is the
+ * walk's post-order (children recorded before their parents), so
+ * applying in order touches child directories before parents and every
+ * parent AFTER all content beneath it has landed. */
+void
+sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
+    struct sftp_hpn_dirattr_list *dl)
+{
+	int i;
+
+	for (i = 0; i < dl->n; i++) {
+		struct sftp_hpn_dirattr *d = &dl->v[i];
+
+		if (!d->is_local) {
+			sftp_setstat(conn, d->path, &d->a);
+			continue;
+		}
+		if (d->set_times) {
+			struct timeval tv[2];
+
+			tv[0].tv_sec = d->atime;
+			tv[1].tv_sec = d->mtime;
+			tv[0].tv_usec = tv[1].tv_usec = 0;
+			if (utimes(d->path, tv) == -1)
+				error("local set times on \"%s\": %s",
+				    d->path, strerror(errno));
+		}
+		if (d->mode != (mode_t)-1 &&
+		    chmod(d->path, d->mode) == -1)
+			error("local chmod directory \"%s\": %s",
+			    d->path, strerror(errno));
+	}
+}
+
+void
+sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl)
+{
+	int i;
+
+	for (i = 0; i < dl->n; i++)
+		free(dl->v[i].path);
+	free(dl->v);
+	dl->v = NULL;
+	dl->n = dl->cap = 0;
 }

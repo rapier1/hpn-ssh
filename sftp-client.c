@@ -2420,7 +2420,8 @@ static int
 download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
     int depth, Attrib *dirattrib, int preserve_flag, int print_flag,
     int resume_flag, int verify, int fsync_flag, int follow_link_flag,
-    int inplace_flag, struct sftp_hpn_bundle_acc *bacc)
+    int inplace_flag, struct sftp_hpn_bundle_acc *bacc,
+    struct sftp_hpn_dirattr_list *dirs)
 {
 	int i, ret = 0, fr;
 	SFTP_DIRENT **dir_entries;
@@ -2449,18 +2450,9 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Retrieving %s\n", src);
 
-	if (dirattrib->flags & SSH2_FILEXFER_ATTR_PERMISSIONS) {
-		mode = dirattrib->perm & 01777;
-		tmpmode = mode | (S_IWUSR|S_IXUSR);
-	} else {
-		debug("download remote \"%s\": server "
-		    "did not send permissions", dst);
-	}
-
-	if (mkdir(dst, tmpmode) == -1 && errno != EEXIST) {
-		error("mkdir %s: %s", dst, strerror(errno));
+	/* HPN: shared helper; final mode/times DEFERRED to end-of-walk. */
+	if (sftp_hpn_ensure_local_dir(dst, dirattrib, &mode, &tmpmode) != 0)
 		return -1;
-	}
 
 	if (sftp_readdir(conn, src, &dir_entries) == -1) {
 		error("remote readdir \"%s\" failed", src);
@@ -2499,7 +2491,7 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			    depth + 1, a, preserve_flag,
 			    print_flag, resume_flag, verify,
 			    fsync_flag, follow_link_flag, inplace_flag,
-			    bacc) == -1)
+			    bacc, dirs) == -1)
 				ret = -1;
 		} else if (S_ISREG(a->perm) &&
 		    (a->flags & SSH2_FILEXFER_ATTR_SIZE) &&
@@ -2559,23 +2551,17 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	free(new_dst);
 	free(new_src);
 
-	if (preserve_flag) {
-		if (dirattrib->flags & SSH2_FILEXFER_ATTR_ACMODTIME) {
-			struct timeval tv[2];
-			tv[0].tv_sec = dirattrib->atime;
-			tv[1].tv_sec = dirattrib->mtime;
-			tv[0].tv_usec = tv[1].tv_usec = 0;
-			if (utimes(dst, tv) == -1)
-				error("local set times on \"%s\": %s",
-				    dst, strerror(errno));
-		} else
-			debug("Server did not send times for directory "
-			    "\"%s\"", dst);
-	}
+	{
+		/* Times only under -p, mirroring the historical behaviour;
+		 * the write-enable chmod is always deferred-reverted. */
+		Attrib da = *dirattrib;
 
-	if (mode != tmpmode && chmod(dst, mode) == -1)
-		error("local chmod directory \"%s\": %s", dst,
-		    strerror(errno));
+		if (!preserve_flag)
+			da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+		if (preserve_flag || mode != tmpmode)
+			sftp_hpn_dirattrs_defer_local(dirs, dst, mode,
+			    tmpmode, &da);
+	}
 
 	sftp_free_dirents(dir_entries);
 
@@ -2590,6 +2576,7 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	char *src_canon;
 	int ret;
 	struct sftp_hpn_bundle_acc bacc;
+	struct sftp_hpn_dirattr_list dirs = { NULL, 0, 0 };
 
 	if ((src_canon = sftp_realpath(conn, src)) == NULL) {
 		error("download \"%s\": path canonicalization failed", src);
@@ -2606,7 +2593,7 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 
 	ret = download_dir_internal(conn, src_canon, dst, 0,
 	    dirattrib, preserve_flag, print_flag, resume_flag, verify,
-	    fsync_flag, follow_link_flag, inplace_flag, &bacc);
+	    fsync_flag, follow_link_flag, inplace_flag, &bacc, &dirs);
 
 	/* Fetch any members still pending.  Skip when interrupted - a
 	 * re-run re-walks; do not start new work on the way out. */
@@ -2616,6 +2603,11 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 			ret = -1;
 	}
 	sftp_hpn_bundle_acc_free(&bacc);
+
+	/* Apply the deferred directory attributes now that all content
+	 * (including the final bundle) has landed. */
+	sftp_hpn_dirattrs_apply(conn, &dirs);
+	sftp_hpn_dirattrs_free(&dirs);
 
 	free(src_canon);
 	return ret;
@@ -3157,15 +3149,14 @@ static int
 upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
     int depth, int preserve_flag, int print_flag, int resume, int verify,
     int fsync_flag, int follow_link_flag, int inplace_flag,
-    struct sftp_hpn_bundle_acc *bacc)
+    struct sftp_hpn_bundle_acc *bacc, struct sftp_hpn_dirattr_list *dirs)
 {
 	int created = 0, ret = 0;
 	DIR *dirp;
 	struct dirent *dp;
 	char *filename, *new_src = NULL, *new_dst = NULL;
 	struct stat sb;
-	Attrib a, dirattrib;
-	uint32_t saved_perm;
+	Attrib a;
 	int fr;
 
 	debug2_f("upload local dir \"%s\" to remote \"%s\"", src, dst);
@@ -3193,25 +3184,11 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	if (!preserve_flag)
 		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 
-	/*
-	 * sftp lacks a portable status value to match errno EEXIST,
-	 * so if we get a failure back then we must check whether
-	 * the path already existed and is a directory.  Ensure we can
-	 * write to the directory we create for the duration of the transfer.
-	 */
-	saved_perm = a.perm;
-	a.perm |= (S_IWUSR|S_IXUSR);
-	if (sftp_mkdir(conn, dst, &a, 0) == 0)
-		created = 1;
-	else {
-		if (sftp_stat(conn, dst, 0, &dirattrib) != 0)
-			return -1;
-		if (!S_ISDIR(dirattrib.perm)) {
-			error("\"%s\" exists but is not a directory", dst);
-			return -1;
-		}
-	}
-	a.perm = saved_perm;
+	/* HPN: shared helper (also used by the parallel producer walk) -
+	 * creates with write+exec forced; the directory's final attributes
+	 * are DEFERRED to end-of-walk via the dirs list. */
+	if (sftp_hpn_ensure_remote_dir(conn, dst, &a, &created) != 0)
+		return -1;
 
 	if ((dirp = opendir(src)) == NULL) {
 		error("local opendir \"%s\": %s", src, strerror(errno));
@@ -3252,7 +3229,7 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			if (upload_dir_internal(conn, new_src, new_dst,
 			    depth + 1, preserve_flag, print_flag, resume,
 			    verify, fsync_flag, follow_link_flag,
-			    inplace_flag, bacc) == -1)
+			    inplace_flag, bacc, dirs) == -1)
 				ret = -1;
 		} else if (S_ISREG(sb.st_mode) &&
 		    sftp_hpn_bundle_acc_eligible(bacc,
@@ -3308,7 +3285,7 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	free(new_src);
 
 	if (created || preserve_flag)
-		sftp_setstat(conn, dst, &a);
+		sftp_hpn_dirattrs_defer_remote(dirs, dst, &a);
 
 	(void) closedir(dirp);
 	return ret;
@@ -3322,6 +3299,7 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	char *dst_canon;
 	int ret;
 	struct sftp_hpn_bundle_acc bacc;
+	struct sftp_hpn_dirattr_list dirs = { NULL, 0, 0 };
 
 	if ((dst_canon = sftp_realpath(conn, dst)) == NULL) {
 		error("upload \"%s\": path canonicalization failed", dst);
@@ -3337,7 +3315,7 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 
 	ret = upload_dir_internal(conn, src, dst_canon, 0, preserve_flag,
 	    print_flag, resume, verify, fsync_flag, follow_link_flag,
-	    inplace_flag, &bacc);
+	    inplace_flag, &bacc, &dirs);
 
 	/* Ship any members still pending.  Skip when interrupted - a
 	 * re-run re-walks; do not start new work on the way out. */
@@ -3347,6 +3325,11 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 			ret = -1;
 	}
 	sftp_hpn_bundle_acc_free(&bacc);
+
+	/* Apply the deferred directory attributes now that all content
+	 * (including the final bundle) has landed. */
+	sftp_hpn_dirattrs_apply(conn, &dirs);
+	sftp_hpn_dirattrs_free(&dirs);
 
 	free(dst_canon);
 	return ret;

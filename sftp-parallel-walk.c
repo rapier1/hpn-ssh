@@ -63,6 +63,8 @@
 #include "sftp-client.h"
 #include "sftp-lustre-client.h"     /* maybe_apply_lustre_layout{,_local} */
 #include "sftp-parallel.h"
+#include "xmalloc.h"		/* xcalloc for the deferred dir-attr list */
+#include "sftp-hpn-client.h"	/* shared dir helpers */
 #include "sftp-parallel-internal.h"	/* parallel_verify_prefix_register */
 
 /*
@@ -70,6 +72,17 @@
  * walker failure rather than risking stack exhaustion.
  */
 #define PARALLEL_MAX_DIR_DEPTH 64
+
+/* Lazy accessor for the deferred directory-attribute list (applied at
+ * the end of sftp_parallel_wait; see sftp-parallel-internal.h). */
+static struct sftp_hpn_dirattr_list *
+parallel_dirattrs(struct sftp_parallel *p, struct sftp_conn *conn)
+{
+	if (p->dirattrs == NULL)
+		p->dirattrs = xcalloc(1, sizeof(*p->dirattrs));
+	p->dirattrs_conn = conn;
+	return p->dirattrs;
+}
 
 static int
 parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
@@ -108,25 +121,14 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	a.perm &= 01777;
 	if (!preserve_flag)
 		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-	saved_perm = a.perm;
-	a.perm |= (S_IWUSR|S_IXUSR);
 	sftp_parallel_set_walker_phase(p, SFTP_WKP_MKDIR);
-	if (sftp_mkdir(conn, dst, &a, 0) == 0) {
-		created = 1;
-	} else {
-		if (sftp_stat(conn, dst, 0, &dirattrib) != 0) {
-			sftp_parallel_walker_record_failure(p, src,
-			    "cannot create or access destination directory");
-			return -1;
-		}
-		if (!S_ISDIR(dirattrib.perm)) {
-			error("\"%s\" exists but is not a directory", dst);
-			sftp_parallel_walker_record_failure(p, src,
-			    "destination exists but is not a directory");
-			return -1;
-		}
+	/* HPN: shared helper (same one the serial walk uses); final
+	 * attrs are deferred until every unit has drained. */
+	if (sftp_hpn_ensure_remote_dir(conn, dst, &a, &created) != 0) {
+		sftp_parallel_walker_record_failure(p, src,
+		    "cannot create or access destination directory");
+		return -1;
 	}
-	a.perm = saved_perm;
 
 	/*
 	 * Now that the destination directory exists, try to bump its Lustre
@@ -227,7 +229,8 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	free(new_src);
 
 	if (created || preserve_flag)
-		sftp_setstat(conn, dst, &a);
+		sftp_hpn_dirattrs_defer_remote(parallel_dirattrs(p, conn),
+		    dst, &a);
 
 	(void)closedir(dirp);
 	return ret;
@@ -292,13 +295,10 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		sftp_parallel_walker_record_failure(p, src, "not a directory");
 		return -1;
 	}
-	if (dirattrib->flags & SSH2_FILEXFER_ATTR_PERMISSIONS) {
-		mode = dirattrib->perm & 01777;
-		tmpmode = mode | (S_IWUSR|S_IXUSR);
-	}
-	if (mkdir(dst, tmpmode) == -1 && errno != EEXIST) {
-		error("mkdir %s: %s", dst, strerror(errno));
-		sftp_parallel_walker_record_failure(p, dst, strerror(errno));
+	/* HPN: shared helper; final mode/times deferred until drain. */
+	if (sftp_hpn_ensure_local_dir(dst, dirattrib, &mode, &tmpmode) != 0) {
+		sftp_parallel_walker_record_failure(p, dst,
+		    "cannot create local directory");
 		return -1;
 	}
 	/* Download parity: give the local destination directory the same
@@ -381,19 +381,16 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	free(new_dst);
 	free(new_src);
 
-	if (preserve_flag &&
-	    (dirattrib->flags & SSH2_FILEXFER_ATTR_ACMODTIME)) {
-		struct timeval tv[2];
-		tv[0].tv_sec = dirattrib->atime;
-		tv[1].tv_sec = dirattrib->mtime;
-		tv[0].tv_usec = tv[1].tv_usec = 0;
-		if (utimes(dst, tv) == -1)
-			error("local set times on \"%s\": %s",
-			    dst, strerror(errno));
+	{
+		Attrib da = *dirattrib;
+
+		if (!preserve_flag)
+			da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+		if (preserve_flag || mode != tmpmode)
+			sftp_hpn_dirattrs_defer_local(
+			    parallel_dirattrs(p, conn), dst, mode,
+			    tmpmode, &da);
 	}
-	if (mode != tmpmode && chmod(dst, mode) == -1)
-		error("local chmod directory \"%s\": %s",
-		    dst, strerror(errno));
 
 	sftp_free_dirents(dir_entries);
 	return ret;
