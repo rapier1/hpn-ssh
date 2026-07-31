@@ -1202,6 +1202,64 @@ sftp_setstat(struct sftp_conn *conn, const char *path, Attrib *a)
 	return status == SSH2_FX_OK ? 0 : -1;
 }
 
+/*
+ * Apply N independent SSH2_FXP_SETSTAT requests with a bounded window of
+ * outstanding requests instead of one blocking round trip each.  The SFTP
+ * server replies in request order on a connection (get_status treats an
+ * out-of-order id as a protocol violation), so we send a window, then
+ * drain-and-refill in order.  Directory setstats have no inter-directory
+ * dependency, so this is safe; it collapses the deferred directory-attr
+ * batch (upload_dir / parallel wait) from ~N sequential RTTs to ~N/window.
+ * Best-effort like sftp_setstat: a failed setstat is logged, not fatal.
+ * Returns the number of failures.
+ */
+#define SFTP_SETSTAT_PIPELINE_WINDOW 64
+int
+sftp_setstat_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
+    int n)
+{
+	u_int *ids;
+	u_int status;
+	int sent = 0, recv = 0, failures = 0, window;
+
+	if (n <= 0)
+		return 0;
+	window = n < SFTP_SETSTAT_PIPELINE_WINDOW ?
+	    n : SFTP_SETSTAT_PIPELINE_WINDOW;
+	ids = xcalloc(n, sizeof(*ids));
+
+	debug2_f("pipelining %d directory setstats (window %d)", n, window);
+	for (sent = 0; sent < window; sent++) {
+		ids[sent] = conn->msg_id++;
+		send_string_attrs_request(conn, ids[sent], SSH2_FXP_SETSTAT,
+		    paths[sent], strlen(paths[sent]), &attrs[sent]);
+	}
+	while (recv < n) {
+		status = get_status(conn, ids[recv]);
+		if (status == SSH2_FX_CONNECTION_LOST) {
+			/* Dead/compromised connection - stop draining; the
+			 * remaining replies go unread as the conn tears down. */
+			failures += n - recv;
+			break;
+		}
+		if (status != SSH2_FX_OK) {
+			error("remote setstat \"%s\": %s", paths[recv],
+			    fx2txt(status));
+			failures++;
+		}
+		recv++;
+		if (sent < n) {
+			ids[sent] = conn->msg_id++;
+			send_string_attrs_request(conn, ids[sent],
+			    SSH2_FXP_SETSTAT, paths[sent],
+			    strlen(paths[sent]), &attrs[sent]);
+			sent++;
+		}
+	}
+	free(ids);
+	return failures;
+}
+
 int
 sftp_fsetstat(struct sftp_conn *conn, const u_char *handle, u_int handle_len,
     Attrib *a)

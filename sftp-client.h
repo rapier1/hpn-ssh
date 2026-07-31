@@ -187,6 +187,14 @@ int sftp_lstat(struct sftp_conn *, const char *, int, Attrib *);
 /* Set file attributes of 'path' */
 int sftp_setstat(struct sftp_conn *, const char *, Attrib *);
 
+/*
+ * Apply N independent directory setstats with a bounded outstanding-request
+ * window instead of one blocking round trip each.  Used by the deferred
+ * directory-attribute apply (sftp_hpn_dirattrs_apply); see the definition
+ * for the in-order-reply contract it relies on.
+ */
+int sftp_setstat_pipeline(struct sftp_conn *, char **, Attrib *, int);
+
 /* Set file attributes of open file 'handle' */
 int sftp_fsetstat(struct sftp_conn *, const u_char *, u_int, Attrib *);
 

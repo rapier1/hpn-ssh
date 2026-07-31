@@ -1645,20 +1645,32 @@ sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
 }
 
 /* Apply every deferred directory attribute.  Insertion order is the
- * walk's post-order (children recorded before their parents), so
- * applying in order touches child directories before parents and every
- * parent AFTER all content beneath it has landed. */
+ * walk's post-order (children recorded before their parents).  Remote
+ * (upload) setstats are applied via sftp_setstat_pipeline - one window
+ * of outstanding requests instead of one blocking RTT per directory,
+ * which is the bulk of the deferred batch's cost on a WAN.  Local
+ * (download) attrs are plain syscalls with no round trip, applied
+ * inline.  A transfer is one direction, so in practice the list is
+ * all-remote or all-local; the pipeline preserves list order, and
+ * directory setstats have no inter-directory dependency anyway. */
 void
 sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
     struct sftp_hpn_dirattr_list *dl)
 {
-	int i;
+	char **paths;
+	Attrib *attrs;
+	int i, nr = 0;
+
+	paths = xcalloc(dl->n, sizeof(*paths));
+	attrs = xcalloc(dl->n, sizeof(*attrs));
 
 	for (i = 0; i < dl->n; i++) {
 		struct sftp_hpn_dirattr *d = &dl->v[i];
 
 		if (!d->is_local) {
-			sftp_setstat(conn, d->path, &d->a);
+			paths[nr] = d->path;	/* borrowed; list outlives us */
+			attrs[nr] = d->a;
+			nr++;
 			continue;
 		}
 		if (d->set_times) {
@@ -1676,6 +1688,12 @@ sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
 			error("local chmod directory \"%s\": %s",
 			    d->path, strerror(errno));
 	}
+
+	if (nr > 0)
+		(void)sftp_setstat_pipeline(conn, paths, attrs, nr);
+
+	free(paths);
+	free(attrs);
 }
 
 void

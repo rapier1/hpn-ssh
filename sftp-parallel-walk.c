@@ -93,8 +93,7 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	struct dirent *dp;
 	char *new_src = NULL, *new_dst = NULL;
 	struct stat sb;
-	Attrib a, dirattrib;
-	uint32_t saved_perm;
+	Attrib a;
 	int preserve_flag    = sftp_parallel_preserve_flag(p);
 	int follow_link_flag = sftp_parallel_follow_link_flag(p);
 
