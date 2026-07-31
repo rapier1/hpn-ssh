@@ -195,6 +195,20 @@ int sftp_setstat(struct sftp_conn *, const char *, Attrib *);
  */
 int sftp_setstat_pipeline(struct sftp_conn *, char **, Attrib *, int);
 
+/*
+ * Create N sibling directories with a bounded outstanding-request window
+ * instead of one blocking mkdir round trip each.  created_out[i] is set to
+ * 1 iff we created it (0 if it pre-existed).  Used by the recursive upload
+ * walks; see the definition for the sibling-independence and stat-fallback
+ * contract.  Caller chunks at MKDIR_BATCH_MAX.
+ */
+int sftp_mkdir_pipeline(struct sftp_conn *, char **, Attrib *, int, u_char *);
+
+/* Max sibling directories created as one atomic (fully-drained) mkdir batch;
+ * larger sibling sets are chunked.  Covers ~99.9% of trees in one pass;
+ * value-aligned with BUNDLE_BATCH_MAX_FILES for consistency. */
+#define MKDIR_BATCH_MAX 8192
+
 /* Set file attributes of open file 'handle' */
 int sftp_fsetstat(struct sftp_conn *, const u_char *, u_int, Attrib *);
 

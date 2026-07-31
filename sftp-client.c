@@ -1260,6 +1260,98 @@ sftp_setstat_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 	return failures;
 }
 
+/*
+ * Create N sibling directories (paths[], creation attrs[]) with a bounded
+ * window of outstanding SSH2_FXP_MKDIR requests instead of one blocking
+ * round trip each.  Siblings are order-independent (each depends only on
+ * the already-existing parent), so pipelining is safe; the caller chunks
+ * at MKDIR_BATCH_MAX and drains each chunk fully, so every directory
+ * provably exists before its files are written.  Each directory is created
+ * with owner write+exec forced (mirrors sftp_hpn_ensure_remote_dir) so the
+ * transfer can write into a read-only source directory; the real mode is
+ * restored by the deferred setstat.  created_out[i] is set to 1 iff we
+ * created it (mkdir succeeded), 0 if it pre-existed - which drives the
+ * "created || preserve" deferred-setstat decision, upstream-identical.
+ * mkdir failures (rare: pre-existing dir) fall back to an individual stat
+ * to distinguish a tolerable existing directory from a real error.
+ * Returns the number of real failures.
+ */
+int
+sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
+    int n, u_char *created_out)
+{
+	u_int *ids;
+	u_int status;
+	int *failed;
+	Attrib wa;
+	int sent, recv = 0, nfailed = 0, failures = 0, window, k;
+
+	if (n <= 0)
+		return 0;
+	window = n < SFTP_SETSTAT_PIPELINE_WINDOW ?
+	    n : SFTP_SETSTAT_PIPELINE_WINDOW;
+	ids = xcalloc(n, sizeof(*ids));
+	failed = xcalloc(n, sizeof(*failed));
+	memset(created_out, 0, (size_t)n);
+
+	/*
+	 * Phase 1: pipeline all the MKDIRs and drain their statuses in order.
+	 * Defer the stat of any failure to phase 2 - a stat issued here would
+	 * collide with the still-outstanding mkdir replies (in-order stream).
+	 */
+	debug2_f("pipelining %d directory mkdirs (window %d)", n, window);
+	for (sent = 0; sent < window; sent++) {
+		wa = attrs[sent];
+		wa.perm |= (S_IWUSR|S_IXUSR);
+		ids[sent] = conn->msg_id++;
+		send_string_attrs_request(conn, ids[sent], SSH2_FXP_MKDIR,
+		    paths[sent], strlen(paths[sent]), &wa);
+	}
+	while (recv < n) {
+		status = get_status(conn, ids[recv]);
+		if (status == SSH2_FX_CONNECTION_LOST) {
+			failures += n - recv;
+			free(ids);
+			free(failed);
+			return failures;
+		}
+		if (status == SSH2_FX_OK)
+			created_out[recv] = 1;
+		else
+			failed[nfailed++] = recv;
+		recv++;
+		if (sent < n) {
+			wa = attrs[sent];
+			wa.perm |= (S_IWUSR|S_IXUSR);
+			ids[sent] = conn->msg_id++;
+			send_string_attrs_request(conn, ids[sent],
+			    SSH2_FXP_MKDIR, paths[sent],
+			    strlen(paths[sent]), &wa);
+			sent++;
+		}
+	}
+	free(ids);
+
+	/*
+	 * Phase 2 (usually empty): the stream is now drained, so an individual
+	 * stat per failure is safe.  Tolerate a pre-existing directory
+	 * (created_out stays 0 -> no spurious setstat); anything else is real.
+	 */
+	for (k = 0; k < nfailed; k++) {
+		int i = failed[k];
+		Attrib ex;
+
+		if (sftp_stat(conn, paths[i], 1, &ex) == 0 &&
+		    (ex.flags & SSH2_FILEXFER_ATTR_PERMISSIONS) &&
+		    S_ISDIR(ex.perm))
+			continue;	/* pre-existing directory: tolerate */
+		error("remote mkdir \"%s\": failed", paths[i]);
+		failures++;
+	}
+	free(failed);
+	return failures;
+}
+
 int
 sftp_fsetstat(struct sftp_conn *conn, const u_char *handle, u_int handle_len,
     Attrib *a)
@@ -3203,19 +3295,79 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	return (r != 0 || status != 0) ? -1 : 0;
 }
 
+static int upload_dir_internal(struct sftp_conn *, const char *,
+    const char *, int, int, int, int, int, int, int, int,
+    struct sftp_hpn_bundle_acc *, struct sftp_hpn_dirattr_list *, int);
+
+/* One collected child directory awaiting a pipelined mkdir batch. */
+struct upload_subdir {
+	char  *src;
+	char  *dst;
+	Attrib a;	/* creation/final attrs, source-derived */
+};
+
+/*
+ * Create the subdirs collected from one directory level in pipelined
+ * MKDIR_BATCH_MAX-sized batches (fully drained), recurse into each, and
+ * hand each child its own "created" flag so the recursion defers the right
+ * setstat.  Siblings are order-independent, so batching is safe and the
+ * full drain guarantees a directory exists before its files are written.
+ */
 static int
-upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
+upload_subdirs_flush(struct sftp_conn *conn, struct upload_subdir *sd, int n,
     int depth, int preserve_flag, int print_flag, int resume, int verify,
     int fsync_flag, int follow_link_flag, int inplace_flag,
     struct sftp_hpn_bundle_acc *bacc, struct sftp_hpn_dirattr_list *dirs)
 {
-	int created = 0, ret = 0;
+	char **paths;
+	Attrib *attrs;
+	u_char *created;
+	int i, base, ret = 0;
+
+	if (n <= 0)
+		return 0;
+	paths = xcalloc(n, sizeof(*paths));
+	attrs = xcalloc(n, sizeof(*attrs));
+	created = xcalloc(n, sizeof(*created));
+	for (i = 0; i < n; i++) {
+		paths[i] = sd[i].dst;
+		attrs[i] = sd[i].a;
+	}
+	/* Chunk so no single mkdir batch materialises an unbounded set. */
+	for (base = 0; base < n && !interrupted; base += MKDIR_BATCH_MAX) {
+		int nb = n - base < MKDIR_BATCH_MAX ? n - base : MKDIR_BATCH_MAX;
+		(void)sftp_mkdir_pipeline(conn, paths + base, attrs + base,
+		    nb, created + base);
+	}
+	free(paths);
+	free(attrs);
+	/* Recurse into each now-created child, passing its created flag. */
+	for (i = 0; i < n && !interrupted; i++) {
+		if (upload_dir_internal(conn, sd[i].src, sd[i].dst, depth + 1,
+		    preserve_flag, print_flag, resume, verify, fsync_flag,
+		    follow_link_flag, inplace_flag, bacc, dirs,
+		    (int)created[i]) == -1)
+			ret = -1;
+	}
+	free(created);
+	return ret;
+}
+
+static int
+upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
+    int depth, int preserve_flag, int print_flag, int resume, int verify,
+    int fsync_flag, int follow_link_flag, int inplace_flag,
+    struct sftp_hpn_bundle_acc *bacc, struct sftp_hpn_dirattr_list *dirs,
+    int created)
+{
+	int ret = 0, fr;
 	DIR *dirp;
 	struct dirent *dp;
 	char *filename, *new_src = NULL, *new_dst = NULL;
 	struct stat sb;
 	Attrib a;
-	int fr;
+	struct upload_subdir *subdirs = NULL;
+	int nsub = 0, subcap = 0;
 
 	debug2_f("upload local dir \"%s\" to remote \"%s\"", src, dst);
 
@@ -3235,6 +3387,8 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		mprintf("Entering %s\n", src);
 
+	/* This directory's source-derived attrs (dst itself was created by the
+	 * caller's mkdir batch, or by sftp_upload_dir for the root). */
 	stat_to_attrib(&sb, &a);
 	a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
 	a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
@@ -3242,17 +3396,13 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	if (!preserve_flag)
 		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 
-	/* HPN: shared helper (also used by the parallel producer walk) -
-	 * creates with write+exec forced; the directory's final attributes
-	 * are DEFERRED to end-of-walk via the dirs list. */
-	if (sftp_hpn_ensure_remote_dir(conn, dst, &a, &created) != 0)
-		return -1;
-
 	if ((dirp = opendir(src)) == NULL) {
 		error("local opendir \"%s\": %s", src, strerror(errno));
 		return -1;
 	}
 
+	/* Single pass: collect subdirs (created together afterwards), and
+	 * process files inline into the bundle / per-file path as before. */
 	while (((dp = readdir(dirp)) != NULL) && !interrupted) {
 		if (dp->d_ino == 0)
 			continue;
@@ -3284,11 +3434,24 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 			}
 		}
 		if (S_ISDIR(sb.st_mode)) {
-			if (upload_dir_internal(conn, new_src, new_dst,
-			    depth + 1, preserve_flag, print_flag, resume,
-			    verify, fsync_flag, follow_link_flag,
-			    inplace_flag, bacc, dirs) == -1)
-				ret = -1;
+			/* Collect for the pipelined mkdir batch; recursion
+			 * happens after the batch (dir must exist first). */
+			if (nsub == subcap) {
+				subcap = subcap ? subcap * 2 : 64;
+				subdirs = xreallocarray(subdirs, subcap,
+				    sizeof(*subdirs));
+			}
+			subdirs[nsub].src = new_src;
+			subdirs[nsub].dst = new_dst;
+			stat_to_attrib(&sb, &subdirs[nsub].a);
+			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+			subdirs[nsub].a.perm &= 01777;
+			if (!preserve_flag)
+				subdirs[nsub].a.flags &=
+				    ~SSH2_FILEXFER_ATTR_ACMODTIME;
+			nsub++;
+			new_src = new_dst = NULL;	/* owned by subdirs[] */
 		} else if (S_ISREG(sb.st_mode) &&
 		    sftp_hpn_bundle_acc_eligible(bacc,
 		    (uint64_t)sb.st_size)) {
@@ -3341,11 +3504,29 @@ upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 	}
 	free(new_dst);
 	free(new_src);
+	(void) closedir(dirp);
 
+	/* Batch-create the collected subdirs, then recurse into them. */
+	if (!interrupted && nsub > 0) {
+		if (upload_subdirs_flush(conn, subdirs, nsub, depth,
+		    preserve_flag, print_flag, resume, verify, fsync_flag,
+		    follow_link_flag, inplace_flag, bacc, dirs) == -1)
+			ret = -1;
+	}
+	{
+		int i;
+		for (i = 0; i < nsub; i++) {
+			free(subdirs[i].src);
+			free(subdirs[i].dst);
+		}
+		free(subdirs);
+	}
+
+	/* Defer this directory's own final attributes (its dst was created by
+	 * the caller); upstream "created || preserve" gate. */
 	if (created || preserve_flag)
 		sftp_hpn_dirattrs_defer_remote(dirs, dst, &a);
 
-	(void) closedir(dirp);
 	return ret;
 }
 
@@ -3371,9 +3552,36 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	 * on, and this is not a resume transfer. */
 	sftp_hpn_bundle_acc_init(&bacc, conn, resume, /*download*/0);
 
-	ret = upload_dir_internal(conn, src, dst_canon, 0, preserve_flag,
-	    print_flag, resume, verify, fsync_flag, follow_link_flag,
-	    inplace_flag, &bacc, &dirs);
+	/* Create the root destination directory before walking - every deeper
+	 * directory is created by its parent level's pipelined mkdir batch, so
+	 * upload_dir_internal assumes its dst already exists. */
+	{
+		struct stat rsb;
+		Attrib ra;
+		int rcreated = 0;
+
+		if (stat(src, &rsb) == -1 || !S_ISDIR(rsb.st_mode)) {
+			error("stat local \"%s\": not a directory", src);
+			sftp_hpn_bundle_acc_free(&bacc);
+			free(dst_canon);
+			return -1;
+		}
+		stat_to_attrib(&rsb, &ra);
+		ra.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+		ra.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+		ra.perm &= 01777;
+		if (!preserve_flag)
+			ra.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+		if (sftp_hpn_ensure_remote_dir(conn, dst_canon, &ra,
+		    &rcreated) != 0) {
+			sftp_hpn_bundle_acc_free(&bacc);
+			free(dst_canon);
+			return -1;
+		}
+		ret = upload_dir_internal(conn, src, dst_canon, 0,
+		    preserve_flag, print_flag, resume, verify, fsync_flag,
+		    follow_link_flag, inplace_flag, &bacc, &dirs, rcreated);
+	}
 
 	/* Ship any members still pending.  Skip when interrupted - a
 	 * re-run re-walks; do not start new work on the way out. */

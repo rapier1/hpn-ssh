@@ -1661,6 +1661,11 @@ sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
 	Attrib *attrs;
 	int i, nr = 0;
 
+	if (dl->n == 0)
+		return;		/* nothing deferred (e.g. download, no -p,
+				 * dirs needed no write-enabling) - xcalloc(0)
+				 * would fatal */
+
 	paths = xcalloc(dl->n, sizeof(*paths));
 	attrs = xcalloc(dl->n, sizeof(*attrs));
 

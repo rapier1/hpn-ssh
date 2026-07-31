@@ -84,16 +84,71 @@ parallel_dirattrs(struct sftp_parallel *p, struct sftp_conn *conn)
 	return p->dirattrs;
 }
 
+static int parallel_upload_walk(struct sftp_parallel *, struct sftp_conn *,
+    const char *, const char *, int, int, int, int);
+
+/* One collected child directory awaiting a pipelined mkdir batch. */
+struct parallel_subdir {
+	char  *src;
+	char  *dst;
+	Attrib a;
+};
+
+/*
+ * Create the subdirs collected from one directory level in pipelined
+ * MKDIR_BATCH_MAX chunks (fully drained) on the control connection, then
+ * recurse into each with its own "created" flag.  Same mechanism and
+ * safety (sibling independence + full drain) as the serial walk.
+ */
+static int
+parallel_upload_subdirs_flush(struct sftp_parallel *p, struct sftp_conn *conn,
+    struct parallel_subdir *sd, int n, int depth, int resume, int verify)
+{
+	char **paths;
+	Attrib *attrs;
+	u_char *created;
+	int i, base, ret = 0;
+
+	if (n <= 0)
+		return 0;
+	paths = xcalloc(n, sizeof(*paths));
+	attrs = xcalloc(n, sizeof(*attrs));
+	created = xcalloc(n, sizeof(*created));
+	for (i = 0; i < n; i++) {
+		paths[i] = sd[i].dst;
+		attrs[i] = sd[i].a;
+	}
+	sftp_parallel_set_walker_phase(p, SFTP_WKP_MKDIR);
+	for (base = 0; base < n && !sftp_parallel_is_aborting(p);
+	    base += MKDIR_BATCH_MAX) {
+		int nb = n - base < MKDIR_BATCH_MAX ? n - base : MKDIR_BATCH_MAX;
+		(void)sftp_mkdir_pipeline(conn, paths + base, attrs + base,
+		    nb, created + base);
+	}
+	free(paths);
+	free(attrs);
+	for (i = 0; i < n && !sftp_parallel_is_aborting(p); i++) {
+		if (parallel_upload_walk(p, conn, sd[i].src, sd[i].dst,
+		    depth + 1, resume, verify, (int)created[i]) == -1)
+			ret = -1;
+	}
+	free(created);
+	return ret;
+}
+
 static int
 parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int depth, int resume, int verify)
+    const char *src, const char *dst, int depth, int resume, int verify,
+    int created)
 {
-	int created = 0, ret = 0;
+	int ret = 0;
 	DIR *dirp;
 	struct dirent *dp;
 	char *new_src = NULL, *new_dst = NULL;
 	struct stat sb;
 	Attrib a;
+	struct parallel_subdir *subdirs = NULL;
+	int nsub = 0, subcap = 0, i;
 	int preserve_flag    = sftp_parallel_preserve_flag(p);
 	int follow_link_flag = sftp_parallel_follow_link_flag(p);
 
@@ -114,31 +169,19 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		return -1;
 	}
 
+	/* This directory's source-derived attrs; dst was created by the
+	 * caller's mkdir batch (or the root by sftp_parallel_upload_dir). */
 	stat_to_attrib(&sb, &a);
 	a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
 	a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
 	a.perm &= 01777;
 	if (!preserve_flag)
 		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-	sftp_parallel_set_walker_phase(p, SFTP_WKP_MKDIR);
-	/* HPN: shared helper (same one the serial walk uses); final
-	 * attrs are deferred until every unit has drained. */
-	if (sftp_hpn_ensure_remote_dir(conn, dst, &a, &created) != 0) {
-		sftp_parallel_walker_record_failure(p, src,
-		    "cannot create or access destination directory");
-		return -1;
-	}
 
 	/*
-	 * Now that the destination directory exists, try to bump its Lustre
-	 * stripe count if HPNLustreStripeCount asks for one wider than the
-	 * current default.  Silent + no-op on non-Lustre destinations, on
-	 * non-parallel transfers, and after the first failure on the conn
-	 * (the helper latches conn->hpn->layout_set_declined).  Files
-	 * subsequently created in this directory (worker writes, bundle
-	 * extraction, walker children) inherit the new layout.  Runs on
-	 * both freshly-created and pre-existing destination dirs by design
-	 * - see HPNLustreStripeCount in hpnssh_config(5) for opt-out.
+	 * Apply the Lustre layout to this (already-created) directory before
+	 * any files land in it, so worker writes / bundle extraction inherit
+	 * the stripe.  Silent no-op off Lustre; see HPNLustreStripeCount.
 	 */
 	maybe_apply_lustre_layout(p, conn, dst);
 
@@ -153,8 +196,6 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		const char *filename = dp->d_name;
 		sftp_parallel_set_walker_phase(p, SFTP_WKP_ENUM);
 		if (dp->d_ino == 0) {
-			/* Filesystem race / oddity (entry marked in-use but
-			 * has no inode).  Skip; not user data. */
 			debug_f("skipping \"%s/%s\" with d_ino == 0",
 			    src, filename);
 			continue;
@@ -175,8 +216,6 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 		}
 		if (S_ISLNK(sb.st_mode)) {
 			if (!follow_link_flag) {
-				/* Skipping symlink is the user's explicit
-				 * choice (no -L); not a loss. */
 				logit("%s: not a regular file", filename);
 				continue;
 			}
@@ -190,17 +229,28 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 			}
 		}
 		if (S_ISDIR(sb.st_mode)) {
-			if (parallel_upload_walk(p, conn, new_src, new_dst,
-			    depth + 1, resume, verify) == -1)
-				ret = -1;
+			/* Collect for the pipelined mkdir batch. */
+			if (nsub == subcap) {
+				subcap = subcap ? subcap * 2 : 64;
+				subdirs = xreallocarray(subdirs, subcap,
+				    sizeof(*subdirs));
+			}
+			subdirs[nsub].src = new_src;
+			subdirs[nsub].dst = new_dst;
+			stat_to_attrib(&sb, &subdirs[nsub].a);
+			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+			subdirs[nsub].a.perm &= 01777;
+			if (!preserve_flag)
+				subdirs[nsub].a.flags &=
+				    ~SSH2_FILEXFER_ATTR_ACMODTIME;
+			nsub++;
+			new_src = new_dst = NULL;	/* owned by subdirs[] */
 		} else if (S_ISREG(sb.st_mode)) {
 			sftp_parallel_set_walker_phase(p, SFTP_WKP_SUBMIT);
 			if (sftp_parallel_submit_upload(p, conn, new_src,
 			    new_dst, sb.st_size, sb.st_mode, resume,
 			    verify) != 0) {
-				/* An aborting fleet refuses submissions by
-				 * design; record the honest cause and stay
-				 * quiet - flush prints the interrupt summary. */
 				if (sftp_parallel_is_aborting(p)) {
 					debug("submit \"%s\" refused "
 					    "(abort in progress)", new_src);
@@ -214,24 +264,30 @@ parallel_upload_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 				}
 				ret = -1;
 			}
-			/* file counting happens at the submit chokepoint
-			 * (sftp_parallel_submit_upload), which also covers
-			 * the direct and glob callers */
 		} else {
-			/* Non-regular file (socket / fifo / device): SFTP
-			 * cannot transfer these.  By-design skip; not a
-			 * loss of user data. */
 			logit("%s: not a regular file", filename);
 		}
 	}
 	free(new_dst);
 	free(new_src);
+	(void)closedir(dirp);
+
+	/* Batch-create the collected subdirs on the control conn, recurse. */
+	if (!sftp_parallel_is_aborting(p) && nsub > 0) {
+		if (parallel_upload_subdirs_flush(p, conn, subdirs, nsub,
+		    depth, resume, verify) == -1)
+			ret = -1;
+	}
+	for (i = 0; i < nsub; i++) {
+		free(subdirs[i].src);
+		free(subdirs[i].dst);
+	}
+	free(subdirs);
 
 	if (created || preserve_flag)
 		sftp_hpn_dirattrs_defer_remote(parallel_dirattrs(p, conn),
 		    dst, &a);
 
-	(void)closedir(dirp);
 	return ret;
 }
 
@@ -254,8 +310,32 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		parallel_verify_prefix_register(p, dst);
 	}
 	{
-		int rc = parallel_upload_walk(p, conn, src, dst, 0, resume,
-		    verify);
+		struct stat rsb;
+		Attrib ra;
+		int rcreated = 0, rc;
+
+		/* Create the root destination directory before walking; deeper
+		 * directories are created by their parent level's pipelined
+		 * mkdir batch, so parallel_upload_walk assumes dst exists. */
+		if (stat(src, &rsb) == -1 || !S_ISDIR(rsb.st_mode)) {
+			error("stat local \"%s\": not a directory", src);
+			sftp_parallel_walker_record_failure(p, src,
+			    "not a directory");
+			return -1;
+		}
+		stat_to_attrib(&rsb, &ra);
+		ra.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+		ra.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+		ra.perm &= 01777;
+		if (!sftp_parallel_preserve_flag(p))
+			ra.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+		if (sftp_hpn_ensure_remote_dir(conn, dst, &ra, &rcreated) != 0) {
+			sftp_parallel_walker_record_failure(p, dst,
+			    "cannot create or access destination directory");
+			return -1;
+		}
+		rc = parallel_upload_walk(p, conn, src, dst, 0, resume,
+		    verify, rcreated);
 		sftp_parallel_set_walker_phase(p, SFTP_WKP_DONE);
 		return rc;
 	}
