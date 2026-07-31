@@ -1,4 +1,22 @@
 /*
+ * Copyright (c) 2026 The Board of Trustees of Carnegie Mellon University.
+ *
+ *  Author: Chris Rapier <rapier@psc.edu>
+ *
+ * This library or code is free software; you can redistribute it and/or
+ * modify it under the terms of the BSD 2 Clause License.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+ * for more details.
+ *
+ * You should have received a copy of the BSD 2-Clause License along with this
+ * code, if not, see https://opensource.org/license/bsd-2-clause.
+ *
+ */
+
+/*
  * hpn-discover-tree@hpnssh.org - server-side remote directory discovery.
  *
  * The client asks the server to enumerate a directory subtree; the server
@@ -19,6 +37,11 @@
  */
 #ifndef _SFTP_HPN_TREE_H
 #define _SFTP_HPN_TREE_H
+
+/* Forward decls only - sftp-common.h has no include guard, so pull it in
+ * from the .c files, not here (every includer already has it). */
+struct sshbuf;
+struct Attrib;
 
 /* Extension name, advertised in SSH2_FXP_VERSION and matched by the client. */
 #define HPN_EXT_DISCOVER_TREE		"hpn-discover-tree@hpnssh.org"
@@ -50,6 +73,9 @@
 #define HPN_DTREE_REC_OTHER		3
 #define HPN_DTREE_REC_ERROR		4
 
+/* Server-side recursion cap; mirrors the client's MAX_DIR_DEPTH. */
+#define HPN_DTREE_MAX_DEPTH		64
+
 /*
  * Wire format.
  *
@@ -75,5 +101,16 @@
  * / ".." components, no escape above root) exactly as readdir does today -
  * the server generates the paths but the client does not trust the peer.
  */
+
+/*
+ * Record codec (sftp-hpn-tree.c), shared by the server emitter and the
+ * client consumer.  put appends one record to m; get parses one from m and
+ * allocates *relpath (caller frees).  status is meaningful only for
+ * HPN_DTREE_REC_ERROR records (SSH2_FX_*); attrs are present otherwise.
+ */
+int	sftp_tree_put_record(struct sshbuf *msg, const char *relpath,
+	    u_char rectype, const struct Attrib *a, u_int32_t status);
+int	sftp_tree_get_record(struct sshbuf *msg, char **relpath,
+	    u_char *rectype, struct Attrib *a, u_int32_t *status);
 
 #endif /* _SFTP_HPN_TREE_H */

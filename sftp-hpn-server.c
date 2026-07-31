@@ -52,6 +52,8 @@
 # include <sys/mount.h>
 #endif
 
+#include <dirent.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -66,10 +68,12 @@
 #include "ssherr.h"
 #include "log.h"
 #include "misc.h"
+#include "xmalloc.h"
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-hpn-bundle.h"
 #include "sftp-hpn-server.h"
+#include "sftp-hpn-tree.h"		/* hpn-discover-tree codec + constants */
 #include "sftp-hpn-verify-hash.h"		/* sftp_hpn_hash_file_ondisk */
 #include "sftp-hpn-bundle-server.h"	/* process_hpn_bundle_open / _fetch */
 #include "sftp-lustre.h"		/* lustre_set_stripe_fd / _tiered_layout_fd / _get_stripe */
@@ -799,6 +803,169 @@ process_hpn_file_layout(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 
 /* ── END hpn-file-layout ─────────────────────────────────────────────── */
 
+/* ---- hpn-discover-tree: server-side recursive directory enumeration ---- */
+
+/* Records buffered per streamed chunk before a DATA reply is drained. */
+#define DTREE_CHUNK_RECORDS	256
+
+struct dtree_emit {
+	u_int		 id;
+	struct sshbuf	*oqueue;
+	struct sshbuf	*recbuf;	/* records accumulated for this chunk */
+	u_int32_t	 count;		/* records currently in recbuf */
+};
+
+/*
+ * Wrap recbuf in an EXTENDED_REPLY chunk (version | kind | count | records),
+ * enqueue it, and synchronously drain oqueue so the bytes leave now instead
+ * of buffering the whole tree.  Resets recbuf for the next chunk.
+ */
+static void
+dtree_flush(struct dtree_emit *emit, u_char kind)
+{
+	struct sshbuf	*msg;
+	int		 r;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
+	    (r = sshbuf_put_u32(msg, emit->id)) != 0 ||
+	    (r = sshbuf_put_u8(msg, HPN_DTREE_VERSION)) != 0 ||
+	    (r = sshbuf_put_u8(msg, kind)) != 0 ||
+	    (r = sshbuf_put_u32(msg, emit->count)) != 0 ||
+	    (r = sshbuf_putb(msg, emit->recbuf)) != 0)
+		fatal_fr(r, "compose dtree chunk");
+	if ((r = sshbuf_put_stringb(emit->oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue dtree chunk");
+	sshbuf_free(msg);
+	flush_oqueue_blocking(emit->oqueue);
+	sshbuf_reset(emit->recbuf);
+	emit->count = 0;
+}
+
+/* Append one record; flush a DATA chunk once the buffer is full. */
+static void
+dtree_add(struct dtree_emit *emit, const char *relpath, u_char rectype,
+    const Attrib *a, u_int32_t status)
+{
+	int r;
+
+	if ((r = sftp_tree_put_record(emit->recbuf, relpath, rectype, a,
+	    status)) != 0)
+		fatal_fr(r, "encode dtree record");
+	if (++emit->count >= DTREE_CHUNK_RECORDS)
+		dtree_flush(emit, HPN_DTREE_CHUNK_DATA);
+}
+
+/*
+ * Recursively enumerate abspath, emitting one record per entry with paths
+ * relative to the walk root (relbase, "" at the root).  A directory record
+ * is emitted BEFORE its contents (parents precede children - the wire
+ * ordering contract).  Symlinks are emitted but never followed (OpenSSH
+ * recursive transfers skip them); "." and ".." are excluded.  An unreadable
+ * directory emits one ERROR record and is otherwise skipped, so one bad
+ * subtree never aborts the walk.
+ */
+static void
+dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
+    int depth)
+{
+	DIR		*dir_handle;
+	struct dirent	*entry;
+
+	if (depth >= HPN_DTREE_MAX_DEPTH)
+		return;
+	if ((dir_handle = opendir(abspath)) == NULL) {
+		dtree_add(emit, relbase, HPN_DTREE_REC_ERROR, NULL,
+		    errno_to_sftp_status(errno));
+		return;
+	}
+	while ((entry = readdir(dir_handle)) != NULL) {
+		char		*child_abs, *child_rel;
+		struct stat	 st;
+		Attrib		 a;
+
+		if (strcmp(entry->d_name, ".") == 0 ||
+		    strcmp(entry->d_name, "..") == 0)
+			continue;
+		xasprintf(&child_abs, "%s/%s", abspath, entry->d_name);
+		if (*relbase == '\0')
+			child_rel = xstrdup(entry->d_name);
+		else
+			xasprintf(&child_rel, "%s/%s", relbase, entry->d_name);
+
+		if (lstat(child_abs, &st) != 0) {
+			dtree_add(emit, child_rel, HPN_DTREE_REC_ERROR, NULL,
+			    errno_to_sftp_status(errno));
+		} else {
+			stat_to_attrib(&st, &a);
+			if (S_ISLNK(st.st_mode)) {
+				dtree_add(emit, child_rel, HPN_DTREE_REC_SYMLINK, &a, 0);
+			} else if (S_ISDIR(st.st_mode)) {
+				dtree_add(emit, child_rel, HPN_DTREE_REC_DIR, &a, 0);
+				dtree_walk(emit, child_abs, child_rel, depth + 1);
+			} else if (S_ISREG(st.st_mode)) {
+				dtree_add(emit, child_rel, HPN_DTREE_REC_REG, &a, 0);
+			} else {
+				dtree_add(emit, child_rel, HPN_DTREE_REC_OTHER, &a, 0);
+			}
+		}
+		free(child_abs);
+		free(child_rel);
+	}
+	closedir(dir_handle);
+}
+
+/*
+ * hpn-discover-tree handler: parse (root, flags), then push-stream the
+ * subtree under root as chunked EXTENDED_REPLY records, terminated by an END
+ * chunk.  Record paths are relative to root; the client re-validates them.
+ * FOLLOW_SYMLINKS is accepted but dormant (OpenSSH's -L is an upstream stub).
+ */
+static void
+process_hpn_discover_tree(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
+{
+	char			*root = NULL;
+	u_int32_t		 flags = 0;
+	struct dtree_emit	 emit;
+	struct stat		 st;
+	int			 r;
+
+	if ((r = sshbuf_get_cstring(iqueue, &root, NULL)) != 0 ||
+	    (r = sshbuf_get_u32(iqueue, &flags)) != 0) {
+		error_f("parse hpn-discover-tree request: %s", ssh_err(r));
+		send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
+		free(root);
+		return;
+	}
+	debug3("request %u: hpn-discover-tree \"%s\" flags=0x%x",
+	    id, root, flags);
+
+	emit.id = id;
+	emit.oqueue = oqueue;
+	emit.count = 0;
+	if ((emit.recbuf = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+
+	if (stat(root, &st) != 0)
+		dtree_add(&emit, "", HPN_DTREE_REC_ERROR, NULL,
+		    errno_to_sftp_status(errno));
+	else if (!S_ISDIR(st.st_mode))
+		dtree_add(&emit, "", HPN_DTREE_REC_ERROR, NULL, SSH2_FX_FAILURE);
+	else
+		dtree_walk(&emit, root, "", 0);
+
+	/* Flush any partial DATA chunk, then the terminal END chunk. */
+	if (emit.count > 0)
+		dtree_flush(&emit, HPN_DTREE_CHUNK_DATA);
+	dtree_flush(&emit, HPN_DTREE_CHUNK_END);
+
+	sshbuf_free(emit.recbuf);
+	free(root);
+}
+
+/* ---- END hpn-discover-tree --------------------------------------------- */
+
 void
 sftp_hpn_server_dispatch(u_int id, const char *name,
     struct sshbuf *iqueue, struct sshbuf *oqueue)
@@ -833,6 +1000,12 @@ sftp_hpn_server_dispatch(u_int id, const char *name,
 	/* Lustre / future-fs layout - see process_hpn_file_layout above. */
 	if (strcmp(name, HPN_EXT_FILE_LAYOUT) == 0) {
 		process_hpn_file_layout(id, iqueue, oqueue);
+		return;
+	}
+
+	/* Remote-tree enumeration - see process_hpn_discover_tree above. */
+	if (strcmp(name, HPN_EXT_DISCOVER_TREE) == 0) {
+		process_hpn_discover_tree(id, iqueue, oqueue);
 		return;
 	}
 
