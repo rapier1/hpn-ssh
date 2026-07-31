@@ -55,6 +55,7 @@
 #include "sftp-client.h"
 #include "sftp-hpn-client.h" /* HPN */
 #include "sftp-hpn-server.h" /* hpn-check-file + heartbeat protocol constants */
+#include "sftp-hpn-tree.h" /* hpn-discover-tree extension name */
 #include "sftp-hpn-transferlog.h"
 #include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
 
@@ -705,6 +706,13 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		} else if (strcmp(name, "hpn-fs-info@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_HPN_FS_INFO;
+			known = 1;
+		} else if (strcmp(name, HPN_EXT_DISCOVER_TREE) == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			/* Server can enumerate a remote subtree in one
+			 * push-streamed request; the download walks use it
+			 * in place of per-directory readdir when present. */
+			ret->exts |= SFTP_EXT_HPN_DISCOVER_TREE;
 			known = 1;
 		} else if (strcmp(name, "hpn-bundle@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
