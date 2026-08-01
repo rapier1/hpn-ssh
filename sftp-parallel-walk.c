@@ -354,14 +354,13 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		};
 		/* HPN: one streamed enumeration when the server supports it,
 		 * else the recursive readdir fallback; both replay through the
-		 * same parallel sink.  Workers ride separate connections, so
-		 * files are submitted as their records arrive, overlapping
-		 * discovery with transfer (defer_file_xfer == 0). */
+		 * same parallel sink.  Files are queued during enumeration and
+		 * handed to the workers once it drains; a transfer issued
+		 * mid-stream would collide with the discover-tree reply on the
+		 * control connection. */
 		int rc = sftp_conn_has_discover_tree(conn) ?
 		    sftp_tree_download_consume(conn, src, dst, NULL,
-		        sftp_parallel_follow_link_flag(p),
-		        0 /* workers transfer on their own conns */,
-		        &sink.base) :
+		        sftp_parallel_follow_link_flag(p), &sink.base) :
 		    sftp_readdir_download_consume(conn, src, dst, 0,
 		        PARALLEL_MAX_DIR_DEPTH, NULL,
 		        sftp_parallel_follow_link_flag(p), &sink.base);

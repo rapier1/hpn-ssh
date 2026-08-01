@@ -450,17 +450,16 @@ struct sftp_tree_dl_sink {
 /*
  * Enumerate the remote subtree at src via hpn-discover-tree and replay each
  * entry through sink as it streams in: create dst and every discovered
- * directory inline, transfer every regular file, skip symlinks/non-regular
- * entries, surface ERROR records.  dirattrib is the root's attrs (NULL ->
- * stat it).  defer_file_xfer selects when files move: 0 transfers each file
- * inline as its record arrives (parallel workers, on their own connections);
- * 1 queues files and transfers them after the stream drains (serial download
- * and crossload, whose transfers share the discover-tree stream's
- * connection).  Returns 0, or -1 if any entry failed.
+ * directory inline as its record arrives, queue every regular file, skip
+ * symlinks/non-regular entries, surface ERROR records.  The queued files are
+ * transferred after the whole stream drains, because a file transfer issued
+ * mid-stream would collide with the discover-tree reply on the control
+ * connection.  dirattrib is the root's attrs (NULL -> stat it).  Returns 0,
+ * or -1 if any entry failed.
  */
 int  sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, Attrib *dirattrib, int follow_link_flag,
-    int defer_file_xfer, struct sftp_tree_dl_sink *sink);
+    struct sftp_tree_dl_sink *sink);
 
 /*
  * Fallback recursive readdir download driver, used when the server lacks

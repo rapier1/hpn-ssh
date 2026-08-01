@@ -1826,9 +1826,9 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 }
 
 /*
- * State threaded through the streaming download consumer.  files[] holds
- * regular-file transfers deferred until the stream drains (populated only
- * when defer_file_xfer is set); ret accumulates the first per-entry failure.
+ * State threaded through the streaming download consumer.  files[] holds the
+ * regular-file transfers queued during enumeration and run after the stream
+ * drains; ret accumulates the first per-entry failure.
  */
 struct tree_dl_file {
 	char	*src;
@@ -1840,7 +1840,6 @@ struct tree_dl_ctx {
 	const char			*src;
 	const char			*dst;
 	struct sftp_tree_dl_sink	*sink;
-	int				 defer_file_xfer;
 	struct tree_dl_file		*files;
 	size_t				 nfiles, files_alloc;
 	int				 ret;
@@ -1849,11 +1848,11 @@ struct tree_dl_ctx {
 /*
  * Per-record callback (see sftp_tree_record_cb).  Directories are created
  * inline: the wire contract emits a parent before its children, so a dir's
- * parent already exists on disk when its record arrives.  Regular files
- * transfer inline when the sink runs on its own connection (defer_file_xfer
- * == 0, the parallel workers), otherwise they are queued for the post-drain
- * pass.  Once the sink signals an abort the callback stops doing work but
- * keeps returning, so the fetch can finish draining the connection clean.
+ * parent already exists on disk when its record arrives.  Regular files are
+ * queued and transferred after the stream drains: a transfer issued while the
+ * discover-tree reply is still arriving would collide with it on the control
+ * connection.  Once the sink signals an abort the callback stops doing work
+ * but keeps returning, so the fetch can finish draining the connection clean.
  */
 static int
 tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
@@ -1882,25 +1881,17 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 		free(new_dst);
 		break;
 	case HPN_DTREE_REC_REG:
-		if (ctx->defer_file_xfer) {
-			if (ctx->nfiles == ctx->files_alloc) {
-				ctx->files_alloc = ctx->files_alloc ?
-				    ctx->files_alloc * 2 : 256;
-				ctx->files = xreallocarray(ctx->files,
-				    ctx->files_alloc, sizeof(*ctx->files));
-			}
-			ctx->files[ctx->nfiles].src = new_src;
-			ctx->files[ctx->nfiles].dst = new_dst;
-			ctx->files[ctx->nfiles].a = *a;
-			ctx->nfiles++;
-			/* new_src / new_dst now owned by the queue */
-		} else {
-			if (ctx->sink->xfer_file(ctx->sink, new_src, new_dst,
-			    a) != 0)
-				ctx->ret = -1;
-			free(new_src);
-			free(new_dst);
+		if (ctx->nfiles == ctx->files_alloc) {
+			ctx->files_alloc = ctx->files_alloc ?
+			    ctx->files_alloc * 2 : 256;
+			ctx->files = xreallocarray(ctx->files,
+			    ctx->files_alloc, sizeof(*ctx->files));
 		}
+		ctx->files[ctx->nfiles].src = new_src;
+		ctx->files[ctx->nfiles].dst = new_dst;
+		ctx->files[ctx->nfiles].a = *a;
+		ctx->nfiles++;
+		/* new_src / new_dst now owned by the queue */
 		break;
 	case HPN_DTREE_REC_ERROR:
 		error("remote \"%s\": %s", new_src, fx2txt(ent->status));
@@ -1928,7 +1919,7 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 int
 sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, Attrib *dirattrib, int follow_link_flag,
-    int defer_file_xfer, struct sftp_tree_dl_sink *sink)
+    struct sftp_tree_dl_sink *sink)
 {
 	struct tree_dl_ctx	ctx;
 	Attrib			ldirattrib;
@@ -1956,7 +1947,6 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	ctx.src = src;
 	ctx.dst = dst;
 	ctx.sink = sink;
-	ctx.defer_file_xfer = defer_file_xfer;
 
 	if (sftp_hpn_discover_tree(conn, src,
 	    follow_link_flag ? HPN_DTREE_FOLLOW_SYMLINKS : 0,
@@ -1967,8 +1957,7 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 		goto out;
 	}
 
-	/* Transfer files deferred during the stream (serial download and
-	 * crossload); parallel submitted inline, so its queue is empty. */
+	/* Transfer the files queued during the stream. */
 	for (i = 0; i < ctx.nfiles && !sink->aborting(sink); i++) {
 		if (sink->xfer_file(sink, ctx.files[i].src, ctx.files[i].dst,
 		    &ctx.files[i].a) != 0)
