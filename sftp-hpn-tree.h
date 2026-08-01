@@ -39,9 +39,12 @@
 #define _SFTP_HPN_TREE_H
 
 /* Forward decls only - sftp-common.h has no include guard, so pull it in
- * from the .c files, not here (every includer already has it). */
+ * from the .c files, not here.  Every includer already includes sftp-common.h
+ * FIRST, so struct Attrib is complete by the time this header is read (needed
+ * for the by-value member in struct sftp_tree_ent below). */
 struct sshbuf;
 struct Attrib;
+struct sftp_conn;
 
 /* Extension name, advertised in SSH2_FXP_VERSION and matched by the client. */
 #define HPN_EXT_DISCOVER_TREE		"hpn-discover-tree@hpnssh.org"
@@ -112,5 +115,30 @@ int	sftp_tree_put_record(struct sshbuf *msg, const char *relpath,
 	    u_char rectype, const struct Attrib *a, u_int32_t status);
 int	sftp_tree_get_record(struct sshbuf *msg, char **relpath,
 	    u_char *rectype, struct Attrib *a, u_int32_t *status);
+
+/*
+ * One decoded tree entry as the client consumer sees it.  relpath is
+ * relative to the discovery root; rectype is HPN_DTREE_REC_*; a holds the
+ * attrs (all types except ERROR); status is the SSH2_FX_* code for an
+ * ERROR entry.
+ */
+struct sftp_tree_ent {
+	char		*relpath;
+	u_char		 rectype;
+	struct Attrib	 a;
+	u_int32_t	 status;
+};
+
+/*
+ * Client fetch (sftp-hpn-client.c): send hpn-discover-tree for root and
+ * drain the whole streamed reply into a freshly allocated array.  The
+ * entire stream is drained before returning - the reply shares the control
+ * connection, so no other request may be issued mid-stream.  Returns 0 and
+ * sets *entsp / *nentsp (caller frees with sftp_hpn_tree_free), or -1 on a
+ * protocol/transport failure.
+ */
+int	sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
+	    u_int32_t flags, struct sftp_tree_ent **entsp, size_t *nentsp);
+void	sftp_hpn_tree_free(struct sftp_tree_ent *ents, size_t nents);
 
 #endif /* _SFTP_HPN_TREE_H */

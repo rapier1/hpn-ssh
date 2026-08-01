@@ -58,6 +58,7 @@
 #include "sftp-client-internal.h"
 #include "sftp-hpn-server.h"	/* hpn-file-layout wire format + status codes */
 #include "sftp-hpn-client.h"
+#include "sftp-hpn-tree.h"	/* hpn-discover-tree fetch + record codec */
 #include "sftp-hpn-bundle.h"	/* HPN_EXT_HASH_RANGE etc. wire names */
 #include "sftp-hpn-transferlog.h"	/* per-member TransferLog entries */
 #include "utf8.h"		/* mprintf */
@@ -1711,4 +1712,133 @@ sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl)
 	free(dl->v);
 	dl->v = NULL;
 	dl->n = dl->cap = 0;
+}
+
+/* ---- hpn-discover-tree: client fetch ----------------------------------- */
+
+void
+sftp_hpn_tree_free(struct sftp_tree_ent *ents, size_t nents)
+{
+	size_t i;
+
+	if (ents == NULL)
+		return;
+	for (i = 0; i < nents; i++)
+		free(ents[i].relpath);
+	free(ents);
+}
+
+/*
+ * Send hpn-discover-tree for root and drain the whole streamed reply into a
+ * flat array.  The reply is one or more EXTENDED_REPLY chunks on the control
+ * connection, terminated by an END chunk; the entire stream is consumed
+ * before returning, so no other request may be issued mid-stream.  See
+ * sftp-hpn-tree.h.
+ */
+int
+sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
+    u_int32_t flags, struct sftp_tree_ent **entsp, size_t *nentsp)
+{
+	struct sshbuf		*msg;
+	struct sftp_tree_ent	*ents = NULL;
+	size_t			 nents = 0, alloc = 0;
+	u_int			 id, rid;
+	u_char			 type, version, kind;
+	u_int32_t		 count, i;
+	int			 r, rc = -1, done = 0;
+
+	*entsp = NULL;
+	*nentsp = 0;
+
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+
+	id = sftp_conn_alloc_msg_id(conn);
+	debug3_f("sending hpn-discover-tree \"%s\" flags=0x%x id=%u",
+	    root, flags, id);
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_DISCOVER_TREE)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, root)) != 0 ||
+	    (r = sshbuf_put_u32(msg, flags)) != 0)
+		fatal_fr(r, "compose hpn-discover-tree request");
+	if (send_msg(conn, msg) != 0) {
+		logit_f("hpn-discover-tree \"%s\": transport send failed", root);
+		goto out;
+	}
+
+	while (!done) {
+		sshbuf_reset(msg);
+		if (get_msg(conn, msg) != 0) {
+			logit_f("hpn-discover-tree \"%s\": transport receive "
+			    "failed", root);
+			goto out;
+		}
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+			logit_f("hpn-discover-tree: parse reply header: %s",
+			    ssh_err(r));
+			goto out;
+		}
+		if (rid != id) {
+			sftp_conn_die(conn, "hpn-discover-tree reply id "
+			    "mismatch (got %u expected %u)", rid, id);
+			goto out;
+		}
+		if (type == SSH2_FXP_STATUS) {
+			u_int fx = SSH2_FX_FAILURE;
+
+			(void)sshbuf_get_u32(msg, &fx);
+			logit_f("hpn-discover-tree \"%s\": server STATUS %s",
+			    root, fx2txt(fx));
+			goto out;
+		}
+		if (type != SSH2_FXP_EXTENDED_REPLY) {
+			sftp_conn_die(conn, "hpn-discover-tree: expected "
+			    "EXTENDED_REPLY(%u), got %u",
+			    SSH2_FXP_EXTENDED_REPLY, type);
+			goto out;
+		}
+		if ((r = sshbuf_get_u8(msg, &version)) != 0 ||
+		    (r = sshbuf_get_u8(msg, &kind)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &count)) != 0) {
+			logit_f("hpn-discover-tree: parse chunk header: %s",
+			    ssh_err(r));
+			goto out;
+		}
+		if (version != HPN_DTREE_VERSION) {
+			sftp_conn_die(conn, "hpn-discover-tree: unsupported "
+			    "codec version %u", version);
+			goto out;
+		}
+		for (i = 0; i < count; i++) {
+			struct sftp_tree_ent ent;
+
+			memset(&ent, 0, sizeof(ent));
+			if ((r = sftp_tree_get_record(msg, &ent.relpath,
+			    &ent.rectype, &ent.a, &ent.status)) != 0) {
+				free(ent.relpath);
+				logit_f("hpn-discover-tree: parse record: %s",
+				    ssh_err(r));
+				goto out;
+			}
+			if (nents == alloc) {
+				alloc = alloc ? alloc * 2 : 256;
+				ents = xreallocarray(ents, alloc,
+				    sizeof(*ents));
+			}
+			ents[nents++] = ent;
+		}
+		if (kind == HPN_DTREE_CHUNK_END)
+			done = 1;
+	}
+
+	*entsp = ents;
+	*nentsp = nents;
+	ents = NULL;
+	rc = 0;
+ out:
+	sshbuf_free(msg);
+	sftp_hpn_tree_free(ents, nents);	/* no-op (NULL) on success */
+	return rc;
 }
