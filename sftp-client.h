@@ -405,6 +405,9 @@ void sftp_conn_set_bundle_config(struct sftp_conn *conn, int use_bundle,
 /* True iff the server advertised hpn-bundle-fetch@hpnssh.org (download). */
 int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
 
+/* True iff the server advertised hpn-discover-tree@hpnssh.org (download). */
+int sftp_conn_has_discover_tree(struct sftp_conn *conn);
+
 /*
  * True iff the server advertised hpn-check-file@hpnssh.org, i.e. it can
  * answer the XXH3 hash queries that verified resume depends on.  Lets the

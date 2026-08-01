@@ -65,6 +65,7 @@
 #include "sftp-parallel.h"
 #include "xmalloc.h"		/* xcalloc for the deferred dir-attr list */
 #include "sftp-hpn-client.h"	/* shared dir helpers */
+#include "sftp-hpn-tree.h"	/* hpn-discover-tree fetch + records */
 #include "sftp-parallel-internal.h"	/* parallel_verify_prefix_register */
 
 /*
@@ -475,6 +476,140 @@ parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
 	return ret;
 }
 
+/*
+ * Tree-based parallel download, used when the server advertises
+ * hpn-discover-tree: one streamed request on the control connection
+ * enumerates the whole remote subtree, and the flat, parents-first record
+ * list is replayed - local directories created (with Lustre-layout parity),
+ * regular files submitted to the worker fleet, directory attrs deferred to
+ * drain.  Mirrors parallel_download_walk; folding the two into one shared
+ * consumer is the tracked walk-consolidation work.  The whole stream is
+ * drained before the first submit; overlapping discovery with worker
+ * transfers is a future optimization (design section 9).
+ */
+static int
+parallel_download_tree(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *src, const char *dst, Attrib *dirattrib, int resume, int verify)
+{
+	struct sftp_tree_ent *ents = NULL;
+	size_t nents = 0, i;
+	Attrib ldirattrib;
+	mode_t mode, tmpmode;
+	int ret = 0;
+	int preserve_flag = sftp_parallel_preserve_flag(p);
+
+	if (dirattrib == NULL) {
+		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
+			error("stat remote \"%s\" directory failed", src);
+			sftp_parallel_walker_record_failure(p, src,
+			    "remote stat failed");
+			return -1;
+		}
+		dirattrib = &ldirattrib;
+	}
+	if (!S_ISDIR(dirattrib->perm)) {
+		error("\"%s\" is not a directory", src);
+		sftp_parallel_walker_record_failure(p, src, "not a directory");
+		return -1;
+	}
+	if (sftp_hpn_ensure_local_dir(dst, dirattrib, &mode, &tmpmode) != 0) {
+		sftp_parallel_walker_record_failure(p, dst,
+		    "cannot create local directory");
+		return -1;
+	}
+	maybe_apply_lustre_layout_local(p, conn, dst);
+	{
+		Attrib da = *dirattrib;
+
+		if (!preserve_flag)
+			da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+		if (preserve_flag || mode != tmpmode)
+			sftp_hpn_dirattrs_defer_local(parallel_dirattrs(p, conn),
+			    dst, mode, tmpmode, &da);
+	}
+
+	if (sftp_hpn_discover_tree(conn, src, 0, &ents, &nents) != 0) {
+		error("remote tree discovery \"%s\" failed", src);
+		sftp_parallel_walker_record_failure(p, src,
+		    "remote tree discovery failed");
+		return -1;
+	}
+
+	for (i = 0; i < nents && !sftp_parallel_is_aborting(p); i++) {
+		struct sftp_tree_ent *ent = &ents[i];
+		Attrib *a = &ent->a;
+		char *new_src, *new_dst;
+
+		if (!sftp_tree_relpath_ok(ent->relpath)) {
+			error("discover-tree: suspect path \"%s\" under \"%s\"",
+			    ent->relpath == NULL ? "(null)" : ent->relpath, src);
+			sftp_parallel_walker_record_failure(p, src,
+			    "suspect path");
+			ret = -1;
+			continue;
+		}
+		new_src = sftp_path_append(src, ent->relpath);
+		new_dst = sftp_path_append(dst, ent->relpath);
+
+		if (ent->rectype == HPN_DTREE_REC_DIR) {
+			mode_t dmode, dtmp;
+
+			if (sftp_hpn_ensure_local_dir(new_dst, a, &dmode,
+			    &dtmp) != 0) {
+				sftp_parallel_walker_record_failure(p, new_dst,
+				    "cannot create local directory");
+				ret = -1;
+			} else {
+				Attrib da = *a;
+
+				maybe_apply_lustre_layout_local(p, conn,
+				    new_dst);
+				if (!preserve_flag)
+					da.flags &=
+					    ~SSH2_FILEXFER_ATTR_ACMODTIME;
+				if (preserve_flag || dmode != dtmp)
+					sftp_hpn_dirattrs_defer_local(
+					    parallel_dirattrs(p, conn), new_dst,
+					    dmode, dtmp, &da);
+			}
+		} else if (ent->rectype == HPN_DTREE_REC_REG) {
+			off_t fsize = (a->flags & SSH2_FILEXFER_ATTR_SIZE) ?
+			    (off_t)a->size : 0;
+			mode_t fmode = (a->flags &
+			    SSH2_FILEXFER_ATTR_PERMISSIONS) ?
+			    (a->perm & 07777) : 0644;
+
+			if (sftp_parallel_submit_download(p, conn, new_src,
+			    new_dst, fsize, fmode, resume, verify) != 0) {
+				if (sftp_parallel_is_aborting(p)) {
+					debug("submit download \"%s\" refused "
+					    "(abort in progress)", new_src);
+					sftp_parallel_walker_record_failure(p,
+					    new_src, "interrupted");
+				} else {
+					error("submit download \"%s\" -> "
+					    "\"%s\" failed", new_src, new_dst);
+					sftp_parallel_walker_record_failure(p,
+					    new_src, "submit failed");
+				}
+				ret = -1;
+			}
+		} else if (ent->rectype == HPN_DTREE_REC_ERROR) {
+			error("remote \"%s\": %s", new_src, fx2txt(ent->status));
+			sftp_parallel_walker_record_failure(p, new_src,
+			    "remote error");
+			ret = -1;
+		} else {
+			/* symlink (skipped, OpenSSH parity) or non-regular */
+			logit("download \"%s\": not a regular file", new_src);
+		}
+		free(new_src);
+		free(new_dst);
+	}
+	sftp_hpn_tree_free(ents, nents);
+	return ret;
+}
+
 int
 sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify)
@@ -492,8 +627,15 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		parallel_verify_prefix_register(p, src);
 	}
 	{
-		int rc = parallel_download_walk(p, conn, src, dst, 0, NULL,
-		    resume, verify);
+		/* HPN: one streamed enumeration in place of per-directory
+		 * readdir when the server supports it; workers ride separate
+		 * connections, so discovery and transfer never interleave.
+		 * Falls back to the readdir walk otherwise. */
+		int rc = sftp_conn_has_discover_tree(conn) ?
+		    parallel_download_tree(p, conn, src, dst, NULL,
+		        resume, verify) :
+		    parallel_download_walk(p, conn, src, dst, 0, NULL,
+		        resume, verify);
 		sftp_parallel_set_walker_phase(p, SFTP_WKP_DONE);
 		return rc;
 	}

@@ -2727,33 +2727,6 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 }
 
 /*
- * Validate a discover-tree relative path before building local/remote paths
- * from it.  The server generated it, but we never trust the peer: reject an
- * absolute path or any ".." component so a hostile or buggy server cannot
- * escape the transfer root.  This is the whole-relpath analogue of the
- * per-name SFTP_DIRECTORY_CHARS guard the readdir walk applies above.
- */
-static int
-tree_relpath_ok(const char *rel)
-{
-	const char *p = rel;
-
-	if (rel == NULL || *rel == '\0' || *rel == '/')
-		return 0;
-	while (*p != '\0') {
-		const char *slash = strchr(p, '/');
-		size_t len = slash ? (size_t)(slash - p) : strlen(p);
-
-		if (len == 2 && p[0] == '.' && p[1] == '.')
-			return 0;
-		if (slash == NULL)
-			break;
-		p = slash + 1;
-	}
-	return 1;
-}
-
-/*
  * Tree-based recursive download, used when the server advertises
  * hpn-discover-tree: one streamed request enumerates the whole remote
  * subtree (replacing the per-directory readdir round trips), and the flat,
@@ -2813,7 +2786,7 @@ download_dir_tree(struct sftp_conn *conn, const char *src, const char *dst,
 		Attrib *a = &ent->a;
 		char *new_src, *new_dst;
 
-		if (!tree_relpath_ok(ent->relpath)) {
+		if (!sftp_tree_relpath_ok(ent->relpath)) {
 			error("discover-tree: suspect path \"%s\" under \"%s\"",
 			    ent->relpath == NULL ? "(null)" : ent->relpath, src);
 			ret = -1;
@@ -2925,7 +2898,7 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	 * the same bundle accumulator and deferred-dirattrs list, so the
 	 * flush/apply below is identical.  Falls back to the readdir walk for
 	 * any server that does not advertise hpn-discover-tree. */
-	if ((conn->exts & SFTP_EXT_HPN_DISCOVER_TREE) != 0)
+	if (sftp_conn_has_discover_tree(conn))
 		ret = download_dir_tree(conn, src_canon, dst,
 		    dirattrib, preserve_flag, print_flag, resume_flag, verify,
 		    fsync_flag, follow_link_flag, inplace_flag, &bacc, &dirs);

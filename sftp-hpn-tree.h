@@ -141,4 +141,7 @@ int	sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 	    u_int32_t flags, struct sftp_tree_ent **entsp, size_t *nentsp);
 void	sftp_hpn_tree_free(struct sftp_tree_ent *ents, size_t nents);
 
+/* Safety check on a received relative path (no absolute, no "..").  1 = ok. */
+int	sftp_tree_relpath_ok(const char *rel);
+
 #endif /* _SFTP_HPN_TREE_H */

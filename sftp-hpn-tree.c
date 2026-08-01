@@ -34,6 +34,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>	/* struct stat, referenced by sftp-common.h prototypes */
+#include <string.h>
 
 #include "sshbuf.h"
 #include "ssherr.h"
@@ -78,4 +79,32 @@ sftp_tree_get_record(struct sshbuf *msg, char **relpath, u_char *rectype,
 	if (*rectype == HPN_DTREE_REC_ERROR)
 		return sshbuf_get_u32(msg, status);
 	return decode_attrib(msg, a);
+}
+
+/*
+ * Validate a discover-tree relative path before a client builds local or
+ * remote paths from it.  The server generated it, but we never trust the
+ * peer: reject an absolute path or any ".." component so a hostile or buggy
+ * server cannot escape the transfer root.  The whole-relpath analogue of the
+ * per-name SFTP_DIRECTORY_CHARS guard the readdir walk applies.  Returns 1 if
+ * safe, 0 otherwise.
+ */
+int
+sftp_tree_relpath_ok(const char *rel)
+{
+	const char *p = rel;
+
+	if (rel == NULL || *rel == '\0' || *rel == '/')
+		return 0;
+	while (*p != '\0') {
+		const char *slash = strchr(p, '/');
+		size_t len = slash ? (size_t)(slash - p) : strlen(p);
+
+		if (len == 2 && p[0] == '.' && p[1] == '.')
+			return 0;
+		if (slash == NULL)
+			break;
+		p = slash + 1;
+	}
+	return 1;
 }

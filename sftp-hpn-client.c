@@ -997,6 +997,12 @@ sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn)
 }
 
 int
+sftp_conn_has_discover_tree(struct sftp_conn *conn)
+{
+	return (sftp_conn_exts(conn) & SFTP_EXT_HPN_DISCOVER_TREE) != 0;
+}
+
+int
 sftp_conn_has_hpn_check_file(struct sftp_conn *conn)
 {
 	return (sftp_conn_exts(conn) & SFTP_EXT_HPN_CHECK_FILE) != 0;
