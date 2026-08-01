@@ -1858,7 +1858,8 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
  */
 int
 sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
-    const char *dst, Attrib *dirattrib, struct sftp_tree_dl_sink *sink)
+    const char *dst, Attrib *dirattrib, int follow_link_flag,
+    struct sftp_tree_dl_sink *sink)
 {
 	struct sftp_tree_ent	*ents = NULL;
 	size_t			 nents = 0, i;
@@ -1883,7 +1884,9 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	if (sink->make_dir(sink, src, dst, dirattrib) != 0)
 		return -1;
 
-	if (sftp_hpn_discover_tree(conn, src, 0, &ents, &nents) != 0) {
+	if (sftp_hpn_discover_tree(conn, src,
+	    follow_link_flag ? HPN_DTREE_FOLLOW_SYMLINKS : 0,
+	    &ents, &nents) != 0) {
 		error("remote tree discovery \"%s\" failed", src);
 		sink->fail(sink, src, "remote tree discovery failed");
 		return -1;

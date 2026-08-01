@@ -358,7 +358,7 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		 * discovery and transfer never interleave). */
 		int rc = sftp_conn_has_discover_tree(conn) ?
 		    sftp_tree_download_consume(conn, src, dst, NULL,
-		        &sink.base) :
+		        sftp_parallel_follow_link_flag(p), &sink.base) :
 		    sftp_readdir_download_consume(conn, src, dst, 0,
 		        PARALLEL_MAX_DIR_DEPTH, NULL,
 		        sftp_parallel_follow_link_flag(p), &sink.base);

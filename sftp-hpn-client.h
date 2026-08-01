@@ -455,7 +455,8 @@ struct sftp_tree_dl_sink {
  * entry failed.
  */
 int  sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
-    const char *dst, Attrib *dirattrib, struct sftp_tree_dl_sink *sink);
+    const char *dst, Attrib *dirattrib, int follow_link_flag,
+    struct sftp_tree_dl_sink *sink);
 
 /*
  * Fallback recursive readdir download driver, used when the server lacks

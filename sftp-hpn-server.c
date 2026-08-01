@@ -859,16 +859,21 @@ dtree_add(struct dtree_emit *emit, const char *relpath, u_char rectype,
 
 /*
  * Recursively enumerate abspath, emitting one record per entry with paths
- * relative to the walk root (relbase, "" at the root).  A directory record
- * is emitted BEFORE its contents (parents precede children - the wire
- * ordering contract).  Symlinks are emitted but never followed (OpenSSH
- * recursive transfers skip them); "." and ".." are excluded.  An unreadable
- * directory emits one ERROR record and is otherwise skipped, so one bad
- * subtree never aborts the walk.
+ * relative to the walk root (relbase, "" at the root). A directory record is
+ * emitted before its contents, so parents precede children on the wire. "."
+ * and ".." are excluded. An unreadable directory emits one ERROR record and
+ * is otherwise skipped, so one bad subtree never aborts the walk.
+ *
+ * A symlink is emitted as a SYMLINK record and not descended, unless follow
+ * is set (the client's follow_link_flag, which scp uses). When follow is set
+ * the link target is stat'd and the entry is treated as that target: a
+ * directory target is descended, a regular target is emitted as REG. A broken
+ * link emits an ERROR record. Loops are bounded by the depth cap, the same
+ * way the client readdir path bounds them.
  */
 static void
 dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
-    int depth)
+    int depth, int follow)
 {
 	DIR		*dir_handle;
 	struct dirent	*entry;
@@ -897,13 +902,20 @@ dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
 		if (lstat(child_abs, &st) != 0) {
 			dtree_add(emit, child_rel, HPN_DTREE_REC_ERROR, NULL,
 			    errno_to_sftp_status(errno));
-		} else {
+		} else if (S_ISLNK(st.st_mode) && !follow) {
 			stat_to_attrib(&st, &a);
-			if (S_ISLNK(st.st_mode)) {
-				dtree_add(emit, child_rel, HPN_DTREE_REC_SYMLINK, &a, 0);
-			} else if (S_ISDIR(st.st_mode)) {
+			dtree_add(emit, child_rel, HPN_DTREE_REC_SYMLINK, &a, 0);
+		} else if (S_ISLNK(st.st_mode) && stat(child_abs, &st) != 0) {
+			/* follow requested but the link target is unreachable */
+			dtree_add(emit, child_rel, HPN_DTREE_REC_ERROR, NULL,
+			    errno_to_sftp_status(errno));
+		} else {
+			/* a regular entry, or a symlink resolved to its target */
+			stat_to_attrib(&st, &a);
+			if (S_ISDIR(st.st_mode)) {
 				dtree_add(emit, child_rel, HPN_DTREE_REC_DIR, &a, 0);
-				dtree_walk(emit, child_abs, child_rel, depth + 1);
+				dtree_walk(emit, child_abs, child_rel, depth + 1,
+				    follow);
 			} else if (S_ISREG(st.st_mode)) {
 				dtree_add(emit, child_rel, HPN_DTREE_REC_REG, &a, 0);
 			} else {
@@ -953,7 +965,8 @@ process_hpn_discover_tree(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue
 	else if (!S_ISDIR(st.st_mode))
 		dtree_add(&emit, "", HPN_DTREE_REC_ERROR, NULL, SSH2_FX_FAILURE);
 	else
-		dtree_walk(&emit, root, "", 0);
+		dtree_walk(&emit, root, "", 0,
+		    (flags & HPN_DTREE_FOLLOW_SYMLINKS) != 0);
 
 	/* Flush any partial DATA chunk, then the terminal END chunk. */
 	if (emit.count > 0)
