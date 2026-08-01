@@ -29,6 +29,7 @@
 
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <dirent.h>
 
 #include <errno.h>
 #include <limits.h>
@@ -2020,5 +2021,165 @@ sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
 	free(new_dst);
 	free(new_src);
 	sftp_free_dirents(entries);
+	return ret;
+}
+
+/* One collected subdirectory awaiting batch creation + recursion. */
+struct upload_walk_subdir {
+	char  *src;
+	char  *dst;
+	Attrib a;
+};
+
+/*
+ * Shared upload driver (serial and parallel): enumerate the local directory
+ * src, hand each regular file to the sink, collect subdirectories, batch-
+ * create them on the control connection (sftp_mkdir_pipeline, MKDIR_BATCH_MAX
+ * chunks, fully drained so a directory exists before its files are written),
+ * then recurse into each with its mkdir "created" flag.  See sftp-hpn-client.h.
+ */
+int
+sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
+    const char *dst, int depth, int max_depth, int created, int preserve_flag,
+    int follow_link_flag, struct sftp_upload_sink *sink)
+{
+	DIR				*dirp;
+	struct dirent			*dp;
+	char				*new_src = NULL, *new_dst = NULL;
+	struct stat			 sb;
+	Attrib				 a;
+	struct upload_walk_subdir	*subdirs = NULL;
+	int				 nsub = 0, subcap = 0, i, ret = 0;
+
+	if (depth >= max_depth) {
+		error("Maximum directory depth exceeded: %d levels", depth);
+		sink->fail(sink, src, "max directory depth exceeded");
+		return -1;
+	}
+	if (stat(src, &sb) == -1) {
+		error("stat local \"%s\": %s", src, strerror(errno));
+		sink->fail(sink, src, strerror(errno));
+		return -1;
+	}
+	if (!S_ISDIR(sb.st_mode)) {
+		error("\"%s\" is not a directory", src);
+		sink->fail(sink, src, "not a directory");
+		return -1;
+	}
+
+	/* This directory's source-derived attrs; dst was created by the caller
+	 * (the root by the entry point, deeper dirs by the parent's batch). */
+	stat_to_attrib(&sb, &a);
+	a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+	a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+	a.perm &= 01777;
+	if (!preserve_flag)
+		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+
+	sink->enter_dir(sink, src, dst);	/* print / Lustre / enum phase */
+
+	if ((dirp = opendir(src)) == NULL) {
+		error("local opendir \"%s\": %s", src, strerror(errno));
+		sink->fail(sink, src, strerror(errno));
+		return -1;
+	}
+	while (((dp = readdir(dirp)) != NULL) && !sink->aborting(sink)) {
+		const char *filename = dp->d_name;
+
+		free(new_dst);
+		free(new_src);
+		new_dst = new_src = NULL;
+		if (dp->d_ino == 0)
+			continue;
+		if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0)
+			continue;
+		new_dst = sftp_path_append(dst, filename);
+		new_src = sftp_path_append(src, filename);
+
+		if (lstat(new_src, &sb) == -1) {
+			logit("local lstat \"%s\": %s", new_src, strerror(errno));
+			sink->fail(sink, new_src, strerror(errno));
+			ret = -1;
+			continue;
+		}
+		if (S_ISLNK(sb.st_mode)) {
+			if (!follow_link_flag) {
+				logit("%s: not a regular file", filename);
+				continue;
+			}
+			/* -L is a dormant upstream stub: follow the target. */
+			if (stat(new_src, &sb) == -1) {
+				logit("local stat \"%s\": %s", new_src,
+				    strerror(errno));
+				sink->fail(sink, new_src, strerror(errno));
+				ret = -1;
+				continue;
+			}
+		}
+		if (S_ISDIR(sb.st_mode)) {
+			if (nsub == subcap) {
+				subcap = subcap ? subcap * 2 : 64;
+				subdirs = xreallocarray(subdirs, subcap,
+				    sizeof(*subdirs));
+			}
+			subdirs[nsub].src = new_src;
+			subdirs[nsub].dst = new_dst;
+			stat_to_attrib(&sb, &subdirs[nsub].a);
+			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+			subdirs[nsub].a.perm &= 01777;
+			if (!preserve_flag)
+				subdirs[nsub].a.flags &=
+				    ~SSH2_FILEXFER_ATTR_ACMODTIME;
+			nsub++;
+			new_src = new_dst = NULL;	/* owned by subdirs[] */
+		} else if (S_ISREG(sb.st_mode)) {
+			if (sink->xfer_file(sink, new_src, new_dst, &sb) != 0)
+				ret = -1;
+		} else {
+			logit("%s: not a regular file", filename);
+		}
+	}
+	free(new_dst);
+	free(new_src);
+	(void)closedir(dirp);
+
+	/* Batch-create the collected subdirs, then recurse into each. */
+	if (!sink->aborting(sink) && nsub > 0) {
+		char	**paths = xcalloc(nsub, sizeof(*paths));
+		Attrib	 *attrs = xcalloc(nsub, sizeof(*attrs));
+		u_char	 *cflags = xcalloc(nsub, sizeof(*cflags));
+		int	  base;
+
+		for (i = 0; i < nsub; i++) {
+			paths[i] = subdirs[i].dst;
+			attrs[i] = subdirs[i].a;
+		}
+		sink->before_mkdir(sink);	/* parallel: mkdir phase */
+		for (base = 0; base < nsub && !sink->aborting(sink);
+		    base += MKDIR_BATCH_MAX) {
+			int nb = nsub - base < MKDIR_BATCH_MAX ?
+			    nsub - base : MKDIR_BATCH_MAX;
+			(void)sftp_mkdir_pipeline(conn, paths + base,
+			    attrs + base, nb, cflags + base);
+		}
+		free(paths);
+		free(attrs);
+		for (i = 0; i < nsub && !sink->aborting(sink); i++) {
+			if (sftp_upload_walk_consume(conn, subdirs[i].src,
+			    subdirs[i].dst, depth + 1, max_depth,
+			    (int)cflags[i], preserve_flag, follow_link_flag,
+			    sink) != 0)
+				ret = -1;
+		}
+		free(cflags);
+	}
+	for (i = 0; i < nsub; i++) {
+		free(subdirs[i].src);
+		free(subdirs[i].dst);
+	}
+	free(subdirs);
+
+	sink->defer_dir(sink, dst, &a, created);
 	return ret;
 }

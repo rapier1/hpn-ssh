@@ -416,13 +416,20 @@ void sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
 void sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl);
 
 /*
- * Shared consumer for a discover-tree enumeration on the download side.
- * The serial-vs-parallel differences - how a directory is created, how a
- * file is transferred, how a failure is recorded, how an abort is detected -
- * are supplied as a sink; sftp_tree_download_consume drives the
- * classification, path building, and iteration once.  A caller embeds
- * struct sftp_tree_dl_sink as the first member of its own context struct and
- * recovers that context with a cast inside the callbacks.
+ * struct sftp_tree_dl_sink is the per-mode callback set for the download walk.
+ * It uses the same callback-table pattern documented on struct
+ * sftp_upload_sink below. That comment explains why the driver cannot branch
+ * on a mode flag and how a callback recovers its context. The download
+ * differences are:
+ *
+ *   - It drives downloads. Both sftp_tree_download_consume (one streamed
+ *     discover-tree enumeration) and sftp_readdir_download_consume (the
+ *     recursive readdir fallback) use it.
+ *   - Local directories are created one at a time with a cheap mkdir, so a
+ *     single make_dir callback both creates the directory and defers its
+ *     attrs. There is no batch-create or before_mkdir step like upload has.
+ *   - The plug-in points are make_dir, xfer_file (download or bundle-fetch
+ *     versus submit to the fleet), fail, and aborting.
  */
 struct sftp_tree_dl_sink {
 	/* Create the local directory dst for a dir entry (remote path src,
@@ -461,6 +468,66 @@ int  sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 int  sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, int depth, int max_depth, Attrib *dirattrib,
     int follow_link_flag, struct sftp_tree_dl_sink *sink);
+
+struct stat;
+
+/*
+ * struct sftp_upload_sink is the small set of per-mode callbacks the shared
+ * upload driver calls out to.
+ *
+ * sftp_upload_walk_consume() below does everything the serial and parallel
+ * uploads do the same way. It walks the local directory, collects
+ * subdirectories, batch-creates them on the control connection, and recurses.
+ * A few steps differ by mode. A file is transferred differently (serial
+ * bundles it or calls sftp_upload, parallel submits it to the worker fleet),
+ * and the per-directory bookkeeping differs (progress print, Lustre layout,
+ * worker phases, which deferred-attrs list to use, how to record a failure,
+ * how to detect an abort).
+ *
+ * The driver cannot just branch on a mode flag. The serial and parallel
+ * implementations live in different files and call file-local functions the
+ * driver cannot see. So each mode hands those steps to the driver as the
+ * callbacks in this struct.
+ *
+ * A mode embeds this struct as the first member of its own context struct
+ * (serial_ul_sink or parallel_ul_sink). That context also carries the mode's
+ * data, such as the connection, bundle accumulator, worker set, and flags.
+ * The driver only ever holds a struct sftp_upload_sink pointer. Each callback
+ * casts that pointer back to the full context struct to reach its own data.
+ * The cast is safe because base is the first member, so the two share an
+ * address. sftp_tree_dl_sink is the download twin.
+ */
+struct sftp_upload_sink {
+	/* Once per directory, after its attrs are known and before its
+	 * contents are enumerated: serial prints "Entering src"; parallel
+	 * applies the Lustre layout to dst and enters the enumerate phase. */
+	void (*enter_dir)(struct sftp_upload_sink *sink, const char *src,
+	         const char *dst);
+	/* Transfer a regular local file src -> dst (local stat sb).  0 or -1. */
+	int  (*xfer_file)(struct sftp_upload_sink *sink, const char *src,
+	         const char *dst, const struct stat *sb);
+	/* Before the pipelined mkdir batch (parallel enters the mkdir phase). */
+	void (*before_mkdir)(struct sftp_upload_sink *sink);
+	/* Defer this directory's final remote attrs (gated created||preserve). */
+	void (*defer_dir)(struct sftp_upload_sink *sink, const char *dst,
+	         const Attrib *a, int created);
+	/* Record a per-entry failure (reason a short static string). */
+	void (*fail)(struct sftp_upload_sink *sink, const char *path,
+	         const char *reason);
+	/* True when the walk should stop (interrupt / fleet abort). */
+	int  (*aborting)(struct sftp_upload_sink *sink);
+};
+
+/*
+ * Enumerate the local subtree at src, hand files to sink, batch-create the
+ * discovered subdirectories on the control connection, and recurse (each
+ * child gets its mkdir "created" flag).  dst must already exist (the caller
+ * creates the root; each level creates its children).  Returns 0, or -1 if
+ * any entry failed.
+ */
+int  sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
+    const char *dst, int depth, int max_depth, int created, int preserve_flag,
+    int follow_link_flag, struct sftp_upload_sink *sink);
 
 void sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc,
     struct sftp_conn *conn, int resume, int is_download);

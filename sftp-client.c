@@ -3276,239 +3276,105 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	return (r != 0 || status != 0) ? -1 : 0;
 }
 
-static int upload_dir_internal(struct sftp_conn *, const char *,
-    const char *, int, int, int, int, int, int, int, int,
-    struct sftp_hpn_bundle_acc *, struct sftp_hpn_dirattr_list *, int);
-
-/* One collected child directory awaiting a pipelined mkdir batch. */
-struct upload_subdir {
-	char  *src;
-	char  *dst;
-	Attrib a;	/* creation/final attrs, source-derived */
+/*
+ * Serial upload sink for the shared upload driver (sftp_upload_walk_consume):
+ * bundle or upload each regular file, defer the remote dir attrs, and print
+ * "Entering".  Serial has no failure list - the driver's -1 return carries
+ * it - so fail() is a no-op; aborting() reports the global interrupt plus a
+ * sticky fatal flag set when a bundle flush fails hard.
+ */
+struct serial_ul_sink {
+	struct sftp_upload_sink		 base;
+	struct sftp_conn		*conn;
+	struct sftp_hpn_bundle_acc	*bacc;
+	struct sftp_hpn_dirattr_list	*dirs;
+	int	preserve_flag, print_flag, resume, verify, fsync_flag,
+		inplace_flag;
+	int	fatal;
 };
 
-/*
- * Create the subdirs collected from one directory level in pipelined
- * MKDIR_BATCH_MAX-sized batches (fully drained), recurse into each, and
- * hand each child its own "created" flag so the recursion defers the right
- * setstat.  Siblings are order-independent, so batching is safe and the
- * full drain guarantees a directory exists before its files are written.
- */
-static int
-upload_subdirs_flush(struct sftp_conn *conn, struct upload_subdir *sd, int n,
-    int depth, int preserve_flag, int print_flag, int resume, int verify,
-    int fsync_flag, int follow_link_flag, int inplace_flag,
-    struct sftp_hpn_bundle_acc *bacc, struct sftp_hpn_dirattr_list *dirs)
+static void
+serial_ul_enter_dir(struct sftp_upload_sink *sink, const char *src,
+    const char *dst)
 {
-	char **paths;
-	Attrib *attrs;
-	u_char *created;
-	int i, base, ret = 0;
+	struct serial_ul_sink	*s = (struct serial_ul_sink *)sink;
 
-	if (n <= 0)
-		return 0;
-	paths = xcalloc(n, sizeof(*paths));
-	attrs = xcalloc(n, sizeof(*attrs));
-	created = xcalloc(n, sizeof(*created));
-	for (i = 0; i < n; i++) {
-		paths[i] = sd[i].dst;
-		attrs[i] = sd[i].a;
-	}
-	/* Chunk so no single mkdir batch materialises an unbounded set. */
-	for (base = 0; base < n && !interrupted; base += MKDIR_BATCH_MAX) {
-		int nb = n - base < MKDIR_BATCH_MAX ? n - base : MKDIR_BATCH_MAX;
-		(void)sftp_mkdir_pipeline(conn, paths + base, attrs + base,
-		    nb, created + base);
-	}
-	free(paths);
-	free(attrs);
-	/* Recurse into each now-created child, passing its created flag. */
-	for (i = 0; i < n && !interrupted; i++) {
-		if (upload_dir_internal(conn, sd[i].src, sd[i].dst, depth + 1,
-		    preserve_flag, print_flag, resume, verify, fsync_flag,
-		    follow_link_flag, inplace_flag, bacc, dirs,
-		    (int)created[i]) == -1)
-			ret = -1;
-	}
-	free(created);
-	return ret;
+	(void)dst;
+	if (s->print_flag && s->print_flag != SFTP_PROGRESS_ONLY)
+		mprintf("Entering %s\n", src);
 }
 
 static int
-upload_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
-    int depth, int preserve_flag, int print_flag, int resume, int verify,
-    int fsync_flag, int follow_link_flag, int inplace_flag,
-    struct sftp_hpn_bundle_acc *bacc, struct sftp_hpn_dirattr_list *dirs,
-    int created)
+serial_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
+    const char *dst, const struct stat *sb)
 {
-	int ret = 0, fr;
-	DIR *dirp;
-	struct dirent *dp;
-	char *filename, *new_src = NULL, *new_dst = NULL;
-	struct stat sb;
-	Attrib a;
-	struct upload_subdir *subdirs = NULL;
-	int nsub = 0, subcap = 0;
+	struct serial_ul_sink	*s = (struct serial_ul_sink *)sink;
+	int			 ur;
 
-	debug2_f("upload local dir \"%s\" to remote \"%s\"", src, dst);
-
-	if (depth >= MAX_DIR_DEPTH) {
-		error("Maximum directory depth exceeded: %d levels", depth);
-		return -1;
-	}
-
-	if (stat(src, &sb) == -1) {
-		error("stat local \"%s\": %s", src, strerror(errno));
-		return -1;
-	}
-	if (!S_ISDIR(sb.st_mode)) {
-		error("\"%s\" is not a directory", src);
-		return -1;
-	}
-	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Entering %s\n", src);
-
-	/* This directory's source-derived attrs (dst itself was created by the
-	 * caller's mkdir batch, or by sftp_upload_dir for the root). */
-	stat_to_attrib(&sb, &a);
-	a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
-	a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
-	a.perm &= 01777;
-	if (!preserve_flag)
-		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-
-	if ((dirp = opendir(src)) == NULL) {
-		error("local opendir \"%s\": %s", src, strerror(errno));
-		return -1;
-	}
-
-	/* Single pass: collect subdirs (created together afterwards), and
-	 * process files inline into the bundle / per-file path as before. */
-	while (((dp = readdir(dirp)) != NULL) && !interrupted) {
-		if (dp->d_ino == 0)
-			continue;
-		free(new_dst);
-		free(new_src);
-		filename = dp->d_name;
-		new_dst = sftp_path_append(dst, filename);
-		new_src = sftp_path_append(src, filename);
-
-		if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0)
-			continue;
-		if (lstat(new_src, &sb) == -1) {
-			logit("local lstat \"%s\": %s", filename,
-			    strerror(errno));
-			ret = -1;
-			continue;
+	if (sftp_hpn_bundle_acc_eligible(s->bacc, (uint64_t)sb->st_size)) {
+		if (sftp_hpn_bundle_acc_add(s->bacc, src, dst,
+		    (long long)sb->st_size)) {
+			int fr = sftp_hpn_bundle_acc_flush(s->conn, s->bacc,
+			    s->preserve_flag, s->print_flag, s->verify,
+			    s->fsync_flag, s->inplace_flag);
+			if (fr < 0)		/* hard failure: stop the walk */
+				s->fatal = 1;
+			if (fr != 0)
+				return -1;
 		}
-		if (S_ISLNK(sb.st_mode)) {
-			if (!follow_link_flag) {
-				logit("%s: not a regular file", filename);
-				continue;
-			}
-			/* Replace the stat contents with the symlink target */
-			if (stat(new_src, &sb) == -1) {
-				logit("local stat \"%s\": %s", filename,
-				    strerror(errno));
-				ret = -1;
-				continue;
-			}
-		}
-		if (S_ISDIR(sb.st_mode)) {
-			/* Collect for the pipelined mkdir batch; recursion
-			 * happens after the batch (dir must exist first). */
-			if (nsub == subcap) {
-				subcap = subcap ? subcap * 2 : 64;
-				subdirs = xreallocarray(subdirs, subcap,
-				    sizeof(*subdirs));
-			}
-			subdirs[nsub].src = new_src;
-			subdirs[nsub].dst = new_dst;
-			stat_to_attrib(&sb, &subdirs[nsub].a);
-			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
-			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
-			subdirs[nsub].a.perm &= 01777;
-			if (!preserve_flag)
-				subdirs[nsub].a.flags &=
-				    ~SSH2_FILEXFER_ATTR_ACMODTIME;
-			nsub++;
-			new_src = new_dst = NULL;	/* owned by subdirs[] */
-		} else if (S_ISREG(sb.st_mode) &&
-		    sftp_hpn_bundle_acc_eligible(bacc,
-		    (uint64_t)sb.st_size)) {
-			/* HPN: bundle-eligible - accumulate; the bundle
-			 * spans directories (matching the parallel
-			 * producer) and ships when the shared policy says
-			 * flush. */
-			if (sftp_hpn_bundle_acc_add(bacc, new_src, new_dst,
-			    (long long)sb.st_size)) {
-				fr = sftp_hpn_bundle_acc_flush(conn, bacc,
-				    preserve_flag, print_flag, verify,
-				    fsync_flag, inplace_flag);
-				if (fr < 0) {
-					ret = -1;
-					break;
-				}
-				if (fr > 0)
-					ret = -1;
-			}
-		} else if (S_ISREG(sb.st_mode)) {
-			int ur = sftp_upload(conn, new_src, new_dst,
-			    preserve_flag, resume, verify, fsync_flag,
-			    inplace_flag);
-			if (ur == -1) {
-				error("upload \"%s\" to \"%s\" failed",
-				    new_src, new_dst);
-				ret = -1;
-				transferlog_file(TRANSFERLOG_FAILED,
-				    (long long)sb.st_size, new_dst);
-			} else if (ur == 1) {
-				fmprintf(hpn_pm_active() ?
-				    stderr : stdout,	/* keep frames clean */
-				    "File skipped: %s: Identical.\n",
-				    new_src);
-				transferlog_file(TRANSFERLOG_SKIPPED,
-				    (long long)sb.st_size, new_dst);
-			} else if (ur == 2) {
-				fmprintf(hpn_pm_active() ?
-				    stderr : stdout,
-				    "File skipped: %s: Target is larger"
-				    " than source.\n", new_src);
-				transferlog_file(TRANSFERLOG_SKIPPED,
-				    (long long)sb.st_size, new_dst);
-			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
-				transferlog_file(TRANSFERLOG_SUCCESS,
-				    (long long)sb.st_size, new_dst);
-			}
-		} else
-			logit("%s: not a regular file", filename);
+		return 0;
 	}
-	free(new_dst);
-	free(new_src);
-	(void) closedir(dirp);
-
-	/* Batch-create the collected subdirs, then recurse into them. */
-	if (!interrupted && nsub > 0) {
-		if (upload_subdirs_flush(conn, subdirs, nsub, depth,
-		    preserve_flag, print_flag, resume, verify, fsync_flag,
-		    follow_link_flag, inplace_flag, bacc, dirs) == -1)
-			ret = -1;
+	ur = sftp_upload(s->conn, src, dst, s->preserve_flag, s->resume,
+	    s->verify, s->fsync_flag, s->inplace_flag);
+	if (ur == -1) {
+		error("upload \"%s\" to \"%s\" failed", src, dst);
+		transferlog_file(TRANSFERLOG_FAILED, (long long)sb->st_size, dst);
+		return -1;
 	}
-	{
-		int i;
-		for (i = 0; i < nsub; i++) {
-			free(subdirs[i].src);
-			free(subdirs[i].dst);
-		}
-		free(subdirs);
+	if (ur == 1) {
+		fmprintf(hpn_pm_active() ? stderr : stdout,
+		    "File skipped: %s: Identical.\n", src);
+		transferlog_file(TRANSFERLOG_SKIPPED, (long long)sb->st_size, dst);
+	} else if (ur == 2) {
+		fmprintf(hpn_pm_active() ? stderr : stdout,
+		    "File skipped: %s: Target is larger than source.\n", src);
+		transferlog_file(TRANSFERLOG_SKIPPED, (long long)sb->st_size, dst);
+	} else if (!sftp_conn_verify_transfer_enabled(s->conn)) {
+		transferlog_file(TRANSFERLOG_SUCCESS, (long long)sb->st_size, dst);
 	}
+	return 0;
+}
 
-	/* Defer this directory's own final attributes (its dst was created by
-	 * the caller); upstream "created || preserve" gate. */
-	if (created || preserve_flag)
-		sftp_hpn_dirattrs_defer_remote(dirs, dst, &a);
+static void
+serial_ul_before_mkdir(struct sftp_upload_sink *sink)
+{
+	(void)sink;	/* serial has no walker phase */
+}
 
-	return ret;
+static void
+serial_ul_defer_dir(struct sftp_upload_sink *sink, const char *dst,
+    const Attrib *a, int created)
+{
+	struct serial_ul_sink	*s = (struct serial_ul_sink *)sink;
+
+	if (created || s->preserve_flag)
+		sftp_hpn_dirattrs_defer_remote(s->dirs, dst, a);
+}
+
+static void
+serial_ul_fail(struct sftp_upload_sink *sink, const char *path,
+    const char *reason)
+{
+	/* Serial has no failure list; the driver's -1 return carries it. */
+	(void)sink;
+	(void)path;
+	(void)reason;
+}
+
+static int
+serial_ul_aborting(struct sftp_upload_sink *sink)
+{
+	return interrupted || ((struct serial_ul_sink *)sink)->fatal;
 }
 
 int
@@ -3559,9 +3425,30 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 			free(dst_canon);
 			return -1;
 		}
-		ret = upload_dir_internal(conn, src, dst_canon, 0,
-		    preserve_flag, print_flag, resume, verify, fsync_flag,
-		    follow_link_flag, inplace_flag, &bacc, &dirs, rcreated);
+		{
+			struct serial_ul_sink sink = {
+				.base = {
+					.enter_dir = serial_ul_enter_dir,
+					.xfer_file = serial_ul_xfer_file,
+					.before_mkdir = serial_ul_before_mkdir,
+					.defer_dir = serial_ul_defer_dir,
+					.fail = serial_ul_fail,
+					.aborting = serial_ul_aborting,
+				},
+				.conn = conn,
+				.bacc = &bacc,
+				.dirs = &dirs,
+				.preserve_flag = preserve_flag,
+				.print_flag = print_flag,
+				.resume = resume,
+				.verify = verify,
+				.fsync_flag = fsync_flag,
+				.inplace_flag = inplace_flag,
+			};
+			ret = sftp_upload_walk_consume(conn, src, dst_canon, 0,
+			    MAX_DIR_DEPTH, rcreated, preserve_flag,
+			    follow_link_flag, &sink.base);
+		}
 	}
 
 	/* Ship any members still pending.  Skip when interrupted - a
