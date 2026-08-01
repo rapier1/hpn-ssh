@@ -5092,128 +5092,93 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 	return status == SSH2_FX_OK ? 0 : -1;
 }
 
+/*
+ * Third-party (remote to remote) transfer sink. It reuses the download
+ * drivers: the driver enumerates the origin with conn set to `from`, and this
+ * sink writes to the destination `to`. make_dir creates the destination
+ * directory and defers its setstat, xfer_file crossloads a file from origin
+ * to destination. See struct sftp_tree_dl_sink for the callback pattern.
+ */
+struct tp_sink {
+	struct sftp_tree_dl_sink	 base;
+	struct sftp_conn		*from;
+	struct sftp_conn		*to;
+	struct sftp_hpn_dirattr_list	*dirs;
+	int	preserve_flag, print_flag;
+};
+
 static int
-crossload_dir_internal(struct sftp_conn *from, struct sftp_conn *to,
-    const char *from_path, const char *to_path,
-    int depth, Attrib *dirattrib, int preserve_flag, int print_flag,
-    int follow_link_flag)
+tp_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
+    Attrib *a)
 {
-	int i, ret = 0, created = 0;
-	SFTP_DIRENT **dir_entries;
-	char *filename, *new_from_path = NULL, *new_to_path = NULL;
-	mode_t mode = 0777;
-	Attrib *a, curdir, ldirattrib, newdir, lsym;
+	struct tp_sink	*s = (struct tp_sink *)sink;
+	Attrib		 curdir = *a, newdir;
+	mode_t		 mode;
+	int		 created = 0;
 
-	debug2_f("crossload dir src \"%s\" to dst \"%s\"", from_path, to_path);
+	if (s->print_flag && s->print_flag != SFTP_PROGRESS_ONLY)
+		mprintf("Retrieving %s\n", src);
 
-	if (depth >= MAX_DIR_DEPTH) {
-		error("Maximum directory depth exceeded: %d levels", depth);
-		return -1;
-	}
-
-	if (dirattrib == NULL) {
-		if (sftp_stat(from, from_path, 1, &ldirattrib) != 0) {
-			error("stat remote \"%s\" failed", from_path);
-			return -1;
-		}
-		dirattrib = &ldirattrib;
-	}
-	if (!S_ISDIR(dirattrib->perm)) {
-		error("\"%s\" is not a directory", from_path);
-		return -1;
-	}
-	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Retrieving %s\n", from_path);
-
-	curdir = *dirattrib; /* dirattrib will be clobbered */
 	curdir.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
 	curdir.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
 	if ((curdir.flags & SSH2_FILEXFER_ATTR_PERMISSIONS) == 0) {
-		debug("Origin did not send permissions for "
-		    "directory \"%s\"", to_path);
-		curdir.perm = S_IWUSR|S_IXUSR;
+		debug("Origin did not send permissions for directory \"%s\"",
+		    dst);
+		curdir.perm = S_IWUSR | S_IXUSR;
 		curdir.flags |= SSH2_FILEXFER_ATTR_PERMISSIONS;
 	}
-	/* We need to be able to write to the directory while we transfer it */
+	/* Keep the directory writable while its contents transfer. */
 	mode = curdir.perm & 01777;
-	curdir.perm = mode | (S_IWUSR|S_IXUSR);
+	curdir.perm = mode | (S_IWUSR | S_IXUSR);
 
 	/*
-	 * sftp lacks a portable status value to match errno EEXIST,
-	 * so if we get a failure back then we must check whether
-	 * the path already existed and is a directory.  Ensure we can
-	 * write to the directory we create for the duration of the transfer.
+	 * SFTP has no portable EEXIST, so on a mkdir failure check whether the
+	 * path already exists as a directory.
 	 */
-	if (sftp_mkdir(to, to_path, &curdir, 0) == 0)
+	if (sftp_mkdir(s->to, dst, &curdir, 0) == 0) {
 		created = 1;
-	else {
-		if (sftp_stat(to, to_path, 0, &newdir) != 0)
+	} else {
+		if (sftp_stat(s->to, dst, 0, &newdir) != 0)
 			return -1;
 		if (!S_ISDIR(newdir.perm)) {
-			error("\"%s\" exists but is not a directory", to_path);
+			error("\"%s\" exists but is not a directory", dst);
 			return -1;
 		}
 	}
-	curdir.perm = mode;
+	curdir.perm = mode;	/* the real mode, for the deferred setstat */
 
-	if (sftp_readdir(from, from_path, &dir_entries) == -1) {
-		error("origin readdir \"%s\" failed", from_path);
+	if (created || s->preserve_flag)
+		sftp_hpn_dirattrs_defer_remote(s->dirs, dst, &curdir);
+	return 0;
+}
+
+static int
+tp_xfer_file(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
+    Attrib *a)
+{
+	struct tp_sink	*s = (struct tp_sink *)sink;
+
+	if (sftp_crossload(s->from, s->to, src, dst, a, s->preserve_flag) == -1) {
+		error("crossload \"%s\" to \"%s\" failed", src, dst);
 		return -1;
 	}
+	return 0;
+}
 
-	for (i = 0; dir_entries[i] != NULL && !interrupted; i++) {
-		free(new_from_path);
-		free(new_to_path);
+static void
+tp_fail(struct sftp_tree_dl_sink *sink, const char *path, const char *reason)
+{
+	/* Third-party is serial; the driver's -1 return carries the error. */
+	(void)sink;
+	(void)path;
+	(void)reason;
+}
 
-		filename = dir_entries[i]->filename;
-		new_from_path = sftp_path_append(from_path, filename);
-		new_to_path = sftp_path_append(to_path, filename);
-
-		a = &dir_entries[i]->a;
-		if (S_ISLNK(a->perm)) {
-			if (!follow_link_flag) {
-				logit("%s: not a regular file", filename);
-				continue;
-			}
-			/* Replace the stat contents with the symlink target */
-			if (sftp_stat(from, new_from_path, 1, &lsym) != 0) {
-				logit("remote stat \"%s\" failed",
-				    new_from_path);
-				ret = -1;
-				continue;
-			}
-			a = &lsym;
-		}
-		if (S_ISDIR(a->perm)) {
-			if (strcmp(filename, ".") == 0 ||
-			    strcmp(filename, "..") == 0)
-				continue;
-			if (crossload_dir_internal(from, to,
-			    new_from_path, new_to_path,
-			    depth + 1, a, preserve_flag,
-			    print_flag, follow_link_flag) == -1)
-				ret = -1;
-		} else if (S_ISREG(a->perm)) {
-			if (sftp_crossload(from, to, new_from_path,
-			    new_to_path, a, preserve_flag) == -1) {
-				error("crossload \"%s\" to \"%s\" failed",
-				    new_from_path, new_to_path);
-				ret = -1;
-			}
-		} else {
-			logit("origin \"%s\": not a regular file",
-			    new_from_path);
-		}
-	}
-	free(new_to_path);
-	free(new_from_path);
-
-	if (created || preserve_flag)
-		sftp_setstat(to, to_path, &curdir);
-
-	sftp_free_dirents(dir_entries);
-
-	return ret;
+static int
+tp_aborting(struct sftp_tree_dl_sink *sink)
+{
+	(void)sink;
+	return interrupted;
 }
 
 int
@@ -5223,6 +5188,20 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 {
 	char *from_path_canon;
 	int ret;
+	struct sftp_hpn_dirattr_list dirs = { NULL, 0, 0 };
+	struct tp_sink sink = {
+		.base = {
+			.make_dir = tp_make_dir,
+			.xfer_file = tp_xfer_file,
+			.fail = tp_fail,
+			.aborting = tp_aborting,
+		},
+		.from = from,
+		.to = to,
+		.dirs = &dirs,
+		.preserve_flag = preserve_flag,
+		.print_flag = print_flag,
+	};
 
 	if ((from_path_canon = sftp_realpath(from, from_path)) == NULL) {
 		error("crossload \"%s\": path canonicalization failed",
@@ -5230,8 +5209,21 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 		return -1;
 	}
 
-	ret = crossload_dir_internal(from, to, from_path_canon, to_path, 0,
-	    dirattrib, preserve_flag, print_flag, follow_link_flag);
+	/* Reuse the download drivers with conn set to from. Use discover-tree
+	 * when the origin supports it, else the recursive readdir fallback.
+	 * The sink writes to the destination. */
+	if (sftp_conn_has_discover_tree(from))
+		ret = sftp_tree_download_consume(from, from_path_canon,
+		    to_path, dirattrib, &sink.base);
+	else
+		ret = sftp_readdir_download_consume(from, from_path_canon,
+		    to_path, 0, MAX_DIR_DEPTH, dirattrib, follow_link_flag,
+		    &sink.base);
+
+	/* Apply the deferred directory setstats on the destination. */
+	sftp_hpn_dirattrs_apply(to, &dirs);
+	sftp_hpn_dirattrs_free(&dirs);
+
 	free(from_path_canon);
 	return ret;
 }
