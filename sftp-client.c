@@ -2727,14 +2727,106 @@ download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
 }
 
 /*
- * Tree-based recursive download, used when the server advertises
- * hpn-discover-tree: one streamed request enumerates the whole remote
- * subtree (replacing the per-directory readdir round trips), and the flat,
- * parents-first record list is replayed into the same sinks the recursive
- * walk uses - local directories created, regular files bundled or
- * downloaded, directory attributes deferred to end-of-walk.  The per-record
- * file/dir handling deliberately mirrors download_dir_internal; folding the
- * two into one shared consumer is the tracked walk-consolidation work.
+ * Serial download sink for the shared discover-tree consumer
+ * (sftp_tree_download_consume): create local dirs, bundle or download
+ * regular files, defer directory attrs.  Serial has no failure list - the
+ * consumer's -1 return carries the error - so fail() is a no-op; aborting()
+ * reports the global interrupt plus a sticky fatal flag set when a bundle
+ * flush fails hard (which used to `break` the walk).
+ */
+struct serial_dl_sink {
+	struct sftp_tree_dl_sink	 base;
+	struct sftp_conn		*conn;
+	struct sftp_hpn_bundle_acc	*bacc;
+	struct sftp_hpn_dirattr_list	*dirs;
+	int	preserve_flag, print_flag, resume_flag, verify, fsync_flag,
+		inplace_flag;
+	int	fatal;
+};
+
+static int
+serial_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
+    const char *dst, Attrib *a)
+{
+	struct serial_dl_sink	*s = (struct serial_dl_sink *)sink;
+	mode_t			 mode, tmpmode;
+	Attrib			 da;
+
+	if (s->print_flag && s->print_flag != SFTP_PROGRESS_ONLY)
+		mprintf("Retrieving %s\n", src);
+	if (sftp_hpn_ensure_local_dir(dst, a, &mode, &tmpmode) != 0)
+		return -1;
+	da = *a;
+	if (!s->preserve_flag)
+		da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+	if (s->preserve_flag || mode != tmpmode)
+		sftp_hpn_dirattrs_defer_local(s->dirs, dst, mode, tmpmode, &da);
+	return 0;
+}
+
+static int
+serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
+    const char *dst, Attrib *a)
+{
+	struct serial_dl_sink	*s = (struct serial_dl_sink *)sink;
+	int			 dr;
+
+	if ((a->flags & SSH2_FILEXFER_ATTR_SIZE) &&
+	    sftp_hpn_bundle_acc_eligible(s->bacc, a->size)) {
+		if (sftp_hpn_bundle_acc_add(s->bacc, src, dst,
+		    (long long)a->size)) {
+			int fr = sftp_hpn_bundle_acc_flush(s->conn, s->bacc,
+			    s->preserve_flag, s->print_flag, s->verify,
+			    s->fsync_flag, s->inplace_flag);
+			if (fr < 0)		/* hard failure: stop the walk */
+				s->fatal = 1;
+			if (fr != 0)
+				return -1;
+		}
+		return 0;
+	}
+
+	dr = sftp_download(s->conn, src, dst, a, s->preserve_flag,
+	    s->resume_flag, s->fsync_flag, s->inplace_flag, s->verify);
+	if (dr == -1) {
+		error("Download of file %s to %s failed", src, dst);
+		transferlog_file(TRANSFERLOG_FAILED, (long long)a->size, dst);
+		return -1;
+	}
+	if (dr == 1) {
+		fmprintf(hpn_pm_active() ? stderr : stdout,
+		    "File skipped: %s: Identical.\n", src);
+		transferlog_file(TRANSFERLOG_SKIPPED, (long long)a->size, dst);
+	} else if (dr == 2) {
+		fmprintf(hpn_pm_active() ? stderr : stdout,
+		    "File skipped: %s: Target is larger than source.\n", src);
+		transferlog_file(TRANSFERLOG_SKIPPED, (long long)a->size, dst);
+	} else if (!sftp_conn_verify_transfer_enabled(s->conn)) {
+		transferlog_file(TRANSFERLOG_SUCCESS, (long long)a->size, dst);
+	}
+	return 0;
+}
+
+static void
+serial_dl_fail(struct sftp_tree_dl_sink *sink, const char *path,
+    const char *reason)
+{
+	/* Serial has no failure list; the consumer's -1 return carries it. */
+	(void)sink;
+	(void)path;
+	(void)reason;
+}
+
+static int
+serial_dl_aborting(struct sftp_tree_dl_sink *sink)
+{
+	return interrupted || ((struct serial_dl_sink *)sink)->fatal;
+}
+
+/*
+ * Tree-based recursive download (serial): populate the serial sink and hand
+ * the discover-tree enumeration to the shared consumer.  Used when the
+ * server advertises hpn-discover-tree, in place of per-directory readdir.
  */
 static int
 download_dir_tree(struct sftp_conn *conn, const char *src, const char *dst,
@@ -2742,132 +2834,26 @@ download_dir_tree(struct sftp_conn *conn, const char *src, const char *dst,
     int verify, int fsync_flag, int follow_link_flag, int inplace_flag,
     struct sftp_hpn_bundle_acc *bacc, struct sftp_hpn_dirattr_list *dirs)
 {
-	struct sftp_tree_ent *ents = NULL;
-	size_t nents = 0, i;
-	Attrib ldirattrib;
-	mode_t mode, tmpmode;
-	int ret = 0, fr;
+	struct serial_dl_sink sink = {
+		.base = {
+			.make_dir = serial_dl_make_dir,
+			.xfer_file = serial_dl_xfer_file,
+			.fail = serial_dl_fail,
+			.aborting = serial_dl_aborting,
+		},
+		.conn = conn,
+		.bacc = bacc,
+		.dirs = dirs,
+		.preserve_flag = preserve_flag,
+		.print_flag = print_flag,
+		.resume_flag = resume_flag,
+		.verify = verify,
+		.fsync_flag = fsync_flag,
+		.inplace_flag = inplace_flag,
+	};
 
-	if (dirattrib == NULL) {
-		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
-			error("stat remote \"%s\" directory failed", src);
-			return -1;
-		}
-		dirattrib = &ldirattrib;
-	}
-	if (!S_ISDIR(dirattrib->perm)) {
-		error("\"%s\" is not a directory", src);
-		return -1;
-	}
-	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Retrieving %s\n", src);
-
-	/* Create the local root and defer its attrs (mirrors the walk top). */
-	if (sftp_hpn_ensure_local_dir(dst, dirattrib, &mode, &tmpmode) != 0)
-		return -1;
-	{
-		Attrib da = *dirattrib;
-
-		if (!preserve_flag)
-			da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-		if (preserve_flag || mode != tmpmode)
-			sftp_hpn_dirattrs_defer_local(dirs, dst, mode,
-			    tmpmode, &da);
-	}
-
-	/* One streamed enumeration of the whole subtree. */
-	if (sftp_hpn_discover_tree(conn, src, 0, &ents, &nents) != 0) {
-		error("remote tree discovery \"%s\" failed", src);
-		return -1;
-	}
-
-	for (i = 0; i < nents && !interrupted; i++) {
-		struct sftp_tree_ent *ent = &ents[i];
-		Attrib *a = &ent->a;
-		char *new_src, *new_dst;
-
-		if (!sftp_tree_relpath_ok(ent->relpath)) {
-			error("discover-tree: suspect path \"%s\" under \"%s\"",
-			    ent->relpath == NULL ? "(null)" : ent->relpath, src);
-			ret = -1;
-			continue;
-		}
-		new_src = sftp_path_append(src, ent->relpath);
-		new_dst = sftp_path_append(dst, ent->relpath);
-
-		if (ent->rectype == HPN_DTREE_REC_DIR) {
-			mode_t dmode, dtmp;
-
-			if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-				mprintf("Retrieving %s\n", new_src);
-			if (sftp_hpn_ensure_local_dir(new_dst, a, &dmode,
-			    &dtmp) != 0) {
-				ret = -1;
-			} else {
-				Attrib da = *a;
-
-				if (!preserve_flag)
-					da.flags &=
-					    ~SSH2_FILEXFER_ATTR_ACMODTIME;
-				if (preserve_flag || dmode != dtmp)
-					sftp_hpn_dirattrs_defer_local(dirs,
-					    new_dst, dmode, dtmp, &da);
-			}
-		} else if (ent->rectype == HPN_DTREE_REC_REG &&
-		    (a->flags & SSH2_FILEXFER_ATTR_SIZE) &&
-		    sftp_hpn_bundle_acc_eligible(bacc, a->size)) {
-			if (sftp_hpn_bundle_acc_add(bacc, new_src, new_dst,
-			    (long long)a->size)) {
-				fr = sftp_hpn_bundle_acc_flush(conn, bacc,
-				    preserve_flag, print_flag, verify,
-				    fsync_flag, inplace_flag);
-				if (fr < 0) {
-					ret = -1;
-					free(new_src);
-					free(new_dst);
-					break;
-				}
-				if (fr > 0)
-					ret = -1;
-			}
-		} else if (ent->rectype == HPN_DTREE_REC_REG) {
-			int dr = sftp_download(conn, new_src, new_dst, a,
-			    preserve_flag, resume_flag, fsync_flag,
-			    inplace_flag, verify);
-			if (dr == -1) {
-				error("Download of file %s to %s failed",
-				    new_src, new_dst);
-				ret = -1;
-				transferlog_file(TRANSFERLOG_FAILED,
-				    (long long)a->size, new_dst);
-			} else if (dr == 1) {
-				fmprintf(hpn_pm_active() ? stderr : stdout,
-				    "File skipped: %s: Identical.\n", new_src);
-				transferlog_file(TRANSFERLOG_SKIPPED,
-				    (long long)a->size, new_dst);
-			} else if (dr == 2) {
-				fmprintf(hpn_pm_active() ? stderr : stdout,
-				    "File skipped: %s: Target is larger"
-				    " than source.\n", new_src);
-				transferlog_file(TRANSFERLOG_SKIPPED,
-				    (long long)a->size, new_dst);
-			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
-				transferlog_file(TRANSFERLOG_SUCCESS,
-				    (long long)a->size, new_dst);
-			}
-		} else if (ent->rectype == HPN_DTREE_REC_ERROR) {
-			error("remote \"%s\": %s", new_src,
-			    fx2txt(ent->status));
-			ret = -1;
-		} else {
-			/* symlink (skipped, OpenSSH parity) or non-regular */
-			logit("download \"%s\": not a regular file", new_src);
-		}
-		free(new_src);
-		free(new_dst);
-	}
-	sftp_hpn_tree_free(ents, nents);
-	return ret;
+	(void)follow_link_flag;	/* symlinks are skipped (OpenSSH parity) */
+	return sftp_tree_download_consume(conn, src, dst, dirattrib, &sink.base);
 }
 
 int

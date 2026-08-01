@@ -1848,3 +1848,85 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 	sftp_hpn_tree_free(ents, nents);	/* no-op (NULL) on success */
 	return rc;
 }
+
+/*
+ * Shared download driver: enumerate src via discover-tree and replay each
+ * record through sink.  Serial and parallel supply their own sink; the
+ * classification, path building, and iteration live here once.  See
+ * sftp-hpn-client.h.
+ */
+int
+sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
+    const char *dst, Attrib *dirattrib, struct sftp_tree_dl_sink *sink)
+{
+	struct sftp_tree_ent	*ents = NULL;
+	size_t			 nents = 0, i;
+	Attrib			 ldirattrib;
+	int			 ret = 0;
+
+	if (dirattrib == NULL) {
+		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
+			error("stat remote \"%s\" directory failed", src);
+			sink->fail(sink, src, "remote stat failed");
+			return -1;
+		}
+		dirattrib = &ldirattrib;
+	}
+	if (!S_ISDIR(dirattrib->perm)) {
+		error("\"%s\" is not a directory", src);
+		sink->fail(sink, src, "not a directory");
+		return -1;
+	}
+	/* Create the local root; the sink defers its attrs (and, for serial,
+	 * prints the "Retrieving" line). */
+	if (sink->make_dir(sink, src, dst, dirattrib) != 0)
+		return -1;
+
+	if (sftp_hpn_discover_tree(conn, src, 0, &ents, &nents) != 0) {
+		error("remote tree discovery \"%s\" failed", src);
+		sink->fail(sink, src, "remote tree discovery failed");
+		return -1;
+	}
+
+	for (i = 0; i < nents; i++) {
+		struct sftp_tree_ent	*ent = &ents[i];
+		Attrib			*a = &ent->a;
+		char			*new_src, *new_dst;
+
+		if (sink->aborting(sink))
+			break;
+		if (!sftp_tree_relpath_ok(ent->relpath)) {
+			error("discover-tree: suspect path \"%s\" under \"%s\"",
+			    ent->relpath == NULL ? "(null)" : ent->relpath, src);
+			sink->fail(sink, src, "suspect path");
+			ret = -1;
+			continue;
+		}
+		new_src = sftp_path_append(src, ent->relpath);
+		new_dst = sftp_path_append(dst, ent->relpath);
+
+		switch (ent->rectype) {
+		case HPN_DTREE_REC_DIR:
+			if (sink->make_dir(sink, new_src, new_dst, a) != 0)
+				ret = -1;
+			break;
+		case HPN_DTREE_REC_REG:
+			if (sink->xfer_file(sink, new_src, new_dst, a) != 0)
+				ret = -1;
+			break;
+		case HPN_DTREE_REC_ERROR:
+			error("remote \"%s\": %s", new_src, fx2txt(ent->status));
+			sink->fail(sink, new_src, "remote error");
+			ret = -1;
+			break;
+		default:
+			/* symlink (skipped, OpenSSH parity) or non-regular */
+			logit("download \"%s\": not a regular file", new_src);
+			break;
+		}
+		free(new_src);
+		free(new_dst);
+	}
+	sftp_hpn_tree_free(ents, nents);
+	return ret;
+}

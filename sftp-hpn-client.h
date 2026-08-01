@@ -415,6 +415,41 @@ void sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
     struct sftp_hpn_dirattr_list *dl);
 void sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl);
 
+/*
+ * Shared consumer for a discover-tree enumeration on the download side.
+ * The serial-vs-parallel differences - how a directory is created, how a
+ * file is transferred, how a failure is recorded, how an abort is detected -
+ * are supplied as a sink; sftp_tree_download_consume drives the
+ * classification, path building, and iteration once.  A caller embeds
+ * struct sftp_tree_dl_sink as the first member of its own context struct and
+ * recovers that context with a cast inside the callbacks.
+ */
+struct sftp_tree_dl_sink {
+	/* Create the local directory dst for a dir entry (remote path src,
+	 * attrs a) and defer its attributes; src is for progress output only.
+	 * Returns 0, or -1 (having recorded failure). */
+	int  (*make_dir)(struct sftp_tree_dl_sink *sink, const char *src,
+	         const char *dst, Attrib *a);
+	/* Transfer regular file src -> dst (attrs a).  Returns 0 or -1. */
+	int  (*xfer_file)(struct sftp_tree_dl_sink *sink, const char *src,
+	         const char *dst, Attrib *a);
+	/* Record a per-entry failure (reason is a short static string). */
+	void (*fail)(struct sftp_tree_dl_sink *sink, const char *path,
+	         const char *reason);
+	/* True when the walk should stop (interrupt / fleet abort). */
+	int  (*aborting)(struct sftp_tree_dl_sink *sink);
+};
+
+/*
+ * Enumerate the remote subtree at src via hpn-discover-tree and replay it
+ * through sink: create dst and every discovered directory, transfer every
+ * regular file, skip symlinks/non-regular entries, surface ERROR records.
+ * dirattrib is the root's attrs (NULL -> stat it).  Returns 0, or -1 if any
+ * entry failed.
+ */
+int  sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
+    const char *dst, Attrib *dirattrib, struct sftp_tree_dl_sink *sink);
+
 void sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc,
     struct sftp_conn *conn, int resume, int is_download);
 int sftp_hpn_bundle_acc_eligible(struct sftp_hpn_bundle_acc *acc,
