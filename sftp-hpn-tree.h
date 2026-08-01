@@ -130,16 +130,24 @@ struct sftp_tree_ent {
 };
 
 /*
+ * Per-record callback invoked by the client fetch as each entry streams off
+ * the wire.  ent is borrowed for the duration of the call: ent->relpath is
+ * freed once the callback returns, so a callback that needs to retain any
+ * field copies it.  The return value is currently ignored; the fetch always
+ * drains the stream to its end so the control connection is left clean.
+ */
+typedef int (*sftp_tree_record_cb)(void *ctx, struct sftp_tree_ent *ent);
+
+/*
  * Client fetch (sftp-hpn-client.c): send hpn-discover-tree for root and
- * drain the whole streamed reply into a freshly allocated array.  The
- * entire stream is drained before returning - the reply shares the control
- * connection, so no other request may be issued mid-stream.  Returns 0 and
- * sets *entsp / *nentsp (caller frees with sftp_hpn_tree_free), or -1 on a
- * protocol/transport failure.
+ * invoke cb once per discovered entry as the reply streams in.  The reply is
+ * a series of EXTENDED_REPLY chunks on the control connection, and the fetch
+ * drains all of them before returning, so the callback must not issue another
+ * request on that connection mid-stream.  Returns 0 on a clean drain, or -1
+ * on a protocol/transport failure.
  */
 int	sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
-	    u_int32_t flags, struct sftp_tree_ent **entsp, size_t *nentsp);
-void	sftp_hpn_tree_free(struct sftp_tree_ent *ents, size_t nents);
+	    u_int32_t flags, sftp_tree_record_cb cb, void *ctx);
 
 /* Safety check on a received relative path (no absolute, no "..").  1 = ok. */
 int	sftp_tree_relpath_ok(const char *rel);

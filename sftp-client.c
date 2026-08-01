@@ -2719,7 +2719,9 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 		 * deferred-attr list, so the flush/apply below is identical. */
 		if (sftp_conn_has_discover_tree(conn))
 			ret = sftp_tree_download_consume(conn, src_canon, dst,
-			    dirattrib, follow_link_flag, &sink.base);
+			    dirattrib, follow_link_flag,
+			    1 /* serial: transfer shares the stream conn */,
+			    &sink.base);
 		else
 			ret = sftp_readdir_download_consume(conn, src_canon,
 			    dst, 0, MAX_DIR_DEPTH, dirattrib, follow_link_flag,
@@ -5214,7 +5216,9 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 	 * The sink writes to the destination. */
 	if (sftp_conn_has_discover_tree(from))
 		ret = sftp_tree_download_consume(from, from_path_canon,
-		    to_path, dirattrib, follow_link_flag, &sink.base);
+		    to_path, dirattrib, follow_link_flag,
+		    1 /* crossload reads from the stream conn */,
+		    &sink.base);
 	else
 		ret = sftp_readdir_download_consume(from, from_path_canon,
 		    to_path, 0, MAX_DIR_DEPTH, dirattrib, follow_link_flag,

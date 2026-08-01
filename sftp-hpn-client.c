@@ -1723,39 +1723,22 @@ sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl)
 
 /* ---- hpn-discover-tree: client fetch ----------------------------------- */
 
-void
-sftp_hpn_tree_free(struct sftp_tree_ent *ents, size_t nents)
-{
-	size_t i;
-
-	if (ents == NULL)
-		return;
-	for (i = 0; i < nents; i++)
-		free(ents[i].relpath);
-	free(ents);
-}
-
 /*
- * Send hpn-discover-tree for root and drain the whole streamed reply into a
- * flat array.  The reply is one or more EXTENDED_REPLY chunks on the control
- * connection, terminated by an END chunk; the entire stream is consumed
- * before returning, so no other request may be issued mid-stream.  See
- * sftp-hpn-tree.h.
+ * Send hpn-discover-tree for root and invoke cb once per discovered entry as
+ * the reply streams in.  The reply is one or more EXTENDED_REPLY chunks on
+ * the control connection, terminated by an END chunk; the whole stream is
+ * drained before returning, so the callback may not issue another request on
+ * that connection mid-stream.  See sftp-hpn-tree.h.
  */
 int
 sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
-    u_int32_t flags, struct sftp_tree_ent **entsp, size_t *nentsp)
+    u_int32_t flags, sftp_tree_record_cb cb, void *ctx)
 {
 	struct sshbuf		*msg;
-	struct sftp_tree_ent	*ents = NULL;
-	size_t			 nents = 0, alloc = 0;
 	u_int			 id, rid;
 	u_char			 type, version, kind;
 	u_int32_t		 count, i;
 	int			 r, rc = -1, done = 0;
-
-	*entsp = NULL;
-	*nentsp = 0;
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
@@ -1829,42 +1812,127 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 				    ssh_err(r));
 				goto out;
 			}
-			if (nents == alloc) {
-				alloc = alloc ? alloc * 2 : 256;
-				ents = xreallocarray(ents, alloc,
-				    sizeof(*ents));
-			}
-			ents[nents++] = ent;
+			(void)cb(ctx, &ent);
+			free(ent.relpath);
 		}
 		if (kind == HPN_DTREE_CHUNK_END)
 			done = 1;
 	}
 
-	*entsp = ents;
-	*nentsp = nents;
-	ents = NULL;
 	rc = 0;
  out:
 	sshbuf_free(msg);
-	sftp_hpn_tree_free(ents, nents);	/* no-op (NULL) on success */
 	return rc;
 }
 
 /*
+ * State threaded through the streaming download consumer.  files[] holds
+ * regular-file transfers deferred until the stream drains (populated only
+ * when defer_file_xfer is set); ret accumulates the first per-entry failure.
+ */
+struct tree_dl_file {
+	char	*src;
+	char	*dst;
+	Attrib	 a;
+};
+
+struct tree_dl_ctx {
+	const char			*src;
+	const char			*dst;
+	struct sftp_tree_dl_sink	*sink;
+	int				 defer_file_xfer;
+	struct tree_dl_file		*files;
+	size_t				 nfiles, files_alloc;
+	int				 ret;
+};
+
+/*
+ * Per-record callback (see sftp_tree_record_cb).  Directories are created
+ * inline: the wire contract emits a parent before its children, so a dir's
+ * parent already exists on disk when its record arrives.  Regular files
+ * transfer inline when the sink runs on its own connection (defer_file_xfer
+ * == 0, the parallel workers), otherwise they are queued for the post-drain
+ * pass.  Once the sink signals an abort the callback stops doing work but
+ * keeps returning, so the fetch can finish draining the connection clean.
+ */
+static int
+tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
+{
+	struct tree_dl_ctx	*ctx = vctx;
+	Attrib			*a = &ent->a;
+	char			*new_src, *new_dst;
+
+	if (ctx->sink->aborting(ctx->sink))
+		return 0;
+	if (!sftp_tree_relpath_ok(ent->relpath)) {
+		error("discover-tree: suspect path \"%s\" under \"%s\"",
+		    ent->relpath == NULL ? "(null)" : ent->relpath, ctx->src);
+		ctx->sink->fail(ctx->sink, ctx->src, "suspect path");
+		ctx->ret = -1;
+		return 0;
+	}
+	new_src = sftp_path_append(ctx->src, ent->relpath);
+	new_dst = sftp_path_append(ctx->dst, ent->relpath);
+
+	switch (ent->rectype) {
+	case HPN_DTREE_REC_DIR:
+		if (ctx->sink->make_dir(ctx->sink, new_src, new_dst, a) != 0)
+			ctx->ret = -1;
+		free(new_src);
+		free(new_dst);
+		break;
+	case HPN_DTREE_REC_REG:
+		if (ctx->defer_file_xfer) {
+			if (ctx->nfiles == ctx->files_alloc) {
+				ctx->files_alloc = ctx->files_alloc ?
+				    ctx->files_alloc * 2 : 256;
+				ctx->files = xreallocarray(ctx->files,
+				    ctx->files_alloc, sizeof(*ctx->files));
+			}
+			ctx->files[ctx->nfiles].src = new_src;
+			ctx->files[ctx->nfiles].dst = new_dst;
+			ctx->files[ctx->nfiles].a = *a;
+			ctx->nfiles++;
+			/* new_src / new_dst now owned by the queue */
+		} else {
+			if (ctx->sink->xfer_file(ctx->sink, new_src, new_dst,
+			    a) != 0)
+				ctx->ret = -1;
+			free(new_src);
+			free(new_dst);
+		}
+		break;
+	case HPN_DTREE_REC_ERROR:
+		error("remote \"%s\": %s", new_src, fx2txt(ent->status));
+		ctx->sink->fail(ctx->sink, new_src, "remote error");
+		ctx->ret = -1;
+		free(new_src);
+		free(new_dst);
+		break;
+	default:
+		/* symlink (skipped, OpenSSH parity) or non-regular */
+		logit("download \"%s\": not a regular file", new_src);
+		free(new_src);
+		free(new_dst);
+		break;
+	}
+	return 0;
+}
+
+/*
  * Shared download driver: enumerate src via discover-tree and replay each
- * record through sink.  Serial and parallel supply their own sink; the
- * classification, path building, and iteration live here once.  See
- * sftp-hpn-client.h.
+ * record through the sink as it streams in.  Serial and parallel supply their
+ * own sink; the classification, path building, and iteration live here once.
+ * See sftp-hpn-client.h.
  */
 int
 sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, Attrib *dirattrib, int follow_link_flag,
-    struct sftp_tree_dl_sink *sink)
+    int defer_file_xfer, struct sftp_tree_dl_sink *sink)
 {
-	struct sftp_tree_ent	*ents = NULL;
-	size_t			 nents = 0, i;
-	Attrib			 ldirattrib;
-	int			 ret = 0;
+	struct tree_dl_ctx	ctx;
+	Attrib			ldirattrib;
+	size_t			i;
 
 	if (dirattrib == NULL) {
 		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
@@ -1884,55 +1952,35 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	if (sink->make_dir(sink, src, dst, dirattrib) != 0)
 		return -1;
 
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.src = src;
+	ctx.dst = dst;
+	ctx.sink = sink;
+	ctx.defer_file_xfer = defer_file_xfer;
+
 	if (sftp_hpn_discover_tree(conn, src,
 	    follow_link_flag ? HPN_DTREE_FOLLOW_SYMLINKS : 0,
-	    &ents, &nents) != 0) {
+	    tree_dl_consume_record, &ctx) != 0) {
 		error("remote tree discovery \"%s\" failed", src);
 		sink->fail(sink, src, "remote tree discovery failed");
-		return -1;
+		ctx.ret = -1;
+		goto out;
 	}
 
-	for (i = 0; i < nents; i++) {
-		struct sftp_tree_ent	*ent = &ents[i];
-		Attrib			*a = &ent->a;
-		char			*new_src, *new_dst;
-
-		if (sink->aborting(sink))
-			break;
-		if (!sftp_tree_relpath_ok(ent->relpath)) {
-			error("discover-tree: suspect path \"%s\" under \"%s\"",
-			    ent->relpath == NULL ? "(null)" : ent->relpath, src);
-			sink->fail(sink, src, "suspect path");
-			ret = -1;
-			continue;
-		}
-		new_src = sftp_path_append(src, ent->relpath);
-		new_dst = sftp_path_append(dst, ent->relpath);
-
-		switch (ent->rectype) {
-		case HPN_DTREE_REC_DIR:
-			if (sink->make_dir(sink, new_src, new_dst, a) != 0)
-				ret = -1;
-			break;
-		case HPN_DTREE_REC_REG:
-			if (sink->xfer_file(sink, new_src, new_dst, a) != 0)
-				ret = -1;
-			break;
-		case HPN_DTREE_REC_ERROR:
-			error("remote \"%s\": %s", new_src, fx2txt(ent->status));
-			sink->fail(sink, new_src, "remote error");
-			ret = -1;
-			break;
-		default:
-			/* symlink (skipped, OpenSSH parity) or non-regular */
-			logit("download \"%s\": not a regular file", new_src);
-			break;
-		}
-		free(new_src);
-		free(new_dst);
+	/* Transfer files deferred during the stream (serial download and
+	 * crossload); parallel submitted inline, so its queue is empty. */
+	for (i = 0; i < ctx.nfiles && !sink->aborting(sink); i++) {
+		if (sink->xfer_file(sink, ctx.files[i].src, ctx.files[i].dst,
+		    &ctx.files[i].a) != 0)
+			ctx.ret = -1;
 	}
-	sftp_hpn_tree_free(ents, nents);
-	return ret;
+ out:
+	for (i = 0; i < ctx.nfiles; i++) {
+		free(ctx.files[i].src);
+		free(ctx.files[i].dst);
+	}
+	free(ctx.files);
+	return ctx.ret;
 }
 
 /*
