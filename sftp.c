@@ -3900,7 +3900,7 @@ main(int argc, char **argv)
 	/* Do this last because we want the user to be able to override it */
 	addargs(&args, "-oForwardAgent no");
 
-	if (!isatty(STDERR_FILENO))
+	if (!isatty(STDERR_FILENO) && getenv("HPN_PM_DEBUG") == NULL)
 		showprogress = 0;
 
 	if (noisy)

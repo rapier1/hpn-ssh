@@ -1003,7 +1003,7 @@ main(int argc, char **argv)
 			 * FILEDONE frames for its transfer log / GUI. */
 			if (strcmp(rprog, "log") == 0)
 				transferlog_frames(1);
-		} else
+		} else if (getenv("HPN_PM_DEBUG") == NULL)
 			showprogress = 0;
 	}
 

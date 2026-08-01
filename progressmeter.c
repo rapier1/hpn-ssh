@@ -346,6 +346,47 @@ render_from_view(const struct meter_view *v)
 	    tail, tsec);
 }
 
+/*
+ * ENV-VAR HPN_PM_DEBUG - developer-only: capture the meter's computed values
+ * without a terminal.  Set to a file path to append samples there, or to "1"
+ * or "-" for stderr.  When set, the meter runs and writes one text line per
+ * refresh regardless of TTY (see the non-TTY showprogress guards in scp.c and
+ * sftp.c), for reviewing meter behavior non-interactively.  Not user-facing.
+ */
+static FILE	*pm_debug_fp;
+static int	 pm_debug_checked;
+
+static void
+pm_debug_init(void)
+{
+	const char *e;
+
+	if (pm_debug_checked)
+		return;
+	pm_debug_checked = 1;
+	if ((e = getenv("HPN_PM_DEBUG")) == NULL || *e == '\0')
+		return;
+	if (strcmp(e, "1") == 0 || strcmp(e, "-") == 0)
+		pm_debug_fp = stderr;
+	else if ((pm_debug_fp = fopen(e, "a")) == NULL)
+		pm_debug_fp = stderr;	/* a bad path stays visible */
+}
+
+static void
+pm_debug_view(const struct meter_view *v)
+{
+	if (pm_debug_fp == NULL)
+		return;
+	fprintf(pm_debug_fp,
+	    "pm label=%s cur=%llu total=%llu pct=%d rate=%lld inst=%llu "
+	    "stalled=%d eta=%u elapsed=%ld\n",
+	    v->label != NULL ? v->label : "",
+	    (unsigned long long)v->cur, (unsigned long long)v->total,
+	    v->percent, (long long)v->rate, (unsigned long long)v->inst,
+	    v->stalled ? 1 : 0, v->eta_sec, v->elapsed_sec);
+	fflush(pm_debug_fp);
+}
+
 void
 refresh_progress_meter(int force_update)
 {
@@ -357,7 +398,7 @@ refresh_progress_meter(int force_update)
 	struct meter_view v;
 
 	if (file == NULL || (!force_update && !alarm_fired && !win_resized) ||
-	    (!hpn_pm_active() && !can_output()))
+	    (!hpn_pm_active() && !can_output() && pm_debug_fp == NULL))
 		return;
 	alarm_fired = 0;
 
@@ -458,8 +499,9 @@ refresh_progress_meter(int force_update)
 
 	if (hpn_pm_active())
 		hpn_pm_emit_view(&v, force_update);
-	else
+	else if (can_output())
 		render_from_view(&v);
+	pm_debug_view(&v);
 	last_pos = cur_pos;
 }
 
@@ -512,6 +554,7 @@ meter_tty_arm(void)
 void
 start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 {
+	pm_debug_init();
 	start = last_update = monotime_double();
 	file = f;
 	hpn_pm_meter_start();
@@ -542,8 +585,10 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 	 * a second; nothing is lost.
 	 */
 	if (!hpn_pm_active()) {
-		meter_tty_arm();
-		refresh_progress_meter(1);
+		if (can_output())
+			meter_tty_arm();
+		if (can_output() || pm_debug_fp != NULL)
+			refresh_progress_meter(1);
 	}
 
 	ssh_signal(SIGALRM, sig_alarm);
