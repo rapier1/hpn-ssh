@@ -2574,158 +2574,6 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	return status == SSH2_FX_OK ? 0 : -1;
 }
 
-static int
-download_dir_internal(struct sftp_conn *conn, const char *src, const char *dst,
-    int depth, Attrib *dirattrib, int preserve_flag, int print_flag,
-    int resume_flag, int verify, int fsync_flag, int follow_link_flag,
-    int inplace_flag, struct sftp_hpn_bundle_acc *bacc,
-    struct sftp_hpn_dirattr_list *dirs)
-{
-	int i, ret = 0, fr;
-	SFTP_DIRENT **dir_entries;
-	char *filename, *new_src = NULL, *new_dst = NULL;
-	mode_t mode = 0777, tmpmode = mode;
-	Attrib *a, ldirattrib, lsym;
-
-	if (depth >= MAX_DIR_DEPTH) {
-		error("Maximum directory depth exceeded: %d levels", depth);
-		return -1;
-	}
-
-	debug2_f("download dir remote \"%s\" to local \"%s\"", src, dst);
-
-	if (dirattrib == NULL) {
-		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
-			error("stat remote \"%s\" directory failed", src);
-			return -1;
-		}
-		dirattrib = &ldirattrib;
-	}
-	if (!S_ISDIR(dirattrib->perm)) {
-		error("\"%s\" is not a directory", src);
-		return -1;
-	}
-	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Retrieving %s\n", src);
-
-	/* HPN: shared helper; final mode/times DEFERRED to end-of-walk. */
-	if (sftp_hpn_ensure_local_dir(dst, dirattrib, &mode, &tmpmode) != 0)
-		return -1;
-
-	if (sftp_readdir(conn, src, &dir_entries) == -1) {
-		error("remote readdir \"%s\" failed", src);
-		return -1;
-	}
-
-	for (i = 0; dir_entries[i] != NULL && !interrupted; i++) {
-		free(new_dst);
-		free(new_src);
-
-		filename = dir_entries[i]->filename;
-		new_dst = sftp_path_append(dst, filename);
-		new_src = sftp_path_append(src, filename);
-
-		a = &dir_entries[i]->a;
-		if (S_ISLNK(a->perm)) {
-			if (!follow_link_flag) {
-				logit("download \"%s\": not a regular file",
-				    new_src);
-				continue;
-			}
-			/* Replace the stat contents with the symlink target */
-			if (sftp_stat(conn, new_src, 1, &lsym) != 0) {
-				logit("remote stat \"%s\" failed", new_src);
-				ret = -1;
-				continue;
-			}
-			a = &lsym;
-		}
-
-		if (S_ISDIR(a->perm)) {
-			if (strcmp(filename, ".") == 0 ||
-			    strcmp(filename, "..") == 0)
-				continue;
-			if (download_dir_internal(conn, new_src, new_dst,
-			    depth + 1, a, preserve_flag,
-			    print_flag, resume_flag, verify,
-			    fsync_flag, follow_link_flag, inplace_flag,
-			    bacc, dirs) == -1)
-				ret = -1;
-		} else if (S_ISREG(a->perm) &&
-		    (a->flags & SSH2_FILEXFER_ATTR_SIZE) &&
-		    sftp_hpn_bundle_acc_eligible(bacc, a->size)) {
-			/* HPN: bundle-eligible - accumulate; the bundle
-			 * spans directories (matching the parallel
-			 * producer) and ships when the shared policy says
-			 * flush. */
-			if (sftp_hpn_bundle_acc_add(bacc, new_src, new_dst,
-			    (long long)a->size)) {
-				fr = sftp_hpn_bundle_acc_flush(conn, bacc,
-				    preserve_flag, print_flag, verify,
-				    fsync_flag, inplace_flag);
-				if (fr < 0) {
-					ret = -1;
-					break;
-				}
-				if (fr > 0)
-					ret = -1;
-			}
-		} else if (S_ISREG(a->perm)) {
-			int dr = sftp_download(conn, new_src, new_dst, a,
-			    preserve_flag, resume_flag, fsync_flag,
-			    inplace_flag, verify);
-			if (dr == -1) {
-				error("Download of file %s to %s failed",
-				    new_src, new_dst);
-				ret = -1;
-				transferlog_file(TRANSFERLOG_FAILED,
-				    (long long)a->size, new_dst);
-			} else if (dr == 1) {
-				/* frame mode: stdout carries binary frames,
-				 * text on it corrupts the relay stream */
-				fmprintf(hpn_pm_active() ?
-				    stderr : stdout,
-				    "File skipped: %s: Identical.\n",
-				    new_src);
-				transferlog_file(TRANSFERLOG_SKIPPED,
-				    (long long)a->size, new_dst);
-			} else if (dr == 2) {
-				fmprintf(hpn_pm_active() ?
-				    stderr : stdout,
-				    "File skipped: %s: Target is larger"
-				    " than source.\n", new_src);
-				transferlog_file(TRANSFERLOG_SKIPPED,
-				    (long long)a->size, new_dst);
-			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
-				/* TransferLog: success is final only when no
-				 * verify phase follows to resolve it. */
-				transferlog_file(TRANSFERLOG_SUCCESS,
-				    (long long)a->size, new_dst);
-			}
-		} else
-			logit("download \"%s\": not a regular file", new_src);
-
-	}
-	free(new_dst);
-	free(new_src);
-
-	{
-		/* Times only under -p, mirroring the historical behaviour;
-		 * the write-enable chmod is always deferred-reverted. */
-		Attrib da = *dirattrib;
-
-		if (!preserve_flag)
-			da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-		if (preserve_flag || mode != tmpmode)
-			sftp_hpn_dirattrs_defer_local(dirs, dst, mode,
-			    tmpmode, &da);
-	}
-
-	sftp_free_dirents(dir_entries);
-
-	return ret;
-}
-
 /*
  * Serial download sink for the shared discover-tree consumer
  * (sftp_tree_download_consume): create local dirs, bundle or download
@@ -2823,39 +2671,6 @@ serial_dl_aborting(struct sftp_tree_dl_sink *sink)
 	return interrupted || ((struct serial_dl_sink *)sink)->fatal;
 }
 
-/*
- * Tree-based recursive download (serial): populate the serial sink and hand
- * the discover-tree enumeration to the shared consumer.  Used when the
- * server advertises hpn-discover-tree, in place of per-directory readdir.
- */
-static int
-download_dir_tree(struct sftp_conn *conn, const char *src, const char *dst,
-    Attrib *dirattrib, int preserve_flag, int print_flag, int resume_flag,
-    int verify, int fsync_flag, int follow_link_flag, int inplace_flag,
-    struct sftp_hpn_bundle_acc *bacc, struct sftp_hpn_dirattr_list *dirs)
-{
-	struct serial_dl_sink sink = {
-		.base = {
-			.make_dir = serial_dl_make_dir,
-			.xfer_file = serial_dl_xfer_file,
-			.fail = serial_dl_fail,
-			.aborting = serial_dl_aborting,
-		},
-		.conn = conn,
-		.bacc = bacc,
-		.dirs = dirs,
-		.preserve_flag = preserve_flag,
-		.print_flag = print_flag,
-		.resume_flag = resume_flag,
-		.verify = verify,
-		.fsync_flag = fsync_flag,
-		.inplace_flag = inplace_flag,
-	};
-
-	(void)follow_link_flag;	/* symlinks are skipped (OpenSSH parity) */
-	return sftp_tree_download_consume(conn, src, dst, dirattrib, &sink.base);
-}
-
 int
 sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
     Attrib *dirattrib, int preserve_flag, int print_flag, int resume_flag,
@@ -2879,19 +2694,37 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	 * resume transfer. */
 	sftp_hpn_bundle_acc_init(&bacc, conn, resume_flag, /*download*/1);
 
-	/* HPN: when the server can enumerate the tree in one streamed
-	 * request, use it in place of per-directory readdir; both paths feed
-	 * the same bundle accumulator and deferred-dirattrs list, so the
-	 * flush/apply below is identical.  Falls back to the readdir walk for
-	 * any server that does not advertise hpn-discover-tree. */
-	if (sftp_conn_has_discover_tree(conn))
-		ret = download_dir_tree(conn, src_canon, dst,
-		    dirattrib, preserve_flag, print_flag, resume_flag, verify,
-		    fsync_flag, follow_link_flag, inplace_flag, &bacc, &dirs);
-	else
-		ret = download_dir_internal(conn, src_canon, dst, 0,
-		    dirattrib, preserve_flag, print_flag, resume_flag, verify,
-		    fsync_flag, follow_link_flag, inplace_flag, &bacc, &dirs);
+	{
+		struct serial_dl_sink sink = {
+			.base = {
+				.make_dir = serial_dl_make_dir,
+				.xfer_file = serial_dl_xfer_file,
+				.fail = serial_dl_fail,
+				.aborting = serial_dl_aborting,
+			},
+			.conn = conn,
+			.bacc = &bacc,
+			.dirs = &dirs,
+			.preserve_flag = preserve_flag,
+			.print_flag = print_flag,
+			.resume_flag = resume_flag,
+			.verify = verify,
+			.fsync_flag = fsync_flag,
+			.inplace_flag = inplace_flag,
+		};
+
+		/* HPN: one streamed enumeration when the server supports it,
+		 * else the recursive readdir fallback; both replay through the
+		 * same serial sink into the shared bundle accumulator and
+		 * deferred-attr list, so the flush/apply below is identical. */
+		if (sftp_conn_has_discover_tree(conn))
+			ret = sftp_tree_download_consume(conn, src_canon, dst,
+			    dirattrib, &sink.base);
+		else
+			ret = sftp_readdir_download_consume(conn, src_canon,
+			    dst, 0, MAX_DIR_DEPTH, dirattrib, follow_link_flag,
+			    &sink.base);
+	}
 
 	/* Fetch any members still pending.  Skip when interrupted - a
 	 * re-run re-walks; do not start new work on the way out. */

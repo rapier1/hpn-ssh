@@ -342,140 +342,6 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	}
 }
 
-static int
-parallel_download_walk(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, int depth, Attrib *dirattrib,
-    int resume, int verify)
-{
-	int i, ret = 0;
-	SFTP_DIRENT **dir_entries;
-	char *new_src = NULL, *new_dst = NULL;
-	mode_t mode = 0777, tmpmode = mode;
-	Attrib *a, ldirattrib, lsym;
-	int preserve_flag    = sftp_parallel_preserve_flag(p);
-	int follow_link_flag = sftp_parallel_follow_link_flag(p);
-
-	if (depth >= PARALLEL_MAX_DIR_DEPTH) {
-		error("Maximum directory depth exceeded: %d levels", depth);
-		sftp_parallel_walker_record_failure(p, src,
-		    "max directory depth exceeded");
-		return -1;
-	}
-	if (dirattrib == NULL) {
-		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
-			error("stat remote \"%s\" directory failed", src);
-			sftp_parallel_walker_record_failure(p, src,
-			    "remote stat failed");
-			return -1;
-		}
-		dirattrib = &ldirattrib;
-	}
-	if (!S_ISDIR(dirattrib->perm)) {
-		error("\"%s\" is not a directory", src);
-		sftp_parallel_walker_record_failure(p, src, "not a directory");
-		return -1;
-	}
-	/* HPN: shared helper; final mode/times deferred until drain. */
-	if (sftp_hpn_ensure_local_dir(dst, dirattrib, &mode, &tmpmode) != 0) {
-		sftp_parallel_walker_record_failure(p, dst,
-		    "cannot create local directory");
-		return -1;
-	}
-	/* Download parity: give the local destination directory the same
-	 * Lustre default layout uploads get on the remote side, so files
-	 * created under it inherit a parallel-friendly stripe. */
-	maybe_apply_lustre_layout_local(p, conn, dst);
-	if (sftp_readdir(conn, src, &dir_entries) == -1) {
-		error("remote readdir \"%s\" failed", src);
-		sftp_parallel_walker_record_failure(p, src,
-		    "remote readdir failed");
-		return -1;
-	}
-
-	for (i = 0; dir_entries[i] != NULL &&
-	    !sftp_parallel_is_aborting(p); i++) {
-		const char *filename = dir_entries[i]->filename;
-		free(new_dst); free(new_src);
-		new_dst = sftp_path_append(dst, filename);
-		new_src = sftp_path_append(src, filename);
-		a = &dir_entries[i]->a;
-
-		if (S_ISLNK(a->perm)) {
-			if (!follow_link_flag) {
-				/* Skipping symlink is the user's explicit
-				 * choice (no -L); not a loss. */
-				logit("download \"%s\": not a regular file",
-				    new_src);
-				continue;
-			}
-			if (sftp_stat(conn, new_src, 1, &lsym) != 0) {
-				error("remote stat \"%s\" failed", new_src);
-				sftp_parallel_walker_record_failure(p, new_src,
-				    "remote stat failed");
-				ret = -1;
-				continue;
-			}
-			a = &lsym;
-		}
-
-		if (S_ISDIR(a->perm)) {
-			if (strcmp(filename, ".") == 0 ||
-			    strcmp(filename, "..") == 0)
-				continue;
-			if (parallel_download_walk(p, conn, new_src, new_dst,
-			    depth + 1, a, resume, verify) == -1)
-				ret = -1;
-		} else if (S_ISREG(a->perm)) {
-			off_t fsize = (a->flags & SSH2_FILEXFER_ATTR_SIZE) ?
-			    (off_t)a->size : 0;
-			mode_t fmode = (a->flags &
-			    SSH2_FILEXFER_ATTR_PERMISSIONS) ?
-			    (a->perm & 07777) : 0644;
-			if (sftp_parallel_submit_download(p, conn,
-			    new_src, new_dst, fsize, fmode, resume,
-			    verify) != 0) {
-				/* Mirror of the upload walker: an aborting
-				 * fleet refuses submissions by design. */
-				if (sftp_parallel_is_aborting(p)) {
-					debug("submit download \"%s\" refused "
-					    "(abort in progress)", new_src);
-					sftp_parallel_walker_record_failure(p,
-					    new_src, "interrupted");
-				} else {
-					error("submit download \"%s\" -> "
-					    "\"%s\" failed", new_src, new_dst);
-					sftp_parallel_walker_record_failure(p,
-					    new_src, "submit failed");
-				}
-				ret = -1;
-			}
-			/* file counting happens at the submit chokepoint
-			 * (sftp_parallel_submit_download) - see the upload
-			 * walker */
-		} else {
-			/* Non-regular remote entry: SFTP cannot transfer
-			 * these.  By-design skip; not a loss of user data. */
-			logit("download \"%s\": not a regular file", new_src);
-		}
-	}
-	free(new_dst);
-	free(new_src);
-
-	{
-		Attrib da = *dirattrib;
-
-		if (!preserve_flag)
-			da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-		if (preserve_flag || mode != tmpmode)
-			sftp_hpn_dirattrs_defer_local(
-			    parallel_dirattrs(p, conn), dst, mode,
-			    tmpmode, &da);
-	}
-
-	sftp_free_dirents(dir_entries);
-	return ret;
-}
-
 /*
  * Parallel download sink for the shared discover-tree consumer
  * (sftp_tree_download_consume): create local dirs with Lustre-layout parity,
@@ -560,32 +426,6 @@ parallel_dl_aborting(struct sftp_tree_dl_sink *sink)
 	return sftp_parallel_is_aborting(((struct parallel_dl_sink *)sink)->p);
 }
 
-/*
- * Tree-based parallel download: populate the parallel sink and hand the
- * discover-tree enumeration to the shared consumer.  Used when the server
- * advertises hpn-discover-tree, in place of per-directory readdir.
- */
-static int
-parallel_download_tree(struct sftp_parallel *p, struct sftp_conn *conn,
-    const char *src, const char *dst, Attrib *dirattrib, int resume, int verify)
-{
-	struct parallel_dl_sink sink = {
-		.base = {
-			.make_dir = parallel_dl_make_dir,
-			.xfer_file = parallel_dl_xfer_file,
-			.fail = parallel_dl_fail,
-			.aborting = parallel_dl_aborting,
-		},
-		.p = p,
-		.conn = conn,
-		.preserve_flag = sftp_parallel_preserve_flag(p),
-		.resume = resume,
-		.verify = verify,
-	};
-
-	return sftp_tree_download_consume(conn, src, dst, dirattrib, &sink.base);
-}
-
 int
 sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify)
@@ -603,15 +443,29 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		parallel_verify_prefix_register(p, src);
 	}
 	{
-		/* HPN: one streamed enumeration in place of per-directory
-		 * readdir when the server supports it; workers ride separate
-		 * connections, so discovery and transfer never interleave.
-		 * Falls back to the readdir walk otherwise. */
+		struct parallel_dl_sink sink = {
+			.base = {
+				.make_dir = parallel_dl_make_dir,
+				.xfer_file = parallel_dl_xfer_file,
+				.fail = parallel_dl_fail,
+				.aborting = parallel_dl_aborting,
+			},
+			.p = p,
+			.conn = conn,
+			.preserve_flag = sftp_parallel_preserve_flag(p),
+			.resume = resume,
+			.verify = verify,
+		};
+		/* HPN: one streamed enumeration when the server supports it,
+		 * else the recursive readdir fallback; both replay through the
+		 * same parallel sink (workers ride separate connections, so
+		 * discovery and transfer never interleave). */
 		int rc = sftp_conn_has_discover_tree(conn) ?
-		    parallel_download_tree(p, conn, src, dst, NULL,
-		        resume, verify) :
-		    parallel_download_walk(p, conn, src, dst, 0, NULL,
-		        resume, verify);
+		    sftp_tree_download_consume(conn, src, dst, NULL,
+		        &sink.base) :
+		    sftp_readdir_download_consume(conn, src, dst, 0,
+		        PARALLEL_MAX_DIR_DEPTH, NULL,
+		        sftp_parallel_follow_link_flag(p), &sink.base);
 		sftp_parallel_set_walker_phase(p, SFTP_WKP_DONE);
 		return rc;
 	}

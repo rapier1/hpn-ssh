@@ -450,6 +450,18 @@ struct sftp_tree_dl_sink {
 int  sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, Attrib *dirattrib, struct sftp_tree_dl_sink *sink);
 
+/*
+ * Fallback recursive readdir download driver, used when the server lacks
+ * hpn-discover-tree.  Enumerates src one directory at a time via sftp_readdir
+ * and replays each entry through the same sink as sftp_tree_download_consume.
+ * Recursive (calls itself per subdirectory); max_depth caps the recursion and
+ * follow_link_flag mirrors the walks' dormant -L handling.  Returns 0, or -1
+ * if any entry failed.
+ */
+int  sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
+    const char *dst, int depth, int max_depth, Attrib *dirattrib,
+    int follow_link_flag, struct sftp_tree_dl_sink *sink);
+
 void sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc,
     struct sftp_conn *conn, int resume, int is_download);
 int sftp_hpn_bundle_acc_eligible(struct sftp_hpn_bundle_acc *acc,

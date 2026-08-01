@@ -1930,3 +1930,95 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	sftp_hpn_tree_free(ents, nents);
 	return ret;
 }
+
+/*
+ * Fallback recursive readdir download driver (used when the server lacks
+ * hpn-discover-tree): enumerate src a directory at a time, recursing into
+ * subdirectories, and replay each entry through the same sink the tree
+ * consumer uses.  Directory attrs are deferred pre-order here rather than the
+ * historical post-order, but every deferred attr is applied at end-of-walk
+ * where order is immaterial.  See sftp-hpn-client.h.
+ */
+int
+sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
+    const char *dst, int depth, int max_depth, Attrib *dirattrib,
+    int follow_link_flag, struct sftp_tree_dl_sink *sink)
+{
+	SFTP_DIRENT	**entries;
+	char		 *new_src = NULL, *new_dst = NULL;
+	Attrib		  ldirattrib, lsym;
+	int		  ret = 0, i;
+
+	if (depth >= max_depth) {
+		error("Maximum directory depth exceeded: %d levels", depth);
+		sink->fail(sink, src, "max directory depth exceeded");
+		return -1;
+	}
+	if (dirattrib == NULL) {
+		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
+			error("stat remote \"%s\" directory failed", src);
+			sink->fail(sink, src, "remote stat failed");
+			return -1;
+		}
+		dirattrib = &ldirattrib;
+	}
+	if (!S_ISDIR(dirattrib->perm)) {
+		error("\"%s\" is not a directory", src);
+		sink->fail(sink, src, "not a directory");
+		return -1;
+	}
+	/* Create dst; print + Lustre parity + deferred attrs live in make_dir. */
+	if (sink->make_dir(sink, src, dst, dirattrib) != 0)
+		return -1;
+	if (sftp_readdir(conn, src, &entries) == -1) {
+		error("remote readdir \"%s\" failed", src);
+		sink->fail(sink, src, "remote readdir failed");
+		return -1;
+	}
+
+	for (i = 0; entries[i] != NULL && !sink->aborting(sink); i++) {
+		const char	*filename;
+		Attrib		*a;
+
+		free(new_dst);
+		free(new_src);
+		filename = entries[i]->filename;
+		new_dst = sftp_path_append(dst, filename);
+		new_src = sftp_path_append(src, filename);
+		a = &entries[i]->a;
+
+		if (S_ISLNK(a->perm)) {
+			if (!follow_link_flag) {
+				logit("download \"%s\": not a regular file",
+				    new_src);
+				continue;
+			}
+			/* -L is a dormant upstream stub: resolve the target
+			 * and treat the entry as whatever it points to. */
+			if (sftp_stat(conn, new_src, 1, &lsym) != 0) {
+				error("remote stat \"%s\" failed", new_src);
+				sink->fail(sink, new_src, "remote stat failed");
+				ret = -1;
+				continue;
+			}
+			a = &lsym;
+		}
+		if (S_ISDIR(a->perm)) {
+			if (strcmp(filename, ".") == 0 ||
+			    strcmp(filename, "..") == 0)
+				continue;
+			if (sftp_readdir_download_consume(conn, new_src, new_dst,
+			    depth + 1, max_depth, a, follow_link_flag, sink) != 0)
+				ret = -1;
+		} else if (S_ISREG(a->perm)) {
+			if (sink->xfer_file(sink, new_src, new_dst, a) != 0)
+				ret = -1;
+		} else {
+			logit("download \"%s\": not a regular file", new_src);
+		}
+	}
+	free(new_dst);
+	free(new_src);
+	sftp_free_dirents(entries);
+	return ret;
+}
