@@ -322,6 +322,13 @@ parallel_dl_aborting(struct sftp_tree_dl_sink *sink)
 	return sftp_parallel_is_aborting(((struct parallel_dl_sink *)sink)->p);
 }
 
+static void
+parallel_dl_set_total(struct sftp_tree_dl_sink *sink, off_t total_bytes)
+{
+	sftp_parallel_progress_set_total(
+	    ((struct parallel_dl_sink *)sink)->p, total_bytes);
+}
+
 int
 sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify)
@@ -345,6 +352,7 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 				.xfer_file = parallel_dl_xfer_file,
 				.fail = parallel_dl_fail,
 				.aborting = parallel_dl_aborting,
+				.set_total = parallel_dl_set_total,
 			},
 			.p = p,
 			.conn = conn,

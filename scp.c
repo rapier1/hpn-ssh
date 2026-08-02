@@ -638,6 +638,7 @@ void source_sftp(int, char *, char *, struct sftp_conn *);
 void sink_sftp(int, char *, const char *, struct sftp_conn *);
 void throughlocal_sftp(struct sftp_conn *, struct sftp_conn *,
     char *, char *);
+static char *prepare_remote_path(struct sftp_conn *, const char *);
 
 int
 main(int argc, char **argv)
@@ -2046,11 +2047,19 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 			if (parallel_orch != NULL && parallel_want_progress) {
 				Attrib da;
 				off_t dtotal = 0;
+				char *da_path;
 
-				if (sftp_stat(conn, src, 1, &da) == 0 &&
+				/* Stat the canonicalized path, as the transfer
+				 * does via prepare_remote_path: a "~/..." source
+				 * does not resolve in a bare SFTP stat and would
+				 * leave the meter total 0. */
+				da_path = prepare_remote_path(conn, src);
+				if (da_path != NULL &&
+				    sftp_stat(conn, da_path, 1, &da) == 0 &&
 				    (da.flags & SSH2_FILEXFER_ATTR_SIZE) &&
 				    !S_ISDIR(da.perm))
 					dtotal = (off_t)da.size;
+				free(da_path);
 				sftp_parallel_progress_start(parallel_orch,
 				    "Downloading in parallel", dtotal);
 			}

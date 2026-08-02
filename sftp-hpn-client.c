@@ -1957,6 +1957,20 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 		goto out;
 	}
 
+	/* The full file list is now in hand (every file was deferred to here),
+	 * so the total size is known.  Hand it to the sink: a parallel download
+	 * switches its aggregate meter from rate-only to a real percentage and
+	 * ETA.  Serial and third-party sinks leave set_total NULL. */
+	if (sink->set_total != NULL) {
+		off_t total_bytes = 0;
+
+		for (i = 0; i < ctx.nfiles; i++) {
+			if (ctx.files[i].a.flags & SSH2_FILEXFER_ATTR_SIZE)
+				total_bytes += (off_t)ctx.files[i].a.size;
+		}
+		sink->set_total(sink, total_bytes);
+	}
+
 	/* Transfer the files queued during the stream. */
 	for (i = 0; i < ctx.nfiles && !sink->aborting(sink); i++) {
 		if (sink->xfer_file(sink, ctx.files[i].src, ctx.files[i].dst,

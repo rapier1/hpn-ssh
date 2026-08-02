@@ -1054,6 +1054,22 @@ sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
 	p->progress_meter_started = 1;
 }
 
+/*
+ * Update a running transfer meter's total after it was started with an
+ * unknown (0) total.  The discover-tree download driver calls this once the
+ * enumeration has drained and the full byte total is known, so the aggregate
+ * meter switches from rate-only to a real percentage and ETA.  No-op before
+ * the meter starts.
+ */
+void
+sftp_parallel_progress_set_total(struct sftp_parallel *p, off_t total_bytes)
+{
+	if (p == NULL || !p->progress_meter_started)
+		return;
+	p->progress_total_bytes = total_bytes;
+	pm_set_total(total_bytes);
+}
+
 void
 sftp_parallel_progress_stop(struct sftp_parallel *p)
 {

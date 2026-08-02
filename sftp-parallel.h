@@ -446,6 +446,8 @@ void sftp_parallel_set_path_rtt(struct sftp_parallel *p, uint64_t rtt_us);
  */
 void sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
     off_t total_bytes);
+void sftp_parallel_progress_set_total(struct sftp_parallel *p,
+    off_t total_bytes);
 void sftp_parallel_progress_stop(struct sftp_parallel *p);
 /* Scan a local path recursively; return total bytes of regular files and
  * optionally the file count via file_count_out (may be NULL). */
