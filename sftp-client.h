@@ -474,7 +474,7 @@ struct sftp_hpn_bundle_download_entry {
 
 int sftp_hpn_bundle_download(struct sftp_conn *conn,
     struct sftp_hpn_bundle_download_entry *entries, int n,
-    int preserve_flag, int writer_pool);
+    int preserve_flag, int writer_pool, off_t *progress);
 
 /* ── END Phase 5 ─────────────────────────────────────────────────────────*/
 

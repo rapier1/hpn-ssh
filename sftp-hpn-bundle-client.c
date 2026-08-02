@@ -182,6 +182,10 @@ struct bundle_dl_stream {
 	/* (D) Most-recently-mkdir_p'd parent dir - skip repeats. */
 	char    *last_mkdir_dir;
 
+	/* Optional received-payload counter for a serial-flush progress meter;
+	 * NULL when the caller does not meter (parallel workers). */
+	off_t   *progress;
+
 	/* Sticky error: data_cb / entry_end_cb / etc. failed. */
 	int      error;
 };
@@ -326,6 +330,8 @@ bundle_dl_data_cb(void *ctx, const u_char *data, size_t len)
 		 * the paths we asked for.) */
 		return 0;
 	}
+	if (s->progress != NULL)
+		*s->progress += (off_t)len;
 	if (s->pool != NULL) {
 		/* Parallel path: accumulate into the per-file buffer; a pool
 		 * thread writes it once the entry completes. */
@@ -641,7 +647,7 @@ bundle_dl_stream_drain_inflight(struct bundle_dl_stream *s)
 int
 sftp_hpn_bundle_download(struct sftp_conn *conn,
     struct sftp_hpn_bundle_download_entry *entries, int n,
-    int preserve_flag, int writer_pool)
+    int preserve_flag, int writer_pool, off_t *progress)
 {
 	struct sshbuf *msg = NULL;
 	u_char *handle = NULL;
@@ -711,6 +717,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	stream.entries      = entries;
 	stream.n_entries    = n;
 	stream.preserve_flag = preserve_flag;
+	stream.progress     = progress;
 	stream.max_inflight_bytes = bundle_dl_queue_max_bytes();
 
 	/* Parallel extract: a writer pool overlaps the per-file open/write/

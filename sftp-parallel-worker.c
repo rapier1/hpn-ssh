@@ -1041,7 +1041,7 @@ worker_run_bundle_download(struct sftp_worker *w,
 
 	t_start_ms = monotime_ms();
 	bundle_rc = sftp_hpn_bundle_download(w->conn, entries, bn,
-	    p->cfg.preserve_flag, p->cfg.writer_pool);
+	    p->cfg.preserve_flag, p->cfg.writer_pool, NULL);
 	t_end_ms = monotime_ms();
 
 	for (i = 0; i < bn; i++)

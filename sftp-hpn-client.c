@@ -57,6 +57,7 @@
 #include "sftp.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"
+#include "progressmeter.h"		/* serial bundle-flush meter */
 #include "sftp-hpn-server.h"	/* hpn-file-layout wire format + status codes */
 #include "sftp-hpn-client.h"
 #include "sftp-hpn-tree.h"	/* hpn-discover-tree fetch + record codec */
@@ -1452,16 +1453,35 @@ bundle_acc_flush_download(struct sftp_conn *conn,
     struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
     int verify, int fsync_flag, int inplace_flag)
 {
+	/* Serial progress gate, owned by sftp-client.c.  Parallel workers call
+	 * sftp_hpn_bundle_download directly rather than this flush, so metering
+	 * here never touches the parallel aggregate meter. */
+	extern int showprogress;
 	struct sftp_hpn_bundle_download_entry *entries;
 	int i, rc, dr, failures = 0;
+	off_t meter_ctr = 0, meter_total = 0;
+	char meter_label[32];
+	int meter_on;
 
 	entries = xcalloc(acc->n, sizeof(*entries));
 	for (i = 0; i < acc->n; i++) {
 		entries[i].remote_path = acc->src_paths[i];
 		entries[i].local_path = acc->dst_paths[i];
+		meter_total += (off_t)acc->sizes[i];
+	}
+	/* Meter the bundle as one unit.  Bundled files never reach
+	 * sftp_download, so without this a serial bundle transfer shows no
+	 * meter at all; non-bundled files keep their own per-file meters. */
+	meter_on = showprogress && meter_total > 0;
+	if (meter_on) {
+		snprintf(meter_label, sizeof(meter_label), "%d files", acc->n);
+		start_progress_meter(meter_label, meter_total, &meter_ctr);
 	}
 	rc = sftp_hpn_bundle_download(conn, entries, acc->n,
-	    preserve_flag, sftp_conn_hpn(conn)->bundle_cfg.writer_pool);
+	    preserve_flag, sftp_conn_hpn(conn)->bundle_cfg.writer_pool,
+	    meter_on ? &meter_ctr : NULL);
+	if (meter_on)
+		stop_progress_meter();
 	switch (rc) {
 	case SFTP_HPN_BUNDLE_OK:
 		for (i = 0; i < acc->n; i++) {
