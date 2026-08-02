@@ -434,7 +434,11 @@ refresh_progress_meter(int force_update)
 	if (delta_pos > max_delta_pos)
 		max_delta_pos = delta_pos;
 
-	if (bytes_left > 0)
+	/* end_pos == 0 means an unknown total (a directory download with no
+	 * pre-scanned size): keep it a rate-only meter - take the normal
+	 * window and the real delta, not the completion branch that zeroes
+	 * the rate and accrues a false stall. */
+	if (bytes_left > 0 || end_pos == 0)
 		elapsed = now - last_update;
 	else {
 		elapsed = now - start;
@@ -479,22 +483,27 @@ refresh_progress_meter(int force_update)
 	v.label = file;
 	v.cur = cur_pos;
 	v.total = end_pos;
-	/* Local policy: an unknown (0) total renders 100%, as the historic
-	 * inline paint did (the parallel aggregate meter runs this way). */
-	if (end_pos == 0 || cur_pos >= end_pos)
+	/* Local policy: an unknown (0) total is a rate-only meter - read 0%
+	 * (matching the relay path) rather than a bogus 100%.  A known total
+	 * met or passed is a real completion. */
+	if (end_pos == 0)
+		v.percent = 0;
+	else if (cur_pos >= end_pos)
 		v.percent = 100;
 	else
 		v.percent = (int)((float)cur_pos / end_pos * 100);
 	v.rate = bytes_per_second;
-	v.inst = bytes_left > 0 ? delta_pos : max_delta_pos;
+	v.inst = (bytes_left > 0 || end_pos == 0) ? delta_pos : max_delta_pos;
 	v.delta = delta_pos;
 	v.elapsed = elapsed;
 	v.eta_sec = (bytes_left > 0 && bytes_per_second > 0) ?
 	    (uint32_t)(bytes_left / bytes_per_second) : HPNS_ETA_UNKNOWN;
 	v.stalled = stalled >= STALL_TIME;
-	v.done = bytes_left == 0;	/* over-completion (cur>total, rate
-					 * forced to 0) falls to UNKNOWN, as the
-					 * historic inline paint did */
+	/* An unknown (0) total is never "done" here - completion is signalled
+	 * by stop_progress_meter, not the byte count.  Over-completion
+	 * (cur>total, rate forced to 0) falls to UNKNOWN, as the historic
+	 * inline paint did. */
+	v.done = end_pos != 0 && bytes_left == 0;
 	v.elapsed_sec = (long)elapsed;
 
 	if (hpn_pm_active())
