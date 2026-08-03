@@ -1988,7 +1988,7 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 			if (ctx.files[i].a.flags & SSH2_FILEXFER_ATTR_SIZE)
 				total_bytes += (off_t)ctx.files[i].a.size;
 		}
-		sink->set_total(sink, total_bytes);
+		sink->set_total(sink, total_bytes, ctx.nfiles);
 	}
 
 	/* Transfer the files queued during the stream. */

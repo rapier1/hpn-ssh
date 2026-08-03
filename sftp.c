@@ -772,13 +772,8 @@ local_is_dir(const char *path)
  * sftp exit code: silent data loss is unacceptable.  When parallel_orch
  * is NULL (parallel mode off) the function is a no-op returning 0.
  */
-/* Cumulative bytes already reflected in an emitted summary line.  parallel_flush
- * runs both per-command and again at the end-of-batch drain; tracking this lets
- * a single command print exactly one summary instead of two. */
-static uint64_t parallel_summary_last_total;
-
 static int
-parallel_flush(void)
+parallel_flush(int final)
 {
 	struct sftp_parallel_stats pstats;
 	int rc = 0;
@@ -790,21 +785,16 @@ parallel_flush(void)
 	sftp_parallel_progress_stop(parallel_orch);
 	sftp_parallel_get_stats(parallel_orch, &pstats);
 
-	/* End-of-transfer summary.  Leads with bytes/throughput so the
-	 * operator gets a one-line health check; appends the respawn
-	 * count when non-zero (so a clean transfer stays terse), and a
-	 * tuning hint when respawn churn crosses ~25 % of -j - the same
-	 * threshold the outlier detector uses, and the empirically
-	 * observed knee-of-the-curve for too many parallel streams on a
-	 * saturated path.  Emitted BEFORE any TRANSFER INCOMPLETE block
-	 * so the signal isn't buried under a long failed-paths list. */
-	if (pstats.elapsed_ms > 0 && pstats.bytes_total_aggregate > 0 &&
-	    pstats.bytes_total_aggregate != parallel_summary_last_total) {
+	/* Session-total summary.  parallel_flush drains after every command,
+	 * but this line is a whole-session rollup - cumulative wire bytes and
+	 * elapsed since the orchestrator started - so it is emitted ONLY on the
+	 * final drain (interactive_loop, after the command loop), never per
+	 * command.  Printing it per command made an interactive user watch the
+	 * running total climb after every get, reading as a per-command figure
+	 * when it is not.  Emitted BEFORE any TRANSFER INCOMPLETE block so the
+	 * signal isn't buried under a long failed-paths list. */
+	if (final && pstats.elapsed_ms > 0 && pstats.bytes_total_aggregate > 0) {
 		double secs   = pstats.elapsed_ms / 1000.0;
-
-		/* Mark this cumulative total as summarized so the redundant
-		 * end-of-batch flush (or any later no-op flush) stays silent. */
-		parallel_summary_last_total = pstats.bytes_total_aggregate;
 		double wired  = (double)pstats.bytes_wired_aggregate;
 		/*
 		 * Primary number is bytes actually transferred (wired) and
@@ -872,16 +862,16 @@ parallel_flush(void)
 			snprintf(brk, sizeof(brk), " (%d peer-stall)",
 			    pstats.peer_stall_terminations);
 		if (pstats.total_respawns > 0) {
-			logit("Parallel streams: %.2f %s transferred in %.1fs"
-			    "%s; %d worker respawn%s%s%s",
+			logit("Parallel streams: session total %.2f %s "
+			    "transferred in %.1fs%s; %d worker respawn%s%s%s",
 			    wired_val, wired_unit, secs,
 			    skipped_str,
 			    pstats.total_respawns,
 			    pstats.total_respawns == 1 ? "" : "s",
 			    brk, churn_hint);
 		} else {
-			logit("Parallel streams: %.2f %s transferred in %.1fs"
-			    "%s",
+			logit("Parallel streams: session total %.2f %s "
+			    "transferred in %.1fs%s",
 			    wired_val, wired_unit, secs, skipped_str);
 		}
 	}
@@ -1291,10 +1281,30 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 
 	if (parallel_orch != NULL && !quiet && g.gl_matchc > 0) {
 		char label[64];
-		snprintf(label, sizeof(label),
-		    "Fetching %d file%s in parallel", (int)g.gl_matchc,
-		    g.gl_matchc == 1 ? "" : "s");
-		sftp_parallel_progress_start(parallel_orch, label, 0);
+		off_t dtotal = 0;
+		Attrib da;
+
+		if (g.gl_matchc == 1 && sftp_globpath_is_dir(g.gl_pathv[0])) {
+			/* Single directory: the real file count is unknown
+			 * until the discover-tree walk, so defer it - the label
+			 * is rewritten to "Fetching N files in parallel" once
+			 * the walk drains (see set_total). */
+			sftp_parallel_progress_start_counted(parallel_orch,
+			    "Fetching", 0);
+		} else {
+			/* A single regular-file source: size the meter to it
+			 * for a real percentage and ETA (mirrors scp.c and
+			 * process_put).  Multi-match globs stay rate-only. */
+			if (g.gl_matchc == 1 &&
+			    sftp_stat(conn, g.gl_pathv[0], 1, &da) == 0 &&
+			    (da.flags & SSH2_FILEXFER_ATTR_SIZE))
+				dtotal = (off_t)da.size;
+			snprintf(label, sizeof(label),
+			    "Fetching %d file%s in parallel",
+			    (int)g.gl_matchc, g.gl_matchc == 1 ? "" : "s");
+			sftp_parallel_progress_start(parallel_orch, label,
+			    dtotal);
+		}
 	}
 
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
@@ -1460,7 +1470,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 	 * the protocol-violation summary then happen at flush time.
 	 */
 	if (parallel_orch != NULL && !defer_parallel_wait) {
-		if (parallel_flush() != 0)
+		if (parallel_flush(0) != 0)
 			err = -1;
 	}
 
@@ -1666,7 +1676,7 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 	 * successive put commands pipeline their files instead of each one
 	 * stalling on a slow tail chunk from the previous file. */
 	if (parallel_orch != NULL && !defer_parallel_wait) {
-		if (parallel_flush() != 0)
+		if (parallel_flush(0) != 0)
 			err = -1;
 	}
 
@@ -2739,7 +2749,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		    strcasecmp(path1, "no") == 0 ||
 		    strcmp(path1, "0") == 0) {
 			if (defer_parallel_wait && parallel_orch != NULL) {
-				if (parallel_flush() != 0)
+				if (parallel_flush(0) != 0)
 					err = -1;
 			}
 			defer_parallel_wait = 0;
@@ -2757,7 +2767,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		 * flight or when the orchestrator isn't running.  Always
 		 * safe - independent of the defer flag. */
 		if (parallel_orch != NULL) {
-			if (parallel_flush() != 0)
+			if (parallel_flush(0) != 0)
 				err = -1;
 		}
 		if (!quiet)
@@ -3350,7 +3360,7 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	 * already drained itself, so the queue is empty and the wait returns
 	 * immediately.
 	 */
-	if (parallel_flush() != 0)
+	if (parallel_flush(1) != 0)
 		err = -1;
 
 	ssh_signal(SIGCHLD, SIG_DFL);

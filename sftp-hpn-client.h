@@ -446,11 +446,13 @@ struct sftp_tree_dl_sink {
 	/* True when the walk should stop (interrupt / fleet abort). */
 	int  (*aborting)(struct sftp_tree_dl_sink *sink);
 	/* Optional.  Once the discover-tree stream has drained and every file
-	 * is queued, report the enumerated total bytes so an aggregate meter
-	 * can switch from rate-only to a real percentage and ETA.  NULL for
-	 * sinks with no such meter (serial per-file, third-party); the readdir
-	 * fallback has no complete total and never calls it. */
-	void (*set_total)(struct sftp_tree_dl_sink *sink, off_t total_bytes);
+	 * is queued, report the enumerated total bytes and file count so an
+	 * aggregate meter can switch from rate-only to a real percentage and
+	 * ETA (and rewrite a deferred-count label).  NULL for sinks with no
+	 * such meter (serial per-file, third-party); the readdir fallback has
+	 * no complete total and never calls it. */
+	void (*set_total)(struct sftp_tree_dl_sink *sink, off_t total_bytes,
+	    size_t nfiles);
 };
 
 /*

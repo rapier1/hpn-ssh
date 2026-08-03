@@ -1052,22 +1052,61 @@ sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
 	start_progress_meter(p->progress_label, total_bytes,
 	    &p->aggregate_progress_counter);
 	p->progress_meter_started = 1;
+	p->progress_verb[0] = '\0';	/* no deferred file count unless the
+					 * caller re-arms it via _start_counted */
 }
 
 /*
- * Update a running transfer meter's total after it was started with an
- * unknown (0) total.  The discover-tree download driver calls this once the
- * enumeration has drained and the full byte total is known, so the aggregate
- * meter switches from rate-only to a real percentage and ETA.  No-op before
- * the meter starts.
+ * Update a running transfer meter after it was started with an unknown (0)
+ * total.  The discover-tree download driver calls this once the enumeration has
+ * drained and the full byte total and file count are known, so the aggregate
+ * meter switches from rate-only to a real percentage and ETA, and (if the
+ * client deferred its count via _start_counted) the label is rewritten to
+ * "<verb> N files in parallel".  No-op before the meter starts.
  */
 void
-sftp_parallel_progress_set_total(struct sftp_parallel *p, off_t total_bytes)
+sftp_parallel_progress_set_total(struct sftp_parallel *p, off_t total_bytes,
+    size_t nfiles)
 {
 	if (p == NULL || !p->progress_meter_started)
 		return;
 	p->progress_total_bytes = total_bytes;
 	pm_set_total(total_bytes);
+	/* If the client deferred its file count (a directory download, where
+	 * the real count is unknown until the discover-tree walk), rewrite the
+	 * label now that we have it.  The meter holds progress_label by pointer,
+	 * so an in-place rewrite shows on the next refresh. */
+	if (p->progress_verb[0] != '\0' && nfiles > 0) {
+		snprintf(p->progress_label, sizeof(p->progress_label),
+		    "%s %zu %s in parallel", p->progress_verb, nfiles,
+		    nfiles == 1 ? "file" : "files");
+		strlcpy(p->progress_label_saved, p->progress_label,
+		    sizeof(p->progress_label_saved));
+	}
+}
+
+/*
+ * Start a parallel download meter whose file count is not yet known (a
+ * directory download - the real count arrives with the discover-tree walk).
+ * Shows a count-less "<verb> files in parallel" until _set_total rewrites it to
+ * "<verb> N files in parallel".  verb is the tool's own word ("Fetching" for
+ * sftp, "Downloading" for scp).
+ */
+void
+sftp_parallel_progress_start_counted(struct sftp_parallel *p, const char *verb,
+    off_t total_bytes)
+{
+	char label[128];
+
+	if (p == NULL)
+		return;
+	if (verb == NULL)
+		verb = "Fetching";
+	snprintf(label, sizeof(label), "%s files in parallel", verb);
+	sftp_parallel_progress_start(p, label, total_bytes);
+	/* progress_start cleared progress_verb; set it AFTER so the count-fill
+	 * in _set_total rewrites this label. */
+	strlcpy(p->progress_verb, verb, sizeof(p->progress_verb));
 }
 
 void

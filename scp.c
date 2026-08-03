@@ -2047,6 +2047,7 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 			if (parallel_orch != NULL && parallel_want_progress) {
 				Attrib da;
 				off_t dtotal = 0;
+				int is_dir = 0;
 				char *da_path;
 
 				/* Stat the canonicalized path, as the transfer
@@ -2055,13 +2056,23 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 				 * leave the meter total 0. */
 				da_path = prepare_remote_path(conn, src);
 				if (da_path != NULL &&
-				    sftp_stat(conn, da_path, 1, &da) == 0 &&
-				    (da.flags & SSH2_FILEXFER_ATTR_SIZE) &&
-				    !S_ISDIR(da.perm))
-					dtotal = (off_t)da.size;
+				    sftp_stat(conn, da_path, 1, &da) == 0) {
+					is_dir = S_ISDIR(da.perm);
+					if (!is_dir &&
+					    (da.flags & SSH2_FILEXFER_ATTR_SIZE))
+						dtotal = (off_t)da.size;
+				}
 				free(da_path);
-				sftp_parallel_progress_start(parallel_orch,
-				    "Downloading in parallel", dtotal);
+				if (is_dir)
+					/* Directory: the real file count arrives
+					 * with the discover-tree walk, so defer
+					 * it (see set_total). */
+					sftp_parallel_progress_start_counted(
+					    parallel_orch, "Downloading", 0);
+				else
+					sftp_parallel_progress_start(
+					    parallel_orch,
+					    "Downloading in parallel", dtotal);
 			}
 
 			/* The protocol */

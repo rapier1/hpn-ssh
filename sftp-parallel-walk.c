@@ -323,10 +323,11 @@ parallel_dl_aborting(struct sftp_tree_dl_sink *sink)
 }
 
 static void
-parallel_dl_set_total(struct sftp_tree_dl_sink *sink, off_t total_bytes)
+parallel_dl_set_total(struct sftp_tree_dl_sink *sink, off_t total_bytes,
+    size_t nfiles)
 {
 	sftp_parallel_progress_set_total(
-	    ((struct parallel_dl_sink *)sink)->p, total_bytes);
+	    ((struct parallel_dl_sink *)sink)->p, total_bytes, nfiles);
 }
 
 int
