@@ -749,7 +749,10 @@ pm_relay_end(u_int64_t bytes_done)
 void
 pm_set_total(off_t total)
 {
-	end_pos = total;
+	/* A negative total is not a size.  Treat it the way an unset one is
+	 * treated, so the meter runs rate-only instead of deriving a
+	 * percentage and an ETA from it. */
+	end_pos = total > 0 ? total : 0;
 }
 
 static void

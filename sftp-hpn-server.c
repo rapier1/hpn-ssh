@@ -808,11 +808,34 @@ process_hpn_file_layout(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 /* Records buffered per streamed chunk before a DATA reply is drained. */
 #define DTREE_CHUNK_RECORDS	256
 
+/*
+ * Byte ceiling on the same chunk.  A record carries the walk-root-relative
+ * path, which grows with tree depth, so a record count alone does not bound
+ * the reply size: 256 records averaging about a kilobyte of path overflow
+ * SFTP_MAX_MSG_LENGTH, and the client treats an over-long message as fatal
+ * rather than recoverable.  The reserve covers the chunk header plus one
+ * full-length record, since the trigger is tested after the record is
+ * appended.  Same shape and reasoning as BUNDLE_DL_FETCH_REQ_MAX.
+ */
+#define DTREE_CHUNK_MAX_BYTES \
+    ((size_t)SFTP_MAX_MSG_LENGTH - PATH_MAX - 1024)
+
+/* One directory on the current recursion path, for symlink-loop detection. */
+struct dtree_pathent {
+	dev_t	dev;
+	ino_t	ino;
+	int	valid;			/* the fstat behind it succeeded */
+};
+
 struct dtree_emit {
 	u_int		 id;
 	struct sshbuf	*oqueue;
 	struct sshbuf	*recbuf;	/* records accumulated for this chunk */
 	u_int32_t	 count;		/* records currently in recbuf */
+	/* Directories from the walk root down to the one being read, indexed
+	 * by depth.  Only maintained when following symlinks, which is the
+	 * only way a directory can reappear beneath itself. */
+	struct dtree_pathent path[HPN_DTREE_MAX_DEPTH];
 };
 
 /*
@@ -853,8 +876,29 @@ dtree_add(struct dtree_emit *emit, const char *relpath, u_char rectype,
 	if ((r = sftp_tree_put_record(emit->recbuf, relpath, rectype, a,
 	    status)) != 0)
 		fatal_fr(r, "encode dtree record");
-	if (++emit->count >= DTREE_CHUNK_RECORDS)
+	if (++emit->count >= DTREE_CHUNK_RECORDS ||
+	    sshbuf_len(emit->recbuf) >= DTREE_CHUNK_MAX_BYTES)
 		dtree_flush(emit, HPN_DTREE_CHUNK_DATA);
+}
+
+/*
+ * Is st one of the directories from the walk root down to the current one?
+ * A followed symlink pointing back at an ancestor otherwise re-enumerates that
+ * subtree once per link, which the depth cap bounds only in path length: k
+ * self-referential links at one level cost k^depth traversals, all inside a
+ * single uninterruptible request.
+ */
+static int
+dtree_on_path(const struct dtree_emit *emit, int depth, const struct stat *st)
+{
+	int i;
+
+	for (i = 0; i <= depth && i < HPN_DTREE_MAX_DEPTH; i++) {
+		if (emit->path[i].valid && emit->path[i].dev == st->st_dev &&
+		    emit->path[i].ino == st->st_ino)
+			return 1;
+	}
+	return 0;
 }
 
 /*
@@ -868,8 +912,9 @@ dtree_add(struct dtree_emit *emit, const char *relpath, u_char rectype,
  * is set (the client's follow_link_flag, which scp uses). When follow is set
  * the link target is stat'd and the entry is treated as that target: a
  * directory target is descended, a regular target is emitted as REG. A broken
- * link emits an ERROR record. Loops are bounded by the depth cap, the same
- * way the client readdir path bounds them.
+ * link emits an ERROR record. A target that resolves to a directory already on
+ * the path from the walk root is a loop: it emits an ERROR record and is not
+ * descended (see dtree_on_path). The depth cap still backstops everything else.
  */
 static void
 dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
@@ -877,6 +922,7 @@ dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
 {
 	DIR		*dir_handle;
 	struct dirent	*entry;
+	struct stat	 dir_st;
 
 	if (depth >= HPN_DTREE_MAX_DEPTH)
 		return;
@@ -884,6 +930,14 @@ dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
 		dtree_add(emit, relbase, HPN_DTREE_REC_ERROR, NULL,
 		    errno_to_sftp_status(errno));
 		return;
+	}
+	/* Put this directory on the recursion path so a followed symlink that
+	 * resolves back to it, or to any ancestor, is caught below. */
+	emit->path[depth].valid = 0;
+	if (follow && fstat(dirfd(dir_handle), &dir_st) == 0) {
+		emit->path[depth].dev = dir_st.st_dev;
+		emit->path[depth].ino = dir_st.st_ino;
+		emit->path[depth].valid = 1;
 	}
 	while ((entry = readdir(dir_handle)) != NULL) {
 		char		*child_abs, *child_rel;
@@ -912,7 +966,12 @@ dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
 		} else {
 			/* a regular entry, or a symlink resolved to its target */
 			stat_to_attrib(&st, &a);
-			if (S_ISDIR(st.st_mode)) {
+			if (S_ISDIR(st.st_mode) &&
+			    dtree_on_path(emit, depth, &st)) {
+				/* Followed a link back into our own path. */
+				dtree_add(emit, child_rel, HPN_DTREE_REC_ERROR,
+				    NULL, SSH2_FX_FAILURE);
+			} else if (S_ISDIR(st.st_mode)) {
 				dtree_add(emit, child_rel, HPN_DTREE_REC_DIR, &a, 0);
 				dtree_walk(emit, child_abs, child_rel, depth + 1,
 				    follow);

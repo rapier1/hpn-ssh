@@ -1758,7 +1758,7 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 	u_int			 id, rid;
 	u_char			 type, version, kind;
 	u_int32_t		 count, i;
-	int			 r, rc = -1, done = 0;
+	int			 r, rc = -1, done = 0, skip = 0;
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
@@ -1821,7 +1821,23 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 			    "codec version %u", version);
 			goto out;
 		}
-		for (i = 0; i < count; i++) {
+		/* A DATA chunk always carries records: the server flushes one
+		 * only when the record buffer is full or non-empty.  Refusing
+		 * an empty one keeps a peer from parking us in this loop
+		 * forever with chunks that never reach the callback. */
+		if (count == 0 && kind != HPN_DTREE_CHUNK_END) {
+			sftp_conn_die(conn, "hpn-discover-tree: DATA chunk "
+			    "carries no records");
+			goto out;
+		}
+		/*
+		 * Once the callback has bowed out, usually an interrupt, stop
+		 * decoding: nothing would be done with the records.  Keep
+		 * reading chunks to the END marker so the exchange finishes in
+		 * sync and the connection stays usable, but discard each one
+		 * whole rather than parsing a tree that is being thrown away.
+		 */
+		for (i = 0; !skip && i < count; i++) {
 			struct sftp_tree_ent ent;
 
 			memset(&ent, 0, sizeof(ent));
@@ -1832,7 +1848,7 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 				    ssh_err(r));
 				goto out;
 			}
-			(void)cb(ctx, &ent);
+			skip = cb(ctx, &ent) != 0;
 			free(ent.relpath);
 		}
 		if (kind == HPN_DTREE_CHUNK_END)
@@ -1881,8 +1897,11 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 	Attrib			*a = &ent->a;
 	char			*new_src, *new_dst;
 
+	/* Stop the enumeration rather than draining the rest of it silently:
+	 * an interrupt during a large walk otherwise looks wedged until the
+	 * server finishes.  The fetch marks the connection dead. */
 	if (ctx->sink->aborting(ctx->sink))
-		return 0;
+		return -1;
 	if (!sftp_tree_relpath_ok(ent->relpath)) {
 		error("discover-tree: suspect path \"%s\" under \"%s\"",
 		    ent->relpath == NULL ? "(null)" : ent->relpath, ctx->src);
@@ -1985,8 +2004,24 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 		off_t total_bytes = 0;
 
 		for (i = 0; i < ctx.nfiles; i++) {
-			if (ctx.files[i].a.flags & SSH2_FILEXFER_ATTR_SIZE)
-				total_bytes += (off_t)ctx.files[i].a.size;
+			u_int64_t sz = ctx.files[i].a.size;
+
+			if ((ctx.files[i].a.flags &
+			    SSH2_FILEXFER_ATTR_SIZE) == 0)
+				continue;
+			/* Sizes come from the peer.  One past off_t, or a sum
+			 * that would pass it, wraps the signed accumulator into
+			 * a negative total and the meter renders nonsense for
+			 * the rest of the transfer.  Report an unknown total
+			 * instead and let the meter run rate-only. */
+			if (sz > (u_int64_t)INT64_MAX ||
+			    (u_int64_t)total_bytes > (u_int64_t)INT64_MAX - sz) {
+				debug_f("discover-tree \"%s\": file sizes exceed "
+				    "off_t; meter falls back to rate-only", src);
+				total_bytes = 0;
+				break;
+			}
+			total_bytes += (off_t)sz;
 		}
 		sink->set_total(sink, total_bytes, ctx.nfiles);
 	}

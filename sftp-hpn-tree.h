@@ -133,8 +133,12 @@ struct sftp_tree_ent {
  * Per-record callback invoked by the client fetch as each entry streams off
  * the wire.  ent is borrowed for the duration of the call: ent->relpath is
  * freed once the callback returns, so a callback that needs to retain any
- * field copies it.  The return value is currently ignored; the fetch always
- * drains the stream to its end so the control connection is left clean.
+ * field copies it.  Return zero to keep consuming.  A non-zero return means
+ * the callback wants no further records, typically an interrupt: the fetch
+ * stops decoding and discards the rest of the stream unread, but still reads
+ * it to the END marker so the exchange finishes in sync and the connection
+ * stays usable.  It is a "stop calling me", not an error, and the fetch still
+ * returns 0.
  */
 typedef int (*sftp_tree_record_cb)(void *ctx, struct sftp_tree_ent *ent);
 
