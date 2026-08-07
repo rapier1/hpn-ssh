@@ -902,6 +902,45 @@ dtree_on_path(const struct dtree_emit *emit, int depth, const struct stat *st)
 }
 
 /*
+ * Open one directory for the walk.  Below the root, and only when the client
+ * asked not to follow symlinks, refuse a final component that has become a
+ * symlink: the entry was classified by an earlier lstat, and the name can be
+ * replaced in the window between that decision and this open, which would
+ * redirect the walk outside the requested tree.  O_NOFOLLOW covers exactly the
+ * component at risk, so the enumeration stays where the client asked.  The
+ * root is named by the client and is stat'd by the caller, so it opens as
+ * given, and a follow walk resolves links because that is what was requested.
+ *
+ * Ancestors are still resolved by path on each open, and the lstat that
+ * classifies an entry remains a separate call, so a raced entry can still be
+ * recorded with the wrong type.  Neither leaves the requested tree.
+ *
+ * Platforms without fdopendir keep the plain path-based open, which is what
+ * OpenSSH's own OPENDIR handler does.
+ */
+static DIR *
+dtree_opendir(const char *abspath, int depth, int follow)
+{
+#ifdef HAVE_FDOPENDIR
+	DIR	*dir_handle;
+	int	 fd, oerrno, flags = O_RDONLY | O_DIRECTORY;
+
+	if (depth > 0 && !follow)
+		flags |= O_NOFOLLOW;
+	if ((fd = open(abspath, flags)) == -1)
+		return NULL;
+	if ((dir_handle = fdopendir(fd)) == NULL) {
+		oerrno = errno;
+		close(fd);
+		errno = oerrno;
+	}
+	return dir_handle;
+#else
+	return opendir(abspath);
+#endif
+}
+
+/*
  * Recursively enumerate abspath, emitting one record per entry with paths
  * relative to the walk root (relbase, "" at the root). A directory record is
  * emitted before its contents, so parents precede children on the wire. "."
@@ -926,7 +965,7 @@ dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
 
 	if (depth >= HPN_DTREE_MAX_DEPTH)
 		return;
-	if ((dir_handle = opendir(abspath)) == NULL) {
+	if ((dir_handle = dtree_opendir(abspath, depth, follow)) == NULL) {
 		dtree_add(emit, relbase, HPN_DTREE_REC_ERROR, NULL,
 		    errno_to_sftp_status(errno));
 		return;

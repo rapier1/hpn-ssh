@@ -2170,6 +2170,7 @@ AC_CHECK_FUNCS([ \
 	fchmodat \
 	fchown \
 	fchownat \
+	fdopendir \
 	flock \
 	fnmatch \
 	freeaddrinfo \
