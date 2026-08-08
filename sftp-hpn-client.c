@@ -1777,6 +1777,11 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 		goto out;
 	}
 
+	/* The reply streams as many chunks until END, so this connection is
+	 * ours until it drains.  Anything that tries to send on it before then
+	 * is a bug and send_msg says so; see reply_stream_active. */
+	sftp_conn_hpn(conn)->reply_stream_active = 1;
+
 	while (!done) {
 		sshbuf_reset(msg);
 		if (get_msg(conn, msg) != 0) {
@@ -1857,6 +1862,10 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 
 	rc = 0;
  out:
+	/* Clear on every exit, including the error gotos: an abandoned stream
+	 * leaves the connection unusable anyway, but a stuck flag would turn
+	 * that into a confusing fatal on the next unrelated request. */
+	sftp_conn_hpn(conn)->reply_stream_active = 0;
 	sshbuf_free(msg);
 	return rc;
 }

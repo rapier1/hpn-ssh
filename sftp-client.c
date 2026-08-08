@@ -210,6 +210,14 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 	if (conn->hpn->dead) /* HPN */
 		return -1;
 
+	/* HPN: a streamed reply owns the connection until it drains; see
+	 * reply_stream_active.  Sending here would interleave this request's
+	 * reply with the remaining chunks and desynchronise both readers, so
+	 * fail loudly at the offending call site rather than corrupt quietly. */
+	if (conn->hpn->reply_stream_active)
+		fatal_f("request sent while a streamed reply is in flight on "
+		    "this connection");
+
 	/* HPN adaptive upload pacing: apply the tighter of the adaptive
 	 * ceiling and the user's explicit -l (NULL when neither binds). */
 	bw = sftp_hpn_pace_bwlimit(conn->hpn,

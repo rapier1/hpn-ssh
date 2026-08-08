@@ -121,6 +121,22 @@ struct sftp_hpn_conn {
 	 * send/recv on this connection. */
 	int              dead;
 
+	/* Non-zero while a multi-message reply is streaming in on this
+	 * connection (hpn-discover-tree).  A reply is matched to its request
+	 * by reading the next message in wire order, so a second request sent
+	 * inside that window has its reply interleaved with the remaining
+	 * chunks: one reader consumes a message meant for the other and both
+	 * desynchronise, which is the "reply id mismatch" class of failure.
+	 * send_msg refuses to send while this is set, so a violation fails
+	 * immediately at the offending call site instead of surfacing later as
+	 * timing-dependent corruption.
+	 *
+	 * The scope is one connection.  A crossload walk legitimately sends on
+	 * the destination connection while the source connection streams, and
+	 * a pipelined helper that tracks its own request ids (mkdir/setstat,
+	 * bundle-fetch) manages its own window and does not set this. */
+	int              reply_stream_active;
+
 	/* Set when a protocol-level violation is detected (ID mismatch,
 	 * unexpected packet type). Distinct from dead: this indicates
 	 * possible MITM attack or serious server corruption, not a simple
