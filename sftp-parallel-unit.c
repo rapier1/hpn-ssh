@@ -1545,6 +1545,25 @@ get_cached_fs_info(struct sftp_parallel *p, struct sftp_conn *conn,
 }
 
 /*
+ * Populate the one-shot fs-info cache up front.  A submit issued while a
+ * streamed reply is draining must send nothing on that connection, and the
+ * lazy query above is the one thing in the download submit path that would;
+ * doing it here means the drain finds the answer already cached.  Warming with
+ * the walk root matches what the first file would have asked for, since the
+ * cache is per-orchestrator rather than per-path.  No-op once cached.
+ */
+void
+sftp_parallel_prewarm_fs_info(struct sftp_parallel *p, struct sftp_conn *conn,
+    const char *remote_path)
+{
+	struct sftp_fs_info info;
+
+	if (p == NULL || conn == NULL || remote_path == NULL)
+		return;
+	(void)get_cached_fs_info(p, conn, remote_path, &info);
+}
+
+/*
  * Resolve the range-split minimum file size, in bytes.  Precedence:
  *   1. cfg.range_split_min_mb (set by -M CLI flag, sftp.c)
  *   2. RANGE_SPLIT_MIN_SIZE_DEFAULT (2 GiB)

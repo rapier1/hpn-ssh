@@ -354,6 +354,11 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 				.fail = parallel_dl_fail,
 				.aborting = parallel_dl_aborting,
 				.set_total = parallel_dl_set_total,
+				/* Submitting only enqueues work for the fleet,
+				 * so files can be handed over as they are
+				 * discovered instead of after the stream
+				 * drains.  See streams_files. */
+				.streams_files = 1,
 			},
 			.p = p,
 			.conn = conn,
@@ -367,6 +372,12 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		 * handed to the workers once it drains; a transfer issued
 		 * mid-stream would collide with the discover-tree reply on the
 		 * control connection. */
+		/* The submit path queries the destination filesystem's stripe
+		 * geometry once and caches it.  Do that now: during a streamed
+		 * enumeration the connection is carrying the reply and cannot
+		 * also carry that query. */
+		if (sftp_conn_has_discover_tree(conn))
+			sftp_parallel_prewarm_fs_info(p, conn, src);
 		int rc = sftp_conn_has_discover_tree(conn) ?
 		    sftp_tree_download_consume(conn, src, dst, NULL,
 		        sftp_parallel_follow_link_flag(p), &sink.base) :

@@ -461,14 +461,28 @@ struct sftp_tree_dl_sink {
 	         const char *reason);
 	/* True when the walk should stop (interrupt / fleet abort). */
 	int  (*aborting)(struct sftp_tree_dl_sink *sink);
-	/* Optional.  Once the discover-tree stream has drained and every file
-	 * is queued, report the enumerated total bytes and file count so an
-	 * aggregate meter can switch from rate-only to a real percentage and
-	 * ETA (and rewrite a deferred-count label).  NULL for sinks with no
-	 * such meter (serial per-file, third-party); the readdir fallback has
-	 * no complete total and never calls it. */
+	/* Optional.  Once the discover-tree stream has drained, report the
+	 * enumerated total bytes and file count so an aggregate meter can
+	 * switch from rate-only to a real percentage and ETA (and rewrite a
+	 * deferred-count label).  NULL for sinks with no such meter (serial
+	 * per-file, third-party); the readdir fallback has no complete total
+	 * and never calls it. */
 	void (*set_total)(struct sftp_tree_dl_sink *sink, off_t total_bytes,
 	    size_t nfiles);
+	/*
+	 * Set when xfer_file may be called DURING the enumeration rather than
+	 * after it drains, so discovery and transfer overlap and the driver
+	 * holds no per-file queue.  Only legal when xfer_file sends nothing on
+	 * the connection carrying the reply: see reply_stream_active, which
+	 * turns a violation into an immediate failure.
+	 *
+	 * The parallel download sink qualifies because it only enqueues work
+	 * for the fleet.  Serial does not (it downloads on this very
+	 * connection) and neither does third-party (it reads from the source
+	 * connection, which is the one streaming), so both leave this clear
+	 * and keep the deferred queue.
+	 */
+	int streams_files;
 };
 
 /*

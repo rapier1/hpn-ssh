@@ -448,6 +448,10 @@ void sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
     off_t total_bytes);
 void sftp_parallel_progress_set_total(struct sftp_parallel *p,
     off_t total_bytes, size_t nfiles);
+/* Fill the one-shot fs-info cache before a streamed enumeration, so a submit
+ * during the drain sends nothing on the connection carrying the reply. */
+void sftp_parallel_prewarm_fs_info(struct sftp_parallel *p,
+    struct sftp_conn *conn, const char *remote_path);
 void sftp_parallel_progress_start_counted(struct sftp_parallel *p,
     const char *verb, off_t total_bytes);
 void sftp_parallel_progress_stop(struct sftp_parallel *p);

@@ -1887,6 +1887,12 @@ struct tree_dl_ctx {
 	struct sftp_tree_dl_sink	*sink;
 	struct tree_dl_file		*files;
 	size_t				 nfiles, files_alloc;
+	/* Streaming sinks transfer during enumeration and queue nothing, so
+	 * the meter's total and count are tallied here instead of summed from
+	 * files[] afterwards.  Unused when the sink defers. */
+	off_t				 streamed_bytes;
+	size_t				 streamed_files;
+	int				 total_overflow;
 	int				 ret;
 };
 
@@ -1929,6 +1935,37 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 		free(new_dst);
 		break;
 	case HPN_DTREE_REC_REG:
+		if (ctx->sink->streams_files) {
+			/*
+			 * Hand it over now instead of queueing it, so transfer
+			 * overlaps discovery and the driver holds no per-file
+			 * queue.  Legal only because this sink just enqueues
+			 * work for the fleet; reply_stream_active catches it
+			 * immediately if that ever stops being true.  The
+			 * meter figures are tallied here because files[] stays
+			 * empty, with the same overflow fallback the deferred
+			 * sum uses.
+			 */
+			if ((a->flags & SSH2_FILEXFER_ATTR_SIZE) != 0 &&
+			    !ctx->total_overflow) {
+				u_int64_t sz = a->size;
+
+				if (sz > (u_int64_t)INT64_MAX ||
+				    (u_int64_t)ctx->streamed_bytes >
+				    (u_int64_t)INT64_MAX - sz) {
+					ctx->total_overflow = 1;
+					ctx->streamed_bytes = 0;
+				} else
+					ctx->streamed_bytes += (off_t)sz;
+			}
+			ctx->streamed_files++;
+			if (ctx->sink->xfer_file(ctx->sink, new_src, new_dst,
+			    a) != 0)
+				ctx->ret = -1;
+			free(new_src);
+			free(new_dst);
+			break;
+		}
 		if (ctx->nfiles == ctx->files_alloc) {
 			ctx->files_alloc = ctx->files_alloc ?
 			    ctx->files_alloc * 2 : 256;
@@ -2009,7 +2046,13 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	 * so the total size is known.  Hand it to the sink: a parallel download
 	 * switches its aggregate meter from rate-only to a real percentage and
 	 * ETA.  Serial and third-party sinks leave set_total NULL. */
-	if (sink->set_total != NULL) {
+	if (sink->set_total != NULL && sink->streams_files) {
+		/* Streaming: the files transferred as they arrived, so the
+		 * figures come from the tally.  This lands after the walk, so
+		 * the meter runs rate-only during discovery and gains its
+		 * percentage and ETA once the total is actually known. */
+		sink->set_total(sink, ctx.streamed_bytes, ctx.streamed_files);
+	} else if (sink->set_total != NULL) {
 		off_t total_bytes = 0;
 
 		for (i = 0; i < ctx.nfiles; i++) {
