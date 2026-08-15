@@ -1479,7 +1479,7 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 	}
 	rc = sftp_hpn_bundle_download(conn, entries, acc->n,
 	    preserve_flag, sftp_conn_hpn(conn)->bundle_cfg.writer_pool,
-	    meter_on ? &meter_ctr : NULL);
+	    fsync_flag, meter_on ? &meter_ctr : NULL);
 	if (meter_on)
 		stop_progress_meter();
 	switch (rc) {

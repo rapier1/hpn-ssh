@@ -159,6 +159,9 @@ struct bundle_dl_stream {
 	struct sftp_hpn_bundle_download_entry *entries;
 	int      n_entries;
 	int      preserve_flag;
+	/* -f: flush each extracted file to disk before its fd is closed.  The
+	 * writer pool does this itself; the serial path below has to. */
+	int      fsync_flag;
 
 	/* Per-entry state set by entry_cb. */
 	int         cur_idx;	/* index into entries[], -1 if tar path
@@ -436,6 +439,15 @@ bundle_dl_entry_end_cb(void *ctx)
 			    s->cur_local, strerror(errno));
 			rc = -1;
 		}
+		/* Before the close, and a real error: -f exists so the caller
+		 * can rely on the data being on disk when the command
+		 * succeeds.  Reporting success without it is the failure this
+		 * flag is meant to prevent. */
+		if (s->fsync_flag && fsync(s->cur_fd) != 0) {
+			error_f("fsync \"%s\": %s",
+			    s->cur_local, strerror(errno));
+			rc = -1;
+		}
 		if (close(s->cur_fd) != 0) {
 			error_f("close \"%s\": %s",
 			    s->cur_local, strerror(errno));
@@ -647,7 +659,7 @@ bundle_dl_stream_drain_inflight(struct bundle_dl_stream *s)
 int
 sftp_hpn_bundle_download(struct sftp_conn *conn,
     struct sftp_hpn_bundle_download_entry *entries, int n,
-    int preserve_flag, int writer_pool, off_t *progress)
+    int preserve_flag, int writer_pool, int fsync_flag, off_t *progress)
 {
 	struct sshbuf *msg = NULL;
 	u_char *handle = NULL;
@@ -717,6 +729,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	stream.entries      = entries;
 	stream.n_entries    = n;
 	stream.preserve_flag = preserve_flag;
+	stream.fsync_flag   = fsync_flag;
 	stream.progress     = progress;
 	stream.max_inflight_bytes = bundle_dl_queue_max_bytes();
 
@@ -727,7 +740,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	 * serial, harmless. */
 	if (writer_pool) {
 		stream.pool = bundle_write_pool_new(bundle_writer_threads(),
-		    preserve_flag, 0 /* do_fsync */, bundle_writer_budget());
+		    preserve_flag, fsync_flag, bundle_writer_budget());
 		if (stream.pool != NULL)
 			debug_f("hpn-bundle-fetch: writer pool active (%d threads)",
 			    bundle_writer_threads());
