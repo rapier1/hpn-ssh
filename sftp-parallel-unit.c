@@ -873,14 +873,41 @@ parallel_unit_pending_trace(const char *action, struct sftp_parallel *p,
 	    worker_id, site, src, dst);
 }
 
+/*
+ * Drop one from the pending count and wake whatever is waiting on the change.
+ * Caller holds pending_mu.
+ *
+ * Two waiters watch this counter and they need different edges.
+ * sftp_parallel_wait sleeps until the fleet is idle, so it needs the zero
+ * transition.  A producer throttled by sftp_parallel_await_capacity sleeps
+ * until there is room under the ceiling, so it needs the edge where pending
+ * falls below outstanding_cap - reached long before zero.  Signalling only at
+ * zero leaves that producer to fall out on its timeout instead, which makes
+ * the timeout the mechanism rather than the backstop and limits how fast work
+ * can reach the fleet to one ceiling per timeout period.
+ *
+ * Only the crossing is signalled, not every decrement below the ceiling: the
+ * latter would broadcast once per completed file for no gain.  Decrements are
+ * serialised by the mutex so every value is visited and the crossing cannot
+ * be skipped, and a waiter tests the same predicate under the same mutex, so
+ * there is no lost wakeup.
+ */
+static void
+pending_dec_locked(struct sftp_parallel *p)
+{
+	if (p->pending > 0)
+		p->pending--;
+	if (p->pending == 0 ||
+	    (p->outstanding_cap != 0 &&
+	     p->pending + 1 == p->outstanding_cap))
+		pthread_cond_broadcast(&p->pending_cv);
+}
+
 void
 parallel_unit_pending_dec(struct sftp_parallel *p)
 {
 	pthread_mutex_lock(&p->pending_mu);
-	if (p->pending > 0)
-		p->pending--;
-	if (p->pending == 0)
-		pthread_cond_broadcast(&p->pending_cv);
+	pending_dec_locked(p);
 	pthread_mutex_unlock(&p->pending_mu);
 }
 
@@ -925,7 +952,7 @@ parallel_bundle_member_pushfail(struct sftp_parallel *p,
     struct sftp_work_unit *u)
 {
 	pthread_mutex_lock(&p->pending_mu);
-	if (p->pending > 0) p->pending--;
+	pending_dec_locked(p);
 	pthread_mutex_unlock(&p->pending_mu);
 	parallel_unit_pending_trace("DEC_PUSHFAIL", p, u, -1, "bundle/pushfail");
 	if (u->size > 0)
@@ -1085,7 +1112,7 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 		    __ATOMIC_RELAXED);
 	if (sftp_workqueue_push(p->q, u) != 0) {
 		pthread_mutex_lock(&p->pending_mu);
-		if (p->pending > 0) p->pending--;
+		pending_dec_locked(p);
 		pthread_mutex_unlock(&p->pending_mu);
 		parallel_unit_pending_trace("DEC_PUSHFAIL", p, u, -1,
 		    "submit/pushfail");
