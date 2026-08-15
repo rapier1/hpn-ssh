@@ -76,8 +76,18 @@ struct sftp_conn;
 #define HPN_DTREE_REC_OTHER		3
 #define HPN_DTREE_REC_ERROR		4
 
-/* Server-side recursion cap; mirrors the client's MAX_DIR_DEPTH. */
-#define HPN_DTREE_MAX_DEPTH		64
+/*
+ * Recursion cap for every HPN directory walk: the discover-tree server walk
+ * and the parallel walk both use this one value.
+ *
+ * It must equal upstream's MAX_DIR_DEPTH in sftp-client.c, which bounds the
+ * readdir walk.  A client picks its walk from what the server advertises, so
+ * two different caps mean the same command reaches a different depth against
+ * a stock server than an HPN one.  Upstream defines its copy in a .c file so
+ * it cannot be included here; sftp-client.c sees both and fails the build if
+ * they ever diverge.
+ */
+#define HPN_WALK_MAX_DEPTH		64
 
 /*
  * Wire format.
@@ -95,7 +105,10 @@ struct sftp_conn;
  *
  * record:
  *     string  relative-path         (from root; '/'-separated; parents
- *                                     always precede their children)
+ *                                     always precede their children.
+ *                                     Empty ONLY on an ERROR record, where
+ *                                     it means the walk root itself failed
+ *                                     and there is no component to name.)
  *     byte    rec-type              (HPN_DTREE_REC_*)
  *     ATTRS   attrib                 (full Attrib; absent iff type==ERROR)
  *     uint32  status                 (present iff type==ERROR: SSH2_FX_*)

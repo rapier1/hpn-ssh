@@ -110,6 +110,14 @@ extern int showprogress;
 /* Maximum depth to descend in directory trees */
 #define MAX_DIR_DEPTH 64
 
+/* The HPN walks carry their own copy of this cap because upstream's lives in
+ * a .c file.  A client chooses its walk from what the server advertises, so
+ * the two must agree or the same command stops at a different depth against a
+ * stock server than an HPN one.  This is the only place both are visible. */
+#if MAX_DIR_DEPTH != HPN_WALK_MAX_DEPTH
+# error "MAX_DIR_DEPTH and HPN_WALK_MAX_DEPTH must match"
+#endif
+
 /* Directory separator characters */
 #ifdef HAVE_CYGWIN
 # define SFTP_DIRECTORY_CHARS      "/\\"

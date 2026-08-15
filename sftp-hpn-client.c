@@ -1917,6 +1917,21 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 	 * server finishes.  The fetch marks the connection dead. */
 	if (ctx->sink->aborting(ctx->sink))
 		return -1;
+	/*
+	 * A failure of the walk root itself is encoded with an empty relpath:
+	 * there is no component below the root to name.  Handle it before the
+	 * validator, which rejects "" - correctly, for every record type that
+	 * goes on to build a path from it.  Left to the validator this arrives
+	 * as an accusation that the peer sent a suspect path, and the real
+	 * reason, an unreadable root, is discarded.
+	 */
+	if (ent->rectype == HPN_DTREE_REC_ERROR &&
+	    (ent->relpath == NULL || *ent->relpath == '\0')) {
+		error("remote \"%s\": %s", ctx->src, fx2txt(ent->status));
+		ctx->sink->fail(ctx->sink, ctx->src, "remote error");
+		ctx->ret = -1;
+		return 0;
+	}
 	if (!sftp_tree_relpath_ok(ent->relpath)) {
 		error("discover-tree: suspect path \"%s\" under \"%s\"",
 		    ent->relpath == NULL ? "(null)" : ent->relpath, ctx->src);

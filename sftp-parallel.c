@@ -1175,7 +1175,6 @@ sftp_parallel_progress_stop(struct sftp_parallel *p)
  * non-regular files are skipped with a warning, matching legacy behavior.
  */
 
-#define PARALLEL_MAX_DIR_DEPTH 64
 
 
 /* ----------------------------------------------------------------

@@ -68,12 +68,6 @@
 #include "sftp-hpn-tree.h"	/* hpn-discover-tree fetch + records */
 #include "sftp-parallel-internal.h"	/* parallel_verify_prefix_register */
 
-/*
- * Maximum directory recursion depth.  Deeper trees are refused with a
- * walker failure rather than risking stack exhaustion.
- */
-#define PARALLEL_MAX_DIR_DEPTH 64
-
 /* Lazy accessor for the deferred directory-attribute list (applied at
  * the end of sftp_parallel_wait; see sftp-parallel-internal.h). */
 static struct sftp_hpn_dirattr_list *
@@ -229,7 +223,7 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 				.verify = verify,
 			};
 			rc = sftp_upload_walk_consume(conn, src, dst, 0,
-			    PARALLEL_MAX_DIR_DEPTH, rcreated,
+			    HPN_WALK_MAX_DEPTH, rcreated,
 			    sftp_parallel_preserve_flag(p),
 			    sftp_parallel_follow_link_flag(p), &sink.base);
 		}
@@ -389,7 +383,7 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		    sftp_tree_download_consume(conn, src, dst, NULL,
 		        sftp_parallel_follow_link_flag(p), &sink.base) :
 		    sftp_readdir_download_consume(conn, src, dst, 0,
-		        PARALLEL_MAX_DIR_DEPTH, NULL,
+		        HPN_WALK_MAX_DEPTH, NULL,
 		        sftp_parallel_follow_link_flag(p), &sink.base);
 		sftp_parallel_set_walker_phase(p, SFTP_WKP_DONE);
 		return rc;

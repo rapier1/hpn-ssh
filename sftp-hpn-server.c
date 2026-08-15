@@ -835,7 +835,7 @@ struct dtree_emit {
 	/* Directories from the walk root down to the one being read, indexed
 	 * by depth.  Only maintained when following symlinks, which is the
 	 * only way a directory can reappear beneath itself. */
-	struct dtree_pathent path[HPN_DTREE_MAX_DEPTH];
+	struct dtree_pathent path[HPN_WALK_MAX_DEPTH];
 };
 
 /*
@@ -893,7 +893,7 @@ dtree_on_path(const struct dtree_emit *emit, int depth, const struct stat *st)
 {
 	int i;
 
-	for (i = 0; i <= depth && i < HPN_DTREE_MAX_DEPTH; i++) {
+	for (i = 0; i <= depth && i < HPN_WALK_MAX_DEPTH; i++) {
 		if (emit->path[i].valid && emit->path[i].dev == st->st_dev &&
 		    emit->path[i].ino == st->st_ino)
 			return 1;
@@ -963,8 +963,24 @@ dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
 	struct dirent	*entry;
 	struct stat	 dir_st;
 
-	if (depth >= HPN_DTREE_MAX_DEPTH)
+	/*
+	 * Report the cap rather than returning quietly.  The parent already
+	 * emitted this directory's DIR record and the stream still ends with a
+	 * normal END chunk, so a bare return leaves the client with a listing
+	 * that looks complete: it builds the skeleton, copies what it was told
+	 * about, and exits 0 having silently dropped everything deeper.  The
+	 * readdir walk errors out for the same condition, and a client picks
+	 * its walk from what the server advertises, so staying quiet here makes
+	 * the same command behave differently against an HPN server.  An ERROR
+	 * record reaches the client's existing arm, which fails the transfer.
+	 */
+	if (depth >= HPN_WALK_MAX_DEPTH) {
+		error_f("max directory depth %d reached at \"%s\"",
+		    HPN_WALK_MAX_DEPTH, abspath);
+		dtree_add(emit, relbase, HPN_DTREE_REC_ERROR, NULL,
+		    SSH2_FX_FAILURE);
 		return;
+	}
 	if ((dir_handle = dtree_opendir(abspath, depth, follow)) == NULL) {
 		dtree_add(emit, relbase, HPN_DTREE_REC_ERROR, NULL,
 		    errno_to_sftp_status(errno));
@@ -978,10 +994,28 @@ dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
 		emit->path[depth].ino = dir_st.st_ino;
 		emit->path[depth].valid = 1;
 	}
-	while ((entry = readdir(dir_handle)) != NULL) {
+	/*
+	 * readdir returns NULL both at the end of the directory and on error,
+	 * and the two are told apart only by errno, which it does not clear on
+	 * success.  Without the reset a failure part way through reads as a
+	 * short directory: the client is told about the entries seen so far and
+	 * nothing about the rest.
+	 */
+	for (;;) {
 		char		*child_abs, *child_rel;
 		struct stat	 st;
 		Attrib		 a;
+
+		errno = 0;
+		if ((entry = readdir(dir_handle)) == NULL) {
+			if (errno != 0) {
+				error_f("readdir \"%s\": %s", abspath,
+				    strerror(errno));
+				dtree_add(emit, relbase, HPN_DTREE_REC_ERROR,
+				    NULL, errno_to_sftp_status(errno));
+			}
+			break;
+		}
 
 		if (strcmp(entry->d_name, ".") == 0 ||
 		    strcmp(entry->d_name, "..") == 0)
