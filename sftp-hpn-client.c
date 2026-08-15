@@ -1809,6 +1809,7 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 	u_int			 id, rid;
 	u_char			 type, version, kind;
 	u_int32_t		 count, i;
+	uint64_t		 nrecords;
 	int			 r, rc = -1, done = 0, skip = 0;
 
 	if ((msg = sshbuf_new()) == NULL)
@@ -1828,6 +1829,7 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 		goto out;
 	}
 
+	nrecords = 0;
 	/* The reply streams as many chunks until END, so this connection is
 	 * ours until it drains.  Anything that tries to send on it before then
 	 * is a bug and send_msg says so; see reply_stream_active. */
@@ -1840,10 +1842,16 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 			    "failed", root);
 			goto out;
 		}
+		/* A message we cannot decode leaves the stream desynced, and
+		 * the server keeps sending chunks until its END regardless.
+		 * Returning without marking the connection dead lets those
+		 * chunks surface as an id mismatch on whatever command runs
+		 * next, which then fails carrying the wrong path.  The
+		 * neighbouring bail-outs already die for this reason. */
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
-			logit_f("hpn-discover-tree: parse reply header: %s",
-			    ssh_err(r));
+			sftp_conn_die(conn, "hpn-discover-tree: parse reply "
+			    "header: %s", ssh_err(r));
 			goto out;
 		}
 		if (rid != id) {
@@ -1868,8 +1876,8 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 		if ((r = sshbuf_get_u8(msg, &version)) != 0 ||
 		    (r = sshbuf_get_u8(msg, &kind)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &count)) != 0) {
-			logit_f("hpn-discover-tree: parse chunk header: %s",
-			    ssh_err(r));
+			sftp_conn_die(conn, "hpn-discover-tree: parse chunk "
+			    "header: %s", ssh_err(r));
 			goto out;
 		}
 		if (version != HPN_DTREE_VERSION) {
@@ -1886,6 +1894,16 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 			    "carries no records");
 			goto out;
 		}
+		/* Terminate a stream that never will.  See
+		 * HPN_DTREE_MAX_RECORDS: this is a backstop against a peer
+		 * that keeps sending, not a limit any real tree meets. */
+		nrecords += count;
+		if (nrecords > HPN_DTREE_MAX_RECORDS) {
+			sftp_conn_die(conn, "hpn-discover-tree \"%s\": more "
+			    "than %llu records", root,
+			    (unsigned long long)HPN_DTREE_MAX_RECORDS);
+			goto out;
+		}
 		/*
 		 * Once the callback has bowed out, usually an interrupt, stop
 		 * decoding: nothing would be done with the records.  Keep
@@ -1900,8 +1918,8 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 			if ((r = sftp_tree_get_record(msg, &ent.relpath,
 			    &ent.rectype, &ent.a, &ent.status)) != 0) {
 				free(ent.relpath);
-				logit_f("hpn-discover-tree: parse record: %s",
-				    ssh_err(r));
+				sftp_conn_die(conn, "hpn-discover-tree: parse "
+				    "record: %s", ssh_err(r));
 				goto out;
 			}
 			skip = cb(ctx, &ent) != 0;

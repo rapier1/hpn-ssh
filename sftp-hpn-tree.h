@@ -90,6 +90,22 @@ struct sftp_conn;
 #define HPN_WALK_MAX_DEPTH		64
 
 /*
+ * Backstop on how many records one enumeration may deliver.  The loop ends
+ * only when the server says END, so without this a peer can hold a client in
+ * it indefinitely.  Refusing an empty chunk already stops a peer spinning us
+ * on chunks that carry nothing, so what remains is an endless stream of real
+ * ones - each doing work, so the client is never idle, but never finishing
+ * either.
+ *
+ * This is a backstop, not a security boundary: a hostile server can exhaust a
+ * client's disk with a genuinely large tree and this does not prevent that.
+ * It only guarantees the walk terminates.  Set far above any real tree - at
+ * the file rates we measure this is hours of transfer - so reaching it means
+ * the peer is lying, and it fails loudly rather than truncating quietly.
+ */
+#define HPN_DTREE_MAX_RECORDS		((uint64_t)64 * 1024 * 1024)
+
+/*
  * Directory separators for validating a path the peer sent.  Mirrors
  * upstream's SFTP_DIRECTORY_CHARS in sftp-client.c, which the readdir walk
  * uses for the same purpose and which cannot be included from here because it
