@@ -289,6 +289,13 @@ parallel_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 	mode_t	fmode = (a->flags & SSH2_FILEXFER_ATTR_PERMISSIONS) ?
 		    (a->perm & 07777) : 0644;
 
+	/* Streaming hands files over during the discover-tree drain, which
+	 * enumerates far faster than the fleet transfers.  Wait for the fleet
+	 * to fall below its outstanding-file ceiling before adding another, so
+	 * the walk's memory tracks the ceiling instead of the tree.  Blocking
+	 * here stops us reading the reply, which back-pressures the server. */
+	sftp_parallel_await_capacity(s->p);
+
 	if (sftp_parallel_submit_download(s->p, s->conn, src, dst, fsize,
 	    fmode, s->resume, s->verify) != 0) {
 		if (sftp_parallel_is_aborting(s->p)) {

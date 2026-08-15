@@ -452,6 +452,10 @@ void sftp_parallel_progress_set_total(struct sftp_parallel *p,
  * during the drain sends nothing on the connection carrying the reply. */
 void sftp_parallel_prewarm_fs_info(struct sftp_parallel *p,
     struct sftp_conn *conn, const char *remote_path);
+/* Block until outstanding files fall below the fleet's ceiling.  Called by a
+ * producer that can enumerate faster than the fleet drains, so its own memory
+ * does not grow with the size of the tree. */
+void sftp_parallel_await_capacity(struct sftp_parallel *p);
 void sftp_parallel_progress_start_counted(struct sftp_parallel *p,
     const char *verb, off_t total_bytes);
 void sftp_parallel_progress_stop(struct sftp_parallel *p);

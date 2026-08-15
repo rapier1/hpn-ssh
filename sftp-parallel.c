@@ -120,6 +120,32 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
 	return depth;
 }
 
+/*
+ * Ceiling on outstanding FILES, for a producer that enumerates far faster
+ * than the fleet drains (the discover-tree walk).  Counted in files rather
+ * than queued objects because the queue is heterogeneous: a bundle is one
+ * object carrying thousands of files, while a file too large to bundle is one
+ * object carrying one.  Only a file count is meaningful for both.
+ *
+ * Sized from the MAXIMUM a bundle can hold, never an assumed occupancy.  Real
+ * packing varies with the workload - the byte target, the member cap and the
+ * download path-list limit each bind in different cases - so a ceiling derived
+ * from any one of them starves the others.  Against the hard maximum every
+ * worker is guaranteed its two bundles whatever the packing, so the ceiling
+ * bounds memory without ever being the thing that limits throughput.
+ *
+ * Without bundling a queued object is already a single file, so the queue's
+ * own depth is the same quantity and is used as-is.
+ */
+static size_t
+outstanding_file_cap(const struct sftp_parallel_config *cfg)
+{
+	if (!cfg->use_bundle)
+		return work_queue_depth(cfg);
+
+	return (size_t)cfg->num_streams * 2 * BUNDLE_BATCH_MAX_FILES;
+}
+
 /* ---------- Worker SSH connection setup ---------- */
 
 /* ---------- Work units ---------- */
@@ -410,6 +436,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 
 	/* 1. Workqueue. Sized for cfg->num_streams.  Respawned workers
 	 * reuse the same queue, so capacity is set once at startup. */
+	p->outstanding_cap = (uint64_t)outstanding_file_cap(cfg);
 	p->q = sftp_workqueue_new(work_queue_depth(cfg));
 	if (p->q == NULL) {
 		error_f("workqueue allocation failed");

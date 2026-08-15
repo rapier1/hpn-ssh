@@ -1563,6 +1563,49 @@ sftp_parallel_prewarm_fs_info(struct sftp_parallel *p, struct sftp_conn *conn,
 	(void)get_cached_fs_info(p, conn, remote_path, &info);
 }
 
+/* How long a capacity wait sleeps before re-testing on its own.  Only one of
+ * the three p->pending decrement sites broadcasts pending_cv (the push-fail
+ * backout paths do not), so this bounds a missed wake to one re-test rather
+ * than a wedged walk.  A completion normally wakes the wait immediately and
+ * this never fires, so second resolution is all it needs. */
+#define AWAIT_CAPACITY_POLL_SEC  1
+
+/*
+ * Block until outstanding (submitted but not completed) files fall below
+ * p->outstanding_cap.
+ *
+ * A producer that enumerates much faster than the fleet transfers will
+ * otherwise submit the whole tree before much of it has moved, and every
+ * outstanding file's unit and its two path strings sit in memory at once.
+ * The workqueue cannot prevent that: its depth counts queued objects, and
+ * under bundling one object is a bundle carrying thousands of files.
+ *
+ * Called from the walk, so blocking here stops the caller reading the
+ * discover-tree reply and TCP back-pressure reaches the server, which stops
+ * producing records.  Workers drain on their own connections and broadcast
+ * as they complete, so they cannot be blocked by this wait.  Returns
+ * immediately once an abort is set, so a failed or interrupted fleet does
+ * not leave the walk parked here.
+ */
+void
+sftp_parallel_await_capacity(struct sftp_parallel *p)
+{
+	struct timespec deadline;
+
+	if (p == NULL || p->outstanding_cap == 0)
+		return;
+
+	pthread_mutex_lock(&p->pending_mu);
+	while (p->pending >= p->outstanding_cap &&
+	    !sftp_parallel_is_aborting(p)) {
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec += AWAIT_CAPACITY_POLL_SEC;
+		(void)pthread_cond_timedwait(&p->pending_cv, &p->pending_mu,
+		    &deadline);
+	}
+	pthread_mutex_unlock(&p->pending_mu);
+}
+
 /*
  * Resolve the range-split minimum file size, in bytes.  Precedence:
  *   1. cfg.range_split_min_mb (set by -M CLI flag, sftp.c)

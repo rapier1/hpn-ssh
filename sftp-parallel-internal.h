@@ -1313,6 +1313,18 @@ struct sftp_parallel {
 	uint64_t                    pending;
 
 	/*
+	 * Ceiling on outstanding (submitted but not completed) files, for
+	 * producers that enumerate faster than the fleet drains.  Set from
+	 * work_queue_depth(), which computes a FILE count: num_streams full
+	 * bundles plus a round of headroom.  The workqueue applies that same
+	 * number to queued OBJECTS, and under bundling one object is a bundle
+	 * carrying thousands of files, so the queue's own cap sits orders of
+	 * magnitude above what it was sized to allow and never engages.  This
+	 * applies the number as intended.  See sftp_parallel_await_capacity.
+	 */
+	uint64_t                    outstanding_cap;
+
+	/*
 	 * Worker re-queue overflow list (FIFO of already-allocated units).  When
 	 * a worker re-queue finds p->q full it parks the unit here instead of
 	 * blocking on the queue it is itself draining (self-deadlock; fatal at
