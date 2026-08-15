@@ -1672,19 +1672,62 @@ sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
 	}
 }
 
-/* Apply every deferred directory attribute.  Insertion order is the
- * walk's post-order (children recorded before their parents).  Remote
- * (upload) setstats are applied via sftp_setstat_pipeline - one window
- * of outstanding requests instead of one blocking RTT per directory,
- * which is the bulk of the deferred batch's cost on a WAN.  Local
- * (download) attrs are plain syscalls with no round trip, applied
- * inline.  A transfer is one direction, so in practice the list is
- * all-remote or all-local; the pipeline preserves list order, and
- * directory setstats have no inter-directory dependency anyway. */
+/* One entry's position and depth, for sorting the deferred attrs without
+ * disturbing the list itself. */
+struct dirattr_order {
+	int idx;
+	int depth;
+};
+
+/* Depth of a path, counted in separators, for ordering the deferred attrs. */
+static int
+dirattr_path_depth(const char *p)
+{
+	int n = 0;
+
+	for (; *p != '\0'; p++)
+		if (*p == '/')
+			n++;
+	return n;
+}
+
+/* Deeper paths first; original position breaks ties so the order is
+ * deterministic for a given list. */
+static int
+dirattr_deepest_first(const void *va, const void *vb)
+{
+	const struct dirattr_order *a = va;
+	const struct dirattr_order *b = vb;
+
+	if (a->depth != b->depth)
+		return b->depth - a->depth;
+	return a->idx - b->idx;
+}
+
+/* Apply every deferred directory attribute, deepest path first.
+ *
+ * Order matters, and it cannot be taken from the list.  A directory is
+ * created with owner write and execute forced on so the transfer can write
+ * into it, and the deferred attrs are what put the real mode back.  Applying
+ * a parent first can strip the owner execute bit its own children still need,
+ * and every chmod and utimes below it then fails with EACCES - leaving those
+ * children with the widened mode this deferral exists to undo.
+ *
+ * The upload driver defers after recursing, so its insertion order is already
+ * children first.  Every download and third-party sink defers inside make_dir,
+ * which is parents first, and the discover-tree wire contract emits parents
+ * before children as well.  Sorting here makes the result independent of which
+ * producer built the list.
+ *
+ * Remote (upload) setstats go through sftp_setstat_pipeline - one window of
+ * outstanding requests rather than a blocking round trip per directory, which
+ * is the bulk of the batch's cost on a WAN - and it preserves the order it is
+ * given.  Local (download) attrs are plain syscalls, applied inline. */
 void
 sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
     struct sftp_hpn_dirattr_list *dl)
 {
+	struct dirattr_order *order;
 	char **paths;
 	Attrib *attrs;
 	int i, nr = 0;
@@ -1696,9 +1739,16 @@ sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
 
 	paths = xcalloc(dl->n, sizeof(*paths));
 	attrs = xcalloc(dl->n, sizeof(*attrs));
+	order = xcalloc(dl->n, sizeof(*order));
 
 	for (i = 0; i < dl->n; i++) {
-		struct sftp_hpn_dirattr *d = &dl->v[i];
+		order[i].idx = i;
+		order[i].depth = dirattr_path_depth(dl->v[i].path);
+	}
+	qsort(order, (size_t)dl->n, sizeof(*order), dirattr_deepest_first);
+
+	for (i = 0; i < dl->n; i++) {
+		struct sftp_hpn_dirattr *d = &dl->v[order[i].idx];
 
 		if (!d->is_local) {
 			paths[nr] = d->path;	/* borrowed; list outlives us */
@@ -1727,6 +1777,7 @@ sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
 
 	free(paths);
 	free(attrs);
+	free(order);
 }
 
 void
@@ -2113,8 +2164,9 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
  * hpn-discover-tree): enumerate src a directory at a time, recursing into
  * subdirectories, and replay each entry through the same sink the tree
  * consumer uses.  Directory attrs are deferred pre-order here rather than the
- * historical post-order, but every deferred attr is applied at end-of-walk
- * where order is immaterial.  See sftp-hpn-client.h.
+ * historical post-order; sftp_hpn_dirattrs_apply sorts deepest-first at
+ * end-of-walk, so which order a producer records them in does not matter.
+ * See sftp-hpn-client.h.
  */
 int
 sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
