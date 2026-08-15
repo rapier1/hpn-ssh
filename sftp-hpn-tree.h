@@ -90,6 +90,21 @@ struct sftp_conn;
 #define HPN_WALK_MAX_DEPTH		64
 
 /*
+ * Directory separators for validating a path the peer sent.  Mirrors
+ * upstream's SFTP_DIRECTORY_CHARS in sftp-client.c, which the readdir walk
+ * uses for the same purpose and which cannot be included from here because it
+ * lives in a .c file.  Cygwin's runtime resolves a backslash as a separator,
+ * so a validator that only knows '/' there lets a peer walk out of the
+ * transfer root.  On POSIX a backslash is an ordinary filename byte and must
+ * stay legal, which is why this is conditional rather than always both.
+ */
+#ifdef HAVE_CYGWIN
+# define HPN_WALK_SEPARATORS		"/\\"
+#else
+# define HPN_WALK_SEPARATORS		"/"
+#endif
+
+/*
  * Wire format.
  *
  * Request  (SSH2_FXP_EXTENDED):

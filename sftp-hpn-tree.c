@@ -34,6 +34,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>	/* struct stat, referenced by sftp-common.h prototypes */
+#include <limits.h>	/* PATH_MAX, bounding a peer-supplied relative path */
 #include <string.h>
 
 #include "sshbuf.h"
@@ -84,27 +85,46 @@ sftp_tree_get_record(struct sshbuf *msg, char **relpath, u_char *rectype,
 /*
  * Validate a discover-tree relative path before a client builds local or
  * remote paths from it.  The server generated it, but we never trust the
- * peer: reject an absolute path or any ".." component so a hostile or buggy
- * server cannot escape the transfer root.  The whole-relpath analogue of the
- * per-name SFTP_DIRECTORY_CHARS guard the readdir walk applies.  Returns 1 if
- * safe, 0 otherwise.
+ * peer.  The whole-relpath analogue of the per-name SFTP_DIRECTORY_CHARS
+ * guard the readdir walk applies, and it splits on the same separator set:
+ * on Cygwin a backslash is a separator to the runtime, so a validator that
+ * only knows '/' would pass "..\\..\\etc\\passwd" as one harmless-looking
+ * component and let the peer write outside the transfer root.
+ *
+ * Rejects, in order: an empty path, one at or past PATH_MAX, an absolute
+ * path, an empty component (which is also a leading or trailing separator or
+ * a doubled one), "." and "..".
+ *
+ * The length bound is not only hygiene.  A bundled download lists every
+ * member's path in one request whose budget reserves a single PATH_MAX of
+ * overshoot (BUNDLE_DL_FETCH_REQ_MAX); one longer path makes that request
+ * unsendable and kills the client with a message blaming the remote shell.
+ *
+ * Returns 1 if safe, 0 otherwise.
  */
 int
 sftp_tree_relpath_ok(const char *rel)
 {
 	const char *p = rel;
 
-	if (rel == NULL || *rel == '\0' || *rel == '/')
+	if (rel == NULL || *rel == '\0')
 		return 0;
-	while (*p != '\0') {
-		const char *slash = strchr(p, '/');
-		size_t len = slash ? (size_t)(slash - p) : strlen(p);
+	if (strlen(rel) >= PATH_MAX)
+		return 0;
+	if (strchr(HPN_WALK_SEPARATORS, *rel) != NULL)
+		return 0;
+	for (;;) {
+		size_t len = strcspn(p, HPN_WALK_SEPARATORS);
 
+		if (len == 0)
+			return 0;
+		if (len == 1 && p[0] == '.')
+			return 0;
 		if (len == 2 && p[0] == '.' && p[1] == '.')
 			return 0;
-		if (slash == NULL)
+		if (p[len] == '\0')
 			break;
-		p = slash + 1;
+		p += len + 1;
 	}
 	return 1;
 }
