@@ -1299,10 +1299,16 @@ sftp_setstat_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
  * mkdir failures (rare: pre-existing dir) fall back to an individual stat
  * to distinguish a tolerable existing directory from a real error.
  * Returns the number of real failures.
+ *
+ * failed_out[i] is set to 1 for each of those real failures, or may be NULL.
+ * The count alone tells a caller that something failed but not what, and a
+ * caller that descends into these directories needs to know which ones do not
+ * exist: writing into them fails per file, and deferring their attributes
+ * applies a setstat to whatever else occupies the path.
  */
 int
 sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
-    int n, u_char *created_out)
+    int n, u_char *created_out, u_char *failed_out)
 {
 	u_int *ids;
 	u_int status;
@@ -1317,6 +1323,8 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 	ids = xcalloc(n, sizeof(*ids));
 	failed = xcalloc(n, sizeof(*failed));
 	memset(created_out, 0, (size_t)n);
+	if (failed_out != NULL)
+		memset(failed_out, 0, (size_t)n);
 
 	/*
 	 * Phase 1: pipeline all the MKDIRs and drain their statuses in order.
@@ -1335,6 +1343,13 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 		status = get_status(conn, ids[recv]);
 		if (status == SSH2_FX_CONNECTION_LOST) {
 			failures += n - recv;
+			/* Everything from here on is unanswered, so none of it
+			 * was created.  Mark it so the caller does not descend
+			 * into directories that may not exist. */
+			if (failed_out != NULL) {
+				for (k = recv; k < n; k++)
+					failed_out[k] = 1;
+			}
 			free(ids);
 			free(failed);
 			return failures;
@@ -1370,6 +1385,8 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 		    S_ISDIR(ex.perm))
 			continue;	/* pre-existing directory: tolerate */
 		error("remote mkdir \"%s\": failed", paths[i]);
+		if (failed_out != NULL)
+			failed_out[i] = 1;
 		failures++;
 	}
 	free(failed);

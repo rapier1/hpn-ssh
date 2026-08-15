@@ -2325,6 +2325,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 		char	**paths = xcalloc(nsub, sizeof(*paths));
 		Attrib	 *attrs = xcalloc(nsub, sizeof(*attrs));
 		u_char	 *cflags = xcalloc(nsub, sizeof(*cflags));
+		u_char	 *ffail = xcalloc(nsub, sizeof(*ffail));
 		int	  base;
 
 		for (i = 0; i < nsub; i++) {
@@ -2336,12 +2337,27 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 		    base += MKDIR_BATCH_MAX) {
 			int nb = nsub - base < MKDIR_BATCH_MAX ?
 			    nsub - base : MKDIR_BATCH_MAX;
-			(void)sftp_mkdir_pipeline(conn, paths + base,
-			    attrs + base, nb, cflags + base);
+			/* A directory we could not create is a failed
+			 * transfer.  Discarding this count reported success
+			 * for an upload that did not happen: an empty
+			 * subdirectory transfers nothing, so nothing else
+			 * notices the destination is missing. */
+			if (sftp_mkdir_pipeline(conn, paths + base,
+			    attrs + base, nb, cflags + base,
+			    ffail + base) > 0)
+				ret = -1;
 		}
 		free(paths);
 		free(attrs);
 		for (i = 0; i < nsub && !sink->aborting(sink); i++) {
+			/* Do not descend into one that failed.  There is
+			 * nothing to write into, and deferring its attributes
+			 * would setstat whatever does occupy the path. */
+			if (ffail[i]) {
+				sink->fail(sink, subdirs[i].dst,
+				    "remote mkdir failed");
+				continue;
+			}
 			if (sftp_upload_walk_consume(conn, subdirs[i].src,
 			    subdirs[i].dst, depth + 1, max_depth,
 			    (int)cflags[i], preserve_flag, follow_link_flag,
@@ -2349,6 +2365,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 				ret = -1;
 		}
 		free(cflags);
+		free(ffail);
 	}
 	for (i = 0; i < nsub; i++) {
 		free(subdirs[i].src);

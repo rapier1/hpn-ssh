@@ -202,7 +202,8 @@ int sftp_setstat_pipeline(struct sftp_conn *, char **, Attrib *, int);
  * walks; see the definition for the sibling-independence and stat-fallback
  * contract.  Caller chunks at MKDIR_BATCH_MAX.
  */
-int sftp_mkdir_pipeline(struct sftp_conn *, char **, Attrib *, int, u_char *);
+int sftp_mkdir_pipeline(struct sftp_conn *, char **, Attrib *, int, u_char *,
+    u_char *);
 
 /* Max sibling directories created as one atomic (fully-drained) mkdir batch;
  * larger sibling sets are chunked.  Covers ~99.9% of trees in one pass;
