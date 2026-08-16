@@ -1455,6 +1455,26 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 		sftp_conn_set_verify_repair(conn, rep_enabled, rep_attempts);
 	}
 
+	/*
+	 * HPN: resolve and latch the bundling knobs (HPNUseBundle,
+	 * HPNBundleSize, HPNWriterPool) before the single-stream returns
+	 * below.  Without -j there is no orchestrator and the serial
+	 * recursive walks run on this connection, so this is the only path
+	 * that reaches them - latching further down, past those returns,
+	 * left -o HPNUseBundle=no silently ignored for exactly the case with
+	 * no orchestrator.  The parallel path resolves the same options into
+	 * its pcfg below.  Mirrors sftp.c's wiring.
+	 */
+	if (host != NULL && *host != '\0') {
+		struct sftp_parallel_config bcfg;
+
+		memset(&bcfg, 0, sizeof(bcfg));
+		if (sftp_parallel_apply_ssh_config(&bcfg, host,
+		    parallel_config_file, parallel_extra_o) == 0)
+			sftp_conn_set_bundle_config(conn, bcfg.use_bundle,
+			    bcfg.bundle_size, bcfg.writer_pool);
+	}
+
 	if (parallel_num_streams <= 1)
 		return;			/* single-stream: no orchestrator */
 
