@@ -981,6 +981,20 @@ dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
 		    SSH2_FX_FAILURE);
 		return;
 	}
+	/*
+	 * Same record sftp-server's own OPENDIR handler writes, in the same
+	 * format and at the same point - before the open, so it means a
+	 * listing was requested rather than that one succeeded.
+	 *
+	 * The client picks its walk from what the server advertises, so
+	 * without this a recursive get logs one line per directory against a
+	 * stock server and nothing at all against an HPN one.  That record has
+	 * been in sftp-server since 2006 and administrators' tooling reads it;
+	 * moving the walk to the server is not a reason for it to disappear.
+	 * Per directory, matching stock's volume, because stock's volume is
+	 * what anyone parsing this already expects.
+	 */
+	logit("opendir \"%s\"", abspath);
 	if ((dir_handle = dtree_opendir(abspath, depth, follow)) == NULL) {
 		dtree_add(emit, relbase, HPN_DTREE_REC_ERROR, NULL,
 		    errno_to_sftp_status(errno));
