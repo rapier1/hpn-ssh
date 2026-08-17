@@ -955,6 +955,20 @@ dtree_opendir(const char *abspath, int depth, int follow)
  * the path from the walk root is a loop: it emits an ERROR record and is not
  * descended (see dtree_on_path). The depth cap still backstops everything else.
  */
+/*
+ * Replace *st with the link target's stat.  Named rather than inlined into
+ * the classification chain below because it MUTATES *st: the branch that
+ * follows reads st as either the lstat of the entry or the stat of its
+ * target depending on whether this ran, and a bare stat() buried in an
+ * "else if" condition does not say so.  Returns 1 on success, 0 if the
+ * target is unreachable, leaving errno set.
+ */
+static int
+dtree_resolve_link(const char *abspath, struct stat *st)
+{
+	return stat(abspath, st) == 0;
+}
+
 static void
 dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
     int depth, int follow)
@@ -1046,7 +1060,8 @@ dtree_walk(struct dtree_emit *emit, const char *abspath, const char *relbase,
 		} else if (S_ISLNK(st.st_mode) && !follow) {
 			stat_to_attrib(&st, &a);
 			dtree_add(emit, child_rel, HPN_DTREE_REC_SYMLINK, &a, 0);
-		} else if (S_ISLNK(st.st_mode) && stat(child_abs, &st) != 0) {
+		} else if (S_ISLNK(st.st_mode) && !dtree_resolve_link(child_abs,
+		    &st)) {
 			/* follow requested but the link target is unreachable */
 			dtree_add(emit, child_rel, HPN_DTREE_REC_ERROR, NULL,
 			    errno_to_sftp_status(errno));

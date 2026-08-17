@@ -1289,7 +1289,7 @@ sftp_setstat_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
  * window of outstanding SSH2_FXP_MKDIR requests instead of one blocking
  * round trip each.  Siblings are order-independent (each depends only on
  * the already-existing parent), so pipelining is safe; the caller chunks
- * at MKDIR_BATCH_MAX and drains each chunk fully, so every directory
+ * drains fully before returning, so every directory
  * provably exists before its files are written.  Each directory is created
  * with owner write+exec forced (mirrors sftp_hpn_ensure_remote_dir) so the
  * transfer can write into a read-only source directory; the real mode is
@@ -3446,12 +3446,7 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 			free(dst_canon);
 			return -1;
 		}
-		stat_to_attrib(&rsb, &ra);
-		ra.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
-		ra.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
-		ra.perm &= 01777;
-		if (!preserve_flag)
-			ra.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+		sftp_hpn_dir_attrs_from_stat(&rsb, preserve_flag, &ra);
 		if (sftp_hpn_ensure_remote_dir(conn, dst_canon, &ra,
 		    &rcreated) != 0) {
 			sftp_hpn_bundle_acc_free(&bacc);
@@ -5132,7 +5127,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
  * directory and defers its setstat, xfer_file crossloads a file from origin
  * to destination. See struct sftp_tree_dl_sink for the callback pattern.
  */
-struct tp_sink {
+struct crossload_sink {
 	struct sftp_tree_dl_sink	 base;
 	struct sftp_conn		*from;
 	struct sftp_conn		*to;
@@ -5141,10 +5136,10 @@ struct tp_sink {
 };
 
 static int
-tp_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
+crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
     Attrib *a)
 {
-	struct tp_sink	*s = (struct tp_sink *)sink;
+	struct crossload_sink	*s = (struct crossload_sink *)sink;
 	Attrib		 curdir = *a, newdir;
 	mode_t		 mode;
 	int		 created = 0;
@@ -5186,10 +5181,10 @@ tp_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
 }
 
 static int
-tp_xfer_file(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
+crossload_xfer_file(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
     Attrib *a)
 {
-	struct tp_sink	*s = (struct tp_sink *)sink;
+	struct crossload_sink	*s = (struct crossload_sink *)sink;
 
 	if (sftp_crossload(s->from, s->to, src, dst, a, s->preserve_flag) == -1) {
 		error("crossload \"%s\" to \"%s\" failed", src, dst);
@@ -5199,7 +5194,7 @@ tp_xfer_file(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
 }
 
 static void
-tp_fail(struct sftp_tree_dl_sink *sink, const char *path, const char *reason)
+crossload_fail(struct sftp_tree_dl_sink *sink, const char *path, const char *reason)
 {
 	/* Third-party is serial; the driver's -1 return carries the error. */
 	(void)sink;
@@ -5208,7 +5203,7 @@ tp_fail(struct sftp_tree_dl_sink *sink, const char *path, const char *reason)
 }
 
 static int
-tp_aborting(struct sftp_tree_dl_sink *sink)
+crossload_aborting(struct sftp_tree_dl_sink *sink)
 {
 	(void)sink;
 	return interrupted;
@@ -5222,12 +5217,12 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 	char *from_path_canon;
 	int ret;
 	struct sftp_hpn_dirattr_list dirs = { NULL, 0, 0 };
-	struct tp_sink sink = {
+	struct crossload_sink sink = {
 		.base = {
-			.make_dir = tp_make_dir,
-			.xfer_file = tp_xfer_file,
-			.fail = tp_fail,
-			.aborting = tp_aborting,
+			.make_dir = crossload_make_dir,
+			.xfer_file = crossload_xfer_file,
+			.fail = crossload_fail,
+			.aborting = crossload_aborting,
 		},
 		.from = from,
 		.to = to,

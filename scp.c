@@ -1550,8 +1550,9 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	    parallel_config_file, parallel_extra_o);
 	if (verify_flag)		/* -V forces verify on regardless of config */
 		pcfg.verify_transfer = 1;
-	/* HPN: latch the resolved bundling knobs on the control connection
-	 * for the serial recursive walks (no -j runs use only this conn). */
+	/* HPN: re-latch from the orchestrator's own resolution.  The no -j
+	 * case is handled above, before the single-stream returns; this keeps
+	 * the connection consistent with the pcfg the workers use. */
 	sftp_conn_set_bundle_config(conn, pcfg.use_bundle,
 	    pcfg.bundle_size, pcfg.writer_pool);
 	/* Adaptive throughput-outlier stall detection: shared defaults +

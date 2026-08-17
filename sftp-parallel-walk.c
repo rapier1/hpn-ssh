@@ -195,12 +195,8 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 			    "not a directory");
 			return -1;
 		}
-		stat_to_attrib(&rsb, &ra);
-		ra.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
-		ra.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
-		ra.perm &= 01777;
-		if (!sftp_parallel_preserve_flag(p))
-			ra.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+		sftp_hpn_dir_attrs_from_stat(&rsb,
+		    sftp_parallel_preserve_flag(p), &ra);
 		if (sftp_hpn_ensure_remote_dir(conn, dst, &ra, &rcreated) != 0) {
 			sftp_parallel_walker_record_failure(p, dst,
 			    "cannot create or access destination directory");
@@ -369,10 +365,11 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		};
 		/* HPN: one streamed enumeration when the server supports it,
 		 * else the recursive readdir fallback; both replay through the
-		 * same parallel sink.  Files are queued during enumeration and
-		 * handed to the workers once it drains; a transfer issued
-		 * mid-stream would collide with the discover-tree reply on the
-		 * control connection. */
+		 * same parallel sink.  This sink hands each file over as its
+		 * record arrives rather than queueing the tree, which is legal
+		 * only because submitting enqueues work for the fleet and
+		 * sends nothing on the connection carrying the reply.  See
+		 * streams_files. */
 		/* The submit path queries the destination filesystem's stripe
 		 * geometry once and caches it.  Do that now: during a streamed
 		 * enumeration the connection is carrying the reply and cannot

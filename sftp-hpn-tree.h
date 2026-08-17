@@ -144,9 +144,11 @@ struct sftp_conn;
  *     ATTRS   attrib                 (full Attrib; absent iff type==ERROR)
  *     uint32  status                 (present iff type==ERROR: SSH2_FX_*)
  *
- * The client re-validates every relative-path (no absolute paths, no "."
- * / ".." components, no escape above root) exactly as readdir does today -
- * the server generates the paths but the client does not trust the peer.
+ * The client re-validates every relative-path - no absolute path, no "."
+ * or ".." component, no empty component, nothing at or past PATH_MAX, and
+ * split on the same separator set readdir uses so a Cygwin client rejects a
+ * backslash too.  The server generates the paths but the client does not
+ * trust the peer.  See sftp_tree_relpath_ok.
  */
 
 /*

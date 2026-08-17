@@ -1381,7 +1381,7 @@ sftp_hpn_bundle_acc_free(struct sftp_hpn_bundle_acc *acc)
  * result enum in sftp-client.h). */
 static int
 bundle_acc_flush_upload(struct sftp_conn *conn,
-    struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
+    struct sftp_hpn_bundle_acc *acc, int preserve_flag,
     int verify, int fsync_flag, int inplace_flag)
 {
 	struct sftp_hpn_bundle_upload_entry *entries;
@@ -1450,7 +1450,7 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
  * are re-driven through the per-file path. */
 static int
 bundle_acc_flush_download(struct sftp_conn *conn,
-    struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
+    struct sftp_hpn_bundle_acc *acc, int preserve_flag,
     int verify, int fsync_flag, int inplace_flag)
 {
 	/* Serial progress gate, owned by sftp-client.c.  Parallel workers call
@@ -1569,10 +1569,10 @@ sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
 		    acc->n, (unsigned long long)acc->bytes);
 	if (acc->is_download)
 		r = bundle_acc_flush_download(conn, acc, preserve_flag,
-		    print_flag, verify, fsync_flag, inplace_flag);
+		    verify, fsync_flag, inplace_flag);
 	else
 		r = bundle_acc_flush_upload(conn, acc, preserve_flag,
-		    print_flag, verify, fsync_flag, inplace_flag);
+		    verify, fsync_flag, inplace_flag);
 	sftp_hpn_bundle_acc_reset(acc);
 	return r;
 }
@@ -1583,6 +1583,27 @@ sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
  * (sftp-client.c) and the parallel producer walks
  * (sftp-parallel-walk.c).
  */
+
+/*
+ * Normalise a local stat into the attrs a directory should be created with.
+ *
+ * Size and owner are dropped because neither is meaningful for a directory
+ * we are creating, permissions are masked to the mode bits, and the
+ * timestamps are kept only under -p.  Four walks derived these attrs
+ * identically before this existed; one definition means a change to what a
+ * directory's creation attrs mean is one edit rather than four.
+ */
+void
+sftp_hpn_dir_attrs_from_stat(const struct stat *sb, int preserve_flag,
+    Attrib *out)
+{
+	stat_to_attrib(sb, out);
+	out->flags &= ~SSH2_FILEXFER_ATTR_SIZE;
+	out->flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
+	out->perm &= 01777;
+	if (!preserve_flag)
+		out->flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+}
 
 /* Create the remote destination directory with write+exec temporarily
  * forced (restored via the deferred attr application), tolerating an
@@ -2280,7 +2301,7 @@ struct upload_walk_subdir {
 /*
  * Shared upload driver (serial and parallel): enumerate the local directory
  * src, hand each regular file to the sink, collect subdirectories, batch-
- * create them on the control connection (sftp_mkdir_pipeline, MKDIR_BATCH_MAX
+ * create them on the control connection (sftp_mkdir_pipeline,
  * chunks, fully drained so a directory exists before its files are written),
  * then recurse into each with its mkdir "created" flag.  See sftp-hpn-client.h.
  */
@@ -2315,12 +2336,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 
 	/* This directory's source-derived attrs; dst was created by the caller
 	 * (the root by the entry point, deeper dirs by the parent's batch). */
-	stat_to_attrib(&sb, &a);
-	a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
-	a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
-	a.perm &= 01777;
-	if (!preserve_flag)
-		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+	sftp_hpn_dir_attrs_from_stat(&sb, preserve_flag, &a);
 
 	sink->enter_dir(sink, src, dst);	/* print / Lustre / enum phase */
 
@@ -2370,13 +2386,8 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 			}
 			subdirs[nsub].src = new_src;
 			subdirs[nsub].dst = new_dst;
-			stat_to_attrib(&sb, &subdirs[nsub].a);
-			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
-			subdirs[nsub].a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
-			subdirs[nsub].a.perm &= 01777;
-			if (!preserve_flag)
-				subdirs[nsub].a.flags &=
-				    ~SSH2_FILEXFER_ATTR_ACMODTIME;
+			sftp_hpn_dir_attrs_from_stat(&sb, preserve_flag,
+			    &subdirs[nsub].a);
 			nsub++;
 			new_src = new_dst = NULL;	/* owned by subdirs[] */
 		} else if (S_ISREG(sb.st_mode)) {
@@ -2396,27 +2407,24 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 		Attrib	 *attrs = xcalloc(nsub, sizeof(*attrs));
 		u_char	 *cflags = xcalloc(nsub, sizeof(*cflags));
 		u_char	 *ffail = xcalloc(nsub, sizeof(*ffail));
-		int	  base;
 
 		for (i = 0; i < nsub; i++) {
 			paths[i] = subdirs[i].dst;
 			attrs[i] = subdirs[i].a;
 		}
 		sink->before_mkdir(sink);	/* parallel: mkdir phase */
-		for (base = 0; base < nsub && !sink->aborting(sink);
-		    base += MKDIR_BATCH_MAX) {
-			int nb = nsub - base < MKDIR_BATCH_MAX ?
-			    nsub - base : MKDIR_BATCH_MAX;
-			/* A directory we could not create is a failed
-			 * transfer.  Discarding this count reported success
-			 * for an upload that did not happen: an empty
-			 * subdirectory transfers nothing, so nothing else
-			 * notices the destination is missing. */
-			if (sftp_mkdir_pipeline(conn, paths + base,
-			    attrs + base, nb, cflags + base,
-			    ffail + base) > 0)
-				ret = -1;
-		}
+		/* One call: the pipeline windows the requests itself and
+		 * drains fully before returning, so chunking on top of it did
+		 * nothing.  MKDIR_BATCH_MAX was 8192 against a window of 64,
+		 * so the loop body ran once for any real directory anyway.
+		 *
+		 * A directory we could not create is a failed transfer.
+		 * Discarding this count reported success for an upload that
+		 * did not happen: an empty subdirectory transfers nothing, so
+		 * nothing else notices the destination is missing. */
+		if (sftp_mkdir_pipeline(conn, paths, attrs, nsub, cflags,
+		    ffail) > 0)
+			ret = -1;
 		free(paths);
 		free(attrs);
 		for (i = 0; i < nsub && !sink->aborting(sink); i++) {

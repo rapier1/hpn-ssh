@@ -419,6 +419,10 @@ struct sftp_hpn_dirattr_list {
 };
 
 struct sftp_conn;
+/* Normalise a local stat into the attrs a directory should be created with:
+ * no size, no owner, mode bits only, timestamps under -p alone. */
+void sftp_hpn_dir_attrs_from_stat(const struct stat *sb, int preserve_flag,
+    Attrib *out);
 int  sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
     Attrib *a, int *created);
 int  sftp_hpn_ensure_local_dir(const char *dst, Attrib *dirattrib,
