@@ -526,13 +526,11 @@ execute_unit(struct sftp_worker *w, struct sftp_work_unit *u)
  *   - free the unit
  *
  * `log_prefix` distinguishes the caller in the give-up log ("unit" for
- * single-unit dispatch, "batch unit" for pipelined-batch).  `trace_tag`
- * is the pending-trace tag string.
+ * single-unit dispatch, "batch unit" for pipelined-batch).
  */
 static void
 worker_give_up_unit(struct sftp_parallel *p, struct sftp_worker *w,
-    struct sftp_work_unit *u, const char *log_prefix,
-    const char *trace_tag)
+    struct sftp_work_unit *u, const char *log_prefix)
 {
 	char        cause[256];
 	const char *captured = hpn_get_last_error();
@@ -545,7 +543,7 @@ worker_give_up_unit(struct sftp_parallel *p, struct sftp_worker *w,
 	    w->id, log_prefix, u->attempt,
 	    u->src_path ? u->src_path : "(null)");
 	worker_record_completion(w, 0, 0);
-	parallel_unit_pending_dec_traced(p, u, w->id, trace_tag);
+	parallel_unit_pending_dec(p);
 	/* TransferLog: whole-file give-up is the file's final status;
 	 * range/span give-ups log once at tracker finalize instead. */
 	if (u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_DOWNLOAD)
@@ -568,13 +566,13 @@ worker_give_up_unit(struct sftp_parallel *p, struct sftp_worker *w,
  */
 static void
 worker_give_up_pushfail(struct sftp_parallel *p, struct sftp_worker *w,
-    struct sftp_work_unit *u, const char *trace_tag)
+    struct sftp_work_unit *u)
 {
 	if (u->size > 0)
 		__atomic_fetch_sub(&p->queued_bytes,
 		    (uint64_t)u->size, __ATOMIC_RELAXED);
 	worker_record_completion(w, 0, 0);
-	parallel_unit_pending_dec_traced(p, u, w->id, trace_tag);
+	parallel_unit_pending_dec(p);
 	if (u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_DOWNLOAD)
 		transferlog_file(TRANSFERLOG_FAILED, (long long)u->size,
 		    u->dst_path);
@@ -631,7 +629,7 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 		 * so the reorder is a no-op in timing.)
 		 */
 		(void)parallel_unit_tracker_finalize(u->range_tracker, 0, w);
-		parallel_unit_pending_dec_traced(p, u, w->id, "wpr/success");
+		parallel_unit_pending_dec(p);
 		parallel_unit_free(u);
 	} else {
 		/*
@@ -706,27 +704,17 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 			if (u->size > 0)
 				__atomic_fetch_add(&p->queued_bytes,
 				    (uint64_t)u->size, __ATOMIC_RELAXED);
-			{
-				uint64_t v;
-
-				pthread_mutex_lock(&p->pending_mu);
-				v = p->pending;
-				pthread_mutex_unlock(&p->pending_mu);
-				parallel_unit_pending_trace("REQUEUE", v, u,
-				    w->id, yielded ? "wpr/yield" :
-				    transient ? "wpr/transient" : "wpr/retry");
-			}
 			/* Yields jump the queue like transients: the parked
 			 * READY fleet should pick the remainder up NOW.  Non-
 			 * blocking: a worker must never block on a full queue it
 			 * also drains (self-deadlock, fatal at -j1). */
 			if (parallel_worker_requeue(p, u,
 			    transient || yielded) != 0)
-				worker_give_up_pushfail(p, w, u, "wpr/pushfail");
+				worker_give_up_pushfail(p, w, u);
 			else if (yielded)
 				sftp_workqueue_kick(p->q);
 		} else {
-			worker_give_up_unit(p, w, u, "unit", "wpr/maxretries");
+			worker_give_up_unit(p, w, u, "unit");
 		}
 	}
 }
@@ -757,7 +745,7 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 				parallel_verify_park_whole_file(p, u->dst_path,
 				    u->src_path, /*local_is_target=*/1);
 		}
-		parallel_unit_pending_dec_traced(p, u, w->id, "batch/success");
+		parallel_unit_pending_dec(p);
 		parallel_unit_free(u);
 		return;
 	}
@@ -779,24 +767,15 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 		if (u->size > 0)
 			__atomic_fetch_add(&p->queued_bytes,
 			    (uint64_t)u->size, __ATOMIC_RELAXED);
-		{
-			uint64_t v;
-
-			pthread_mutex_lock(&p->pending_mu);
-			v = p->pending;
-			pthread_mutex_unlock(&p->pending_mu);
-			parallel_unit_pending_trace("REQUEUE", v, u, w->id,
-			    transient ? "batch/transient" : "batch/retry");
-		}
 		/* Non-blocking: a failed bundle re-queues all its members here,
 		 * and a blocking push on a full queue the sole consumer also
 		 * drains is the -j1 self-deadlock this whole path exists to
 		 * avoid. */
 		if (parallel_worker_requeue(p, u, transient) != 0)
-			worker_give_up_pushfail(p, w, u, "batch/pushfail");
+			worker_give_up_pushfail(p, w, u);
 		return;
 	}
-	worker_give_up_unit(p, w, u, "batch unit", "batch/maxretries");
+	worker_give_up_unit(p, w, u, "batch unit");
 }
 
 static void
@@ -1299,8 +1278,7 @@ parallel_worker_thread(void *arg)
 		if (u0->yield_from == w->id + 1) {
 			u0->yield_from = 0;
 			if (parallel_worker_requeue(p, u0, /*front=*/1) != 0) {
-				worker_give_up_pushfail(p, w, u0,
-				    "yield/pushfail");
+				worker_give_up_pushfail(p, w, u0);
 				__atomic_store_n(&w->unit_start_ms, 0,
 				    __ATOMIC_RELEASE);
 				continue;
@@ -1344,8 +1322,7 @@ parallel_worker_thread(void *arg)
 			 * finalize, free) - silently dropping it stranded
 			 * the tracker and leaked the unit. */
 			if (parallel_worker_requeue(p, u0, /*front=*/0) != 0)
-				worker_give_up_pushfail(p, w, u0,
-				    "capgate/pushfail");
+				worker_give_up_pushfail(p, w, u0);
 			__atomic_store_n(&w->unit_start_ms, 0, __ATOMIC_RELEASE);
 			/* Availability intent: cap-gate parking = available for
 			 * OTHER files, blocked on this one's writer cap. */
@@ -1595,8 +1572,7 @@ parallel_worker_thread(void *arg)
 					if (parallel_worker_requeue(p,
 					    leftover, /*front=*/0) != 0)
 						worker_give_up_pushfail(p, w,
-						    leftover,
-						    "leftover/pushfail");
+						    leftover);
 				}
 			}
 			free(batch);	/* heap batch; bundle mode can exceed UPLOAD_BATCH_SIZE */

@@ -1624,8 +1624,6 @@ int	 parallel_unit_tracker_finalize_n(struct sftp_range_tracker *, int,
 int	 parallel_unit_writer_acquire(struct sftp_range_tracker *);
 void	 parallel_unit_writer_release(struct sftp_range_tracker *);
 int	 parallel_unit_max_retries(struct sftp_parallel *);
-void	 parallel_unit_pending_trace(const char *, uint64_t,
-    const struct sftp_work_unit *, int, const char *);
 int	 parallel_unit_submit(struct sftp_parallel *, struct sftp_work_unit *);
 /* Worker-context re-queue: non-blocking.  Tries p->q (front when front!=0);
  * on a full queue parks the unit on the retry-overflow list rather than
@@ -1644,8 +1642,6 @@ void	 parallel_unit_store_range_hash(struct sftp_range_tracker *, int index,
  * sftp_parallel_wait once a command has finished submitting. */
 void	 parallel_bundle_flush_pending(struct sftp_parallel *);
 void	 parallel_unit_pending_dec(struct sftp_parallel *);
-void	 parallel_unit_pending_dec_traced(struct sftp_parallel *,
-	    const struct sftp_work_unit *, int, const char *);
 uint64_t parallel_unit_split_min_size(struct sftp_parallel *);
 int	 parallel_unit_ensure_file(struct sftp_conn *,
 	    struct sftp_work_unit *);
