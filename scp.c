@@ -115,6 +115,7 @@
 #include "hpn3scp-run.h"
 #include "misc.h"
 #include "progressmeter.h"
+#include "hpn-meter.h"	/* progress meter core */
 #include "utf8.h"
 #include "sftp.h"
 
@@ -2354,7 +2355,9 @@ next:			if (fd != -1) {
 		fprintf(stderr, "%s: going to xfer %ld\n", hostname, xfer_size);
 #endif
 		if (showprogress) {
-			start_progress_meter(curfile, xfer_size, &statbytes);
+			hpn_meter_start(hpn_meter_serial(), &statbytes,
+			    HPN_METER_FILE, HPN_METER_DOM_TRANSFER,
+			    curfile, xfer_size, &statbytes, 1);
 		}
 		set_nonblock(remout);
 		for (haderr = i = 0; i < xfer_size; i += bp->cnt) {
@@ -2390,7 +2393,7 @@ next:			if (fd != -1) {
 			run_err("%s: %s", name, strerror(haderr));
 		(void) response();
 		if (showprogress)
-			stop_progress_meter();
+			hpn_meter_stop(hpn_meter_serial(), &statbytes);
 	}
 }
 
@@ -2906,7 +2909,9 @@ bad:			run_err("%s: %s", np, strerror(errno));
 		 */
 		statbytes = 0;
 		if (showprogress)
-			start_progress_meter(curfile, xfer_size, &statbytes);
+			hpn_meter_start(hpn_meter_serial(), &statbytes,
+			    HPN_METER_FILE, HPN_METER_DOM_TRANSFER,
+			    curfile, xfer_size, &statbytes, 1);
 		set_nonblock(remin);
 #ifdef DEBUG
 		fprintf(stderr, "%s: xfer_size is %ld\n", hostname, xfer_size);
@@ -2979,7 +2984,7 @@ bad:			run_err("%s: %s", np, strerror(errno));
 			note_err("%s: close: %s", np, strerror(errno));
 		(void) response();
 		if (showprogress)
-			stop_progress_meter();
+			hpn_meter_stop(hpn_meter_serial(), &statbytes);
 		if (setimes && !wrerr) {
 			setimes = 0;
 			if (utimes(np, tv) == -1) {
