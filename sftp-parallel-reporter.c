@@ -855,7 +855,6 @@ parallel_reporter_thread(void *arg)
 		uint64_t bytes;
 		off_t newpos;
 		parallel_stats_snapshot(p, &bytes, NULL, NULL);
-		p->aggregate_bytes_for_meter = bytes;
 		if (p->verify_phase_active && p->verify_total_units > 0) {
 			resume_stretch_restore(p);	/* safety: never both */
 			/* Post-transfer verify phase: byte-granular meter.  Counter

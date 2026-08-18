@@ -1462,7 +1462,6 @@ struct sftp_parallel {
 
 	int                         saved_showprogress;
 	int                         progress_meter_started;
-	uint64_t                    aggregate_bytes_for_meter;
 	uint64_t                    progress_bytes_baseline;    /* bytes already
 								   * done when meter
 								   * started; delta

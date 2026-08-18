@@ -479,7 +479,7 @@ hpn_meter_relay_sample(const struct hpns_progress *p)
 
 /*
  * END received: force the completion line (100%, total elapsed, peak
- * instantaneous rate).  The caller still calls stop_progress_meter()
+ * instantaneous rate).  The caller still closes the meter
  * for the trailing newline.
  */
 void

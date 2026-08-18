@@ -67,20 +67,9 @@ static void sig_alarm(int);
 /* render one meter line from a filled per-meter view (Stage 2) */
 static void render_from_view(const struct meter_view *);
 
-static double start;		/* start progress */
-static double last_update;	/* last progress update */
-static const char *file;	/* name of the file being transferred */
-static off_t start_pos;		/* initial position of transfer */
-static off_t end_pos;		/* ending position of transfer */
-static off_t cur_pos;		/* transfer position as of last refresh */
-static off_t last_pos;
 /* HPN log/meter interleave guard state (see meter_log_enter below). */
 static pthread_mutex_t meter_mu = PTHREAD_MUTEX_INITIALIZER;
 static int meter_active;
-static off_t max_delta_pos = 0;
-static volatile off_t *counter;	/* progress counter */
-static long stalled;		/* how long we have been stalled */
-static long long bytes_per_second; /* current speed in bytes per second */
 static int win_size;		/* terminal window size */
 static volatile sig_atomic_t win_resized; /* for window resizing */
 static volatile sig_atomic_t alarm_fired;
@@ -296,14 +285,7 @@ pm_debug_view(const struct meter_view *v)
 void
 refresh_progress_meter(int force_update)
 {
-	off_t transferred;
-	double elapsed, now;
-	off_t bytes_left;
-	long long cur_speed;
-	off_t delta_pos;
-	struct meter_view v;
-
-	if ((file == NULL && !hpn_meter_display_active()) ||
+	if (!hpn_meter_display_active() ||
 	    (!force_update && !alarm_fired && !win_resized) ||
 	    (!hpn_pm_active() && !can_output() && pm_debug_fp == NULL))
 		return;
@@ -315,108 +297,10 @@ refresh_progress_meter(int force_update)
 		win_resized = 0;
 	}
 
-	/* HPN meter core: a meter started through hpn_meter_start owns its
-	 * own sample state and fill; this function supplies only the shared
-	 * cadence gates above. The legacy fill below serves the callers not
-	 * yet converted to the core. */
-	if (hpn_meter_display_active()) {
-		hpn_meter_refresh_current(force_update);
-		return;
-	}
-
-	transferred = *counter - (cur_pos ? cur_pos : start_pos);
-	/* HPN: the parallel aggregate can step BACKWARD - a worker dying
-	 * mid-unit takes its in-progress bytes out of the aggregate until
-	 * the requeued unit re-transfers them.  A negative step poisons the
-	 * rate math (the EMA explodes through format_rate's cast - 81.3TB/s -
-	 * or prints negative garbage).  Clamp: the meter pauses through the
-	 * dip instead of exploding. */
-	if (transferred < 0)
-		transferred = 0;
-	cur_pos = *counter;
-	now = monotime_double();
-	bytes_left = end_pos - cur_pos;
-
-	delta_pos = cur_pos - last_pos;
-	if (delta_pos < 0)
-		delta_pos = 0;
-	if (delta_pos > max_delta_pos)
-		max_delta_pos = delta_pos;
-
-	/* end_pos == 0 means an unknown total (a directory download with no
-	 * pre-scanned size): keep it a rate-only meter - take the normal
-	 * window and the real delta, not the completion branch that zeroes
-	 * the rate and accrues a false stall. */
-	if (bytes_left > 0 || end_pos == 0)
-		elapsed = now - last_update;
-	else {
-		elapsed = now - start;
-		/* Calculate true total speed when done */
-		transferred = end_pos - start_pos;
-		bytes_per_second = 0;
-	}
-
-	/* calculate speed.  HPN: require a measurable window - back-to-back
-	 * refreshes (alarm + forced update) give elapsed ~1 microsecond,
-	 * which passes a !=0 test and explodes the division by 10^6 (the
-	 * 984.6TB/s artifact); the poisoned EMA then decays for many ticks.
-	 * Under 1ms there is nothing meaningful to measure: hold the EMA. */
-	if (elapsed >= 0.001)
-		cur_speed = (transferred / elapsed);
-	else
-		cur_speed = bytes_per_second;
-
-#define AGE_FACTOR 0.9
-	if (bytes_per_second != 0) {
-		bytes_per_second = (bytes_per_second * AGE_FACTOR) +
-		    (cur_speed * (1.0 - AGE_FACTOR));
-	} else
-		bytes_per_second = cur_speed;
-
-	last_update = now;
-
-	/* Stall accounting is stateful (mutates `stalled`) so it stays in the
-	 * sample step; render_from_view only reads whether we crossed the
-	 * threshold.  (Frame mode ignores it, but it is cheap and per-meter.) */
-	if (!transferred)
-		stalled += elapsed;
-	else
-		stalled = 0;
-
-	/*
-	 * Fill the per-meter view once, then dispatch to the active sink: the
-	 * TTY renderer, or the frame emitter.  The frame sink overlays the
-	 * cross-file aggregate and derives its own per-second rate from the
-	 * raw delta/elapsed carried here; the display fields it ignores.
-	 */
-	v.label = file;
-	v.cur = cur_pos;
-	v.total = end_pos;
-	/* Local policy: an unknown (0) total is a rate-only meter - read 0%
-	 * (matching the relay path) rather than a bogus 100%.  A known total
-	 * met or passed is a real completion. */
-	if (end_pos == 0)
-		v.percent = 0;
-	else if (cur_pos >= end_pos)
-		v.percent = 100;
-	else
-		v.percent = (int)((float)cur_pos / end_pos * 100);
-	v.rate = bytes_per_second;
-	v.inst = (bytes_left > 0 || end_pos == 0) ? delta_pos : max_delta_pos;
-	v.delta = delta_pos;
-	v.elapsed = elapsed;
-	v.eta_sec = (bytes_left > 0 && bytes_per_second > 0) ?
-	    (uint32_t)(bytes_left / bytes_per_second) : HPNS_ETA_UNKNOWN;
-	v.stalled = stalled >= STALL_TIME;
-	/* An unknown (0) total is never "done" here - completion is signalled
-	 * by stop_progress_meter, not the byte count.  Over-completion
-	 * (cur>total, rate forced to 0) falls to UNKNOWN, as the historic
-	 * inline paint did. */
-	v.done = end_pos != 0 && bytes_left == 0;
-	v.elapsed_sec = (long)elapsed;
-
-	pm_dispatch_view(&v, force_update);
-	last_pos = cur_pos;
+	/* The meter core owns all sample state and the fills; this function
+	 * supplies the shared cadence gates above (the alarm flag, forced
+	 * updates, and window resizes) and nothing else. */
+	hpn_meter_refresh_current(force_update);
 }
 
 /*
@@ -481,85 +365,25 @@ meter_tty_arm(void)
 	ssh_signal(SIGWINCH, sig_winch);
 }
 
+/*
+ * Compatibility wrappers with the stock signatures. Every in-tree caller
+ * uses the meter core directly; these exist so upstream code arriving in
+ * a rebase that still calls the historic API gets a working FILE meter
+ * instead of a link error. The owner token is this file's own.
+ */
+static const char pm_wrapper_owner;
+
 void
 start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 {
-	pm_debug_init();
-	start = last_update = monotime_double();
-	file = f;
-	hpn_pm_meter_start();
-	max_delta_pos = 0;		/* peak-inst is per meter; carrying it
-					 * across meters leaked the previous
-					 * transfer's peak into this one */
-	start_pos = *ctr;
-	end_pos = filesize;
-	cur_pos = 0;
-	/* Seed last_pos at the starting position: a resumed transfer's
-	 * counter begins at the resume offset, and a zero last_pos would
-	 * paint that whole offset as the first instantaneous rate (then
-	 * latch it as the run's peak via max_delta_pos). */
-	last_pos = *ctr;
-	counter = ctr;
-	stalled = 0;
-	bytes_per_second = 0;
-
-	/*
-	 * Frame mode skips the TTY arming (stdout is its binary channel)
-	 * AND the initial forced paint: phase callers set their flag
-	 * (set_phase) only AFTER this returns (the reset above would clear
-	 * it), so a frame emitted here would carry cleared flags and the
-	 * wrong byte base - one mislabeled frame at every phase boundary.
-	 * The alarm / reporter tick emits a correctly-flagged frame within
-	 * a second; nothing is lost.
-	 */
-	if (!hpn_pm_active()) {
-		if (can_output())
-			meter_tty_arm();
-		if (can_output() || pm_debug_fp != NULL)
-			refresh_progress_meter(1);
-	}
-
-	ssh_signal(SIGALRM, sig_alarm);
-	alarm(UPDATE_INTERVAL);
+	(void)hpn_meter_start(hpn_meter_serial(), &pm_wrapper_owner,
+	    HPN_METER_FILE, HPN_METER_DOM_TRANSFER, f, filesize, ctr, 1);
 }
 
 void
 stop_progress_meter(void)
 {
-	alarm(0);
-
-	pthread_mutex_lock(&meter_mu);
-	meter_active = 0;
-	pthread_mutex_unlock(&meter_mu);
-
-	/*
-	 * Frame mode: fold the finished meter into the aggregate so the
-	 * next meter's frames continue the running totals (serial scp runs
-	 * one meter per file).  A boundary frame is emitted through the
-	 * regular limiter - if it is dropped, the next 1 Hz tick or the
-	 * final END frame carries the totals.
-	 */
-	if (hpn_pm_active()) {
-		if (file != NULL) {
-			if (counter != NULL)
-				cur_pos = *counter;
-			hpn_pm_meter_done(cur_pos, end_pos,
-			    bytes_per_second);
-			cur_pos = 0;
-		}
-		file = NULL;
-		return;
-	}
-
-	if (!can_output())
-		return;
-
-	/* Ensure we complete the progress */
-	if (cur_pos != end_pos)
-		refresh_progress_meter(1);
-
-	atomicio(vwrite, STDOUT_FILENO, "\n", 1);
-	file = NULL;
+	hpn_meter_stop(hpn_meter_serial(), &pm_wrapper_owner);
 }
 
 /*
@@ -612,7 +436,13 @@ pm_display_begin(void)
 {
 	pm_debug_init();
 	if (!hpn_pm_active()) {
-		if (can_output())
+		/* Arm on "stdout is a terminal", not "foreground right
+		 * now": a transfer started in the background never armed,
+		 * so win_size stayed 0 and no paint ever happened after
+		 * fg, with no self-heal because the resize handler that
+		 * sets win_resized was never installed (review finding
+		 * #27). Painting stays gated on being foreground below. */
+		if (isatty(STDOUT_FILENO))
 			meter_tty_arm();
 		if (can_output() || pm_debug_fp != NULL)
 			refresh_progress_meter(1);
@@ -654,20 +484,6 @@ pm_display_end(off_t painted, off_t cur, off_t total, double rate)
 
 
 
-/*
- * Adjust a running meter's target size.  Used by the parallel reporter
- * (source side) when a live meter's denominator legitimately changes:
- * it tracks the aggregate hash-work total during the resume-check
- * stretch, then restores the transfer total when the stretch ends.
- */
-void
-pm_set_total(off_t total)
-{
-	/* A negative total is not a size.  Treat it the way an unset one is
-	 * treated, so the meter runs rate-only instead of deriving a
-	 * percentage and an ETA from it. */
-	end_pos = total > 0 ? total : 0;
-}
 
 static void
 sig_winch(int sig)

@@ -34,7 +34,6 @@
 void	start_progress_meter(const char *, off_t, off_t *);
 void	refresh_progress_meter(int);
 void	stop_progress_meter(void);
-void	pm_set_total(off_t);
 
 /* Sink dispatch and display session mechanics, exported for the hpn-meter
  * core (hpn-meter.c): the core owns meter state and the fill, this file
