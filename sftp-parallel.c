@@ -586,12 +586,13 @@ sftp_parallel_wait(struct sftp_parallel *p)
 				 * bytes and both legs advance it. */
 				p->verify_meter_total = 2 * vtotal;
 				p->aggregate_progress_counter = 0;
-				strlcpy(p->progress_label, "verify",
-				    sizeof(p->progress_label));
-				start_progress_meter(p->progress_label,
-				    2 * vtotal,
-				    &p->aggregate_progress_counter);
-				hpn_pm_set_phase(HPNS_F_VERIFY, 1);
+				/* WORK kind in the work-byte domain: the
+				 * core marks it not a file and raises the
+				 * verify phase flag. */
+				hpn_meter_start(&p->meter, p,
+				    HPN_METER_WORK, HPN_METER_DOM_WORK,
+				    "verify", 2 * vtotal,
+				    &p->aggregate_progress_counter, 0);
 				/* verify_phase_active BEFORE meter_started: a
 				 * reporter tick between the two would take the
 				 * transfer branch against the verify meter's
@@ -1061,23 +1062,24 @@ sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
 		return;
 	if (label == NULL)
 		label = "transfer";
-	strlcpy(p->progress_label, label, sizeof(p->progress_label));
-	/* Saved for the reporter's resume-check stretch, which swaps the
-	 * label/total and must restore them when transfer bytes move. */
-	strlcpy(p->progress_label_saved, label,
-	    sizeof(p->progress_label_saved));
-	p->progress_total_bytes = total_bytes;
 	p->resume_stretch_on = 0;
 	p->verify_meter_total = 0;	/* this is a TRANSFER meter; a stale
 					 * verify total would hijack the stop
 					 * snapshot (work-byte domain) */
+	/* Nothing posted yet for this meter. */
+	__atomic_store_n(&p->posted_total_add, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&p->posted_files_add, 0, __ATOMIC_RELAXED);
 	/* Snapshot current accumulated bytes across all workers so the meter
 	 * shows only bytes moved in this transfer, not prior transfers in the
 	 * same session. */
 	parallel_stats_snapshot(p, &p->progress_bytes_baseline, NULL, NULL);
 	p->aggregate_progress_counter = 0;
-	start_progress_meter(p->progress_label, total_bytes,
-	    &p->aggregate_progress_counter);
+	/* AGGREGATE kind: an unknown (0) total renders rate-only, and after
+	 * this returns the reporter is the only thread that updates the
+	 * meter. The core owns the label copy. */
+	hpn_meter_start(&p->meter, p, HPN_METER_AGGREGATE,
+	    HPN_METER_DOM_TRANSFER, label, total_bytes,
+	    &p->aggregate_progress_counter, 0);
 	p->progress_meter_started = 1;
 	p->progress_verb[0] = '\0';	/* no deferred file count unless the
 					 * caller re-arms it via _start_counted */
@@ -1097,19 +1099,21 @@ sftp_parallel_progress_set_total(struct sftp_parallel *p, off_t total_bytes,
 {
 	if (p == NULL || !p->progress_meter_started)
 		return;
-	p->progress_total_bytes = total_bytes;
-	pm_set_total(total_bytes);
-	/* If the client deferred its file count (a directory download, where
-	 * the real count is unknown until the discover-tree walk), rewrite the
-	 * label now that we have it.  The meter holds progress_label by pointer,
-	 * so an in-place rewrite shows on the next refresh. */
-	if (p->progress_verb[0] != '\0' && nfiles > 0) {
-		snprintf(p->progress_label, sizeof(p->progress_label),
-		    "%s %zu %s in parallel", p->progress_verb, nfiles,
-		    nfiles == 1 ? "file" : "files");
-		strlcpy(p->progress_label_saved, p->progress_label,
-		    sizeof(p->progress_label_saved));
-	}
+	/*
+	 * Post, do not apply: this runs on the walker's thread when an
+	 * enumeration drains, and the reporter is the only thread that
+	 * touches display state (review finding #19). Additive so a later
+	 * walk grows a live denominator instead of replacing it, which
+	 * could freeze the meter at a bogus 100 percent (finding #9). The
+	 * reporter folds these in on its next tick and rewrites a
+	 * deferred-count label from progress_verb.
+	 */
+	if (total_bytes > 0)
+		__atomic_fetch_add(&p->posted_total_add, total_bytes,
+		    __ATOMIC_RELAXED);
+	if (nfiles > 0)
+		__atomic_fetch_add(&p->posted_files_add, (u_int)nfiles,
+		    __ATOMIC_RELAXED);
 }
 
 /*
@@ -1125,8 +1129,11 @@ sftp_parallel_progress_start_counted(struct sftp_parallel *p, const char *verb,
 {
 	char label[128];
 
-	if (p == NULL)
-		return;
+	if (p == NULL || p->progress_meter_started)
+		return;		/* a live meter keeps its own count; arming
+				 * the verb against it would let this
+				 * command rewrite that meter's label and
+				 * total (review finding #28) */
 	if (verb == NULL)
 		verb = "Fetching";
 	snprintf(label, sizeof(label), "%s files in parallel", verb);
@@ -1158,7 +1165,7 @@ sftp_parallel_progress_stop(struct sftp_parallel *p)
 			    (off_t)(bytes - p->progress_bytes_baseline);
 	}
 	p->progress_meter_started = 0;
-	stop_progress_meter();
+	hpn_meter_stop(&p->meter, p);
 }
 
 /* ---------- Recursive walkers (Approach B) ----------

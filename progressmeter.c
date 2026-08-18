@@ -85,36 +85,6 @@ static int win_size;		/* terminal window size */
 static volatile sig_atomic_t win_resized; /* for window resizing */
 static volatile sig_atomic_t alarm_fired;
 
-/*
- * HPN status relay, consumer side: render remote telemetry verbatim.
- * Everything painted comes from the last PROGRESS frame - no rate, delta,
- * or ETA is ever derived locally, because the counter would advance only
- * when a ~1 Hz frame lands and sampling that against the local clock
- * aliases (alternating 0 and 2x-link-speed readings).  Opt-in: only the
- * frame consumers (scp -R, hpn3scp) enter this mode; local meters never
- * touch it and their math path is unchanged.
- */
-static int relay_mode;
-static struct {
-	uint64_t bytes_done;
-	uint64_t bytes_total;
-	uint64_t rate;		/* source-smoothed */
-	uint64_t rate_inst;	/* source last-interval */
-	uint64_t rate_inst_max;	/* peak inst within the current phase */
-	uint64_t rate_inst_peak_xfer;	/* transfer-phase peak, latched at the
-					 * verify transition: the completion
-					 * line summarizes the TRANSFER, and a
-					 * verify-phase hash peak (legitimately
-					 * above link speed) would read as an
-					 * impossible network rate there */
-	uint32_t eta_sec;
-	int	 verifying;	/* HPNS_F_VERIFY seen: label the phase */
-	int	 resuming;	/* HPNS_F_RESUME live: label the phase */
-	int	 done;		/* END received: paint the 100% line */
-	double	 last_frame;	/* monotime of the last sample (stall aging) */
-	double	 started;
-} relay;
-static off_t relay_ctr;		/* placeholder counter for the meter core */
 
 /* units for format_size */
 static const char unit[] = " KMGT";
@@ -246,71 +216,6 @@ render_meter_line(const char *label, int percent, off_t bytes_shown,
 	free(obuf);
 }
 
-/*
- * Relay-mode paint: everything shown comes from the stored frame
- * telemetry.  The only local inputs are wall-clock ages: total elapsed
- * for the completion line and the last-frame age for stall detection
- * (a dead source must not keep displaying its final healthy rate).
- */
-static void
-relay_render(void)
-{
-	char vlabel[512];
-	const char *label = file;
-	double now = monotime_double();
-	struct meter_view v;
-	int silent = now - relay.last_frame >= STALL_TIME;
-
-	memset(&v, 0, sizeof(v));
-
-	/* PREFIX the phase tag: the label field truncates at the right edge
-	 * (win_size - 45), so a suffix vanishes on narrow terminals.  The
-	 * resume check precedes transfer; verify follows it - mutually
-	 * exclusive in practice, resume checked first. */
-	if (relay.resuming && label != NULL) {
-		snprintf(vlabel, sizeof(vlabel), "resume check: %s", label);
-		label = vlabel;
-	} else if (relay.verifying && label != NULL) {
-		snprintf(vlabel, sizeof(vlabel), "verify: %s", label);
-		label = vlabel;
-	}
-
-	v.label = label;
-	v.cur = (off_t)relay.bytes_done;
-	v.total = (off_t)relay.bytes_total;
-	v.eta_sec = relay.eta_sec;
-	v.done = relay.done;
-	v.stalled = !relay.done && silent;
-	v.elapsed_sec = (long)(now - relay.started);
-	/* Relay policy: an unknown (0) total reads 0% - do not claim 100%
-	 * before the source has reported a size. */
-	if (relay.done || (relay.bytes_total > 0 &&
-	    relay.bytes_done >= relay.bytes_total))
-		v.percent = 100;
-	else if (relay.bytes_total > 0)
-		v.percent = (int)(relay.bytes_done * 100 / relay.bytes_total);
-	else
-		v.percent = 0;
-
-	/*
-	 * Source-specific display choices live in the fill, not the shared
-	 * renderer.  A silent source: blank the rate/inst - its last value is
-	 * stale (a dead source must not keep showing a healthy rate).  On
-	 * completion: show the TRANSFER-phase peak inst (a verify-phase hash
-	 * peak is not a network rate).  The relay never derives rate/eta
-	 * locally; both ride in the frame (see the relay struct comment).
-	 */
-	if (relay.done)
-		v.inst = (off_t)(relay.rate_inst_peak_xfer > 0 ?
-		    relay.rate_inst_peak_xfer : relay.rate_inst_max);
-	else if (silent)
-		v.inst = 0;
-	else
-		v.inst = (off_t)relay.rate_inst;
-	v.rate = (silent && !relay.done) ? 0 : (long long)relay.rate;
-
-	render_from_view(&v);
-}
 
 /*
  * Paint one meter line from a filled view: the shared render derivation -
@@ -408,13 +313,6 @@ refresh_progress_meter(int force_update)
 		if (!hpn_pm_active())
 			setscreensize();
 		win_resized = 0;
-	}
-
-	/* HPN status relay consumer: paint the stored remote telemetry and
-	 * skip every local derivation (see relay_render). */
-	if (relay_mode) {
-		relay_render();
-		return;
 	}
 
 	/* HPN meter core: a meter started through hpn_meter_start owns its
@@ -590,8 +488,6 @@ start_progress_meter(const char *f, off_t filesize, off_t *ctr)
 	start = last_update = monotime_double();
 	file = f;
 	hpn_pm_meter_start();
-	relay_mode = 0;			/* local meter unless the relay APIs
-					 * re-arm it (pm_relay_*) */
 	max_delta_pos = 0;		/* peak-inst is per meter; carrying it
 					 * across meters leaked the previous
 					 * transfer's peak into this one */
@@ -655,10 +551,6 @@ stop_progress_meter(void)
 		return;
 	}
 
-	/* Relay meter: the completion line was painted by relay_end();
-	 * just drop out of relay mode and finish with the newline. */
-	relay_mode = 0;
-
 	if (!can_output())
 		return;
 
@@ -679,11 +571,46 @@ stop_progress_meter(void)
  * same reasons start_progress_meter does: stdout is the frame channel, and
  * phase flags are set only after start returns.
  */
+/*
+ * Display session for the relay source (hpn-meter.c): TTY arming and the
+ * alarm, with two deliberate differences from pm_display_begin. No initial
+ * forced paint, because nothing has arrived to paint until the first frame,
+ * and the TTY arms unconditionally, matching the historic relay start.
+ */
+void
+pm_display_begin_relay(void)
+{
+	pm_debug_init();
+	meter_tty_arm();
+	ssh_signal(SIGALRM, sig_alarm);
+	alarm(UPDATE_INTERVAL);
+}
+
+/*
+ * Close the relay's display session: the completion line was painted by
+ * the relay end, so only the alarm, the log guard, and the trailing
+ * newline remain. The newline is skipped when output is impossible, as
+ * the legacy relay branch of stop_progress_meter skipped it.
+ */
+void
+pm_display_end_relay(void)
+{
+	alarm(0);
+
+	pthread_mutex_lock(&meter_mu);
+	meter_active = 0;
+	pthread_mutex_unlock(&meter_mu);
+
+	if (!can_output())
+		return;
+
+	atomicio(vwrite, STDOUT_FILENO, "\n", 1);
+}
+
 void
 pm_display_begin(void)
 {
 	pm_debug_init();
-	relay_mode = 0;
 	if (!hpn_pm_active()) {
 		if (can_output())
 			meter_tty_arm();
@@ -724,98 +651,8 @@ pm_display_end(off_t painted, off_t cur, off_t total, double rate)
 	atomicio(vwrite, STDOUT_FILENO, "\n", 1);
 }
 
-/*
- * Relay mode (consumer side): begin a meter whose every displayed value
- * comes from remote PROGRESS frames.  Reuses the meter core for the
- * alarm, window sizing, and log interleave, but relay_render() bypasses
- * all local rate/delta/ETA math - see the relay struct above for why.
- */
-void
-pm_relay_start(const char *label)
-{
-	/*
-	 * Own initialization instead of borrowing start_progress_meter():
-	 * its local path would paint a bogus "100% 0.0KB/s" line before
-	 * the first frame arrives.  cur_pos == end_pos == 0 also keeps the
-	 * final local repaint in stop_progress_meter() skipped - relay_end
-	 * paints the completion line itself.
-	 */
-	relay_ctr = 0;
-	file = label;
-	counter = &relay_ctr;
-	start_pos = end_pos = cur_pos = last_pos = 0;
-	stalled = 0;
-	bytes_per_second = 0;
-	meter_tty_arm();
-	memset(&relay, 0, sizeof(relay));
-	relay.started = relay.last_frame = monotime_double();
-	relay_mode = 1;
-	ssh_signal(SIGALRM, sig_alarm);
-	alarm(UPDATE_INTERVAL);
-}
 
-/* Store one PROGRESS frame's telemetry and repaint (alarm-gated). */
-void
-pm_relay_sample(const struct hpns_progress *p)
-{
-	if (!relay_mode)
-		return;
-	if ((p->flags & HPNS_F_RESUME) && !relay.resuming)
-		relay.resuming = 1;
-	else if (relay.resuming && !(p->flags & HPNS_F_RESUME)) {
-		/* resume check over, transfer begins: drop the hash peaks
-		 * so the completion line reflects transfer rates only */
-		relay.resuming = 0;
-		relay.rate_inst_max = 0;
-	}
-	if ((p->flags & HPNS_F_VERIFY) && !relay.verifying) {
-		relay.verifying = 1;
-		/* latch the transfer peak for the completion line, then
-		 * track the verify phase's own peak separately */
-		relay.rate_inst_peak_xfer = relay.rate_inst_max;
-		relay.rate_inst_max = 0;
-	}
-	relay.bytes_done = p->bytes_done;
-	if (p->bytes_total > 0)
-		relay.bytes_total = p->bytes_total;
-	relay.rate = p->rate_bps;
-	relay.rate_inst = p->rate_inst_bps;
-	if (p->rate_inst_bps > relay.rate_inst_max)
-		relay.rate_inst_max = p->rate_inst_bps;
-	relay.eta_sec = p->eta_sec;
-	relay.last_frame = monotime_double();
-	refresh_progress_meter(0);
-}
 
-/*
- * END received: force the completion line (100%, total elapsed, peak
- * instantaneous rate).  The caller still calls stop_progress_meter()
- * for the trailing newline.
- */
-void
-pm_relay_end(u_int64_t bytes_done)
-{
-	double dur;
-
-	if (!relay_mode)
-		return;
-	relay.bytes_done = bytes_done;
-	if (bytes_done > relay.bytes_total)
-		relay.bytes_total = bytes_done;
-	relay.done = 1;
-	/* Phases are over at END: the completion line summarizes the
-	 * transfer and must not carry a "verify:"/"resume check:" prefix. */
-	relay.verifying = 0;
-	relay.resuming = 0;
-	/* Whole-run average for the completion line, matching the local
-	 * meter.  Computed over the full local duration, so per-tick frame
-	 * quantization cannot alias it. */
-	dur = monotime_double() - relay.started;
-	relay.rate = dur >= 0.001 ? (uint64_t)(bytes_done / dur) : 0;
-	relay.rate_inst = 0;
-	relay.last_frame = monotime_double();
-	refresh_progress_meter(1);
-}
 
 /*
  * Adjust a running meter's target size.  Used by the parallel reporter

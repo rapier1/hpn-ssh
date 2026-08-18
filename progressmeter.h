@@ -43,8 +43,8 @@ void	pm_dispatch_view(const struct meter_view *, int);
 void	pm_display_begin(void);
 void	pm_display_end(off_t, off_t, off_t, double);
 
-/* HPN status relay, consumer side: meter rendered from remote telemetry
- * only (no local rate/ETA derivation - frame arrival timing aliases). */
-void	pm_relay_start(const char *);
-void	pm_relay_sample(const struct hpns_progress *);
-void	pm_relay_end(u_int64_t);
+/* Display session for the relay source in hpn-meter.c, which renders
+ * remote telemetry only (no local rate/ETA derivation - frame arrival
+ * timing aliases). */
+void	pm_display_begin_relay(void);
+void	pm_display_end_relay(void);

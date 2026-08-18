@@ -70,8 +70,8 @@ hpn_meter_display_active(void)
  * starts nothing if a meter is already current, which no legal caller
  * sequence produces today.
  */
-int
-hpn_meter_start(struct hpn_meter *m, const void *owner,
+static int
+meter_init(struct hpn_meter *m, const void *owner,
     enum hpn_meter_kind kind, enum hpn_meter_domain domain,
     const char *label, off_t total, off_t *ctr, u_int nfiles)
 {
@@ -126,24 +126,90 @@ hpn_meter_start(struct hpn_meter *m, const void *owner,
 		else if (domain == HPN_METER_DOM_WORK)
 			hpn_pm_set_phase(HPNS_F_VERIFY, 1);
 	}
+	return 0;
+}
+
+int
+hpn_meter_start(struct hpn_meter *m, const void *owner,
+    enum hpn_meter_kind kind, enum hpn_meter_domain domain,
+    const char *label, off_t total, off_t *ctr, u_int nfiles)
+{
+	if (meter_init(m, owner, kind, domain, label, total, ctr,
+	    nfiles) != 0)
+		return -1;
 	pm_display_begin();
 	return 0;
 }
 
 /*
- * Stop a meter. Only the owner that started it may stop it; anything else
- * is a caller holding a stale handle and is refused loudly rather than
- * folded into the wrong meter's completion.
+ * Owner gate shared by stop and the update entry points: the meter must be
+ * current and active, and the caller must be the owner that started it.
+ * Anything else is a caller holding a stale handle and is refused loudly
+ * rather than folded into the wrong meter (review findings #9 and #28 were
+ * exactly such updates landing on a meter their caller did not own). The
+ * update entry points below are display-thread only: for the fleet meter
+ * that is the reporter, and nothing else may call them.
+ */
+static int
+meter_owned(struct hpn_meter *m, const void *owner, const char *what)
+{
+	if (m == NULL || !m->active || m != current_meter)
+		return 0;
+	if (owner != m->owner) {
+		error_f("%s for \"%s\" from a non-owner ignored",
+		    what, m->label);
+		return 0;
+	}
+	return 1;
+}
+
+/*
+ * Grow the total and file count. Additive on purpose: a later enumeration
+ * grows a live denominator instead of replacing it, so the meter can never
+ * read a frozen 100 percent because a second command shrank the total
+ * under the bytes already counted (review finding #9).
+ */
+void
+hpn_meter_add_total(struct hpn_meter *m, const void *owner,
+    off_t add_bytes, u_int add_files)
+{
+	if (!meter_owned(m, owner, "total update"))
+		return;
+	if (add_bytes > 0)
+		m->total += add_bytes;
+	m->nfiles += add_files;
+}
+
+/*
+ * Replace the total outright. For the reporter's resume-check stretch,
+ * which temporarily runs the meter in the hash-byte domain and restores
+ * the transfer total afterwards; ordinary growth uses hpn_meter_add_total.
+ */
+void
+hpn_meter_retotal(struct hpn_meter *m, const void *owner, off_t total)
+{
+	if (!meter_owned(m, owner, "retotal"))
+		return;
+	m->total = total;
+}
+
+/* Replace the label. The meter owns the copy, as at start. */
+void
+hpn_meter_relabel(struct hpn_meter *m, const void *owner, const char *label)
+{
+	if (!meter_owned(m, owner, "relabel") || label == NULL)
+		return;
+	strlcpy(m->label, label, sizeof(m->label));
+}
+
+/*
+ * Stop a meter. Only the owner that started it may stop it.
  */
 void
 hpn_meter_stop(struct hpn_meter *m, const void *owner)
 {
-	if (m == NULL || !m->active || m != current_meter)
+	if (!meter_owned(m, owner, "stop"))
 		return;
-	if (owner != m->owner) {
-		error_f("stop for \"%s\" from a non-owner ignored", m->label);
-		return;
-	}
 	/*
 	 * The display session needs two positions: the last painted one to
 	 * decide whether a final repaint is owed (a completed transfer's
@@ -169,9 +235,20 @@ hpn_meter_refresh_current(int force_update)
 	struct meter_view v;
 	off_t transferred, bytes_left, delta_pos;
 	double now, elapsed, cur_speed;
+	int total_unknown;
 
 	if (m == NULL)
 		return;
+
+	/* A source with its own fill (the relay) supplies the whole view;
+	 * the counter math below is the builtin fill. */
+	if (m->fill != NULL) {
+		struct meter_view v;
+
+		m->fill(m, &v);
+		pm_dispatch_view(&v, force_update);
+		return;
+	}
 
 	transferred = *m->ctr - (m->cur_pos ? m->cur_pos : m->start_pos);
 	m->cur_pos = *m->ctr;
@@ -182,7 +259,12 @@ hpn_meter_refresh_current(int force_update)
 	if (delta_pos > m->max_delta)
 		m->max_delta = delta_pos;
 
-	if (bytes_left > 0)
+	/* An AGGREGATE meter with no total yet is a rate-only meter, not a
+	 * completed one: its denominator arrives mid-flight when the
+	 * enumeration drains. Every other kind reads a zero total as an
+	 * empty transfer, complete on its first sample. */
+	total_unknown = (m->kind == HPN_METER_AGGREGATE && m->total == 0);
+	if (bytes_left > 0 || total_unknown)
 		elapsed = now - m->last_t;
 	else {
 		/* Complete: report the true whole-transfer average. A FILE
@@ -215,20 +297,228 @@ hpn_meter_refresh_current(int force_update)
 	v.label = m->label;
 	v.cur = m->cur_pos;
 	v.total = m->total;
-	if (m->total == 0 || m->cur_pos >= m->total)
+	if (total_unknown)
+		v.percent = 0;
+	else if (m->total == 0 || m->cur_pos >= m->total)
 		v.percent = 100;
 	else
 		v.percent = (int)((float)m->cur_pos / m->total * 100);
 	v.rate = (long long)m->rate_ema;
-	v.inst = bytes_left > 0 ? delta_pos : m->max_delta;
+	v.inst = (bytes_left > 0 || total_unknown) ? delta_pos : m->max_delta;
 	v.delta = delta_pos;
 	v.elapsed = elapsed;
 	v.eta_sec = (bytes_left > 0 && m->rate_ema > 0) ?
 	    (uint32_t)(bytes_left / m->rate_ema) : HPNS_ETA_UNKNOWN;
 	v.stalled = m->stalled >= HPN_METER_STALL_SEC;
-	v.done = bytes_left <= 0;
+	v.done = !total_unknown && bytes_left <= 0;
 	v.elapsed_sec = (long)elapsed;
 
 	pm_dispatch_view(&v, force_update);
 	m->last_pos = m->cur_pos;
+}
+
+/* ---- relay source ----------------------------------------------------- */
+
+/*
+ * HPN status relay, consumer side: render remote telemetry verbatim.
+ * Everything painted comes from the last PROGRESS frame - no rate, delta,
+ * or ETA is ever derived locally, because the counter would advance only
+ * when a ~1 Hz frame lands and sampling that against the local clock
+ * aliases (alternating 0 and 2x-link-speed readings).  Opt-in: only the
+ * frame consumers (scp -R, hpn3scp) enter this mode; local meters never
+ * touch it and their math path is unchanged.
+ */
+static struct {
+	uint64_t bytes_done;
+	uint64_t bytes_total;
+	uint64_t rate;		/* source-smoothed */
+	uint64_t rate_inst;	/* source last-interval */
+	uint64_t rate_inst_max;	/* peak inst within the current phase */
+	uint64_t rate_inst_peak_xfer;	/* transfer-phase peak, latched at the
+					 * verify transition: the completion
+					 * line summarizes the TRANSFER, and a
+					 * verify-phase hash peak (legitimately
+					 * above link speed) would read as an
+					 * impossible network rate there */
+	uint32_t eta_sec;
+	int	 verifying;	/* HPNS_F_VERIFY seen: label the phase */
+	int	 resuming;	/* HPNS_F_RESUME live: label the phase */
+	int	 done;		/* END received: paint the 100% line */
+	double	 last_frame;	/* monotime of the last sample (stall aging) */
+	double	 started;
+} relay;
+static off_t relay_ctr;		/* the core requires a counter; the
+				 * relay fill never reads it */
+static struct hpn_meter relay_meter;	/* core-owned, like serial_meter */
+
+/*
+ * Fill a view from the stored remote telemetry. Ported from the old
+ * relay_render; the only changes are the label coming from the meter's
+ * owned copy instead of the borrowed file global, and the view being
+ * returned for the shared dispatch instead of rendered directly, which
+ * also puts relay views into the HPN_PM_DEBUG capture for the first time.
+ */
+/*
+ * Relay-mode paint: everything shown comes from the stored frame
+ * telemetry.  The only local inputs are wall-clock ages: total elapsed
+ * for the completion line and the last-frame age for stall detection
+ * (a dead source must not keep displaying its final healthy rate).
+ */
+static void
+relay_fill(struct hpn_meter *m, struct meter_view *view)
+{
+	char vlabel[512];
+	const char *label = m->label;
+	double now = monotime_double();
+	struct meter_view v;
+	int silent = now - relay.last_frame >= HPN_METER_STALL_SEC;
+
+	memset(&v, 0, sizeof(v));
+
+	/* PREFIX the phase tag: the label field truncates at the right edge
+	 * (win_size - 45), so a suffix vanishes on narrow terminals.  The
+	 * resume check precedes transfer; verify follows it - mutually
+	 * exclusive in practice, resume checked first. */
+	if (relay.resuming && label != NULL) {
+		snprintf(vlabel, sizeof(vlabel), "resume check: %s", label);
+		label = vlabel;
+	} else if (relay.verifying && label != NULL) {
+		snprintf(vlabel, sizeof(vlabel), "verify: %s", label);
+		label = vlabel;
+	}
+
+	v.label = label;
+	v.cur = (off_t)relay.bytes_done;
+	v.total = (off_t)relay.bytes_total;
+	v.eta_sec = relay.eta_sec;
+	v.done = relay.done;
+	v.stalled = !relay.done && silent;
+	v.elapsed_sec = (long)(now - relay.started);
+	/* Relay policy: an unknown (0) total reads 0% - do not claim 100%
+	 * before the source has reported a size. */
+	if (relay.done || (relay.bytes_total > 0 &&
+	    relay.bytes_done >= relay.bytes_total))
+		v.percent = 100;
+	else if (relay.bytes_total > 0)
+		v.percent = (int)(relay.bytes_done * 100 / relay.bytes_total);
+	else
+		v.percent = 0;
+
+	/*
+	 * Source-specific display choices live in the fill, not the shared
+	 * renderer.  A silent source: blank the rate/inst - its last value is
+	 * stale (a dead source must not keep showing a healthy rate).  On
+	 * completion: show the TRANSFER-phase peak inst (a verify-phase hash
+	 * peak is not a network rate).  The relay never derives rate/eta
+	 * locally; both ride in the frame (see the relay struct comment).
+	 */
+	if (relay.done)
+		v.inst = (off_t)(relay.rate_inst_peak_xfer > 0 ?
+		    relay.rate_inst_peak_xfer : relay.rate_inst_max);
+	else if (silent)
+		v.inst = 0;
+	else
+		v.inst = (off_t)relay.rate_inst;
+	v.rate = (silent && !relay.done) ? 0 : (long long)relay.rate;
+
+	*view = v;
+}
+
+
+/*
+ * Start the relay meter. Differs from the counter sources on purpose: no
+ * initial paint (nothing has arrived to paint until the first frame) and
+ * the placeholder counter exists only to satisfy the core.
+ */
+void
+hpn_meter_relay_start(const char *label)
+{
+	relay_ctr = 0;
+	if (meter_init(&relay_meter, &relay_meter, HPN_METER_AGGREGATE,
+	    HPN_METER_DOM_TRANSFER, label, 0, &relay_ctr, 0) != 0)
+		return;
+	relay_meter.fill = relay_fill;
+	memset(&relay, 0, sizeof(relay));
+	relay.started = relay.last_frame = monotime_double();
+	pm_display_begin_relay();
+}
+
+/* Store one PROGRESS frame's telemetry and repaint (alarm-gated). */
+void
+hpn_meter_relay_sample(const struct hpns_progress *p)
+{
+	if (current_meter != &relay_meter)
+		return;
+	if ((p->flags & HPNS_F_RESUME) && !relay.resuming)
+		relay.resuming = 1;
+	else if (relay.resuming && !(p->flags & HPNS_F_RESUME)) {
+		/* resume check over, transfer begins: drop the hash peaks
+		 * so the completion line reflects transfer rates only */
+		relay.resuming = 0;
+		relay.rate_inst_max = 0;
+	}
+	if ((p->flags & HPNS_F_VERIFY) && !relay.verifying) {
+		relay.verifying = 1;
+		/* latch the transfer peak for the completion line, then
+		 * track the verify phase's own peak separately */
+		relay.rate_inst_peak_xfer = relay.rate_inst_max;
+		relay.rate_inst_max = 0;
+	}
+	relay.bytes_done = p->bytes_done;
+	if (p->bytes_total > 0)
+		relay.bytes_total = p->bytes_total;
+	relay.rate = p->rate_bps;
+	relay.rate_inst = p->rate_inst_bps;
+	if (p->rate_inst_bps > relay.rate_inst_max)
+		relay.rate_inst_max = p->rate_inst_bps;
+	relay.eta_sec = p->eta_sec;
+	relay.last_frame = monotime_double();
+	refresh_progress_meter(0);
+}
+
+
+/*
+ * END received: force the completion line (100%, total elapsed, peak
+ * instantaneous rate).  The caller still calls stop_progress_meter()
+ * for the trailing newline.
+ */
+void
+hpn_meter_relay_end(u_int64_t bytes_done)
+{
+	double dur;
+
+	if (current_meter != &relay_meter)
+		return;
+	relay.bytes_done = bytes_done;
+	if (bytes_done > relay.bytes_total)
+		relay.bytes_total = bytes_done;
+	relay.done = 1;
+	/* Phases are over at END: the completion line summarizes the
+	 * transfer and must not carry a "verify:"/"resume check:" prefix. */
+	relay.verifying = 0;
+	relay.resuming = 0;
+	/* Whole-run average for the completion line, matching the local
+	 * meter.  Computed over the full local duration, so per-tick frame
+	 * quantization cannot alias it. */
+	dur = monotime_double() - relay.started;
+	relay.rate = dur >= 0.001 ? (uint64_t)(bytes_done / dur) : 0;
+	relay.rate_inst = 0;
+	relay.last_frame = monotime_double();
+	refresh_progress_meter(1);
+}
+
+
+/*
+ * Close the relay meter. The completion line, if any, was painted by
+ * hpn_meter_relay_end; a close without an end (a garbled stream) paints
+ * nothing, so a broken source never shows a fake completion.
+ */
+void
+hpn_meter_relay_stop(void)
+{
+	if (current_meter != &relay_meter)
+		return;
+	pm_display_end_relay();
+	current_meter = NULL;
+	relay_meter.active = 0;
 }

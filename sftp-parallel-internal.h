@@ -36,6 +36,7 @@
 
 #include "sftp-parallel.h"	/* struct sftp_parallel_config (embedded) */
 #include "sftp-hpn-bundle.h"	/* shared bundle-eligibility policy */
+#include "hpn-meter.h"	/* fleet display meter object */
 
 struct sftp_conn;
 struct sftp_workqueue;
@@ -1467,9 +1468,17 @@ struct sftp_parallel {
 								   * started; delta
 								   * gives this-xfer */
 	off_t                       aggregate_progress_counter; /* meter ctr */
-	char                        progress_label[128];        /* stable storage
-								   * for the meter
-								   * label string */
+	/*
+	 * The fleet display meter (hpn-meter core). The reporter is the ONLY
+	 * thread that updates it after start. A walker with a drained
+	 * enumeration posts into the accumulators below (atomic adds) and
+	 * the reporter folds them into the meter on its next tick, so no
+	 * display state is ever written off the reporter thread (review
+	 * finding #19).
+	 */
+	struct hpn_meter            meter;
+	off_t                       posted_total_add;  /* walker -> reporter */
+	u_int                       posted_files_add;  /* walker -> reporter */
 	/* Resume-check stretch (HPN -Z UX): before any transfer byte moves,
 	 * workers may be hashing existing partials (chunked resume).  The
 	 * reporter detects fresh hash-op markers on the worker conns, swaps

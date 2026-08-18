@@ -42,6 +42,7 @@
 #include "misc.h"
 #include "pathnames.h"
 #include "progressmeter.h"
+#include "hpn-meter.h"	/* relay meter source */
 #include "xmalloc.h"
 #include "hpn3scp.h"
 #include "hpn3scp-hostkey.h"
@@ -247,10 +248,10 @@ ev_progress(const struct hpns_progress *p, void *ctx)
 	(void)ctx;
 	if (proto_human()) {
 		if (!meter.on) {
-			pm_relay_start(meter.label);
+			hpn_meter_relay_start(meter.label);
 			meter.on = 1;
 		}
-		pm_relay_sample(p);
+		hpn_meter_relay_sample(p);
 		return;
 	}
 	proto_emit_progress(p);
@@ -267,7 +268,7 @@ ev_end(const struct hpns_end *e, void *ctx)
 	endinfo.got = 1;
 	if (proto_human()) {
 		if (meter.on)
-			pm_relay_end(e->bytes_done);
+			hpn_meter_relay_end(e->bytes_done);
 		return;
 	}
 	/* synthesize the final 100% snapshot; phases are over by END and
@@ -320,7 +321,7 @@ ev_degrade(void *ctx)
 {
 	(void)ctx;
 	if (meter.on) {
-		stop_progress_meter();
+		hpn_meter_relay_stop();
 		meter.on = 0;
 	}
 	proto_emit_warning("source is not sending status; the transfer "
@@ -438,7 +439,7 @@ do_launch(struct launch_session *s)
 	freeargs(&a);
 	if (meter.on) {
 		refresh_progress_meter(1);
-		stop_progress_meter();
+		hpn_meter_relay_stop();
 		meter.on = 0;
 	}
 	return r;

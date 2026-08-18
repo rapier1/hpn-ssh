@@ -345,11 +345,11 @@ scp_meter_progress(const struct hpns_progress *p, void *ctx)
 	struct scp_meter *m = ctx;
 
 	if (!m->meter_on && showprogress) {
-		pm_relay_start(m->label);
+		hpn_meter_relay_start(m->label);
 		m->meter_on = 1;
 	}
 	if (m->meter_on)
-		pm_relay_sample(p);
+		hpn_meter_relay_sample(p);
 }
 
 static void
@@ -358,7 +358,7 @@ scp_meter_end(const struct hpns_end *e, void *ctx)
 	struct scp_meter *m = ctx;
 
 	if (m->meter_on)
-		pm_relay_end(e->bytes_done);
+		hpn_meter_relay_end(e->bytes_done);
 }
 
 static void
@@ -376,7 +376,7 @@ scp_meter_degrade(void *ctx)
 	struct scp_meter *m = ctx;
 
 	if (m->meter_on) {
-		stop_progress_meter();
+		hpn_meter_relay_stop();
 		m->meter_on = 0;
 	}
 	error("remote status stream garbled; continuing without progress "
@@ -438,7 +438,7 @@ do_local_cmd_status(arglist *a, const char *label)
 
 	if (m.meter_on) {
 		refresh_progress_meter(1);
-		stop_progress_meter();
+		hpn_meter_relay_stop();
 	}
 	return (r);
 }

@@ -790,9 +790,8 @@ resume_stretch_restore(struct sftp_parallel *p)
 	if (!p->resume_stretch_on)
 		return;
 	p->resume_stretch_on = 0;
-	strlcpy(p->progress_label, p->progress_label_saved,
-	    sizeof(p->progress_label));
-	pm_set_total(p->progress_total_bytes);
+	hpn_meter_relabel(&p->meter, p, p->progress_label_saved);
+	hpn_meter_retotal(&p->meter, p, p->progress_total_bytes);
 	p->aggregate_progress_counter = 0;
 	hpn_pm_set_phase(HPNS_F_RESUME, 0);
 }
@@ -930,14 +929,23 @@ parallel_reporter_thread(void *arg)
 			if (rtotal > 0) {
 				if (!p->resume_stretch_on) {
 					p->resume_stretch_on = 1;
-					strlcpy(p->progress_label,
-					    "resume check",
-					    sizeof(p->progress_label));
+					/* Save the transfer meter's label
+					 * and total for the restore; the
+					 * reporter owns the meter, so
+					 * reading them here is safe. */
+					strlcpy(p->progress_label_saved,
+					    p->meter.label,
+					    sizeof(p->progress_label_saved));
+					p->progress_total_bytes =
+					    p->meter.total;
+					hpn_meter_relabel(&p->meter, p,
+					    "resume check");
 					p->aggregate_progress_counter = 0;
 					hpn_pm_set_phase(
 					    HPNS_F_RESUME, 1);
 				}
-				pm_set_total((off_t)rtotal);
+				hpn_meter_retotal(&p->meter, p,
+				    (off_t)rtotal);
 				if (rdone > rtotal)
 					rdone = rtotal;
 				newpos = (off_t)rdone;
@@ -999,6 +1007,36 @@ parallel_reporter_thread(void *arg)
 			        __ATOMIC_RELAXED));
 		}
 
+		/*
+		 * Fold in what a walker posted (the total and file count
+		 * from a drained enumeration). The reporter is the only
+		 * thread that updates the meter; walkers only accumulate
+		 * into the posted fields. Held while the resume-check
+		 * stretch has the meter, so a post never lands in the
+		 * stretch's hash-byte total.
+		 */
+		if (p->progress_meter_started && !p->resume_stretch_on) {
+			off_t addb = __atomic_exchange_n(
+			    &p->posted_total_add, 0, __ATOMIC_RELAXED);
+			u_int addf = __atomic_exchange_n(
+			    &p->posted_files_add, 0, __ATOMIC_RELAXED);
+
+			if (addb > 0 || addf > 0) {
+				hpn_meter_add_total(&p->meter, p, addb, addf);
+				if (p->progress_verb[0] != '\0' &&
+				    p->meter.nfiles > 0) {
+					char lbl[HPN_METER_LABEL_MAX];
+
+					snprintf(lbl, sizeof(lbl),
+					    "%s %u %s in parallel",
+					    p->progress_verb,
+					    p->meter.nfiles,
+					    p->meter.nfiles == 1 ?
+					    "file" : "files");
+					hpn_meter_relabel(&p->meter, p, lbl);
+				}
+			}
+		}
 		if (p->progress_meter_started)
 			refresh_progress_meter(0);
 

@@ -38,6 +38,9 @@
 
 #include <sys/types.h>
 
+struct meter_view;
+struct hpns_progress;
+
 /*
  * What a meter measures. Declared at start, never after: the old API let a
  * caller mark a running meter "not a file" once it was already live, and
@@ -80,6 +83,13 @@ struct hpn_meter {
 	u_int	nfiles;		/* how many files this meter represents */
 	const void *owner;	/* opaque token; updates and stop must match */
 
+	/*
+	 * Source-specific view fill; NULL runs the builtin counter fill.
+	 * Set inside the meter unit by sources whose view does not derive
+	 * from a local counter (the relay).
+	 */
+	void	(*fill)(struct hpn_meter *m, struct meter_view *v);
+
 	/* Sample state, written by the fill between start and stop. */
 	off_t	start_pos, cur_pos, last_pos, max_delta;
 	double	start_t, last_t;
@@ -99,6 +109,28 @@ int	hpn_meter_start(struct hpn_meter *m, const void *owner,
 	    enum hpn_meter_kind kind, enum hpn_meter_domain domain,
 	    const char *label, off_t total, off_t *ctr, u_int nfiles);
 void	hpn_meter_stop(struct hpn_meter *m, const void *owner);
+
+/* Owner-checked updates, display-thread only (the reporter for the fleet
+ * meter): grow the total additively, replace it (resume-check stretch),
+ * or replace the owned label. */
+void	hpn_meter_add_total(struct hpn_meter *m, const void *owner,
+	    off_t add_bytes, u_int add_files);
+void	hpn_meter_retotal(struct hpn_meter *m, const void *owner, off_t total);
+void	hpn_meter_relabel(struct hpn_meter *m, const void *owner,
+	    const char *label);
+
+/*
+ * Relay source: a meter over hpns_progress frames from a remote transfer
+ * (scp -R and hpn3scp consume these). No local counter exists; rate and
+ * ETA ride in the frames because deriving them from ~1 Hz frame arrival
+ * against the local clock aliases. Start arms the display without an
+ * initial paint (nothing has arrived to paint), end paints the completion
+ * line, and stop closes the display session.
+ */
+void	hpn_meter_relay_start(const char *label);
+void	hpn_meter_relay_sample(const struct hpns_progress *p);
+void	hpn_meter_relay_end(u_int64_t bytes_done);
+void	hpn_meter_relay_stop(void);
 
 /* Display routing used by progressmeter.c: is a core meter current, and
  * fill-and-dispatch it on the shared refresh cadence. */
