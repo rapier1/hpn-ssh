@@ -65,6 +65,22 @@ hpn_meter_display_active(void)
 }
 
 /*
+ * True when the calling thread may run the current meter's fill. Checked
+ * by refresh_progress_meter BEFORE it consumes the alarm flag: a bound
+ * meter's tick must be left for the owning thread, not eaten by whichever
+ * worker's receive path called refresh first and then returned without
+ * painting.
+ */
+int
+hpn_meter_display_thread_ok(void)
+{
+	struct hpn_meter *m = current_meter;
+
+	return m == NULL || !m->display_bound ||
+	    pthread_equal(pthread_self(), m->display_tid);
+}
+
+/*
  * Start a meter. The kind, domain, and file count are fixed here for the
  * meter's whole life. The label is copied, not borrowed. Returns -1 and
  * starts nothing if a meter is already current, which no legal caller
@@ -193,6 +209,23 @@ hpn_meter_retotal(struct hpn_meter *m, const void *owner, off_t total)
 	m->total = total;
 }
 
+/*
+ * Restrict the fill to one thread. Every thread that drives refresh
+ * reaches the fill, and for the fleet meter that includes workers on each
+ * received message and the walker on the control connection; their fills
+ * would race the reporter's updates, which ThreadSanitizer confirmed.
+ * Binding makes their refresh calls no-ops for this meter, so the
+ * reporter's alarm-gated tick is the only sampler.
+ */
+void
+hpn_meter_bind_display(struct hpn_meter *m, const void *owner, pthread_t tid)
+{
+	if (!meter_owned(m, owner, "display bind"))
+		return;
+	m->display_tid = tid;
+	m->display_bound = 1;
+}
+
 /* Replace the label. The meter owns the copy, as at start. */
 void
 hpn_meter_relabel(struct hpn_meter *m, const void *owner, const char *label)
@@ -238,6 +271,9 @@ hpn_meter_refresh_current(int force_update)
 	int total_unknown;
 
 	if (m == NULL)
+		return;
+	if (m->display_bound &&
+	    !pthread_equal(pthread_self(), m->display_tid))
 		return;
 
 	/* A source with its own fill (the relay) supplies the whole view;

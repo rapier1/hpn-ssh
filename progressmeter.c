@@ -286,10 +286,13 @@ void
 refresh_progress_meter(int force_update)
 {
 	if (!hpn_meter_display_active() ||
-	    (!force_update && !alarm_fired && !win_resized) ||
+	    !hpn_meter_display_thread_ok() ||
+	    (!force_update &&
+	    !__atomic_load_n(&alarm_fired, __ATOMIC_RELAXED) &&
+	    !win_resized) ||
 	    (!hpn_pm_active() && !can_output() && pm_debug_fp == NULL))
 		return;
-	alarm_fired = 0;
+	__atomic_store_n(&alarm_fired, 0, __ATOMIC_RELAXED);
 
 	if (win_resized) {
 		if (!hpn_pm_active())
@@ -344,8 +347,15 @@ meter_log_exit(void)
 static void
 sig_alarm(int ignore)
 {
-	alarm_fired = 1;
+	int save_errno = errno;
+
+	/* Relaxed atomic store: the flag is read and cleared by whichever
+	 * thread drives refresh, not only the one this signal landed on.
+	 * alarm() can clobber errno, so restore it; a handler that spoils
+	 * errno corrupts whatever syscall it interrupted. */
+	__atomic_store_n(&alarm_fired, 1, __ATOMIC_RELAXED);
 	alarm(UPDATE_INTERVAL);
+	errno = save_errno;
 }
 
 /*

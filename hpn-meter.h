@@ -38,6 +38,8 @@
 
 #include <sys/types.h>
 
+#include <pthread.h>
+
 struct meter_view;
 struct hpns_progress;
 
@@ -90,6 +92,17 @@ struct hpn_meter {
 	 */
 	void	(*fill)(struct hpn_meter *m, struct meter_view *v);
 
+	/*
+	 * When bound, only this thread may run the fill: the fleet meter is
+	 * sampled by every thread that drives refresh (workers per received
+	 * message, the walker on the control connection, the alarm), and an
+	 * unbound fill from any of them would race the reporter's updates on
+	 * this struct. Serial meters stay unbound; their fill runs on the
+	 * one thread that owns the transfer.
+	 */
+	int	display_bound;
+	pthread_t display_tid;
+
 	/* Sample state, written by the fill between start and stop. */
 	off_t	start_pos, cur_pos, last_pos, max_delta;
 	double	start_t, last_t;
@@ -118,6 +131,9 @@ void	hpn_meter_add_total(struct hpn_meter *m, const void *owner,
 void	hpn_meter_retotal(struct hpn_meter *m, const void *owner, off_t total);
 void	hpn_meter_relabel(struct hpn_meter *m, const void *owner,
 	    const char *label);
+/* Restrict the fill to one thread (the reporter, for the fleet meter). */
+void	hpn_meter_bind_display(struct hpn_meter *m, const void *owner,
+	    pthread_t tid);
 
 /*
  * Relay source: a meter over hpns_progress frames from a remote transfer
@@ -135,6 +151,7 @@ void	hpn_meter_relay_stop(void);
 /* Display routing used by progressmeter.c: is a core meter current, and
  * fill-and-dispatch it on the shared refresh cadence. */
 int	hpn_meter_display_active(void);
+int	hpn_meter_display_thread_ok(void);
 void	hpn_meter_refresh_current(int force_update);
 
 #endif /* HPN_METER_H */

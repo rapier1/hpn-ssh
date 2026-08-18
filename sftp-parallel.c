@@ -593,6 +593,8 @@ sftp_parallel_wait(struct sftp_parallel *p)
 				    HPN_METER_WORK, HPN_METER_DOM_WORK,
 				    "verify", 2 * vtotal,
 				    &p->aggregate_progress_counter, 0);
+				hpn_meter_bind_display(&p->meter, p,
+				    p->reporter_tid);
 				/* verify_phase_active BEFORE meter_started: a
 				 * reporter tick between the two would take the
 				 * transfer branch against the verify meter's
@@ -1080,6 +1082,7 @@ sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
 	hpn_meter_start(&p->meter, p, HPN_METER_AGGREGATE,
 	    HPN_METER_DOM_TRANSFER, label, total_bytes,
 	    &p->aggregate_progress_counter, 0);
+	hpn_meter_bind_display(&p->meter, p, p->reporter_tid);
 	p->progress_meter_started = 1;
 	p->progress_verb[0] = '\0';	/* no deferred file count unless the
 					 * caller re-arms it via _start_counted */
