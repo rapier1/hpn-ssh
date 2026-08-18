@@ -706,9 +706,16 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 			if (u->size > 0)
 				__atomic_fetch_add(&p->queued_bytes,
 				    (uint64_t)u->size, __ATOMIC_RELAXED);
-			parallel_unit_pending_trace("REQUEUE", p, u, w->id,
-			    yielded ? "wpr/yield" :
-			    transient ? "wpr/transient" : "wpr/retry");
+			{
+				uint64_t v;
+
+				pthread_mutex_lock(&p->pending_mu);
+				v = p->pending;
+				pthread_mutex_unlock(&p->pending_mu);
+				parallel_unit_pending_trace("REQUEUE", v, u,
+				    w->id, yielded ? "wpr/yield" :
+				    transient ? "wpr/transient" : "wpr/retry");
+			}
 			/* Yields jump the queue like transients: the parked
 			 * READY fleet should pick the remainder up NOW.  Non-
 			 * blocking: a worker must never block on a full queue it
@@ -772,8 +779,15 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 		if (u->size > 0)
 			__atomic_fetch_add(&p->queued_bytes,
 			    (uint64_t)u->size, __ATOMIC_RELAXED);
-		parallel_unit_pending_trace("REQUEUE", p, u, w->id,
-		    transient ? "batch/transient" : "batch/retry");
+		{
+			uint64_t v;
+
+			pthread_mutex_lock(&p->pending_mu);
+			v = p->pending;
+			pthread_mutex_unlock(&p->pending_mu);
+			parallel_unit_pending_trace("REQUEUE", v, u, w->id,
+			    transient ? "batch/transient" : "batch/retry");
+		}
 		/* Non-blocking: a failed bundle re-queues all its members here,
 		 * and a blocking push on a full queue the sole consumer also
 		 * drains is the -j1 self-deadlock this whole path exists to

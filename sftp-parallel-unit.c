@@ -860,16 +860,19 @@ parallel_unit_max_retries(struct sftp_parallel *p)
 
 /* Pending-counter lifecycle trace at -vvv: one line per inc/dec so a leak (a
  * unit incremented but never decremented -> a hang at teardown) can be paired
- * and traced.  debug3 self-gates, so callers invoke it unconditionally. */
+ * and traced.  debug3 self-gates, so callers invoke it unconditionally.
+ * The count is passed in, captured by the caller under pending_mu, so the
+ * traced value is the ledger at the traced operation rather than whatever
+ * an unlocked read raced to. */
 void
-parallel_unit_pending_trace(const char *action, struct sftp_parallel *p,
+parallel_unit_pending_trace(const char *action, uint64_t pending,
     const struct sftp_work_unit *u, int worker_id, const char *site)
 {
 	const char *src = (u && u->src_path) ? u->src_path : "(null)";
 	const char *dst = (u && u->dst_path) ? u->dst_path : "(null)";
 	int op = u ? (int)u->op : -1;
 	debug3_f("PTRACE %s pending=%llu op=%d u=%p w=%d site=%s src=%s dst=%s",
-	    action, (unsigned long long)p->pending, op, (const void *)u,
+	    action, (unsigned long long)pending, op, (const void *)u,
 	    worker_id, site, src, dst);
 }
 
@@ -917,8 +920,15 @@ void
 parallel_unit_pending_dec_traced(struct sftp_parallel *p, const struct sftp_work_unit *u,
     int worker_id, const char *site)
 {
-	parallel_unit_pending_trace("DEC", p, u, worker_id, site);
-	parallel_unit_pending_dec(p);
+	uint64_t v;
+
+	pthread_mutex_lock(&p->pending_mu);
+	v = p->pending;
+	pending_dec_locked(p);
+	pthread_mutex_unlock(&p->pending_mu);
+	/* Pre-decrement, matching the INC sites' post-increment: both ends
+	 * of a pair print the same level. */
+	parallel_unit_pending_trace("DEC", v, u, worker_id, site);
 }
 
 /*
@@ -951,10 +961,12 @@ static void
 parallel_bundle_member_pushfail(struct sftp_parallel *p,
     struct sftp_work_unit *u)
 {
+	uint64_t v;
 	pthread_mutex_lock(&p->pending_mu);
+	v = p->pending;
 	pending_dec_locked(p);
 	pthread_mutex_unlock(&p->pending_mu);
-	parallel_unit_pending_trace("DEC_PUSHFAIL", p, u, -1, "bundle/pushfail");
+	parallel_unit_pending_trace("DEC_PUSHFAIL", v, u, -1, "bundle/pushfail");
 	if (u->size > 0)
 		__atomic_fetch_sub(&p->queued_bytes, (uint64_t)u->size,
 		    __ATOMIC_RELAXED);
@@ -1016,14 +1028,16 @@ parallel_bundle_flush_locked(struct sftp_parallel *p)
 static int
 parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
 {
+	uint64_t v;
 	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
 	uint64_t target = (p->cfg.bundle_size > 0)
 	    ? p->cfg.bundle_size : BUNDLE_TARGET_BYTES_DEFAULT;
 
 	pthread_mutex_lock(&p->pending_mu);
 	p->pending++;
+	v = p->pending;
 	pthread_mutex_unlock(&p->pending_mu);
-	parallel_unit_pending_trace("INC", p, u, -1, "bundle-add");
+	parallel_unit_pending_trace("INC", v, u, -1, "bundle-add");
 	if (add_bytes)
 		__atomic_fetch_add(&p->queued_bytes, add_bytes,
 		    __ATOMIC_RELAXED);
@@ -1074,6 +1088,7 @@ parallel_bundle_flush_pending(struct sftp_parallel *p)
 int
 parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 {
+	uint64_t v;
 	if (p == NULL || p->stopped || p->abort_flag) {
 		parallel_unit_free(u);
 		return -1;
@@ -1105,16 +1120,18 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
 	pthread_mutex_lock(&p->pending_mu);
 	p->pending++;
+	v = p->pending;
 	pthread_mutex_unlock(&p->pending_mu);
-	parallel_unit_pending_trace("INC", p, u, -1, "submit");
+	parallel_unit_pending_trace("INC", v, u, -1, "submit");
 	if (add_bytes)
 		__atomic_fetch_add(&p->queued_bytes, add_bytes,
 		    __ATOMIC_RELAXED);
 	if (sftp_workqueue_push(p->q, u) != 0) {
 		pthread_mutex_lock(&p->pending_mu);
+		v = p->pending;
 		pending_dec_locked(p);
 		pthread_mutex_unlock(&p->pending_mu);
-		parallel_unit_pending_trace("DEC_PUSHFAIL", p, u, -1,
+		parallel_unit_pending_trace("DEC_PUSHFAIL", v, u, -1,
 		    "submit/pushfail");
 		if (add_bytes)
 			__atomic_fetch_sub(&p->queued_bytes, add_bytes,

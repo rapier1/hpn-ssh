@@ -1624,8 +1624,8 @@ int	 parallel_unit_tracker_finalize_n(struct sftp_range_tracker *, int,
 int	 parallel_unit_writer_acquire(struct sftp_range_tracker *);
 void	 parallel_unit_writer_release(struct sftp_range_tracker *);
 int	 parallel_unit_max_retries(struct sftp_parallel *);
-void	 parallel_unit_pending_trace(const char *, struct sftp_parallel *,
-	    const struct sftp_work_unit *, int, const char *);
+void	 parallel_unit_pending_trace(const char *, uint64_t,
+    const struct sftp_work_unit *, int, const char *);
 int	 parallel_unit_submit(struct sftp_parallel *, struct sftp_work_unit *);
 /* Worker-context re-queue: non-blocking.  Tries p->q (front when front!=0);
  * on a full queue parks the unit on the retry-overflow list rather than
