@@ -2016,10 +2016,11 @@ resume_check_meter_begin(struct sftp_conn *conn, off_t total)
 	if (!showprogress || total <= 0)
 		return;
 	resume_meter_ctr = 0;
-	start_progress_meter("resume check", total,
-	    (off_t *)&resume_meter_ctr);
-	hpn_pm_meter_not_a_file();	/* not a file */
-	hpn_pm_set_phase(HPNS_F_RESUME, 1);	/* phase flag */
+	/* WORK kind in the hash-byte domain: the core marks it not a file
+	 * and raises the resume phase flag for the frame stream. */
+	hpn_meter_start(hpn_meter_serial(), conn, HPN_METER_WORK,
+	    HPN_METER_DOM_HASH, "resume check", total,
+	    (off_t *)&resume_meter_ctr, 0);
 	sftp_conn_set_hash_meter_ctr(conn, &resume_meter_ctr);
 	resume_meter_on = 1;
 }
@@ -2030,7 +2031,7 @@ resume_check_meter_end(struct sftp_conn *conn)
 	if (!resume_meter_on)
 		return;
 	sftp_conn_set_hash_meter_ctr(conn, NULL);
-	stop_progress_meter();
+	hpn_meter_stop(hpn_meter_serial(), conn);
 	resume_meter_on = 0;
 }
 

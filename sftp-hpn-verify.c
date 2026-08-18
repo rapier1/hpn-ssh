@@ -59,6 +59,7 @@
 /* verify_run_phase (moved from sftp-client.c) drives the progress meter,
  * status frames, and the transfer log: */
 #include "progressmeter.h"
+#include "hpn-meter.h"	/* progress meter core */
 #include "hpn-status-frame.h"
 #include "sftp-hpn-transferlog.h"
 
@@ -1421,9 +1422,11 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 		total += 2 * h->verify_pending[i].size;
 	}
 	if (showprogress && total > 0) {
-		start_progress_meter("verify", total, &counter);
-		hpn_pm_meter_not_a_file();	/* not a file */
-		hpn_pm_set_phase(HPNS_F_VERIFY, 1); /* verify phase */
+		/* WORK kind in the work-byte domain (2x the moved bytes,
+		 * both ends hash): the core marks it not a file and raises
+		 * the verify phase flag for the frame stream. */
+		hpn_meter_start(hpn_meter_serial(), conn, HPN_METER_WORK,
+		    HPN_METER_DOM_WORK, "verify", total, &counter, 0);
 		/* Bridge the hash engines' per-op progress into the meter
 		 * counter so a single big file moves smoothly instead of
 		 * jumping 0->100 at completion. */
@@ -1490,7 +1493,7 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 	}
 	if (meter_on) {
 		sftp_conn_set_hash_meter_ctr(conn, NULL);
-		stop_progress_meter();
+		hpn_meter_stop(hpn_meter_serial(), conn);
 	}
 	h->verify_pending_count = 0;
 }

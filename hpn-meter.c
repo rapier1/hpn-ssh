@@ -107,6 +107,23 @@ hpn_meter_start(struct hpn_meter *m, const void *owner,
 	 * meter began, then run the display session mechanics, which end
 	 * with the initial forced paint routed back to this meter. */
 	hpn_pm_meter_start();
+	/*
+	 * The kind and domain drive the frame-side declarations the old API
+	 * left to each caller after start, which is how the bundle meter
+	 * came to be counted as one file. A WORK meter is not a file, and
+	 * its domain names the phase a frame consumer labels: hash bytes
+	 * are the resume check, and work-bytes are the verify pass. The
+	 * flag persists past stop on purpose; the next meter start clears
+	 * it, which is the existing frame timing.
+	 */
+	if (kind == HPN_METER_WORK || kind == HPN_METER_AGGREGATE)
+		hpn_pm_meter_not_a_file();
+	if (kind == HPN_METER_WORK) {
+		if (domain == HPN_METER_DOM_HASH)
+			hpn_pm_set_phase(HPNS_F_RESUME, 1);
+		else if (domain == HPN_METER_DOM_WORK)
+			hpn_pm_set_phase(HPNS_F_VERIFY, 1);
+	}
 	pm_display_begin();
 	return 0;
 }
