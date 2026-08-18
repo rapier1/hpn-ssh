@@ -43,6 +43,7 @@ int	hpn_pm_active(void);
 void	hpn_pm_set_workers(u_int, u_int);
 void	hpn_pm_set_files(u_int, u_int);
 void	hpn_pm_meter_not_a_file(void);
+void	hpn_pm_meter_files(u_int);
 void	hpn_pm_count_file(void);
 void	hpn_pm_set_phase(u_int, int);
 void	hpn_pm_filefail(u_int, const char *, size_t);

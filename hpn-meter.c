@@ -118,6 +118,8 @@ hpn_meter_start(struct hpn_meter *m, const void *owner,
 	 */
 	if (kind == HPN_METER_WORK || kind == HPN_METER_AGGREGATE)
 		hpn_pm_meter_not_a_file();
+	if (kind == HPN_METER_BUNDLE)
+		hpn_pm_meter_files(nfiles);
 	if (kind == HPN_METER_WORK) {
 		if (domain == HPN_METER_DOM_HASH)
 			hpn_pm_set_phase(HPNS_F_RESUME, 1);

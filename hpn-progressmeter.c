@@ -57,8 +57,10 @@ static off_t frames_acc_bytes;		/* bytes from completed meters */
 static u_int32_t frames_files_done;	/* completed meters (serial) */
 static u_int32_t frames_files_total;	/* external, 0 = unknown */
 static int frames_files_ext;		/* setter overrides meter counts */
-static int frame_meter_is_file = 1;	/* current meter counts as a file; the
-					 * verify meter clears it (not a file) */
+static u_int32_t frames_meter_files = 1; /* how many files the current meter
+					 * represents: 1 per-file, N for a
+					 * bundle, 0 for a non-file meter
+					 * (verify, resume check) */
 static u_int32_t frames_streams = 1;	/* effective -j for HELLO */
 static u_int16_t frames_workers_active;
 static u_int16_t frames_workers_stalled;
@@ -179,7 +181,9 @@ hpn_pm_emit_view(const struct meter_view *v, int force)
 void
 hpn_pm_meter_start(void)
 {
-	frame_meter_is_file = 1;	/* each meter is a file unless cleared */
+	frames_meter_files = 1;		/* each meter is one file unless the
+					 * kind says otherwise (see
+					 * hpn_pm_meter_files / _not_a_file) */
 	__atomic_fetch_and(&frames_flags,
 	    (u_int16_t)~(HPNS_F_VERIFY | HPNS_F_RESUME), __ATOMIC_RELAXED);
 					/* phase meters re-arm these per meter */
@@ -203,8 +207,8 @@ hpn_pm_meter_done(off_t cur_pos, off_t end_pos,
 	if (!(__atomic_load_n(&frames_flags, __ATOMIC_RELAXED) &
 	    (HPNS_F_VERIFY | HPNS_F_RESUME)))
 		frames_acc_bytes += cur_pos;
-	if (!frames_files_ext && frame_meter_is_file)
-		frames_files_done++;
+	if (!frames_files_ext)
+		frames_files_done += frames_meter_files;
 }
 
 /*
@@ -264,7 +268,18 @@ hpn_pm_set_workers(u_int active, u_int stalled)
 void
 hpn_pm_meter_not_a_file(void)
 {
-	frame_meter_is_file = 0;
+	frames_meter_files = 0;
+}
+
+/*
+ * Declare how many files the current meter represents. A serial bundle is
+ * one meter carrying N files; counting it as one meter, one file is review
+ * finding #16. Called by the meter core from the BUNDLE kind.
+ */
+void
+hpn_pm_meter_files(u_int n)
+{
+	frames_meter_files = (u_int32_t)n;
 }
 
 /*

@@ -61,6 +61,7 @@
 #include "sftp-hpn-server.h"	/* hpn-file-layout wire format + status codes */
 #include "sftp-hpn-client.h"
 #include "sftp-hpn-tree.h"	/* hpn-discover-tree fetch + record codec */
+#include "hpn-meter.h"	/* progress meter core */
 #include "sftp-hpn-bundle.h"	/* HPN_EXT_HASH_RANGE etc. wire names */
 #include "sftp-hpn-transferlog.h"	/* per-member TransferLog entries */
 #include "utf8.h"		/* mprintf */
@@ -1472,16 +1473,22 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 	/* Meter the bundle as one unit.  Bundled files never reach
 	 * sftp_download, so without this a serial bundle transfer shows no
 	 * meter at all; non-bundled files keep their own per-file meters. */
-	meter_on = showprogress && meter_total > 0;
+	/* BUNDLE kind: one meter carrying acc->n files, declared at start so
+	 * the frame stream counts every member (review finding #16). A
+	 * bundle of only zero-length files meters too: the kind renders a
+	 * zero total as complete, and its members still count. */
+	meter_on = showprogress;
 	if (meter_on) {
 		snprintf(meter_label, sizeof(meter_label), "%d files", acc->n);
-		start_progress_meter(meter_label, meter_total, &meter_ctr);
+		hpn_meter_start(hpn_meter_serial(), acc, HPN_METER_BUNDLE,
+		    HPN_METER_DOM_TRANSFER, meter_label, meter_total,
+		    &meter_ctr, (u_int)acc->n);
 	}
 	rc = sftp_hpn_bundle_download(conn, entries, acc->n,
 	    preserve_flag, sftp_conn_hpn(conn)->bundle_cfg.writer_pool,
 	    fsync_flag, meter_on ? &meter_ctr : NULL);
 	if (meter_on)
-		stop_progress_meter();
+		hpn_meter_stop(hpn_meter_serial(), acc);
 	switch (rc) {
 	case SFTP_HPN_BUNDLE_OK:
 		for (i = 0; i < acc->n; i++) {
