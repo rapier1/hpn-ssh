@@ -36,6 +36,13 @@ void	refresh_progress_meter(int);
 void	stop_progress_meter(void);
 void	pm_set_total(off_t);
 
+/* Sink dispatch and display session mechanics, exported for the hpn-meter
+ * core (hpn-meter.c): the core owns meter state and the fill, this file
+ * owns the alarm, the TTY, the log guard, and the sinks. */
+void	pm_dispatch_view(const struct meter_view *, int);
+void	pm_display_begin(void);
+void	pm_display_end(off_t, off_t, off_t, double);
+
 /* HPN status relay, consumer side: meter rendered from remote telemetry
  * only (no local rate/ETA derivation - frame arrival timing aliases). */
 void	pm_relay_start(const char *);

@@ -55,7 +55,8 @@
 #include "sftp-client.h"
 #include "sftp-hpn-client.h" /* HPN */
 #include "sftp-hpn-server.h" /* hpn-check-file + heartbeat protocol constants */
-#include "sftp-hpn-tree.h" /* hpn-discover-tree extension name */
+#include "sftp-hpn-tree.h"
+#include "hpn-meter.h"	/* progress meter core */ /* hpn-discover-tree extension name */
 #include "sftp-hpn-transferlog.h"
 #include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
 
@@ -2298,8 +2299,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	progress_counter = offset;
 
 	if (showprogress && size != 0) {
-		start_progress_meter(progress_meter_path(remote_path),
-		    size, &progress_counter);
+		hpn_meter_start(hpn_meter_serial(), conn, HPN_METER_FILE,
+		    HPN_METER_DOM_TRANSFER,
+		    progress_meter_path(remote_path), size,
+		    &progress_counter, 1);
 	}
 
 	while (num_req > 0 || max_req > 0) {
@@ -2495,7 +2498,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	}
 
 	if (showprogress && size)
-		stop_progress_meter();
+		hpn_meter_stop(hpn_meter_serial(), conn);
 
 	/*
 	 * Requests still queued here means the loop broke early on a dead
@@ -2813,8 +2816,10 @@ do_upload_body(struct sftp_conn *conn,
 
 	offset = progress_counter = resume_offset;
 	if (showprogress) {
-		start_progress_meter(progress_meter_path(local_path),
-		    local_size, &progress_counter);
+		hpn_meter_start(hpn_meter_serial(), conn, HPN_METER_FILE,
+		    HPN_METER_DOM_TRANSFER,
+		    progress_meter_path(local_path), local_size,
+		    &progress_counter, 1);
 	}
 
 	/*
@@ -2964,7 +2969,7 @@ do_upload_body(struct sftp_conn *conn,
 	sshbuf_free(msg);
 
 	if (showprogress)
-		stop_progress_meter();
+		hpn_meter_stop(hpn_meter_serial(), conn);
 	free(data);
 
 	if (status == SSH2_FX_OK && !interrupted) {
@@ -4881,8 +4886,10 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 	progress_counter = 0;
 
 	if (showprogress && size != 0) {
-		start_progress_meter(progress_meter_path(from_path),
-		    size, &progress_counter);
+		hpn_meter_start(hpn_meter_serial(), from, HPN_METER_FILE,
+		    HPN_METER_DOM_TRANSFER,
+		    progress_meter_path(from_path), size,
+		    &progress_counter, 1);
 	}
 	while (num_req > 0 || max_req > 0) {
 		u_char *data;
@@ -5047,7 +5054,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 	}
 
 	if (showprogress && size)
-		stop_progress_meter();
+		hpn_meter_stop(hpn_meter_serial(), from);
 
 	/* Drain replies from the server (blocking) */
 	debug3_f("waiting for %u replies from destination", num_upload_req);

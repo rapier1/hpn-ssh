@@ -44,6 +44,7 @@
 #include "atomicio.h"
 #include "hpn-status-frame.h"
 #include "hpn-progressmeter.h"
+#include "hpn-meter.h"
 #include "log.h"
 #include "misc.h"
 #include "utf8.h"
@@ -397,7 +398,8 @@ refresh_progress_meter(int force_update)
 	off_t delta_pos;
 	struct meter_view v;
 
-	if (file == NULL || (!force_update && !alarm_fired && !win_resized) ||
+	if ((file == NULL && !hpn_meter_display_active()) ||
+	    (!force_update && !alarm_fired && !win_resized) ||
 	    (!hpn_pm_active() && !can_output() && pm_debug_fp == NULL))
 		return;
 	alarm_fired = 0;
@@ -412,6 +414,15 @@ refresh_progress_meter(int force_update)
 	 * skip every local derivation (see relay_render). */
 	if (relay_mode) {
 		relay_render();
+		return;
+	}
+
+	/* HPN meter core: a meter started through hpn_meter_start owns its
+	 * own sample state and fill; this function supplies only the shared
+	 * cadence gates above. The legacy fill below serves the callers not
+	 * yet converted to the core. */
+	if (hpn_meter_display_active()) {
+		hpn_meter_refresh_current(force_update);
 		return;
 	}
 
@@ -506,12 +517,24 @@ refresh_progress_meter(int force_update)
 	v.done = end_pos != 0 && bytes_left == 0;
 	v.elapsed_sec = (long)elapsed;
 
-	if (hpn_pm_active())
-		hpn_pm_emit_view(&v, force_update);
-	else if (can_output())
-		render_from_view(&v);
-	pm_debug_view(&v);
+	pm_dispatch_view(&v, force_update);
 	last_pos = cur_pos;
+}
+
+/*
+ * Route one filled view to the active sinks: the frame emitter when frame
+ * mode is armed, else the TTY renderer when output is possible, and the
+ * HPN_PM_DEBUG capture always. The single dispatch definition, shared by
+ * the legacy fill above and the hpn-meter core's fills.
+ */
+void
+pm_dispatch_view(const struct meter_view *v, int force_update)
+{
+	if (hpn_pm_active())
+		hpn_pm_emit_view(v, force_update);
+	else if (can_output())
+		render_from_view(v);
+	pm_debug_view(v);
 }
 
 /*
@@ -645,6 +668,60 @@ stop_progress_meter(void)
 
 	atomicio(vwrite, STDOUT_FILENO, "\n", 1);
 	file = NULL;
+}
+
+/*
+ * Display session mechanics for a meter owned by the hpn-meter core:
+ * everything start_progress_meter does around the meter state itself. The
+ * initial forced paint routes back to the core's fill through the hook in
+ * refresh_progress_meter, so the core must be current before this is
+ * called. Frame mode skips the TTY arming and the initial paint for the
+ * same reasons start_progress_meter does: stdout is the frame channel, and
+ * phase flags are set only after start returns.
+ */
+void
+pm_display_begin(void)
+{
+	pm_debug_init();
+	relay_mode = 0;
+	if (!hpn_pm_active()) {
+		if (can_output())
+			meter_tty_arm();
+		if (can_output() || pm_debug_fp != NULL)
+			refresh_progress_meter(1);
+	}
+	ssh_signal(SIGALRM, sig_alarm);
+	alarm(UPDATE_INTERVAL);
+}
+
+/*
+ * Close the display session for a core-owned meter, mirroring
+ * stop_progress_meter. painted is the last position a refresh actually
+ * showed and decides whether a final repaint is owed; cur is the fresh
+ * counter value and total and rate feed the completion frame, exactly as
+ * the legacy stop reads them.
+ */
+void
+pm_display_end(off_t painted, off_t cur, off_t total, double rate)
+{
+	alarm(0);
+
+	pthread_mutex_lock(&meter_mu);
+	meter_active = 0;
+	pthread_mutex_unlock(&meter_mu);
+
+	if (hpn_pm_active()) {
+		hpn_pm_meter_done(cur, total, rate);
+		return;
+	}
+
+	if (!can_output())
+		return;
+
+	if (painted != total)
+		refresh_progress_meter(1);
+
+	atomicio(vwrite, STDOUT_FILENO, "\n", 1);
 }
 
 /*
