@@ -380,8 +380,6 @@ static struct {
 	int	 verifying;	/* HPNS_F_VERIFY seen: label the phase */
 	int	 resuming;	/* HPNS_F_RESUME live: label the phase */
 	int	 done;		/* END received: paint the 100% line */
-	uint32_t files_prev;	/* last files_done seen; a rise is a source-
-				 * side file boundary */
 	double	 last_break;	/* rate floor for boundary line breaks */
 	double	 last_frame;	/* monotime of the last sample (stall aging) */
 	double	 started;
@@ -581,19 +579,20 @@ hpn_meter_relay_sample(const struct hpns_progress *p)
 	relay.eta_sec = p->eta_sec;
 	relay.last_frame = now;
 	/*
-	 * A rise in files_done is a source-side file boundary, and the
-	 * frame carrying it is the file's exact end state (the source
-	 * counts the file before its forced boundary emit - see
+	 * HPNS_F_BOUNDARY marks a frame the source emitted at a serial
+	 * file boundary, carrying that file's exact end state (see
 	 * hpn_pm_meter_done). Preserve a completed-file row: the file's
 	 * bytes are the span since the last boundary, its average that
 	 * span over the wall time, its peak the largest frame inst seen
-	 * within it. Floored at one row per second so a source streaming
-	 * many small files cannot turn the history into spam; skipped
-	 * boundaries fold into the next row, which then summarizes the
-	 * span of files since the last one.
+	 * within it. A rise in files_done is NOT a boundary - a fleet
+	 * source's external counts rise on ordinary mid-flight ticks, and
+	 * treating those as boundaries painted spurious rows. Floored at
+	 * one row per second so a source streaming many small files cannot
+	 * turn the history into spam; skipped boundaries fold into the
+	 * next row, which then summarizes the span of files since the
+	 * last one.
 	 */
-	if (p->files_done > relay.files_prev) {
-		relay.files_prev = p->files_done;
+	if (p->flags & HPNS_F_BOUNDARY) {
 		if (now - relay.last_break >= 1.0) {
 			double span = now - relay.file_start;
 

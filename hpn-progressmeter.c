@@ -110,7 +110,7 @@ frames_write(u_char *buf, size_t len)
  */
 static void
 emit_progress(off_t cur_pos, off_t end_pos, long long bytes_per_second,
-    int force)
+    int force, u_int16_t extra_flags)
 {
 	struct hpns_progress pr;
 	u_char fbuf[HPNS_HDR_LEN + HPNS_PROGRESS_LEN];
@@ -150,7 +150,7 @@ emit_progress(off_t cur_pos, off_t end_pos, long long bytes_per_second,
 	pr.files_total = frames_files_total;
 	pr.workers_active = frames_workers_active;
 	pr.workers_stalled = frames_workers_stalled;
-	pr.flags = fl;
+	pr.flags = fl | extra_flags;
 
 	frames_write(fbuf, hpns_encode_progress(fbuf, &pr));
 }
@@ -170,7 +170,7 @@ hpn_pm_emit_view(const struct meter_view *v, int force)
 
 	frames_rate_inst = (bytes_left > 0 && v->elapsed >= 0.001) ?
 	    (long long)(v->delta / v->elapsed) : 0;
-	emit_progress(v->cur, v->total, v->rate, force);
+	emit_progress(v->cur, v->total, v->rate, force, 0);
 }
 
 /*
@@ -205,9 +205,21 @@ void
 hpn_pm_meter_done(off_t cur_pos, off_t end_pos,
     long long bytes_per_second)
 {
+	u_int16_t boundary = 0;
+
+	/*
+	 * Mark the frame a file boundary only when this meter's completion
+	 * is itself a file completing: a per-file transfer meter counting
+	 * its own files. Externally counted runs (the fleet) and the
+	 * verify and resume-check phase meters (not files) never mark one,
+	 * so the consumer only ever preserves rows for true serial file
+	 * boundaries.
+	 */
+	if (!frames_files_ext && frames_meter_files > 0)
+		boundary = HPNS_F_BOUNDARY;
 	if (!frames_files_ext)
 		frames_files_done += frames_meter_files;
-	emit_progress(cur_pos, end_pos, bytes_per_second, 1);
+	emit_progress(cur_pos, end_pos, bytes_per_second, 1, boundary);
 	/* Only transfer meters feed the running total; verify and
 	 * resume-check bytes are hash-domain quantities (see emit_progress)
 	 * and must not inflate it or the END frame. */

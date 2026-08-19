@@ -118,6 +118,13 @@
 						 * are NOT a wire break -
 						 * consumers ignore unknown
 						 * bits. */
+#define HPNS_F_BOUNDARY		0x0004		/* this frame is a serial file
+						 * boundary: bytes_done is the
+						 * finished file's exact end
+						 * state.  Only per-file meters
+						 * mark it; a fleet's external
+						 * file counts rise on ordinary
+						 * ticks and never do. */
 
 #define HPNS_ETA_UNKNOWN	0xffffffffu
 
