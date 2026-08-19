@@ -172,7 +172,7 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		return -1;
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Entering %s\n", src);
+		pm_mprintf("Entering %s\n", src);
 	/* Register this command's roots as prefixes so whole-file verify items
 	 * store paths relative to them (upload: local root = src, remote = dst).
 	 * Gated on the orchestrator's verify_transfer (same flag the park checks);
@@ -336,7 +336,7 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		return -1;
 	}
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Retrieving %s\n", src);
+		pm_mprintf("Retrieving %s\n", src);
 	/* Register this command's roots as prefixes (download: local root = dst,
 	 * remote = src).  Gated on verify_transfer (same flag the park checks). */
 	if (p->cfg.verify_transfer) {

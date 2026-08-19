@@ -2101,6 +2101,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	if (resume_flag) {
 		/* -1=error, 1=identical, 2=target larger than source */
 		int skip_ret = -1;
+		int chunked_metered = 0;	/* the chunked re-fetch ran its
+						 * own transfer meter, which
+						 * counts the file at stop */
 		if (fstat(local_fd, &st) == -1) {
 			error("stat local \"%s\": %s",
 			    local_path, strerror(errno));
@@ -2145,6 +2148,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				        remote_path, (off_t)size,
 				        st.st_size /* dest-EOF clamp */);
 				if (chunked >= 0) {
+					if (chunked == 0 && showprogress)
+						chunked_metered = 1;
 					skip_ret = chunked == 1 ? 1 : 0;
 					goto resume_fail;
 				}
@@ -2220,6 +2225,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				        remote_path, (off_t)size,
 				        st.st_size /* dest-EOF clamp */);
 				if (dchunked >= 0) {
+					if (dchunked == 0 && showprogress)
+						chunked_metered = 1;
 					skip_ret = dchunked == 1 ? 1 : 0;
 					goto resume_fail;
 				}
@@ -2287,7 +2294,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		free(handle);
 		if (local_fd != -1)
 			close(local_fd);
-		if (skip_ret >= 0)	/* resolved, no transfer meter ran */
+		if (skip_ret >= 0 && !chunked_metered)
+			/* resolved without a transfer meter; a chunked
+			 * re-fetch metered and counted the file itself */
 			hpn_pm_count_file();
 		return skip_ret;
  resume_done:
@@ -2638,7 +2647,7 @@ serial_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
 	Attrib			 da;
 
 	if (s->print_flag && s->print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Retrieving %s\n", src);
+		pm_mprintf("Retrieving %s\n", src);
 	if (sftp_hpn_ensure_local_dir(dst, a, &mode, &tmpmode) != 0)
 		return -1;
 	da = *a;
@@ -3091,7 +3100,10 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				if (chunked >= 0) {
 					resume_check_meter_end(conn);
 					close(local_fd);
-					hpn_pm_count_file();
+					/* a chunked re-send metered and
+					 * counted the file itself */
+					if (!(chunked == 0 && showprogress))
+						hpn_pm_count_file();
 					return chunked; /* 1=skip, 0=success */
 				}
 
@@ -3176,7 +3188,10 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				if (chunked >= 0) {
 					resume_check_meter_end(conn);
 					close(local_fd);
-					hpn_pm_count_file();
+					/* a chunked re-send metered and
+					 * counted the file itself */
+					if (!(chunked == 0 && showprogress))
+						hpn_pm_count_file();
 					return chunked; /* 1=skip, 0=success */
 				}
 				/*
@@ -3340,7 +3355,7 @@ serial_ul_enter_dir(struct sftp_upload_sink *sink, const char *src,
 
 	(void)dst;
 	if (s->print_flag && s->print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Entering %s\n", src);
+		pm_mprintf("Entering %s\n", src);
 }
 
 static int
@@ -5153,7 +5168,7 @@ crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *
 	int		 created = 0;
 
 	if (s->print_flag && s->print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("Retrieving %s\n", src);
+		pm_mprintf("Retrieving %s\n", src);
 
 	curdir.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
 	curdir.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;

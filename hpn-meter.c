@@ -380,8 +380,29 @@ static struct {
 	int	 verifying;	/* HPNS_F_VERIFY seen: label the phase */
 	int	 resuming;	/* HPNS_F_RESUME live: label the phase */
 	int	 done;		/* END received: paint the 100% line */
+	uint32_t files_prev;	/* last files_done seen; a rise is a source-
+				 * side file boundary */
+	double	 last_break;	/* rate floor for boundary line breaks */
 	double	 last_frame;	/* monotime of the last sample (stall aging) */
 	double	 started;
+
+	/*
+	 * Per-file rendering state. The frames carry cumulative bytes
+	 * (running total plus the current meter), while their rate and ETA
+	 * are already per-file, so subtracting the cumulative base recorded
+	 * at the last boundary recovers the source's own per-file meter
+	 * exactly. The live line renders relative to file_base, and each
+	 * boundary preserves a completed-file row built from the row_*
+	 * snapshot.
+	 */
+	uint64_t file_base;	/* cumulative bytes at the last preserved row */
+	uint64_t file_inst_max;	/* peak frame inst since the last row */
+	double	 file_start;	/* monotime of the last preserved row */
+	int	 row_pending;	/* fill paints one completed-file row */
+	uint64_t row_bytes;
+	uint64_t row_avg;
+	uint64_t row_peak;
+	long	 row_elapsed;
 } relay;
 static off_t relay_ctr;		/* the core requires a counter; the
 				 * relay fill never reads it */
@@ -424,21 +445,58 @@ relay_fill(struct hpn_meter *m, struct meter_view *view)
 	}
 
 	v.label = label;
-	v.cur = (off_t)relay.bytes_done;
-	v.total = (off_t)relay.bytes_total;
+
+	/*
+	 * A completed-file row: one preserved line per source-side file
+	 * boundary, rendered as a done row (100%, the file's bytes, its
+	 * average and peak rates, elapsed tail). The average is derived
+	 * locally, but from the exact byte span between two boundary
+	 * frames over the wall time between them - a whole-file quotient,
+	 * not a per-frame delta, so the ~1 Hz frame cadence cannot alias
+	 * it the way per-sample rate derivation would.
+	 */
+	if (relay.row_pending) {
+		relay.row_pending = 0;
+		v.cur = v.total = (off_t)relay.row_bytes;
+		v.rate = (long long)relay.row_avg;
+		v.inst = (off_t)relay.row_peak;
+		v.done = 1;
+		v.percent = 100;
+		v.elapsed_sec = relay.row_elapsed;
+		*view = v;
+		return;
+	}
+
+	/*
+	 * Live line and END line. While the transfer runs, render the
+	 * source's per-file meter: the frame's cumulative bytes and total
+	 * minus the base recorded at the last boundary are the current
+	 * file's position and size, and the frame's rate and ETA are
+	 * per-file already. The END line reverts to the cumulative view -
+	 * it summarizes the whole run.
+	 */
+	{
+		uint64_t base = relay.done ? 0 : relay.file_base;
+		uint64_t cur = relay.bytes_done > base ?
+		    relay.bytes_done - base : 0;
+		uint64_t total = relay.bytes_total > base ?
+		    relay.bytes_total - base : 0;
+
+		v.cur = (off_t)cur;
+		v.total = (off_t)total;
+		/* Relay policy: an unknown (0) total reads 0% - do not
+		 * claim 100% before the source has reported a size. */
+		if (relay.done || (total > 0 && cur >= total))
+			v.percent = 100;
+		else if (total > 0)
+			v.percent = (int)(cur * 100 / total);
+		else
+			v.percent = 0;
+	}
 	v.eta_sec = relay.eta_sec;
 	v.done = relay.done;
 	v.stalled = !relay.done && silent;
 	v.elapsed_sec = (long)(now - relay.started);
-	/* Relay policy: an unknown (0) total reads 0% - do not claim 100%
-	 * before the source has reported a size. */
-	if (relay.done || (relay.bytes_total > 0 &&
-	    relay.bytes_done >= relay.bytes_total))
-		v.percent = 100;
-	else if (relay.bytes_total > 0)
-		v.percent = (int)(relay.bytes_done * 100 / relay.bytes_total);
-	else
-		v.percent = 0;
 
 	/*
 	 * Source-specific display choices live in the fill, not the shared
@@ -476,6 +534,7 @@ hpn_meter_relay_start(const char *label)
 	relay_meter.fill = relay_fill;
 	memset(&relay, 0, sizeof(relay));
 	relay.started = relay.last_frame = monotime_double();
+	relay.file_start = relay.started;
 	pm_display_begin_relay();
 }
 
@@ -485,13 +544,20 @@ hpn_meter_relay_sample(const struct hpns_progress *p)
 {
 	if (current_meter != &relay_meter)
 		return;
+	double now = monotime_double();
+
 	if ((p->flags & HPNS_F_RESUME) && !relay.resuming)
 		relay.resuming = 1;
 	else if (relay.resuming && !(p->flags & HPNS_F_RESUME)) {
 		/* resume check over, transfer begins: drop the hash peaks
-		 * so the completion line reflects transfer rates only */
+		 * so the completion line reflects transfer rates only,
+		 * and restart the per-file base - the frames' cumulative
+		 * bytes change domain with the phase */
 		relay.resuming = 0;
 		relay.rate_inst_max = 0;
+		relay.file_base = 0;
+		relay.file_inst_max = 0;
+		relay.file_start = now;
 	}
 	if ((p->flags & HPNS_F_VERIFY) && !relay.verifying) {
 		relay.verifying = 1;
@@ -499,6 +565,9 @@ hpn_meter_relay_sample(const struct hpns_progress *p)
 		 * track the verify phase's own peak separately */
 		relay.rate_inst_peak_xfer = relay.rate_inst_max;
 		relay.rate_inst_max = 0;
+		relay.file_base = 0;
+		relay.file_inst_max = 0;
+		relay.file_start = now;
 	}
 	relay.bytes_done = p->bytes_done;
 	if (p->bytes_total > 0)
@@ -507,8 +576,42 @@ hpn_meter_relay_sample(const struct hpns_progress *p)
 	relay.rate_inst = p->rate_inst_bps;
 	if (p->rate_inst_bps > relay.rate_inst_max)
 		relay.rate_inst_max = p->rate_inst_bps;
+	if (p->rate_inst_bps > relay.file_inst_max)
+		relay.file_inst_max = p->rate_inst_bps;
 	relay.eta_sec = p->eta_sec;
-	relay.last_frame = monotime_double();
+	relay.last_frame = now;
+	/*
+	 * A rise in files_done is a source-side file boundary, and the
+	 * frame carrying it is the file's exact end state (the source
+	 * counts the file before its forced boundary emit - see
+	 * hpn_pm_meter_done). Preserve a completed-file row: the file's
+	 * bytes are the span since the last boundary, its average that
+	 * span over the wall time, its peak the largest frame inst seen
+	 * within it. Floored at one row per second so a source streaming
+	 * many small files cannot turn the history into spam; skipped
+	 * boundaries fold into the next row, which then summarizes the
+	 * span of files since the last one.
+	 */
+	if (p->files_done > relay.files_prev) {
+		relay.files_prev = p->files_done;
+		if (now - relay.last_break >= 1.0) {
+			double span = now - relay.file_start;
+
+			relay.last_break = now;
+			relay.row_bytes = p->bytes_done - relay.file_base;
+			relay.row_avg = span >= 0.001 ?
+			    (uint64_t)(relay.row_bytes / span) : 0;
+			relay.row_peak = relay.file_inst_max;
+			relay.row_elapsed = (long)span;
+			relay.row_pending = 1;
+			refresh_progress_meter(1);
+			relay.row_pending = 0;
+			pm_meter_line_break();
+			relay.file_base = p->bytes_done;
+			relay.file_start = now;
+			relay.file_inst_max = 0;
+		}
+	}
 	refresh_progress_meter(0);
 }
 

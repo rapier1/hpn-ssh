@@ -344,6 +344,45 @@ meter_log_exit(void)
 	pthread_mutex_unlock(&meter_mu);
 }
 
+/*
+ * Preserve the currently painted meter line: write a bare newline so the
+ * next repaint starts a fresh row. For the relay's per-file boundaries,
+ * where one meter spans many files and would otherwise paint over its own
+ * history. No clear sequence on purpose - the painted line is the point.
+ */
+void
+pm_meter_line_break(void)
+{
+	pthread_mutex_lock(&meter_mu);
+	if (can_output())
+		atomicio(vwrite, STDOUT_FILENO, "\n", 1);
+	pthread_mutex_unlock(&meter_mu);
+}
+
+/*
+ * mprintf with the meter-line guard. Transfer-path informational prints
+ * (Fetching, Retrieving, Entering, the bundle line) land while a meter is
+ * live, and an unguarded write glues onto the meter's painted line and
+ * orphans it. This gives them the same discipline log output already gets
+ * through log.c's guard: clear the meter line, print whole, flush inside
+ * the guard so buffered stdio cannot land after the next repaint, and let
+ * the meter's next tick repaint below.
+ */
+int
+pm_mprintf(const char *fmt, ...)
+{
+	va_list ap;
+	int ret;
+
+	meter_log_enter();
+	va_start(ap, fmt);
+	ret = vfmprintf(stdout, fmt, ap);
+	va_end(ap);
+	fflush(stdout);
+	meter_log_exit();
+	return ret;
+}
+
 static void
 sig_alarm(int ignore)
 {

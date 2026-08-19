@@ -1478,6 +1478,11 @@ struct sftp_parallel {
 	struct hpn_meter            meter;
 	off_t                       posted_total_add;  /* walker -> reporter */
 	u_int                       posted_files_add;  /* walker -> reporter */
+	/* Stop handshake: the meter is bound to the reporter, so the final
+	 * 100 percent paint must come from it. progress_stop snaps the
+	 * counter, raises this, and waits briefly; the reporter's next tick
+	 * paints and clears it. See sftp_parallel_progress_stop. */
+	int                         meter_final_request;
 	/* Resume-check stretch (HPN -Z UX): before any transfer byte moves,
 	 * workers may be hashing existing partials (chunked resume).  The
 	 * reporter detects fresh hash-op markers on the worker conns, swaps

@@ -101,11 +101,12 @@ frames_write(u_char *buf, size_t len)
 
 /*
  * Build and emit one PROGRESS frame from the passed meter state (frame
- * mode only).  Rate limited unless forced; the periodic 1 Hz alarm tick
- * always carries current totals, so a dropped boundary frame loses
- * nothing.  Reads the retained frames_rate_inst - hpn_pm_emit sets
- * it just before a refresh-driven emit, and a boundary emit reuses the
- * last value.
+ * mode only).  Rate limited unless forced.  Meter boundaries force the
+ * emit: the consumer preserves one painted row per completed file and
+ * derives per-file byte spans from the boundary frames, so a dropped
+ * boundary would leave it a stale tick short.  Reads the retained
+ * frames_rate_inst - hpn_pm_emit sets it just before a refresh-driven
+ * emit, and a boundary emit reuses the last value.
  */
 static void
 emit_progress(off_t cur_pos, off_t end_pos, long long bytes_per_second,
@@ -190,25 +191,29 @@ hpn_pm_meter_start(void)
 }
 
 /*
- * A meter finished (frame mode): emit a boundary frame through the
- * regular limiter, then fold the meter into the aggregate so the next
- * meter's frames continue the running totals (serial scp runs one meter
- * per file).  If the boundary frame is dropped, the next 1 Hz tick or the
- * final END frame carries the totals.
+ * A meter finished (frame mode): count the file, emit a forced boundary
+ * frame, then fold the meter into the aggregate so the next meter's
+ * frames continue the running totals (serial scp runs one meter per
+ * file).  The count comes first so the boundary frame itself announces
+ * the completion: the consumer preserves a painted row when files_done
+ * rises, and that frame must carry the file's exact end state, not the
+ * next 1 Hz tick's mid-file position.  Forced for the same reason - a
+ * rate-limited boundary emit would drop whenever a tick landed just
+ * before the completion.
  */
 void
 hpn_pm_meter_done(off_t cur_pos, off_t end_pos,
     long long bytes_per_second)
 {
-	emit_progress(cur_pos, end_pos, bytes_per_second, 0);
+	if (!frames_files_ext)
+		frames_files_done += frames_meter_files;
+	emit_progress(cur_pos, end_pos, bytes_per_second, 1);
 	/* Only transfer meters feed the running total; verify and
 	 * resume-check bytes are hash-domain quantities (see emit_progress)
 	 * and must not inflate it or the END frame. */
 	if (!(__atomic_load_n(&frames_flags, __ATOMIC_RELAXED) &
 	    (HPNS_F_VERIFY | HPNS_F_RESUME)))
 		frames_acc_bytes += cur_pos;
-	if (!frames_files_ext)
-		frames_files_done += frames_meter_files;
 }
 
 /*

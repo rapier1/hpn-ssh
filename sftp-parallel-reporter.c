@@ -1036,7 +1036,15 @@ parallel_reporter_thread(void *arg)
 				}
 			}
 		}
-		if (p->progress_meter_started)
+		if (__atomic_load_n(&p->meter_final_request,
+		    __ATOMIC_ACQUIRE)) {
+			/* progress_stop snapped the counter to the total and
+			 * is waiting on this paint; force it past the alarm
+			 * gate and acknowledge. */
+			refresh_progress_meter(1);
+			__atomic_store_n(&p->meter_final_request, 0,
+			    __ATOMIC_RELEASE);
+		} else if (p->progress_meter_started)
 			refresh_progress_meter(0);
 
 		/* Tail trend detector (phase B: telemetry only). */

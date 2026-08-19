@@ -47,3 +47,9 @@ void	pm_display_end(off_t, off_t, off_t, double);
  * timing aliases). */
 void	pm_display_begin_relay(void);
 void	pm_display_end_relay(void);
+
+/* mprintf that clears a live meter line first; for transfer-path prints
+ * that would otherwise land glued onto the meter's in-place repaint. */
+void	pm_meter_line_break(void);
+int	pm_mprintf(const char *, ...)
+	    __attribute__((format(printf, 1, 2)));

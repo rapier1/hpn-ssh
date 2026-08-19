@@ -1167,6 +1167,35 @@ sftp_parallel_progress_stop(struct sftp_parallel *p)
 			p->aggregate_progress_counter =
 			    (off_t)(bytes - p->progress_bytes_baseline);
 	}
+	/*
+	 * The meter is bound to the reporter, so the final paint must come
+	 * from it: a repaint from this thread is refused by the display
+	 * gate, which is how completions were left showing the last alarm
+	 * tick's 99 percent. Ask the reporter to paint the snapped total and
+	 * wait up to two of its ticks. If it does not answer (already torn
+	 * down on an abort path), unbind and let the stop paint from here;
+	 * the reporter is not filling anything in that state.
+	 */
+	if (p->meter.display_bound) {
+		int i;
+
+		__atomic_store_n(&p->meter_final_request, 1,
+		    __ATOMIC_RELEASE);
+		for (i = 0; i < 40 && __atomic_load_n(&p->meter_final_request,
+		    __ATOMIC_ACQUIRE); i++) {
+			/* 10 ms: the reporter ticks every 200 ms, so the
+			 * wait is sub-second by construction and bounded. */
+			struct timespec ts = { 0, 10 * 1000000L };
+
+			nanosleep(&ts, NULL);
+		}
+		if (__atomic_load_n(&p->meter_final_request,
+		    __ATOMIC_ACQUIRE)) {
+			__atomic_store_n(&p->meter_final_request, 0,
+			    __ATOMIC_RELAXED);
+			p->meter.display_bound = 0;
+		}
+	}
 	p->progress_meter_started = 0;
 	hpn_meter_stop(&p->meter, p);
 }

@@ -842,6 +842,9 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	u_int64_t		*local_hashes = NULL;
 	u_int64_t		*remote_hashes = NULL;
 	u_int64_t		 slen, soff, bytes_moved = 0, checked_bytes;
+	u_int64_t		 refetch_total = 0;
+	volatile uint64_t	 live_ctr = 0;
+	int			 meter_on = 0;
 	const char		*ing = local_is_target ? "re-fetching"
 				    : "re-transferring";
 	const char		*ed = local_is_target ? "re-fetched"
@@ -997,6 +1000,36 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 		goto out;
 	}
 
+	for (i = 0; i < n_chunks; i++) {
+		if (local_hashes[i] != remote_hashes[i])
+			refetch_total += ranges[i].len;
+	}
+	/*
+	 * Hand the display from the resume-check meter to a transfer meter.
+	 * The hash work is done, and leaving that meter up leaves its
+	 * counter dead for the whole re-fetch: the user watches a stalled
+	 * 98 percent while gigabytes move. The range legs feed the
+	 * connection's live counter, so this meter ticks with received or
+	 * sent bytes and completes when the re-fetch does.
+	 */
+	if (showprogress && refetch_total > 0) {
+		const char *target = local_is_target ? local_path
+		    : remote_path;
+		const char *base = strrchr(target, '/');
+
+		hpn_meter_stop(hpn_meter_serial(), conn);
+		/* The live counter is a volatile uint64_t and the meter
+		 * takes an off_t: same width, and byte counts stay far
+		 * below the sign bit. */
+		if (hpn_meter_start(hpn_meter_serial(), conn,
+		    HPN_METER_FILE, HPN_METER_DOM_TRANSFER,
+		    base != NULL ? base + 1 : target,
+		    (off_t)refetch_total, (off_t *)&live_ctr, 1) == 0) {
+			sftp_set_live_counter(conn, &live_ctr);
+			meter_on = 1;
+		}
+	}
+
 	i = 0;
 	while (i < n_chunks) {
 		u_int run_start;
@@ -1049,6 +1082,10 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	    100.0 * (double)bytes_moved / (double)slen);
 	rc = 0;
 out:
+	if (meter_on) {
+		sftp_set_live_counter(conn, NULL);
+		hpn_meter_stop(hpn_meter_serial(), conn);
+	}
 	free(ranges);
 	free(local_hashes);
 	free(remote_hashes);

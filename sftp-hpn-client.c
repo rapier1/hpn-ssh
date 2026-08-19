@@ -1571,7 +1571,7 @@ sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
 		return 0;
 
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		mprintf("%s bundle: %d files, %llu bytes\n",
+		pm_mprintf("%s bundle: %d files, %llu bytes\n",
 		    acc->is_download ? "Fetching" : "Uploading",
 		    acc->n, (unsigned long long)acc->bytes);
 	if (acc->is_download)

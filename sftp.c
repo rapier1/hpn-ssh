@@ -1335,13 +1335,13 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 
 		resume |= global_aflag;
 		if (!quiet && verify)
-			mprintf("Downloading %s to %s (verified resume)\n",
+			pm_mprintf("Downloading %s to %s (verified resume)\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && resume)
 			mprintf("Resuming %s to %s\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && !resume)
-			mprintf("Fetching %s to %s\n",
+			pm_mprintf("Fetching %s to %s\n",
 			    g.gl_pathv[i], abs_dst);
 		/* XXX follow link flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
@@ -1578,13 +1578,13 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 
 		resume |= global_aflag;
 		if (!quiet && verify)
-			mprintf("Uploading %s to %s (verified resume)\n",
+			pm_mprintf("Uploading %s to %s (verified resume)\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && resume)
 			mprintf("Resuming upload of %s to %s\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && !resume)
-			mprintf("Uploading %s to %s\n",
+			pm_mprintf("Uploading %s to %s\n",
 			    g.gl_pathv[i], abs_dst);
 		/* XXX follow_link_flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
