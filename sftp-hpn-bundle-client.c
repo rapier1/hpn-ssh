@@ -78,7 +78,7 @@
  * replaced by the sftp-hpn-tar codec.  DATA bytes flow wire →
  * drain_one → parser_feed → file write, with no intermediate buffering.
  * Per-worker memory is bounded by the in-flight read depth × chunk
- * size (HPN_BUNDLE_QUEUE_MAX_BYTES) plus ~1 KiB parser state.
+ * size (BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT) plus ~1 KiB parser state.
  *
  * Pipelining: still fire-N-reads-ahead via the adaptive read-ahead
  * controller, so the wire stays saturated.  But there's no orphan-
@@ -119,10 +119,13 @@ bundle_dl_lookup_entry(struct sftp_hpn_bundle_download_entry *entries, int n,
 #define BUNDLE_DL_MAX_INFLIGHT  1024u
 
 /*
- * Default per-worker memory ceiling on in-flight READ requests, in
- * bytes.  Bounds (in_flight × CHUNK_BYTES) ≤ this value.  Overridable
- * at runtime via HPN_BUNDLE_QUEUE_MAX_BYTES.  32 MiB / 128 KiB = 256
- * outstanding chunks - enough for ~10 Gbps × 25 ms or 1 Gbps × 250 ms.
+ * Per-worker memory ceiling on in-flight READ requests, in bytes.
+ * Bounds (in_flight × CHUNK_BYTES) ≤ this value.  32 MiB / 128 KiB =
+ * 256 outstanding chunks - enough for ~10 Gbps × 25 ms or 1 Gbps ×
+ * 250 ms.  Higher would saturate fatter BDPs; lower bounds memory at
+ * the cost of throughput when extract can't keep up.  The runtime
+ * HPN_BUNDLE_QUEUE_MAX_BYTES override is gone; this constant is the
+ * only knob.
  *
  * Note: with the codec replacing libarchive, client-side memory is
  * actually dominated by the SSH transport's input buffer, not by any
@@ -152,7 +155,7 @@ struct bundle_dl_stream {
 	uint64_t fire_off;
 	int      eoa_seen;	/* parser returned 1 from feed() */
 
-	size_t   max_inflight_bytes;	/* HPN_BUNDLE_QUEUE_MAX_BYTES */
+	size_t   max_inflight_bytes;	/* in-flight READ byte ceiling */
 
 	/* Caller-supplied download-entry list, used by entry_cb to map
 	 * tar pathnames back to local destinations. */
@@ -192,41 +195,6 @@ struct bundle_dl_stream {
 	/* Sticky error: data_cb / entry_end_cb / etc. failed. */
 	int      error;
 };
-
-/*
- * Per-worker memory ceiling on in-flight READ requests for the bundle
- * download path.  Bounds in_flight_count x BUNDLE_DL_CHUNK_BYTES <= this
- * value; BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT (32 MiB), clamped up to at
- * least one chunk.  Higher would saturate fatter BDPs; lower bounds
- * memory at the cost of throughput when extract can't keep up.
- *
- * Renamed from HPN_BUNDLE_DL_QUEUE_MAX_BYTES (2026-05-31) when the
- * upload path gained the symmetric cap.  See benchmark/env-vars-reference.md.
- *
- * The previous in-file bundle_dl_parse_bytes helper was deduplicated
- * against the server-side parse_bytes_arg by routing both through
- * scan_scaled (2026-05-31 cleanup) - the rest of the codebase uses
- * scan_scaled for the same job, so the bundle modules now follow the
- * project idiom.
- */
-static size_t
-bundle_dl_queue_max_bytes(void)
-{
-	static size_t cached     = 0;
-	static int    initialized = 0;
-	size_t        v;
-
-	if (initialized)
-		return cached;
-	v = BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT;
-	if (v < BUNDLE_DL_CHUNK_BYTES)
-		v = BUNDLE_DL_CHUNK_BYTES;
-	cached     = v;
-	initialized = 1;
-	debug_f("hpn-bundle inflight cap %zu bytes (%zu chunks)",
-	    cached, cached / BUNDLE_DL_CHUNK_BYTES);
-	return cached;
-}
 
 /* ── Parser callbacks ───────────────────────────────────────────────── */
 
@@ -731,7 +699,9 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	stream.preserve_flag = preserve_flag;
 	stream.fsync_flag   = fsync_flag;
 	stream.progress     = progress;
-	stream.max_inflight_bytes = bundle_dl_queue_max_bytes();
+	/* Per-worker ceiling on in-flight READ bytes, at least one chunk. */
+	stream.max_inflight_bytes = MAXIMUM(BUNDLE_DL_QUEUE_MAX_BYTES_DEFAULT,
+	    BUNDLE_DL_CHUNK_BYTES);
 
 	/* Parallel extract: a writer pool overlaps the per-file open/write/
 	 * close on the local (possibly networked) destination, mirroring the
