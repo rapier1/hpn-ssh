@@ -4,9 +4,12 @@
 tid="integrity"
 cp $OBJ/sshd_proxy $OBJ/sshd_proxy_bak
 
-# start at byte 2900 (i.e. after kex) and corrupt at different offsets
+# corrupt at different offsets inside the session-data phase.  The
+# start offset is probed per MAC/cipher combo below: HPN handshake
+# lengths vary too much for the fixed 2900 upstream uses (the version
+# banner suffix, larger algorithm lists, and the post-auth MT cipher
+# switch's second KEX all move the data phase).
 tries=10
-startoffset=2900
 macs=`${SSH} -Q mac`
 
 # The following are not MACs, but ciphers with integrated integrity. They are
@@ -35,6 +38,28 @@ for m in $macs; do
 	etmo=0
 	ecnt=0
 	skip=0
+	# Probe the clean stream with no payload; its length bounds the
+	# handshake plus close overhead, so corruption starting a little
+	# past it lands inside the 4 KB data burst for this combo, where
+	# every flip is caught as a MAC error.
+	cp $OBJ/sshd_proxy_bak $OBJ/sshd_proxy
+	if ${SSH} -Q cipher-auth | grep "^${m}\$" >/dev/null 2>&1 ; then
+		echo "Ciphers=$m" >> $OBJ/sshd_proxy
+		macopt="-c $m"
+	else
+		echo "Ciphers=aes128-ctr" >> $OBJ/sshd_proxy
+		echo "MACs=$m" >> $OBJ/sshd_proxy
+		macopt="-m $m -c aes128-ctr"
+	fi
+	${SSH} $macopt -F $OBJ/ssh_proxy \
+	    -o "proxycommand=$cmd | tee $OBJ/integrity.probe" \
+	    999.999.999.999 true >/dev/null 2>&1
+	startoffset=`wc -c < $OBJ/integrity.probe`
+	if [ "$startoffset" -le 2900 ]; then
+		fail "clean probe failed for $m"
+		continue
+	fi
+	startoffset=`expr $startoffset + 512`
 	for off in `jot $tries $startoffset`; do
 		skip=`expr $skip - 1`
 		if [ $skip -gt 0 ]; then
