@@ -1,4 +1,4 @@
-/* $OpenBSD: myproposal.h,v 1.78 2026/02/05 22:05:49 djm Exp $ */
+/* $OpenBSD: myproposal.h,v 1.80 2026/08/10 23:27:04 djm Exp $ */
 
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
@@ -58,7 +58,7 @@
 	"sk-ecdsa-sha2-nistp256@openssh.com," \
 	"webauthn-sk-ecdsa-sha2-nistp256@openssh.com," \
 	"rsa-sha2-512," \
-	"rsa-sha2-256"
+	"rsa-sha2-256" \
 
 /*if we aren't using OpenSSL we need to remove
  * the parallel ChaCha20 cipher from the list */
@@ -101,7 +101,7 @@
 	"sk-ecdsa-sha2-nistp256@openssh.com," \
 	"webauthn-sk-ecdsa-sha2-nistp256@openssh.com," \
 	"rsa-sha2-512," \
-	"rsa-sha2-256"
+	"rsa-sha2-256" \
 
 #ifdef HAVE_LIBZSTD
 #define	KEX_DEFAULT_COMP	"none,zlib@openssh.com,zstd@hpnssh.org"

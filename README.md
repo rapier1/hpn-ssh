@@ -38,14 +38,12 @@ Detailed step by step instructions can be found at https://psc.edu/hpn-ssh-home/
 
 HPNSSH is built using autoconf and make. It requires a working C compiler, standard library and headers.
 
-<<<<<<< HEAD
 ``libcrypto`` from one of [LibreSSL](https://www.libressl.org/), [OpenSSL](https://www.openssl.org), [AWS-LC](https://github.com/aws/aws-lc) or [BoringSSL](https://github.com/google/boringssl) may also be used.  OpenSSH may be built without either of these, but the resulting binaries will have only a subset of the cryptographic algorithms normally available.
-=======
-``libcrypto`` from either [LibreSSL](https://www.libressl.org/) or [OpenSSL](https://www.openssl.org) may also be used. HPN-SSH may be built without either of these, but the resulting binaries will have only a subset of the cryptographic algorithms normally available.
 The developers of HPN-SSH strongly suggest the use of OpenSSL 3.0 or higher to support the advanced cryptography methods used.
->>>>>>> bug-restrict-window-openssh10
 
 [zlib](https://www.zlib.net/) is optional; without it transport compression is not supported.
+
+For advanced compression methods HPN-SSH uses [libzstd](https://github.com/facebook/zstd). Like zlib, this is optional but advanced compression (using -z) is not supported. 
 
 FIDO security token support needs [libfido2](https://github.com/Yubico/libfido2) and its dependencies and will be enabled automatically if they are found.
 
