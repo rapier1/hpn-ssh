@@ -3683,7 +3683,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 
-	/* HPNVerifyTransfer: tee this range's source bytes into a streaming
+	/* Verify transfer: tee this range's source bytes into a streaming
 	 * XXH3 as we read them to send, so the finalize verify can reuse the
 	 * hash instead of re-reading the source.  Only when the caller asked
 	 * (range_hash_out != NULL).  A range that does not transfer in one

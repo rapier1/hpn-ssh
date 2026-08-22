@@ -75,7 +75,7 @@ struct sftp_limits {
 
 /*
  * Exit code returned by hpnsftp/hpnscp when one or more files fail
- * post-transfer XXH3 verification (HPNVerifyTransfer) or the verified
+ * post-transfer XXH3 verification (verify transfer) or the verified
  * resume gate.  The transfer is NOT aborted on a mismatch - the file is
  * re-transferred (resume) or flagged (verify) and a summary is printed -
  * but the process exits non-zero so automation can detect it.  57 = a
@@ -277,7 +277,7 @@ int sftp_upload(struct sftp_conn *, const char *, const char *,
     int, int, int, int, int);
 
 /*
- * HPNVerifyTransfer post-transfer integrity check: XXH3 the full local and
+ * Verify transfer post-transfer integrity check: XXH3 the full local and
  * remote file and compare.  Returns 0 = match, 1 = mismatch (corruption),
  * -1 = could not verify (server lacks hpn-check-file or I/O error).
  */

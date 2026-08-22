@@ -144,7 +144,7 @@ struct sftp_parallel_config {
 	int          fsync_flag;
 	int          inplace_flag;
 	int          follow_link_flag;
-	int          verify_transfer;	/* HPNVerifyTransfer: post-transfer
+	int          verify_transfer;	/* Verify transfer: post-transfer
 					 * XXH3 verify; warn+collect on
 					 * mismatch, never abort */
 	int          no_verify_repair;	/* auto-repair (#6): 0 = repair on
@@ -558,7 +558,7 @@ uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
     char ***out_paths, size_t *out_used);
 
 /*
- * Drain the HPNVerifyTransfer post-transfer hash-mismatch list (transfers
+ * Drain the verify transfer post-transfer hash-mismatch list (transfers
  * ownership of the path strings to the caller).  Non-zero return => some
  * file failed end-to-end verification => exit SFTP_EX_VERIFY_FAILED.
  */

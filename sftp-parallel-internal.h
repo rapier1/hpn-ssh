@@ -702,7 +702,7 @@ enum sftp_range_target {
  * here would silently give every module its own dead copy. */
 extern volatile sig_atomic_t parallel_user_abort_flag;
 
-/* One per range, for HPNVerifyTransfer per-range verification (upload). */
+/* One per range, for verify transfer per-range verification (upload). */
 struct sftp_range_vslot {
 	u_int64_t off;    /* original range start in the file */
 	u_int64_t len;    /* original range length */
@@ -722,7 +722,7 @@ struct sftp_range_tracker {
 	char                  *path;       /* TARGET path (the file written):
 					    * local on download, remote on
 					    * upload (xstrdup'd in new) */
-	/* HPNVerifyTransfer: when verify is set, the source path (the file
+	/* Verify transfer: when verify is set, the source path (the file
 	 * read - remote on download, local on upload) and a flag so the last
 	 * range to finalize runs a whole-file post-transfer verify on the
 	 * finalizing worker's live conn.  src_path xstrdup'd in new. */
@@ -747,7 +747,7 @@ struct sftp_range_tracker {
 	 * an interrupted transfer leaves no empty full-size placeholders
 	 * and verified resume only ever hashes files that hold data. */
 	int                    file_ensured;
-	/* HPNVerifyTransfer per-range verify (upload only): one slot per range
+	/* Verify transfer per-range verify (upload only): one slot per range
 	 * holding the original byte span and the teed source hash.  NULL unless
 	 * this is a verified upload.  Sized `total`; filled at submit. */
 	struct sftp_range_vslot *vslots;
@@ -854,7 +854,7 @@ struct sftp_work_unit {
 	int      skipped;      /* whole-file resume gate returned identical /
 				* target-larger: TransferLog "skipped", set
 				* before the rc collapse in execute_unit */
-	uint64_t range_hash;   /* HPNVerifyTransfer: XXH3 of the source bytes,
+	uint64_t range_hash;   /* Verify transfer: XXH3 of the source bytes,
 				* teed during a clean send; consumed into the
 				* tracker slot when acked == range_length. */
 	/* Shared across all range units of one file.  NULL for non-range
@@ -1248,14 +1248,14 @@ struct sftp_parallel {
 	 * needs-to-see" accumulation across threads. */
 	struct hpn_strlist          failed_paths;
 
-	/* HPNVerifyTransfer: files whose post-transfer XXH3 hash did NOT
+	/* Verify transfer: files whose post-transfer XXH3 hash did NOT
 	 * match the source.  The transfer is NOT aborted on a mismatch; the
 	 * path is recorded here (thread-safe append from workers) and the
 	 * end-of-transfer summary prints them.  A non-empty list makes
 	 * hpnsftp exit SFTP_EX_VERIFY_FAILED. */
 	struct hpn_strlist          verify_failed_paths;
 
-	/* HPNVerifyTransfer post-transfer phase: completed files (whole-file or
+	/* Verify transfer post-transfer phase: completed files (whole-file or
 	 * range-split) parked at completion instead of verifying inline, so
 	 * verify never runs on the transfer path.  sftp_parallel_wait submits
 	 * them as SFTP_OP_VERIFY units once the transfer queue drains; the now

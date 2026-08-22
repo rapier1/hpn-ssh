@@ -154,9 +154,8 @@ int global_pflag = 0;
 int global_fflag = 0;
 
 /*
- * HPNVerifyTransfer: when enabled (ssh_config HPNVerifyTransfer yes,
- * resolved at startup), every successfully transferred single-stream file
- * is XXH3-verified end-to-end after transfer.  A mismatch does NOT abort -
+ * Verify transfer: when enabled with -V, every successfully transferred
+ * single-stream file is XXH3-verified end-to-end after transfer.  A mismatch does NOT abort -
  * it is logged loudly and recorded; at exit a summary is printed and the
  * process returns SFTP_EX_VERIFY_FAILED (57).
  */
@@ -993,8 +992,8 @@ verify_print_summary(void)
 
 	if (verify_fail_count == 0)
 		return 0;
-	mprintf("\nHPNVerifyTransfer: %u file(s) FAILED post-transfer "
-	    "verification:\n", verify_fail_count);
+	mprintf("\nVerification FAILED for %u file(s) after transfer:\n",
+	    verify_fail_count);
 	for (i = 0; i < verify_fail_count; i++)
 		mprintf("    %s\n", verify_fail_list[i]);
 	return verify_fail_count;
@@ -3789,11 +3788,11 @@ main(int argc, char **argv)
 			break;
 		case 'V':
 			/*
-			 * Force HPNVerifyTransfer on - the dedicated switch for
-			 * what -o HPNVerifyTransfer=yes does via ssh_config.
-			 * Transfer-layer verify deserves a first-class flag, not
-			 * only an ssh-wide -o option (which plain hpnssh parses
-			 * but ignores).
+			 * Turn verify transfer on for this session. It is
+			 * requested per run by this flag, not by any config
+			 * keyword: transfer-layer verify deserves a first-class
+			 * flag rather than an ssh-wide -o option that plain
+			 * hpnssh would parse and ignore.
 			 */
 			verify_flag_user = 1;
 			break;
@@ -4053,7 +4052,7 @@ main(int argc, char **argv)
 	 */
 	hpn_verify_transfer = verify_flag_user;
 	/*
-	 * Propagate HPNVerifyTransfer state onto the connection so the
+	 * Propagate verify transfer state onto the connection so the
 	 * resume-decision hash callers can flag the hpn-check-file request
 	 * as STRICT (no sparse-skip sentinel).  When set, the user has
 	 * explicitly asked for maximum verification and shouldn't accept
@@ -4161,7 +4160,7 @@ main(int argc, char **argv)
 			    strerror(errno));
 
 	/*
-	 * HPNVerifyTransfer: if any file failed post-transfer verification,
+	 * Verify transfer: if any file failed post-transfer verification,
 	 * print the summary and exit with the distinct SFTP_EX_VERIFY_FAILED
 	 * code so automation can detect silent-corruption even though the
 	 * transfer itself was not aborted.  This takes precedence over the

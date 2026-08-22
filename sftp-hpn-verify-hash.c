@@ -1,6 +1,6 @@
 /*
  * sftp-hpn-verify-hash.c - shared verify hashing primitives for
- * HPNVerifyTransfer, linked into both the client and the server.
+ * Verify transfer, linked into both the client and the server.
  *
  * The primitive that lives here:
  *   - sftp_hpn_hash_file_ondisk: fsync + posix_fadvise(DONTNEED) + O_DIRECT

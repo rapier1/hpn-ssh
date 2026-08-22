@@ -128,8 +128,8 @@ void     sftp_conn_live_account(struct sftp_conn *conn, size_t nbytes);
 void sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn);
 
 /*
- * Set / query the HPNVerifyTransfer enabled state on a connection.
- * Resolved from ssh_config in sftp.c and stashed on conn->hpn; gates the
+ * Set / query the verify transfer enabled state on a connection.
+ * Latched from -V in sftp.c and stashed on conn->hpn; gates the
  * inline source-hash tee and the post-transfer verify phase.  Safe with
  * conn / conn->hpn NULL; query returns 0 in that case.
  */

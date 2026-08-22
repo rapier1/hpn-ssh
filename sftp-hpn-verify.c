@@ -445,7 +445,7 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 }
 
 /*
- * ── Inline source-hash accumulator (HPNVerifyTransfer 1b) ────────────────
+ * ── Inline source-hash accumulator (verify transfer 1b) ────────────────
  * The upload reads the whole source to send it; rather than re-read the
  * source a second time at verify, we tee those bytes into a streaming XXH3
  * as they are read.  State lives on conn->hpn so it survives from the upload
@@ -1319,8 +1319,8 @@ sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
  * still lives in sftp-client.c - it drives the progress meter + transfer log.)
  * ========================================================================== */
 
-/* HPNVerifyTransfer state accessors.  Set from sftp.c after ssh_config
- * resolution; read where verify is gated - arming the inline source-hash tee
+/* Verify transfer state accessors.  Set from sftp.c once -V has been
+ * parsed; read where verify is gated - arming the inline source-hash tee
  * and the classic post-transfer verify phase. */
 void
 sftp_conn_set_verify_transfer(struct sftp_conn *conn, int enabled)

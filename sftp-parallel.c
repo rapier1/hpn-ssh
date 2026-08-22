@@ -1267,7 +1267,7 @@ sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
 }
 
 /*
- * Drain the HPNVerifyTransfer post-transfer mismatch list.  Same
+ * Drain the verify transfer post-transfer mismatch list.  Same
  * as sftp_parallel_drain_failed_paths above: returns the total mismatch count and
  * (when out_paths is non-NULL) transfers ownership of the path strings to
  * the caller.  A non-zero return means hpnsftp should exit

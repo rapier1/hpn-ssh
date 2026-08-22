@@ -202,8 +202,8 @@ static const char *parallel_config_file = NULL;	/* -F */
 static char **parallel_extra_o = NULL;		/* -o KEY=VALUE list, NULL-term */
 static size_t parallel_extra_o_count = 0;
 static size_t parallel_extra_o_cap = 0;
-static int hpn_verify_transfer = 0;		/* HPNVerifyTransfer resolved */
-static int verify_flag = 0;			/* -V: force HPNVerifyTransfer on */
+static int hpn_verify_transfer = 0;		/* Verify transfer resolved */
+static int verify_flag = 0;			/* -V: force verify transfer on */
 static int family_flag = 0;			/* -4/-6: forward to -R source scp */
 static int compress_flag = 0;			/* -C: forward to -R source scp */
 static int zstd_level = 0;			/* -z: zstd@hpnssh.org level */
@@ -841,11 +841,11 @@ main(int argc, char **argv)
 			break;
 		case 'V':
 			/*
-			 * Force HPNVerifyTransfer on for this transfer - the
-			 * dedicated switch for what -o HPNVerifyTransfer=yes
-			 * does via ssh_config.  Transfer-layer verify deserves a
-			 * first-class flag rather than only an ssh-wide -o option
-			 * (which plain hpnssh also parses but ignores).
+			 * Turn verify transfer on for this transfer. It is
+			 * requested per run by this flag, not by any config
+			 * keyword: transfer-layer verify deserves a first-class
+			 * flag rather than an ssh-wide -o option that plain
+			 * hpnssh would parse and ignore.
 			 */
 			verify_flag = 1;
 			break;
@@ -1413,7 +1413,7 @@ do_sftp_connect(char *host, char *user, int port, char *sftp_direct,
 
 /*
  * Launch the parallel-streams orchestrator for a transfer involving `host`.
- * Always resolves HPNVerifyTransfer and latches it on the control connection
+ * Always resolves verify transfer and latches it on the control connection
  * (so the single-stream path verifies through that conn); only spins up worker
  * connections when -j N (N > 1) was requested.  On orchestrator start failure
  * it leaves parallel_orch NULL and reverts to single-stream.
@@ -1541,8 +1541,9 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	pcfg.print_flag    = showprogress ? SFTP_PROGRESS_ONLY : SFTP_QUIET;
 	/*
 	 * Resolves HPNUseBundle, HPNMaxRetries, HPNBundleSize,
-	 * HPNMaxAuthConcurrent and HPNVerifyTransfer into pcfg from
-	 * ssh_config + the -o overrides; must run before sftp_parallel_start.
+	 * HPNMaxAuthConcurrent into pcfg from ssh_config + the -o overrides;
+	 * must run before sftp_parallel_start.  Verify transfer is not a
+	 * config keyword and is latched separately from -V.
 	 * (The per-user worker cap, HPNMaxConcurrentWorkers, is a server-side
 	 * option delivered over the wire via hpn-max-workers@hpnssh.org and
 	 * applied above, not resolved from client ssh_config.)
@@ -1641,7 +1642,7 @@ scp_parallel_finish(struct sftp_conn *conn)
 		    &paths, &used) > 0) {
 			for (i = 0; i < used; i++) {
 				fmprintf(stderr,
-				    "HPNVerifyTransfer: FAILED: %s\n", paths[i]);
+				    "Verification FAILED: %s\n", paths[i]);
 				hpn_pm_filefail(HPNS_FF_VERIFY,
 				    paths[i], strlen(paths[i]));
 				free(paths[i]);
@@ -1656,7 +1657,7 @@ scp_parallel_finish(struct sftp_conn *conn)
 		if (sftp_conn_drain_verify_failures(conn, &paths, &used) > 0) {
 			for (i = 0; i < used; i++) {
 				fmprintf(stderr,
-				    "HPNVerifyTransfer: FAILED: %s\n", paths[i]);
+				    "Verification FAILED: %s\n", paths[i]);
 				hpn_pm_filefail(HPNS_FF_VERIFY,
 				    paths[i], strlen(paths[i]));
 				free(paths[i]);
@@ -1922,7 +1923,7 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 					}
 					/*
 					 * Launch the parallel orchestrator and
-					 * resolve HPNVerifyTransfer once the
+					 * resolve verify transfer once the
 					 * control connection is up (-j N only;
 					 * single-stream just latches verify).
 					 */
@@ -2049,7 +2050,7 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 			}
 			/*
 			 * Launch the parallel orchestrator (and resolve
-			 * HPNVerifyTransfer) for this source's connection,
+			 * Verify transfer) for this source's connection,
 			 * finished just below.  Downloads relaunch per source
 			 * argument because each may name a different remote
 			 * host, so one orchestrator can't serve them all.
@@ -2206,7 +2207,7 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 		 * fans the regular files across worker connections; the
 		 * post-transfer verify phase runs inside sftp_parallel_wait.
 		 * The per-call verify arg is resume-verify intent (-Z verified
-		 * resume), distinct from HPNVerifyTransfer which is carried in
+		 * resume), distinct from verify transfer which is carried in
 		 * the orchestrator config - so it follows resume_flag, exactly
 		 * like the download sites.  Passing 0 here sent workers down
 		 * the plain size-only resume path: fresh destinations failed
@@ -2538,7 +2539,7 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 			 * and runs the post-transfer verify phase in
 			 * sftp_parallel_wait.  verify carries scp's -Z
 			 * verified-resume intent, matching the single-stream
-			 * calls below; HPNVerifyTransfer rides on the
+			 * calls below; verify transfer rides on the
 			 * orchestrator config.
 			 */
 			if (parallel_orch != NULL) {

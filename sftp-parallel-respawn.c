@@ -371,7 +371,7 @@ spawn_one_worker(struct sftp_parallel *fleet)
 	sftp_set_live_counter(worker->conn, &worker->live_bytes);
 	__atomic_store_n(&worker->yield_req, 0, __ATOMIC_RELAXED);
 	sftp_set_yield_flag(worker->conn, &worker->yield_req);
-	/* Propagate HPNVerifyTransfer to this worker conn: the main conn gets
+	/* Propagate verify transfer to this worker conn: the main conn gets
 	 * it at sftp_init time, but worker conns are created here and must be
 	 * told explicitly.  Without it the upload's inline source-hash
 	 * accumulator never arms (verify falls back to a second full read). */

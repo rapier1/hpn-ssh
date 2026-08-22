@@ -50,7 +50,7 @@
  *       flips byte(s) at absolute file offset(s) in the data SENT.  The on-disk
  *       source is left clean, so a verified transfer's source hash stays good
  *       and the target hash diverges - a manufactured transfer/write corruption
- *       for exercising the integrity verify (HPNVerifyTransfer) and auto-repair.
+ *       for exercising the integrity verify (verify transfer) and auto-repair.
  *       Single offset, no suffix: flip once, then disarm (verify-detection /
  *       single-file repair-success - a repair re-transfer is clean).  :persist:
  *       re-flip to the SAME value on every write covering the offset (repair

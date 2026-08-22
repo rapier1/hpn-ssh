@@ -18,7 +18,7 @@
 
 /*
  * sftp-hpn-verify-hash.h - shared verify hashing primitives for
- * HPNVerifyTransfer, linked into both the client and the server.
+ * Verify transfer, linked into both the client and the server.
  *
  * sftp_hpn_hash_file_ondisk hashes what actually landed on the platter
  * (fsync + O_DIRECT), not the page cache.

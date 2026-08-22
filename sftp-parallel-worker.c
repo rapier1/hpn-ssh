@@ -125,7 +125,7 @@ worker_record_completion(struct sftp_worker *worker, off_t bytes, int success)
 }
 
 /*
- * HPNVerifyTransfer (parallel): verify one just-transferred whole file
+ * Verify transfer (parallel): verify one just-transferred whole file
  * end-to-end on the worker's connection and record a mismatch in the
  * orchestrator's thread-safe verify_failed_paths list.  Never fails the
  * unit - a mismatch is surfaced in the summary + exit code, not retried.
@@ -430,7 +430,7 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *u)
 		    "acked=%lld attempt=%d", worker->id,
 		    (long long)u->range_offset, (long long)u->range_length,
 		    rc, (long long)u->acked_bytes, u->attempt);
-		/* HPNVerifyTransfer: a range that transferred in one clean pass
+		/* Verify transfer: a range that transferred in one clean pass
 		 * (first attempt, fully acked) has a teed source hash good for
 		 * the whole original range - record it so finalize skips the
 		 * source re-read.  Pass the span actually covered: store_range_hash
@@ -736,7 +736,7 @@ worker_finalize_one_entry(struct sftp_parallel *fleet, struct sftp_worker *worke
 			transferlog_file(TRANSFERLOG_SUCCESS,
 			    (long long)u->size, u->dst_path);
 		/*
-		 * HPNVerifyTransfer: park every completed batched/bundled member
+		 * Verify transfer: park every completed batched/bundled member
 		 * for the post-transfer verify phase.  This is the one point the
 		 * pipelined upload batch AND the bundle members converge, so
 		 * parking here gives verify-on coverage to both - the single-file

@@ -177,7 +177,7 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path,
 }
 
 /*
- * HPNVerifyTransfer: record a range's teed source hash into its tracker slot.
+ * Verify transfer: record a range's teed source hash into its tracker slot.
  * The teed hash covers exactly the byte span the unit transferred in this
  * pass.  It is authoritative for the slot ONLY when that span still equals the
  * slot's original [off, len) - i.e. the range was never split.  The caller's
@@ -384,7 +384,7 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 		    (long long)t->file_bytes, t->path);
 	} else if (t->verify && worker != NULL) {
 		/*
-		 * HPNVerifyTransfer: the file's last range just finished
+		 * Verify transfer: the file's last range just finished
 		 * cleanly.  Park the completed tracker for the post-transfer
 		 * verify phase rather than verifying here - keeping verify off
 		 * the transfer path so an in-flight transfer never blocks on a
@@ -1716,7 +1716,7 @@ submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		return -1;
 
 	/* Upload: remote file is the target, local file is the source.  Tag the
-	 * tracker for post-transfer verify when HPNVerifyTransfer is on, so the
+	 * tracker for post-transfer verify when verify transfer is on, so the
 	 * last range to finalize runs the whole-file integrity check (range
 	 * units do not pass through execute_unit's whole-file verify). */
 	tracker = range_tracker_new(effective_ranges,

@@ -193,7 +193,7 @@ struct sftp_hpn_conn {
 	 * or auto-expires.  Atomic load/store; safe from any thread. */
 	volatile uint64_t watchdog_pause_until_ms;
 
-	/* HPNVerifyTransfer state, propagated from ssh_config at sftp_init
+	/* Verify transfer state, latched from the -V flag at sftp_init
 	 * time.  Gates the inline source-hash tee (so the post-transfer verify
 	 * has a source hash) and the post-transfer integrity check itself. */
 	int              verify_transfer_enabled;
@@ -298,7 +298,7 @@ struct sftp_hpn_conn {
 	int      fault_recv_throttling; /* this conn holds a recv-throttle slot */
 #endif
 
-	/* HPNVerifyTransfer (1b): inline source-hash accumulator.  When the
+	/* Verify transfer (1b): inline source-hash accumulator.  When the
 	 * upload computes the source XXH3 as it reads (post-transfer verify
 	 * enabled, whole-file upload), the result lands here so the verify
 	 * step consumes it instead of re-reading the source.  state is the
@@ -587,7 +587,7 @@ int sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
 void sftp_hpn_bundle_acc_free(struct sftp_hpn_bundle_acc *acc);
 
 /*
- * HPNVerifyTransfer (1b) inline source-hash accumulator (sftp-hpn-verify.c).
+ * Verify transfer (1b) inline source-hash accumulator (sftp-hpn-verify.c).
  * arm:     begin a streaming XXH3 over the source bytes.
  * feed:    add bytes as the source is read so the hash reflects the
  *          on-disk source.
