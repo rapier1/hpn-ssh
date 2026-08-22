@@ -17,12 +17,25 @@
  */
 
 /*
- * Phase 2 worker fault isolation:
- *
  * sftp-client.c's I/O helpers (send_msg, get_msg_extended) return -1 and set
- * conn->hpn->dead on EOF or write errors rather than calling fatal(). A dead
- * connection propagates up through execute_unit() back to the worker loop,
+ * conn->hpn->dead on EOF or write errors rather than calling fatal(). If
+ * fatal is called it will kill the entire fleet and we don't want that
+ * to happen. Instead the problem is handled by the reporter (a coordinator process)
+ * A dead connection propagates up through execute_unit back to the worker loop,
  * which re-queues the in-flight unit (if under MAX_RETRIES) and then exits.
+ *
+ * MAX_RETRIES = Retry budget per work unit.  Default 3 attempts (1st + 2 retries).
+ *
+ * Configured via ssh_config HPNMaxRetries copied to pcfg->max_retries.
+ * Valid range is [1, 20]:
+ *   - 1 = no retries (one attempt total).  Useful for diagnosing
+ *     transient-vs-permanent failures: every failure is final.
+ *   - 3 = default.  Covers ordinary network hiccups; doesn't punish
+ *     permanent failures (permission denied, disk full) with much
+ *     wasted retry time.
+ *   - 20 = upper bound.  For demonstrably flaky networks where the
+ *     transport layer hasn't yet self-recovered.  Above this the
+ *     retry storm itself becomes the load problem.
  *
  * The reporter's watchdog detects dead workers via kill(0) probes and elapsed
  * time since last completion. When a worker is classified DEAD, it sends
@@ -30,9 +43,6 @@
  * The reap loop joins the exited worker thread, frees its resources, and
  * spawns a replacement in a detached thread so the SSH handshake doesn't
  * block the reporter's 200ms progress ticks.
- *
- * Remaining Phase 2 work: convert protocol-level fatal()s (request ID
- * mismatch, unexpected packet type) to conn->hpn->dead.
  */
 
 #include "includes.h"
@@ -41,7 +51,6 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
-
 #include <dirent.h>
 #include <errno.h>
 #include <libgen.h>
@@ -66,52 +75,40 @@
 #include "sftp-workqueue.h"
 #include "sftp-parallel.h"
 #include "hpn-exit-codes.h"
-
-extern int showprogress;
-
-/* Work-queue depth is computed by work_queue_depth() below (defined after the
- * bundle constants it depends on), NOT a fixed macro: bundle mode needs a much
- * deeper queue than the old 64-file pipelining did. */
-
-/* Retry budget per work unit.  Default 3 attempts (initial + 2 retries).
- *
- * Configured via ssh_config HPNMaxRetries (parsed by readconf.c into
- * options.parallel_unit_max_retries, then copied to pcfg->max_retries by
- * sftp-parallel-config.c).  Clamped to [1, 20] at the readconf layer:
- *   - 1 = no retries (one attempt total).  Useful for diagnosing
- *     transient-vs-permanent failures: every failure is final.
- *   - 3 = default.  Covers ordinary network hiccups; doesn't punish
- *     permanent failures (permission denied, disk full) with much
- *     wasted retry time.
- *   - 20 = upper bound.  For demonstrably flaky networks where the
- *     transport layer hasn't yet self-recovered.  Above this the
- *     retry storm itself becomes the load problem.
- */
 #include "sftp-hpn-client.h"	/* deferred dir attrs */
 #include "sftp-parallel-internal.h"
+
+extern int showprogress;
 
 /* Single definition; declared extern in sftp-parallel-internal.h. */
 volatile sig_atomic_t parallel_user_abort_flag;
 
 
+/* The depth of the work queue depth neeed to be bundle aware because a single bundle
+ * might include thousands of files which, if we are just counting files, would destroy
+ * performance. So if we are using bundles the max depth is dependant on the size of
+ * the bundle
+ */
 static size_t
 work_queue_depth(const struct sftp_parallel_config *cfg)
 {
-	size_t base = (size_t)cfg->num_streams * UPLOAD_BATCH_SIZE * 4 +
-	    UPLOAD_BATCH_SIZE;
+	size_t base = 0, per_bundle = 0, depth = 0;
+	uint64_t target = 0;
 
+	base = (size_t)cfg->num_streams * UPLOAD_BATCH_SIZE * 4 +
+	    UPLOAD_BATCH_SIZE;
 	if (!cfg->use_bundle)
 		return base;
 
-	uint64_t target = (cfg->bundle_size > 0)
+	target = (cfg->bundle_size > 0)
 	    ? cfg->bundle_size : BUNDLE_TARGET_BYTES;
-	size_t per_bundle = (size_t)(target / BUNDLE_QUEUE_FILE_HINT);
+	per_bundle = (size_t)(target / BUNDLE_QUEUE_FILE_HINT);
 	if (per_bundle < UPLOAD_BATCH_SIZE)
 		per_bundle = UPLOAD_BATCH_SIZE;
 
 	/* num_streams full bundles + one round of headroom so the walker stays
 	 * ahead of all workers assembling at once. */
-	size_t depth = (size_t)cfg->num_streams * per_bundle * 2 +
+	depth = (size_t)cfg->num_streams * per_bundle * 2 +
 	    UPLOAD_BATCH_SIZE;
 	if (depth < base)
 		depth = base;
@@ -127,12 +124,12 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
  * object carrying thousands of files, while a file too large to bundle is one
  * object carrying one.  Only a file count is meaningful for both.
  *
- * Sized from the MAXIMUM a bundle can hold, never an assumed occupancy.  Real
- * packing varies with the workload - the byte target, the member cap and the
- * download path-list limit each bind in different cases - so a ceiling derived
- * from any one of them starves the others.  Against the hard maximum every
- * worker is guaranteed its two bundles whatever the packing, so the ceiling
- * bounds memory without ever being the thing that limits throughput.
+ * Sized from the MAXIMUM a bundle can hold.  Real packing varies with the workload.
+ * The byte target, the member cap, and the download path-list limit each
+ * bind in different cases. A ceiling derived from any one of them starves the
+ * others.  Against the hard maximum every worker is guaranteed its two
+ * bundles whatever the packing, so the ceiling bounds memory without ever
+ * being the thing that limits throughput.
  *
  * Without bundling a queued object is already a single file, so the queue's
  * own depth is the same quantity and is used as-is.
@@ -146,20 +143,12 @@ outstanding_file_cap(const struct sftp_parallel_config *cfg)
 	return (size_t)cfg->num_streams * 2 * BUNDLE_BATCH_MAX_FILES;
 }
 
-/* ---------- Worker SSH connection setup ---------- */
-
-/* ---------- Work units ---------- */
-
 /*
  * Walker-side failure recorder: bumps the aggregate counter and adds
  * "path: error" to the failed-paths list in one shot.  `err` may be
  * NULL when no errno-style message is available (e.g. depth limit,
  * "not a directory").  Single-call helper because every walker
  * skip-on-error site does both - bump + list.
- *
- * Public (declared in sftp-parallel.h) so the walkers in
- * sftp-parallel-walk.c can call it without seeing struct
- * sftp_parallel's internals.
  */
 void
 sftp_parallel_walker_record_failure(struct sftp_parallel *p, const char *path,
@@ -167,6 +156,8 @@ sftp_parallel_walker_record_failure(struct sftp_parallel *p, const char *path,
 {
 	char buf[PATH_MAX + 256];
 
+	/* need atomics because this happens while the fleet is live and
+	 * working concurrently. This prevents possible issues */
 	__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
 	if (path == NULL)
 		path = "(unknown)";
@@ -193,45 +184,45 @@ sftp_parallel_set_walker_phase(struct sftp_parallel *p, int phase)
  * Bounded thread-safe string list - see comment on struct hpn_strlist.
  */
 void
-hpn_strlist_init(struct hpn_strlist *l, size_t cap)
+hpn_strlist_init(struct hpn_strlist *list, size_t cap)
 {
-	pthread_mutex_init(&l->mu, NULL);
-	l->cap   = cap;
-	l->used  = 0;
-	l->total = 0;
-	l->items = (cap > 0) ? xcalloc(cap, sizeof(*l->items)) : NULL;
+	pthread_mutex_init(&list->mu, NULL);
+	list->cap   = cap;
+	list->used  = 0;
+	list->total = 0;
+	list->items = (cap > 0) ? xcalloc(cap, sizeof(*list->items)) : NULL;
 }
 
 void
-hpn_strlist_free(struct hpn_strlist *l)
+hpn_strlist_free(struct hpn_strlist *list)
 {
-	if (l->items != NULL) {
-		for (size_t i = 0; i < l->used; i++)
-			free(l->items[i]);
-		free(l->items);
-		l->items = NULL;
+	if (list->items != NULL) {
+		for (size_t i = 0; i < list->used; i++)
+			free(list->items[i]);
+		free(list->items);
+		list->items = NULL;
 	}
-	pthread_mutex_destroy(&l->mu);
-	l->used = 0;
-	l->cap  = 0;
+	pthread_mutex_destroy(&list->mu);
+	list->used = 0;
+	list->cap  = 0;
 }
 
 /*
- * Append `s` to the list.  Always bumps `total`; only allocates a
+ * Append `entry` to the list.  Always bumps `total`; only allocates a
  * new entry if `used < cap`.  Silently drops the string contents when
  * over cap so memory stays bounded; the count is preserved so the
  * user knows how many were dropped.
  */
 void
-hpn_strlist_append(struct hpn_strlist *l, const char *s)
+hpn_strlist_append(struct hpn_strlist *list, const char *entry)
 {
-	if (l == NULL || s == NULL)
+	if (list == NULL || entry == NULL)
 		return;
-	pthread_mutex_lock(&l->mu);
-	l->total++;
-	if (l->used < l->cap)
-		l->items[l->used++] = xstrdup(s);
-	pthread_mutex_unlock(&l->mu);
+	pthread_mutex_lock(&list->mu);
+	list->total++;
+	if (list->used < list->cap)
+		list->items[list->used++] = xstrdup(entry);
+	pthread_mutex_unlock(&list->mu);
 }
 
 /*
@@ -242,127 +233,33 @@ hpn_strlist_append(struct hpn_strlist *l, const char *s)
  * and the array.
  */
 uint64_t
-hpn_strlist_drain(struct hpn_strlist *l, char ***out, size_t *out_used)
+hpn_strlist_drain(struct hpn_strlist *list, char ***out, size_t *out_used)
 {
 	uint64_t total;
-	pthread_mutex_lock(&l->mu);
-	total = l->total;
+	pthread_mutex_lock(&list->mu);
+	total = list->total;
 	if (out != NULL && out_used != NULL) {
-		*out_used = l->used;
-		if (l->used > 0) {
-			*out = xcalloc(l->used, sizeof(**out));
-			for (size_t i = 0; i < l->used; i++)
-				(*out)[i] = l->items[i];   /* transfer ownership */
+		*out_used = list->used;
+		if (list->used > 0) {
+			*out = xcalloc(list->used, sizeof(**out));
+			for (size_t i = 0; i < list->used; i++)
+				(*out)[i] = list->items[i];   /* transfer ownership */
 		} else {
 			*out = NULL;
 		}
 	}
 	/* Reset the list so subsequent appends start fresh. */
-	if (l->items != NULL)
-		memset(l->items, 0, l->cap * sizeof(*l->items));
-	l->used  = 0;
-	l->total = 0;
-	pthread_mutex_unlock(&l->mu);
+	if (list->items != NULL)
+		memset(list->items, 0, list->cap * sizeof(*list->items));
+	list->used  = 0;
+	list->total = 0;
+	pthread_mutex_unlock(&list->mu);
 	return total;
 }
 
-/* ---------- Worker thread ---------- */
+/* ---------- Public API Functions ---------- */
 
-/*
- * Pending-counter trace: one line per inc/dec at -vvv (debug3) so we can pair
- * them post-run and find any work-unit leaks.  Self-gating; cheap when off.
- */
-/* ── BEGIN Phase 4 gap 1: pipelined-batch helpers ─────────────────────────
- *
- * Three helpers manage the deferred phase-5 state across parallel_worker_thread
- * iterations:
- *
- *   worker_finalize_one_entry
- *     Records the result of a single batch entry: success → completion;
- *     failure → retry (re-queue) or maximum-retries-give-up.  Mirrors the
- *     existing inline result loop in parallel_worker_thread.
- *
- *   worker_drain_pipeline
- *     Calls sftp_upload_batch_finish on the carry-over prev batch (if
- *     any), processes per-entry results, frees the heap arrays.  Called
- *     before handling any non-batch work and at parallel_worker_thread exit.
- *
- *   worker_run_batch_pipelined
- *     Runs one upload batch.  Allocates heap entry/unit arrays so they
- *     survive across the next iteration, calls sftp_upload_batch_send
- *     (which drains prev as part of its phase 1), finalises prev (if there
- *     was one), then saves THIS batch as the new prev.  On send failure,
- *     finalises this batch inline (no carry).
- * ──────────────────────────────────────────────────────────────────────── */
-
-/* ── END Phase 4 gap 1 ────────────────────────────────────────────────── */
-
-/* ── BEGIN Phase 5: bundle-mode batch dispatch ────────────────────────────
- *
- * worker_run_bundle is the bundle-mode analogue of
- * worker_run_batch_pipelined.  When w->bundle_enabled the worker calls
- * this instead - the batch of small files is packed into a single tar
- * stream and shipped through one OPEN/WRITE×N/CLOSE on a fresh bundle
- * handle.  This eliminates the per-file open/close round-trip that limits
- * Phase 4's pipelined batch path on high-RTT links.
- *
- * Per-entry success is signalled via the result field (set by
- * sftp_hpn_bundle_upload): on bundle failure every entry is marked -1, the
- * units retry through the normal worker_finalize_one_entry path, and the
- * batch is requeued unit-by-unit (no batch-wide retry needed since the
- * units are still individual work-queue entries).
- *
- * Synchronous in this first cut: no overlap with the next batch.  Could
- * be relaxed later by splitting send/finish like Phase 4 gap 1; not worth
- * the complexity until benchmarks show bundle close latency is a problem.
- * ────────────────────────────────────────────────────────────────────── */
-
-/* ── END Phase 5 ──────────────────────────────────────────────────────── */
-
-/* ---------- Reporter thread ---------- */
-
-/*
- * Adaptive throughput-based stall detection (first pass).
- *
- * For each worker, computes kbps since the last tick.  Identifies the
- * fastest worker (max_kbps).  If the path looks healthy (max_kbps >=
- * cfg.tput_path_healthy_kbps), increments outlier_ticks for any worker
- * whose kbps is dramatically below max.  Returns the per-worker outlier
- * tick count via *worker_outlier_ticks[i] (caller-allocated array of
- * length p->num_workers; must be called under workers_mu).
- *
- * The caller (parallel_watchdog_check) combines this with the existing
- * time-based and ssh-child-existence checks to make final classifications.
- *
- * FUTURE: a server-side query (e.g. hpn-conn-stats@hpnssh.org SSH global
- * request) could provide an independent signal about each worker's
- * receive-side state - useful when the local-side tput estimate is
- * noisy or when we want to confirm the rwnd rescue has already fired.
- * For now we rely on local bytes_total deltas only.
- */
-
-/*
- * Watchdog: classify each worker as HEALTHY/STALLED/DEAD based on (a) its
- * ssh child's existence and (b) elapsed time since last completion when
- * the queue had work to feed it, and (c) adaptive throughput-outlier
- * detection (if cfg.tput_path_healthy_kbps > 0). Returns nonzero if any
- * worker has transitioned to DEAD, signaling the reporter to abort the
- * orchestrator.
- */
-
-/* ---------- Public API ---------- */
-
-/*
- * Spawn one worker: SSH child via the master's socket, sftp_init, attach
- * to p->workers[] under workers_mu, then start the thread.  Returns the
- * worker on success, NULL on failure (with all resources cleaned up).
- * Used by sftp_parallel_start (during initial bring-up) and by the
- * reporter's respawn dispatch when a worker has died.
- */
-/* ---------- Parallel spawn helper ---------- */
-
-/* ---------- Public API ---------- */
-
+/* instantiate the fleet of workers and fire them up. */
 struct sftp_parallel *
 sftp_parallel_start(const struct sftp_parallel_config *cfg)
 {
@@ -372,11 +269,12 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		return NULL;
 	}
 
+	struct sftp_parallel *p = xcalloc(1, sizeof(*p));
+
 	/* Fresh fleet: clear the process-wide user-abort mirror left by a
 	 * previous orchestrator's interrupt (the post-interrupt rebuild). */
 	parallel_user_abort_flag = 0;
 
-	struct sftp_parallel *p = xcalloc(1, sizeof(*p));
 	p->cfg = *cfg;
 	/* cfg.port may point to a stack buffer in the caller that is only
 	 * valid until the enclosing scope exits.  Copy it into p->cfg_port_buf
@@ -385,18 +283,20 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		strlcpy(p->cfg_port_buf, cfg->port, sizeof(p->cfg_port_buf));
 		p->cfg.port = p->cfg_port_buf;
 	}
+
+	/* instantiate mutexs and the like */
 	pthread_mutex_init(&p->pending_mu, NULL);
 	pthread_cond_init(&p->pending_cv, NULL);
 	pthread_mutex_init(&p->workers_mu, NULL);
-	pthread_mutex_init(&p->bundle_mu, NULL);
 	pthread_mutex_init(&p->verify_pending_mu, NULL);
 	pthread_mutex_init(&p->retry_overflow_mu, NULL);
 
 	/* Parked-verify memory gate: fleet-wide budget on parked-path bytes.
 	 * When the parked set crosses this the submitter runs a verify wave
 	 * (parallel_verify_maybe_wave).  64 MiB, validated across a range of
-	 * values as a reasonable batching-vs-RAM balance. */
-	p->verify_park_budget = (uint64_t)64 * 1024ULL * 1024ULL;
+	 * values as a reasonable batching-vs-RAM balance. Basically, if we are
+	 * doing verification then do it occasionally during the transfer.*/
+	p->verify_park_budget = 64 * 1024 * 1024;
 
 	p->session_start_ms = monotime_ms();
 
@@ -409,27 +309,30 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	if (p->noprogress_abort_s < 0)
 		p->noprogress_abort_s = 0;
 
-	/* Phase-C tail redistribution (cooperative yield of a confirmed-lagging
-	 * endgame holder), resolved from ssh_config HPNTailRedistribute.  Default
-	 * ON; HPNTailRedistribute no leaves the tail detector telemetry-only. */
+	/* Enable tail redistribution (cooperative yield of a confirmed-lagging
+	 * endgame holder) from HPNTailRedistribute.  Default ON.
+	 * off leaves the tail detector as telemetry only. */
 	p->tail_redistribute = cfg->tail_redistribute;
 
-	/* Auto-repair (#6): on a post-transfer verify mismatch, re-transfer the
+	/* Auto-repair: on a post-transfer verify mismatch, re-transfer the
 	 * bad ranges and re-verify, bounded by a per-range attempt cap.  ON by
-	 * default; disabled by EITHER the -X VerifyRepair=no CLI token
-	 * (cfg->no_verify_repair) OR the HPN_NO_VERIFY_REPAIR env var.  The cap
-	 * defaults to 3 (HPN_VERIFY_REPAIR_ATTEMPTS); below 1 it is clamped to 1. */
+	 * default; disabled by the -X VerifyRepair=no CLI token
+	 * (cfg->no_verify_repair).  The attempt cap is fixed at 3. */
 	sftp_hpn_verify_repair_resolve(cfg->no_verify_repair,
 	    &p->verify_repair_enabled, &p->verify_repair_attempts);
 	p->last_worker_exit_code = -1;	/* no worker reaped yet */
-	/* Born-dead 0-bytes kill threshold.  RTT-derived once the path RTT is
+
+	/* Born-dead 0-bytes kill threshold. This is when a worker starts but there
+	 * is no data transmission for whatever reason. This can happen in lossy
+	 * environments. RTT-derived once the path RTT is
 	 * registered (sftp_parallel_set_path_rtt); BORN_DEAD_KILL_SEC until then. */
 	p->born_dead_sec = BORN_DEAD_KILL_SEC;
 	p->born_dead_stuck_offset = -1;	/* 0 is a valid range_offset */
 
-	/* Cap chosen so the worst-case allocation is bounded but the
-	 * "show me what failed" list is still useful for moderately
-	 * broken transfers.  HPN_FAILED_PATHS_MAX × ~256 bytes typical
+	/* List of failures. Cap chosen so the worst-case allocation is
+	 * bounded but the "show me what failed" list is still useful for moderately
+	 * broken transfers. Really broken ones could potentially spam the interface.
+	 * XXX: This might need to be revisited. HPN_FAILED_PATHS_MAX × ~256 bytes typical
 	 * = ~25 KiB at the default cap. */
 	hpn_strlist_init(&p->failed_paths, HPN_FAILED_PATHS_MAX);
 	hpn_strlist_init(&p->verify_failed_paths, HPN_FAILED_PATHS_MAX);
@@ -450,7 +353,8 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 
 	/* 3. Spawn workers in parallel to overlap SSH handshakes, but cap
 	 * the number of simultaneous unauthenticated connections to stay
-	 * under the server's MaxStartups limit (default 10:30:100). */
+	 * under the server's MaxStartups limit (default 10:30:100).
+	 8 in it's own clode block to limit namespace/declaration */
 	{
 		int n = cfg->num_streams;
 		int max_in_flight = cfg->max_auth_concurrent > 0
@@ -512,31 +416,28 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 }
 
 void
-sftp_parallel_wait(struct sftp_parallel *p)
+sftp_parallel_wait(struct sftp_parallel *p, struct sftp_conn *conn)
 {
 	if (p == NULL) return;
-	/* Push the last partially-filled bundle (the tail) before waiting.
+
+	/* Push the the tail before waiting.
 	 * Entering wait is the universal "done submitting" point for every
 	 * command - directory walks and direct (non-walker) put/get alike -
 	 * so the tail bundle can't be left stranded in the accumulator. */
 	parallel_bundle_flush_pending(p);
-	/* The caller drains only after a command has finished submitting, so
-	 * entering wait IS the "no more units coming" signal.  Publish it as
-	 * walker-phase DONE: for direct (non-walker) puts/gets nothing else
-	 * ever sets DONE, leaving the endgame machinery (range split,
-	 * straggler reaper) permanently gated off.  The walker's own DONE at
-	 * the end of a directory walk makes this a no-op there.  The public
-	 * submit entry points demote DONE back to SUBMIT, so the next
-	 * interactive command re-gates correctly; the internal parallel_unit_submit() does
-	 * NOT demote, because endgame-split pieces are submitted from a
-	 * worker thread mid-drain and must not un-arm the endgame state. */
+
+	/* Entering wait is the "no more units coming" signal, so publish
+	 * walker-phase DONE here. A directory walk already set it; direct
+	 * put/get never does, and without it the endgame machinery (range
+	 * split, straggler reaper) stays gated off for the whole transfer.
+	 * Demotion back to SUBMIT is the submit path's business. */
 	__atomic_store_n(&p->walker_phase, SFTP_WKP_DONE, __ATOMIC_RELAXED);
 	pthread_mutex_lock(&p->pending_mu);
 	while (p->pending > 0 && !p->abort_flag)
 		pthread_cond_wait(&p->pending_cv, &p->pending_mu);
 	pthread_mutex_unlock(&p->pending_mu);
 
-	/* Transfers drained: run the post-transfer verify phase.  Every
+	/* Transfers drained: run the post-transfer verify phase. Every
 	 * completed verified file (whole-file or range-split) parked its tracker
 	 * at completion; submit them now as SFTP_OP_VERIFY units so the idle
 	 * workers verify them in parallel on their own conns - off the transfer
@@ -550,18 +451,14 @@ sftp_parallel_wait(struct sftp_parallel *p)
 
 		if (vn > 0) {
 			/*
-			 * Verify-phase UX (HPN): set up the meter BEFORE the
-			 * submit, because parallel_verify_phase_submit blocks (the
-			 * verify units exceed the queue depth, so it interleaves
-			 * submitting with draining) and is most of the phase - put
-			 * it after, and the meter only covers the tail while the
-			 * frozen-100% transfer bar sits there looking hung.  Stop
-			 * that bar, announce the phase, and start a verify-labelled
-			 * meter sized to the bytes just moved (= bytes to verify);
-			 * the reporter advances it from verify_done_units (a
-			 * worker-bumped count - pending is ambiguous mid-submit).
-			 * Gated like the transfer meter (saved_showprogress) and
-			 * line (quiet).
+			 * Set the verify meter up BEFORE submitting: the submit
+			 * blocks and is most of the phase, so a meter started
+			 * after it would cover only the tail while the finished
+			 * transfer bar sits at 100% looking hung. Sized to the
+			 * bytes just moved; the reporter advances it from
+			 * verify_done_units, since pending is ambiguous
+			 * mid-submit. This is a lot of work for a progressmeter
+			 * but it will be a critical part of any GUI we develop.
 			 */
 			uint64_t moved = 0;
 			off_t vtotal;
@@ -620,8 +517,12 @@ sftp_parallel_wait(struct sftp_parallel *p)
 	/* HPN: apply the deferred directory attributes now that every
 	 * unit has drained (shared machinery with the serial walks). */
 	if (p->dirattrs != NULL) {
-		if (p->dirattrs_conn != NULL)
-			sftp_hpn_dirattrs_apply(p->dirattrs_conn, p->dirattrs);
+		if (conn != NULL)
+			sftp_hpn_dirattrs_apply(conn, p->dirattrs);
+		else if (p->dirattrs->n > 0)
+			error_f("no control connection: %d directory "
+			    "attribute(s) not applied.",
+			    p->dirattrs->n);
 		sftp_hpn_dirattrs_free(p->dirattrs);
 		free(p->dirattrs);
 		p->dirattrs = NULL;
@@ -968,7 +869,6 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	parallel_retry_overflow_free(p);
 	pthread_mutex_destroy(&p->verify_pending_mu);
 	pthread_mutex_destroy(&p->retry_overflow_mu);
-	pthread_mutex_destroy(&p->bundle_mu);
 	pthread_mutex_destroy(&p->pending_mu);
 	pthread_cond_destroy(&p->pending_cv);
 	pthread_mutex_destroy(&p->workers_mu);

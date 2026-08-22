@@ -301,6 +301,13 @@ parallel_respawn_sweep_stalled(struct sftp_parallel *p)
 	pthread_mutex_unlock(&p->workers_mu);
 }
 
+/*
+ * Spawn one worker: SSH child via the master's socket, sftp_init,
+ * attach to p->workers[] under workers_mu, then start the worker
+ * thread. Returns the worker on success, NULL on failure with all
+ * resources cleaned up. Used during initial bring-up and by the
+ * reporter's respawn dispatch when a worker has died.
+ */
 static struct sftp_worker *
 spawn_one_worker(struct sftp_parallel *p)
 {

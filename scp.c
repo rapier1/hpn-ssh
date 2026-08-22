@@ -1445,9 +1445,9 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	 * Resolve and latch the verify auto-repair settings on the control
 	 * conn so single-stream scp's classic verify phase repairs too - the
 	 * parallel path gets them via pcfg.no_verify_repair below.  Mirrors the
-	 * sftp.c wiring: -X VerifyRepair=no (sftp_no_verify_repair) or
-	 * HPN_NO_VERIFY_REPAIR disables; attempts from HPN_VERIFY_REPAIR_ATTEMPTS.
-	 * Contained in { } to narrow the scope for the temprary vars. 
+	 * sftp.c wiring: -X VerifyRepair=no (sftp_no_verify_repair) disables;
+	 * the attempt cap is fixed at 3.  Contained in { } to narrow the
+	 * scope for the temporary vars.
 	 */
 	{
 		int rep_enabled, rep_attempts;
@@ -1603,7 +1603,7 @@ scp_parallel_finish(struct sftp_conn *conn)
 	if (parallel_orch != NULL) {
 		struct sftp_parallel_stats pstats;
 
-		sftp_parallel_wait(parallel_orch);
+		sftp_parallel_wait(parallel_orch, conn);
 		/* A canceled run (interrupt / control-session loss) must not
 		 * exit 0: the destination is incomplete by design. */
 		if (sftp_parallel_was_aborted(parallel_orch)) {

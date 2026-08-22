@@ -937,7 +937,7 @@ parallel_bundle_member_pushfail(struct sftp_parallel *p,
 }
 
 /*
- * Flush the producer-side bundle accumulator (caller holds bundle_mu).
+ * Flush the producer-side bundle accumulator (submit thread only).
  *   n == 0  -> nothing to do.
  *   n == 1  -> push the lone member as an ordinary unit (a bundle of one is
  *              pointless; it still transfers, just un-bundled).
@@ -947,7 +947,7 @@ parallel_bundle_member_pushfail(struct sftp_parallel *p,
  * the single pickup subtraction at worker dispatch).
  */
 static void
-parallel_bundle_flush_locked(struct sftp_parallel *p)
+parallel_bundle_flush(struct sftp_parallel *p)
 {
 	int n = p->bundle_pending_n, i;
 
@@ -985,8 +985,9 @@ parallel_bundle_flush_locked(struct sftp_parallel *p)
 /*
  * Add a bundle-eligible small file to the accumulator.  It takes the same
  * pending / queued_bytes accounting as an individual unit (members are real
- * work units; the bundle just transports them), then accumulates under
- * bundle_mu and flushes a full bundle at the framed-byte or file-count cap.
+ * work units; the bundle just transports them), then accumulates and
+ * flushes a full bundle at the framed-byte or file-count cap. Submit
+ * thread only; there is no lock here by design.
  */
 static int
 parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
@@ -1002,10 +1003,9 @@ parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
 		__atomic_fetch_add(&p->queued_bytes, add_bytes,
 		    __ATOMIC_RELAXED);
 
-	pthread_mutex_lock(&p->bundle_mu);
 	/* A bundle carries one direction; flush a pending one of the other op. */
 	if (p->bundle_pending_n > 0 && p->bundle_pending_op != u->op)
-		parallel_bundle_flush_locked(p);
+		parallel_bundle_flush(p);
 	if (p->bundle_pending_n == p->bundle_pending_cap) {
 		int ncap = p->bundle_pending_cap ? p->bundle_pending_cap * 2 : 64;
 		p->bundle_pending = xreallocarray(p->bundle_pending,
@@ -1028,8 +1028,7 @@ parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
 	    BUNDLE_DL_FETCH_REQ_MAX) :
 	    hpn_bundle_should_flush(p->bundle_pending_framed,
 	    p->bundle_pending_n, target)))
-		parallel_bundle_flush_locked(p);
-	pthread_mutex_unlock(&p->bundle_mu);
+		parallel_bundle_flush(p);
 	sftp_workqueue_kick(p->q);
 	return 0;
 }
@@ -1039,12 +1038,16 @@ parallel_bundle_flush_pending(struct sftp_parallel *p)
 {
 	if (p == NULL)
 		return;
-	pthread_mutex_lock(&p->bundle_mu);
-	parallel_bundle_flush_locked(p);
-	pthread_mutex_unlock(&p->bundle_mu);
+	parallel_bundle_flush(p);
 	sftp_workqueue_kick(p->q);
 }
 
+/*
+ * Internal submit. Deliberately does NOT demote walker-phase DONE the way
+ * the public submit entry points do: endgame-split pieces arrive here from
+ * worker threads mid-drain, and demoting would un-arm the endgame state
+ * they were created by.
+ */
 int
 parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 {
@@ -1357,8 +1360,10 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode,
     int resume, int verify)
 {
-	/* New command submitting: re-gate the endgame machinery (see the
-	 * DONE-at-wait note in sftp_parallel_wait).  Main thread only. */
+	/* A new command is submitting, so demote walker-phase DONE back to
+	 * SUBMIT: sftp_parallel_wait leaves it DONE, and the endgame
+	 * machinery must re-gate for this command's units. Main thread
+	 * only. */
 	if (p != NULL && __atomic_load_n(&p->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
 		__atomic_store_n(&p->walker_phase, SFTP_WKP_SUBMIT,
@@ -1430,8 +1435,7 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
     const char *remote_path, const char *local_path, off_t size, mode_t mode,
     int resume, int verify)
 {
-	/* New command submitting: re-gate the endgame machinery (see the
-	 * DONE-at-wait note in sftp_parallel_wait).  Main thread only. */
+	/* Demote DONE back to SUBMIT (see sftp_parallel_submit_upload). */
 	if (p != NULL && __atomic_load_n(&p->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
 		__atomic_store_n(&p->walker_phase, SFTP_WKP_SUBMIT,

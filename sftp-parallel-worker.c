@@ -719,6 +719,11 @@ worker_process_result(struct sftp_worker *w, struct sftp_work_unit *u, int rc)
 	}
 }
 
+/*
+ * Record the result of one batch entry: success counts a completion;
+ * failure re-queues the unit for retry or, past the retry budget,
+ * gives it up permanently.
+ */
 static void
 worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
     struct sftp_work_unit *u, int rc)
@@ -778,6 +783,12 @@ worker_finalize_one_entry(struct sftp_parallel *p, struct sftp_worker *w,
 	worker_give_up_unit(p, w, u, "batch unit");
 }
 
+/*
+ * Finish the carried-over previous batch, if any: run
+ * sftp_upload_batch_finish on it, feed the per-entry results through
+ * worker_finalize_one_entry, and free the heap arrays. Called before
+ * handling any non-batch work and at parallel_worker_thread exit.
+ */
 static void
 worker_drain_pipeline(struct sftp_worker *w)
 {
@@ -798,6 +809,14 @@ worker_drain_pipeline(struct sftp_worker *w)
 	w->batch_prev_n       = 0;
 }
 
+/*
+ * Run one upload batch, pipelined. Allocates heap entry and unit
+ * arrays so they survive into the next iteration, calls
+ * sftp_upload_batch_send (which drains the previous batch as part of
+ * its first phase), finalizes the previous batch, then saves this
+ * batch as the new carry-over. On send failure this batch is
+ * finalized inline with no carry.
+ */
 static void
 worker_run_batch_pipelined(struct sftp_worker *w,
     struct sftp_work_unit **batch, int bn)
@@ -960,6 +979,23 @@ worker_finish_bundle(struct sftp_parallel *p, struct sftp_worker *w,
 		worker_finalize_one_entry(p, w, batch[i], results[i]);
 }
 
+/*
+ * Bundle-mode analogue of worker_run_batch_pipelined. When
+ * w->bundle_enabled the batch of small files is packed into a single
+ * tar stream and shipped through one OPEN/WRITE/CLOSE sequence on a
+ * fresh bundle handle, eliminating the per-file open/close round trip
+ * that limits the pipelined batch path on high-RTT links.
+ *
+ * Per-entry success is signalled via the result field set by
+ * sftp_hpn_bundle_upload. On bundle failure every entry is marked
+ * failed and the units retry individually through
+ * worker_finalize_one_entry; no batch-wide retry is needed because
+ * the units remain individual work-queue entries.
+ *
+ * Synchronous: no overlap with the next batch. Could be relaxed by
+ * splitting send and finish like the pipelined path; not worth the
+ * complexity until benchmarks show bundle close latency is a problem.
+ */
 static void
 worker_run_bundle(struct sftp_worker *w,
     struct sftp_work_unit **batch, int bn)

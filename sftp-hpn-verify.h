@@ -150,12 +150,11 @@ int sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
     off_t dest_size);
 
 /*
- * Resolve the verify auto-repair (#6) settings from the CLI/env precedence,
- * shared by the orchestrator (sftp_parallel_start) and the single-conn path
- * (sftp.c).  no_verify_repair_cli is the -X VerifyRepair=no token; the
- * HPN_NO_VERIFY_REPAIR env also disables.  Attempts come from
- * HPN_VERIFY_REPAIR_ATTEMPTS (default 3, clamped to >= 1).  One resolution so
- * the two call paths cannot drift.
+ * Resolve the verify auto-repair (#6) settings, shared by the orchestrator
+ * (sftp_parallel_start) and the single-conn path (sftp.c).
+ * no_verify_repair_cli is the -X VerifyRepair=no token and is the only
+ * disable; the attempt cap is fixed at 3.  One resolution so the two call
+ * paths cannot drift.
  */
 void sftp_hpn_verify_repair_resolve(int no_verify_repair_cli,
     int *enabled_out, int *attempts_out);

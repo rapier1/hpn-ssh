@@ -1300,8 +1300,8 @@ struct sftp_parallel {
 
 	/* Auto-repair: on a post-transfer verify mismatch the worker splices the
 	 * bad 64 MiB sub-chunks of its range inline and re-verifies, bounded by
-	 * the attempt cap + convergence.  ON by default; HPN_NO_VERIFY_REPAIR (or
-	 * -X VerifyRepair=no) disables; verify_repair_attempts is the cap (3). */
+	 * the attempt cap + convergence.  ON by default; -X VerifyRepair=no
+	 * disables; verify_repair_attempts is the cap (fixed at 3). */
 	int                         verify_repair_enabled;
 	int                         verify_repair_attempts;
 
@@ -1361,11 +1361,12 @@ struct sftp_parallel {
 	 * transfer's first files as un-bundled single round-trips.  Flushed
 	 * into a SFTP_OP_BUNDLE_* container at the framed-byte / file-count
 	 * cap (parallel_bundle_add) and at sftp_parallel_wait (the tail).
-	 * bundle_mu is defensive: bundle-eligible adds are main-thread-only
-	 * (worker re-submits are always bundle_ineligible, so they bypass
-	 * this and push individually).
+	 * Single-threaded by design: bundle-eligible adds and the flush run
+	 * only on the submit thread (worker re-submits are always
+	 * bundle_ineligible, so they bypass this and push individually).
+	 * There is deliberately no lock here; a future second producer must
+	 * bring one with it.
 	 */
-	pthread_mutex_t             bundle_mu;
 	struct sftp_work_unit     **bundle_pending;    /* member units, grown */
 	int                         bundle_pending_n;
 	int                         bundle_pending_cap;
@@ -1574,14 +1575,14 @@ struct sftp_parallel {
 	int      born_dead_stuck_count;  /* consecutive born-dead reaps on that
 	                                  * offset */
 
-	/* HPN: deferred directory attributes recorded by the producer
-	 * walks (shared helpers in sftp-hpn-client.c) and applied on the
-	 * control connection at the end of sftp_parallel_wait, once all
-	 * units have drained.  Written only by the walking (main) thread
-	 * and applied on that same thread; appended at the END of the
-	 * struct so no existing field offset shifts. */
+	/* HPN: directory attributes (final modes and times) recorded by the
+	 * producer walks and deferred until every unit has drained, since
+	 * applying them early would lock directories still being written.
+	 * sftp_parallel_wait applies them at the end, over the control
+	 * connection its caller passes in. The list is built by the shared
+	 * helpers in sftp-hpn-client.c. Written and applied on the walking
+	 * (main) thread only. */
 	struct sftp_hpn_dirattr_list *dirattrs;
-	struct sftp_conn *dirattrs_conn;
 };
 
 /*

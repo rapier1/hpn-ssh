@@ -199,9 +199,9 @@ struct sftp_hpn_conn {
 	int              verify_transfer_enabled;
 
 	/* Auto-repair (#6) settings for the single-conn (classic) verify phase,
-	 * resolved once in sftp.c from -X VerifyRepair / HPN_NO_VERIFY_REPAIR /
-	 * HPN_VERIFY_REPAIR_ATTEMPTS - the conn-side analogue of the
-	 * orchestrator's p->verify_repair_{enabled,attempts}.  The shared core
+	 * resolved once in sftp.c from the -X VerifyRepair token (attempt cap
+	 * fixed at 3) - the conn-side analogue of the orchestrator's
+	 * p->verify_repair_{enabled,attempts}.  The shared core
 	 * (sftp_hpn_verify_repair) reads these on this path. */
 	int              verify_repair_enabled;
 	int              verify_repair_attempts;

@@ -65,6 +65,7 @@ typedef void EditLine;
 #include "sftp-usergroup.h"
 #include "sftp-lustre-client.h"	/* maybe_apply_lustre_layout{,_local} */
 #include "sftp-parallel.h"
+#include "progressmeter.h"	/* pm_mprintf */
 
 /* File to read commands from */
 FILE* infile;
@@ -771,9 +772,12 @@ local_is_dir(const char *path)
  * (units_failed_aggregate > 0).  Callers MUST propagate -1 up to the
  * sftp exit code: silent data loss is unacceptable.  When parallel_orch
  * is NULL (parallel mode off) the function is a no-op returning 0.
+ *
+ * conn is the caller's control connection, lent to sftp_parallel_wait so
+ * it can apply the directory attributes the walks deferred.
  */
 static int
-parallel_flush(int final)
+parallel_flush(struct sftp_conn *conn, int final)
 {
 	struct sftp_parallel_stats pstats;
 	int rc = 0;
@@ -781,7 +785,7 @@ parallel_flush(int final)
 	if (parallel_orch == NULL)
 		return 0;
 
-	sftp_parallel_wait(parallel_orch);
+	sftp_parallel_wait(parallel_orch, conn);
 	sftp_parallel_progress_stop(parallel_orch);
 	sftp_parallel_get_stats(parallel_orch, &pstats);
 
@@ -1470,7 +1474,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 	 * the protocol-violation summary then happen at flush time.
 	 */
 	if (parallel_orch != NULL && !defer_parallel_wait) {
-		if (parallel_flush(0) != 0)
+		if (parallel_flush(conn, 0) != 0)
 			err = -1;
 	}
 
@@ -1676,7 +1680,7 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 	 * successive put commands pipeline their files instead of each one
 	 * stalling on a slow tail chunk from the previous file. */
 	if (parallel_orch != NULL && !defer_parallel_wait) {
-		if (parallel_flush(0) != 0)
+		if (parallel_flush(conn, 0) != 0)
 			err = -1;
 	}
 
@@ -2749,7 +2753,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		    strcasecmp(path1, "no") == 0 ||
 		    strcmp(path1, "0") == 0) {
 			if (defer_parallel_wait && parallel_orch != NULL) {
-				if (parallel_flush(0) != 0)
+				if (parallel_flush(conn, 0) != 0)
 					err = -1;
 			}
 			defer_parallel_wait = 0;
@@ -2767,7 +2771,7 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		 * flight or when the orchestrator isn't running.  Always
 		 * safe - independent of the defer flag. */
 		if (parallel_orch != NULL) {
-			if (parallel_flush(0) != 0)
+			if (parallel_flush(conn, 0) != 0)
 				err = -1;
 		}
 		if (!quiet)
@@ -3360,7 +3364,7 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	 * already drained itself, so the queue is empty and the wait returns
 	 * immediately.
 	 */
-	if (parallel_flush(1) != 0)
+	if (parallel_flush(conn, 1) != 0)
 		err = -1;
 
 	ssh_signal(SIGCHLD, SIG_DFL);
@@ -4060,8 +4064,7 @@ main(int argc, char **argv)
 	 * Resolve and propagate the verify auto-repair (#6) settings onto the
 	 * connection for the single-conn (classic) verify phase, mirroring the
 	 * orchestrator's resolution in sftp_parallel_start.  -X VerifyRepair=no
-	 * (no_verify_repair) or HPN_NO_VERIFY_REPAIR disables; the attempt cap
-	 * comes from HPN_VERIFY_REPAIR_ATTEMPTS (default 3).
+	 * (no_verify_repair) disables; the attempt cap is fixed at 3.
 	 */
 	{
 		int rep_enabled, rep_attempts;

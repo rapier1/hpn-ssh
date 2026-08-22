@@ -67,15 +67,15 @@
 #include "sftp-hpn-client.h"	/* shared dir helpers */
 #include "sftp-hpn-tree.h"	/* hpn-discover-tree fetch + records */
 #include "sftp-parallel-internal.h"	/* parallel_verify_prefix_register */
+#include "progressmeter.h"	/* pm_mprintf */
 
 /* Lazy accessor for the deferred directory-attribute list (applied at
  * the end of sftp_parallel_wait; see sftp-parallel-internal.h). */
 static struct sftp_hpn_dirattr_list *
-parallel_dirattrs(struct sftp_parallel *p, struct sftp_conn *conn)
+parallel_dirattrs(struct sftp_parallel *p)
 {
 	if (p->dirattrs == NULL)
 		p->dirattrs = xcalloc(1, sizeof(*p->dirattrs));
-	p->dirattrs_conn = conn;
 	return p->dirattrs;
 }
 
@@ -144,7 +144,7 @@ parallel_ul_defer_dir(struct sftp_upload_sink *sink, const char *dst,
 	struct parallel_ul_sink	*s = (struct parallel_ul_sink *)sink;
 
 	if (created || s->preserve_flag)
-		sftp_hpn_dirattrs_defer_remote(parallel_dirattrs(s->p, s->conn),
+		sftp_hpn_dirattrs_defer_remote(parallel_dirattrs(s->p),
 		    dst, a);
 }
 
@@ -264,7 +264,7 @@ parallel_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
 	if (!s->preserve_flag)
 		da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 	if (s->preserve_flag || mode != tmpmode)
-		sftp_hpn_dirattrs_defer_local(parallel_dirattrs(s->p, s->conn),
+		sftp_hpn_dirattrs_defer_local(parallel_dirattrs(s->p),
 		    dst, mode, tmpmode, &da);
 	return 0;
 }

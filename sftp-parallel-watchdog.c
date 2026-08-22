@@ -48,6 +48,22 @@
 #include "sftp-parallel.h"
 #include "sftp-parallel-internal.h"
 
+/*
+ * Adaptive throughput-based stall detection. Computes each worker's
+ * kbps since the last tick and a smoothed EMA, finds the fleet
+ * maxima, and, when the path looks healthy (max >=
+ * cfg.tput_path_healthy_kbps), bumps the outlier tick count of any
+ * worker running dramatically below the maximum. The watchdog checks
+ * combine those ticks with the time-based and ssh-child-existence
+ * checks for the final classification. No-op when
+ * cfg.tput_path_healthy_kbps is 0.
+ *
+ * FUTURE: a server-side query (e.g. an hpn-conn-stats@hpnssh.org SSH
+ * global request) could provide an independent signal about each
+ * worker's receive-side state, useful when the local estimate is
+ * noisy or to confirm the rwnd rescue has already fired. For now we
+ * rely on local byte deltas only.
+ */
 static void
 watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 {
@@ -1003,6 +1019,15 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 	return (next == WORKER_DEAD) ? 1 : 0;
 }
 
+/*
+ * Classify each worker as HEALTHY, STALLED, or DEAD from (a) its ssh
+ * child's existence, (b) elapsed time since last completion while the
+ * queue had work for it, and (c) the adaptive throughput-outlier
+ * ticks when enabled. Dooms newly DEAD workers (SIGTERM to the ssh
+ * child, w->doomed set) so the reporter's reap loop can join and
+ * respawn them. Returns nonzero when any worker is DEAD; the current
+ * caller ignores the return and relies on the reap loop instead.
+ */
 int
 parallel_watchdog_check(struct sftp_parallel *p)
 {

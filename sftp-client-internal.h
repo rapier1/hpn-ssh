@@ -138,8 +138,8 @@ int  sftp_conn_verify_transfer_enabled(struct sftp_conn *conn);
 
 /*
  * Set the single-conn (classic) verify auto-repair settings on a connection,
- * resolved in sftp.c from -X VerifyRepair / HPN_NO_VERIFY_REPAIR /
- * HPN_VERIFY_REPAIR_ATTEMPTS.  The conn-side analogue of the orchestrator's
+ * resolved in sftp.c from the -X VerifyRepair token (attempt cap fixed at
+ * 3).  The conn-side analogue of the orchestrator's
  * p->verify_repair_{enabled,attempts}; read by sftp_conn_verify_run_phase.
  * Safe with conn / conn->hpn NULL.
  */

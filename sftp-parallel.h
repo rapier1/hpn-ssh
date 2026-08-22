@@ -149,9 +149,7 @@ struct sftp_parallel_config {
 					 * mismatch, never abort */
 	int          no_verify_repair;	/* auto-repair (#6): 0 = repair on
 					 * (default), 1 = disabled via the
-					 * -X VerifyRepair=no CLI token.  OR'd
-					 * with HPN_NO_VERIFY_REPAIR in
-					 * sftp_parallel_start. */
+					 * -X VerifyRepair=no CLI token. */
 
 	/* Reporting: SFTP_QUIET / SFTP_PROGRESS_ONLY / SFTP_PRINT */
 	int          print_flag;
@@ -388,8 +386,14 @@ void sftp_parallel_register_verify_dir(struct sftp_parallel *p,
  * Block until all submitted units have been completed (or failed past
  * retry limits). After this returns, no in-flight work remains. May be
  * called multiple times; subsequent submits are valid until stop().
+ *
+ * conn is the caller's control connection, used once the units have
+ * drained to apply the directory attributes the producer walks deferred.
+ * May be NULL if the caller has no connection to lend; deferred
+ * attributes are then dropped and an error is logged naming how many,
+ * since the directories keep the temporary modes they were created with.
  */
-void sftp_parallel_wait(struct sftp_parallel *p);
+void sftp_parallel_wait(struct sftp_parallel *p, struct sftp_conn *conn);
 
 /*
  * Asynchronous abort. Sets a flag that workers check between units; in-flight
