@@ -224,46 +224,46 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 }
 
 void
-parallel_respawn_teardown_ssh(struct sftp_worker *w)
+parallel_respawn_teardown_ssh(struct sftp_worker *worker)
 {
-	if (w->fd_in >= 0)  { close(w->fd_in);  w->fd_in = -1; }
-	if (w->fd_out >= 0) { close(w->fd_out); w->fd_out = -1; }
-	if (w->ssh_pid > 0) {
+	if (worker->fd_in >= 0)  { close(worker->fd_in);  worker->fd_in = -1; }
+	if (worker->fd_out >= 0) { close(worker->fd_out); worker->fd_out = -1; }
+	if (worker->ssh_pid > 0) {
 		int status;
-		(void)waitpid(w->ssh_pid, &status, 0);
-		w->ssh_pid = -1;
+		(void)waitpid(worker->ssh_pid, &status, 0);
+		worker->ssh_pid = -1;
 	}
 }
 
 /* Register/deregister an in-flight spawn's ssh child so abort/stop can
  * SIGTERM it out of a blocking connect instead of waiting it out. */
 static int
-spawning_pid_register(struct sftp_parallel *p, pid_t pid)
+spawning_pid_register(struct sftp_parallel *fleet, pid_t pid)
 {
 	int registered = 0;
-	pthread_mutex_lock(&p->workers_mu);
-	if (p->n_spawning < SFTP_PARALLEL_MAX_WORKERS) {
-		p->spawning_since[p->n_spawning] = monotime();
-		p->spawning_pids[p->n_spawning++] = pid;
+	pthread_mutex_lock(&fleet->workers_mu);
+	if (fleet->n_spawning < SFTP_PARALLEL_MAX_WORKERS) {
+		fleet->spawning_since[fleet->n_spawning] = monotime();
+		fleet->spawning_pids[fleet->n_spawning++] = pid;
 		registered = 1;
 	}
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_unlock(&fleet->workers_mu);
 	return registered;
 }
 
 static void
-spawning_pid_deregister(struct sftp_parallel *p, pid_t pid)
+spawning_pid_deregister(struct sftp_parallel *fleet, pid_t pid)
 {
-	pthread_mutex_lock(&p->workers_mu);
-	for (int i = 0; i < p->n_spawning; i++) {
-		if (p->spawning_pids[i] == pid) {
-			p->spawning_pids[i] =
-			    p->spawning_pids[--p->n_spawning];
-			p->spawning_since[i] = p->spawning_since[p->n_spawning];
+	pthread_mutex_lock(&fleet->workers_mu);
+	for (int i = 0; i < fleet->n_spawning; i++) {
+		if (fleet->spawning_pids[i] == pid) {
+			fleet->spawning_pids[i] =
+			    fleet->spawning_pids[--fleet->n_spawning];
+			fleet->spawning_since[i] = fleet->spawning_since[fleet->n_spawning];
 			break;
 		}
 	}
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_unlock(&fleet->workers_mu);
 }
 
 /* A respawn whose connect+handshake has not completed in this many seconds is
@@ -281,56 +281,56 @@ spawning_pid_deregister(struct sftp_parallel *p, pid_t pid)
  * recovery proceed.  Called every reporter tick (the blocked spawn thread
  * cannot time itself out). */
 void
-parallel_respawn_sweep_stalled(struct sftp_parallel *p)
+parallel_respawn_sweep_stalled(struct sftp_parallel *fleet)
 {
 	time_t now = monotime();
 
-	pthread_mutex_lock(&p->workers_mu);
-	for (int i = 0; i < p->n_spawning; i++) {
-		if (p->spawning_pids[i] <= 0 ||
-		    now - p->spawning_since[i] < HPN_RESPAWN_STALL_SEC)
+	pthread_mutex_lock(&fleet->workers_mu);
+	for (int i = 0; i < fleet->n_spawning; i++) {
+		if (fleet->spawning_pids[i] <= 0 ||
+		    now - fleet->spawning_since[i] < HPN_RESPAWN_STALL_SEC)
 			continue;
 		debug2_ft("respawn pid %ld stalled %lds in handshake; SIGTERM to "
-		    "free the respawn slot", (long)p->spawning_pids[i],
-		    (long)(now - p->spawning_since[i]));
-		(void)kill(p->spawning_pids[i], SIGTERM);
+		    "free the respawn slot", (long)fleet->spawning_pids[i],
+		    (long)(now - fleet->spawning_since[i]));
+		(void)kill(fleet->spawning_pids[i], SIGTERM);
 		/* Re-arm so we don't SIGTERM-storm before the spawn thread
 		 * deregisters on the EOF; the child dies in milliseconds. */
-		p->spawning_since[i] = now;
+		fleet->spawning_since[i] = now;
 	}
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_unlock(&fleet->workers_mu);
 }
 
 /*
  * Spawn one worker: SSH child via the master's socket, sftp_init,
- * attach to p->workers[] under workers_mu, then start the worker
+ * attach to fleet->workers[] under workers_mu, then start the worker
  * thread. Returns the worker on success, NULL on failure with all
  * resources cleaned up. Used during initial bring-up and by the
  * reporter's respawn dispatch when a worker has died.
  */
 static struct sftp_worker *
-spawn_one_worker(struct sftp_parallel *p)
+spawn_one_worker(struct sftp_parallel *fleet)
 {
 	int registered = 0;
 
 	/* A dying/dead fleet takes no recruits - and a spawn that starts
 	 * after abort/stop would block the teardown drain on its connect. */
-	if (p->abort_flag || p->stopped)
+	if (fleet->abort_flag || fleet->stopped)
 		return NULL;
 
-	struct sftp_worker *w = xcalloc(1, sizeof(*w));
-	w->parent = p;
-	w->fd_in = w->fd_out = -1;
-	w->ssh_pid = -1;
-	pthread_mutex_init(&w->mu, NULL);
+	struct sftp_worker *worker = xcalloc(1, sizeof(*worker));
+	worker->parent = fleet;
+	worker->fd_in = worker->fd_out = -1;
+	worker->ssh_pid = -1;
+	pthread_mutex_init(&worker->mu, NULL);
 
-	u_int buflen = p->cfg.transfer_buflen ?
-	    p->cfg.transfer_buflen : DEFAULT_TRANSFER_BUFLEN;
-	u_int nreq = p->cfg.num_requests ?
-	    p->cfg.num_requests : DEFAULT_NUM_REQUESTS;
+	u_int buflen = fleet->cfg.transfer_buflen ?
+	    fleet->cfg.transfer_buflen : DEFAULT_TRANSFER_BUFLEN;
+	u_int nreq = fleet->cfg.num_requests ?
+	    fleet->cfg.num_requests : DEFAULT_NUM_REQUESTS;
 
-	if (spawn_worker_ssh(&p->cfg,
-	    &w->fd_in, &w->fd_out, &w->ssh_pid) != 0) {
+	if (spawn_worker_ssh(&fleet->cfg,
+	    &worker->fd_in, &worker->fd_out, &worker->ssh_pid) != 0) {
 		error_ft("ssh spawn failed");
 		goto fail;
 	}
@@ -339,7 +339,7 @@ spawn_one_worker(struct sftp_parallel *p)
 	 * SIGTERM it (the pipe EOF fails sftp_init within ms), and re-check
 	 * the flags AFTER registering: a teardown that swept the registry
 	 * just before our registration is caught here and we self-kill. */
-	if (!spawning_pid_register(p, w->ssh_pid)) {
+	if (!spawning_pid_register(fleet, worker->ssh_pid)) {
 		/* Registry full (SFTP_PARALLEL_MAX_WORKERS spawns already in
 		 * flight - pathological, e.g. a spawn storm).  An unregistered
 		 * child cannot be found by abort/stop's SIGTERM sweep, so
@@ -347,85 +347,85 @@ spawn_one_worker(struct sftp_parallel *p)
 		 * Reap it now and fail the spawn; respawn_owed persists, so the
 		 * dispatch retries once an in-flight slot frees. */
 		error_ft("spawn registry full; abandoning spawn");
-		(void)kill(w->ssh_pid, SIGTERM);
+		(void)kill(worker->ssh_pid, SIGTERM);
 		goto fail;
 	}
 	registered = 1;
-	if (p->abort_flag || p->stopped) {
-		(void)kill(w->ssh_pid, SIGTERM);
+	if (fleet->abort_flag || fleet->stopped) {
+		(void)kill(worker->ssh_pid, SIGTERM);
 		goto fail;
 	}
-	w->conn = sftp_init(w->fd_in, w->fd_out, buflen, nreq,
-	    p->cfg.limit_kbps);
-	spawning_pid_deregister(p, w->ssh_pid);
+	worker->conn = sftp_init(worker->fd_in, worker->fd_out, buflen, nreq,
+	    fleet->cfg.limit_kbps);
+	spawning_pid_deregister(fleet, worker->ssh_pid);
 	registered = 0;
-	if (w->conn == NULL) {
+	if (worker->conn == NULL) {
 		/* Quiet when the teardown killed our child out of the
 		 * connect; loud for a genuine init failure. */
-		if (p->abort_flag || p->stopped)
+		if (fleet->abort_flag || fleet->stopped)
 			debug_ft("sftp_init abandoned (abort)");
 		else
 			error_ft("sftp_init failed");
 		goto fail;
 	}
-	sftp_set_live_counter(w->conn, &w->live_bytes);
-	__atomic_store_n(&w->yield_req, 0, __ATOMIC_RELAXED);
-	sftp_set_yield_flag(w->conn, &w->yield_req);
+	sftp_set_live_counter(worker->conn, &worker->live_bytes);
+	__atomic_store_n(&worker->yield_req, 0, __ATOMIC_RELAXED);
+	sftp_set_yield_flag(worker->conn, &worker->yield_req);
 	/* Propagate HPNVerifyTransfer to this worker conn: the main conn gets
 	 * it at sftp_init time, but worker conns are created here and must be
 	 * told explicitly.  Without it the upload's inline source-hash
 	 * accumulator never arms (verify falls back to a second full read). */
-	sftp_conn_set_verify_transfer(w->conn, p->cfg.verify_transfer);
+	sftp_conn_set_verify_transfer(worker->conn, fleet->cfg.verify_transfer);
 
 	/* Insert into workers array under lock. */
-	pthread_mutex_lock(&p->workers_mu);
-	if (p->num_workers >= SFTP_PARALLEL_MAX_WORKERS) {
-		pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_lock(&fleet->workers_mu);
+	if (fleet->num_workers >= SFTP_PARALLEL_MAX_WORKERS) {
+		pthread_mutex_unlock(&fleet->workers_mu);
 		goto fail;
 	}
-	if (p->num_workers >= p->workers_cap) {
-		int newcap = p->workers_cap ? p->workers_cap * 2 : 8;
+	if (fleet->num_workers >= fleet->workers_cap) {
+		int newcap = fleet->workers_cap ? fleet->workers_cap * 2 : 8;
 		if (newcap > SFTP_PARALLEL_MAX_WORKERS)
 			newcap = SFTP_PARALLEL_MAX_WORKERS;
-		p->workers = xreallocarray(p->workers, newcap,
-		    sizeof(*p->workers));
-		p->workers_cap = newcap;
+		fleet->workers = xreallocarray(fleet->workers, newcap,
+		    sizeof(*fleet->workers));
+		fleet->workers_cap = newcap;
 	}
-	w->id = p->next_worker_id++;
-	p->workers[p->num_workers++] = w;
-	pthread_mutex_unlock(&p->workers_mu);
+	worker->id = fleet->next_worker_id++;
+	fleet->workers[fleet->num_workers++] = worker;
+	pthread_mutex_unlock(&fleet->workers_mu);
 
-	if (pthread_create(&w->tid, NULL, parallel_worker_thread, w) != 0) {
+	if (pthread_create(&worker->tid, NULL, parallel_worker_thread, worker) != 0) {
 		error_ft("pthread_create failed");
 		/* Roll back insertion. */
-		pthread_mutex_lock(&p->workers_mu);
-		for (int i = 0; i < p->num_workers; i++) {
-			if (p->workers[i] == w) {
-				memmove(&p->workers[i], &p->workers[i + 1],
-				    (p->num_workers - i - 1) *
-				    sizeof(*p->workers));
-				p->num_workers--;
+		pthread_mutex_lock(&fleet->workers_mu);
+		for (int i = 0; i < fleet->num_workers; i++) {
+			if (fleet->workers[i] == worker) {
+				memmove(&fleet->workers[i], &fleet->workers[i + 1],
+				    (fleet->num_workers - i - 1) *
+				    sizeof(*fleet->workers));
+				fleet->num_workers--;
 				break;
 			}
 		}
-		pthread_mutex_unlock(&p->workers_mu);
+		pthread_mutex_unlock(&fleet->workers_mu);
 		goto fail;
 	}
-	w->started = 1;
-	return w;
+	worker->started = 1;
+	return worker;
 
  fail:
 	if (registered)
-		spawning_pid_deregister(p, w->ssh_pid);
-	if (w->conn) sftp_free(w->conn);
-	if (w->fd_in >= 0) close(w->fd_in);
-	if (w->fd_out >= 0) close(w->fd_out);
-	if (w->ssh_pid > 0) {
+		spawning_pid_deregister(fleet, worker->ssh_pid);
+	if (worker->conn) sftp_free(worker->conn);
+	if (worker->fd_in >= 0) close(worker->fd_in);
+	if (worker->fd_out >= 0) close(worker->fd_out);
+	if (worker->ssh_pid > 0) {
 		int s;
-		(void)waitpid(w->ssh_pid, &s, 0);
+		(void)waitpid(worker->ssh_pid, &s, 0);
 	}
-	pthread_mutex_destroy(&w->mu);
-	free(w);
+	pthread_mutex_destroy(&worker->mu);
+	free(worker);
 	return NULL;
 }
 
@@ -434,7 +434,7 @@ spawn_one_worker(struct sftp_parallel *p)
 static void *
 respawn_worker_thread(void *arg)
 {
-	struct sftp_parallel *p = arg;
+	struct sftp_parallel *fleet = arg;
 
 	/*
 	 * Brief delay before attempting the replacement's SFTP handshake.
@@ -457,33 +457,33 @@ respawn_worker_thread(void *arg)
 	 * (user interrupt, fleet abort, session teardown).  Bail WITHOUT
 	 * spawning: a replacement would join a dead fleet.  This check is
 	 * also what makes the detached-thread lifetime safe - stop() drains
-	 * pending_respawns before freeing p, and that drain returns promptly
+	 * pending_respawns before freeing fleet, and that drain returns promptly
 	 * only because we exit here instead of attempting a connection. */
-	if (p->abort_flag || p->stopped) {
-		pthread_mutex_lock(&p->workers_mu);
-		p->pending_respawns--;
-		pthread_mutex_unlock(&p->workers_mu);
+	if (fleet->abort_flag || fleet->stopped) {
+		pthread_mutex_lock(&fleet->workers_mu);
+		fleet->pending_respawns--;
+		pthread_mutex_unlock(&fleet->workers_mu);
 		return NULL;
 	}
 
 	/*
-	 * Once spawn_one_worker returns, w is owned by the fleet (already
-	 * inserted into p->workers[] and running its thread), so the reporter
+	 * Once spawn_one_worker returns, worker is owned by the fleet (already
+	 * inserted into fleet->workers[] and running its thread), so the reporter
 	 * reap can pthread_join + destroy + free it at any moment.  Do NOT
-	 * dereference w here - a success only needs the NULL check.
+	 * dereference worker here - a success only needs the NULL check.
 	 */
-	struct sftp_worker *w = spawn_one_worker(p);
-	if (w == NULL) {
+	struct sftp_worker *worker = spawn_one_worker(fleet);
+	if (worker == NULL) {
 		/* Under an abort the failure is manufactured (we killed the
 		 * spawn ourselves) - expected fallout, not news. */
-		if (p->abort_flag || p->stopped)
+		if (fleet->abort_flag || fleet->stopped)
 			debug_ft("worker respawn abandoned (abort)");
 		else
 			error_ft("worker respawn failed");
 	}
-	pthread_mutex_lock(&p->workers_mu);
-	p->pending_respawns--;
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_lock(&fleet->workers_mu);
+	fleet->pending_respawns--;
+	pthread_mutex_unlock(&fleet->workers_mu);
 	return NULL;
 }
 
@@ -530,28 +530,28 @@ respawn_worker_thread(void *arg)
  *   is the next candidate; deferred for now.
  */
 int
-parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
+parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 {
 	time_t now_s = monotime();	/* misc.c, CLOCK_MONOTONIC seconds */
 
-	pthread_mutex_lock(&p->workers_mu);
-	int cur_workers  = p->num_workers;
-	int respawn_ceil = p->cfg.num_streams * RESPAWN_MULTIPLIER;
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_lock(&fleet->workers_mu);
+	int cur_workers  = fleet->num_workers;
+	int respawn_ceil = fleet->cfg.num_streams * RESPAWN_MULTIPLIER;
+	pthread_mutex_unlock(&fleet->workers_mu);
 
-	pthread_mutex_lock(&p->pending_mu);
-	uint64_t pending = p->pending;
-	pthread_mutex_unlock(&p->pending_mu);
+	pthread_mutex_lock(&fleet->pending_mu);
+	uint64_t pending = fleet->pending;
+	pthread_mutex_unlock(&fleet->pending_mu);
 
 	/* Absorb this tick's involuntary deaths into the backlog.
 	 * respawn_owed carries across cooldowns and pthread_create failures,
 	 * so the worker pool drains back up to num_streams once spawning
 	 * resumes. */
 	if (n_to_respawn > 0)
-		p->respawn_owed += n_to_respawn;
+		fleet->respawn_owed += n_to_respawn;
 
-	if (p->respawn_cooldown_dur_s == 0)
-		p->respawn_cooldown_dur_s = RESPAWN_COOLDOWN_BASE_SEC; /* lazy */
+	if (fleet->respawn_cooldown_dur_s == 0)
+		fleet->respawn_cooldown_dur_s = RESPAWN_COOLDOWN_BASE_SEC; /* lazy */
 
 	/*
 	 * Systemic peer-stall detector: push this tick's delta of peer-stall
@@ -561,18 +561,18 @@ parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
 	 * peer_stall_terminations (in the reap just above) and reads it here,
 	 * so no extra lock is needed.
 	 */
-	int ps_delta = p->peer_stall_terminations - p->peer_stall_prev_sample;
+	int ps_delta = fleet->peer_stall_terminations - fleet->peer_stall_prev_sample;
 	if (ps_delta < 0)
 		ps_delta = 0;
-	p->peer_stall_prev_sample = p->peer_stall_terminations;
-	p->peer_stall_window[p->peer_stall_window_pos % PEER_STALL_WINDOW] =
+	fleet->peer_stall_prev_sample = fleet->peer_stall_terminations;
+	fleet->peer_stall_window[fleet->peer_stall_window_pos % PEER_STALL_WINDOW] =
 	    ps_delta;
-	p->peer_stall_window_pos++;
+	fleet->peer_stall_window_pos++;
 	int ps_sum = 0;
 	for (int i = 0; i < PEER_STALL_WINDOW; i++)
-		ps_sum += p->peer_stall_window[i];
+		ps_sum += fleet->peer_stall_window[i];
 	int systemic_min =
-	    (p->cfg.num_streams * PEER_STALL_SYSTEMIC_FRAC_PCT + 99) / 100;
+	    (fleet->cfg.num_streams * PEER_STALL_SYSTEMIC_FRAC_PCT + 99) / 100;
 	if (systemic_min < PEER_STALL_SYSTEMIC_MIN)
 		systemic_min = PEER_STALL_SYSTEMIC_MIN;
 	int systemic = (ps_sum >= systemic_min);
@@ -582,45 +582,45 @@ parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
 	 * early exit from an active pause.  "Healthy" = the freshest raw max
 	 * throughput is at or above the configured floor (default 2000 kbps).
 	 */
-	int healthy = (p->cfg.tput_path_healthy_kbps > 0) &&
-	    (p->tput_last_raw_max_kbps >= p->cfg.tput_path_healthy_kbps);
+	int healthy = (fleet->cfg.tput_path_healthy_kbps > 0) &&
+	    (fleet->tput_last_raw_max_kbps >= fleet->cfg.tput_path_healthy_kbps);
 	if (healthy) {
-		if (p->respawn_healthy_since_s == 0) {
-			p->respawn_healthy_since_s = now_s;
-			p->respawn_decay_anchor_s  = now_s;
+		if (fleet->respawn_healthy_since_s == 0) {
+			fleet->respawn_healthy_since_s = now_s;
+			fleet->respawn_decay_anchor_s  = now_s;
 		}
-		while (p->respawn_cooldown_dur_s > RESPAWN_COOLDOWN_BASE_SEC &&
-		    now_s - p->respawn_decay_anchor_s >=
+		while (fleet->respawn_cooldown_dur_s > RESPAWN_COOLDOWN_BASE_SEC &&
+		    now_s - fleet->respawn_decay_anchor_s >=
 		    RESPAWN_COOLDOWN_DECAY_SEC) {
-			p->respawn_cooldown_dur_s /= 2;
-			if (p->respawn_cooldown_dur_s < RESPAWN_COOLDOWN_BASE_SEC)
-				p->respawn_cooldown_dur_s =
+			fleet->respawn_cooldown_dur_s /= 2;
+			if (fleet->respawn_cooldown_dur_s < RESPAWN_COOLDOWN_BASE_SEC)
+				fleet->respawn_cooldown_dur_s =
 				    RESPAWN_COOLDOWN_BASE_SEC;
-			p->respawn_decay_anchor_s += RESPAWN_COOLDOWN_DECAY_SEC;
+			fleet->respawn_decay_anchor_s += RESPAWN_COOLDOWN_DECAY_SEC;
 		}
 	} else {
-		p->respawn_healthy_since_s = 0;
+		fleet->respawn_healthy_since_s = 0;
 	}
 
 	/* Cooldown expiry, or early exit once the backend has recovered. */
 	int in_cooldown = 0;
-	if (p->respawn_resume_s != 0) {
-		if (now_s >= p->respawn_resume_s) {
+	if (fleet->respawn_resume_s != 0) {
+		if (now_s >= fleet->respawn_resume_s) {
 			debug_ft("respawn cooldown ended, resuming "
-			    "(epoch reset, owed=%d)", p->respawn_owed);
-			p->respawn_resume_s = 0;
-			p->respawn_epoch_count = 0;
-		} else if (healthy && p->respawn_healthy_since_s != 0 &&
-		    now_s - p->respawn_healthy_since_s >=
+			    "(epoch reset, owed=%d)", fleet->respawn_owed);
+			fleet->respawn_resume_s = 0;
+			fleet->respawn_epoch_count = 0;
+		} else if (healthy && fleet->respawn_healthy_since_s != 0 &&
+		    now_s - fleet->respawn_healthy_since_s >=
 		    RESPAWN_COOLDOWN_DECAY_SEC) {
 			/* debug-level: the operator-facing recovery line is the
 			 * reporter_flare falling-edge notice. */
 			debug_ft("respawn cooldown ended early: path healthy "
 			    "(%llukbps) for %ds - resuming respawns",
-			    (unsigned long long)p->tput_last_raw_max_kbps,
+			    (unsigned long long)fleet->tput_last_raw_max_kbps,
 			    RESPAWN_COOLDOWN_DECAY_SEC);
-			p->respawn_resume_s = 0;
-			p->respawn_epoch_count = 0;
+			fleet->respawn_resume_s = 0;
+			fleet->respawn_epoch_count = 0;
 		} else {
 			in_cooldown = 1;
 		}
@@ -632,29 +632,29 @@ parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
 	 * Pause respawns for the current escalating level, then double it
 	 * (capped) for the next burst.  No count cap, no abort - best-effort.
 	 */
-	if (!in_cooldown && p->respawn_owed > 0 &&
-	    (systemic || p->respawn_epoch_count >= respawn_ceil)) {
-		p->respawn_resume_s = now_s + p->respawn_cooldown_dur_s;
-		p->respawn_decay_anchor_s = now_s;	/* freeze decay while paused */
-		p->respawn_healthy_since_s = 0;		/* require fresh sustained
+	if (!in_cooldown && fleet->respawn_owed > 0 &&
+	    (systemic || fleet->respawn_epoch_count >= respawn_ceil)) {
+		fleet->respawn_resume_s = now_s + fleet->respawn_cooldown_dur_s;
+		fleet->respawn_decay_anchor_s = now_s;	/* freeze decay while paused */
+		fleet->respawn_healthy_since_s = 0;		/* require fresh sustained
 							 * health to exit early */
-		p->respawn_epoch_count = 0;
+		fleet->respawn_epoch_count = 0;
 		in_cooldown = 1;
 		/* debug-level: the operator-facing notice is the reporter_flare
 		 * rising-edge line; this keeps the per-entry detail for traces. */
 		debug_ft("respawn cooldown: %s - pausing respawns for %llds "
 		    "(healthy workers continue)",
 		    systemic ? "systemic peer stall" : "epoch-ceiling churn",
-		    (long long)p->respawn_cooldown_dur_s);
-		p->respawn_cooldown_dur_s *= 2;
-		if (p->respawn_cooldown_dur_s > RESPAWN_COOLDOWN_CAP_SEC)
-			p->respawn_cooldown_dur_s = RESPAWN_COOLDOWN_CAP_SEC;
+		    (long long)fleet->respawn_cooldown_dur_s);
+		fleet->respawn_cooldown_dur_s *= 2;
+		if (fleet->respawn_cooldown_dur_s > RESPAWN_COOLDOWN_CAP_SEC)
+			fleet->respawn_cooldown_dur_s = RESPAWN_COOLDOWN_CAP_SEC;
 	}
 
-	int target = p->cfg.num_streams;
+	int target = fleet->cfg.num_streams;
 	int slots  = target - cur_workers;
 	int to_spawn;
-	if (in_cooldown || p->abort_flag || p->stopped) {
+	if (in_cooldown || fleet->abort_flag || fleet->stopped) {
 		to_spawn = 0;
 	} else if (cur_workers == 0) {
 		/* Fleet empty: launch a SINGLE probe rather than num_streams
@@ -668,45 +668,45 @@ parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
 		 * next tick(s) still see cur_workers == 0 and launch additional
 		 * probes - the exact connection storm the single-probe design
 		 * exists to avoid.  One probe in flight is enough. */
-		to_spawn = (p->pending_respawns == 0 &&
-		    (p->respawn_owed > 0 || pending > 0)) ? 1 : 0;
+		to_spawn = (fleet->pending_respawns == 0 &&
+		    (fleet->respawn_owed > 0 || pending > 0)) ? 1 : 0;
 	} else {
-		to_spawn = (p->respawn_owed > 0 && slots > 0)
-		    ? ((p->respawn_owed < slots) ? p->respawn_owed : slots)
+		to_spawn = (fleet->respawn_owed > 0 && slots > 0)
+		    ? ((fleet->respawn_owed < slots) ? fleet->respawn_owed : slots)
 		    : 0;
 	}
 	if (to_spawn > 0) {
 		debug_ft("initiating respawn for %d worker(s) (current=%d "
 		    "target=%d owed=%d epoch=%d/%d cooldown_level=%llds%s)",
-		    to_spawn, cur_workers, target, p->respawn_owed,
-		    p->respawn_epoch_count + to_spawn, respawn_ceil,
-		    (long long)p->respawn_cooldown_dur_s,
+		    to_spawn, cur_workers, target, fleet->respawn_owed,
+		    fleet->respawn_epoch_count + to_spawn, respawn_ceil,
+		    (long long)fleet->respawn_cooldown_dur_s,
 		    cur_workers == 0 ? " probe" : "");
 	}
 	for (int i = 0; i < to_spawn; i++) {
-		if (p->abort_flag || p->stopped)
+		if (fleet->abort_flag || fleet->stopped)
 			break;
-		pthread_mutex_lock(&p->workers_mu);
-		p->pending_respawns++;
-		p->total_respawns++;
-		p->respawn_epoch_count++;
-		pthread_mutex_unlock(&p->workers_mu);
+		pthread_mutex_lock(&fleet->workers_mu);
+		fleet->pending_respawns++;
+		fleet->total_respawns++;
+		fleet->respawn_epoch_count++;
+		pthread_mutex_unlock(&fleet->workers_mu);
 		pthread_t rtid;
 		if (pthread_create(&rtid, NULL,
-		    respawn_worker_thread, p) == 0) {
+		    respawn_worker_thread, fleet) == 0) {
 			(void)pthread_detach(rtid);
 			/* Drain backlog only on success; a failed create
 			 * leaves owed in place so we retry next tick.  A probe
 			 * (owed may be 0) doesn't underflow the backlog. */
-			if (p->respawn_owed > 0)
-				p->respawn_owed--;
+			if (fleet->respawn_owed > 0)
+				fleet->respawn_owed--;
 		} else {
 			error_ft("respawn thread create failed");
-			pthread_mutex_lock(&p->workers_mu);
-			p->pending_respawns--;
-			p->total_respawns--;
-			p->respawn_epoch_count--;
-			pthread_mutex_unlock(&p->workers_mu);
+			pthread_mutex_lock(&fleet->workers_mu);
+			fleet->pending_respawns--;
+			fleet->total_respawns--;
+			fleet->respawn_epoch_count--;
+			pthread_mutex_unlock(&fleet->workers_mu);
 		}
 	}
 
@@ -718,14 +718,14 @@ parallel_respawn_dispatch(struct sftp_parallel *p, int n_to_respawn)
 	 * have a probe pending), so we wait and retry indefinitely rather than
 	 * dropping the transfer.
 	 */
-	pthread_mutex_lock(&p->workers_mu);
-	int all_gone = (p->num_workers == 0 && p->pending_respawns == 0);
-	pthread_mutex_unlock(&p->workers_mu);
-	if (all_gone && !in_cooldown && !p->abort_flag && pending > 0) {
+	pthread_mutex_lock(&fleet->workers_mu);
+	int all_gone = (fleet->num_workers == 0 && fleet->pending_respawns == 0);
+	pthread_mutex_unlock(&fleet->workers_mu);
+	if (all_gone && !in_cooldown && !fleet->abort_flag && pending > 0) {
 		error_ft("all workers gone with %llu unit(s) pending and no "
 		    "respawn could be launched -- aborting transfer",
 		    (unsigned long long)pending);
-		sftp_parallel_abort(p);
+		sftp_parallel_abort(fleet);
 		return 1;
 	}
 	return 0;
@@ -743,13 +743,13 @@ parallel_respawn_spawn_thread(void *arg)
 	int started = ++*ctx->started;
 	pthread_mutex_unlock(ctx->auth_mu);
 
-	if (ctx->p->cfg.print_flag != SFTP_QUIET) {
+	if (ctx->fleet->cfg.print_flag != SFTP_QUIET) {
 		if (started % ctx->max_in_flight == 0 || started == ctx->total)
 			fprintf(stderr, "Connecting workers %d of %d\n",
 			    started, ctx->total);
 	}
 
-	ctx->succeeded = (spawn_one_worker(ctx->p) != NULL) ? 1 : 0;
+	ctx->succeeded = (spawn_one_worker(ctx->fleet) != NULL) ? 1 : 0;
 
 	pthread_mutex_lock(ctx->auth_mu);
 	--*ctx->auth_in_flight;

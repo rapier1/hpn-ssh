@@ -281,11 +281,11 @@ int sftp_resolve_hpn_lustre_stripe_count(const char *host,
  * hpn-check-file@hpnssh.org - otherwise this is fatal (RESUME_INCOMPAT_MSG),
  * checked once up front on conn in the calling thread.
  */
-int sftp_parallel_submit_upload(struct sftp_parallel *p,
+int sftp_parallel_submit_upload(struct sftp_parallel *fleet,
     struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode,
     int resume, int verify);
-int sftp_parallel_submit_download(struct sftp_parallel *p,
+int sftp_parallel_submit_download(struct sftp_parallel *fleet,
     struct sftp_conn *conn,
     const char *remote_path, const char *local_path, off_t size, mode_t mode,
     int resume, int verify);
@@ -297,15 +297,15 @@ int sftp_parallel_submit_download(struct sftp_parallel *p,
  * (or write-only-via-helper) - no callers should grow direct field
  * access to bypass these.
  */
-int sftp_parallel_preserve_flag(const struct sftp_parallel *p);
-int sftp_parallel_follow_link_flag(const struct sftp_parallel *p);
-int sftp_parallel_is_aborting(const struct sftp_parallel *p);
+int sftp_parallel_preserve_flag(const struct sftp_parallel *fleet);
+int sftp_parallel_follow_link_flag(const struct sftp_parallel *fleet);
+int sftp_parallel_is_aborting(const struct sftp_parallel *fleet);
 /* 1 iff the abort was caused by the user's interrupt (Ctrl-C) rather than a
  * fleet failure; drives interrupt-aware (calm) messaging in flush/walker. */
-int sftp_parallel_user_abort(const struct sftp_parallel *p);
+int sftp_parallel_user_abort(const struct sftp_parallel *fleet);
 /* Number of parallel worker streams configured (-j N).  Returns 1 when
- * `p` is NULL (i.e. parallel mode is not engaged). */
-int sftp_parallel_num_streams(const struct sftp_parallel *p);
+ * `fleet` is NULL (i.e. parallel mode is not engaged). */
+int sftp_parallel_num_streams(const struct sftp_parallel *fleet);
 
 /* The HPNLustreStripeCount layout-policy entry points
  * (maybe_apply_lustre_layout / _local) moved to sftp-lustre-client.h. */
@@ -316,7 +316,7 @@ int sftp_parallel_num_streams(const struct sftp_parallel *p);
  * when err is NULL) to the failed-paths list.  Used by every walker
  * skip-on-error site.
  */
-void sftp_parallel_walker_record_failure(struct sftp_parallel *p,
+void sftp_parallel_walker_record_failure(struct sftp_parallel *fleet,
     const char *path, const char *err);
 
 /*
@@ -335,7 +335,7 @@ enum sftp_walker_phase {
 	SFTP_WKP_SUBMIT,  /* pushing units (blocks if the queue is full) */
 	SFTP_WKP_DONE,    /* enumeration complete */
 };
-void sftp_parallel_set_walker_phase(struct sftp_parallel *p, int phase);
+void sftp_parallel_set_walker_phase(struct sftp_parallel *fleet, int phase);
 
 /*
  * Default minimum file size at which a single file is split across workers
@@ -368,10 +368,10 @@ void sftp_parallel_set_walker_phase(struct sftp_parallel *p, int phase);
  * preserve_flag and follow_link_flag are taken from the orchestrator's
  * stored config.
  */
-int sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
+int sftp_parallel_upload_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify);
 
-int sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
+int sftp_parallel_download_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify);
 
 /*
@@ -379,7 +379,7 @@ int sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
  * path factoring (the glob / direct-dispatch path that bypasses the walker).
  * No-op unless verify is enabled.  Pass both the local and remote path.
  */
-void sftp_parallel_register_verify_dir(struct sftp_parallel *p,
+void sftp_parallel_register_verify_dir(struct sftp_parallel *fleet,
     const char *path);
 
 /*
@@ -393,13 +393,13 @@ void sftp_parallel_register_verify_dir(struct sftp_parallel *p,
  * attributes are then dropped and an error is logged naming how many,
  * since the directories keep the temporary modes they were created with.
  */
-void sftp_parallel_wait(struct sftp_parallel *p, struct sftp_conn *conn);
+void sftp_parallel_wait(struct sftp_parallel *fleet, struct sftp_conn *conn);
 
 /*
  * Asynchronous abort. Sets a flag that workers check between units; in-flight
  * units are allowed to finish. Safe to call from a signal handler.
  */
-void sftp_parallel_abort(struct sftp_parallel *p);
+void sftp_parallel_abort(struct sftp_parallel *fleet);
 
 /*
  * Register an external interrupt flag (typically sftp.c's `interrupted`,
@@ -411,21 +411,21 @@ void sftp_parallel_abort(struct sftp_parallel *p);
  * Call once after sftp_parallel_start() returns non-NULL.  Pass NULL to
  * clear a previously registered flag.
  */
-void sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
+void sftp_parallel_set_interrupt_flag(struct sftp_parallel *fleet,
     _Atomic sig_atomic_t *flag);
 
 /*
  * Enable/disable the post-transfer verify phase for work submitted from here
  * on.  The interactive client toggles this per command (put/getv enable it,
  * resume verbs disable it) since one orchestrator persists across commands.
- * No-op when p is NULL.
+ * No-op when fleet is NULL.
  */
-void sftp_parallel_set_verify_transfer(struct sftp_parallel *p, int on);
+void sftp_parallel_set_verify_transfer(struct sftp_parallel *fleet, int on);
 
 /* Per-command preserve toggle (put/get -p) for the parallel/bundle path; the
  * orchestrator persists across commands so each command pushes its effective
- * preserve here.  No-op when p is NULL. */
-void sftp_parallel_set_preserve(struct sftp_parallel *p, int on);
+ * preserve here.  No-op when fleet is NULL. */
+void sftp_parallel_set_preserve(struct sftp_parallel *fleet, int on);
 
 /*
  * Register an app-layer round-trip-time estimate (microseconds) for the
@@ -436,7 +436,7 @@ void sftp_parallel_set_preserve(struct sftp_parallel *p, int on);
  * every worker connection traverses the same path.  Pass 0 to indicate
  * "unknown" and fall back to the fixed-tick warmup gate.
  */
-void sftp_parallel_set_path_rtt(struct sftp_parallel *p, uint64_t rtt_us);
+void sftp_parallel_set_path_rtt(struct sftp_parallel *fleet, uint64_t rtt_us);
 
 /*
  * Drive a single global progress_meter for the duration of an aggregate
@@ -448,42 +448,42 @@ void sftp_parallel_set_path_rtt(struct sftp_parallel *p, uint64_t rtt_us);
  * Calling _start while a meter is already active is a no-op. Calling
  * _stop without a started meter is a no-op. label is copied internally.
  */
-void sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
+void sftp_parallel_progress_start(struct sftp_parallel *fleet, const char *label,
     off_t total_bytes);
-void sftp_parallel_progress_set_total(struct sftp_parallel *p,
+void sftp_parallel_progress_set_total(struct sftp_parallel *fleet,
     off_t total_bytes, size_t nfiles);
 /* Fill the one-shot fs-info cache before a streamed enumeration, so a submit
  * during the drain sends nothing on the connection carrying the reply. */
-void sftp_parallel_prewarm_fs_info(struct sftp_parallel *p,
+void sftp_parallel_prewarm_fs_info(struct sftp_parallel *fleet,
     struct sftp_conn *conn, const char *remote_path);
 /* Block until outstanding files fall below the fleet's ceiling.  Called by a
  * producer that can enumerate faster than the fleet drains, so its own memory
  * does not grow with the size of the tree. */
-void sftp_parallel_await_capacity(struct sftp_parallel *p);
-void sftp_parallel_progress_start_counted(struct sftp_parallel *p,
+void sftp_parallel_await_capacity(struct sftp_parallel *fleet);
+void sftp_parallel_progress_start_counted(struct sftp_parallel *fleet,
     const char *verb, off_t total_bytes);
-void sftp_parallel_progress_stop(struct sftp_parallel *p);
+void sftp_parallel_progress_stop(struct sftp_parallel *fleet);
 /* Scan a local path recursively; return total bytes of regular files and
  * optionally the file count via file_count_out (may be NULL). */
 off_t sftp_parallel_scan_upload_total(const char *src,
     uint64_t *file_count_out);
 
 /* Store the scan-time total file count (for the progress frames/meter). */
-void sftp_parallel_set_file_total(struct sftp_parallel *p, uint64_t total);
+void sftp_parallel_set_file_total(struct sftp_parallel *fleet, uint64_t total);
 
 /* Walker-authoritative per-file counts (for a final END-frame publish). */
-u_int sftp_parallel_files_submitted(struct sftp_parallel *p);
-u_int sftp_parallel_files_total(struct sftp_parallel *p);
+u_int sftp_parallel_files_submitted(struct sftp_parallel *fleet);
+u_int sftp_parallel_files_total(struct sftp_parallel *fleet);
 
 /* Non-zero after wait if the run was aborted (interrupt / control-session
  * loss / fatal error) - callers must not report success. */
-int sftp_parallel_was_aborted(struct sftp_parallel *p);
+int sftp_parallel_was_aborted(struct sftp_parallel *fleet);
 
 /*
  * Tear down: signal workers to exit, join all threads, close worker SSH
  * subprocesses, free everything. Idempotent.
  */
-void sftp_parallel_stop(struct sftp_parallel *p);
+void sftp_parallel_stop(struct sftp_parallel *fleet);
 
 /*
  * Aggregate orchestrator state snapshot.  Cheap (one mutex per worker
@@ -537,7 +537,7 @@ struct sftp_parallel_stats {
 	uint64_t elapsed_ms;
 };
 
-void sftp_parallel_get_stats(struct sftp_parallel *p,
+void sftp_parallel_get_stats(struct sftp_parallel *fleet,
     struct sftp_parallel_stats *out);
 
 /*
@@ -554,7 +554,7 @@ void sftp_parallel_get_stats(struct sftp_parallel *p,
  *
  * The list is reset by this call so subsequent failures start fresh.
  */
-uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
+uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
     char ***out_paths, size_t *out_used);
 
 /*
@@ -562,7 +562,7 @@ uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
  * ownership of the path strings to the caller).  Non-zero return => some
  * file failed end-to-end verification => exit SFTP_EX_VERIFY_FAILED.
  */
-uint64_t sftp_parallel_drain_verify_failures(struct sftp_parallel *p,
+uint64_t sftp_parallel_drain_verify_failures(struct sftp_parallel *fleet,
     char ***out_paths, size_t *out_used);
 
 /*

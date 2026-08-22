@@ -65,16 +65,16 @@
  * rely on local byte deltas only.
  */
 static void
-watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
+watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 {
-	if (p->cfg.tput_path_healthy_kbps == 0)
+	if (fleet->cfg.tput_path_healthy_kbps == 0)
 		return;	/* feature disabled */
 
 	uint64_t max_kbps = 0;      /* raw max - path-health gate only */
 	uint64_t max_ema_kbps = 0;  /* smoothed max - threshold basis */
 
-	double alpha = (p->cfg.tput_ema_alpha > 0.0)
-	    ? p->cfg.tput_ema_alpha : 0.2;
+	double alpha = (fleet->cfg.tput_ema_alpha > 0.0)
+	    ? fleet->cfg.tput_ema_alpha : 0.2;
 
 	/* First pass: compute per-worker raw kbps, update EMA, find maxima.
 	 *
@@ -89,30 +89,30 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 	 * threshold and falsely classifying slower-but-healthy peers.  The
 	 * raw max is kept separately so the path-health gate (step 3) still
 	 * reacts immediately to actual path state. */
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = p->workers[i];
+	for (int i = 0; i < fleet->num_workers; i++) {
+		struct sftp_worker *worker = fleet->workers[i];
 		uint64_t now_bytes;
-		pthread_mutex_lock(&w->mu);
-		now_bytes = w->bytes_total;
-		pthread_mutex_unlock(&w->mu);
-		now_bytes += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
+		pthread_mutex_lock(&worker->mu);
+		now_bytes = worker->bytes_total;
+		pthread_mutex_unlock(&worker->mu);
+		now_bytes += __atomic_load_n(&worker->live_bytes, __ATOMIC_RELAXED);
 
-		if (w->tput_check_ms == 0) {
+		if (worker->tput_check_ms == 0) {
 			/* First sample: initialize baselines, skip this tick. */
-			w->tput_check_bytes = now_bytes;
-			w->tput_check_ms = now;
-			w->tput_current_kbps = 0;
-			w->tput_ema_kbps = 0;
+			worker->tput_check_bytes = now_bytes;
+			worker->tput_check_ms = now;
+			worker->tput_current_kbps = 0;
+			worker->tput_ema_kbps = 0;
 			continue;
 		}
 
-		uint64_t elapsed_ms = now - w->tput_check_ms;
-		uint64_t bytes_delta = (now_bytes >= w->tput_check_bytes)
-		    ? (now_bytes - w->tput_check_bytes) : 0;
-		w->tput_current_kbps = (elapsed_ms > 0)
+		uint64_t elapsed_ms = now - worker->tput_check_ms;
+		uint64_t bytes_delta = (now_bytes >= worker->tput_check_bytes)
+		    ? (now_bytes - worker->tput_check_bytes) : 0;
+		worker->tput_current_kbps = (elapsed_ms > 0)
 		    ? bytes_delta * 1000ULL / elapsed_ms / 1024ULL : 0;
-		w->tput_check_bytes = now_bytes;
-		w->tput_check_ms = now;
+		worker->tput_check_bytes = now_bytes;
+		worker->tput_check_ms = now;
 
 		/* EMA update.  Skip when the worker has no unit in flight so
 		 * idle gaps between files don't decay the EMA toward zero and
@@ -129,31 +129,31 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		 * else-branch clear tput_outlier_ticks on the first tick of every
 		 * new unit, preventing the consec counter from ever reaching the
 		 * STALLED threshold on a persistently slow worker. */
-		uint64_t cur_unit_start = __atomic_load_n(&w->unit_start_ms,
+		uint64_t cur_unit_start = __atomic_load_n(&worker->unit_start_ms,
 		    __ATOMIC_RELAXED);
 		int w_idle = (cur_unit_start == 0);
 		if (!w_idle) {
-			if (cur_unit_start != w->tput_last_unit_start_ms) {
+			if (cur_unit_start != worker->tput_last_unit_start_ms) {
 				/* Worker transitioned to a new unit: cold-start
 				 * EMA so next ticks reflect actual performance. */
-				w->tput_ema_kbps = 0;
-				w->tput_ema_warmup_ticks = 0;
-				w->tput_last_unit_start_ms = cur_unit_start;
+				worker->tput_ema_kbps = 0;
+				worker->tput_ema_warmup_ticks = 0;
+				worker->tput_last_unit_start_ms = cur_unit_start;
 			}
-			if (w->tput_ema_kbps == 0)
-				w->tput_ema_kbps = w->tput_current_kbps;
+			if (worker->tput_ema_kbps == 0)
+				worker->tput_ema_kbps = worker->tput_current_kbps;
 			else
-				w->tput_ema_kbps = (uint64_t)(
-				    alpha * (double)w->tput_current_kbps +
-				    (1.0 - alpha) * (double)w->tput_ema_kbps);
-			if (w->tput_ema_warmup_ticks < TPUT_EMA_WARMUP_TICKS)
-				w->tput_ema_warmup_ticks++;
-			if (w->tput_ema_kbps > max_ema_kbps)
-				max_ema_kbps = w->tput_ema_kbps;
+				worker->tput_ema_kbps = (uint64_t)(
+				    alpha * (double)worker->tput_current_kbps +
+				    (1.0 - alpha) * (double)worker->tput_ema_kbps);
+			if (worker->tput_ema_warmup_ticks < TPUT_EMA_WARMUP_TICKS)
+				worker->tput_ema_warmup_ticks++;
+			if (worker->tput_ema_kbps > max_ema_kbps)
+				max_ema_kbps = worker->tput_ema_kbps;
 		}
 
-		if (w->tput_current_kbps > max_kbps)
-			max_kbps = w->tput_current_kbps;
+		if (worker->tput_current_kbps > max_kbps)
+			max_kbps = worker->tput_current_kbps;
 	}
 
 	/* Diagnostic: log per-worker raw and EMA kbps once every ~5 sec. */
@@ -162,13 +162,13 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		char per_worker[256];
 		int off = 0;
 		per_worker[0] = '\0';
-		for (int i = 0; i < p->num_workers; i++) {
-			struct sftp_worker *w = p->workers[i];
+		for (int i = 0; i < fleet->num_workers; i++) {
+			struct sftp_worker *worker = fleet->workers[i];
 			int n = snprintf(per_worker + off,
 			    sizeof(per_worker) - off,
-			    " w%d=%llu(ema=%llu)", w->id,
-			    (unsigned long long)w->tput_current_kbps,
-			    (unsigned long long)w->tput_ema_kbps);
+			    " w%d=%llu(ema=%llu)", worker->id,
+			    (unsigned long long)worker->tput_current_kbps,
+			    (unsigned long long)worker->tput_ema_kbps);
 			if (n < 0 || (size_t)(off + n) >= sizeof(per_worker))
 				break;
 			off += n;
@@ -177,18 +177,18 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		    "path_healthy=%llu%s",
 		    (unsigned long long)max_kbps,
 		    (unsigned long long)max_ema_kbps,
-		    (unsigned long long)p->cfg.tput_path_healthy_kbps,
+		    (unsigned long long)fleet->cfg.tput_path_healthy_kbps,
 		    per_worker);
 	}
 
 	/* Snapshot for the respawn throughput gate (checked in the reporter). */
-	p->tput_last_raw_max_kbps = max_kbps;
+	fleet->tput_last_raw_max_kbps = max_kbps;
 
 	/* Path-health gate uses raw max_kbps so it reacts immediately when
 	 * the link recovers (an EMA-smoothed gate would lag). */
-	if (max_kbps < p->cfg.tput_path_healthy_kbps) {
-		for (int i = 0; i < p->num_workers; i++)
-			p->workers[i]->tput_outlier_ticks = 0;
+	if (max_kbps < fleet->cfg.tput_path_healthy_kbps) {
+		for (int i = 0; i < fleet->num_workers; i++)
+			fleet->workers[i]->tput_outlier_ticks = 0;
 		return;
 	}
 
@@ -202,16 +202,16 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 	 * worker between queue pops legitimately shows kbps=0 and must not be
 	 * penalised. */
 	uint64_t threshold_kbps =
-	    (uint64_t)(max_ema_kbps * p->cfg.tput_outlier_fraction);
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = p->workers[i];
+	    (uint64_t)(max_ema_kbps * fleet->cfg.tput_outlier_fraction);
+	for (int i = 0; i < fleet->num_workers; i++) {
+		struct sftp_worker *worker = fleet->workers[i];
 		uint64_t in_flight;
-		pthread_mutex_lock(&w->mu);
-		in_flight = w->units_started - w->units_completed -
-		    w->units_failed;
-		pthread_mutex_unlock(&w->mu);
+		pthread_mutex_lock(&worker->mu);
+		in_flight = worker->units_started - worker->units_completed -
+		    worker->units_failed;
+		pthread_mutex_unlock(&worker->mu);
 
-		if (w->tput_ema_warmup_ticks < TPUT_EMA_WARMUP_TICKS) {
+		if (worker->tput_ema_warmup_ticks < TPUT_EMA_WARMUP_TICKS) {
 			/* EMA not yet warm - skip outlier detection, but don't
 			 * reset tput_outlier_ticks: a pre-accumulated consec count
 			 * from before this unit boundary should carry forward so a
@@ -242,10 +242,10 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		 * loops when one worker died and its replacement got killed
 		 * on its first tick of slow-start traffic.
 		 *
-		 * Skip when no RTT is known (p->path_rtt_us == 0); the
+		 * Skip when no RTT is known (fleet->path_rtt_us == 0); the
 		 * tick-based EMA warmup above is the fallback in that case.
 		 */
-		if (p->path_rtt_us > 0 && max_ema_kbps > 0) {
+		if (fleet->path_rtt_us > 0 && max_ema_kbps > 0) {
 			/*
 			 * max_ema_kbps is KiB/s (bytes/s / 1024; see the raw-kbps
 			 * computation in the first pass), so the ramp-window byte
@@ -257,7 +257,7 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 			 * gate exists to prevent.
 			 */
 			uint64_t warmup_bytes =
-			    ((uint64_t)max_ema_kbps * 1024ULL * p->path_rtt_us *
+			    ((uint64_t)max_ema_kbps * 1024ULL * fleet->path_rtt_us *
 			        (uint64_t)RAMP_RTTS) / 1000000ULL;
 			if (warmup_bytes < RAMP_WARMUP_BYTES_MIN)
 				warmup_bytes = RAMP_WARMUP_BYTES_MIN;
@@ -276,16 +276,16 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 			 * the gate lifts even if no unit has yet completed.
 			 */
 			uint64_t b;
-			pthread_mutex_lock(&w->mu);
-			b = w->bytes_total;
-			pthread_mutex_unlock(&w->mu);
-			b += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
+			pthread_mutex_lock(&worker->mu);
+			b = worker->bytes_total;
+			pthread_mutex_unlock(&worker->mu);
+			b += __atomic_load_n(&worker->live_bytes, __ATOMIC_RELAXED);
 
 			/* Time cap: lift the gate after RAMP_MAX_WARMUP_SEC
 			 * regardless of bytes so a genuinely-slow worker is
 			 * not protected for its entire slow lifetime. */
 			uint64_t unit_start = __atomic_load_n(
-			    &w->unit_start_ms, __ATOMIC_RELAXED);
+			    &worker->unit_start_ms, __ATOMIC_RELAXED);
 			/* Guard now > unit_start before the unsigned subtraction:
 			 * the worker can store a fresh unit_start_ms after we
 			 * sampled `now`, so unit_start > now would wrap to a huge
@@ -296,7 +296,7 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 			    (uint64_t)RAMP_MAX_WARMUP_SEC * 1000ULL);
 
 			if (b < warmup_bytes && !past_time_cap) {
-				w->tput_outlier_ticks = 0;
+				worker->tput_outlier_ticks = 0;
 				continue;
 			}
 		}
@@ -308,26 +308,26 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		 * the instant the marker goes stale (~3s after the engine
 		 * exits), executing a worker that just did legitimate work
 		 * and is ramping its first post-hash writes. */
-		if (w->conn != NULL &&
-		    sftp_conn_hash_op_live_total(w->conn) > 0) {
-			w->tput_outlier_ticks = 0;
-			w->tput_below_floor_ticks = 0;
+		if (worker->conn != NULL &&
+		    sftp_conn_hash_op_live_total(worker->conn) > 0) {
+			worker->tput_outlier_ticks = 0;
+			worker->tput_below_floor_ticks = 0;
 			continue;
 		}
 
-		if (w->tput_ema_kbps < threshold_kbps) {
-			w->tput_outlier_ticks++;
+		if (worker->tput_ema_kbps < threshold_kbps) {
+			worker->tput_outlier_ticks++;
 			debug_ft("worker %d tput-outlier: "
 			    "kbps=%llu ema=%llu threshold=%llu "
 			    "consec=%d in_flight=%llu",
-			    w->id,
-			    (unsigned long long)w->tput_current_kbps,
-			    (unsigned long long)w->tput_ema_kbps,
+			    worker->id,
+			    (unsigned long long)worker->tput_current_kbps,
+			    (unsigned long long)worker->tput_ema_kbps,
 			    (unsigned long long)threshold_kbps,
-			    w->tput_outlier_ticks,
+			    worker->tput_outlier_ticks,
 			    (unsigned long long)in_flight);
 		} else {
-			w->tput_outlier_ticks = 0;
+			worker->tput_outlier_ticks = 0;
 		}
 
 		/* Born-slow tracking: per-worker counter of consecutive ticks
@@ -340,15 +340,15 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
 		 * streak here. */
 		{
 			uint64_t born_slow_floor =
-			    (uint64_t)(p->cfg.tput_path_healthy_kbps *
+			    (uint64_t)(fleet->cfg.tput_path_healthy_kbps *
 			        BORN_SLOW_FLOOR_FRAC);
 			if (born_slow_floor > 0
-			    && w->tput_ema_kbps < born_slow_floor
-			    && w->tput_ema_warmup_ticks
+			    && worker->tput_ema_kbps < born_slow_floor
+			    && worker->tput_ema_warmup_ticks
 			        >= TPUT_EMA_WARMUP_TICKS)
-				w->tput_below_floor_ticks++;
+				worker->tput_below_floor_ticks++;
 			else
-				w->tput_below_floor_ticks = 0;
+				worker->tput_below_floor_ticks = 0;
 		}
 	}
 }
@@ -366,31 +366,31 @@ watchdog_sample_throughput(struct sftp_parallel *p, uint64_t now)
  * the fraction is intended as a future congestion-aware scale-down signal.
  */
 void
-parallel_watchdog_sync_check(struct sftp_parallel *p)
+parallel_watchdog_sync_check(struct sftp_parallel *fleet)
 {
 	uint64_t now_bytes = 0;
 	uint64_t total_in_flight = 0;
 	uint64_t now_ms = monotime_ms();
 	int any_paused = 0;	/* any worker heart-beating through a verify/hash */
 
-	pthread_mutex_lock(&p->workers_mu);
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = p->workers[i];
-		pthread_mutex_lock(&w->mu);
-		now_bytes += w->bytes_total;
-		total_in_flight += w->units_started - w->units_completed -
-		    w->units_failed;
-		pthread_mutex_unlock(&w->mu);
-		now_bytes += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
-		if (sftp_conn_watchdog_pause_until_ms(w->conn) > now_ms)
+	pthread_mutex_lock(&fleet->workers_mu);
+	for (int i = 0; i < fleet->num_workers; i++) {
+		struct sftp_worker *worker = fleet->workers[i];
+		pthread_mutex_lock(&worker->mu);
+		now_bytes += worker->bytes_total;
+		total_in_flight += worker->units_started - worker->units_completed -
+		    worker->units_failed;
+		pthread_mutex_unlock(&worker->mu);
+		now_bytes += __atomic_load_n(&worker->live_bytes, __ATOMIC_RELAXED);
+		if (sftp_conn_watchdog_pause_until_ms(worker->conn) > now_ms)
 			any_paused = 1;
 	}
-	now_bytes += p->retired_bytes;
-	pthread_mutex_unlock(&p->workers_mu);
+	now_bytes += fleet->retired_bytes;
+	pthread_mutex_unlock(&fleet->workers_mu);
 
-	uint64_t delta = (now_bytes >= p->sync_stall_prev_bytes)
-	    ? (now_bytes - p->sync_stall_prev_bytes) : 0;
-	p->sync_stall_prev_bytes = now_bytes;
+	uint64_t delta = (now_bytes >= fleet->sync_stall_prev_bytes)
+	    ? (now_bytes - fleet->sync_stall_prev_bytes) : 0;
+	fleet->sync_stall_prev_bytes = now_bytes;
 
 	/* First sample: prev_bytes was 0, so delta spans all bytes ever
 	 * moved - not an interval.  Skip both accruals below via a
@@ -399,12 +399,12 @@ parallel_watchdog_sync_check(struct sftp_parallel *p)
 	 * noprogress_consec_ticks at each wrap - capping it at
 	 * SYNC_STALL_WINDOW-1, below every HPNStallAbortTimeout, so the
 	 * fleet abort could never fire. */
-	int first_tick = !p->sync_seen_first_tick;
-	p->sync_seen_first_tick = 1;
+	int first_tick = !fleet->sync_seen_first_tick;
+	fleet->sync_seen_first_tick = 1;
 
-	pthread_mutex_lock(&p->pending_mu);
-	uint64_t pending = p->pending;
-	pthread_mutex_unlock(&p->pending_mu);
+	pthread_mutex_lock(&fleet->pending_mu);
+	uint64_t pending = fleet->pending;
+	pthread_mutex_unlock(&fleet->pending_mu);
 
 	/* Sync-stall observer (write-cache saturation signal): zero aggregate
 	 * progress WHILE a unit is in flight.  First tick: prev_bytes was 0 so
@@ -412,7 +412,7 @@ parallel_watchdog_sync_check(struct sftp_parallel *p)
 	int stalled_now = (!first_tick && delta == 0 &&
 	    total_in_flight > 0);
 	if (stalled_now)
-		p->sync_stall_ticks++;
+		fleet->sync_stall_ticks++;
 
 	/* Fleet-abort no-progress window: zero aggregate progress while work
 	 * REMAINS and no worker is heart-beating.  Unlike the observer above this
@@ -421,15 +421,15 @@ parallel_watchdog_sync_check(struct sftp_parallel *p)
 	 * case total_in_flight == 0 would otherwise mask. */
 	if (!first_tick && delta == 0 && pending > 0 &&
 	    !any_paused)
-		p->noprogress_consec_ticks++;
+		fleet->noprogress_consec_ticks++;
 	else
-		p->noprogress_consec_ticks = 0;
+		fleet->noprogress_consec_ticks = 0;
 
 	/* Any sign of life resets the unproductive-death streak: a worker moved
 	 * bytes this tick, or one is heart-beating through a long verify/hash
 	 * (watchdog-paused).  Either way the fleet is not dead. */
 	if (delta > 0 || any_paused)
-		p->unproductive_deaths = 0;
+		fleet->unproductive_deaths = 0;
 
 	/*
 	 * Fleet abort.  Give up on the whole transfer only when EVERY base
@@ -442,33 +442,33 @@ parallel_watchdog_sync_check(struct sftp_parallel *p)
 	 * transfer alive - the no-progress window and the unproductive-death
 	 * streak both reset on any sign of life above.
 	 */
-	if (p->noprogress_abort_s > 0 && !p->abort_flag && !any_paused &&
+	if (fleet->noprogress_abort_s > 0 && !fleet->abort_flag && !any_paused &&
 	    pending > 0 &&
-	    p->noprogress_consec_ticks >= p->noprogress_abort_s) {
-		int abort_n = p->cfg.num_streams * FLEET_ABORT_UNPRODUCTIVE_MULT;
+	    fleet->noprogress_consec_ticks >= fleet->noprogress_abort_s) {
+		int abort_n = fleet->cfg.num_streams * FLEET_ABORT_UNPRODUCTIVE_MULT;
 		if (abort_n < 2)
 			abort_n = 2;
-		if (p->unproductive_deaths >= abort_n) {
+		if (fleet->unproductive_deaths >= abort_n) {
 			error("transfer stalled: no worker can establish a working "
 			    "connection (%d consecutive respawns produced no data, "
 			    "last worker exit %d), 0 bytes moved for ~%ds with "
 			    "%llu unit(s) pending - aborting",
-			    p->unproductive_deaths, p->last_worker_exit_code,
-			    p->noprogress_consec_ticks, (unsigned long long)pending);
-			sftp_parallel_abort(p);
+			    fleet->unproductive_deaths, fleet->last_worker_exit_code,
+			    fleet->noprogress_consec_ticks, (unsigned long long)pending);
+			sftp_parallel_abort(fleet);
 		}
 	}
 
-	if (++p->sync_stall_window_pos >= SYNC_STALL_WINDOW) {
-		double frac = (double)p->sync_stall_ticks / SYNC_STALL_WINDOW;
+	if (++fleet->sync_stall_window_pos >= SYNC_STALL_WINDOW) {
+		double frac = (double)fleet->sync_stall_ticks / SYNC_STALL_WINDOW;
 		debug_ft("sync-stall: %u/%u ticks (%.0f%%) - %s",
-		    p->sync_stall_ticks, SYNC_STALL_WINDOW,
+		    fleet->sync_stall_ticks, SYNC_STALL_WINDOW,
 		    frac * 100.0,
 		    frac >= SYNC_STALL_THRESHOLD
 		        ? "possible write-cache saturation"
 		        : "nominal");
-		p->sync_stall_ticks = 0;
-		p->sync_stall_window_pos = 0;
+		fleet->sync_stall_ticks = 0;
+		fleet->sync_stall_window_pos = 0;
 	}
 }
 
@@ -482,7 +482,7 @@ parallel_watchdog_sync_check(struct sftp_parallel *p)
  * only for short critical sections (state read + transition).
  */
 static int
-watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
+watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worker,
     uint64_t now, int queue_has_work, int endgame_idle)
 {
 	enum worker_health prev, next;
@@ -492,27 +492,27 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 					 * the transition log must not claim
 					 * "no progress" for it */
 
-	pthread_mutex_lock(&w->mu);
-	prev = w->health;
+	pthread_mutex_lock(&worker->mu);
+	prev = worker->health;
 	/* Already doomed: the kill was sent and the worker is draining
 	 * toward reap - nothing the inactivity heuristics decide matters
 	 * anymore, and re-evaluating them re-triggers the doom branches
 	 * every tick (observed: one ENDGAME-REAP log line per second
 	 * against a worker that cannot die mid-phase).  Doom is
 	 * once-per-death; only the SIGKILL escalation below still runs. */
-	if (w->doomed) {
-		pthread_mutex_unlock(&w->mu);
+	if (worker->doomed) {
+		pthread_mutex_unlock(&worker->mu);
 		next = prev;
 		goto sigkill_escalation;
 	}
-	uint64_t in_flight = w->units_started - w->units_completed -
-	    w->units_failed;
-	uint64_t w_bytes_total = w->bytes_total;
-	uint64_t w_units_completed = w->units_completed;
-	uint64_t since_completion_ms = w->last_completion_ms ?
-	    (now - w->last_completion_ms) : 0;  /* for log messages */
-	pthread_mutex_unlock(&w->mu);
-	uint64_t w_live_bytes = __atomic_load_n(&w->live_bytes,
+	uint64_t in_flight = worker->units_started - worker->units_completed -
+	    worker->units_failed;
+	uint64_t w_bytes_total = worker->bytes_total;
+	uint64_t w_units_completed = worker->units_completed;
+	uint64_t since_completion_ms = worker->last_completion_ms ?
+	    (now - worker->last_completion_ms) : 0;  /* for log messages */
+	pthread_mutex_unlock(&worker->mu);
+	uint64_t w_live_bytes = __atomic_load_n(&worker->live_bytes,
 	    __ATOMIC_RELAXED);
 
 	/*
@@ -530,10 +530,10 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 	 * exit, reap) is unaffected; a genuinely wedged hash stops
 	 * refreshing and the gate reopens within seconds.
 	 */
-	int hashing = (w->conn != NULL &&
-	    sftp_conn_hash_op_live_total(w->conn) > 0);
+	int hashing = (worker->conn != NULL &&
+	    sftp_conn_hash_op_live_total(worker->conn) > 0);
 
-	uint64_t unit_start = __atomic_load_n(&w->unit_start_ms,
+	uint64_t unit_start = __atomic_load_n(&worker->unit_start_ms,
 	    __ATOMIC_ACQUIRE);
 	uint64_t since_unit_start_ms = (unit_start > 0 &&
 	    now > unit_start) ? (now - unit_start) : 0;
@@ -552,10 +552,10 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 	 * touching last_progress_bytes (which is also 0).
 	 */
 	uint64_t cur_progress_bytes = w_bytes_total + w_live_bytes;
-	if (w->last_progress_ms == 0 ||
-	    cur_progress_bytes > w->last_progress_bytes) {
-		w->last_progress_ms = now;
-		w->last_progress_bytes = cur_progress_bytes;
+	if (worker->last_progress_ms == 0 ||
+	    cur_progress_bytes > worker->last_progress_bytes) {
+		worker->last_progress_ms = now;
+		worker->last_progress_bytes = cur_progress_bytes;
 	}
 	/* Starting a new unit counts as progress: byte counters freeze
 	 * while the fleet idles at the prompt between commands, so without
@@ -564,11 +564,11 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 	 * reaper fires at 0% of a fresh put on a warm fleet.  (Sibling of
 	 * the paused-tick re-seed below: silence is measured from the most
 	 * recent of byte-progress / held lease / unit dispatch.) */
-	if (unit_start > w->last_progress_ms)
-		w->last_progress_ms = unit_start;
+	if (unit_start > worker->last_progress_ms)
+		worker->last_progress_ms = unit_start;
 	uint64_t effective_silence_ms =
-	    (w->last_progress_ms > 0 && now > w->last_progress_ms)
-	    ? (now - w->last_progress_ms) : 0;
+	    (worker->last_progress_ms > 0 && now > worker->last_progress_ms)
+	    ? (now - worker->last_progress_ms) : 0;
 
 	next = WORKER_HEALTHY;
 
@@ -582,11 +582,11 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 * waitpid still succeeds.  kill(0) alone misses the
 		 * SIGKILL-then-zombie case because a zombie's pid is still
 		 * present in the process table. */
-		if (w->ssh_pid > 0) {
+		if (worker->ssh_pid > 0) {
 			int wstatus;
-			pid_t wr = waitpid(w->ssh_pid, &wstatus,
+			pid_t wr = waitpid(worker->ssh_pid, &wstatus,
 			    WNOHANG | WNOWAIT);
-			if (wr == w->ssh_pid ||
+			if (wr == worker->ssh_pid ||
 			    (wr == -1 && errno == ECHILD)) {
 				next = WORKER_DEAD;
 				doom_reason = "child_gone";
@@ -608,7 +608,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 */
 		if (next != WORKER_DEAD) {
 			uint64_t paused_until =
-			    sftp_conn_watchdog_pause_until_ms(w->conn);
+			    sftp_conn_watchdog_pause_until_ms(worker->conn);
 			if (paused_until > now) {
 				/* A held lease counts as progress: re-seed
 				 * the silence clock so that when the lease
@@ -622,7 +622,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 				 * silence, and one slow first write-ack gets
 				 * the worker reaped as an endgame straggler
 				 * (then the verify restarts from scratch). */
-				w->last_progress_ms = now;
+				worker->last_progress_ms = now;
 				goto inactivity_checks_done;
 			}
 		}
@@ -639,12 +639,12 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 * flag the instant scan-idle reassigns - defeating the whole
 		 * fix (the proven holder never becomes born-dead-eligible).
 		 */
-		if (p->born_dead_stuck_offset >= 0 &&
-		    __atomic_load_n(&w->unit_offset, __ATOMIC_RELAXED) ==
-		        p->born_dead_stuck_offset &&
+		if (fleet->born_dead_stuck_offset >= 0 &&
+		    __atomic_load_n(&worker->unit_offset, __ATOMIC_RELAXED) ==
+		        fleet->born_dead_stuck_offset &&
 		    w_live_bytes > 0) {
-			p->born_dead_stuck_offset = -1;
-			p->born_dead_stuck_count = 0;
+			fleet->born_dead_stuck_offset = -1;
+			fleet->born_dead_stuck_count = 0;
 		}
 
 		/*
@@ -680,13 +680,13 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 * eligible too (zero progress on the CURRENT unit, on the
 		 * known-stuck offset), without touching any byte counter.
 		 */
-		int64_t off = __atomic_load_n(&w->unit_offset, __ATOMIC_RELAXED);
+		int64_t off = __atomic_load_n(&worker->unit_offset, __ATOMIC_RELAXED);
 		int bd_fresh = (w_units_completed == 0 && w_bytes_total == 0);
-		int bd_on_stuck = (off >= 0 && off == p->born_dead_stuck_offset);
+		int bd_on_stuck = (off >= 0 && off == fleet->born_dead_stuck_offset);
 		if (next != WORKER_DEAD && !hashing && in_flight > 0
 		    && w_live_bytes == 0
 		    && (bd_fresh || bd_on_stuck)
-		    && since_unit_start_ms > (uint64_t)p->born_dead_sec
+		    && since_unit_start_ms > (uint64_t)fleet->born_dead_sec
 		        * 1000ULL) {
 			/*
 			 * Stuck-range guard: a prior born-dead reap already
@@ -698,28 +698,28 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 			 * if the connection really is dead.
 			 */
 			int stuck = (bd_on_stuck &&
-			    p->born_dead_stuck_count >= BORN_DEAD_STUCK_KILLS);
+			    fleet->born_dead_stuck_count >= BORN_DEAD_STUCK_KILLS);
 
 			if (stuck) {
 				debug_ft("worker %d: born-dead SUPPRESSED at "
 				    "offset %lld - stuck range (%d prior "
-				    "reaps), waiting not killing", w->id,
-				    (long long)off, p->born_dead_stuck_count);
+				    "reaps), waiting not killing", worker->id,
+				    (long long)off, fleet->born_dead_stuck_count);
 			} else {
 				if (bd_on_stuck)
-					p->born_dead_stuck_count++;
+					fleet->born_dead_stuck_count++;
 				else {
-					p->born_dead_stuck_offset = off;
-					p->born_dead_stuck_count = 1;
+					fleet->born_dead_stuck_offset = off;
+					fleet->born_dead_stuck_count = 1;
 				}
 				debug_ft("worker %d: born-dead fast-kill "
 				    "(unit_start=%llus, 0 bytes, 0 "
 				    "completions, offset=%lld, hit %d)",
-				    w->id,
+				    worker->id,
 				    (unsigned long long)
 				    (since_unit_start_ms / 1000ULL),
 				    (long long)off,
-				    p->born_dead_stuck_count);
+				    fleet->born_dead_stuck_count);
 				next = WORKER_DEAD;
 				doom_reason = "born_dead";
 			}
@@ -764,15 +764,15 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 				if (getenv("HPN_PARALLEL_TRACE") != NULL)
 					logit("HPN ENDGAME-REAP worker=%d "
 					    "silence=%llus - reaping stuck "
-					    "endgame straggler", w->id,
+					    "endgame straggler", worker->id,
 					    (unsigned long long)s);
 				next = WORKER_DEAD;
 				doom_reason = "endgame_straggler";
 			} else if (s > (uint64_t)WORKER_SILENCE_BRAKE_SEC &&
-			    p->cfg.tput_path_healthy_kbps > 0 &&
-			    w->tput_ema_warmup_ticks >= TPUT_EMA_WARMUP_TICKS &&
-			    w->tput_ema_kbps <
-			        p->cfg.tput_path_healthy_kbps) {
+			    fleet->cfg.tput_path_healthy_kbps > 0 &&
+			    worker->tput_ema_warmup_ticks >= TPUT_EMA_WARMUP_TICKS &&
+			    worker->tput_ema_kbps <
+			        fleet->cfg.tput_path_healthy_kbps) {
 				next = WORKER_DEAD;
 				doom_reason = "isolation";
 			} else if (s > WORKER_SILENCE_BRAKE_SEC) {
@@ -805,10 +805,10 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 * reporter's worker telemetry.
 		 */
 		if (next == WORKER_HEALTHY && !hashing &&
-		    p->cfg.tput_path_healthy_kbps > 0) {
-			int req = p->cfg.tput_consec_required > 0
-			    ? p->cfg.tput_consec_required : 5;
-			if (w->tput_outlier_ticks >= req) {
+		    fleet->cfg.tput_path_healthy_kbps > 0) {
+			int req = fleet->cfg.tput_consec_required > 0
+			    ? fleet->cfg.tput_consec_required : 5;
+			if (worker->tput_outlier_ticks >= req) {
 				next = WORKER_STALLED;
 				stalled_slow = 1;
 			}
@@ -831,27 +831,27 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 * (best-effort) until the path recovers.  No separate budget.
 		 */
 		if (next != WORKER_DEAD
-		    && !w->doomed
+		    && !worker->doomed
 		    && !hashing
-		    && p->cfg.tput_path_healthy_kbps > 0
-		    && w->tput_below_floor_ticks >= BORN_SLOW_TICKS) {
+		    && fleet->cfg.tput_path_healthy_kbps > 0
+		    && worker->tput_below_floor_ticks >= BORN_SLOW_TICKS) {
 			/* Worker qualifies as born-slow (persistently below floor).
-			 * The !w->doomed guard stops a worker already killed (but not
+			 * The !worker->doomed guard stops a worker already killed (but not
 			 * yet reaped) from re-triggering each tick (next resets to
 			 * HEALTHY every pass). */
 			uint64_t floor =
-			    (uint64_t)(p->cfg.tput_path_healthy_kbps *
+			    (uint64_t)(fleet->cfg.tput_path_healthy_kbps *
 			        BORN_SLOW_FLOOR_FRAC);
-			if (p->tput_last_raw_max_kbps >=
-			        p->cfg.tput_path_healthy_kbps
-			    && p->respawn_resume_s == 0) {
+			if (fleet->tput_last_raw_max_kbps >=
+			        fleet->cfg.tput_path_healthy_kbps
+			    && fleet->respawn_resume_s == 0) {
 				debug_ft("worker %d: born-slow kill "
 				    "(ema=%llukbps < %llukbps for %d ticks; "
 				    "healthy peer present, no cooldown)",
-				    w->id,
-				    (unsigned long long)w->tput_ema_kbps,
+				    worker->id,
+				    (unsigned long long)worker->tput_ema_kbps,
 				    (unsigned long long)floor,
-				    w->tput_below_floor_ticks);
+				    worker->tput_below_floor_ticks);
 				next = WORKER_DEAD;
 				doom_reason = "born_slow";
 			} else {
@@ -861,15 +861,15 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 				 * reporter_flare can surface "accepting N slow
 				 * worker(s)" - also the live signal for whether this
 				 * gating is helping or hurting on a real path. */
-				p->born_slow_accepting++;
+				fleet->born_slow_accepting++;
 				debug_ft("worker %d: born-slow accepted "
 				    "(ema=%llukbps < %llukbps for %d ticks; "
 				    "%s)",
-				    w->id,
-				    (unsigned long long)w->tput_ema_kbps,
+				    worker->id,
+				    (unsigned long long)worker->tput_ema_kbps,
 				    (unsigned long long)floor,
-				    w->tput_below_floor_ticks,
-				    p->respawn_resume_s != 0
+				    worker->tput_below_floor_ticks,
+				    fleet->respawn_resume_s != 0
 				        ? "cooldown active"
 				        : "no healthy peer");
 			}
@@ -886,10 +886,10 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		if (endgame_idle && in_flight > 0 &&
 		    getenv("HPN_PARALLEL_TRACE") != NULL) {
 			uint64_t pu =
-			    sftp_conn_watchdog_pause_until_ms(w->conn);
+			    sftp_conn_watchdog_pause_until_ms(worker->conn);
 			logit("HPN ENDGAME-TRACE worker=%d egi=%d qhw=%d "
 			    "inflight=%llu silence=%llus bytes=%llu "
-			    "paused=%llds next=%d reason=%s", w->id,
+			    "paused=%llds next=%d reason=%s", worker->id,
 			    endgame_idle, queue_has_work,
 			    (unsigned long long)in_flight,
 			    (unsigned long long)
@@ -908,9 +908,9 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 * inference, so pause is no longer relevant.
 		 */
 		if (next != prev) {
-			pthread_mutex_lock(&w->mu);
-			w->health = next;
-			pthread_mutex_unlock(&w->mu);
+			pthread_mutex_lock(&worker->mu);
+			worker->health = next;
+			pthread_mutex_unlock(&worker->mu);
 			if (next == WORKER_STALLED && stalled_slow) {
 				/* Outlier flag: progressing, just slow -
 				 * saying "no progress" here is what sent us
@@ -918,14 +918,14 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 				debug_ft("worker %d slow vs fleet: ema=%llu "
 				    "kbps, %d consecutive outlier ticks - "
 				    "progressing, flagged only",
-				    w->id,
-				    (unsigned long long)w->tput_ema_kbps,
-				    w->tput_outlier_ticks);
+				    worker->id,
+				    (unsigned long long)worker->tput_ema_kbps,
+				    worker->tput_outlier_ticks);
 			} else if (next == WORKER_STALLED) {
 				debug_ft("worker %d stalled: no progress in "
 				    "%llu sec (since_completion=%llus, "
 				    "since_unit_start=%llus)",
-				    w->id,
+				    worker->id,
 				    (unsigned long long)
 				    (effective_silence_ms / 1000ULL),
 				    (unsigned long long)
@@ -937,9 +937,9 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 				    "ssh_pid=%ld silence=%llus "
 				    "(since_completion=%llus, "
 				    "since_unit_start=%llus)",
-				    w->id,
+				    worker->id,
 				    doom_reason ? doom_reason : "?",
-				    (long)w->ssh_pid,
+				    (long)worker->ssh_pid,
 				    (unsigned long long)
 				    (effective_silence_ms / 1000ULL),
 				    (unsigned long long)
@@ -954,20 +954,20 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 		 * doomed to prevent double-SIGTERM on successive ticks. */
 		if (next == WORKER_DEAD) {
 			int already_doomed;
-			pthread_mutex_lock(&w->mu);
-			already_doomed = w->doomed || w->exited;
+			pthread_mutex_lock(&worker->mu);
+			already_doomed = worker->doomed || worker->exited;
 			if (!already_doomed) {
-				w->doomed = 1;
-				w->doom_ms = now;
-				w->doom_reason = doom_reason;
+				worker->doomed = 1;
+				worker->doom_ms = now;
+				worker->doom_reason = doom_reason;
 			}
-			pthread_mutex_unlock(&w->mu);
+			pthread_mutex_unlock(&worker->mu);
 			if (!already_doomed) {
-				if (w->ssh_pid > 0)
-					(void)kill(w->ssh_pid, SIGTERM);
+				if (worker->ssh_pid > 0)
+					(void)kill(worker->ssh_pid, SIGTERM);
 				debug_ft("worker %d: sent SIGTERM to ssh "
-				    "child (pid %ld)", w->id,
-				    (long)w->ssh_pid);
+				    "child (pid %ld)", worker->id,
+				    (long)worker->ssh_pid);
 				/*
 				 * Endgame straggler: log at DEBUG level only.
 				 * It is an internal optimization (reap a stuck
@@ -980,7 +980,7 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 					debug_ft("worker %d: endgame straggler "
 					    "(no progress %llus at end of "
 					    "transfer) - reaping, re-bundling on "
-					    "a fresh worker", w->id,
+					    "a fresh worker", worker->id,
 					    (unsigned long long)
 					    (effective_silence_ms /
 					    1000ULL));
@@ -996,20 +996,20 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 	 * worker thread sees EOF/EPIPE on its next I/O call, sets
 	 * exited=1, and gets reaped.  Without this we deadlock: the
 	 * SIGKILL-on-reap path is gated on exited=1. */
-	if (w->doomed && !w->exited && w->doom_ms > 0 && w->ssh_pid > 0 &&
-	    now - w->doom_ms >
+	if (worker->doomed && !worker->exited && worker->doom_ms > 0 && worker->ssh_pid > 0 &&
+	    now - worker->doom_ms >
 	    (uint64_t)SIGKILL_ESCALATION_SEC * 1000ULL) {
-		(void)kill(w->ssh_pid, SIGKILL);
+		(void)kill(worker->ssh_pid, SIGKILL);
 		debug_ft("worker %d: escalated to SIGKILL after %llus "
 		    "(SSH child unresponsive to SIGTERM, pid %ld)",
-		    w->id,
+		    worker->id,
 		    (unsigned long long)
-		    ((now - w->doom_ms) / 1000ULL),
-		    (long)w->ssh_pid);
+		    ((now - worker->doom_ms) / 1000ULL),
+		    (long)worker->ssh_pid);
 		/* Clear doom_ms so we don't re-escalate every tick. */
-		pthread_mutex_lock(&w->mu);
-		w->doom_ms = 0;
-		pthread_mutex_unlock(&w->mu);
+		pthread_mutex_lock(&worker->mu);
+		worker->doom_ms = 0;
+		pthread_mutex_unlock(&worker->mu);
 	}
 	return (next == WORKER_DEAD) ? 1 : 0;
 }
@@ -1019,31 +1019,31 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
  * child's existence, (b) elapsed time since last completion while the
  * queue had work for it, and (c) the adaptive throughput-outlier
  * ticks when enabled. Dooms newly DEAD workers (SIGTERM to the ssh
- * child, w->doomed set) so the reporter's reap loop can join and
+ * child, worker->doomed set) so the reporter's reap loop can join and
  * respawn them. Returns nonzero when any worker is DEAD; the current
  * caller ignores the return and relies on the reap loop instead.
  */
 int
-parallel_watchdog_check(struct sftp_parallel *p)
+parallel_watchdog_check(struct sftp_parallel *fleet)
 {
 	int any_dead = 0;
 	uint64_t now = monotime_ms();
-	int queue_has_work = (sftp_workqueue_depth(p->q) > 0);
+	int queue_has_work = (sftp_workqueue_depth(fleet->q) > 0);
 
 	/* Per-tick scratch: count of slow workers accepted (born-slow gated
 	 * off) this pass; reporter_flare reads it after the watchdog runs. */
-	p->born_slow_accepting = 0;
+	fleet->born_slow_accepting = 0;
 
-	pthread_mutex_lock(&p->workers_mu);
+	pthread_mutex_lock(&fleet->workers_mu);
 
 	/* Endgame-idle gate: walker done, queue drained, and >=1 worker holds
 	 * no in-flight unit (idle in pop, free to take over).  Only then does
 	 * the per-worker isolation branch fast-reap a stuck straggler. */
-	int walker_done = (__atomic_load_n(&p->walker_phase,
+	int walker_done = (__atomic_load_n(&fleet->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE);
 	int n_idle = 0;
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *iw = p->workers[i];
+	for (int i = 0; i < fleet->num_workers; i++) {
+		struct sftp_worker *iw = fleet->workers[i];
 		pthread_mutex_lock(&iw->mu);
 		if (iw->units_started - iw->units_completed -
 		    iw->units_failed == 0)
@@ -1053,14 +1053,14 @@ parallel_watchdog_check(struct sftp_parallel *p)
 	int endgame_idle = (walker_done && !queue_has_work && n_idle > 0);
 
 	/* Adaptive throughput sample for outlier detection (no-op if
-	 * cfg.tput_path_healthy_kbps == 0).  Sets w->tput_outlier_ticks. */
-	watchdog_sample_throughput(p, now);
+	 * cfg.tput_path_healthy_kbps == 0).  Sets worker->tput_outlier_ticks. */
+	watchdog_sample_throughput(fleet, now);
 
-	for (int i = 0; i < p->num_workers; i++) {
-		if (watchdog_check_one_worker(p, p->workers[i], now,
+	for (int i = 0; i < fleet->num_workers; i++) {
+		if (watchdog_check_one_worker(fleet, fleet->workers[i], now,
 		    queue_has_work, endgame_idle))
 			any_dead = 1;
 	}
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_unlock(&fleet->workers_mu);
 	return any_dead;
 }

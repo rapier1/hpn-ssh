@@ -96,7 +96,7 @@ stripe_to_small_threshold(uint64_t stripe_size)
  * on single-stream transfers.
  */
 void
-maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
+maybe_apply_lustre_layout(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *dst)
 {
 	struct sftp_fs_info info;
@@ -109,7 +109,7 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	uint32_t layout_kind = 0;
 	int rc;
 
-	if (p == NULL || conn == NULL || dst == NULL)
+	if (fleet == NULL || conn == NULL || dst == NULL)
 		return;
 	if (sftp_conn_layout_set_declined(conn))
 		return;  /* prior failure on this conn - short-circuit */
@@ -118,7 +118,7 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	if (configured == 0)
 		return;  /* HPNLustreStripeCount=0 → feature disabled */
 
-	n_workers = sftp_parallel_num_streams(p);
+	n_workers = sftp_parallel_num_streams(fleet);
 	if (n_workers < 2)
 		return;  /* not in parallel mode */
 
@@ -133,7 +133,7 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 	use_tiered = (configured < 0);
 	desired    = use_tiered ? n_workers : configured;
 
-	sftp_parallel_set_walker_phase(p, SFTP_WKP_FSINFO);
+	sftp_parallel_set_walker_phase(fleet, SFTP_WKP_FSINFO);
 	if (sftp_fs_info(conn, dst, &info) != 0)
 		return;  /* server lacks hpn-fs-info, or query failed */
 	if (strcmp(info.fs_type, "lustre") != 0)
@@ -162,7 +162,7 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
 		return;
 	}
 
-	sftp_parallel_set_walker_phase(p, SFTP_WKP_LAYOUT);
+	sftp_parallel_set_walker_phase(fleet, SFTP_WKP_LAYOUT);
 	rc = sftp_hpn_set_file_layout(conn, dst, (u_int32_t)desired,
 	    small_threshold, &applied, &layout_kind);
 	switch (rc) {
@@ -213,7 +213,7 @@ maybe_apply_lustre_layout(struct sftp_parallel *p, struct sftp_conn *conn,
  *  - No fs-info gate: the setter's own NOT_FS result is the detection.
  */
 void
-maybe_apply_lustre_layout_local(struct sftp_parallel *p,
+maybe_apply_lustre_layout_local(struct sftp_parallel *fleet,
     struct sftp_conn *conn, const char *dst)
 {
 	uint64_t l_ssize = 0;
@@ -226,12 +226,12 @@ maybe_apply_lustre_layout_local(struct sftp_parallel *p,
 	int use_tiered;
 	int desired;
 
-	if (p == NULL || conn == NULL || dst == NULL)
+	if (fleet == NULL || conn == NULL || dst == NULL)
 		return;
 	configured = sftp_conn_lustre_stripe_count(conn);
 	if (configured == 0)
 		return;  /* HPNLustreStripeCount=0 -> feature disabled */
-	n_workers = sftp_parallel_num_streams(p);
+	n_workers = sftp_parallel_num_streams(fleet);
 	if (n_workers < 2)
 		return;  /* not in parallel mode */
 

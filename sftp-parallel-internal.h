@@ -465,7 +465,7 @@ struct sftp_parallel;
 
 /*
  * Systemic peer-stall detector.  Each slow-tick the reporter pushes the
- * per-tick delta of peer-stall worker DEATHS (p->peer_stall_terminations)
+ * per-tick delta of peer-stall worker DEATHS (fleet->peer_stall_terminations)
  * into a rolling window; when the window sum reaches the systemic threshold
  * the backend is saturated fleet-wide and we enter/escalate a cooldown.
  * Below the threshold a death is localized - the unit is just re-queued and
@@ -656,8 +656,8 @@ enum sftp_op {
  *        worker_process_result / worker_give_up_unit, so the dead
  *        pointer is unreachable.)
  *
- *   (I4) Worker context `w` is retained in the signature but is no
- *        longer dereferenced: finalize used to need w->conn to sftp_rm
+ *   (I4) Worker context `worker` is retained in the signature but is no
+ *        longer dereferenced: finalize used to need worker->conn to sftp_rm
  *        a corrupt remote file, but incomplete files are now left in
  *        place for resume instead of removed.  Passing NULL is always
  *        safe (e.g., synthesised finalize during a submit failure in
@@ -697,7 +697,7 @@ enum sftp_range_target {
  * time, so a single process-wide flag is faithful.
  */
 /* Set by the reporter when an abort was USER-initiated (Ctrl-C): lets
- * p-less sites (tracker finalize) tell interrupt fallout from genuine
+ * fleet-less sites (tracker finalize) tell interrupt fallout from genuine
  * failure.  extern - exactly one definition (sftp-parallel.c); a static
  * here would silently give every module its own dead copy. */
 extern volatile sig_atomic_t parallel_user_abort_flag;
@@ -879,8 +879,8 @@ struct sftp_work_unit {
 	 * it.  parallel_unit_free decrements/frees it if the unit is dropped. */
 	struct verify_job *verify_job;
 	/* Retry-overflow list link (sftp-parallel.c retry_overflow_*).  A worker
-	 * re-queue that finds p->q full parks the unit here instead of blocking
-	 * (self-deadlock); the reporter drains it back into p->q as space frees.
+	 * re-queue that finds fleet->q full parks the unit here instead of blocking
+	 * (self-deadlock); the reporter drains it back into fleet->q as space frees.
 	 * overflow_front preserves the unit's push_front (head) vs push (tail)
 	 * intent across the parking.  Both 0 when the unit is not parked. */
 	struct sftp_work_unit  *overflow_next;
@@ -1075,7 +1075,7 @@ struct sftp_worker {
 	/* -- Phase 5: bundle-mode state (hpn-bundle@hpnssh.org) -----
 	 * bundle_enabled is set once at worker startup when
 	 *   ssh_config HPNUseBundle yes (the default) AND
-	 *   sftp_conn_has_hpn_bundle(w->conn) is true.
+	 *   sftp_conn_has_hpn_bundle(worker->conn) is true.
 	 * When set, the worker collects upload batches to bundle_target_bytes
 	 * and dispatches them via sftp_hpn_bundle_upload instead of
 	 * sftp_upload_batch / sftp_upload_batch_send.  No interaction with
@@ -1117,9 +1117,9 @@ struct sftp_parallel {
 
 	/* Workers held as an array of pointers so add/remove can mutate
 	 * the array without invalidating pointers held by worker threads
-	 * via w->parent->workers[...]. workers_mu serializes structural
+	 * via worker->parent->workers[...]. workers_mu serializes structural
 	 * changes (add/remove/reap); the per-worker mu still serializes
-	 * counter updates. Lock ordering: workers_mu BEFORE w->mu. */
+	 * counter updates. Lock ordering: workers_mu BEFORE worker->mu. */
 	pthread_mutex_t             workers_mu;
 	struct sftp_worker        **workers;
 	int                         num_workers;
@@ -1325,12 +1325,12 @@ struct sftp_parallel {
 
 	/*
 	 * Worker re-queue overflow list (FIFO of already-allocated units).  When
-	 * a worker re-queue finds p->q full it parks the unit here instead of
+	 * a worker re-queue finds fleet->q full it parks the unit here instead of
 	 * blocking on the queue it is itself draining (self-deadlock; fatal at
-	 * -j1).  The reporter drains this back into p->q via trypush as space
+	 * -j1).  The reporter drains this back into fleet->q via trypush as space
 	 * frees.  Costs no new allocation (these are existing pending units, so
 	 * bounded by in-flight work) and is decoupled from pending: parked units
-	 * stay counted in p->pending, so sftp_parallel_wait does not complete
+	 * stay counted in fleet->pending, so sftp_parallel_wait does not complete
 	 * while any remain.  Guarded by retry_overflow_mu.
 	 */
 	pthread_mutex_t             retry_overflow_mu;
@@ -1591,7 +1591,7 @@ struct sftp_parallel {
  * varies with RTT and any tc-netem delay in effect.
  */
 struct spawn_ctx {
-	struct sftp_parallel *p;
+	struct sftp_parallel *fleet;
 	pthread_mutex_t      *auth_mu;
 	pthread_cond_t       *auth_cv;
 	int                  *auth_in_flight;
@@ -1628,13 +1628,13 @@ int	 parallel_unit_writer_acquire(struct sftp_range_tracker *);
 void	 parallel_unit_writer_release(struct sftp_range_tracker *);
 int	 parallel_unit_max_retries(struct sftp_parallel *);
 int	 parallel_unit_submit(struct sftp_parallel *, struct sftp_work_unit *);
-/* Worker-context re-queue: non-blocking.  Tries p->q (front when front!=0);
+/* Worker-context re-queue: non-blocking.  Tries fleet->q (front when front!=0);
  * on a full queue parks the unit on the retry-overflow list rather than
  * blocking.  Returns 0 if the unit was placed (queue or overflow), -1 only if
  * the queue is shut down (caller does the give-up bookkeeping). */
 int	 parallel_worker_requeue(struct sftp_parallel *, struct sftp_work_unit *,
 	    int front);
-/* Reporter-context: move overflow-parked units back into p->q while it has
+/* Reporter-context: move overflow-parked units back into fleet->q while it has
  * room (non-blocking).  No-op when the overflow list is empty. */
 void	 parallel_retry_overflow_drain(struct sftp_parallel *);
 /* Stop/abort cleanup: free any units still parked on the overflow list. */

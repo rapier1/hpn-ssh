@@ -79,26 +79,26 @@ walker_phase_name(int ph)
 }
 
 void
-parallel_stats_snapshot(struct sftp_parallel *p, uint64_t *bytes_out,
+parallel_stats_snapshot(struct sftp_parallel *fleet, uint64_t *bytes_out,
     uint64_t *completed_out, uint64_t *failed_out)
 {
 	uint64_t b = 0, c = 0, f = 0;
-	pthread_mutex_lock(&p->workers_mu);
+	pthread_mutex_lock(&fleet->workers_mu);
 	/* Bytes from workers that have already exited and been reaped. */
-	b += p->retired_bytes;
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = p->workers[i];
-		pthread_mutex_lock(&w->mu);
-		b += w->bytes_total;
+	b += fleet->retired_bytes;
+	for (int i = 0; i < fleet->num_workers; i++) {
+		struct sftp_worker *worker = fleet->workers[i];
+		pthread_mutex_lock(&worker->mu);
+		b += worker->bytes_total;
 		/* live_bytes is written atomically by the worker without holding
-		 * w->mu (to avoid lock contention in the inner transfer loop),
+		 * worker->mu (to avoid lock contention in the inner transfer loop),
 		 * so read it with a relaxed atomic load for the display value. */
-		b += __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
-		c += w->units_completed;
-		f += w->units_failed;
-		pthread_mutex_unlock(&w->mu);
+		b += __atomic_load_n(&worker->live_bytes, __ATOMIC_RELAXED);
+		c += worker->units_completed;
+		f += worker->units_failed;
+		pthread_mutex_unlock(&worker->mu);
 	}
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_unlock(&fleet->workers_mu);
 	if (bytes_out) *bytes_out = b;
 	if (completed_out) *completed_out = c;
 	if (failed_out) *failed_out = f;
@@ -106,7 +106,7 @@ parallel_stats_snapshot(struct sftp_parallel *p, uint64_t *bytes_out,
 
 /*
  * Classify and log how a reaped worker died, using the wait status plus
- * w->doomed (did WE kill it?).  Diagnostic only - it changes no control
+ * worker->doomed (did WE kill it?).  Diagnostic only - it changes no control
  * flow; the caller respawns regardless.  Death modes:
  *
  *   - doomed                  : the watchdog terminated it (reason already
@@ -122,12 +122,12 @@ parallel_stats_snapshot(struct sftp_parallel *p, uint64_t *bytes_out,
  *   - other signal            : a genuine crash (we only ever send SIGKILL).
  *
  * Read on the reporter thread, which also owns the doom state - so
- * w->doomed needs no lock here.
+ * worker->doomed needs no lock here.
  */
 static void
-classify_worker_death(const struct sftp_worker *w, int have_status, int status)
+classify_worker_death(const struct sftp_worker *worker, int have_status, int status)
 {
-	struct sftp_parallel *p = w->parent;
+	struct sftp_parallel *fleet = worker->parent;
 	const char *cause = NULL;
 	uint64_t n = 0;
 	int quiet = 0;
@@ -149,8 +149,8 @@ classify_worker_death(const struct sftp_worker *w, int have_status, int status)
 	 * record.  Rare/meaningful causes (wedge, peer-stall brake,
 	 * endgame stall, crashes) stay user-visible.
 	 */
-	if (w->doomed) {
-		const char *r = w->doom_reason ? w->doom_reason : "doomed";
+	if (worker->doomed) {
+		const char *r = worker->doom_reason ? worker->doom_reason : "doomed";
 
 		if (strcmp(r, "born_dead") == 0) {
 			cause = "worker unresponsive at startup";
@@ -173,58 +173,58 @@ classify_worker_death(const struct sftp_worker *w, int have_status, int status)
 		else
 			cause = "worker terminated by watchdog";
 		debug_ft("worker %d: reaped after orchestrator termination "
-		    "(%s)", w->id, r);
+		    "(%s)", worker->id, r);
 	} else if (!have_status) {
 		cause = "worker lost";
-		debug_ft("worker %d: died (no wait status)", w->id);
+		debug_ft("worker %d: died (no wait status)", worker->id);
 	} else if (WIFEXITED(status)) {
 		int code = WEXITSTATUS(status);
 
 		if (code == HPN_EXIT_TCP_WEDGE) {
-			if (p != NULL)
-				p->wedge_terminations++;
+			if (fleet != NULL)
+				fleet->wedge_terminations++;
 			cause = "worker connection wedged";
 			debug_ft("worker %d: self-terminated: TCP wedge",
-			    w->id);
+			    worker->id);
 		} else if (code == HPN_EXIT_TCP_PEER_STALL) {
-			if (p != NULL)
-				p->peer_stall_terminations++;
+			if (fleet != NULL)
+				fleet->peer_stall_terminations++;
 			cause = "worker remote stopped draining";
 			debug_ft("worker %d: self-terminated: peer stall",
-			    w->id);
+			    worker->id);
 		} else if (HPN_EXIT_IS_TCP(code)) {
 			cause = "worker transport self-check failed";
 			debug_ft("worker %d: self-terminated: transport "
-			    "(exit %d)", w->id, code);
+			    "(exit %d)", worker->id, code);
 		} else if (code == 255) {
 			cause = "worker connection lost";
 			quiet = 1;
 			debug_ft("worker %d: ssh transport error / dropped "
-			    "connection (exit 255)", w->id);
+			    "connection (exit 255)", worker->id);
 		} else if (code == 0) {
 			cause = "worker exited unexpectedly";
 			debug_ft("worker %d: exited cleanly (watchdog had not "
-			    "doomed it)", w->id);
+			    "doomed it)", worker->id);
 		} else {
 			cause = "worker exited unexpectedly";
 			debug_ft("worker %d: exited with status %d",
-			    w->id, code);
+			    worker->id, code);
 		}
 	} else if (WIFSIGNALED(status)) {
 		cause = "worker terminated unexpectedly";
-		debug_ft("worker %d: killed by signal %d", w->id,
+		debug_ft("worker %d: killed by signal %d", worker->id,
 		    WTERMSIG(status));
 	} else {
 		cause = "worker lost";
 		debug_ft("worker %d: reaped (unrecognized wait status)",
-		    w->id);
+		    worker->id);
 	}
 
-	if (p != NULL)
-		n = ++p->death_ordinal;
+	if (fleet != NULL)
+		n = ++fleet->death_ordinal;
 	/* During teardown the deaths are manufactured and nothing is
 	 * reconnecting - keep it out of the user's face. */
-	if (p == NULL || p->abort_flag || p->stopped)
+	if (fleet == NULL || fleet->abort_flag || fleet->stopped)
 		debug("%s (teardown)", cause);
 	else if (quiet)
 		debug("%s; reconnecting (respawn %llu)", cause,
@@ -243,10 +243,10 @@ classify_worker_death(const struct sftp_worker *w, int have_status, int status)
 	 * (FLEET_ABORT_UNPRODUCTIVE_MULT / RESPAWN_MULTIPLIER); suppressed
 	 * during teardown.  Reporter thread only - no lock needed.
 	 */
-	if (p != NULL && !p->abort_flag && !p->stopped &&
-	    !p->churn_notice_emitted &&
-	    n >= (uint64_t)p->cfg.num_streams * HPN_PATH_CHURN_NOTICE_MULT) {
-		p->churn_notice_emitted = 1;
+	if (fleet != NULL && !fleet->abort_flag && !fleet->stopped &&
+	    !fleet->churn_notice_emitted &&
+	    n >= (uint64_t)fleet->cfg.num_streams * HPN_PATH_CHURN_NOTICE_MULT) {
+		fleet->churn_notice_emitted = 1;
 		logit("this transfer has required %llu worker reconnections; "
 		    "the network path may be unreliable",
 		    (unsigned long long)n);
@@ -265,19 +265,19 @@ classify_worker_death(const struct sftp_worker *w, int have_status, int status)
  * respawn slots the caller (reporter) needs to dispatch.
  */
 static int
-reporter_reap_exited_workers(struct sftp_parallel *p)
+reporter_reap_exited_workers(struct sftp_parallel *fleet)
 {
 	struct sftp_worker *to_reap[SFTP_PARALLEL_MAX_WORKERS];
 	int n_reap = 0;
 
-	pthread_mutex_lock(&p->workers_mu);
-	for (int i = p->num_workers - 1; i >= 0; i--) {
-		struct sftp_worker *w = p->workers[i];
+	pthread_mutex_lock(&fleet->workers_mu);
+	for (int i = fleet->num_workers - 1; i >= 0; i--) {
+		struct sftp_worker *worker = fleet->workers[i];
 		int exited;
 		uint64_t bt;
-		pthread_mutex_lock(&w->mu);
-		exited = w->exited;
-		bt     = w->bytes_total;
+		pthread_mutex_lock(&worker->mu);
+		exited = worker->exited;
+		bt     = worker->bytes_total;
 		/* Capture bytes_total before the worker leaves the array
 		 * so the aggregate stays monotonic.  live_bytes was reset
 		 * to 0 at the worker's last completion so it is not
@@ -285,48 +285,48 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 		 * used to die with the struct, undercounting every
 		 * post-respawn aggregate. */
 		if (exited) {
-			uint64_t cw = w->conn ?
-			    sftp_conn_bytes_wired(w->conn) : 0;
+			uint64_t cw = worker->conn ?
+			    sftp_conn_bytes_wired(worker->conn) : 0;
 
-			p->retired_bytes += bt;
-			p->retired_wired += cw;
-			p->retired_units_failed += w->units_failed;
+			fleet->retired_bytes += bt;
+			fleet->retired_wired += cw;
+			fleet->retired_units_failed += worker->units_failed;
 			debug("reap-capture: worker %d conn=%p wired=%llu "
-			    "bt=%llu retired_wired_now=%llu", w->id,
-			    (void *)w->conn, (unsigned long long)cw,
+			    "bt=%llu retired_wired_now=%llu", worker->id,
+			    (void *)worker->conn, (unsigned long long)cw,
 			    (unsigned long long)bt,
-			    (unsigned long long)p->retired_wired);
+			    (unsigned long long)fleet->retired_wired);
 		}
-		pthread_mutex_unlock(&w->mu);
+		pthread_mutex_unlock(&worker->mu);
 		if (exited) {
-			to_reap[n_reap++] = w;
-			memmove(&p->workers[i],
-			    &p->workers[i + 1],
-			    (p->num_workers - i - 1) *
-			    sizeof(*p->workers));
-			p->num_workers--;
+			to_reap[n_reap++] = worker;
+			memmove(&fleet->workers[i],
+			    &fleet->workers[i + 1],
+			    (fleet->num_workers - i - 1) *
+			    sizeof(*fleet->workers));
+			fleet->num_workers--;
 		}
 	}
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_unlock(&fleet->workers_mu);
 
 	for (int i = 0; i < n_reap; i++) {
-		struct sftp_worker *w = to_reap[i];
-		pthread_join(w->tid, NULL);
+		struct sftp_worker *worker = to_reap[i];
+		pthread_join(worker->tid, NULL);
 		/* Worker thread has exited; no concurrent writer, so this read
 		 * needs no lock.  Lifetime committed bytes feed the fleet-abort
 		 * unproductive-death streak below. */
-		uint64_t lifetime_bytes = w->bytes_total;
-		if (w->conn) sftp_free(w->conn);
-		if (w->fd_in >= 0) close(w->fd_in);
-		if (w->fd_out >= 0) close(w->fd_out);
+		uint64_t lifetime_bytes = worker->bytes_total;
+		if (worker->conn) sftp_free(worker->conn);
+		if (worker->fd_in >= 0) close(worker->fd_in);
+		if (worker->fd_out >= 0) close(worker->fd_out);
 		int s = 0, reaped = 0;
-		if (w->ssh_pid > 0) {
+		if (worker->ssh_pid > 0) {
 			/* Belt-and-suspenders: may already be dead from
 			 * SIGTERM above.  A child that self-exited is already a
 			 * zombie, so this SIGKILL is a no-op and waitpid still
 			 * returns its real exit code. */
-			(void)kill(w->ssh_pid, SIGKILL);
-			reaped = (waitpid(w->ssh_pid, &s, 0) == w->ssh_pid);
+			(void)kill(worker->ssh_pid, SIGKILL);
+			reaped = (waitpid(worker->ssh_pid, &s, 0) == worker->ssh_pid);
 		}
 		/* Classify and account EVERY reaped worker, not only those with
 		 * a live ssh_pid.  An in-array worker always has ssh_pid > 0
@@ -335,7 +335,7 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 		 * that ever changes, still classify the death (no wait status)
 		 * and count the unproductive streak rather than freeing the
 		 * worker silently and losing it from the summary. */
-		p->last_worker_exit_code =
+		fleet->last_worker_exit_code =
 		    (reaped && WIFEXITED(s)) ? WEXITSTATUS(s) : -1;
 		/* Fleet-abort signal: a worker that died without ever committing
 		 * a byte, and not as a clean end-of-queue exit, is a respawn
@@ -343,10 +343,10 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
 		 * parallel_watchdog_sync_check on any sign of life. */
 		int clean = reaped && WIFEXITED(s) && WEXITSTATUS(s) == 0;
 		if (lifetime_bytes == 0 && !clean)
-			p->unproductive_deaths++;
-		classify_worker_death(w, reaped, s);
-		pthread_mutex_destroy(&w->mu);
-		free(w);
+			fleet->unproductive_deaths++;
+		classify_worker_death(worker, reaped, s);
+		pthread_mutex_destroy(&worker->mu);
+		free(worker);
 	}
 	return n_reap;
 }
@@ -363,39 +363,39 @@ reporter_reap_exited_workers(struct sftp_parallel *p)
  * On a clean transfer degraded is always 0 and this is a no-op.
  */
 static void
-reporter_flare(struct sftp_parallel *p)
+reporter_flare(struct sftp_parallel *fleet)
 {
 	time_t now_s;
 	int cooldown_active, accepting_slow, degraded;
 
 	/* Quiet stays quiet: -q and -b both set print_flag to SFTP_QUIET.
 	 * Errors (TRANSFER INCOMPLETE, failed paths) still surface via error(). */
-	if (p->cfg.print_flag == SFTP_QUIET)
+	if (fleet->cfg.print_flag == SFTP_QUIET)
 		return;
 
 	now_s = monotime();
-	cooldown_active = (p->respawn_resume_s != 0);
-	accepting_slow  = (p->born_slow_accepting > 0);
+	cooldown_active = (fleet->respawn_resume_s != 0);
+	accepting_slow  = (fleet->born_slow_accepting > 0);
 	degraded        = cooldown_active || accepting_slow;
 
 	if (!degraded) {
-		if (p->flare_in_episode) {
+		if (fleet->flare_in_episode) {
 			/* Falling edge: recovered. */
 			logit("transfer recovered after %llds - resumed full "
 			    "concurrency",
-			    (long long)(now_s - p->flare_episode_start_s));
-			p->flare_in_episode = 0;
+			    (long long)(now_s - fleet->flare_episode_start_s));
+			fleet->flare_in_episode = 0;
 		}
 		return;
 	}
 
-	if (!p->flare_in_episode) {
+	if (!fleet->flare_in_episode) {
 		/* Rising edge: open an episode.  No countdown - the cooldown
 		 * level escalates/decays and isn't actionable; just the state. */
-		p->flare_in_episode = 1;
-		p->flare_episode_start_s = now_s;
-		p->flare_last_reminder_s = now_s;
-		p->flare_reminder_interval_s = FLARE_REMINDER_BASE_SEC;
+		fleet->flare_in_episode = 1;
+		fleet->flare_episode_start_s = now_s;
+		fleet->flare_last_reminder_s = now_s;
+		fleet->flare_reminder_interval_s = FLARE_REMINDER_BASE_SEC;
 		if (cooldown_active)
 			logit("transfer backing off: the destination appears "
 			    "saturated - pausing new connections; active workers "
@@ -404,23 +404,23 @@ reporter_flare(struct sftp_parallel *p)
 			logit("transfer backing off: no worker is reaching the "
 			    "healthy rate - accepting %d slow worker(s) rather "
 			    "than churning connections; transfer continues",
-			    p->born_slow_accepting);
+			    fleet->born_slow_accepting);
 		return;
 	}
 
 	/* Sustained: reminder on a multiplicative back-off cadence (prompt
 	 * first, then spacing out), escalating to warning wording once the
 	 * episode has been prolonged. */
-	if (now_s - p->flare_last_reminder_s >= p->flare_reminder_interval_s) {
-		time_t since = now_s - p->flare_episode_start_s;
+	if (now_s - fleet->flare_last_reminder_s >= fleet->flare_reminder_interval_s) {
+		time_t since = now_s - fleet->flare_episode_start_s;
 		uint64_t pending;
-		p->flare_last_reminder_s = now_s;
-		p->flare_reminder_interval_s *= 2;
-		if (p->flare_reminder_interval_s > FLARE_REMINDER_CAP_SEC)
-			p->flare_reminder_interval_s = FLARE_REMINDER_CAP_SEC;
-		pthread_mutex_lock(&p->pending_mu);
-		pending = p->pending;
-		pthread_mutex_unlock(&p->pending_mu);
+		fleet->flare_last_reminder_s = now_s;
+		fleet->flare_reminder_interval_s *= 2;
+		if (fleet->flare_reminder_interval_s > FLARE_REMINDER_CAP_SEC)
+			fleet->flare_reminder_interval_s = FLARE_REMINDER_CAP_SEC;
+		pthread_mutex_lock(&fleet->pending_mu);
+		pending = fleet->pending;
+		pthread_mutex_unlock(&fleet->pending_mu);
 		if (since >= FLARE_WARN_SEC) {
 			logit("warning: transfer degraded for %llds - %llu file(s) "
 			    "still pending; continuing best-effort, no data lost",
@@ -447,15 +447,15 @@ reporter_flare(struct sftp_parallel *p)
  * Returns 0 when the worker lacks WORKER_RATE_MIN_SAMPLES of history -
  * callers treat 0 as "no evidence, contributes nothing either way". */
 static uint64_t
-worker_window_median(const struct sftp_worker *w)
+worker_window_median(const struct sftp_worker *worker)
 {
 	uint64_t q[WORKER_RATE_RING];
-	int n = w->rate_ring_count, i, j;
+	int n = worker->rate_ring_count, i, j;
 
 	if (n < WORKER_RATE_MIN_SAMPLES)
 		return 0;
 	for (i = 0; i < n; i++)
-		q[i] = w->rate_ring[i];
+		q[i] = worker->rate_ring[i];
 	for (i = 1; i < n; i++) {
 		uint64_t v = q[i];
 		for (j = i; j > 0 && q[j - 1] > v; j--)
@@ -497,14 +497,14 @@ tail_quarter_median(const uint64_t *ring, int count, int idx, int newest)
  * handoff.  No-op unless the env gate armed it at parallel start.
  */
 static void
-tail_fire_yield(struct sftp_parallel *p, struct sftp_worker *tgt,
+tail_fire_yield(struct sftp_parallel *fleet, struct sftp_worker *tgt,
     uint64_t tgt_med, uint64_t tgt_proj)
 {
-	if (!p->tail_redistribute || p->tail_yield_fired || tgt == NULL ||
+	if (!fleet->tail_redistribute || fleet->tail_yield_fired || tgt == NULL ||
 	    tgt_proj <= TAIL_PROJECT_SEC)
 		return;
 	__atomic_store_n(&tgt->yield_req, 1, __ATOMIC_RELAXED);
-	p->tail_yield_fired = 1;
+	fleet->tail_yield_fired = 1;
 	if (getenv("HPN_PARALLEL_TRACE") != NULL)
 		logit("HPN TAIL-YIELD worker=%d holder_med=%llu proj=%llus",
 		    tgt->id, (unsigned long long)tgt_med,
@@ -515,32 +515,32 @@ tail_fire_yield(struct sftp_parallel *p, struct sftp_worker *tgt,
 }
 
 static void
-tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
+tail_detector_tick(struct sftp_parallel *fleet, uint64_t bytes_now)
 {
 	uint64_t now = monotime_ms();
 	uint64_t rate = 0;
 	int would_arm = 0;
 
 	/* Per-tick rate sample into the ring. */
-	if (p->tail_prev_ms != 0 && now > p->tail_prev_ms &&
-	    bytes_now >= p->tail_prev_bytes) {
-		rate = (bytes_now - p->tail_prev_bytes) * 1000ULL /
-		    (now - p->tail_prev_ms);
-		p->tail_rate_ring[p->tail_ring_idx] = rate;
-		p->tail_ring_idx = (p->tail_ring_idx + 1) % TAIL_RING_TICKS;
-		if (p->tail_ring_count < TAIL_RING_TICKS)
-			p->tail_ring_count++;
+	if (fleet->tail_prev_ms != 0 && now > fleet->tail_prev_ms &&
+	    bytes_now >= fleet->tail_prev_bytes) {
+		rate = (bytes_now - fleet->tail_prev_bytes) * 1000ULL /
+		    (now - fleet->tail_prev_ms);
+		fleet->tail_rate_ring[fleet->tail_ring_idx] = rate;
+		fleet->tail_ring_idx = (fleet->tail_ring_idx + 1) % TAIL_RING_TICKS;
+		if (fleet->tail_ring_count < TAIL_RING_TICKS)
+			fleet->tail_ring_count++;
 	}
-	p->tail_prev_bytes = bytes_now;
-	p->tail_prev_ms = now;
+	fleet->tail_prev_bytes = bytes_now;
+	fleet->tail_prev_ms = now;
 
-	if (p->tail_ring_count < TAIL_RING_TICKS)
+	if (fleet->tail_ring_count < TAIL_RING_TICKS)
 		return;	/* window not full yet */
 
 	/* Structural conjunction first (cheap, and required for an arm). */
-	int walker_done = (__atomic_load_n(&p->walker_phase,
+	int walker_done = (__atomic_load_n(&fleet->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE);
-	if (!walker_done || sftp_workqueue_depth(p->q) != 0)
+	if (!walker_done || sftp_workqueue_depth(fleet->q) != 0)
 		goto resolve;
 
 	{
@@ -565,45 +565,45 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 		 * accuse nor be accused - the measured source of the old
 		 * predicate's false positives).
 		 */
-		pthread_mutex_lock(&p->workers_mu);
-		for (int i = 0; i < p->num_workers; i++) {
-			struct sftp_worker *w = p->workers[i];
-			int av = __atomic_load_n(&w->avail, __ATOMIC_RELAXED);
+		pthread_mutex_lock(&fleet->workers_mu);
+		for (int i = 0; i < fleet->num_workers; i++) {
+			struct sftp_worker *worker = fleet->workers[i];
+			int av = __atomic_load_n(&worker->avail, __ATOMIC_RELAXED);
 
-			pthread_mutex_lock(&w->mu);
-			int healthy = (w->health == WORKER_HEALTHY);
-			uint64_t bt = w->bytes_total;
-			pthread_mutex_unlock(&w->mu);
-			uint64_t cur = bt + __atomic_load_n(&w->live_bytes,
+			pthread_mutex_lock(&worker->mu);
+			int healthy = (worker->health == WORKER_HEALTHY);
+			uint64_t bt = worker->bytes_total;
+			pthread_mutex_unlock(&worker->mu);
+			uint64_t cur = bt + __atomic_load_n(&worker->live_bytes,
 			    __ATOMIC_RELAXED);
 
 			/* Window sampling: BUSY workers only; idle workers
 			 * keep their last demonstrated samples. */
 			if (av == WORKER_AVAIL_BUSY) {
-				if (w->rate_prev_ms != 0 &&
-				    now > w->rate_prev_ms &&
-				    cur >= w->rate_prev_bytes) {
-					uint64_t r = (cur - w->rate_prev_bytes)
+				if (worker->rate_prev_ms != 0 &&
+				    now > worker->rate_prev_ms &&
+				    cur >= worker->rate_prev_bytes) {
+					uint64_t r = (cur - worker->rate_prev_bytes)
 					    * 1000ULL /
-					    (now - w->rate_prev_ms);
-					w->rate_ring[w->rate_ring_idx] = r;
-					w->rate_ring_idx =
-					    (w->rate_ring_idx + 1) %
+					    (now - worker->rate_prev_ms);
+					worker->rate_ring[worker->rate_ring_idx] = r;
+					worker->rate_ring_idx =
+					    (worker->rate_ring_idx + 1) %
 					    WORKER_RATE_RING;
-					if (w->rate_ring_count <
+					if (worker->rate_ring_count <
 					    WORKER_RATE_RING)
-						w->rate_ring_count++;
+						worker->rate_ring_count++;
 				}
-				w->rate_prev_bytes = cur;
-				w->rate_prev_ms = now;
+				worker->rate_prev_bytes = cur;
+				worker->rate_prev_ms = now;
 			} else {
-				w->rate_prev_ms = 0; /* re-baseline on next BUSY */
+				worker->rate_prev_ms = 0; /* re-baseline on next BUSY */
 			}
 
 			if (!healthy)
 				continue;
 			if (av == WORKER_AVAIL_READY) {
-				uint64_t m = worker_window_median(w);
+				uint64_t m = worker_window_median(worker);
 				n_ready++;
 				if (m > 0)
 					ready_medians[n_ready_hist++] = m;
@@ -621,18 +621,18 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 			}
 			baseline = ready_medians[n_ready_hist / 2];
 		}
-		for (int i = 0; i < p->num_workers && baseline > 0; i++) {
-			struct sftp_worker *w = p->workers[i];
-			int av = __atomic_load_n(&w->avail, __ATOMIC_RELAXED);
+		for (int i = 0; i < fleet->num_workers && baseline > 0; i++) {
+			struct sftp_worker *worker = fleet->workers[i];
+			int av = __atomic_load_n(&worker->avail, __ATOMIC_RELAXED);
 
 			if (av != WORKER_AVAIL_BUSY)
 				continue;
-			pthread_mutex_lock(&w->mu);
-			int healthy = (w->health == WORKER_HEALTHY);
-			pthread_mutex_unlock(&w->mu);
+			pthread_mutex_lock(&worker->mu);
+			int healthy = (worker->health == WORKER_HEALTHY);
+			pthread_mutex_unlock(&worker->mu);
 			if (!healthy)
 				continue;
-			uint64_t hmed = worker_window_median(w);
+			uint64_t hmed = worker_window_median(worker);
 			if (hmed == 0)
 				continue;	/* no evidence: cannot accuse */
 			if (hmed * 100 < baseline * TAIL_HOLDER_LAG_PCT) {
@@ -642,9 +642,9 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 				if (hmed > worst_holder_med ||
 				    worst_holder_med == 0)
 					worst_holder_med = hmed;
-				uint64_t usz = __atomic_load_n(&w->unit_size,
+				uint64_t usz = __atomic_load_n(&worker->unit_size,
 				    __ATOMIC_RELAXED);
-				uint64_t done = __atomic_load_n(&w->live_bytes,
+				uint64_t done = __atomic_load_n(&worker->live_bytes,
 				    __ATOMIC_RELAXED);
 				if (usz > done && hmed > 0) {
 					proj = (usz - done) / hmed;
@@ -652,21 +652,21 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 						worst_proj_sec = proj;
 				}
 				if (yield_tgt == NULL || hmed < yield_tgt_med) {
-					yield_tgt = w;
+					yield_tgt = worker;
 					yield_tgt_med = hmed;
 					yield_tgt_proj = proj;
 				}
 			}
 		}
-		pthread_mutex_unlock(&p->workers_mu);
+		pthread_mutex_unlock(&fleet->workers_mu);
 
 		if (n_ready > 0 && lagging > 0) {
 			uint64_t med_old = tail_quarter_median(
-			    p->tail_rate_ring, p->tail_ring_count,
-			    p->tail_ring_idx, 0);
+			    fleet->tail_rate_ring, fleet->tail_ring_count,
+			    fleet->tail_ring_idx, 0);
 			uint64_t med_new = tail_quarter_median(
-			    p->tail_rate_ring, p->tail_ring_count,
-			    p->tail_ring_idx, 1);
+			    fleet->tail_rate_ring, fleet->tail_ring_count,
+			    fleet->tail_ring_idx, 1);
 			int trend = (med_old > 0 && med_new <
 			    med_old * (100 - TAIL_DECLINE_PCT) / 100);
 			int project = (worst_proj_sec > TAIL_PROJECT_SEC);
@@ -681,10 +681,10 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 				 * episode start backdates to when the lag
 				 * began, so reported durations stay true.
 				 */
-				if (p->tail_lag_start_ms == 0)
-					p->tail_lag_start_ms = now;
-				if (!p->tail_episode &&
-				    now - p->tail_lag_start_ms >=
+				if (fleet->tail_lag_start_ms == 0)
+					fleet->tail_lag_start_ms = now;
+				if (!fleet->tail_episode &&
+				    now - fleet->tail_lag_start_ms >=
 				    TAIL_CONFIRM_SEC * 1000ULL) {
 					if (getenv("HPN_PARALLEL_TRACE") != NULL)
 						logit("HPN TAIL-DETECT t=%.3f "
@@ -696,7 +696,7 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 						    "ready_baseline=%llu",
 						    (double)now / 1e3,
 						    (double)(now -
-						    p->tail_lag_start_ms) / 1e3,
+						    fleet->tail_lag_start_ms) / 1e3,
 						    trend,
 						    (unsigned long long)worst_proj_sec,
 						    (unsigned long long)med_old,
@@ -704,9 +704,9 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 						    n_ready, n_ready_hist, lagging,
 						    (unsigned long long)worst_holder_med,
 						    (unsigned long long)baseline);
-					p->tail_episode = 1;
-					p->tail_episode_ms = p->tail_lag_start_ms;
-					tail_fire_yield(p, yield_tgt,
+					fleet->tail_episode = 1;
+					fleet->tail_episode_ms = fleet->tail_lag_start_ms;
+					tail_fire_yield(fleet, yield_tgt,
 					    yield_tgt_med, yield_tgt_proj);
 				}
 			}
@@ -715,16 +715,16 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
 
  resolve:
 	if (!would_arm)
-		p->tail_lag_start_ms = 0;	/* condition broke: re-confirm */
-	if (p->tail_episode && !would_arm) {
+		fleet->tail_lag_start_ms = 0;	/* condition broke: re-confirm */
+	if (fleet->tail_episode && !would_arm) {
 		if (getenv("HPN_PARALLEL_TRACE") != NULL)
 			logit("HPN TAIL-EPISODE-END t=%.3f dur=%.1fs "
 			    "pending=%llu",
 			    (double)now / 1e3,
-			    (double)(now - p->tail_episode_ms) / 1e3,
-			    (unsigned long long)p->pending);
-		p->tail_episode = 0;
-		p->tail_yield_fired = 0;	/* re-arm for the next episode */
+			    (double)(now - fleet->tail_episode_ms) / 1e3,
+			    (unsigned long long)fleet->pending);
+		fleet->tail_episode = 0;
+		fleet->tail_yield_fired = 0;	/* re-arm for the next episode */
 	}
 }
 
@@ -737,7 +737,7 @@ tail_detector_tick(struct sftp_parallel *p, uint64_t bytes_now)
  * with its transport's HPN TCPSAMPLE lines (which carry getpid()).
  */
 static void
-reporter_emit_fleetsample(struct sftp_parallel *p)
+reporter_emit_fleetsample(struct sftp_parallel *fleet)
 {
 	static int on = -1;
 	char line[4096];
@@ -752,27 +752,27 @@ reporter_emit_fleetsample(struct sftp_parallel *p)
 
 	off = (size_t)snprintf(line, sizeof(line),
 	    "HPN FLEETSAMPLE t=%.3f qdepth=%zu walker=%s",
-	    monotime_double(), sftp_workqueue_depth(p->q),
-	    walker_phase_name(__atomic_load_n(&p->walker_phase,
+	    monotime_double(), sftp_workqueue_depth(fleet->q),
+	    walker_phase_name(__atomic_load_n(&fleet->walker_phase,
 	        __ATOMIC_RELAXED)));
 
-	pthread_mutex_lock(&p->workers_mu);
-	for (i = 0; i < p->num_workers && off < sizeof(line) - 64; i++) {
-		struct sftp_worker *w = p->workers[i];
+	pthread_mutex_lock(&fleet->workers_mu);
+	for (i = 0; i < fleet->num_workers && off < sizeof(line) - 64; i++) {
+		struct sftp_worker *worker = fleet->workers[i];
 		uint64_t wb;
-		pthread_mutex_lock(&w->mu);
-		wb = w->bytes_total +
-		    __atomic_load_n(&w->live_bytes, __ATOMIC_RELAXED);
-		pthread_mutex_unlock(&w->mu);
+		pthread_mutex_lock(&worker->mu);
+		wb = worker->bytes_total +
+		    __atomic_load_n(&worker->live_bytes, __ATOMIC_RELAXED);
+		pthread_mutex_unlock(&worker->mu);
 		total += wb;
 		off += (size_t)snprintf(line + off, sizeof(line) - off,
-		    " w%d:%s:%llu:%ld", w->id,
-		    worker_phase_name(__atomic_load_n(&w->phase,
+		    " w%d:%s:%llu:%ld", worker->id,
+		    worker_phase_name(__atomic_load_n(&worker->phase,
 		        __ATOMIC_RELAXED)),
-		    (unsigned long long)wb, (long)w->ssh_pid);
+		    (unsigned long long)wb, (long)worker->ssh_pid);
 	}
-	total += p->retired_bytes;
-	pthread_mutex_unlock(&p->workers_mu);
+	total += fleet->retired_bytes;
+	pthread_mutex_unlock(&fleet->workers_mu);
 
 	logit("%s total_bytes=%llu", line, (unsigned long long)total);
 }
@@ -784,21 +784,21 @@ reporter_emit_fleetsample(struct sftp_parallel *p)
  * transfer bytes, so the published counter must not carry over.  Idempotent.
  */
 static void
-resume_stretch_restore(struct sftp_parallel *p)
+resume_stretch_restore(struct sftp_parallel *fleet)
 {
-	if (!p->resume_stretch_on)
+	if (!fleet->resume_stretch_on)
 		return;
-	p->resume_stretch_on = 0;
-	hpn_meter_relabel(&p->meter, p, p->progress_label_saved);
-	hpn_meter_retotal(&p->meter, p, p->progress_total_bytes);
-	p->aggregate_progress_counter = 0;
+	fleet->resume_stretch_on = 0;
+	hpn_meter_relabel(&fleet->meter, fleet, fleet->progress_label_saved);
+	hpn_meter_retotal(&fleet->meter, fleet, fleet->progress_total_bytes);
+	fleet->aggregate_progress_counter = 0;
 	hpn_pm_set_phase(HPNS_F_RESUME, 0);
 }
 
 void *
 parallel_reporter_thread(void *arg)
 {
-	struct sftp_parallel *p = arg;
+	struct sftp_parallel *fleet = arg;
 	struct timespec sleep_ts = {
 		.tv_sec = REPORTER_TICK_MS / 1000,
 		.tv_nsec = (REPORTER_TICK_MS % 1000) * 1000000L,
@@ -807,17 +807,17 @@ parallel_reporter_thread(void *arg)
 
 	while (1) {
 		nanosleep(&sleep_ts, NULL);
-		if (p->stopped)
+		if (fleet->stopped)
 			break;
 
 		/* Propagate caller's interrupt signal (e.g. SIGINT / Ctrl+C).
 		 * sftp_parallel_abort is idempotent; calling it every tick while
 		 * the flag stays set is harmless.  Record the CAUSE first so
 		 * the abort fallout is reported as an interrupt, not errors. */
-		if (p->ext_interrupt_flag != NULL && *p->ext_interrupt_flag) {
-			p->abort_user = 1;
+		if (fleet->ext_interrupt_flag != NULL && *fleet->ext_interrupt_flag) {
+			fleet->abort_user = 1;
 			parallel_user_abort_flag = 1;
-			sftp_parallel_abort(p);
+			sftp_parallel_abort(fleet);
 		}
 
 		/*
@@ -834,7 +834,7 @@ parallel_reporter_thread(void *arg)
 		 * alone (stdout piped to a reader that exited) keeps stock
 		 * pass-through behavior.
 		 */
-		if (!p->abort_flag) {
+		if (!fleet->abort_flag) {
 			struct pollfd lfd[2];
 
 			lfd[0].fd = STDOUT_FILENO;
@@ -846,16 +846,16 @@ parallel_reporter_thread(void *arg)
 			    (lfd[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
 				logit("control session closed; "
 				    "canceling transfer");
-				p->abort_user = 1;
-				sftp_parallel_abort(p);
+				fleet->abort_user = 1;
+				sftp_parallel_abort(fleet);
 			}
 		}
 
 		uint64_t bytes;
 		off_t newpos;
-		parallel_stats_snapshot(p, &bytes, NULL, NULL);
-		if (p->verify_phase_active && p->verify_total_units > 0) {
-			resume_stretch_restore(p);	/* safety: never both */
+		parallel_stats_snapshot(fleet, &bytes, NULL, NULL);
+		if (fleet->verify_phase_active && fleet->verify_total_units > 0) {
+			resume_stretch_restore(fleet);	/* safety: never both */
 			/* Post-transfer verify phase: byte-granular meter.  Counter
 			 * = bytes of fully-verified files (verify_done_bytes) + every
 			 * worker's in-flight count for the file it is hashing right
@@ -866,39 +866,39 @@ parallel_reporter_thread(void *arg)
 			 * exact total once all units are done so the bar lands at
 			 * 100% (the last heartbeat may trail the final bytes). */
 			uint64_t done_units = __atomic_load_n(
-			    &p->verify_done_units, __ATOMIC_RELAXED);
-			if (done_units >= p->verify_total_units) {
-				newpos = p->verify_meter_total;
+			    &fleet->verify_done_units, __ATOMIC_RELAXED);
+			if (done_units >= fleet->verify_total_units) {
+				newpos = fleet->verify_meter_total;
 			} else {
 				uint64_t hashed = __atomic_load_n(
-				    &p->verify_done_bytes, __ATOMIC_RELAXED);
+				    &fleet->verify_done_bytes, __ATOMIC_RELAXED);
 				/* workers_mu: a detached respawn thread can
-				 * xreallocarray(p->workers) (and the reap loop can
+				 * xreallocarray(fleet->workers) (and the reap loop can
 				 * remove/free a worker) during the verify phase -
 				 * a worker whose conn drops mid-hash is reaped and
-				 * respawned.  Iterating workers[]/w->conn unlocked
+				 * respawned.  Iterating workers[]/worker->conn unlocked
 				 * would race that realloc/free (UAF/OOB).  Mirror
 				 * the sibling fleet-sample/reap/CSV loops, which all
 				 * hold this lock; the body is only a cheap atomic
 				 * getter. */
-				pthread_mutex_lock(&p->workers_mu);
-				for (int wi = 0; wi < p->num_workers; wi++) {
-					struct sftp_worker *w = p->workers[wi];
+				pthread_mutex_lock(&fleet->workers_mu);
+				for (int wi = 0; wi < fleet->num_workers; wi++) {
+					struct sftp_worker *worker = fleet->workers[wi];
 					uint64_t d, t;
 
-					if (w == NULL || w->conn == NULL)
+					if (worker == NULL || worker->conn == NULL)
 						continue;
-					sftp_conn_hash_work_live(w->conn,
+					sftp_conn_hash_work_live(worker->conn,
 					    &d, &t);
 					hashed += d;
 				}
-				pthread_mutex_unlock(&p->workers_mu);
-				if (hashed > (uint64_t)p->verify_meter_total)
-					hashed = (uint64_t)p->verify_meter_total;
+				pthread_mutex_unlock(&fleet->workers_mu);
+				if (hashed > (uint64_t)fleet->verify_meter_total)
+					hashed = (uint64_t)fleet->verify_meter_total;
 				newpos = (off_t)hashed;
 			}
-		} else if (bytes == p->progress_bytes_baseline &&
-		    p->progress_meter_started) {
+		} else if (bytes == fleet->progress_bytes_baseline &&
+		    fleet->progress_meter_started) {
 			/*
 			 * Resume-check stretch (-Z UX): no transfer byte has
 			 * moved yet, but workers may be hashing existing
@@ -912,49 +912,49 @@ parallel_reporter_thread(void *arg)
 			 */
 			uint64_t rtotal = 0, rdone = 0;
 
-			pthread_mutex_lock(&p->workers_mu);
-			for (int wi = 0; wi < p->num_workers; wi++) {
-				struct sftp_worker *w = p->workers[wi];
+			pthread_mutex_lock(&fleet->workers_mu);
+			for (int wi = 0; wi < fleet->num_workers; wi++) {
+				struct sftp_worker *worker = fleet->workers[wi];
 				uint64_t d, t;
 
-				if (w == NULL || w->conn == NULL)
+				if (worker == NULL || worker->conn == NULL)
 					continue;
-				sftp_conn_hash_work_live(w->conn, &d, &t);
+				sftp_conn_hash_work_live(worker->conn, &d, &t);
 				rtotal += t;
 				rdone += d;
 			}
-			pthread_mutex_unlock(&p->workers_mu);
+			pthread_mutex_unlock(&fleet->workers_mu);
 			if (rtotal > 0) {
-				if (!p->resume_stretch_on) {
-					p->resume_stretch_on = 1;
+				if (!fleet->resume_stretch_on) {
+					fleet->resume_stretch_on = 1;
 					/* Save the transfer meter's label
 					 * and total for the restore; the
 					 * reporter owns the meter, so
 					 * reading them here is safe. */
-					strlcpy(p->progress_label_saved,
-					    p->meter.label,
-					    sizeof(p->progress_label_saved));
-					p->progress_total_bytes =
-					    p->meter.total;
-					hpn_meter_relabel(&p->meter, p,
+					strlcpy(fleet->progress_label_saved,
+					    fleet->meter.label,
+					    sizeof(fleet->progress_label_saved));
+					fleet->progress_total_bytes =
+					    fleet->meter.total;
+					hpn_meter_relabel(&fleet->meter, fleet,
 					    "resume check");
-					p->aggregate_progress_counter = 0;
+					fleet->aggregate_progress_counter = 0;
 					hpn_pm_set_phase(
 					    HPNS_F_RESUME, 1);
 				}
-				hpn_meter_retotal(&p->meter, p,
+				hpn_meter_retotal(&fleet->meter, fleet,
 				    (off_t)rtotal);
 				if (rdone > rtotal)
 					rdone = rtotal;
 				newpos = (off_t)rdone;
 			} else {
-				resume_stretch_restore(p);
+				resume_stretch_restore(fleet);
 				newpos = 0;
 			}
 		} else {
-			resume_stretch_restore(p);
-			newpos = bytes > p->progress_bytes_baseline ?
-			    (off_t)(bytes - p->progress_bytes_baseline) : 0;
+			resume_stretch_restore(fleet);
+			newpos = bytes > fleet->progress_bytes_baseline ?
+			    (off_t)(bytes - fleet->progress_bytes_baseline) : 0;
 		}
 		/*
 		 * Monotonic publish.  The raw aggregate steps BACKWARD when a
@@ -974,9 +974,9 @@ parallel_reporter_thread(void *arg)
 		 * verify start) with no lock, and a raciness-window publish
 		 * would be pinned by the ratchet for the whole next meter
 		 * instead of self-correcting on the following tick. */
-		if (p->progress_meter_started &&
-		    newpos > p->aggregate_progress_counter)
-			p->aggregate_progress_counter = newpos;
+		if (fleet->progress_meter_started &&
+		    newpos > fleet->aggregate_progress_counter)
+			fleet->aggregate_progress_counter = newpos;
 		/* HPN status relay: keep the frame emitter's fleet telemetry
 		 * fresh (stored unconditionally; only read when frame mode
 		 * is armed).  Same lock discipline as the sibling fleet
@@ -984,24 +984,24 @@ parallel_reporter_thread(void *arg)
 		{
 			u_int fr_active = 0, fr_stalled = 0;
 
-			pthread_mutex_lock(&p->workers_mu);
-			for (int wi = 0; wi < p->num_workers; wi++) {
-				struct sftp_worker *w = p->workers[wi];
+			pthread_mutex_lock(&fleet->workers_mu);
+			for (int wi = 0; wi < fleet->num_workers; wi++) {
+				struct sftp_worker *worker = fleet->workers[wi];
 
-				if (w == NULL || w->exited)
+				if (worker == NULL || worker->exited)
 					continue;
-				if (w->health == WORKER_STALLED)
+				if (worker->health == WORKER_STALLED)
 					fr_stalled++;
-				else if (w->health != WORKER_DEAD)
+				else if (worker->health != WORKER_DEAD)
 					fr_active++;
 			}
-			pthread_mutex_unlock(&p->workers_mu);
+			pthread_mutex_unlock(&fleet->workers_mu);
 			hpn_pm_set_workers(fr_active,
 			    fr_stalled);
 			hpn_pm_set_files(
-			    (u_int)__atomic_load_n(&p->files_submitted,
+			    (u_int)__atomic_load_n(&fleet->files_submitted,
 			        __ATOMIC_RELAXED),
-			    (u_int)__atomic_load_n(&p->files_total,
+			    (u_int)__atomic_load_n(&fleet->files_total,
 			        __ATOMIC_RELAXED));
 		}
 
@@ -1013,85 +1013,85 @@ parallel_reporter_thread(void *arg)
 		 * stretch has the meter, so a post never lands in the
 		 * stretch's hash-byte total.
 		 */
-		if (p->progress_meter_started && !p->resume_stretch_on) {
+		if (fleet->progress_meter_started && !fleet->resume_stretch_on) {
 			off_t addb = __atomic_exchange_n(
-			    &p->posted_total_add, 0, __ATOMIC_RELAXED);
+			    &fleet->posted_total_add, 0, __ATOMIC_RELAXED);
 			u_int addf = __atomic_exchange_n(
-			    &p->posted_files_add, 0, __ATOMIC_RELAXED);
+			    &fleet->posted_files_add, 0, __ATOMIC_RELAXED);
 
 			if (addb > 0 || addf > 0) {
-				hpn_meter_add_total(&p->meter, p, addb, addf);
-				if (p->progress_verb[0] != '\0' &&
-				    p->meter.nfiles > 0) {
+				hpn_meter_add_total(&fleet->meter, fleet, addb, addf);
+				if (fleet->progress_verb[0] != '\0' &&
+				    fleet->meter.nfiles > 0) {
 					char lbl[HPN_METER_LABEL_MAX];
 
 					snprintf(lbl, sizeof(lbl),
 					    "%s %u %s in parallel",
-					    p->progress_verb,
-					    p->meter.nfiles,
-					    p->meter.nfiles == 1 ?
+					    fleet->progress_verb,
+					    fleet->meter.nfiles,
+					    fleet->meter.nfiles == 1 ?
 					    "file" : "files");
-					hpn_meter_relabel(&p->meter, p, lbl);
+					hpn_meter_relabel(&fleet->meter, fleet, lbl);
 				}
 			}
 		}
-		if (__atomic_load_n(&p->meter_final_request,
+		if (__atomic_load_n(&fleet->meter_final_request,
 		    __ATOMIC_ACQUIRE)) {
 			/* progress_stop snapped the counter to the total and
 			 * is waiting on this paint; force it past the alarm
 			 * gate and acknowledge. */
 			refresh_progress_meter(1);
-			__atomic_store_n(&p->meter_final_request, 0,
+			__atomic_store_n(&fleet->meter_final_request, 0,
 			    __ATOMIC_RELEASE);
-		} else if (p->progress_meter_started)
+		} else if (fleet->progress_meter_started)
 			refresh_progress_meter(0);
 
 		/* Tail trend detector (phase B: telemetry only). */
-		tail_detector_tick(p, bytes);
+		tail_detector_tick(fleet, bytes);
 
 		/* Liveness checks on a slower cadence (every 5 ticks ≈ 1s):
 		 * cheaper and watchdog timing doesn't need 200ms granularity. */
 		if (++slow_tick_counter >= 5) {
 			slow_tick_counter = 0;
 
-			reporter_emit_fleetsample(p);
+			reporter_emit_fleetsample(fleet);
 
 			/* Watchdog classifies workers HEALTHY/STALLED/DEAD
 			 * and SIGTERMs newly DEAD ones. We don't abort here;
 			 * the reap loop below joins exited workers and spawns
 			 * replacements. */
-			(void)parallel_watchdog_check(p);
+			(void)parallel_watchdog_check(fleet);
 
 			/* SIGTERM any respawn wedged in its handshake past the
 			 * stall deadline.  The blocked spawn thread cannot time
 			 * itself out, so the reporter does it: otherwise the
 			 * stalled respawn pins pending_respawns and deadlocks the
 			 * abort net (fatal at -j1). */
-			parallel_respawn_sweep_stalled(p);
+			parallel_respawn_sweep_stalled(fleet);
 
-			/* Move any worker re-queue overflow back into p->q as it
+			/* Move any worker re-queue overflow back into fleet->q as it
 			 * frees up.  Workers park here (instead of blocking) when
 			 * a re-queue hits a full queue; draining from the reporter
 			 * is what keeps that non-blocking path live. */
-			parallel_retry_overflow_drain(p);
+			parallel_retry_overflow_drain(fleet);
 
 			/* Track synchronous stalls (all workers at zero bytes
 			 * while work is in flight) as a leading indicator of
 			 * write-cache saturation from too many parallel writers.
 			 * Observation-only for now; future use as a scale-down
 			 * signal. */
-			parallel_watchdog_sync_check(p);
+			parallel_watchdog_sync_check(fleet);
 
-			int n_to_respawn = reporter_reap_exited_workers(p);
+			int n_to_respawn = reporter_reap_exited_workers(fleet);
 
-			if (parallel_respawn_dispatch(p, n_to_respawn))
+			if (parallel_respawn_dispatch(fleet, n_to_respawn))
 				break;
 
 			/* Operator flare: episode-level notices for degraded
 			 * stretches (cooldown / accepting slow workers).  Runs
 			 * after dispatch so cooldown + born_slow_accepting are
 			 * fresh; no-op on a clean transfer. */
-			reporter_flare(p);
+			reporter_flare(fleet);
 		}
 	}
 	return NULL;

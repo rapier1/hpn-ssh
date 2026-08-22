@@ -305,7 +305,7 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
  * (scan-build flagged it as a potential UAF; see
  * SECURITY_REVIEW_19.0_FINDINGS.md LOW-1).
  *
- * `w` is the worker reporting completion; used only for sftp_rm on
+ * `worker` is the worker reporting completion; used only for sftp_rm on
  * REMOTE-target trackers when the corrupt-file cleanup fires.  May
  * be NULL otherwise (I4).
  *
@@ -320,7 +320,7 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
  */
 int
 parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
-    int failed, struct sftp_worker *w)
+    int failed, struct sftp_worker *worker)
 {
 	int was_last, incomplete;
 
@@ -382,7 +382,7 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 		 * an aborted file is still not delivered). */
 		transferlog_file(TRANSFERLOG_FAILED,
 		    (long long)t->file_bytes, t->path);
-	} else if (t->verify && w != NULL) {
+	} else if (t->verify && worker != NULL) {
 		/*
 		 * HPNVerifyTransfer: the file's last range just finished
 		 * cleanly.  Park the completed tracker for the post-transfer
@@ -392,7 +392,7 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 		 * SFTP_OP_VERIFY unit once the transfer queue drains; the verify
 		 * handler frees the tracker.
 		 */
-		parallel_verify_park(w->parent, t);
+		parallel_verify_park(worker->parent, t);
 		return incomplete;
 	} else {
 		/* TransferLog: clean range/span completion with no verify
@@ -417,9 +417,9 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
  */
 int
 parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
-    struct sftp_worker *w)
+    struct sftp_worker *worker)
 {
-	return parallel_unit_tracker_finalize_n(t, 1, failed, w);
+	return parallel_unit_tracker_finalize_n(t, 1, failed, worker);
 }
 
 /*
@@ -445,18 +445,18 @@ parallel_verify_tracker_free(struct sftp_range_tracker *t)
  * teed per-range source hashes) is held until sftp_parallel_wait submits it.
  */
 void
-parallel_verify_park(struct sftp_parallel *p, struct sftp_range_tracker *t)
+parallel_verify_park(struct sftp_parallel *fleet, struct sftp_range_tracker *t)
 {
-	pthread_mutex_lock(&p->verify_pending_mu);
-	if (p->verify_pending_n == p->verify_pending_cap) {
-		int ncap = p->verify_pending_cap ? p->verify_pending_cap * 2 : 16;
-		p->verify_pending = xreallocarray(p->verify_pending,
-		    (size_t)ncap, sizeof(*p->verify_pending));
-		p->verify_pending_cap = ncap;
+	pthread_mutex_lock(&fleet->verify_pending_mu);
+	if (fleet->verify_pending_n == fleet->verify_pending_cap) {
+		int ncap = fleet->verify_pending_cap ? fleet->verify_pending_cap * 2 : 16;
+		fleet->verify_pending = xreallocarray(fleet->verify_pending,
+		    (size_t)ncap, sizeof(*fleet->verify_pending));
+		fleet->verify_pending_cap = ncap;
 	}
-	p->verify_pending[p->verify_pending_n++] = t;
+	fleet->verify_pending[fleet->verify_pending_n++] = t;
 	/* Memory gate charged at SUBMIT, not at park (see park_whole_file). */
-	pthread_mutex_unlock(&p->verify_pending_mu);
+	pthread_mutex_unlock(&fleet->verify_pending_mu);
 }
 
 /*
@@ -465,7 +465,7 @@ parallel_verify_park(struct sftp_parallel *p, struct sftp_range_tracker *t)
  * hpnsftp exits SFTP_EX_VERIFY_FAILED.
  */
 void
-parallel_verify_fail_record(struct sftp_parallel *p, int local_is_target,
+parallel_verify_fail_record(struct sftp_parallel *fleet, int local_is_target,
     const char *local_path, const char *remote_path)
 {
 	char *desc;
@@ -474,7 +474,7 @@ parallel_verify_fail_record(struct sftp_parallel *p, int local_is_target,
 	xasprintf(&desc, "%s file \"%s\"",
 	    local_is_target ? "local" : "remote",
 	    local_is_target ? local_path : remote_path);
-	hpn_strlist_append(&p->verify_failed_paths, desc);
+	hpn_strlist_append(&fleet->verify_failed_paths, desc);
 	free(desc);
 }
 
@@ -501,12 +501,12 @@ path_strip_prefix(const char *path, const char *prefix, const char **rel)
 }
 
 void
-parallel_verify_prefix_register(struct sftp_parallel *p, const char *dir)
+parallel_verify_prefix_register(struct sftp_parallel *fleet, const char *dir)
 {
 	char *d;
 	int i;
 
-	if (p == NULL || dir == NULL || dir[0] == '\0')
+	if (fleet == NULL || dir == NULL || dir[0] == '\0')
 		return;
 	d = xstrdup(dir);
 	path_trim_trailing_slash(d);
@@ -516,10 +516,10 @@ parallel_verify_prefix_register(struct sftp_parallel *p, const char *dir)
 		free(d);
 		return;
 	}
-	pthread_mutex_lock(&p->verify_pending_mu);
-	for (i = 0; i < p->verify_prefixes_n; i++) {	/* dedup */
-		if (strcmp(p->verify_prefixes[i], d) == 0) {
-			pthread_mutex_unlock(&p->verify_pending_mu);
+	pthread_mutex_lock(&fleet->verify_pending_mu);
+	for (i = 0; i < fleet->verify_prefixes_n; i++) {	/* dedup */
+		if (strcmp(fleet->verify_prefixes[i], d) == 0) {
+			pthread_mutex_unlock(&fleet->verify_pending_mu);
 			free(d);
 			return;
 		}
@@ -529,60 +529,60 @@ parallel_verify_prefix_register(struct sftp_parallel *p, const char *dir)
 	 * files store the full path (prefix = -1) instead of an out-of-range index.
 	 * Graceful degradation - never a bad index.  Reaching here needs one
 	 * command set spanning 32k+ distinct directories. */
-	if (p->verify_prefixes_n >= INT16_MAX) {
-		pthread_mutex_unlock(&p->verify_pending_mu);
+	if (fleet->verify_prefixes_n >= INT16_MAX) {
+		pthread_mutex_unlock(&fleet->verify_pending_mu);
 		free(d);
 		return;
 	}
-	if (p->verify_prefixes_n == p->verify_prefixes_cap) {
-		int ncap = p->verify_prefixes_cap ? p->verify_prefixes_cap * 2 : 8;
-		p->verify_prefixes = xreallocarray(p->verify_prefixes,
-		    (size_t)ncap, sizeof(*p->verify_prefixes));
-		p->verify_prefixes_cap = ncap;
+	if (fleet->verify_prefixes_n == fleet->verify_prefixes_cap) {
+		int ncap = fleet->verify_prefixes_cap ? fleet->verify_prefixes_cap * 2 : 8;
+		fleet->verify_prefixes = xreallocarray(fleet->verify_prefixes,
+		    (size_t)ncap, sizeof(*fleet->verify_prefixes));
+		fleet->verify_prefixes_cap = ncap;
 	}
-	p->verify_prefixes[p->verify_prefixes_n++] = d;
+	fleet->verify_prefixes[fleet->verify_prefixes_n++] = d;
 	/* Memory gate: account the dir string + its array slot (+16 rounding). */
-	p->verify_parked_bytes += strlen(d) + 1 + 8 + 16;
-	pthread_mutex_unlock(&p->verify_pending_mu);
+	fleet->verify_parked_bytes += strlen(d) + 1 + 8 + 16;
+	pthread_mutex_unlock(&fleet->verify_pending_mu);
 }
 
 int
-parallel_verify_prefix_match(struct sftp_parallel *p, const char *path,
+parallel_verify_prefix_match(struct sftp_parallel *fleet, const char *path,
     const char **rel)
 {
 	int i, best = -1;
 	size_t best_len = 0;
 
 	*rel = path;			/* default: no prefix, store the path as-is */
-	if (p == NULL)
+	if (fleet == NULL)
 		return -1;
-	pthread_mutex_lock(&p->verify_pending_mu);
-	for (i = 0; i < p->verify_prefixes_n; i++) {
+	pthread_mutex_lock(&fleet->verify_pending_mu);
+	for (i = 0; i < fleet->verify_prefixes_n; i++) {
 		const char *r;
-		size_t pl = strlen(p->verify_prefixes[i]);
+		size_t pl = strlen(fleet->verify_prefixes[i]);
 
 		if (pl > best_len &&
-		    path_strip_prefix(path, p->verify_prefixes[i], &r)) {
+		    path_strip_prefix(path, fleet->verify_prefixes[i], &r)) {
 			best = i;
 			best_len = pl;
 			*rel = r;
 		}
 	}
-	pthread_mutex_unlock(&p->verify_pending_mu);
+	pthread_mutex_unlock(&fleet->verify_pending_mu);
 	return best;
 }
 
 char *
-parallel_verify_prefix_join(struct sftp_parallel *p, int idx, const char *rel)
+parallel_verify_prefix_join(struct sftp_parallel *fleet, int idx, const char *rel)
 {
 	char *out, *prefix = NULL;
 
 	if (idx < 0)
 		return xstrdup(rel);		/* no prefix: rel is the path as-is */
-	pthread_mutex_lock(&p->verify_pending_mu);
-	if (idx < p->verify_prefixes_n)
-		prefix = xstrdup(p->verify_prefixes[idx]);
-	pthread_mutex_unlock(&p->verify_pending_mu);
+	pthread_mutex_lock(&fleet->verify_pending_mu);
+	if (idx < fleet->verify_prefixes_n)
+		prefix = xstrdup(fleet->verify_prefixes[idx]);
+	pthread_mutex_unlock(&fleet->verify_pending_mu);
 	if (prefix == NULL)
 		return xstrdup(rel);		/* defensive: pool changed */
 	xasprintf(&out, "%s/%s", prefix, rel);
@@ -598,17 +598,17 @@ parallel_verify_prefix_join(struct sftp_parallel *p, int idx, const char *rel)
  * INT16_MAX pool cap.  Submitter thread only.
  */
 void
-parallel_verify_prefix_pool_reset(struct sftp_parallel *p)
+parallel_verify_prefix_pool_reset(struct sftp_parallel *fleet)
 {
 	int i;
 
-	if (p == NULL)
+	if (fleet == NULL)
 		return;
-	pthread_mutex_lock(&p->verify_pending_mu);
-	for (i = 0; i < p->verify_prefixes_n; i++)
-		free(p->verify_prefixes[i]);
-	p->verify_prefixes_n = 0;
-	pthread_mutex_unlock(&p->verify_pending_mu);
+	pthread_mutex_lock(&fleet->verify_pending_mu);
+	for (i = 0; i < fleet->verify_prefixes_n; i++)
+		free(fleet->verify_prefixes[i]);
+	fleet->verify_prefixes_n = 0;
+	pthread_mutex_unlock(&fleet->verify_pending_mu);
 }
 
 /*
@@ -648,7 +648,7 @@ verify_whole_item_new(int local_prefix, const char *local_rel,
  * back to full paths.  The verify handler rebuilds local/remote.
  */
 void
-parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
+parallel_verify_park_whole_file(struct sftp_parallel *fleet, const char *local_path,
     const char *remote_path, int local_is_target)
 {
 	struct verify_whole_item *it;
@@ -658,22 +658,22 @@ parallel_verify_park_whole_file(struct sftp_parallel *p, const char *local_path,
 	/* Factor each side independently: the always-full side (remote on both
 	 * upload and download) matches a registered dir prefix; a relative side
 	 * matches nothing and is stored as-is (already short). */
-	lp = parallel_verify_prefix_match(p, local_path, &lrel);
-	rp = parallel_verify_prefix_match(p, remote_path, &rrel);
+	lp = parallel_verify_prefix_match(fleet, local_path, &lrel);
+	rp = parallel_verify_prefix_match(fleet, remote_path, &rrel);
 	it = verify_whole_item_new(lp, lrel, rp, rrel, local_is_target);
 
-	pthread_mutex_lock(&p->verify_pending_mu);
-	if (p->verify_whole_pending_n == p->verify_whole_pending_cap) {
-		int ncap = p->verify_whole_pending_cap
-		    ? p->verify_whole_pending_cap * 2 : 16;
-		p->verify_whole_pending = xreallocarray(p->verify_whole_pending,
-		    (size_t)ncap, sizeof(*p->verify_whole_pending));
-		p->verify_whole_pending_cap = ncap;
+	pthread_mutex_lock(&fleet->verify_pending_mu);
+	if (fleet->verify_whole_pending_n == fleet->verify_whole_pending_cap) {
+		int ncap = fleet->verify_whole_pending_cap
+		    ? fleet->verify_whole_pending_cap * 2 : 16;
+		fleet->verify_whole_pending = xreallocarray(fleet->verify_whole_pending,
+		    (size_t)ncap, sizeof(*fleet->verify_whole_pending));
+		fleet->verify_whole_pending_cap = ncap;
 	}
-	p->verify_whole_pending[p->verify_whole_pending_n++] = it;
+	fleet->verify_whole_pending[fleet->verify_whole_pending_n++] = it;
 	/* Memory gate is charged at SUBMIT (parallel_verify_item_bytes_estimate),
 	 * not here - parking is the lagging event the submitter can't see. */
-	pthread_mutex_unlock(&p->verify_pending_mu);
+	pthread_mutex_unlock(&fleet->verify_pending_mu);
 }
 
 /* Free a range-granular verify job (paths + the per-range arrays). */
@@ -750,36 +750,36 @@ verify_units_append(struct sftp_work_unit ***units, int *nunits, int *ucap,
  * whole-file units, not files) for the phase meter.
  */
 int
-parallel_verify_phase_submit(struct sftp_parallel *p)
+parallel_verify_phase_submit(struct sftp_parallel *fleet)
 {
 	struct sftp_range_tracker **arr;
 	struct verify_whole_item **warr;
 	struct sftp_work_unit **units = NULL;
 	int i, n, wn, can_chunk, nunits = 0, ucap = 0;
 
-	pthread_mutex_lock(&p->verify_pending_mu);
-	arr = p->verify_pending;
-	n = p->verify_pending_n;
-	p->verify_pending = NULL;
-	p->verify_pending_n = 0;
-	p->verify_pending_cap = 0;
-	warr = p->verify_whole_pending;
-	wn = p->verify_whole_pending_n;
-	p->verify_whole_pending = NULL;
-	p->verify_whole_pending_n = 0;
-	p->verify_whole_pending_cap = 0;
+	pthread_mutex_lock(&fleet->verify_pending_mu);
+	arr = fleet->verify_pending;
+	n = fleet->verify_pending_n;
+	fleet->verify_pending = NULL;
+	fleet->verify_pending_n = 0;
+	fleet->verify_pending_cap = 0;
+	warr = fleet->verify_whole_pending;
+	wn = fleet->verify_whole_pending_n;
+	fleet->verify_whole_pending = NULL;
+	fleet->verify_whole_pending_n = 0;
+	fleet->verify_whole_pending_cap = 0;
 	/* Memory gate: this drains every parked item into verify units (their
 	 * frees follow as the units complete), so the parked total returns to 0.
 	 * The prefix pool's bytes are released separately by the wave's
 	 * pool_reset once the verify units finish reading it. */
-	p->verify_parked_bytes = 0;
-	pthread_mutex_unlock(&p->verify_pending_mu);
+	fleet->verify_parked_bytes = 0;
+	pthread_mutex_unlock(&fleet->verify_pending_mu);
 
 	/* Range-granular verify needs the server's sftp-hash-range; all workers
 	 * talk to the same server, so one worker's conn answers for the fleet. */
-	can_chunk = (p->num_workers > 0 && p->workers[0] != NULL &&
-	    p->workers[0]->conn != NULL &&
-	    sftp_conn_has_hash_range(p->workers[0]->conn));
+	can_chunk = (fleet->num_workers > 0 && fleet->workers[0] != NULL &&
+	    fleet->workers[0]->conn != NULL &&
+	    sftp_conn_has_hash_range(fleet->workers[0]->conn));
 
 	for (i = 0; i < n; i++) {
 		struct sftp_range_tracker *t = arr[i];
@@ -833,10 +833,10 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
 
 	/* Set the unit total BEFORE pushing so the reporter's 100%-snap gate
 	 * (done_units >= total) can't fire early while we are still submitting. */
-	p->verify_total_units = (uint64_t)nunits;
+	fleet->verify_total_units = (uint64_t)nunits;
 
 	for (i = 0; i < nunits; i++)
-		(void)parallel_unit_submit(p, units[i]);
+		(void)parallel_unit_submit(fleet, units[i]);
 	free(units);
 	return nunits;
 }
@@ -849,12 +849,12 @@ parallel_verify_phase_submit(struct sftp_parallel *p)
  * defines.
  */
 int
-parallel_unit_max_retries(struct sftp_parallel *p)
+parallel_unit_max_retries(struct sftp_parallel *fleet)
 {
-	if (p != NULL &&
-	    p->cfg.max_retries >= HPN_MAX_RETRIES_MIN &&
-	    p->cfg.max_retries <= HPN_MAX_RETRIES_MAX)
-		return p->cfg.max_retries;
+	if (fleet != NULL &&
+	    fleet->cfg.max_retries >= HPN_MAX_RETRIES_MIN &&
+	    fleet->cfg.max_retries <= HPN_MAX_RETRIES_MAX)
+		return fleet->cfg.max_retries;
 	return HPN_MAX_RETRIES_DEFAULT;
 }
 
@@ -878,22 +878,22 @@ parallel_unit_max_retries(struct sftp_parallel *p)
  * there is no lost wakeup.
  */
 static void
-pending_dec_locked(struct sftp_parallel *p)
+pending_dec_locked(struct sftp_parallel *fleet)
 {
-	if (p->pending > 0)
-		p->pending--;
-	if (p->pending == 0 ||
-	    (p->outstanding_cap != 0 &&
-	     p->pending + 1 == p->outstanding_cap))
-		pthread_cond_broadcast(&p->pending_cv);
+	if (fleet->pending > 0)
+		fleet->pending--;
+	if (fleet->pending == 0 ||
+	    (fleet->outstanding_cap != 0 &&
+	     fleet->pending + 1 == fleet->outstanding_cap))
+		pthread_cond_broadcast(&fleet->pending_cv);
 }
 
 void
-parallel_unit_pending_dec(struct sftp_parallel *p)
+parallel_unit_pending_dec(struct sftp_parallel *fleet)
 {
-	pthread_mutex_lock(&p->pending_mu);
-	pending_dec_locked(p);
-	pthread_mutex_unlock(&p->pending_mu);
+	pthread_mutex_lock(&fleet->pending_mu);
+	pending_dec_locked(fleet);
+	pthread_mutex_unlock(&fleet->pending_mu);
 }
 
 
@@ -904,17 +904,17 @@ parallel_unit_pending_dec(struct sftp_parallel *p)
  * of truth with the serial walk accumulator.
  */
 static uint64_t
-bundle_target_for(const struct sftp_parallel *p)
+bundle_target_for(const struct sftp_parallel *fleet)
 {
-	return (p != NULL && p->cfg.bundle_size > 0)
-	    ? p->cfg.bundle_size
+	return (fleet != NULL && fleet->cfg.bundle_size > 0)
+	    ? fleet->cfg.bundle_size
 	    : BUNDLE_TARGET_BYTES_DEFAULT;
 }
 
-static int submit_upload_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
+static int submit_upload_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
     off_t file_size, mode_t mode);
-static int submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
+static int submit_download_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *remote_path, const char *local_path,
     off_t file_size, mode_t mode);
 
@@ -924,14 +924,14 @@ static int submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn
  * push-fail backout so pending / queued_bytes stay balanced.
  */
 static void
-parallel_bundle_member_pushfail(struct sftp_parallel *p,
+parallel_bundle_member_pushfail(struct sftp_parallel *fleet,
     struct sftp_work_unit *u)
 {
-	pthread_mutex_lock(&p->pending_mu);
-	pending_dec_locked(p);
-	pthread_mutex_unlock(&p->pending_mu);
+	pthread_mutex_lock(&fleet->pending_mu);
+	pending_dec_locked(fleet);
+	pthread_mutex_unlock(&fleet->pending_mu);
 	if (u->size > 0)
-		__atomic_fetch_sub(&p->queued_bytes, (uint64_t)u->size,
+		__atomic_fetch_sub(&fleet->queued_bytes, (uint64_t)u->size,
 		    __ATOMIC_RELAXED);
 	parallel_unit_free(u);
 }
@@ -947,36 +947,36 @@ parallel_bundle_member_pushfail(struct sftp_parallel *p,
  * the single pickup subtraction at worker dispatch).
  */
 static void
-parallel_bundle_flush(struct sftp_parallel *p)
+parallel_bundle_flush(struct sftp_parallel *fleet)
 {
-	int n = p->bundle_pending_n, i;
+	int n = fleet->bundle_pending_n, i;
 
 	if (n == 0)
 		return;
-	p->bundle_pending_n = 0;
-	p->bundle_pending_framed = 0;
-	p->bundle_pending_path_bytes = 0;
+	fleet->bundle_pending_n = 0;
+	fleet->bundle_pending_framed = 0;
+	fleet->bundle_pending_path_bytes = 0;
 
 	if (n == 1) {
-		struct sftp_work_unit *u = p->bundle_pending[0];
-		if (sftp_workqueue_push(p->q, u) != 0)
-			parallel_bundle_member_pushfail(p, u);
+		struct sftp_work_unit *u = fleet->bundle_pending[0];
+		if (sftp_workqueue_push(fleet->q, u) != 0)
+			parallel_bundle_member_pushfail(fleet, u);
 		return;
 	}
 
 	struct sftp_work_unit *c = xcalloc(1, sizeof(*c));
-	c->op = (p->bundle_pending_op == SFTP_OP_DOWNLOAD)
+	c->op = (fleet->bundle_pending_op == SFTP_OP_DOWNLOAD)
 	    ? SFTP_OP_BUNDLE_DOWNLOAD : SFTP_OP_BUNDLE_UPLOAD;
 	c->members = xreallocarray(NULL, (size_t)n, sizeof(*c->members));
 	c->n_members = n;
 	for (i = 0; i < n; i++) {
-		c->members[i] = p->bundle_pending[i];
-		if (p->bundle_pending[i]->size > 0)
-			c->size += p->bundle_pending[i]->size;
+		c->members[i] = fleet->bundle_pending[i];
+		if (fleet->bundle_pending[i]->size > 0)
+			c->size += fleet->bundle_pending[i]->size;
 	}
-	if (sftp_workqueue_push(p->q, c) != 0) {
+	if (sftp_workqueue_push(fleet->q, c) != 0) {
 		for (i = 0; i < n; i++)
-			parallel_bundle_member_pushfail(p, c->members[i]);
+			parallel_bundle_member_pushfail(fleet, c->members[i]);
 		free(c->members);
 		free(c);
 	}
@@ -990,56 +990,56 @@ parallel_bundle_flush(struct sftp_parallel *p)
  * thread only; there is no lock here by design.
  */
 static int
-parallel_bundle_add(struct sftp_parallel *p, struct sftp_work_unit *u)
+parallel_bundle_add(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 {
 	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
-	uint64_t target = (p->cfg.bundle_size > 0)
-	    ? p->cfg.bundle_size : BUNDLE_TARGET_BYTES_DEFAULT;
+	uint64_t target = (fleet->cfg.bundle_size > 0)
+	    ? fleet->cfg.bundle_size : BUNDLE_TARGET_BYTES_DEFAULT;
 
-	pthread_mutex_lock(&p->pending_mu);
-	p->pending++;
-	pthread_mutex_unlock(&p->pending_mu);
+	pthread_mutex_lock(&fleet->pending_mu);
+	fleet->pending++;
+	pthread_mutex_unlock(&fleet->pending_mu);
 	if (add_bytes)
-		__atomic_fetch_add(&p->queued_bytes, add_bytes,
+		__atomic_fetch_add(&fleet->queued_bytes, add_bytes,
 		    __ATOMIC_RELAXED);
 
 	/* A bundle carries one direction; flush a pending one of the other op. */
-	if (p->bundle_pending_n > 0 && p->bundle_pending_op != u->op)
-		parallel_bundle_flush(p);
-	if (p->bundle_pending_n == p->bundle_pending_cap) {
-		int ncap = p->bundle_pending_cap ? p->bundle_pending_cap * 2 : 64;
-		p->bundle_pending = xreallocarray(p->bundle_pending,
-		    (size_t)ncap, sizeof(*p->bundle_pending));
-		p->bundle_pending_cap = ncap;
+	if (fleet->bundle_pending_n > 0 && fleet->bundle_pending_op != u->op)
+		parallel_bundle_flush(fleet);
+	if (fleet->bundle_pending_n == fleet->bundle_pending_cap) {
+		int ncap = fleet->bundle_pending_cap ? fleet->bundle_pending_cap * 2 : 64;
+		fleet->bundle_pending = xreallocarray(fleet->bundle_pending,
+		    (size_t)ncap, sizeof(*fleet->bundle_pending));
+		fleet->bundle_pending_cap = ncap;
 	}
-	p->bundle_pending[p->bundle_pending_n++] = u;
-	p->bundle_pending_op = u->op;
-	p->bundle_pending_framed += BUNDLE_REC_FRAME_BYTES(
+	fleet->bundle_pending[fleet->bundle_pending_n++] = u;
+	fleet->bundle_pending_op = u->op;
+	fleet->bundle_pending_framed += BUNDLE_REC_FRAME_BYTES(
 	    u->dst_path ? strlen(u->dst_path) : 0, u->size);
 	/* Download bundles list every member's remote path (src_path) in one
 	 * hpn-bundle-fetch request; track that request size and flush before it
 	 * overflows SFTP_MAX_MSG_LENGTH (see BUNDLE_DL_FETCH_REQ_MAX). */
 	if (u->op == SFTP_OP_DOWNLOAD)
-		p->bundle_pending_path_bytes += 4 +
+		fleet->bundle_pending_path_bytes += 4 +
 		    (u->src_path ? strlen(u->src_path) : 0);
-	if ((p->bundle_pending_op == SFTP_OP_DOWNLOAD ?
-	    hpn_bundle_dl_should_flush(p->bundle_pending_framed,
-	    p->bundle_pending_n, target, p->bundle_pending_path_bytes,
+	if ((fleet->bundle_pending_op == SFTP_OP_DOWNLOAD ?
+	    hpn_bundle_dl_should_flush(fleet->bundle_pending_framed,
+	    fleet->bundle_pending_n, target, fleet->bundle_pending_path_bytes,
 	    BUNDLE_DL_FETCH_REQ_MAX) :
-	    hpn_bundle_should_flush(p->bundle_pending_framed,
-	    p->bundle_pending_n, target)))
-		parallel_bundle_flush(p);
-	sftp_workqueue_kick(p->q);
+	    hpn_bundle_should_flush(fleet->bundle_pending_framed,
+	    fleet->bundle_pending_n, target)))
+		parallel_bundle_flush(fleet);
+	sftp_workqueue_kick(fleet->q);
 	return 0;
 }
 
 void
-parallel_bundle_flush_pending(struct sftp_parallel *p)
+parallel_bundle_flush_pending(struct sftp_parallel *fleet)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return;
-	parallel_bundle_flush(p);
-	sftp_workqueue_kick(p->q);
+	parallel_bundle_flush(fleet);
+	sftp_workqueue_kick(fleet->q);
 }
 
 /*
@@ -1049,9 +1049,9 @@ parallel_bundle_flush_pending(struct sftp_parallel *p)
  * they were created by.
  */
 int
-parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
+parallel_unit_submit(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 {
-	if (p == NULL || p->stopped || p->abort_flag) {
+	if (fleet == NULL || fleet->stopped || fleet->abort_flag) {
 		parallel_unit_free(u);
 		return -1;
 	}
@@ -1066,9 +1066,9 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 	 * path (which may further range-split it).  Range and resume
 	 * units are never bundle-eligible regardless of size - handled
 	 * by their op-type elsewhere. */
-	if (p->cfg.use_bundle && u->size > 0 &&
+	if (fleet->cfg.use_bundle && u->size > 0 &&
 	    !hpn_bundle_file_eligible((uint64_t)u->size,
-	    bundle_target_for(p))) {
+	    bundle_target_for(fleet))) {
 		u->bundle_ineligible = 1;
 	}
 	/* Producer-side bundle assembly: group eligible small files into whole
@@ -1076,22 +1076,22 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 	 * rather than racing to accumulate one.  Everything else - large/range/
 	 * resume units, and worker re-submits (always bundle_ineligible) - takes
 	 * the individual path below. */
-	if (p->cfg.use_bundle && !u->bundle_ineligible &&
+	if (fleet->cfg.use_bundle && !u->bundle_ineligible &&
 	    (u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_DOWNLOAD))
-		return parallel_bundle_add(p, u);
+		return parallel_bundle_add(fleet, u);
 	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
-	pthread_mutex_lock(&p->pending_mu);
-	p->pending++;
-	pthread_mutex_unlock(&p->pending_mu);
+	pthread_mutex_lock(&fleet->pending_mu);
+	fleet->pending++;
+	pthread_mutex_unlock(&fleet->pending_mu);
 	if (add_bytes)
-		__atomic_fetch_add(&p->queued_bytes, add_bytes,
+		__atomic_fetch_add(&fleet->queued_bytes, add_bytes,
 		    __ATOMIC_RELAXED);
-	if (sftp_workqueue_push(p->q, u) != 0) {
-		pthread_mutex_lock(&p->pending_mu);
-		pending_dec_locked(p);
-		pthread_mutex_unlock(&p->pending_mu);
+	if (sftp_workqueue_push(fleet->q, u) != 0) {
+		pthread_mutex_lock(&fleet->pending_mu);
+		pending_dec_locked(fleet);
+		pthread_mutex_unlock(&fleet->pending_mu);
 		if (add_bytes)
-			__atomic_fetch_sub(&p->queued_bytes, add_bytes,
+			__atomic_fetch_sub(&fleet->queued_bytes, add_bytes,
 			    __ATOMIC_RELAXED);
 		parallel_unit_free(u);
 		return -1;
@@ -1101,83 +1101,84 @@ parallel_unit_submit(struct sftp_parallel *p, struct sftp_work_unit *u)
 	 * the cap-gate's own requeue pushes there, and kicking from push
 	 * created a wake->pass->requeue->kick feedback storm (measured:
 	 * denials 6M -> 109M, four cores burned). */
-	sftp_workqueue_kick(p->q);
+	sftp_workqueue_kick(fleet->q);
 	return 0;
 }
 
 /*
- * Worker-context re-queue (non-blocking).  A worker that blocks on a full p->q
+ * Worker-context re-queue (non-blocking).  A worker that blocks on a full fleet->q
  * it also drains can self-deadlock (fatal at -j1).  Try the queue; on full,
  * park the unit on the retry-overflow list (existing allocation, FIFO,
  * reporter-drained).  pending/queued_bytes are unchanged - the unit stays
  * pending wherever it sits, so callers must NOT re-account here.
  */
 int
-parallel_worker_requeue(struct sftp_parallel *p, struct sftp_work_unit *u,
+parallel_worker_requeue(struct sftp_parallel *fleet, struct sftp_work_unit *u,
     int front)
 {
-	int rc = front ? sftp_workqueue_trypush_front(p->q, u)
-	               : sftp_workqueue_trypush(p->q, u);
+	int rc = front ? sftp_workqueue_trypush_front(fleet->q, u)
+	               : sftp_workqueue_trypush(fleet->q, u);
 	if (rc == 0)
 		return 0;	/* placed on the queue */
 	if (rc < 0)
 		return -1;	/* queue shut down -> caller gives up */
 
 	/* rc > 0: queue full.  Park on the overflow list; never block. */
-	pthread_mutex_lock(&p->retry_overflow_mu);
+	pthread_mutex_lock(&fleet->retry_overflow_mu);
 	u->overflow_next = NULL;
 	u->overflow_front = front;
-	if (p->retry_overflow_tail != NULL)
-		p->retry_overflow_tail->overflow_next = u;
+	if (fleet->retry_overflow_tail != NULL)
+		fleet->retry_overflow_tail->overflow_next = u;
 	else
-		p->retry_overflow_head = u;
-	p->retry_overflow_tail = u;
-	size_t depth = ++p->retry_overflow_n;
-	pthread_mutex_unlock(&p->retry_overflow_mu);
-	debug2_ft("re-queue overflow: p->q full, parked unit (depth=%zu)", depth);
+		fleet->retry_overflow_head = u;
+	fleet->retry_overflow_tail = u;
+	size_t depth = ++fleet->retry_overflow_n;
+	pthread_mutex_unlock(&fleet->retry_overflow_mu);
+	debug2_ft("re-queue overflow: fleet->q full, parked unit (depth=%zu)",
+	    depth);
 	return 0;
 }
 
 /*
- * Reporter-context: move overflow-parked units back into p->q while it has
+ * Reporter-context: move overflow-parked units back into fleet->q while it has
  * room.  Each re-enters via its original front/tail intent (a worker blocked
  * in pop wakes on trypush's not_empty signal).  Stops at the first unit that
  * won't fit (queue full again) or on shutdown, re-parking it at the head so
  * FIFO order and the pending invariant hold.
  */
 void
-parallel_retry_overflow_drain(struct sftp_parallel *p)
+parallel_retry_overflow_drain(struct sftp_parallel *fleet)
 {
 	for (;;) {
-		pthread_mutex_lock(&p->retry_overflow_mu);
-		struct sftp_work_unit *u = p->retry_overflow_head;
+		pthread_mutex_lock(&fleet->retry_overflow_mu);
+		struct sftp_work_unit *u = fleet->retry_overflow_head;
 		if (u == NULL) {
-			pthread_mutex_unlock(&p->retry_overflow_mu);
+			pthread_mutex_unlock(&fleet->retry_overflow_mu);
 			return;
 		}
-		p->retry_overflow_head = u->overflow_next;
-		if (p->retry_overflow_head == NULL)
-			p->retry_overflow_tail = NULL;
-		p->retry_overflow_n--;
-		pthread_mutex_unlock(&p->retry_overflow_mu);
+		fleet->retry_overflow_head = u->overflow_next;
+		if (fleet->retry_overflow_head == NULL)
+			fleet->retry_overflow_tail = NULL;
+		fleet->retry_overflow_n--;
+		pthread_mutex_unlock(&fleet->retry_overflow_mu);
 
 		int front = u->overflow_front;
 		u->overflow_next = NULL;
 		u->overflow_front = 0;
-		int rc = front ? sftp_workqueue_trypush_front(p->q, u)
-		               : sftp_workqueue_trypush(p->q, u);
+		int rc = front ? sftp_workqueue_trypush_front(fleet->q, u)
+		               : sftp_workqueue_trypush(fleet->q, u);
 		if (rc == 0)
 			continue;	/* placed; try the next parked unit */
 
 		/* Full again or shut down: re-park at the head and stop. */
-		pthread_mutex_lock(&p->retry_overflow_mu);
+		pthread_mutex_lock(&fleet->retry_overflow_mu);
 		u->overflow_front = front;
-		u->overflow_next = p->retry_overflow_head;
-		p->retry_overflow_head = u;
-		if (p->retry_overflow_tail == NULL)
-			p->retry_overflow_tail = u;
-		p->retry_overflow_n++;
-		pthread_mutex_unlock(&p->retry_overflow_mu);
+		u->overflow_next = fleet->retry_overflow_head;
+		fleet->retry_overflow_head = u;
+		if (fleet->retry_overflow_tail == NULL)
+			fleet->retry_overflow_tail = u;
+		fleet->retry_overflow_n++;
+		pthread_mutex_unlock(&fleet->retry_overflow_mu);
 		return;
 	}
 }
@@ -1188,16 +1189,16 @@ parallel_retry_overflow_drain(struct sftp_parallel *p)
  * units never reached a worker, so freeing mirrors a drained queue item.
  */
 void
-parallel_retry_overflow_free(struct sftp_parallel *p)
+parallel_retry_overflow_free(struct sftp_parallel *fleet)
 {
 	struct sftp_work_unit *u, *next;
 
-	pthread_mutex_lock(&p->retry_overflow_mu);
-	u = p->retry_overflow_head;
-	p->retry_overflow_head = NULL;
-	p->retry_overflow_tail = NULL;
-	p->retry_overflow_n = 0;
-	pthread_mutex_unlock(&p->retry_overflow_mu);
+	pthread_mutex_lock(&fleet->retry_overflow_mu);
+	u = fleet->retry_overflow_head;
+	fleet->retry_overflow_head = NULL;
+	fleet->retry_overflow_tail = NULL;
+	fleet->retry_overflow_n = 0;
+	pthread_mutex_unlock(&fleet->retry_overflow_mu);
 
 	while (u != NULL) {
 		next = u->overflow_next;
@@ -1227,7 +1228,7 @@ parallel_retry_overflow_free(struct sftp_parallel *p)
  * per-op convention (upload: local→remote; download: remote→local).
  */
 static int
-submit_resume_whole_file(struct sftp_parallel *p, struct sftp_conn *conn,
+submit_resume_whole_file(struct sftp_parallel *fleet, struct sftp_conn *conn,
     enum sftp_op op, const char *src, const char *dst, const char *remote,
     off_t size, mode_t mode, int resume, int verify)
 {
@@ -1238,7 +1239,7 @@ submit_resume_whole_file(struct sftp_parallel *p, struct sftp_conn *conn,
 	u = make_unit(op, src, dst, size, mode);
 	u->resume = resume;
 	u->verify = verify;
-	return parallel_unit_submit(p, u);
+	return parallel_unit_submit(fleet, u);
 }
 
 /*
@@ -1266,12 +1267,12 @@ submit_resume_whole_file(struct sftp_parallel *p, struct sftp_conn *conn,
  * where the fallback's own submit refuses identically).
  */
 static int
-submit_resume_split(struct sftp_parallel *p, struct sftp_conn *conn,
+submit_resume_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     enum sftp_op op, const char *src, const char *dst, const char *remote,
     off_t src_size, off_t dest_size, mode_t mode)
 {
 	struct sftp_range_tracker *tracker;
-	off_t span = (off_t)parallel_unit_split_min_size(p);
+	off_t span = (off_t)parallel_unit_split_min_size(fleet);
 	off_t tail_len = src_size - dest_size;
 	enum sftp_op tail_op = (op == SFTP_OP_UPLOAD) ?
 	    SFTP_OP_UPLOAD_RANGE : SFTP_OP_DOWNLOAD_RANGE;
@@ -1292,7 +1293,7 @@ submit_resume_split(struct sftp_parallel *p, struct sftp_conn *conn,
 	tracker = range_tracker_new(n,
 	    op == SFTP_OP_UPLOAD ? SFTP_RANGE_TARGET_REMOTE :
 	    SFTP_RANGE_TARGET_LOCAL, /*path=*/dst, /*src=*/src,
-	    /*verify=*/p->cfg.verify_transfer, p->cfg.writers_per_inode_cap);
+	    /*verify=*/fleet->cfg.verify_transfer, fleet->cfg.writers_per_inode_cap);
 	tracker->file_bytes = src_size;
 
 	for (i = 0; i < n; i++) {
@@ -1316,8 +1317,8 @@ submit_resume_split(struct sftp_parallel *p, struct sftp_conn *conn,
 			tracker->vslots[i].off = (u_int64_t)offset;
 			tracker->vslots[i].len = (u_int64_t)length;
 		}
-		if (parallel_unit_submit(p, ru) != 0) {
-			if (p->abort_flag)
+		if (parallel_unit_submit(fleet, ru) != 0) {
+			if (fleet->abort_flag)
 				debug("submit resume piece %d of \"%s\" "
 				    "refused (abort in progress)", i, remote);
 			else
@@ -1344,19 +1345,19 @@ submit_resume_split(struct sftp_parallel *p, struct sftp_conn *conn,
  * the estimate equals the real item size.
  */
 static uint64_t
-parallel_verify_item_bytes_estimate(struct sftp_parallel *p,
+parallel_verify_item_bytes_estimate(struct sftp_parallel *fleet,
     const char *local_path, const char *remote_path)
 {
 	const char *lrel = local_path, *rrel = remote_path;
 
-	(void)parallel_verify_prefix_match(p, local_path, &lrel);
-	(void)parallel_verify_prefix_match(p, remote_path, &rrel);
+	(void)parallel_verify_prefix_match(fleet, local_path, &lrel);
+	(void)parallel_verify_prefix_match(fleet, remote_path, &rrel);
 	return (uint64_t)sizeof(struct verify_whole_item)
 	    + strlen(lrel) + 1 + strlen(rrel) + 1 + 8 + 16;
 }
 
 int
-sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
+sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode,
     int resume, int verify)
 {
@@ -1364,9 +1365,9 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	 * SUBMIT: sftp_parallel_wait leaves it DONE, and the endgame
 	 * machinery must re-gate for this command's units. Main thread
 	 * only. */
-	if (p != NULL && __atomic_load_n(&p->walker_phase,
+	if (fleet != NULL && __atomic_load_n(&fleet->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
-		__atomic_store_n(&p->walker_phase, SFTP_WKP_SUBMIT,
+		__atomic_store_n(&fleet->walker_phase, SFTP_WKP_SUBMIT,
 		    __ATOMIC_RELAXED);
 	int rc;
 
@@ -1389,12 +1390,12 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 			if (sftp_stat(conn, remote_path, 1, &ra) == 0 &&
 			    (ra.flags & SSH2_FILEXFER_ATTR_SIZE) != 0 &&
 			    ra.size > 0 && (off_t)ra.size < size)
-				rc = submit_resume_split(p, conn,
+				rc = submit_resume_split(fleet, conn,
 				    SFTP_OP_UPLOAD, local_path, remote_path,
 				    remote_path, size, (off_t)ra.size, mode);
 		}
 		if (rc != 0)
-			rc = submit_resume_whole_file(p, conn, SFTP_OP_UPLOAD,
+			rc = submit_resume_whole_file(fleet, conn, SFTP_OP_UPLOAD,
 			    local_path, remote_path, remote_path, size, mode,
 			    resume, verify);
 	}
@@ -1403,42 +1404,42 @@ sftp_parallel_submit_upload(struct sftp_parallel *p, struct sftp_conn *conn,
 	 * multiple range work units (feeds the byte-based scale-up
 	 * trigger).  Otherwise, fall back to a whole-file unit. */
 	else if (conn != NULL)
-		rc = submit_upload_maybe_split(p, conn, local_path, remote_path,
+		rc = submit_upload_maybe_split(fleet, conn, local_path, remote_path,
 		    size, mode);
 	else
-		rc = parallel_unit_submit(p,
+		rc = parallel_unit_submit(fleet,
 		    make_unit(SFTP_OP_UPLOAD, local_path, remote_path, size, mode));
 	/* Memory gate: charge this file's parked-verify footprint NOW, at submit
 	 * (a leading signal), then drain if the outstanding total is over budget.
 	 * Submit blocks during the drain - that block IS the backpressure that
 	 * paces submission with verification.  Main thread only. */
-	if (p != NULL && p->cfg.verify_transfer) {
-		uint64_t est = parallel_verify_item_bytes_estimate(p,
+	if (fleet != NULL && fleet->cfg.verify_transfer) {
+		uint64_t est = parallel_verify_item_bytes_estimate(fleet,
 		    local_path, remote_path);
-		pthread_mutex_lock(&p->verify_pending_mu);
-		p->verify_parked_bytes += est;
-		pthread_mutex_unlock(&p->verify_pending_mu);
-		parallel_verify_maybe_wave(p);
+		pthread_mutex_lock(&fleet->verify_pending_mu);
+		fleet->verify_parked_bytes += est;
+		pthread_mutex_unlock(&fleet->verify_pending_mu);
+		parallel_verify_maybe_wave(fleet);
 	}
 	/* The single authoritative file count: every caller - walker,
 	 * glob, direct single-file - funnels through this chokepoint, one
 	 * count per successfully submitted file, upstream of bundling /
 	 * range-splitting / verify re-submits (relayed via the frames). */
-	if (rc == 0 && p != NULL)
-		__atomic_add_fetch(&p->files_submitted, 1, __ATOMIC_RELAXED);
+	if (rc == 0 && fleet != NULL)
+		__atomic_add_fetch(&fleet->files_submitted, 1, __ATOMIC_RELAXED);
 	return rc;
 }
 
 int
-sftp_parallel_submit_download(struct sftp_parallel *p,
+sftp_parallel_submit_download(struct sftp_parallel *fleet,
     struct sftp_conn *conn,
     const char *remote_path, const char *local_path, off_t size, mode_t mode,
     int resume, int verify)
 {
 	/* Demote DONE back to SUBMIT (see sftp_parallel_submit_upload). */
-	if (p != NULL && __atomic_load_n(&p->walker_phase,
+	if (fleet != NULL && __atomic_load_n(&fleet->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
-		__atomic_store_n(&p->walker_phase, SFTP_WKP_SUBMIT,
+		__atomic_store_n(&fleet->walker_phase, SFTP_WKP_SUBMIT,
 		    __ATOMIC_RELAXED);
 	int rc;
 
@@ -1454,36 +1455,36 @@ sftp_parallel_submit_download(struct sftp_parallel *p,
 			if (stat(local_path, &st) == 0 &&
 			    S_ISREG(st.st_mode) && st.st_size > 0 &&
 			    st.st_size < size)
-				rc = submit_resume_split(p, conn,
+				rc = submit_resume_split(fleet, conn,
 				    SFTP_OP_DOWNLOAD, remote_path, local_path,
 				    remote_path, size, st.st_size, mode);
 		}
 		if (rc != 0)
-			rc = submit_resume_whole_file(p, conn,
+			rc = submit_resume_whole_file(fleet, conn,
 			    SFTP_OP_DOWNLOAD, remote_path, local_path,
 			    remote_path, size, mode, resume, verify);
 	}
 	else if (conn != NULL)
-		rc = submit_download_maybe_split(p, conn, remote_path, local_path,
+		rc = submit_download_maybe_split(fleet, conn, remote_path, local_path,
 		    size, mode);
 	else
-		rc = parallel_unit_submit(p,
+		rc = parallel_unit_submit(fleet,
 		    make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path, size, mode));
 	/* Memory gate (see submit_upload): charge the footprint at submit, drain
 	 * if over budget.  This is what makes the trigger fire on DOWNLOAD too -
 	 * the walker submits all units before any file parks, so charging at
 	 * submit is the only point that sees the memory coming. */
-	if (p != NULL && p->cfg.verify_transfer) {
-		uint64_t est = parallel_verify_item_bytes_estimate(p,
+	if (fleet != NULL && fleet->cfg.verify_transfer) {
+		uint64_t est = parallel_verify_item_bytes_estimate(fleet,
 		    local_path, remote_path);
-		pthread_mutex_lock(&p->verify_pending_mu);
-		p->verify_parked_bytes += est;
-		pthread_mutex_unlock(&p->verify_pending_mu);
-		parallel_verify_maybe_wave(p);
+		pthread_mutex_lock(&fleet->verify_pending_mu);
+		fleet->verify_parked_bytes += est;
+		pthread_mutex_unlock(&fleet->verify_pending_mu);
+		parallel_verify_maybe_wave(fleet);
 	}
 	/* Single authoritative file count - see the upload sibling. */
-	if (rc == 0 && p != NULL)
-		__atomic_add_fetch(&p->files_submitted, 1, __ATOMIC_RELAXED);
+	if (rc == 0 && fleet != NULL)
+		__atomic_add_fetch(&fleet->files_submitted, 1, __ATOMIC_RELAXED);
 	return rc;
 }
 
@@ -1532,16 +1533,16 @@ stripe_info_viable(struct sftp_fs_info *info, const char *path)
  * inspect info->stripe_size etc).
  */
 static int
-get_cached_fs_info(struct sftp_parallel *p, struct sftp_conn *conn,
+get_cached_fs_info(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *remote_path, struct sftp_fs_info *info_out)
 {
-	if (p->fs_info_cached) {
-		*info_out = p->fs_info_cache;
+	if (fleet->fs_info_cached) {
+		*info_out = fleet->fs_info_cache;
 	} else {
 		memset(info_out, 0, sizeof(*info_out));
 		sftp_fs_info(conn, remote_path, info_out);
-		p->fs_info_cache = *info_out;
-		p->fs_info_cached = 1;
+		fleet->fs_info_cache = *info_out;
+		fleet->fs_info_cached = 1;
 	}
 	return stripe_info_viable(info_out, remote_path);
 }
@@ -1555,18 +1556,18 @@ get_cached_fs_info(struct sftp_parallel *p, struct sftp_conn *conn,
  * cache is per-orchestrator rather than per-path.  No-op once cached.
  */
 void
-sftp_parallel_prewarm_fs_info(struct sftp_parallel *p, struct sftp_conn *conn,
+sftp_parallel_prewarm_fs_info(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *remote_path)
 {
 	struct sftp_fs_info info;
 
-	if (p == NULL || conn == NULL || remote_path == NULL)
+	if (fleet == NULL || conn == NULL || remote_path == NULL)
 		return;
-	(void)get_cached_fs_info(p, conn, remote_path, &info);
+	(void)get_cached_fs_info(fleet, conn, remote_path, &info);
 }
 
 /* How long a capacity wait sleeps before re-testing on its own.  Only one of
- * the three p->pending decrement sites broadcasts pending_cv (the push-fail
+ * the three fleet->pending decrement sites broadcasts pending_cv (the push-fail
  * backout paths do not), so this bounds a missed wake to one re-test rather
  * than a wedged walk.  A completion normally wakes the wait immediately and
  * this never fires, so second resolution is all it needs. */
@@ -1574,7 +1575,7 @@ sftp_parallel_prewarm_fs_info(struct sftp_parallel *p, struct sftp_conn *conn,
 
 /*
  * Block until outstanding (submitted but not completed) files fall below
- * p->outstanding_cap.
+ * fleet->outstanding_cap.
  *
  * A producer that enumerates much faster than the fleet transfers will
  * otherwise submit the whole tree before much of it has moved, and every
@@ -1590,22 +1591,22 @@ sftp_parallel_prewarm_fs_info(struct sftp_parallel *p, struct sftp_conn *conn,
  * not leave the walk parked here.
  */
 void
-sftp_parallel_await_capacity(struct sftp_parallel *p)
+sftp_parallel_await_capacity(struct sftp_parallel *fleet)
 {
 	struct timespec deadline;
 
-	if (p == NULL || p->outstanding_cap == 0)
+	if (fleet == NULL || fleet->outstanding_cap == 0)
 		return;
 
-	pthread_mutex_lock(&p->pending_mu);
-	while (p->pending >= p->outstanding_cap &&
-	    !sftp_parallel_is_aborting(p)) {
+	pthread_mutex_lock(&fleet->pending_mu);
+	while (fleet->pending >= fleet->outstanding_cap &&
+	    !sftp_parallel_is_aborting(fleet)) {
 		clock_gettime(CLOCK_REALTIME, &deadline);
 		deadline.tv_sec += AWAIT_CAPACITY_POLL_SEC;
-		(void)pthread_cond_timedwait(&p->pending_cv, &p->pending_mu,
+		(void)pthread_cond_timedwait(&fleet->pending_cv, &fleet->pending_mu,
 		    &deadline);
 	}
-	pthread_mutex_unlock(&p->pending_mu);
+	pthread_mutex_unlock(&fleet->pending_mu);
 }
 
 /*
@@ -1617,13 +1618,13 @@ sftp_parallel_await_capacity(struct sftp_parallel *p)
  * chosen value once per orchestrator at default verbosity.
  */
 uint64_t
-parallel_unit_split_min_size(struct sftp_parallel *p)
+parallel_unit_split_min_size(struct sftp_parallel *fleet)
 {
 	uint64_t bytes;
 	const char *source;
 
-	if (p->cfg.range_split_min_mb > 0) {
-		bytes = (uint64_t)p->cfg.range_split_min_mb * 1024ULL * 1024ULL;
+	if (fleet->cfg.range_split_min_mb > 0) {
+		bytes = (uint64_t)fleet->cfg.range_split_min_mb * 1024ULL * 1024ULL;
 		source = "-M";
 	} else {
 		bytes = RANGE_SPLIT_MIN_SIZE_DEFAULT;
@@ -1636,12 +1637,12 @@ parallel_unit_split_min_size(struct sftp_parallel *p)
 		bytes = RANGE_SPLIT_MIN_SIZE_CEILING;
 
 	static struct sftp_parallel *logged_for;
-	if (logged_for != p) {
+	if (logged_for != fleet) {
 		/* Config echo - debug only; the user set (or defaulted) this. */
 		debug("range-split threshold = %llu MiB (source: %s)",
 		    (unsigned long long)(bytes / (1024ULL*1024ULL)),
 		    source);
-		logged_for = p;
+		logged_for = fleet;
 	}
 	return bytes;
 }
@@ -1670,7 +1671,7 @@ make_download_range_unit(const char *remote_path, const char *local_path,
  * should fall back to a single whole-file upload unit).
  */
 static int
-submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
+submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
     off_t file_size, mode_t mode,
     off_t range_size, int num_ranges)
@@ -1720,7 +1721,7 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 	 * units do not pass through execute_unit's whole-file verify). */
 	tracker = range_tracker_new(effective_ranges,
 	    SFTP_RANGE_TARGET_REMOTE, remote_path, /*src=*/local_path,
-	    /*verify=*/p->cfg.verify_transfer, p->cfg.writers_per_inode_cap);
+	    /*verify=*/fleet->cfg.verify_transfer, fleet->cfg.writers_per_inode_cap);
 	tracker->file_bytes = file_size;
 
 	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
@@ -1737,10 +1738,10 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
 				tracker->vslots[i].len = (u_int64_t)length;
 			}
 		}
-		if (parallel_unit_submit(p, ru) != 0) {
+		if (parallel_unit_submit(fleet, ru) != 0) {
 			/* Under an abort the refusal is expected fallout
 			 * (queue is shut), not a fault - keep it quiet. */
-			if (p->abort_flag)
+			if (fleet->abort_flag)
 				debug("submit range %d of \"%s\" refused "
 				    "(abort in progress)", i, local_path);
 			else
@@ -1769,7 +1770,7 @@ submit_upload_ranges(struct sftp_parallel *p, struct sftp_conn *conn,
  * should fall back to a single whole-file download unit).
  */
 static int
-submit_download_ranges(struct sftp_parallel *p,
+submit_download_ranges(struct sftp_parallel *fleet,
     const char *remote_path, const char *local_path,
     off_t file_size, mode_t mode,
     off_t range_size, int num_ranges)
@@ -1812,7 +1813,7 @@ submit_download_ranges(struct sftp_parallel *p,
 	/* Download: local file is the target, remote file is the source. */
 	tracker = range_tracker_new(effective_ranges,
 	    SFTP_RANGE_TARGET_LOCAL, local_path, /*src=*/remote_path,
-	    /*verify=*/p->cfg.verify_transfer, p->cfg.writers_per_inode_cap);
+	    /*verify=*/fleet->cfg.verify_transfer, fleet->cfg.writers_per_inode_cap);
 	tracker->file_bytes = file_size;
 
 	for (i = 0; i < effective_ranges; i++) {
@@ -1828,10 +1829,10 @@ submit_download_ranges(struct sftp_parallel *p,
 			tracker->vslots[i].off = (u_int64_t)offset;
 			tracker->vslots[i].len = (u_int64_t)length;
 		}
-		if (parallel_unit_submit(p, ru) != 0) {
+		if (parallel_unit_submit(fleet, ru) != 0) {
 			/* Under an abort the refusal is expected fallout
 			 * (queue is shut), not a fault - keep it quiet. */
-			if (p->abort_flag)
+			if (fleet->abort_flag)
 				debug("submit download range %d of \"%s\" "
 				    "refused (abort in progress)",
 				    i, remote_path);
@@ -1868,7 +1869,7 @@ submit_download_ranges(struct sftp_parallel *p,
  * otherwise plain file_size/num_ranges.
  */
 static int
-compute_range_split(struct sftp_parallel *p, struct sftp_conn *conn,
+compute_range_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *remote_path, off_t file_size,
     off_t *range_size, int *num_ranges)
 {
@@ -1882,16 +1883,16 @@ compute_range_split(struct sftp_parallel *p, struct sftp_conn *conn,
 	 * without paying for the fs-info RTT. */
 	if ((uint64_t)file_size < RANGE_SPLIT_MIN_SIZE_FLOOR)
 		return 0;
-	if ((uint64_t)file_size < parallel_unit_split_min_size(p))
+	if ((uint64_t)file_size < parallel_unit_split_min_size(fleet))
 		return 0;
 
-	max_ranges = (int)(file_size / parallel_unit_split_min_size(p));
+	max_ranges = (int)(file_size / parallel_unit_split_min_size(fleet));
 	if (max_ranges < 2)
 		return 0;
 
 	/* fs-info costs one control-connection RTT; cached per orchestrator
 	 * (the destination filesystem does not change within a transfer). */
-	have_stripe = get_cached_fs_info(p, conn, remote_path, &info);
+	have_stripe = get_cached_fs_info(fleet, conn, remote_path, &info);
 	n = max_ranges;
 	per_range = (file_size + n - 1) / n;
 	if (have_stripe && info.stripe_size > 0) {
@@ -1923,20 +1924,20 @@ compute_range_split(struct sftp_parallel *p, struct sftp_conn *conn,
 }
 
 static int
-submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
+submit_download_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *remote_path, const char *local_path,
     off_t file_size, mode_t mode)
 {
 	off_t range_size;
 	int num_ranges;
 
-	if (compute_range_split(p, conn, remote_path, file_size,
+	if (compute_range_split(fleet, conn, remote_path, file_size,
 	    &range_size, &num_ranges) &&
-	    submit_download_ranges(p, remote_path, local_path,
+	    submit_download_ranges(fleet, remote_path, local_path,
 	    file_size, mode, range_size, num_ranges) == 0)
 		return 0;
 	/* No split, or pre-creation failed - whole-file. */
-	return parallel_unit_submit(p, make_unit(SFTP_OP_DOWNLOAD,
+	return parallel_unit_submit(fleet, make_unit(SFTP_OP_DOWNLOAD,
 	    remote_path, local_path, file_size, mode));
 }
 
@@ -1946,19 +1947,19 @@ submit_download_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
  * The split decision is shared with the download side in compute_range_split().
  */
 static int
-submit_upload_maybe_split(struct sftp_parallel *p, struct sftp_conn *conn,
+submit_upload_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
     off_t file_size, mode_t mode)
 {
 	off_t range_size;
 	int num_ranges;
 
-	if (compute_range_split(p, conn, remote_path, file_size,
+	if (compute_range_split(fleet, conn, remote_path, file_size,
 	    &range_size, &num_ranges) &&
-	    submit_upload_ranges(p, conn, local_path, remote_path,
+	    submit_upload_ranges(fleet, conn, local_path, remote_path,
 	    file_size, mode, range_size, num_ranges) == 0)
 		return 0;
 	/* No split, or pre-creation failed - whole-file. */
-	return parallel_unit_submit(p, make_unit(SFTP_OP_UPLOAD,
+	return parallel_unit_submit(fleet, make_unit(SFTP_OP_UPLOAD,
 	    local_path, remote_path, file_size, mode));
 }

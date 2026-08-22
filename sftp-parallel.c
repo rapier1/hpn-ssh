@@ -39,7 +39,7 @@
  *
  * The reporter's watchdog detects dead workers via kill(0) probes and elapsed
  * time since last completion. When a worker is classified DEAD, it sends
- * SIGTERM to the SSH child (to unblock any pending I/O) and sets w->doomed.
+ * SIGTERM to the SSH child (to unblock any pending I/O) and sets worker->doomed.
  * The reap loop joins the exited worker thread, frees its resources, and
  * spawns a replacement in a detached thread so the SSH handshake doesn't
  * block the reporter's 200ms progress ticks.
@@ -151,21 +151,21 @@ outstanding_file_cap(const struct sftp_parallel_config *cfg)
  * skip-on-error site does both - bump + list.
  */
 void
-sftp_parallel_walker_record_failure(struct sftp_parallel *p, const char *path,
+sftp_parallel_walker_record_failure(struct sftp_parallel *fleet, const char *path,
     const char *err)
 {
 	char buf[PATH_MAX + 256];
 
 	/* need atomics because this happens while the fleet is live and
 	 * working concurrently. This prevents possible issues */
-	__atomic_fetch_add(&p->walker_failures, 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&fleet->walker_failures, 1, __ATOMIC_RELAXED);
 	if (path == NULL)
 		path = "(unknown)";
 	if (err != NULL && *err != '\0')
 		snprintf(buf, sizeof(buf), "%s: %s", path, err);
 	else
 		snprintf(buf, sizeof(buf), "%s", path);
-	hpn_strlist_append(&p->failed_paths, buf);
+	hpn_strlist_append(&fleet->failed_paths, buf);
 }
 
 /*
@@ -174,10 +174,10 @@ sftp_parallel_walker_record_failure(struct sftp_parallel *p, const char *path,
  * seeing struct sftp_parallel's internals.  Relaxed atomic; observability only.
  */
 void
-sftp_parallel_set_walker_phase(struct sftp_parallel *p, int phase)
+sftp_parallel_set_walker_phase(struct sftp_parallel *fleet, int phase)
 {
-	if (p != NULL)
-		__atomic_store_n(&p->walker_phase, phase, __ATOMIC_RELAXED);
+	if (fleet != NULL)
+		__atomic_store_n(&fleet->walker_phase, phase, __ATOMIC_RELAXED);
 }
 
 /*
@@ -269,86 +269,86 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		return NULL;
 	}
 
-	struct sftp_parallel *p = xcalloc(1, sizeof(*p));
+	struct sftp_parallel *fleet = xcalloc(1, sizeof(*fleet));
 
 	/* Fresh fleet: clear the process-wide user-abort mirror left by a
 	 * previous orchestrator's interrupt (the post-interrupt rebuild). */
 	parallel_user_abort_flag = 0;
 
-	p->cfg = *cfg;
+	fleet->cfg = *cfg;
 	/* cfg.port may point to a stack buffer in the caller that is only
-	 * valid until the enclosing scope exits.  Copy it into p->cfg_port_buf
+	 * valid until the enclosing scope exits.  Copy it into fleet->cfg_port_buf
 	 * so the orchestrator owns the string for its entire lifetime. */
 	if (cfg->port && cfg->port[0]) {
-		strlcpy(p->cfg_port_buf, cfg->port, sizeof(p->cfg_port_buf));
-		p->cfg.port = p->cfg_port_buf;
+		strlcpy(fleet->cfg_port_buf, cfg->port, sizeof(fleet->cfg_port_buf));
+		fleet->cfg.port = fleet->cfg_port_buf;
 	}
 
 	/* instantiate mutexs and the like */
-	pthread_mutex_init(&p->pending_mu, NULL);
-	pthread_cond_init(&p->pending_cv, NULL);
-	pthread_mutex_init(&p->workers_mu, NULL);
-	pthread_mutex_init(&p->verify_pending_mu, NULL);
-	pthread_mutex_init(&p->retry_overflow_mu, NULL);
+	pthread_mutex_init(&fleet->pending_mu, NULL);
+	pthread_cond_init(&fleet->pending_cv, NULL);
+	pthread_mutex_init(&fleet->workers_mu, NULL);
+	pthread_mutex_init(&fleet->verify_pending_mu, NULL);
+	pthread_mutex_init(&fleet->retry_overflow_mu, NULL);
 
 	/* Parked-verify memory gate: fleet-wide budget on parked-path bytes.
 	 * When the parked set crosses this the submitter runs a verify wave
 	 * (parallel_verify_maybe_wave).  64 MiB, validated across a range of
 	 * values as a reasonable batching-vs-RAM balance. Basically, if we are
 	 * doing verification then do it occasionally during the transfer.*/
-	p->verify_park_budget = 64 * 1024 * 1024;
+	fleet->verify_park_budget = 64 * 1024 * 1024;
 
-	p->session_start_ms = monotime_ms();
+	fleet->session_start_ms = monotime_ms();
 
 	/* Fleet-abort zero-progress window, resolved from ssh_config
 	 * HPNStallAbortTimeout (default 60 s).  The abort also requires no worker
 	 * heartbeating and FLEET_ABORT_UNPRODUCTIVE_MULT * num_streams
 	 * unproductive respawns (see parallel_watchdog_sync_check); this knob
 	 * only sizes the window.  0 disables the abort entirely. */
-	p->noprogress_abort_s = cfg->stall_abort_timeout;
-	if (p->noprogress_abort_s < 0)
-		p->noprogress_abort_s = 0;
+	fleet->noprogress_abort_s = cfg->stall_abort_timeout;
+	if (fleet->noprogress_abort_s < 0)
+		fleet->noprogress_abort_s = 0;
 
 	/* Enable tail redistribution (cooperative yield of a confirmed-lagging
 	 * endgame holder) from HPNTailRedistribute.  Default ON.
 	 * off leaves the tail detector as telemetry only. */
-	p->tail_redistribute = cfg->tail_redistribute;
+	fleet->tail_redistribute = cfg->tail_redistribute;
 
 	/* Auto-repair: on a post-transfer verify mismatch, re-transfer the
 	 * bad ranges and re-verify, bounded by a per-range attempt cap.  ON by
 	 * default; disabled by the -X VerifyRepair=no CLI token
 	 * (cfg->no_verify_repair).  The attempt cap is fixed at 3. */
 	sftp_hpn_verify_repair_resolve(cfg->no_verify_repair,
-	    &p->verify_repair_enabled, &p->verify_repair_attempts);
-	p->last_worker_exit_code = -1;	/* no worker reaped yet */
+	    &fleet->verify_repair_enabled, &fleet->verify_repair_attempts);
+	fleet->last_worker_exit_code = -1;	/* no worker reaped yet */
 
 	/* Born-dead 0-bytes kill threshold. This is when a worker starts but there
 	 * is no data transmission for whatever reason. This can happen in lossy
 	 * environments. RTT-derived once the path RTT is
 	 * registered (sftp_parallel_set_path_rtt); BORN_DEAD_KILL_SEC until then. */
-	p->born_dead_sec = BORN_DEAD_KILL_SEC;
-	p->born_dead_stuck_offset = -1;	/* 0 is a valid range_offset */
+	fleet->born_dead_sec = BORN_DEAD_KILL_SEC;
+	fleet->born_dead_stuck_offset = -1;	/* 0 is a valid range_offset */
 
 	/* List of failures. Cap chosen so the worst-case allocation is
 	 * bounded but the "show me what failed" list is still useful for moderately
 	 * broken transfers. Really broken ones could potentially spam the interface.
 	 * XXX: This might need to be revisited. HPN_FAILED_PATHS_MAX × ~256 bytes typical
 	 * = ~25 KiB at the default cap. */
-	hpn_strlist_init(&p->failed_paths, HPN_FAILED_PATHS_MAX);
-	hpn_strlist_init(&p->verify_failed_paths, HPN_FAILED_PATHS_MAX);
+	hpn_strlist_init(&fleet->failed_paths, HPN_FAILED_PATHS_MAX);
+	hpn_strlist_init(&fleet->verify_failed_paths, HPN_FAILED_PATHS_MAX);
 
 	/* 1. Workqueue. Sized for cfg->num_streams.  Respawned workers
 	 * reuse the same queue, so capacity is set once at startup. */
-	p->outstanding_cap = (uint64_t)outstanding_file_cap(cfg);
-	p->q = sftp_workqueue_new(work_queue_depth(cfg));
-	if (p->q == NULL) {
+	fleet->outstanding_cap = (uint64_t)outstanding_file_cap(cfg);
+	fleet->q = sftp_workqueue_new(work_queue_depth(cfg));
+	if (fleet->q == NULL) {
 		error_f("workqueue allocation failed");
 		goto fail;
 	}
 
 	/* 2. Suppress per-file progress in workers; the orchestrator drives
 	 * aggregate progress when requested via sftp_parallel_progress_*. */
-	p->saved_showprogress = showprogress;
+	fleet->saved_showprogress = showprogress;
 	showprogress = 0;
 
 	/* 3. Spawn workers in parallel to overlap SSH handshakes, but cap
@@ -371,7 +371,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		pthread_cond_init(&auth_cv, NULL);
 
 		for (int i = 0; i < n; i++) {
-			sctx[i].p              = p;
+			sctx[i].fleet              = fleet;
 			sctx[i].auth_mu        = &auth_mu;
 			sctx[i].auth_cv        = &auth_cv;
 			sctx[i].auth_in_flight = &auth_in_flight;
@@ -404,50 +404,50 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	}
 
 	/* 4. Reporter - best-effort. */
-	if (pthread_create(&p->reporter_tid, NULL, parallel_reporter_thread, p) == 0)
-		p->reporter_started = 1;
+	if (pthread_create(&fleet->reporter_tid, NULL, parallel_reporter_thread, fleet) == 0)
+		fleet->reporter_started = 1;
 
-	p->started = 1;
-	return p;
+	fleet->started = 1;
+	return fleet;
 
  fail:
-	sftp_parallel_stop(p);
+	sftp_parallel_stop(fleet);
 	return NULL;
 }
 
 void
-sftp_parallel_wait(struct sftp_parallel *p, struct sftp_conn *conn)
+sftp_parallel_wait(struct sftp_parallel *fleet, struct sftp_conn *conn)
 {
-	if (p == NULL) return;
+	if (fleet == NULL) return;
 
 	/* Push the the tail before waiting.
 	 * Entering wait is the universal "done submitting" point for every
 	 * command - directory walks and direct (non-walker) put/get alike -
 	 * so the tail bundle can't be left stranded in the accumulator. */
-	parallel_bundle_flush_pending(p);
+	parallel_bundle_flush_pending(fleet);
 
 	/* Entering wait is the "no more units coming" signal, so publish
 	 * walker-phase DONE here. A directory walk already set it; direct
 	 * put/get never does, and without it the endgame machinery (range
 	 * split, straggler reaper) stays gated off for the whole transfer.
 	 * Demotion back to SUBMIT is the submit path's business. */
-	__atomic_store_n(&p->walker_phase, SFTP_WKP_DONE, __ATOMIC_RELAXED);
-	pthread_mutex_lock(&p->pending_mu);
-	while (p->pending > 0 && !p->abort_flag)
-		pthread_cond_wait(&p->pending_cv, &p->pending_mu);
-	pthread_mutex_unlock(&p->pending_mu);
+	__atomic_store_n(&fleet->walker_phase, SFTP_WKP_DONE, __ATOMIC_RELAXED);
+	pthread_mutex_lock(&fleet->pending_mu);
+	while (fleet->pending > 0 && !fleet->abort_flag)
+		pthread_cond_wait(&fleet->pending_cv, &fleet->pending_mu);
+	pthread_mutex_unlock(&fleet->pending_mu);
 
 	/* Transfers drained: run the post-transfer verify phase. Every
 	 * completed verified file (whole-file or range-split) parked its tracker
 	 * at completion; submit them now as SFTP_OP_VERIFY units so the idle
 	 * workers verify them in parallel on their own conns - off the transfer
 	 * path - then wait for those units to drain before returning. */
-	if (!p->abort_flag) {
+	if (!fleet->abort_flag) {
 		/* All verify units: range-split trackers (verify_pending) plus
 		 * whole-file items (verify_whole_pending).  Whole-file transfers
 		 * park only in the latter, so gating the meter on verify_pending_n
 		 * alone left the common case with no verify progress at all. */
-		int vn = p->verify_pending_n + p->verify_whole_pending_n;
+		int vn = fleet->verify_pending_n + fleet->verify_whole_pending_n;
 
 		if (vn > 0) {
 			/*
@@ -463,50 +463,50 @@ sftp_parallel_wait(struct sftp_parallel *p, struct sftp_conn *conn)
 			uint64_t moved = 0;
 			off_t vtotal;
 
-			parallel_stats_snapshot(p, &moved, NULL, NULL);
-			vtotal = (moved > p->progress_bytes_baseline)
-			    ? (off_t)(moved - p->progress_bytes_baseline) : 0;
-			if (p->progress_meter_started)
-				sftp_parallel_progress_stop(p);
+			parallel_stats_snapshot(fleet, &moved, NULL, NULL);
+			vtotal = (moved > fleet->progress_bytes_baseline)
+			    ? (off_t)(moved - fleet->progress_bytes_baseline) : 0;
+			if (fleet->progress_meter_started)
+				sftp_parallel_progress_stop(fleet);
 			/* Suppress in frame mode: stdout is the binary status
 			 * channel there, so this text would corrupt frames. */
-			if (p->cfg.print_flag != SFTP_QUIET &&
+			if (fleet->cfg.print_flag != SFTP_QUIET &&
 			    !hpn_pm_active())
 				mprintf("Verifying %d file(s)...\n", vn);
-			if (p->saved_showprogress && vtotal > 0) {
-				p->verify_total_units = (uint64_t)vn;
-				p->verify_done_units = 0;
-				p->verify_done_bytes = 0;
+			if (fleet->saved_showprogress && vtotal > 0) {
+				fleet->verify_total_units = (uint64_t)vn;
+				fleet->verify_done_units = 0;
+				fleet->verify_done_bytes = 0;
 				/* WORK-bytes: each transferred byte is hashed
 				 * on both ends (project_hash_work_meter_design),
 				 * so the verify meter total is 2x the moved
 				 * bytes and both legs advance it. */
-				p->verify_meter_total = 2 * vtotal;
-				p->aggregate_progress_counter = 0;
+				fleet->verify_meter_total = 2 * vtotal;
+				fleet->aggregate_progress_counter = 0;
 				/* WORK kind in the work-byte domain: the
 				 * core marks it not a file and raises the
 				 * verify phase flag. */
-				hpn_meter_start(&p->meter, p,
+				hpn_meter_start(&fleet->meter, fleet,
 				    HPN_METER_WORK, HPN_METER_DOM_WORK,
 				    "verify", 2 * vtotal,
-				    &p->aggregate_progress_counter, 0);
-				hpn_meter_bind_display(&p->meter, p,
-				    p->reporter_tid);
+				    &fleet->aggregate_progress_counter, 0);
+				hpn_meter_bind_display(&fleet->meter, fleet,
+				    fleet->reporter_tid);
 				/* verify_phase_active BEFORE meter_started: a
 				 * reporter tick between the two would take the
 				 * transfer branch against the verify meter's
 				 * freshly-zeroed counter and the ratchet would
 				 * pin the bogus publish for the whole phase. */
-				p->verify_phase_active = 1;
-				p->progress_meter_started = 1;
+				fleet->verify_phase_active = 1;
+				fleet->progress_meter_started = 1;
 			}
 		}
-		(void)parallel_verify_phase_submit(p);
-		pthread_mutex_lock(&p->pending_mu);
-		while (p->pending > 0 && !p->abort_flag)
-			pthread_cond_wait(&p->pending_cv, &p->pending_mu);
-		pthread_mutex_unlock(&p->pending_mu);
-		p->verify_phase_active = 0;
+		(void)parallel_verify_phase_submit(fleet);
+		pthread_mutex_lock(&fleet->pending_mu);
+		while (fleet->pending > 0 && !fleet->abort_flag)
+			pthread_cond_wait(&fleet->pending_cv, &fleet->pending_mu);
+		pthread_mutex_unlock(&fleet->pending_mu);
+		fleet->verify_phase_active = 0;
 		/*
 		 * Auto-repair now runs inline inside each verify unit (the
 		 * worker splices the bad sub-chunks of its range and re-verifies
@@ -516,16 +516,16 @@ sftp_parallel_wait(struct sftp_parallel *p, struct sftp_conn *conn)
 
 	/* HPN: apply the deferred directory attributes now that every
 	 * unit has drained (shared machinery with the serial walks). */
-	if (p->dirattrs != NULL) {
+	if (fleet->dirattrs != NULL) {
 		if (conn != NULL)
-			sftp_hpn_dirattrs_apply(conn, p->dirattrs);
-		else if (p->dirattrs->n > 0)
+			sftp_hpn_dirattrs_apply(conn, fleet->dirattrs);
+		else if (fleet->dirattrs->n > 0)
 			error_f("no control connection: %d directory "
 			    "attribute(s) not applied.",
-			    p->dirattrs->n);
-		sftp_hpn_dirattrs_free(p->dirattrs);
-		free(p->dirattrs);
-		p->dirattrs = NULL;
+			    fleet->dirattrs->n);
+		sftp_hpn_dirattrs_free(fleet->dirattrs);
+		free(fleet->dirattrs);
+		fleet->dirattrs = NULL;
 	}
 }
 
@@ -536,30 +536,30 @@ sftp_parallel_wait(struct sftp_parallel *p, struct sftp_conn *conn)
  * prefix pool.
   */
 static void
-parallel_verify_wave(struct sftp_parallel *p)
+parallel_verify_wave(struct sftp_parallel *fleet)
 {
-	parallel_bundle_flush_pending(p);
+	parallel_bundle_flush_pending(fleet);
 	/* Pause: drain in-flight transfers (no new units arrive - the walker
 	 * is blocked in this call). */
-	pthread_mutex_lock(&p->pending_mu);
-	while (p->pending > 0 && !p->abort_flag)
-		pthread_cond_wait(&p->pending_cv, &p->pending_mu);
-	pthread_mutex_unlock(&p->pending_mu);
-	if (p->abort_flag)
+	pthread_mutex_lock(&fleet->pending_mu);
+	while (fleet->pending > 0 && !fleet->abort_flag)
+		pthread_cond_wait(&fleet->pending_cv, &fleet->pending_mu);
+	pthread_mutex_unlock(&fleet->pending_mu);
+	if (fleet->abort_flag)
 		return;
 	debug("verify wave: draining parked set (%llu bytes)",
-	    (unsigned long long)p->verify_parked_bytes);
+	    (unsigned long long)fleet->verify_parked_bytes);
 	/* Drain the parked set into verify units (resets verify_parked_bytes),
 	 * then wait for those units to finish. */
-	(void)parallel_verify_phase_submit(p);
-	pthread_mutex_lock(&p->pending_mu);
-	while (p->pending > 0 && !p->abort_flag)
-		pthread_cond_wait(&p->pending_cv, &p->pending_mu);
-	pthread_mutex_unlock(&p->pending_mu);
+	(void)parallel_verify_phase_submit(fleet);
+	pthread_mutex_lock(&fleet->pending_mu);
+	while (fleet->pending > 0 && !fleet->abort_flag)
+		pthread_cond_wait(&fleet->pending_cv, &fleet->pending_mu);
+	pthread_mutex_unlock(&fleet->pending_mu);
 	/* Every parked item is now verified + freed, so nothing references the
 	 * prefix pool indices: free the pool
 	 */
-	parallel_verify_prefix_pool_reset(p);
+	parallel_verify_prefix_pool_reset(fleet);
 }
 
 /*
@@ -570,31 +570,31 @@ parallel_verify_wave(struct sftp_parallel *p)
  * paths).  No-op until something is parked.
  */
 void
-parallel_verify_maybe_wave(struct sftp_parallel *p)
+parallel_verify_maybe_wave(struct sftp_parallel *fleet)
 {
 	int over;
 
-	if (p == NULL)
+	if (fleet == NULL)
 		return;
-	pthread_mutex_lock(&p->verify_pending_mu);
-	over = (p->verify_park_budget > 0 &&
-	    p->verify_parked_bytes >= p->verify_park_budget) ||
-	    (p->verify_prefixes_n >= INT16_MAX - 256);
-	pthread_mutex_unlock(&p->verify_pending_mu);
+	pthread_mutex_lock(&fleet->verify_pending_mu);
+	over = (fleet->verify_park_budget > 0 &&
+	    fleet->verify_parked_bytes >= fleet->verify_park_budget) ||
+	    (fleet->verify_prefixes_n >= INT16_MAX - 256);
+	pthread_mutex_unlock(&fleet->verify_pending_mu);
 	if (over)
-		parallel_verify_wave(p);
+		parallel_verify_wave(fleet);
 }
 
 void
-sftp_parallel_abort(struct sftp_parallel *p)
+sftp_parallel_abort(struct sftp_parallel *fleet)
 {
-	if (p == NULL) return;
-	p->abort_flag = 1;
+	if (fleet == NULL) return;
+	fleet->abort_flag = 1;
 	/* Kill the progress meter FIRST: with the fleet dying, further
 	 * redraws are stale frames with garbage rates. */
-	sftp_parallel_progress_stop(p);
-	if (p->q)
-		sftp_workqueue_shutdown(p->q);
+	sftp_parallel_progress_stop(fleet);
+	if (fleet->q)
+		sftp_workqueue_shutdown(fleet->q);
 
 	/*
 	 * Close every worker's SSH FDs.  Without this, a worker blocked in
@@ -610,18 +610,18 @@ sftp_parallel_abort(struct sftp_parallel *p)
 	 * later from sftp_parallel_free) is a no-op for these slots and
 	 * doesn't double-close a (potentially reused) FD number.
 	 */
-	pthread_mutex_lock(&p->workers_mu);
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *w = p->workers[i];
-		if (w == NULL)
+	pthread_mutex_lock(&fleet->workers_mu);
+	for (int i = 0; i < fleet->num_workers; i++) {
+		struct sftp_worker *worker = fleet->workers[i];
+		if (worker == NULL)
 			continue;
-		if (w->fd_in >= 0) {
-			(void)close(w->fd_in);
-			w->fd_in = -1;
+		if (worker->fd_in >= 0) {
+			(void)close(worker->fd_in);
+			worker->fd_in = -1;
 		}
-		if (w->fd_out >= 0) {
-			(void)close(w->fd_out);
-			w->fd_out = -1;
+		if (worker->fd_out >= 0) {
+			(void)close(worker->fd_out);
+			worker->fd_out = -1;
 		}
 		/* Closing the fds does NOT wake a worker thread already
 		 * blocked in writev on a full pipe (Linux pins the struct
@@ -632,37 +632,37 @@ sftp_parallel_abort(struct sftp_parallel *p)
 		 * stop()'s join (and the user's exit) hostage for the
 		 * server's grace timeout.  Kill the child: the broken pipe
 		 * fails the write immediately and the worker unwinds. */
-		if (w->ssh_pid > 0)
-			(void)kill(w->ssh_pid, SIGTERM);
+		if (worker->ssh_pid > 0)
+			(void)kill(worker->ssh_pid, SIGTERM);
 	}
 	/* Also SIGTERM any current spawn attempts. The spawner's blocked
 	 * sftp_init fails within ms of the child dying. Its post-register
 	 * flag re-check covers the race where a spawn registers after this sweep. */
-	for (int i = 0; i < p->n_spawning; i++) {
-		if (p->spawning_pids[i] > 0)
-			(void)kill(p->spawning_pids[i], SIGTERM);
+	for (int i = 0; i < fleet->n_spawning; i++) {
+		if (fleet->spawning_pids[i] > 0)
+			(void)kill(fleet->spawning_pids[i], SIGTERM);
 	}
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_unlock(&fleet->workers_mu);
 
-	pthread_mutex_lock(&p->pending_mu);
-	pthread_cond_broadcast(&p->pending_cv);
-	pthread_mutex_unlock(&p->pending_mu);
+	pthread_mutex_lock(&fleet->pending_mu);
+	pthread_cond_broadcast(&fleet->pending_cv);
+	pthread_mutex_unlock(&fleet->pending_mu);
 }
 
 void
-sftp_parallel_set_interrupt_flag(struct sftp_parallel *p,
+sftp_parallel_set_interrupt_flag(struct sftp_parallel *fleet,
     _Atomic sig_atomic_t *flag)
 {
-	if (p != NULL)
-		p->ext_interrupt_flag = flag;
+	if (fleet != NULL)
+		fleet->ext_interrupt_flag = flag;
 }
 
 void
-sftp_parallel_set_path_rtt(struct sftp_parallel *p, uint64_t rtt_us)
+sftp_parallel_set_path_rtt(struct sftp_parallel *fleet, uint64_t rtt_us)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return;
-	p->path_rtt_us = rtt_us;
+	fleet->path_rtt_us = rtt_us;
 
 	/* RTT-dependent born-dead threshold: ~100 round-trips, i.e. rtt_ms/10
 	 * seconds (rtt_us/10000), with the mantissa dropped, floored at
@@ -676,7 +676,7 @@ sftp_parallel_set_path_rtt(struct sftp_parallel *p, uint64_t rtt_us)
 			v = BORN_DEAD_KILL_SEC;
 		if (v > BORN_DEAD_SEC_MAX)
 			v = BORN_DEAD_SEC_MAX;
-		p->born_dead_sec = v;
+		fleet->born_dead_sec = v;
 	}
 }
 
@@ -685,67 +685,67 @@ sftp_parallel_set_path_rtt(struct sftp_parallel *p, uint64_t rtt_us)
  * so workers stop pulling, join the reporter so nothing reaps behind us,
  * drain the respawn threads, then kill the worker ssh children and join
  * their threads. Work that never ran is drained and finalized, and every
- * buffer the fleet owns is freed. p is invalid once this returns.
+ * buffer the fleet owns is freed. fleet is invalid once this returns.
  */
 void
-sftp_parallel_stop(struct sftp_parallel *p)
+sftp_parallel_stop(struct sftp_parallel *fleet)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return;
 
-	p->stopped = 1;
+	fleet->stopped = 1;
 
-	if (p->q)
-		sftp_workqueue_shutdown(p->q);
+	if (fleet->q)
+		sftp_workqueue_shutdown(fleet->q);
 
 	/*
 	 * Join the reporter BEFORE touching the workers. Otherwise
 	 * we might end up having a worker getting freed out of sync leading to
 	 * a use after free. */
-	if (p->reporter_started)
-		pthread_join(p->reporter_tid, NULL);
+	if (fleet->reporter_started)
+		pthread_join(fleet->reporter_tid, NULL);
 
-	/* Drain detached respawn threads before touching p->workers[] or
-	 * freeing p: they hold p across a ~2s sleep and would wake to freed
+	/* Drain detached respawn threads before touching fleet->workers[] or
+	 * freeing fleet: they hold fleet across a ~2s sleep and would wake to freed
 	 * memory. With the reporter joined no new ones start, and pending ones
-	 * bail on p->stopped, so this loop is bounded. */
-	pthread_mutex_lock(&p->workers_mu);
+	 * bail on fleet->stopped, so this loop is bounded. */
+	pthread_mutex_lock(&fleet->workers_mu);
 
 	/* SIGKILL in-flight spawn attempts so the wait below resolves in
 	 * milliseconds instead of a connect timeout. KILL, not TERM: ssh
 	 * catches TERM and shuts down in an orderly way, which can itself
 	 * block on the very stall we are escaping. */
-	for (int i = 0; i < p->n_spawning; i++) {
-		if (p->spawning_pids[i] > 0)
-			(void)kill(p->spawning_pids[i], SIGKILL);
+	for (int i = 0; i < fleet->n_spawning; i++) {
+		if (fleet->spawning_pids[i] > 0)
+			(void)kill(fleet->spawning_pids[i], SIGKILL);
 	}
-	while (p->pending_respawns > 0) {
-		pthread_mutex_unlock(&p->workers_mu);
+	while (fleet->pending_respawns > 0) {
+		pthread_mutex_unlock(&fleet->workers_mu);
 		struct timespec drain_ts = { 0, 50 * 1000 * 1000 };
 		nanosleep(&drain_ts, NULL);
-		pthread_mutex_lock(&p->workers_mu);
+		pthread_mutex_lock(&fleet->workers_mu);
 	}
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_unlock(&fleet->workers_mu);
 
-	if (p->workers) {
+	if (fleet->workers) {
 		/* Same reasoning for worker ssh children that survived the
 		 * abort's SIGTERM: one was observed alive a minute later while
 		 * its worker sat in pipe_write and this join waited behind it.
 		 * KILL breaks the pipe, the write fails, the worker unwinds. */
-		pthread_mutex_lock(&p->workers_mu);
-		for (int i = 0; i < p->num_workers; i++) {
-			struct sftp_worker *w = p->workers[i];
-			if (w != NULL && w->ssh_pid > 0)
-				(void)kill(w->ssh_pid, SIGKILL);
+		pthread_mutex_lock(&fleet->workers_mu);
+		for (int i = 0; i < fleet->num_workers; i++) {
+			struct sftp_worker *worker = fleet->workers[i];
+			if (worker != NULL && worker->ssh_pid > 0)
+				(void)kill(worker->ssh_pid, SIGKILL);
 		}
-		pthread_mutex_unlock(&p->workers_mu);
+		pthread_mutex_unlock(&fleet->workers_mu);
 
 		/* Reporter is gone - no concurrent reaping.  Join any worker
 		 * threads it had not already reaped. */
-		for (int i = 0; i < p->num_workers; i++) {
-			struct sftp_worker *w = p->workers[i];
-			if (w != NULL && w->started)
-				pthread_join(w->tid, NULL);
+		for (int i = 0; i < fleet->num_workers; i++) {
+			struct sftp_worker *worker = fleet->workers[i];
+			if (worker != NULL && worker->started)
+				pthread_join(worker->tid, NULL);
 		}
 	}
 
@@ -753,9 +753,9 @@ sftp_parallel_stop(struct sftp_parallel *p)
 	 * joined, so nothing pops or requeues concurrently. Each unit owes its
 	 * tracker one finalize  and owns its path strings. Without this sweep
 	 * both leak on every abort, and leaked paths can be sensitive. */
-	if (p->q) {
+	if (fleet->q) {
 		void *item;
-		while (sftp_workqueue_drain(p->q, &item) == 0) {
+		while (sftp_workqueue_drain(fleet->q, &item) == 0) {
 			struct sftp_work_unit *work_unit = item;
 			/* A bundle container is one queue item but N members, and
 			 * pending was bumped per member at add time, so decrement by
@@ -763,19 +763,19 @@ sftp_parallel_stop(struct sftp_parallel *p)
 			 * pending is not read after a terminal stop. */
 			uint64_t dec = (work_unit->members != NULL && work_unit->n_members > 0)
 			    ? (uint64_t)work_unit->n_members : 1;
-			pthread_mutex_lock(&p->pending_mu);
-			p->pending = (p->pending > dec) ? (p->pending - dec) : 0;
-			pthread_mutex_unlock(&p->pending_mu);
+			pthread_mutex_lock(&fleet->pending_mu);
+			fleet->pending = (fleet->pending > dec) ? (fleet->pending - dec) : 0;
+			pthread_mutex_unlock(&fleet->pending_mu);
 			(void)parallel_unit_tracker_finalize(work_unit->range_tracker, 1, NULL);
 			parallel_unit_free(work_unit);
 		}
 	}
 
-	if (p->workers) {
+	if (fleet->workers) {
 		/* Reporter is now joined - no more concurrent reaping. We
-		 * own everything still in p->workers; tear it down. */
-		for (int i = 0; i < p->num_workers; i++) {
-			struct sftp_worker *worker = p->workers[i];
+		 * own everything still in fleet->workers; tear it down. */
+		for (int i = 0; i < fleet->num_workers; i++) {
+			struct sftp_worker *worker = fleet->workers[i];
 			if (worker == NULL) continue;
 			if (worker->conn) {
 				sftp_free(worker->conn);
@@ -785,58 +785,58 @@ sftp_parallel_stop(struct sftp_parallel *p)
 			pthread_mutex_destroy(&worker->mu);
 			free(worker);
 		}
-		free(p->workers);
-		p->workers = NULL;
-		p->num_workers = 0;
-		p->workers_cap = 0;
+		free(fleet->workers);
+		fleet->workers = NULL;
+		fleet->num_workers = 0;
+		fleet->workers_cap = 0;
 	}
 
-	if (p->q) {
-		sftp_workqueue_free(p->q);
-		p->q = NULL;
+	if (fleet->q) {
+		sftp_workqueue_free(fleet->q);
+		fleet->q = NULL;
 	}
 
 	/* Restore the user's progress preference. */
-	showprogress = p->saved_showprogress;
+	showprogress = fleet->saved_showprogress;
 
 	/* Bundle accumulator: normally drained by parallel_bundle_flush_pending
 	 * at wait.  Free any leftover (e.g. aborted before wait) so the member
 	 * units and the array don't leak. */
-	for (int i = 0; i < p->bundle_pending_n; i++)
-		parallel_unit_free(p->bundle_pending[i]);
-	free(p->bundle_pending);
-	p->bundle_pending = NULL;
+	for (int i = 0; i < fleet->bundle_pending_n; i++)
+		parallel_unit_free(fleet->bundle_pending[i]);
+	free(fleet->bundle_pending);
+	fleet->bundle_pending = NULL;
 
 	/* Verify-pending: range trackers + whole-file items parked at completion
 	 * but never submitted as verify units (e.g. aborted before wait's verify
 	 * phase).  Free both lists so neither leaks. */
-	for (int i = 0; i < p->verify_pending_n; i++)
-		parallel_verify_tracker_free(p->verify_pending[i]);
-	free(p->verify_pending);
-	p->verify_pending = NULL;
-	for (int i = 0; i < p->verify_whole_pending_n; i++)
-		free(p->verify_whole_pending[i]);	/* single block */
-	free(p->verify_whole_pending);
-	p->verify_whole_pending = NULL;
+	for (int i = 0; i < fleet->verify_pending_n; i++)
+		parallel_verify_tracker_free(fleet->verify_pending[i]);
+	free(fleet->verify_pending);
+	fleet->verify_pending = NULL;
+	for (int i = 0; i < fleet->verify_whole_pending_n; i++)
+		free(fleet->verify_whole_pending[i]);	/* single block */
+	free(fleet->verify_whole_pending);
+	fleet->verify_whole_pending = NULL;
 
 	/* Path-factoring prefix pool: the registered directory prefixes. */
-	for (int i = 0; i < p->verify_prefixes_n; i++)
-		free(p->verify_prefixes[i]);
-	free(p->verify_prefixes);
-	p->verify_prefixes = NULL;
+	for (int i = 0; i < fleet->verify_prefixes_n; i++)
+		free(fleet->verify_prefixes[i]);
+	free(fleet->verify_prefixes);
+	fleet->verify_prefixes = NULL;
 
 	/* Worker re-queue overflow: units parked here when a worker hit a full
 	 * queue, never drained back (abort/shutdown before the reporter moved
 	 * them).  Threads have joined by now, so free without locking concerns. */
-	parallel_retry_overflow_free(p);
-	pthread_mutex_destroy(&p->verify_pending_mu);
-	pthread_mutex_destroy(&p->retry_overflow_mu);
-	pthread_mutex_destroy(&p->pending_mu);
-	pthread_cond_destroy(&p->pending_cv);
-	pthread_mutex_destroy(&p->workers_mu);
-	hpn_strlist_free(&p->failed_paths);
-	hpn_strlist_free(&p->verify_failed_paths);
-	free(p);
+	parallel_retry_overflow_free(fleet);
+	pthread_mutex_destroy(&fleet->verify_pending_mu);
+	pthread_mutex_destroy(&fleet->retry_overflow_mu);
+	pthread_mutex_destroy(&fleet->pending_mu);
+	pthread_cond_destroy(&fleet->pending_cv);
+	pthread_mutex_destroy(&fleet->workers_mu);
+	hpn_strlist_free(&fleet->failed_paths);
+	hpn_strlist_free(&fleet->verify_failed_paths);
+	free(fleet);
 }
 
 /*
@@ -900,29 +900,29 @@ sftp_parallel_scan_upload_total(const char *src, uint64_t *file_count_out)
 
 /* Record the scan-time total file count for the progress frames/meter. */
 void
-sftp_parallel_set_file_total(struct sftp_parallel *p, uint64_t total)
+sftp_parallel_set_file_total(struct sftp_parallel *fleet, uint64_t total)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return;
-	__atomic_store_n(&p->files_total, total, __ATOMIC_RELAXED);
+	__atomic_store_n(&fleet->files_total, total, __ATOMIC_RELAXED);
 }
 
 /* Walker-authoritative per-file counts, for a final END-frame publish. */
 u_int
-sftp_parallel_files_submitted(struct sftp_parallel *p)
+sftp_parallel_files_submitted(struct sftp_parallel *fleet)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return 0;
-	return (u_int)__atomic_load_n(&p->files_submitted,
+	return (u_int)__atomic_load_n(&fleet->files_submitted,
 	    __ATOMIC_RELAXED);
 }
 
 u_int
-sftp_parallel_files_total(struct sftp_parallel *p)
+sftp_parallel_files_total(struct sftp_parallel *fleet)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return 0;
-	return (u_int)__atomic_load_n(&p->files_total,
+	return (u_int)__atomic_load_n(&fleet->files_total,
 	    __ATOMIC_RELAXED);
 }
 
@@ -932,41 +932,41 @@ sftp_parallel_files_total(struct sftp_parallel *p)
  * report success for a canceled, incomplete transfer.
  */
 int
-sftp_parallel_was_aborted(struct sftp_parallel *p)
+sftp_parallel_was_aborted(struct sftp_parallel *fleet)
 {
-	return p != NULL && p->abort_flag;
+	return fleet != NULL && fleet->abort_flag;
 }
 
 /* initialize the progressmeter */
 void
-sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
+sftp_parallel_progress_start(struct sftp_parallel *fleet, const char *label,
     off_t total_bytes)
 {
-	if (p == NULL || p->progress_meter_started)
+	if (fleet == NULL || fleet->progress_meter_started)
 		return;
 	if (label == NULL)
 		label = "transfer";
-	p->resume_stretch_on = 0;
-	p->verify_meter_total = 0;	/* this is a TRANSFER meter; a stale
+	fleet->resume_stretch_on = 0;
+	fleet->verify_meter_total = 0;	/* this is a TRANSFER meter; a stale
 					 * verify total would hijack the stop
 					 * snapshot (work-byte domain) */
 	/* Nothing posted yet for this meter. */
-	__atomic_store_n(&p->posted_total_add, 0, __ATOMIC_RELAXED);
-	__atomic_store_n(&p->posted_files_add, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&fleet->posted_total_add, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&fleet->posted_files_add, 0, __ATOMIC_RELAXED);
 	/* Snapshot current accumulated bytes across all workers so the meter
 	 * shows only bytes moved in this transfer, not prior transfers in the
 	 * same session. */
-	parallel_stats_snapshot(p, &p->progress_bytes_baseline, NULL, NULL);
-	p->aggregate_progress_counter = 0;
+	parallel_stats_snapshot(fleet, &fleet->progress_bytes_baseline, NULL, NULL);
+	fleet->aggregate_progress_counter = 0;
 	/* AGGREGATE kind: an unknown (0) total renders rate-only, and after
 	 * this returns the reporter is the only thread that updates the
 	 * meter. The core owns the label copy. */
-	hpn_meter_start(&p->meter, p, HPN_METER_AGGREGATE,
+	hpn_meter_start(&fleet->meter, fleet, HPN_METER_AGGREGATE,
 	    HPN_METER_DOM_TRANSFER, label, total_bytes,
-	    &p->aggregate_progress_counter, 0);
-	hpn_meter_bind_display(&p->meter, p, p->reporter_tid);
-	p->progress_meter_started = 1;
-	p->progress_verb[0] = '\0';	/* no deferred file count unless the
+	    &fleet->aggregate_progress_counter, 0);
+	hpn_meter_bind_display(&fleet->meter, fleet, fleet->reporter_tid);
+	fleet->progress_meter_started = 1;
+	fleet->progress_verb[0] = '\0';	/* no deferred file count unless the
 					 * caller re-arms it via _start_counted */
 }
 
@@ -979,10 +979,10 @@ sftp_parallel_progress_start(struct sftp_parallel *p, const char *label,
  * "<verb> N files in parallel".  No-op before the meter starts.
  */
 void
-sftp_parallel_progress_set_total(struct sftp_parallel *p, off_t total_bytes,
+sftp_parallel_progress_set_total(struct sftp_parallel *fleet, off_t total_bytes,
     size_t nfiles)
 {
-	if (p == NULL || !p->progress_meter_started)
+	if (fleet == NULL || !fleet->progress_meter_started)
 		return;
 	/*
 	 * Post, do not apply: this runs on the walker's thread when an
@@ -994,10 +994,10 @@ sftp_parallel_progress_set_total(struct sftp_parallel *p, off_t total_bytes,
 	 * deferred-count label from progress_verb.
 	 */
 	if (total_bytes > 0)
-		__atomic_fetch_add(&p->posted_total_add, total_bytes,
+		__atomic_fetch_add(&fleet->posted_total_add, total_bytes,
 		    __ATOMIC_RELAXED);
 	if (nfiles > 0)
-		__atomic_fetch_add(&p->posted_files_add, (u_int)nfiles,
+		__atomic_fetch_add(&fleet->posted_files_add, (u_int)nfiles,
 		    __ATOMIC_RELAXED);
 }
 
@@ -1009,12 +1009,12 @@ sftp_parallel_progress_set_total(struct sftp_parallel *p, off_t total_bytes,
  * sftp, "Downloading" for scp).
  */
 void
-sftp_parallel_progress_start_counted(struct sftp_parallel *p, const char *verb,
+sftp_parallel_progress_start_counted(struct sftp_parallel *fleet, const char *verb,
     off_t total_bytes)
 {
 	char label[128];
 
-	if (p == NULL || p->progress_meter_started)
+	if (fleet == NULL || fleet->progress_meter_started)
 		return;		/* a live meter keeps its own count; arming
 				 * the verb against it would let this
 				 * command rewrite that meter's label and
@@ -1022,19 +1022,19 @@ sftp_parallel_progress_start_counted(struct sftp_parallel *p, const char *verb,
 	if (verb == NULL)
 		verb = "Fetching";
 	snprintf(label, sizeof(label), "%s files in parallel", verb);
-	sftp_parallel_progress_start(p, label, total_bytes);
+	sftp_parallel_progress_start(fleet, label, total_bytes);
 	/* progress_start cleared progress_verb; set it AFTER so the count-fill
 	 * in _set_total rewrites this label. */
-	strlcpy(p->progress_verb, verb, sizeof(p->progress_verb));
+	strlcpy(fleet->progress_verb, verb, sizeof(fleet->progress_verb));
 }
 
 /* stop the progress meter once we've reached the end of the workunit */
 void
-sftp_parallel_progress_stop(struct sftp_parallel *p)
+sftp_parallel_progress_stop(struct sftp_parallel *fleet)
 {
 	uint64_t bytes = 0;
 
-	if (p == NULL || !p->progress_meter_started)
+	if (fleet == NULL || !fleet->progress_meter_started)
 		return;
 	/* The reporter advances the aggregate counter only on its tick, so
 	 * the final units land between ticks and the meter's forced last
@@ -1042,13 +1042,13 @@ sftp_parallel_progress_stop(struct sftp_parallel *p)
 	 * the verify meter counts hash WORK-bytes (2x the moved bytes -
 	 * project_hash_work_meter_design), so painting the transfer-byte
 	 * snapshot onto it would land the completion line at 50%. */
-	if (p->verify_meter_total > 0) {
-		p->aggregate_progress_counter = p->verify_meter_total;
+	if (fleet->verify_meter_total > 0) {
+		fleet->aggregate_progress_counter = fleet->verify_meter_total;
 	} else {
-		parallel_stats_snapshot(p, &bytes, NULL, NULL);
-		if (bytes >= p->progress_bytes_baseline)
-			p->aggregate_progress_counter =
-			    (off_t)(bytes - p->progress_bytes_baseline);
+		parallel_stats_snapshot(fleet, &bytes, NULL, NULL);
+		if (bytes >= fleet->progress_bytes_baseline)
+			fleet->aggregate_progress_counter =
+			    (off_t)(bytes - fleet->progress_bytes_baseline);
 	}
 	/*
 	 * The meter is bound to the reporter, so the final paint must come
@@ -1061,12 +1061,12 @@ sftp_parallel_progress_stop(struct sftp_parallel *p)
 	 * Atomic because the flag is the handshake with the reporter
 	 * thread: the release on the raise publishes the snapped total,
 	 * the acquire on the poll observes the reporter's answer. */
-	if (p->meter.display_bound) {
+	if (fleet->meter.display_bound) {
 		int i;
 
-		__atomic_store_n(&p->meter_final_request, 1,
+		__atomic_store_n(&fleet->meter_final_request, 1,
 		    __ATOMIC_RELEASE);
-		for (i = 0; i < 40 && __atomic_load_n(&p->meter_final_request,
+		for (i = 0; i < 40 && __atomic_load_n(&fleet->meter_final_request,
 		    __ATOMIC_ACQUIRE); i++) {
 			/* 10 ms: the reporter ticks every 200 ms, so the
 			 * wait is sub-second by construction and bounded. */
@@ -1074,15 +1074,15 @@ sftp_parallel_progress_stop(struct sftp_parallel *p)
 
 			nanosleep(&ts, NULL);
 		}
-		if (__atomic_load_n(&p->meter_final_request,
+		if (__atomic_load_n(&fleet->meter_final_request,
 		    __ATOMIC_ACQUIRE)) {
-			__atomic_store_n(&p->meter_final_request, 0,
+			__atomic_store_n(&fleet->meter_final_request, 0,
 			    __ATOMIC_RELAXED);
-			p->meter.display_bound = 0;
+			fleet->meter.display_bound = 0;
 		}
 	}
-	p->progress_meter_started = 0;
-	hpn_meter_stop(&p->meter, p);
+	fleet->progress_meter_started = 0;
+	hpn_meter_stop(&fleet->meter, fleet);
 }
 
 /* ----------------------------------------------------------------
@@ -1092,36 +1092,36 @@ sftp_parallel_progress_stop(struct sftp_parallel *p)
  * ---------------------------------------------------------------- */
 
 int
-sftp_parallel_preserve_flag(const struct sftp_parallel *p)
+sftp_parallel_preserve_flag(const struct sftp_parallel *fleet)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return 0;
-	return p->cfg.preserve_flag;
+	return fleet->cfg.preserve_flag;
 }
 
 int
-sftp_parallel_num_streams(const struct sftp_parallel *p)
+sftp_parallel_num_streams(const struct sftp_parallel *fleet)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return 1;
-	return p->cfg.num_streams;
+	return fleet->cfg.num_streams;
 }
 
 void
-sftp_parallel_set_verify_transfer(struct sftp_parallel *p, int on)
+sftp_parallel_set_verify_transfer(struct sftp_parallel *fleet, int on)
 {
-	if (p != NULL)
-		p->cfg.verify_transfer = on ? 1 : 0;
+	if (fleet != NULL)
+		fleet->cfg.verify_transfer = on ? 1 : 0;
 }
 
 /* Per-command preserve toggle: the parallel/bundle path reads preserve from
  * the orchestrator config, so a per-command put/get -p has to push it here
  * (the long-lived orchestrator was launched once with the program-level -p). */
 void
-sftp_parallel_set_preserve(struct sftp_parallel *p, int on)
+sftp_parallel_set_preserve(struct sftp_parallel *fleet, int on)
 {
-	if (p != NULL)
-		p->cfg.preserve_flag = on ? 1 : 0;
+	if (fleet != NULL)
+		fleet->cfg.preserve_flag = on ? 1 : 0;
 }
 
 /*
@@ -1134,46 +1134,46 @@ sftp_parallel_set_preserve(struct sftp_parallel *p, int on)
  * the common flat-glob case (one or two distinct directories).
  */
 void
-sftp_parallel_register_verify_dir(struct sftp_parallel *p, const char *path)
+sftp_parallel_register_verify_dir(struct sftp_parallel *fleet, const char *path)
 {
 	const char *slash;
 	char *dir;
 
-	if (p == NULL || path == NULL || !p->cfg.verify_transfer)
+	if (fleet == NULL || path == NULL || !fleet->cfg.verify_transfer)
 		return;
 	if ((slash = strrchr(path, '/')) == NULL)
 		return;			/* relative no-dir path: nothing to factor */
 	dir = xmalloc((size_t)(slash - path) + 1);
 	memcpy(dir, path, (size_t)(slash - path));
 	dir[slash - path] = '\0';
-	parallel_verify_prefix_register(p, dir);  /* handles ""/"."/dedup */
+	parallel_verify_prefix_register(fleet, dir);  /* handles ""/"."/dedup */
 	free(dir);
 }
 
 int
-sftp_parallel_follow_link_flag(const struct sftp_parallel *p)
+sftp_parallel_follow_link_flag(const struct sftp_parallel *fleet)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return 0;
-	return p->cfg.follow_link_flag;
+	return fleet->cfg.follow_link_flag;
 }
 
 int
-sftp_parallel_is_aborting(const struct sftp_parallel *p)
+sftp_parallel_is_aborting(const struct sftp_parallel *fleet)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return 0;
-	return p->abort_flag;
+	return fleet->abort_flag;
 }
 
 /* 1 iff the abort was caused by the user's interrupt (Ctrl-C), as opposed
  * to a fleet failure.  Drives the interrupt-aware messaging. */
 int
-sftp_parallel_user_abort(const struct sftp_parallel *p)
+sftp_parallel_user_abort(const struct sftp_parallel *fleet)
 {
-	if (p == NULL)
+	if (fleet == NULL)
 		return 0;
-	return p->abort_user;
+	return fleet->abort_user;
 }
 
 /* ---------- Stats accessor (programmatic observability) ---------- */
@@ -1186,7 +1186,7 @@ sftp_parallel_user_abort(const struct sftp_parallel *p)
  * data points if needed for development or reporting but these are useful.
  */
 void
-sftp_parallel_get_stats(struct sftp_parallel *p,
+sftp_parallel_get_stats(struct sftp_parallel *fleet,
     struct sftp_parallel_stats *out)
 {
 	uint64_t bytes = 0, failed = 0, bytes_wired = 0;
@@ -1194,17 +1194,17 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	if (out == NULL)
 		return;
 	memset(out, 0, sizeof(*out));
-	if (p == NULL)
+	if (fleet == NULL)
 		return;
 
-	pthread_mutex_lock(&p->workers_mu);
-	out->num_workers        = p->num_workers;
-	out->protocol_violations = p->protocol_violations;
-	out->total_respawns      = p->total_respawns;
-	out->wedge_terminations  = p->wedge_terminations;
-	out->peer_stall_terminations = p->peer_stall_terminations;
-	for (int i = 0; i < p->num_workers; i++) {
-		struct sftp_worker *worker = p->workers[i];
+	pthread_mutex_lock(&fleet->workers_mu);
+	out->num_workers        = fleet->num_workers;
+	out->protocol_violations = fleet->protocol_violations;
+	out->total_respawns      = fleet->total_respawns;
+	out->wedge_terminations  = fleet->wedge_terminations;
+	out->peer_stall_terminations = fleet->peer_stall_terminations;
+	for (int i = 0; i < fleet->num_workers; i++) {
+		struct sftp_worker *worker = fleet->workers[i];
 		pthread_mutex_lock(&worker->mu);
 		bytes += worker->bytes_total;
 		failed += worker->units_failed;
@@ -1223,27 +1223,27 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
 	 * post-abort; sometimes, post-respawn) silently undercounted or
 	 * vanished entirely (the bytes>0 gate failed). Read under workers_mu,
 	 * which the reap site holds while accumulating. */
-	bytes += p->retired_bytes;
-	bytes_wired += p->retired_wired;
-	failed += p->retired_units_failed;
+	bytes += fleet->retired_bytes;
+	bytes_wired += fleet->retired_wired;
+	failed += fleet->retired_units_failed;
 	debug("stats-sum: retired_wired=%llu retired_bytes=%llu -> "
 	    "aggregate wired=%llu bt=%llu",
-	    (unsigned long long)p->retired_wired,
-	    (unsigned long long)p->retired_bytes,
+	    (unsigned long long)fleet->retired_wired,
+	    (unsigned long long)fleet->retired_bytes,
 	    (unsigned long long)bytes_wired, (unsigned long long)bytes);
-	pthread_mutex_unlock(&p->workers_mu);
+	pthread_mutex_unlock(&fleet->workers_mu);
 
 	out->bytes_total_aggregate = bytes;
 	out->bytes_wired_aggregate = bytes_wired;
 	out->units_failed_aggregate = failed;
 	out->walker_failures_aggregate =
-	    __atomic_load_n(&p->walker_failures, __ATOMIC_RELAXED);
-	pthread_mutex_lock(&p->pending_mu);
-	out->units_pending = (uint64_t)p->pending;
-	pthread_mutex_unlock(&p->pending_mu);
+	    __atomic_load_n(&fleet->walker_failures, __ATOMIC_RELAXED);
+	pthread_mutex_lock(&fleet->pending_mu);
+	out->units_pending = (uint64_t)fleet->pending;
+	pthread_mutex_unlock(&fleet->pending_mu);
 
-	if (p->session_start_ms != 0)
-		out->elapsed_ms = monotime_ms() - p->session_start_ms;
+	if (fleet->session_start_ms != 0)
+		out->elapsed_ms = monotime_ms() - fleet->session_start_ms;
 }
 
 /*
@@ -1253,17 +1253,17 @@ sftp_parallel_get_stats(struct sftp_parallel *p,
  * reset, so failures recorded after this call start fresh.
  */
 uint64_t
-sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
+sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
     char ***out_paths, size_t *out_used)
 {
-	if (p == NULL) {
+	if (fleet == NULL) {
 		if (out_paths != NULL)
 			*out_paths = NULL;
 		if (out_used != NULL)
 			*out_used = 0;
 		return 0;
 	}
-	return hpn_strlist_drain(&p->failed_paths, out_paths, out_used);
+	return hpn_strlist_drain(&fleet->failed_paths, out_paths, out_used);
 }
 
 /*
@@ -1274,15 +1274,15 @@ sftp_parallel_drain_failed_paths(struct sftp_parallel *p,
  * SFTP_EX_VERIFY_FAILED.
  */
 uint64_t
-sftp_parallel_drain_verify_failures(struct sftp_parallel *p,
+sftp_parallel_drain_verify_failures(struct sftp_parallel *fleet,
     char ***out_paths, size_t *out_used)
 {
-	if (p == NULL) {
+	if (fleet == NULL) {
 		if (out_paths != NULL)
 			*out_paths = NULL;
 		if (out_used != NULL)
 			*out_used = 0;
 		return 0;
 	}
-	return hpn_strlist_drain(&p->verify_failed_paths, out_paths, out_used);
+	return hpn_strlist_drain(&fleet->verify_failed_paths, out_paths, out_used);
 }

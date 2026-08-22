@@ -43,7 +43,7 @@ struct sftp_conn;
  * On success emits one INFO log line.  Safe to call repeatedly on the
  * same directory - Lustre setstripe is idempotent.
  */
-void maybe_apply_lustre_layout(struct sftp_parallel *p,
+void maybe_apply_lustre_layout(struct sftp_parallel *fleet,
     struct sftp_conn *conn, const char *dst);
 
 /*
@@ -55,7 +55,7 @@ void maybe_apply_lustre_layout(struct sftp_parallel *p,
  * destinations are skipped silently.  conn supplies only the resolved
  * config value.
  */
-void maybe_apply_lustre_layout_local(struct sftp_parallel *p,
+void maybe_apply_lustre_layout_local(struct sftp_parallel *fleet,
     struct sftp_conn *conn, const char *dst);
 
 #endif /* SFTP_LUSTRE_CLIENT_H */

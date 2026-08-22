@@ -73,11 +73,11 @@
 /* Lazy accessor for the deferred directory-attribute list (applied at
  * the end of sftp_parallel_wait; see sftp-parallel-internal.h). */
 static struct sftp_hpn_dirattr_list *
-parallel_dirattrs(struct sftp_parallel *p)
+parallel_dirattrs(struct sftp_parallel *fleet)
 {
-	if (p->dirattrs == NULL)
-		p->dirattrs = xcalloc(1, sizeof(*p->dirattrs));
-	return p->dirattrs;
+	if (fleet->dirattrs == NULL)
+		fleet->dirattrs = xcalloc(1, sizeof(*fleet->dirattrs));
+	return fleet->dirattrs;
 }
 
 /*
@@ -89,7 +89,7 @@ parallel_dirattrs(struct sftp_parallel *p)
  */
 struct parallel_ul_sink {
 	struct sftp_upload_sink	 base;
-	struct sftp_parallel	*p;
+	struct sftp_parallel	*fleet;
 	struct sftp_conn	*conn;
 	int	preserve_flag, resume, verify;
 };
@@ -103,8 +103,8 @@ parallel_ul_enter_dir(struct sftp_upload_sink *sink, const char *src,
 	(void)src;
 	/* Lay out this already-created directory for Lustre before any files
 	 * land in it, then enter the enumerate phase. */
-	maybe_apply_lustre_layout(s->p, s->conn, dst);
-	sftp_parallel_set_walker_phase(s->p, SFTP_WKP_ENUM);
+	maybe_apply_lustre_layout(s->fleet, s->conn, dst);
+	sftp_parallel_set_walker_phase(s->fleet, SFTP_WKP_ENUM);
 }
 
 static int
@@ -113,16 +113,16 @@ parallel_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
 {
 	struct parallel_ul_sink	*s = (struct parallel_ul_sink *)sink;
 
-	sftp_parallel_set_walker_phase(s->p, SFTP_WKP_SUBMIT);
-	if (sftp_parallel_submit_upload(s->p, s->conn, src, dst, sb->st_size,
+	sftp_parallel_set_walker_phase(s->fleet, SFTP_WKP_SUBMIT);
+	if (sftp_parallel_submit_upload(s->fleet, s->conn, src, dst, sb->st_size,
 	    sb->st_mode, s->resume, s->verify) != 0) {
-		if (sftp_parallel_is_aborting(s->p)) {
+		if (sftp_parallel_is_aborting(s->fleet)) {
 			debug("submit \"%s\" refused (abort in progress)", src);
-			sftp_parallel_walker_record_failure(s->p, src,
+			sftp_parallel_walker_record_failure(s->fleet, src,
 			    "interrupted");
 		} else {
 			error("submit \"%s\" -> \"%s\" failed", src, dst);
-			sftp_parallel_walker_record_failure(s->p, src,
+			sftp_parallel_walker_record_failure(s->fleet, src,
 			    "submit failed");
 		}
 		return -1;
@@ -135,7 +135,7 @@ parallel_ul_before_mkdir(struct sftp_upload_sink *sink)
 {
 	struct parallel_ul_sink	*s = (struct parallel_ul_sink *)sink;
 
-	sftp_parallel_set_walker_phase(s->p, SFTP_WKP_MKDIR);
+	sftp_parallel_set_walker_phase(s->fleet, SFTP_WKP_MKDIR);
 }
 
 static void
@@ -145,7 +145,7 @@ parallel_ul_defer_dir(struct sftp_upload_sink *sink, const char *dst,
 	struct parallel_ul_sink	*s = (struct parallel_ul_sink *)sink;
 
 	if (created || s->preserve_flag)
-		sftp_hpn_dirattrs_defer_remote(parallel_dirattrs(s->p),
+		sftp_hpn_dirattrs_defer_remote(parallel_dirattrs(s->fleet),
 		    dst, a);
 }
 
@@ -155,20 +155,20 @@ parallel_ul_fail(struct sftp_upload_sink *sink, const char *path,
 {
 	struct parallel_ul_sink	*s = (struct parallel_ul_sink *)sink;
 
-	sftp_parallel_walker_record_failure(s->p, path, reason);
+	sftp_parallel_walker_record_failure(s->fleet, path, reason);
 }
 
 static int
 parallel_ul_aborting(struct sftp_upload_sink *sink)
 {
-	return sftp_parallel_is_aborting(((struct parallel_ul_sink *)sink)->p);
+	return sftp_parallel_is_aborting(((struct parallel_ul_sink *)sink)->fleet);
 }
 
 int
-sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
+sftp_parallel_upload_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify)
 {
-	if (p == NULL || conn == NULL || src == NULL || dst == NULL) {
+	if (fleet == NULL || conn == NULL || src == NULL || dst == NULL) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -178,9 +178,9 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 	 * store paths relative to them (upload: local root = src, remote = dst).
 	 * Gated on the orchestrator's verify_transfer (same flag the park checks);
 	 * the per-command `verify` arg is not reliably set for putv. */
-	if (p->cfg.verify_transfer) {
-		parallel_verify_prefix_register(p, src);
-		parallel_verify_prefix_register(p, dst);
+	if (fleet->cfg.verify_transfer) {
+		parallel_verify_prefix_register(fleet, src);
+		parallel_verify_prefix_register(fleet, dst);
 	}
 	{
 		struct stat rsb;
@@ -192,14 +192,14 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		 * mkdir batch, so parallel_upload_walk assumes dst exists. */
 		if (stat(src, &rsb) == -1 || !S_ISDIR(rsb.st_mode)) {
 			error("stat local \"%s\": not a directory", src);
-			sftp_parallel_walker_record_failure(p, src,
+			sftp_parallel_walker_record_failure(fleet, src,
 			    "not a directory");
 			return -1;
 		}
 		sftp_hpn_dir_attrs_from_stat(&rsb,
-		    sftp_parallel_preserve_flag(p), &ra);
+		    sftp_parallel_preserve_flag(fleet), &ra);
 		if (sftp_hpn_ensure_remote_dir(conn, dst, &ra, &rcreated) != 0) {
-			sftp_parallel_walker_record_failure(p, dst,
+			sftp_parallel_walker_record_failure(fleet, dst,
 			    "cannot create or access destination directory");
 			return -1;
 		}
@@ -213,18 +213,18 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 					.fail = parallel_ul_fail,
 					.aborting = parallel_ul_aborting,
 				},
-				.p = p,
+				.fleet = fleet,
 				.conn = conn,
-				.preserve_flag = sftp_parallel_preserve_flag(p),
+				.preserve_flag = sftp_parallel_preserve_flag(fleet),
 				.resume = resume,
 				.verify = verify,
 			};
 			rc = sftp_upload_walk_consume(conn, src, dst, 0,
 			    HPN_WALK_MAX_DEPTH, rcreated,
-			    sftp_parallel_preserve_flag(p),
-			    sftp_parallel_follow_link_flag(p), &sink.base);
+			    sftp_parallel_preserve_flag(fleet),
+			    sftp_parallel_follow_link_flag(fleet), &sink.base);
 		}
-		sftp_parallel_set_walker_phase(p, SFTP_WKP_DONE);
+		sftp_parallel_set_walker_phase(fleet, SFTP_WKP_DONE);
 		return rc;
 	}
 }
@@ -241,7 +241,7 @@ sftp_parallel_upload_dir(struct sftp_parallel *p, struct sftp_conn *conn,
  */
 struct parallel_dl_sink {
 	struct sftp_tree_dl_sink	 base;
-	struct sftp_parallel		*p;
+	struct sftp_parallel		*fleet;
 	struct sftp_conn		*conn;
 	int	preserve_flag, resume, verify;
 };
@@ -256,16 +256,16 @@ parallel_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
 
 	(void)src;	/* parallel prints the root once at the caller, not per-dir */
 	if (sftp_hpn_ensure_local_dir(dst, a, &mode, &tmpmode) != 0) {
-		sftp_parallel_walker_record_failure(s->p, dst,
+		sftp_parallel_walker_record_failure(s->fleet, dst,
 		    "cannot create local directory");
 		return -1;
 	}
-	maybe_apply_lustre_layout_local(s->p, s->conn, dst);
+	maybe_apply_lustre_layout_local(s->fleet, s->conn, dst);
 	da = *a;
 	if (!s->preserve_flag)
 		da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 	if (s->preserve_flag || mode != tmpmode)
-		sftp_hpn_dirattrs_defer_local(parallel_dirattrs(s->p),
+		sftp_hpn_dirattrs_defer_local(parallel_dirattrs(s->fleet),
 		    dst, mode, tmpmode, &da);
 	return 0;
 }
@@ -285,19 +285,19 @@ parallel_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 	 * to fall below its outstanding-file ceiling before adding another, so
 	 * the walk's memory tracks the ceiling instead of the tree.  Blocking
 	 * here stops us reading the reply, which back-pressures the server. */
-	sftp_parallel_await_capacity(s->p);
+	sftp_parallel_await_capacity(s->fleet);
 
-	if (sftp_parallel_submit_download(s->p, s->conn, src, dst, fsize,
+	if (sftp_parallel_submit_download(s->fleet, s->conn, src, dst, fsize,
 	    fmode, s->resume, s->verify) != 0) {
-		if (sftp_parallel_is_aborting(s->p)) {
+		if (sftp_parallel_is_aborting(s->fleet)) {
 			debug("submit download \"%s\" refused (abort in "
 			    "progress)", src);
-			sftp_parallel_walker_record_failure(s->p, src,
+			sftp_parallel_walker_record_failure(s->fleet, src,
 			    "interrupted");
 		} else {
 			error("submit download \"%s\" -> \"%s\" failed", src,
 			    dst);
-			sftp_parallel_walker_record_failure(s->p, src,
+			sftp_parallel_walker_record_failure(s->fleet, src,
 			    "submit failed");
 		}
 		return -1;
@@ -311,13 +311,13 @@ parallel_dl_fail(struct sftp_tree_dl_sink *sink, const char *path,
 {
 	struct parallel_dl_sink	*s = (struct parallel_dl_sink *)sink;
 
-	sftp_parallel_walker_record_failure(s->p, path, reason);
+	sftp_parallel_walker_record_failure(s->fleet, path, reason);
 }
 
 static int
 parallel_dl_aborting(struct sftp_tree_dl_sink *sink)
 {
-	return sftp_parallel_is_aborting(((struct parallel_dl_sink *)sink)->p);
+	return sftp_parallel_is_aborting(((struct parallel_dl_sink *)sink)->fleet);
 }
 
 static void
@@ -325,14 +325,14 @@ parallel_dl_set_total(struct sftp_tree_dl_sink *sink, off_t total_bytes,
     size_t nfiles)
 {
 	sftp_parallel_progress_set_total(
-	    ((struct parallel_dl_sink *)sink)->p, total_bytes, nfiles);
+	    ((struct parallel_dl_sink *)sink)->fleet, total_bytes, nfiles);
 }
 
 int
-sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
+sftp_parallel_download_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify)
 {
-	if (p == NULL || conn == NULL || src == NULL || dst == NULL) {
+	if (fleet == NULL || conn == NULL || src == NULL || dst == NULL) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -340,9 +340,9 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		pm_mprintf("Retrieving %s\n", src);
 	/* Register this command's roots as prefixes (download: local root = dst,
 	 * remote = src).  Gated on verify_transfer (same flag the park checks). */
-	if (p->cfg.verify_transfer) {
-		parallel_verify_prefix_register(p, dst);
-		parallel_verify_prefix_register(p, src);
+	if (fleet->cfg.verify_transfer) {
+		parallel_verify_prefix_register(fleet, dst);
+		parallel_verify_prefix_register(fleet, src);
 	}
 	{
 		struct parallel_dl_sink sink = {
@@ -358,9 +358,9 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 				 * drains.  See streams_files. */
 				.streams_files = 1,
 			},
-			.p = p,
+			.fleet = fleet,
 			.conn = conn,
-			.preserve_flag = sftp_parallel_preserve_flag(p),
+			.preserve_flag = sftp_parallel_preserve_flag(fleet),
 			.resume = resume,
 			.verify = verify,
 		};
@@ -376,14 +376,14 @@ sftp_parallel_download_dir(struct sftp_parallel *p, struct sftp_conn *conn,
 		 * enumeration the connection is carrying the reply and cannot
 		 * also carry that query. */
 		if (sftp_conn_has_discover_tree(conn))
-			sftp_parallel_prewarm_fs_info(p, conn, src);
+			sftp_parallel_prewarm_fs_info(fleet, conn, src);
 		int rc = sftp_conn_has_discover_tree(conn) ?
 		    sftp_tree_download_consume(conn, src, dst, NULL,
-		        sftp_parallel_follow_link_flag(p), &sink.base) :
+		        sftp_parallel_follow_link_flag(fleet), &sink.base) :
 		    sftp_readdir_download_consume(conn, src, dst, 0,
 		        HPN_WALK_MAX_DEPTH, NULL,
-		        sftp_parallel_follow_link_flag(p), &sink.base);
-		sftp_parallel_set_walker_phase(p, SFTP_WKP_DONE);
+		        sftp_parallel_follow_link_flag(fleet), &sink.base);
+		sftp_parallel_set_walker_phase(fleet, SFTP_WKP_DONE);
 		return rc;
 	}
 }
