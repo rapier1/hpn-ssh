@@ -359,9 +359,9 @@ void sftp_parallel_set_walker_phase(struct sftp_parallel *p, int phase);
 #define RANGE_SPLIT_MIN_SIZE_CEILING   ((uint64_t)10240 * 1024 * 1024)
 
 /*
- * Recursive walkers (Approach B): traverse the source tree on the control
- * connection (`conn`), creating destination directories synchronously along
- * the way, and submitting regular files to the orchestrator's worker pool.
+ * Recursive walkers: traverse the source tree on the control connection
+ * (`conn`), creating destination directories synchronously along the way,
+ * and submitting regular files to the orchestrator's worker pool.
  * The walker returns once the tree has been fully visited and all files
  * submitted; the caller is responsible for sftp_parallel_wait().
  *
@@ -465,10 +465,11 @@ void sftp_parallel_progress_start_counted(struct sftp_parallel *p,
 void sftp_parallel_progress_stop(struct sftp_parallel *p);
 /* Scan a local path recursively; return total bytes of regular files and
  * optionally the file count via file_count_out (may be NULL). */
-off_t sftp_parallel_scan_upload_total(const char *src, long *file_count_out);
+off_t sftp_parallel_scan_upload_total(const char *src,
+    uint64_t *file_count_out);
 
 /* Store the scan-time total file count (for the progress frames/meter). */
-void sftp_parallel_set_file_total(struct sftp_parallel *p, long total);
+void sftp_parallel_set_file_total(struct sftp_parallel *p, uint64_t total);
 
 /* Walker-authoritative per-file counts (for a final END-frame publish). */
 u_int sftp_parallel_files_submitted(struct sftp_parallel *p);
@@ -491,9 +492,6 @@ void sftp_parallel_stop(struct sftp_parallel *p);
 
 struct sftp_parallel_stats {
 	int      num_workers;
-	size_t   queue_depth;
-	size_t   queue_capacity;
-	size_t   queue_high_watermark;
 	uint64_t bytes_total_aggregate;
 	/*
 	 * Cumulative SFTP payload bytes that actually crossed the wire
@@ -507,7 +505,6 @@ struct sftp_parallel_stats {
 	 * worker's conn.
 	 */
 	uint64_t bytes_wired_aggregate;
-	uint64_t units_completed_aggregate;
 	uint64_t units_failed_aggregate;
 	/* Work units submitted but not yet finalized at snapshot time.
 	 * Nonzero after an abort = work abandoned in flight/queue (the
@@ -533,7 +530,6 @@ struct sftp_parallel_stats {
 	 * total_respawns), surfaced in the end-of-transfer summary. */
 	int      wedge_terminations;
 	int      peer_stall_terminations;
-	int      endgame_straggler_reaps;  /* stuck-at-endgame reaps */
 	/* Wall-clock duration of the parallel-streams session in
 	 * milliseconds.  session_start_ms is captured in sftp_parallel_start();
 	 * elapsed_ms is computed against the monotonic clock at

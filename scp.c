@@ -1942,7 +1942,7 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 					    parallel_want_progress) {
 						char label[64];
 						off_t total_bytes = 0;
-						long total_files = 0, fc;
+						uint64_t total_files = 0, fc;
 						int k;
 
 						for (k = 0; k < argc - 1; k++) {
@@ -1953,8 +1953,9 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 							total_files += fc;
 						}
 						snprintf(label, sizeof(label),
-						    "Uploading %ld file%s in "
-						    "parallel", total_files,
+						    "Uploading %llu file%s in "
+						    "parallel",
+						    (unsigned long long)total_files,
 						    total_files == 1 ? "" : "s");
 						sftp_parallel_progress_start(
 						    parallel_orch, label,

@@ -969,19 +969,14 @@ watchdog_check_one_worker(struct sftp_parallel *p, struct sftp_worker *w,
 				    "child (pid %ld)", w->id,
 				    (long)w->ssh_pid);
 				/*
-				 * Endgame straggler: count it (for stats /
-				 * debug) and log at DEBUG level only - it is an
-				 * internal optimization (reap a stuck bundle and
-				 * re-bundle on idle capacity), not something the
-				 * user needs to act on, so it stays out of the
-				 * default output.  Counted at the doom site so it
-				 * is once-per-death (the SIGTERM is a signal
-				 * death, not an HPN exit code, so the reap-time
-				 * exit-code counters below would miss it).
+				 * Endgame straggler: log at DEBUG level only.
+				 * It is an internal optimization (reap a stuck
+				 * bundle and re-bundle on idle capacity), not
+				 * something the user needs to act on, so it
+				 * stays out of the default output.
 				 */
 				if (doom_reason != NULL && strcmp(doom_reason,
 				    "endgame_straggler") == 0) {
-					p->endgame_straggler_reaps++;
 					debug_ft("worker %d: endgame straggler "
 					    "(no progress %llus at end of "
 					    "transfer) - reaping, re-bundling on "

@@ -17,24 +17,25 @@
  */
 
 /*
- * sftp-parallel-walk.c - recursive directory walkers (Approach B) for the
- * parallel-streams orchestrator.  Split out of sftp-parallel.c during the
+ * sftp-parallel-walk.c - recursive directory walkers for the
+ * parallel-streams orchestrator. Split out of sftp-parallel.c during the
  * 18.10 cleanup pass.
  *
  * The walker runs on the producer (caller) thread and uses the control
  * connection (`conn`) for metadata operations: mkdir on the destination
- * tree, readdir/stat for downloads.  Regular files are handed to the
- * orchestrator via sftp_parallel_submit_upload / submit_download; the
- * workers transfer them in parallel while the walker continues
- * descending.  The caller is expected to call sftp_parallel_wait after
- * the walker returns.
+ * tree, and enumeration of the source. Downloads enumerate through one
+ * streamed discover-tree request where the server offers it and fall
+ * back to recursive readdir otherwise; both replay through the same
+ * sink. Regular files are handed to the orchestrator via
+ * sftp_parallel_submit_upload / submit_download; the workers transfer
+ * them in parallel while the walker continues descending. The caller is
+ * expected to call sftp_parallel_wait after the walker returns.
  *
- * Mirrors the structure of upload_dir_internal / download_dir_internal in
- * sftp-client.c.  Symlinks honour follow_link_flag from the
- * orchestrator's config; non-regular files are skipped with a warning
- * (matching legacy SFTP behaviour).
+ * Symlinks honour follow_link_flag from the orchestrator's config;
+ * non-regular files are skipped with a warning (matching legacy SFTP
+ * behaviour).
  *
- * Boundary: struct sftp_parallel is opaque here.  Access goes through:
+ * Boundary: struct sftp_parallel is opaque here. Access goes through:
  *   sftp_parallel_preserve_flag()
  *   sftp_parallel_follow_link_flag()
  *   sftp_parallel_is_aborting()

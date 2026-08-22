@@ -1140,15 +1140,13 @@ struct sftp_parallel {
 						 * has fired once this transfer
 						 * (reporter thread only) */
 	/* _Atomic: bumped in classify_worker_death on the reporter thread's
-	 * UNLOCKED reap loop (siblings total_respawns/endgame_straggler_reaps/
-	 * protocol_violations are all written under workers_mu, but this one is
-	 * not), and read by main in get_stats before the reporter is joined -
-	 * cross-thread, so the access must be atomic. */
+	 * UNLOCKED reap loop (siblings total_respawns/protocol_violations are
+	 * written under workers_mu, but this one is not), and read by main in
+	 * get_stats before the reporter is joined - cross-thread, so the
+	 * access must be atomic. */
 	_Atomic int                 wedge_terminations;	/* workers reaped with
 							 * HPN_EXIT_TCP_WEDGE */
 	_Atomic int                 peer_stall_terminations; /* ditto, PEER_STALL */
-	int                         endgame_straggler_reaps; /* endgame stuck-
-							 * straggler reaps (orchestrator-doomed) */
 	/* Tail trend detector state (phase B, reporter thread only - no
 	 * locking).  rate_ring holds per-tick aggregate-rate samples
 	 * (bytes/sec); the detector compares oldest- vs newest-quarter
@@ -1406,7 +1404,6 @@ struct sftp_parallel {
 	 * aggregate (end-of-transfer report, failure counts).  Accumulated at
 	 * the same reap site, added back in sftp_parallel_get_stats. */
 	uint64_t                    retired_wired;
-	uint64_t                    retired_units_completed;
 	uint64_t                    retired_units_failed;
 
 	/*
