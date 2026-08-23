@@ -1134,10 +1134,10 @@ parallel_orch_launch(struct sftp_conn *conn)
 	pcfg.print_flag       = quiet ? 0 : 1;
 
 	/*
-	 * Adaptive throughput-outlier stall detection.  On by default in
-	 * parallel mode with conservative WAN-bulk settings; defaults and the
-	 * SFTP_TPUT_* developer overrides live in sftp_parallel_set_stall_defaults
-	 * so hpnsftp and hpnscp share one source of truth.
+	 * Adaptive throughput-outlier stall detection. On by default in
+	 * parallel mode with conservative WAN-bulk settings; the defaults live
+	 * in sftp_parallel_set_stall_defaults so hpnsftp and hpnscp share one
+	 * source of truth.
 	 */
 	sftp_parallel_set_stall_defaults(&pcfg);
 

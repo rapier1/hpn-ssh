@@ -89,12 +89,6 @@ build_master_argv(const struct sftp_cm_config *cfg, const char *socket_path)
 	if (cfg->config_file) {
 		PUSH("-F"); PUSH(cfg->config_file);
 	}
-	if (cfg->known_hosts) {
-		char buf[1024];
-		snprintf(buf, sizeof(buf), "UserKnownHostsFile=%s",
-		    cfg->known_hosts);
-		PUSH("-o"); PUSH(buf);
-	}
 	if (cfg->extra_argv) {
 		for (size_t i = 0; cfg->extra_argv[i] != NULL; i++) {
 			PUSH("-o"); PUSH(cfg->extra_argv[i]);

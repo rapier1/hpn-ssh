@@ -57,7 +57,6 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 {
 	int p2c[2] = { -1, -1 }, c2p[2] = { -1, -1 };
 	char user_host[512];
-	char kh_opt[PATH_MAX + 32];
 
 	const char *ssh_bin = cfg->ssh_binary ? cfg->ssh_binary : "hpnssh";
 
@@ -178,12 +177,6 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 		if (cfg->config_file) {
 			argv[argc++] = "-F";
 			argv[argc++] = (char *)cfg->config_file;
-		}
-		if (cfg->known_hosts) {
-			snprintf(kh_opt, sizeof(kh_opt),
-			    "UserKnownHostsFile=%s", cfg->known_hosts);
-			argv[argc++] = "-o";
-			argv[argc++] = kh_opt;
 		}
 		if (cfg->extra_argv) {
 			for (int i = 0;

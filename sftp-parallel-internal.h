@@ -834,10 +834,10 @@ struct sftp_work_unit {
 			       * worker can never deadlock on its own
 			       * yield. */
 	/* Per-unit resume/verify (whole-file units only - set by the public
-	 * submit entry points).  Carries the originating command's intent
-	 * (reget vs regetv, scp -Z) into the worker, replacing the dormant
-	 * session-global cfg.resume_flag.  Range units never resume; see
-	 * the resume⇒whole-file rule in sftp_parallel_submit_upload. */
+	 * submit entry points). Carries the originating command's intent
+	 * (reget vs regetv, scp -Z) into the worker. Range units never
+	 * resume; see the resume-implies-whole-file rule in
+	 * sftp_parallel_submit_upload. */
 	int      resume;
 	int      verify;
 	/* Phase 5: set to 1 after a bundle wire failure (server refused open,

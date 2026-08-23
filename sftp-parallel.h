@@ -17,17 +17,18 @@
  */
 
 /*
- * Parallel-streams orchestrator for the sftp client.
+ * Parallel-streams orchestrator for the sftp client, enabled with -j N.
  *
- * Topology (Pattern B): one ControlMaster amortizes auth, then N independent
- * worker SSH connections each open their own SFTP subsystem. A producer
- * thread (typically the caller) submits work units; N worker threads pop
- * units and execute them via the standard sftp_upload / sftp_download /
+ * One ControlMaster amortizes auth, then N independent worker SSH
+ * connections each open their own SFTP subsystem. The collective workers are
+ * the fleet as referenced by the sftp_parallel struct. The individual workers are
+ * defined by the sftp_worker struct. These are defined in sftp-parallel-internal.h.
+ *
+ * A producer thread submits work units; N worker threads pop units
+ * and execute them via the standard sftp_upload / sftp_download /
  * sftp_mkdir APIs. Each worker owns its own struct sftp_conn - no shared
- * cipher state, no shared TCP socket. A reporter thread aggregates per-worker
- * progress counters and drives a single global progress meter.
- *
- * Step 5 (architecture). The CLI wiring (-P N) lands in step 6.
+ * cipher state, no shared TCP socket. A reporter thread aggregates
+ * per-worker progress counters and drives the fleet's progress meter.
  */
 
 #ifndef _SFTP_PARALLEL_H
@@ -42,17 +43,84 @@ struct sftp_parallel;
 struct sftp_conn;	/* opaque; defined in sftp-client.c */
 
 /*
- * Per-inode concurrent range-writer cap (-w).  Bounds how many range-split
+ * Hard cap on the number of parallel worker SSH connections per process.
+ *
+ * This is intentionally a compile-time constant, not a runtime parameter.
+ * Client-side rate limiting is advisory by nature - a malicious actor with
+ * control of their own system can bypass any client-side check - so the
+ * cap exists to prevent accidental self-DoS (e.g. scripts that launch many
+ * hpnsftp processes without realising each spawns N workers) rather than
+ * to defend against determined abuse. The correct defence against abusive
+ * connection floods is server-side: MaxStartups, MaxSessions, pf/iptables
+ * rate limiting, and fail2ban-style tools.
+ */
+#define SFTP_PARALLEL_MAX_WORKERS 24
+
+/*
+ * Conservative worker count the orchestrator falls back to when the server
+ * advertises no parallel-worker policy (hpn-max-workers@hpnssh.org absent,
+ * i.e. a stock / non-HPN server). Keeps an HPN client from opening a large
+ * burst of connections to a server that expressed no preference and may not
+ * be sized for it. An HPN server that advertises the extension with value 0
+ * ("no cap") is honoured up to SFTP_PARALLEL_MAX_WORKERS instead.
+ */
+#define HPN_NO_POLICY_WORKER_DEFAULT 8
+
+/*
+ * Per-inode concurrent range-writer cap (-w). Bounds how many range-split
  * workers write one file's inode at once: buffered multi-writer into a single
  * inode serialises on the per-inode write lock (measured on Lustre - 8 writers
  * to one inode runs slower than 1 plain stream; 4 is the throughput knee).
- * The effective cap is always min(this, num_streams).  DEFAULT is the built-in
- * used when -w is absent; FLOOR/MAX bound the -w argument.
+ * DEFAULT is the built-in used when -w is absent; FLOOR/MAX bound the -w argument.
  */
 #define HPN_RANGE_WRITERS_CAP_DEFAULT	4
 #define HPN_RANGE_WRITERS_CAP_FLOOR	1
 #define HPN_RANGE_WRITERS_CAP_MAX	10
 
+/*
+ * Default minimum file size at which a single file is split across workers
+ * by byte range. Below this threshold the file is treated as a whole-file
+ * work unit.
+ *
+ * 2 GiB empirically minimises both wall time and run-to-run variance on
+ * the Lustre and ext4 sweeps. On Lustre this avoids the per-chunk
+ * close()/OST-commit serialization that dominated the early formula-driven
+ * approach; on ext4 it is roughly equivalent to or slightly worse than
+ * aggressive chunking at j=4 but dramatically better at j=16.
+ * A single static value that the operator can override is far simpler
+ * than the per-fs formula it replaces.
+ *
+ * Override via -M MiB on the hpnsftp command line. Range [64, 10240] MiB
+ * is enforced both at parse time and again in the resolver below.
+ */
+#define RANGE_SPLIT_MIN_SIZE_DEFAULT   ((uint64_t)2048 * 1024 * 1024)
+#define RANGE_SPLIT_MIN_SIZE_FLOOR     ((uint64_t)64 * 1024 * 1024)
+#define RANGE_SPLIT_MIN_SIZE_CEILING   ((uint64_t)10240 * 1024 * 1024)
+
+/*
+ * ENV-VAR HPN_PARALLEL_TRACE midstream-freeze probe (2026-06-05): the walker
+ * publishes its current phase so the reporter's per-second FLEETSAMPLE can
+ * show whether a producer stall (blocked mkdir/fsinfo/layout, or blocked
+ * pushing to a full queue) is what starves the fleet. Set via the accessor
+ * since struct sftp_parallel is private to sftp-parallel.c.
+ */
+enum sftp_walker_phase {
+	SFTP_WKP_INIT = 0,
+	SFTP_WKP_ENUM,    /* local readdir/stat enumeration */
+	SFTP_WKP_MKDIR,   /* blocked in sftp_mkdir (server round-trip) */
+	SFTP_WKP_FSINFO,  /* blocked in sftp_fs_info */
+	SFTP_WKP_LAYOUT,  /* blocked in sftp_hpn_set_file_layout */
+	SFTP_WKP_SUBMIT,  /* pushing units (blocks if the queue is full) */
+	SFTP_WKP_DONE,    /* enumeration complete */
+};
+
+/*
+ * Caller-filled configuration for one parallel session. sftp.c and scp.c
+ * populate it from the command line and from ssh_config, then hand it to
+ * sftp_parallel_start, which copies it into the fleet. Read-mostly after
+ * that: workers and the reporter read it without locking, so anything that
+ * changes per command must be atomic (preserve_flag) rather than plain.
+ */
 struct sftp_parallel_config {
 	int          num_streams;       /* N - must be >= 1 */
 
@@ -62,7 +130,6 @@ struct sftp_parallel_config {
 	const char  *user;              /* NULL = no -l flag */
 	const char  *ssh_binary;        /* /path/to/hpnssh / NULL = "hpnssh" */
 	const char  *identity;          /* NULL = rely on agent / default key */
-	const char  *known_hosts;       /* NULL = use system/user default */
 	const char  *config_file;
 	const char  *sftp_server;       /* -s remote subsystem name, or a
 	                                 * server-command path (contains '/');
@@ -72,82 +139,79 @@ struct sftp_parallel_config {
 	char *const *extra_argv;        /* additional -o KEY=VALUE; may be NULL */
 
 	/* Per-worker sftp_init parameters */
-	u_int    transfer_buflen;       /* 0 = default */
-	u_int    num_requests;          /* 0 = default */
-	uint64_t limit_kbps;            /* 0 = no bandwidth limit */
+	u_int        transfer_buflen;   /* 0 = default */
+	u_int        num_requests;      /* 0 = default */
+	uint64_t     limit_kbps;        /* 0 = no bandwidth limit */
 
-	/* CLI-set range-split minimum, in MiB.  0 = unset (env or default
-	 * applies).  Set by -M flag in sftp.c; bounded [64, 10240] at parse
+	/* CLI-set range-split minimum, in MiB. 0 = unset, so the built-in
+	 * default applies. Set by -M in sftp.c; bounded [64, 10240] at parse
 	 * time. */
 	int          range_split_min_mb;
 
 	/* Max concurrent range-writers per inode, set by -w flag in sftp.c.
-	 * Bounds how many range units of one file write its inode at once;
-	 * effective cap is min(this, num_streams).  Set to
-	 * HPN_RANGE_WRITERS_CAP_DEFAULT when -w is absent; -w validates to
-	 * [HPN_RANGE_WRITERS_CAP_FLOOR, HPN_RANGE_WRITERS_CAP_MAX]. */
+	 * Bounds how many range units of one file write its inode at once.
+	 * Set to HPN_RANGE_WRITERS_CAP_DEFAULT when -w is absent; -w validates
+	 * to [HPN_RANGE_WRITERS_CAP_FLOOR, HPN_RANGE_WRITERS_CAP_MAX]. */
 	int          writers_per_inode_cap;
 
 	/* Per-worker SSH stderr capture directory, set by -W flag in sftp.c.
 	 * NULL = off (production default - worker stderr is inherited so
-	 * connection errors reach the user's terminal).  When non-NULL, each
+	 * connection errors reach the user's terminal). When non-NULL, each
 	 * spawned worker writes its SSH child's stderr to
-	 * <worker_log_dir>/hpnssh-worker-<pid>.stderr.  sftp.c validates the
+	 * <worker_log_dir>/hpnssh-worker-<pid>.stderr. sftp.c validates the
 	 * directory exists and is writable at parse time. */
 	const char  *worker_log_dir;
 
-	/* User-supplied -v count on the hpnsftp command line.  Passed through
-	 * to each parallel worker SSH child so worker-side verbosity matches
-	 * what the user asked for at the hpnsftp layer.  When worker_log_dir
-	 * is also set, the effective worker level is max(verbose_level, 1)
-	 * so the captured stderr files actually contain something useful. */
+	/* User-supplied -v count, passed through to each worker SSH child so
+	 * worker verbosity matches what was asked for at the hpnsftp layer.
+	 * When worker_log_dir is set the effective level is
+	 * max(verbose_level, 1), since ssh is silent on a clean handshake and
+	 * an empty capture file helps nobody. */
 	int          verbose_level;
 
-	/* Bundle-mode enable, resolved from ssh_config HPNUseBundle by
-	 * sftp.c (which queries `hpnssh -G host`).  0 = disabled (force
-	 * Phase-4 fallback), 1 = enabled (default; subject to server
-	 * advertising the hpn-bundle extension). */
+	/* Bundle-mode enable, resolved from ssh_config HPNUseBundle by sftp.c
+	 * (which queries `hpnssh -G host`). 0 = disabled, so small files go
+	 * through the pipelined batch path instead; 1 = enabled (default,
+	 * subject to the server advertising the hpn-bundle extension). */
 	int          use_bundle;
 
-	/* Writer-pool enable, resolved from ssh_config HPNWriterPool.  1 =
+	/* Writer-pool enable, resolved from ssh_config HPNWriterPool. 1 =
 	 * use the bundle writer pool (default); 0 = request serial extract
 	 * (sets HPN_BUNDLE_FLAG_NO_POOL on upload, skips the client download
 	 * pool). */
 	int          writer_pool;
 
 	/* Tail-redistribution enable, resolved from ssh_config
-	 * HPNTailRedistribute.  1 = arm phase-C cooperative yield of a
-	 * confirmed-lagging endgame holder (default); 0 = the tail detector
-	 * stays telemetry-only. */
+	 * HPNTailRedistribute. 1 = let the tail detector make a
+	 * confirmed-lagging endgame holder yield its work (default); 0 = the
+	 * detector stays telemetry-only. */
 	int          tail_redistribute;
 
-	/* Retry budget per work unit, resolved from ssh_config
-	 * HPNMaxRetries.  Default 3, clamped to [1, 20] by readconf.c
-	 * fill_default_options. */
+	/* Retry budget per work unit, resolved from ssh_config HPNMaxRetries.
+	 * Default 3, clamped to [1, 20] by readconf.c fill_default_options. */
 	int          max_retries;
 
 	/* Fleet zero-progress abort window in seconds, resolved from ssh_config
-	 * HPNStallAbortTimeout.  Default 60; 0 disables the abort.  Sizes one of
-	 * the four conjunctive fleet-abort conditions (see
+	 * HPNStallAbortTimeout. Default 60; 0 disables the abort. One of the
+	 * conditions that must all hold before the fleet aborts (see
 	 * parallel_watchdog_sync_check). */
 	int          stall_abort_timeout;
 
 	/* Bundle-mode accumulator target size in bytes, resolved from
-	 * ssh_config HPNBundleSize.  Default 32 MiB (HPN_BUNDLE_SIZE_DEFAULT),
-	 * clamped to [1 MiB, 256 MiB].  0 = unset / use default. */
+	 * ssh_config HPNBundleSize. Default 32 MiB (HPN_BUNDLE_SIZE_DEFAULT),
+	 * clamped to [1 MiB, 256 MiB]. 0 = unset, use the default. */
 	uint64_t     bundle_size;
 
 	/* Transfer flags applied to every submitted unit */
 	/* _Atomic: per-command set_preserve() (main) races worker reads */
 	_Atomic int  preserve_flag;
-	int          resume_flag;
 	int          fsync_flag;
 	int          inplace_flag;
 	int          follow_link_flag;
 	int          verify_transfer;	/* Verify transfer: post-transfer
 					 * XXH3 verify; warn+collect on
 					 * mismatch, never abort */
-	int          no_verify_repair;	/* auto-repair (#6): 0 = repair on
+	int          no_verify_repair;	/* auto-repair: 0 = repair on
 					 * (default), 1 = disabled via the
 					 * -X VerifyRepair=no CLI token. */
 
@@ -155,71 +219,88 @@ struct sftp_parallel_config {
 	int          print_flag;
 
 	/*
-	 * Maximum number of workers allowed in the SSH authentication phase
-	 * simultaneously.  Caps concurrent unauthenticated connections to
-	 * stay under the server's MaxStartups limit (default 10:30:100).
-	 * 0 = auto (8, safely below the default MaxStartups threshold).
+	 * Maximum number of workers in the SSH authentication phase at once,
+	 * to stay under the server's MaxStartups limit (default 10:30:100).
+	 * 0 = auto (8, safely below that threshold).
 	 */
 	int          max_auth_concurrent;
 
 	/*
-	 * Adaptive throughput-based stall detection (FIRST PASS, opt-in).
+	 * Adaptive throughput-based stall detection, enabled iff
+	 * tput_path_healthy_kbps > 0.
 	 *
-	 * The existing watchdog detects STALLED/DEAD via TIME since last
-	 * completion. A worker whose TCP cwnd has been hammered into
-	 * collapse may still complete the occasional 10 MiB file at
-	 * ~800 kbps - well below useful throughput, but never crossing
-	 * the 60/120 s time threshold. We add an outlier-based detector
-	 * for that case.
+	 * The time-based watchdog misses a worker whose cwnd has collapsed but
+	 * which still completes the occasional file, so this compares each
+	 * worker against the fastest peer rather than against a fixed floor.
+	 * Comparing against a peer is what makes it safe to act on: when the
+	 * fastest worker is itself under tput_path_healthy_kbps the path is the
+	 * bottleneck, and when every worker is equally slow there is no
+	 * outlier. Neither case does anything, because respawning would only
+	 * churn.
 	 *
-	 * The detector is intentionally ADAPTIVE: it compares each
-	 * worker's throughput to the FASTEST peer worker. Two consequences:
+	 * An outlier is a worker whose smoothed rate stays below
+	 * tput_outlier_fraction of the fleet maximum for tput_consec_required
+	 * consecutive ticks. It is marked STALLED for telemetry and never
+	 * killed: on a saturated path TCP fairness starves some streams while
+	 * peers run at line rate, and a respawn inherits the contention. Kills
+	 * come only from the silence paths and born-slow.
 	 *
-	 * - "Slow link" case: if the fastest worker is itself slow
-	 *   (under tput_path_healthy_kbps), the PATH is the bottleneck
-	 *   and we skip - respawning would only churn.
-	 * - "Congestion" case: if all workers are similarly slow, no
-	 *   outlier exists, no action taken - respawning would not help.
+	 * Starting values for WAN bulk transfer: 2000 kbps path-healthy, 0.25
+	 * outlier fraction, 5 consecutive ticks, 0.2 EMA alpha.
 	 *
-	 * The detector only acts when one worker is dramatically slower
-	 * than its healthy peers - the cwnd-collapse signature.
-	 *
-	 * Enabled iff tput_path_healthy_kbps > 0. Per watchdog tick (~1s):
-	 *   1. Sample each worker's bytes_total+live_bytes delta -> raw kbps.
-	 *   2. Update per-worker EMA: ema = alpha*raw + (1-alpha)*ema.
-	 *      Cold-starts at the first real measurement (seeds EMA = raw).
-	 *      Raw max_kbps is used only for the path-health gate (step 3);
-	 *      all outlier decisions use EMA values so a single-tick burst
-	 *      from one worker cannot instantly spike the threshold.
-	 *   3. If raw max_kbps < tput_path_healthy_kbps, skip (path-limited).
-	 *   4. threshold = max_ema_kbps * tput_outlier_fraction.
-	 *   5. A worker is an outlier if its ema_kbps < threshold. After
-	 *      tput_consec_required consecutive outlier ticks it is marked
-	 *      STALLED (surfaced in worker telemetry) - never killed.
-	 *      Slower-than-sibling is not death: on a saturated path TCP
-	 *      fairness starves some streams while peers run at line rate,
-	 *      and a respawn inherits the contention.  Kills come only from
-	 *      the silence paths and born-slow (absolute floor).
-	 *
-	 * Reasonable starting values for WAN bulk transfer:
-	 *   tput_path_healthy_kbps = 2000   (best worker must clear 2 MB/s)
-	 *   tput_outlier_fraction  = 0.25   (outlier if < 25% of EMA max)
-	 *   tput_consec_required   = 5      (sustained for ~5 sec)
-	 *   tput_ema_alpha         = 0.2    (5-tick / ~5 sec time constant)
-	 *
-	 * Set tput_path_healthy_kbps to 0 to disable entirely.
-	 *
-	 * FUTURE: an SSH global request such as
-	 * `hpn-conn-stats@hpnssh.org` would let the orchestrator query
-	 * the server's TCP_INFO and cross-check the local-side signal
-	 * against what the receiver actually observed.  Not in this
-	 * first pass - see watchdog_check_workers() for the integration
-	 * point.
+	 * The sampling itself is watchdog_sample_throughput().
 	 */
 	uint64_t     tput_path_healthy_kbps;
 	double       tput_outlier_fraction;
 	int          tput_consec_required;
 	double       tput_ema_alpha;  /* EMA smoothing [0,1]; 0 = default 0.2 */
+};
+
+/*
+ * One snapshot of the fleet's aggregate counters, filled by
+ * sftp_parallel_get_stats. Every field is a whole-session total that
+ * includes workers the reaper has already retired, so a snapshot taken
+ * after a respawn never goes backwards.
+ */
+struct sftp_parallel_stats {
+	int      num_workers;
+	uint64_t bytes_total_aggregate;
+	/* Payload bytes that actually crossed the wire (uploads: WRITE
+	 * sent; downloads: DATA received), summed from
+	 * sftp_conn_bytes_wired() on each worker's conn. Distinct from
+	 * bytes_total_aggregate, which counts every resolved unit at full
+	 * size even when chunked resume matched the data and skipped the
+	 * transfer: this is what moved, that is what was resolved. */
+	uint64_t bytes_wired_aggregate;
+	uint64_t units_failed_aggregate;
+	/* Work units submitted but not yet finalized at snapshot time.
+	 * Nonzero after an abort = work abandoned in flight/queue (the
+	 * interrupt summary keys on it; nothing "failed", so the failure
+	 * aggregates stay zero in that case). */
+	uint64_t units_pending;
+	/* Files the recursive walker dropped before submission (lstat,
+	 * readdir, symlink-stat failures). Counted separately from
+	 * units_failed_aggregate because they happen on the main thread
+	 * inside the walkers, not inside a worker. */
+	uint64_t walker_failures_aggregate;
+	int      protocol_violations; /* ID mismatches / bad packet types;
+				       * non-zero means the transfer was aborted
+				       * due to possible MITM or corruption */
+	/* Lifetime worker respawn count for this orchestrator session.
+	 * Incremented atomically at respawn dispatch. Surfaced in the
+	 * end-of-transfer summary as the operator-visible signal for
+	 * "you may have set -j too high" - once respawn churn climbs to
+	 * ~25 % of -j, additional workers stop adding throughput because
+	 * they're flapping in and out of the outlier-detector reap path. */
+	int      total_respawns;
+	/* Per-cause worker self-termination counts (a subset of
+	 * total_respawns), surfaced in the end-of-transfer summary. */
+	int      wedge_terminations;
+	int      peer_stall_terminations;
+	/* Wall-clock duration of the session in milliseconds, measured from
+	 * the monotonic clock stamped in sftp_parallel_start to the moment
+	 * sftp_parallel_get_stats is called. */
+	uint64_t elapsed_ms;
 };
 
 /*
@@ -230,9 +311,9 @@ struct sftp_parallel_config {
 struct sftp_parallel *sftp_parallel_start(const struct sftp_parallel_config *cfg);
 
 /*
- * Populate pcfg fields from ssh_config resolution for `host`.  Uses the
+ * Populate pcfg fields from ssh_config resolution for `host`. Uses the
  * same two-pass parser as hpnssh (resolves Match blocks against the
- * canonicalised hostname).  Today maps only:
+ * canonicalised hostname). Today maps only:
  *   HPNUseBundle yes|no  ->  pcfg->use_bundle
  * Future ssh_config promotions (BundleSize, etc.) extend the mapping
  * in sftp-parallel-config.c.
@@ -241,7 +322,7 @@ struct sftp_parallel *sftp_parallel_start(const struct sftp_parallel_config *cfg
  * user_config_file: explicit -F path, or NULL to use the standard
  *                   ~/.ssh/config + /etc/ssh/ssh_config search.
  *
- * Returns 0 on success, -1 on parse failure.  On failure pcfg keeps
+ * Returns 0 on success, -1 on parse failure. On failure pcfg keeps
  * compile-time defaults (use_bundle = 1).
  */
 int sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
@@ -250,8 +331,8 @@ int sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 
 /*
  * Set the adaptive throughput-outlier stall-detector fields of pcfg to their
- * defaults, honouring the SFTP_TPUT_* developer env overrides.  Shared by
- * hpnsftp and hpnscp so the tunables cannot drift between the two.
+ * defaults. Shared by hpnsftp and hpnscp so the tunables cannot drift
+ * between the two.
  */
 void sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg);
 
@@ -270,16 +351,13 @@ int sftp_resolve_hpn_lustre_stripe_count(const char *host,
  * ownership of its own buffers. Returns 0 on success, -1 if the orchestrator
  * is in shutdown / abort state.
  *
- * sftp_parallel_submit_upload accepts an optional control connection (conn)
- * used to query filesystem stripe geometry and pre-create the remote file
- * when speculative range-splitting applies.  Pass NULL to skip the split
- * decision (the upload is submitted as a single whole-file work unit).
+ * On upload conn is optional: it queries stripe geometry and pre-creates
+ * the remote file when speculative range-splitting applies, and NULL
+ * submits the file as one whole-file unit.
  *
- * resume/verify carry the originating command's intent (reget vs regetv,
- * scp -Z).  When either is set the file is submitted whole-file (range-split
- * resume is deferred) and, if verify is set, the remote MUST advertise
- * hpn-check-file@hpnssh.org - otherwise this is fatal (RESUME_INCOMPAT_MSG),
- * checked once up front on conn in the calling thread.
+ * resume and verify carry the originating command's intent (reget vs
+ * regetv, scp -Z); the rules they impose are documented at the definition
+ * in sftp-parallel-unit.c.
  */
 int sftp_parallel_submit_upload(struct sftp_parallel *fleet,
     struct sftp_conn *conn,
@@ -291,9 +369,9 @@ int sftp_parallel_submit_download(struct sftp_parallel *fleet,
     int resume, int verify);
 
 /*
- * Walker-helper accessors.  Exposed for sftp-parallel-walk.c (the
+ * Walker-helper accessors. Exposed for sftp-parallel-walk.c (the
  * recursive-directory walkers, split out of sftp-parallel.c) so it
- * doesn't need to see struct sftp_parallel's internals.  All read-only
+ * doesn't need to see struct sftp_parallel's internals. All read-only
  * (or write-only-via-helper) - no callers should grow direct field
  * access to bypass these.
  */
@@ -303,60 +381,20 @@ int sftp_parallel_is_aborting(const struct sftp_parallel *fleet);
 /* 1 iff the abort was caused by the user's interrupt (Ctrl-C) rather than a
  * fleet failure; drives interrupt-aware (calm) messaging in flush/walker. */
 int sftp_parallel_user_abort(const struct sftp_parallel *fleet);
-/* Number of parallel worker streams configured (-j N).  Returns 1 when
+/* Number of parallel worker streams configured (-j N). Returns 1 when
  * `fleet` is NULL (i.e. parallel mode is not engaged). */
 int sftp_parallel_num_streams(const struct sftp_parallel *fleet);
 
-/* The HPNLustreStripeCount layout-policy entry points
- * (maybe_apply_lustre_layout / _local) moved to sftp-lustre-client.h. */
-
 /*
- * Walker-side failure recorder.  Bumps the orchestrator's
+ * Walker-side failure recorder. Bumps the orchestrator's
  * walker_failures counter and appends "path: err" (or just "path"
- * when err is NULL) to the failed-paths list.  Used by every walker
+ * when err is NULL) to the failed-paths list. Used by every walker
  * skip-on-error site.
  */
 void sftp_parallel_walker_record_failure(struct sftp_parallel *fleet,
     const char *path, const char *err);
 
-/*
- * ENV-VAR HPN_PARALLEL_TRACE midstream-freeze probe (2026-06-05): the walker
- * publishes its current phase so the reporter's per-second FLEETSAMPLE can
- * show whether a producer stall (blocked mkdir/fsinfo/layout, or blocked
- * pushing to a full queue) is what starves the fleet.  Set via the accessor
- * since struct sftp_parallel is private to sftp-parallel.c.
- */
-enum sftp_walker_phase {
-	SFTP_WKP_INIT = 0,
-	SFTP_WKP_ENUM,    /* local readdir/stat enumeration */
-	SFTP_WKP_MKDIR,   /* blocked in sftp_mkdir (server round-trip) */
-	SFTP_WKP_FSINFO,  /* blocked in sftp_fs_info */
-	SFTP_WKP_LAYOUT,  /* blocked in sftp_hpn_set_file_layout */
-	SFTP_WKP_SUBMIT,  /* pushing units (blocks if the queue is full) */
-	SFTP_WKP_DONE,    /* enumeration complete */
-};
 void sftp_parallel_set_walker_phase(struct sftp_parallel *fleet, int phase);
-
-/*
- * Default minimum file size at which a single file is split across workers
- * by byte range.  Below this threshold the file is treated as a whole-file
- * work unit.
- *
- * 2 GiB empirically minimises both wall time and run-to-run variance on
- * the Lustre and ext4 sweeps documented in
- *   benchmark/range-split-tuning-analysis.md
- * On Lustre this avoids the per-chunk close()/OST-commit serialization that
- * dominated the early formula-driven approach; on ext4 it is roughly
- * equivalent to or slightly worse than aggressive chunking at j=4 but
- * dramatically better at j=16.  A single static value that the operator
- * can override is far simpler than the per-fs formula it replaces.
- *
- * Override via -M MiB on the hpnsftp command line.  Range [64, 10240] MiB
- * is enforced both at parse time and again in the resolver below.
- */
-#define RANGE_SPLIT_MIN_SIZE_DEFAULT   ((uint64_t)2048 * 1024 * 1024)
-#define RANGE_SPLIT_MIN_SIZE_FLOOR     ((uint64_t)64 * 1024 * 1024)
-#define RANGE_SPLIT_MIN_SIZE_CEILING   ((uint64_t)10240 * 1024 * 1024)
 
 /*
  * Recursive walkers: traverse the source tree on the control connection
@@ -377,7 +415,7 @@ int sftp_parallel_download_dir(struct sftp_parallel *fleet, struct sftp_conn *co
 /*
  * Register the directory of a single transferred path for whole-file verify
  * path factoring (the glob / direct-dispatch path that bypasses the walker).
- * No-op unless verify is enabled.  Pass both the local and remote path.
+ * No-op unless verify is enabled.
  */
 void sftp_parallel_register_verify_dir(struct sftp_parallel *fleet,
     const char *path);
@@ -397,26 +435,27 @@ void sftp_parallel_wait(struct sftp_parallel *fleet, struct sftp_conn *conn);
 
 /*
  * Asynchronous abort. Sets a flag that workers check between units; in-flight
- * units are allowed to finish. Safe to call from a signal handler.
+ * units are allowed to finish. Takes locks, so it must NOT be called from
+ * a signal handler: register the handler's flag with
+ * sftp_parallel_set_interrupt_flag and let the reporter call this.
  */
 void sftp_parallel_abort(struct sftp_parallel *fleet);
 
 /*
  * Register an external interrupt flag (typically sftp.c's `interrupted`,
- * a volatile sig_atomic_t set by the SIGINT handler).  The reporter thread
- * polls this pointer each tick (~200ms); when non-zero it calls
- * sftp_parallel_abort(), which wakes sftp_parallel_wait() promptly instead
- * of waiting for all in-flight units to complete naturally.
+ * set by the SIGINT handler). The reporter polls it and aborts the fleet
+ * when it goes non-zero, which is how a signal reaches the orchestrator
+ * without calling sftp_parallel_abort from handler context.
  *
- * Call once after sftp_parallel_start() returns non-NULL.  Pass NULL to
- * clear a previously registered flag.
+ * Call once after sftp_parallel_start returns non-NULL. Pass NULL to clear
+ * a previously registered flag.
  */
 void sftp_parallel_set_interrupt_flag(struct sftp_parallel *fleet,
     _Atomic sig_atomic_t *flag);
 
 /*
  * Enable/disable the post-transfer verify phase for work submitted from here
- * on.  The interactive client toggles this per command (put/getv enable it,
+ * on. The interactive client toggles this per command (put/getv enable it,
  * resume verbs disable it) since one orchestrator persists across commands.
  * No-op when fleet is NULL.
  */
@@ -424,29 +463,25 @@ void sftp_parallel_set_verify_transfer(struct sftp_parallel *fleet, int on);
 
 /* Per-command preserve toggle (put/get -p) for the parallel/bundle path; the
  * orchestrator persists across commands so each command pushes its effective
- * preserve here.  No-op when fleet is NULL. */
+ * preserve here. No-op when fleet is NULL. */
 void sftp_parallel_set_preserve(struct sftp_parallel *fleet, int on);
 
 /*
- * Register an app-layer round-trip-time estimate (microseconds) for the
- * remote path.  Used by the reporter's tput-outlier check to compute a
- * BDP-sized warmup threshold so newly-respawned workers in TCP slow-start
- * are not killed before they have a chance to ramp.  Sampling RTT once on
- * the control connection right after sftp_parallel_start() is sufficient:
- * every worker connection traverses the same path.  Pass 0 to indicate
- * "unknown" and fall back to the fixed-tick warmup gate.
+ * Register an app-layer round-trip-time estimate, in microseconds, for the
+ * remote path. Sample it once on the control connection after
+ * sftp_parallel_start: every worker traverses the same path. Pass 0 for
+ * "unknown". What the estimate feeds is documented at the definition.
  */
 void sftp_parallel_set_path_rtt(struct sftp_parallel *fleet, uint64_t rtt_us);
 
 /*
- * Drive a single global progress_meter for the duration of an aggregate
- * batch (e.g. a put/get command's worth of submissions). Call _start
- * before submitting; the orchestrator's reporter thread will update the
- * meter's counter from snapshotted worker bytes_total. Call _stop after
- * sftp_parallel_wait returns.
+ * Drive the fleet's progress meter for the duration of an aggregate batch
+ * (e.g. a put/get command's worth of submissions). Call _start before
+ * submitting and _stop after sftp_parallel_wait returns; the reporter
+ * advances the meter in between.
  *
- * Calling _start while a meter is already active is a no-op. Calling
- * _stop without a started meter is a no-op. label is copied internally.
+ * _start on an already-active meter is a no-op, as is _stop with no meter
+ * started. label is copied internally.
  */
 void sftp_parallel_progress_start(struct sftp_parallel *fleet, const char *label,
     off_t total_bytes);
@@ -456,7 +491,7 @@ void sftp_parallel_progress_set_total(struct sftp_parallel *fleet,
  * during the drain sends nothing on the connection carrying the reply. */
 void sftp_parallel_prewarm_fs_info(struct sftp_parallel *fleet,
     struct sftp_conn *conn, const char *remote_path);
-/* Block until outstanding files fall below the fleet's ceiling.  Called by a
+/* Block until outstanding files fall below the fleet's ceiling. Called by a
  * producer that can enumerate faster than the fleet drains, so its own memory
  * does not grow with the size of the tree. */
 void sftp_parallel_await_capacity(struct sftp_parallel *fleet);
@@ -481,75 +516,28 @@ int sftp_parallel_was_aborted(struct sftp_parallel *fleet);
 
 /*
  * Tear down: signal workers to exit, join all threads, close worker SSH
- * subprocesses, free everything. Idempotent.
+ * subprocesses, free everything. The fleet itself is freed, so call
+ * this once and drop the pointer.
  */
 void sftp_parallel_stop(struct sftp_parallel *fleet);
 
 /*
- * Aggregate orchestrator state snapshot.  Cheap (one mutex per worker
- * briefly held).  Safe to call from any thread.
+ * Fill out with a current snapshot. Cheap - one worker mutex held
+ * briefly apiece - and safe to call from any thread.
  */
-
-struct sftp_parallel_stats {
-	int      num_workers;
-	uint64_t bytes_total_aggregate;
-	/*
-	 * Cumulative SFTP payload bytes that actually crossed the wire
-	 * across all workers (uploads: SSH2_FXP_WRITE payload sent;
-	 * downloads: SSH2_FXP_DATA payload received).  Distinct from
-	 * bytes_total_aggregate, which counts the full size of every
-	 * successfully resolved work unit even when chunked-resume verified
-	 * the data already matched and skipped the transfer.  Use this when
-	 * reporting "what actually moved" vs bytes_total_aggregate's "what
-	 * was resolved."  Sourced from sftp_conn_bytes_wired() on each
-	 * worker's conn.
-	 */
-	uint64_t bytes_wired_aggregate;
-	uint64_t units_failed_aggregate;
-	/* Work units submitted but not yet finalized at snapshot time.
-	 * Nonzero after an abort = work abandoned in flight/queue (the
-	 * interrupt summary keys on it; nothing "failed", so the failure
-	 * aggregates stay zero in that case). */
-	uint64_t units_pending;
-	/* Files the recursive walker dropped before submission
-	 * (lstat / readdir / symlink-stat failures, etc.).  Counted
-	 * separately from units_failed_aggregate because they happen on
-	 * the main thread inside the walkers, not inside a worker. */
-	uint64_t walker_failures_aggregate;
-	int      protocol_violations; /* ID mismatches / bad packet types;
-				       * non-zero means the transfer was aborted
-				       * due to possible MITM or corruption */
-	/* Lifetime worker respawn count for this orchestrator session.
-	 * Incremented atomically at respawn dispatch.  Surfaced in the
-	 * end-of-transfer summary as the operator-visible signal for
-	 * "you may have set -j too high" - once respawn churn climbs to
-	 * ~25 % of -j, additional workers stop adding throughput because
-	 * they're flapping in and out of the outlier-detector reap path. */
-	int      total_respawns;
-	/* Per-cause worker self-termination counts (a subset of
-	 * total_respawns), surfaced in the end-of-transfer summary. */
-	int      wedge_terminations;
-	int      peer_stall_terminations;
-	/* Wall-clock duration of the parallel-streams session in
-	 * milliseconds.  session_start_ms is captured in sftp_parallel_start();
-	 * elapsed_ms is computed against the monotonic clock at
-	 * sftp_parallel_get_stats() call time. */
-	uint64_t elapsed_ms;
-};
-
 void sftp_parallel_get_stats(struct sftp_parallel *fleet,
     struct sftp_parallel_stats *out);
 
 /*
  * Drain the orchestrator's bounded list of paths that could not be
  * delivered (permanent give-up after MAX_RETRIES, workqueue push-fail,
- * walker skip-on-error).  Returns the TOTAL number of failures seen
+ * walker skip-on-error). Returns the TOTAL number of failures seen
  * (which may exceed the number of held entries - the held list is
  * bounded at orchestrator init time).
  *
  * If `out_paths` and `out_used` are non-NULL, on return *out_paths is
  * a malloc'd array of *out_used strdup'd path strings; caller frees
- * each entry and the array.  Returns 0 with *out_used == 0 and
+ * each entry and the array. Returns 0 with *out_used == 0 and
  * *out_paths == NULL when no failures have occurred.
  *
  * The list is reset by this call so subsequent failures start fresh.
@@ -559,34 +547,10 @@ uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
 
 /*
  * Drain the verify transfer post-transfer hash-mismatch list (transfers
- * ownership of the path strings to the caller).  Non-zero return => some
+ * ownership of the path strings to the caller). Non-zero return => some
  * file failed end-to-end verification => exit SFTP_EX_VERIFY_FAILED.
  */
 uint64_t sftp_parallel_drain_verify_failures(struct sftp_parallel *fleet,
     char ***out_paths, size_t *out_used);
-
-/*
- * Hard cap on the number of parallel worker SSH connections per process.
- *
- * This is intentionally a compile-time constant, not a runtime parameter.
- * Client-side rate limiting is advisory by nature - a malicious actor with
- * control of their own system can bypass any client-side check - so the
- * cap exists to prevent accidental self-DoS (e.g. scripts that launch many
- * hpnsftp processes without realising each spawns N workers) rather than
- * to defend against determined abuse.  The correct defence against abusive
- * connection floods is server-side: MaxStartups, MaxSessions, pf/iptables
- * rate limiting, and fail2ban-style tools.
- */
-#define SFTP_PARALLEL_MAX_WORKERS 24
-
-/*
- * Conservative worker count the orchestrator falls back to when the server
- * advertises no parallel-worker policy (hpn-max-workers@hpnssh.org absent,
- * i.e. a stock / non-HPN server).  Keeps an HPN client from opening a large
- * burst of connections to a server that expressed no preference and may not
- * be sized for it.  An HPN server that advertises the extension with value 0
- * ("no cap") is honoured up to SFTP_PARALLEL_MAX_WORKERS instead.
- */
-#define HPN_NO_POLICY_WORKER_DEFAULT 8
 
 #endif /* _SFTP_PARALLEL_H */

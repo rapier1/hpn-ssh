@@ -1540,6 +1540,14 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	pcfg.preserve_flag = pflag;
 	pcfg.print_flag    = showprogress ? SFTP_PROGRESS_ONLY : SFTP_QUIET;
 	/*
+	 * scp semantics, matching what the serial path passes to
+	 * sftp_upload_dir / sftp_download_dir: scp follows symlinks during a
+	 * recursive walk and writes files in place.  sftp wants neither, and
+	 * leaves both at 0.
+	 */
+	pcfg.follow_link_flag = 1;
+	pcfg.inplace_flag  = 1;
+	/*
 	 * Resolves HPNUseBundle, HPNMaxRetries, HPNBundleSize,
 	 * HPNMaxAuthConcurrent into pcfg from ssh_config + the -o overrides;
 	 * must run before sftp_parallel_start.  Verify transfer is not a
@@ -1557,9 +1565,8 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	 * the connection consistent with the pcfg the workers use. */
 	sftp_conn_set_bundle_config(conn, pcfg.use_bundle,
 	    pcfg.bundle_size, pcfg.writer_pool);
-	/* Adaptive throughput-outlier stall detection: shared defaults +
-	 * SFTP_TPUT_* overrides (was a copy-paste of sftp.c's values that
-	 * silently dropped the env overrides). */
+	/* Adaptive throughput-outlier stall detection: take the shared
+	 * defaults rather than repeating sftp.c's values here. */
 	sftp_parallel_set_stall_defaults(&pcfg);
 
 	if (showprogress)

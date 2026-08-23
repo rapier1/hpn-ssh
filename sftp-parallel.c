@@ -649,6 +649,13 @@ sftp_parallel_abort(struct sftp_parallel *fleet)
 	pthread_mutex_unlock(&fleet->pending_mu);
 }
 
+/*
+ * Point the fleet at the caller's interrupt flag. The reporter polls it
+ * once per tick (~200 ms) and calls sftp_parallel_abort when it goes
+ * non-zero, so a Ctrl-C wakes sftp_parallel_wait promptly instead of
+ * waiting for every in-flight unit to finish naturally. This indirection
+ * exists because abort takes locks and cannot run in handler context.
+ */
 void
 sftp_parallel_set_interrupt_flag(struct sftp_parallel *fleet,
     _Atomic sig_atomic_t *flag)
@@ -657,6 +664,14 @@ sftp_parallel_set_interrupt_flag(struct sftp_parallel *fleet,
 		fleet->ext_interrupt_flag = flag;
 }
 
+/*
+ * Record the path RTT and size the born-dead kill threshold from it.
+ * The estimate also lets the watchdog compute a BDP-sized warmup budget,
+ * so a freshly respawned worker still in TCP slow-start is not reaped
+ * before it has had a chance to ramp. It is an application-level round
+ * trip, so treat it as good to roughly a millisecond, not to the
+ * microsecond its unit suggests.
+ */
 void
 sftp_parallel_set_path_rtt(struct sftp_parallel *fleet, uint64_t rtt_us)
 {

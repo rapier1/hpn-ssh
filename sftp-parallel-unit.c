@@ -1356,6 +1356,18 @@ parallel_verify_item_bytes_estimate(struct sftp_parallel *fleet,
 	    + strlen(lrel) + 1 + strlen(rrel) + 1 + 8 + 16;
 }
 
+/*
+ * Submit one file for upload. conn is optional: when present it is used to
+ * query stripe geometry and pre-create the remote file so the file can be
+ * split across workers by byte range; NULL submits it as a single
+ * whole-file unit.
+ *
+ * resume and verify carry the originating command's intent. When either is
+ * set the file is submitted whole-file, because range-split resume is not
+ * implemented, and when verify is set the remote must advertise
+ * hpn-check-file@hpnssh.org - that is checked once up front on conn in the
+ * calling thread and is fatal if missing.
+ */
 int
 sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode,
@@ -1430,6 +1442,8 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	return rc;
 }
 
+/* Download counterpart of sftp_parallel_submit_upload; same resume and
+ * verify rules apply. */
 int
 sftp_parallel_submit_download(struct sftp_parallel *fleet,
     struct sftp_conn *conn,
