@@ -25,7 +25,7 @@
  *
  * PFS NOTE: stripe_info_viable() and get_cached_fs_info() are the
  * filesystem-aware seam in the submit path (today: Lustre via
- * sftp-lustre.c and the fs-info extension).  Future parallel-fs
+ * sftp-lustre.c and the fs-info extension). Future parallel-fs
  * support (GPFS, BeeGFS, GFS) should generalize THESE call sites
  * into a provider interface rather than adding new probes elsewhere.
  */
@@ -73,7 +73,7 @@ make_unit(enum sftp_op op, const char *src, const char *dst,
 
 /*
  * Shared range-unit builder: upload and download range units are identical
- * except for the op enum.  src/dst map to src_path/dst_path (upload:
+ * except for the op enum. src/dst map to src_path/dst_path (upload:
  * local -> remote; download: remote -> local).
  */
 static struct sftp_work_unit *
@@ -105,7 +105,7 @@ void
 parallel_unit_free(struct sftp_work_unit *u)
 {
 	if (u == NULL) return;
-	/* Bundle container: free any still-attached member units.  The worker
+	/* Bundle container: free any still-attached member units. The worker
 	 * detaches members (sets ->members = NULL) before dispatch, so this
 	 * only fires on the abort/drain path where the bundle was never run. */
 	if (u->members != NULL) {
@@ -117,8 +117,8 @@ parallel_unit_free(struct sftp_work_unit *u)
 	free(u->src_path);
 	free(u->dst_path);
 	/* range_tracker is shared across sibling range units; never freed
-	 * by parallel_unit_free.  See parallel_unit_tracker_finalize for ownership rules. */
-	/* A whole-file verify unit owns its parked item.  The verify handler
+	 * by parallel_unit_free. See parallel_unit_tracker_finalize for ownership rules. */
+	/* A whole-file verify unit owns its parked item. The verify handler
 	 * NULLs this after freeing it, so a still-set pointer means the unit was
 	 * dropped before any worker ran it (abort / queue shutdown): free it. */
 	if (u->verify_whole != NULL) {
@@ -139,10 +139,10 @@ parallel_unit_free(struct sftp_work_unit *u)
 }
 
 /*
- * Range-completion tracker constructor.  Allocated once per range-split
+ * Range-completion tracker constructor. Allocated once per range-split
  * transfer (download by submit_download_ranges, upload by
  * submit_upload_ranges) and attached to each of the N range work units
- * it creates.  Lives until the last range completes; that completer
+ * it creates. Lives until the last range completes; that completer
  * frees the tracker.
  */
 static struct sftp_range_tracker *
@@ -160,9 +160,9 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path,
 	t->verify     = verify;
 	/* Per-range verify slots, allocated for BOTH directions when verifying so
 	 * the range-granular parallel verify can fan a big file's transfer ranges
-	 * across the pool.  Upload (REMOTE) tees a source hash into each slot
+	 * across the pool. Upload (REMOTE) tees a source hash into each slot
 	 * (valid=1); download (LOCAL) leaves valid=0 and reads the dest range back
-	 * at verify time.  Either way submit_*_ranges fills off/len. */
+	 * at verify time. Either way submit_*_ranges fills off/len. */
 	t->vslots = (verify && total > 0)
 	    ? xcalloc((size_t)total, sizeof(*t->vslots)) : NULL;
 	t->vslots_n = (t->vslots != NULL) ? total : 0;
@@ -179,15 +179,15 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path,
 /*
  * Verify transfer: record a range's teed source hash into its tracker slot.
  * The teed hash covers exactly the byte span the unit transferred in this
- * pass.  It is authoritative for the slot ONLY when that span still equals the
- * slot's original [off, len) - i.e. the range was never split.  The caller's
+ * pass. It is authoritative for the slot ONLY when that span still equals the
+ * slot's original [off, len) - i.e. the range was never split. The caller's
  * own attempt==0 guard is NOT sufficient: the highwater-resume requeue
  * (worker_process_result) resets attempt to 0 and shrinks the unit to its
  * remainder, so a resumed range reaches here looking "first-attempt clean"
- * while its teed hash covers only the tail.  The endgame split likewise shrinks
- * the held unit and spawns pieces.  So the authoritative guard lives here:
+ * while its teed hash covers only the tail. The endgame split likewise shrinks
+ * the held unit and spawns pieces. So the authoritative guard lives here:
  * store only when (off, len) match the slot; any split leaves valid=0 and the
- * range is re-read in full from the source at finalize.  NULL-safe; a no-op
+ * range is re-read in full from the source at finalize. NULL-safe; a no-op
  * unless this is a verified upload.
  */
 void
@@ -206,9 +206,9 @@ parallel_unit_store_range_hash(struct sftp_range_tracker *t, int index,
 }
 
 /*
- * Concurrent-writer cap (HPN).  Try to claim a writer slot on this file's
+ * Concurrent-writer cap (HPN). Try to claim a writer slot on this file's
  * tracker: succeeds (returns 1, active_writers bumped) only while below the
- * cap.  NULL tracker (non-range unit) always succeeds with no accounting.
+ * cap. NULL tracker (non-range unit) always succeeds with no accounting.
  * Paired 1:1 with parallel_unit_writer_release per executed unit.
  */
 int
@@ -230,7 +230,7 @@ parallel_unit_writer_acquire(struct sftp_range_tracker *t)
 	return ok;
 }
 
-/* Release a writer slot claimed by parallel_unit_writer_acquire.  NULL-safe;
+/* Release a writer slot claimed by parallel_unit_writer_acquire. NULL-safe;
  * clamped so a stray release can never drive the count negative. */
 void
 parallel_unit_writer_release(struct sftp_range_tracker *t)
@@ -244,12 +244,12 @@ parallel_unit_writer_release(struct sftp_range_tracker *t)
 }
 
 /*
- * Lazy first-writer file creation.  Called by the worker before it
+ * Lazy first-writer file creation. Called by the worker before it
  * dispatches the first range of a unit; the tracker mutex makes it
- * exactly-once per file.  create-if-absent ONLY: layout-created files
+ * exactly-once per file. create-if-absent ONLY: layout-created files
  * (Lustre auto-stripe creates with layout before data) and existing
  * partials (reput onto a previous attempt) pass through untouched -
- * never truncated, never re-laid-out.  No size is pinned: the file
+ * never truncated, never re-laid-out. No size is pinned: the file
  * grows with the pwrite highwater, so interrupted transfers show
  * honest sizes and verified resume hashes only what exists.
  * Permanent failures (permission class) set u->no_retry so the unit
@@ -295,23 +295,23 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
 
 /*
  * Batch completion: retire `n` ranges in one call, all with the same
- * outcome (`failed` = 1 on permanent give-up, 0 on success).  The
+ * outcome (`failed` = 1 on permanent give-up, 0 on success). The
  * submit-error paths use this to synthesise failures for every range
  * they never submitted: ONE decrement under ONE lock acquisition, so
  * the call that drops remaining to 0 (and frees the tracker) is
  * unambiguous - the caller treats the pointer as dead after the call,
- * unconditionally.  This replaced a finalize-in-a-loop pattern whose
+ * unconditionally. This replaced a finalize-in-a-loop pattern whose
  * safety relied on the loop count being arithmetically exact
  * (scan-build flagged it as a potential UAF; see
  * SECURITY_REVIEW_19.0_FINDINGS.md LOW-1).
  *
  * `worker` is the worker reporting completion; used only for sftp_rm on
- * REMOTE-target trackers when the corrupt-file cleanup fires.  May
+ * REMOTE-target trackers when the corrupt-file cleanup fires. May
  * be NULL otherwise (I4).
  *
  * Returns 1 if THIS call was the last-completer AND any range
  * failed (informational - the cleanup happened inside this call
- * regardless).  Returns 0 otherwise.
+ * regardless). Returns 0 otherwise.
  *
  * Tracker is freed when remaining hits 0; after any call the caller
  * must assume the pointer is dead (I3).
@@ -348,14 +348,14 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 		/*
 		 * At least one byte-range failed permanently after retries,
 		 * so the pre-allocated file is now full-size with HOLES (the
-		 * failed ranges are still zeros from fallocate).  Do NOT
-		 * delete it.  Leaving it in place keeps it RESUMABLE: the
+		 * failed ranges are still zeros from fallocate). Do NOT
+		 * delete it. Leaving it in place keeps it RESUMABLE: the
 		 * user re-runs verified resume (reputv for uploads, regetv
 		 * for downloads), which uses sftp-hash-range@hpnssh.org to
 		 * hash each range and refill only the mismatched ones -
 		 * salvaging every range that already transferred instead of
-		 * forcing a full re-send.  Unlinking would throw all that
-		 * good data away.  Report loudly so the user and any
+		 * forcing a full re-send. Unlinking would throw all that
+		 * good data away. Report loudly so the user and any
 		 * automation know the file is incomplete; the non-zero
 		 * process exit comes from the failed-path accounting at the
 		 * give-up site (worker_record_failed_path).
@@ -385,10 +385,10 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 	} else if (t->verify && worker != NULL) {
 		/*
 		 * Verify transfer: the file's last range just finished
-		 * cleanly.  Park the completed tracker for the post-transfer
+		 * cleanly. Park the completed tracker for the post-transfer
 		 * verify phase rather than verifying here - keeping verify off
 		 * the transfer path so an in-flight transfer never blocks on a
-		 * server read-back.  sftp_parallel_wait submits it as an
+		 * server read-back. sftp_parallel_wait submits it as an
 		 * SFTP_OP_VERIFY unit once the transfer queue drains; the verify
 		 * handler frees the tracker.
 		 */
@@ -410,9 +410,9 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 
 /*
  * One range's final completion: `failed` = 1 on permanent give-up
- * (after MAX_RETRIES) or 0 on success.  Must be called exactly once
+ * (after MAX_RETRIES) or 0 on success. Must be called exactly once
  * per range unit, on its final outcome only - see invariants (I1)
- * and (I2) at struct sftp_range_tracker.  Thin n=1 wrapper over the
+ * and (I2) at struct sftp_range_tracker. Thin n=1 wrapper over the
  * batch form above; all the ownership rules there apply.
  */
 int
@@ -423,7 +423,7 @@ parallel_unit_tracker_finalize(struct sftp_range_tracker *t, int failed,
 }
 
 /*
- * Free a completed range tracker.  Range-split files reuse their transfer
+ * Free a completed range tracker. Range-split files reuse their transfer
  * tracker for the verify phase (parked at finalize); this releases it after the
  * verify units have built their verify_job from it, and on the abort/drop path.
  * Verify itself now runs inline per range in the worker, so this no longer
@@ -500,6 +500,10 @@ path_strip_prefix(const char *path, const char *prefix, const char **rel)
 	return 1;
 }
 
+/* Record one directory prefix in the path-factoring pool, deduped. "." and a
+ * relative path with no directory part are skipped. Whole-file verify items
+ * store their paths relative to a registered prefix, so a long common
+ * directory is held once here instead of twice in every parked item. */
 void
 parallel_verify_prefix_register(struct sftp_parallel *fleet, const char *dir)
 {
@@ -524,10 +528,10 @@ parallel_verify_prefix_register(struct sftp_parallel *fleet, const char *dir)
 			return;
 		}
 	}
-	/* The pool index is stored as int16_t in verify_whole_item.  Cap the pool
+	/* The pool index is stored as int16_t in verify_whole_item. Cap the pool
 	 * at INT16_MAX entries: past the cap, leave this dir unregistered so its
 	 * files store the full path (prefix = -1) instead of an out-of-range index.
-	 * Graceful degradation - never a bad index.  Reaching here needs one
+	 * Graceful degradation - never a bad index. Reaching here needs one
 	 * command set spanning 32k+ distinct directories. */
 	if (fleet->verify_prefixes_n >= INT16_MAX) {
 		pthread_mutex_unlock(&fleet->verify_pending_mu);
@@ -546,6 +550,10 @@ parallel_verify_prefix_register(struct sftp_parallel *fleet, const char *dir)
 	pthread_mutex_unlock(&fleet->verify_pending_mu);
 }
 
+/* Find the longest registered prefix of `path`, point *rel at the suffix past
+ * it, and return that prefix's index. Returns -1 with *rel = path when nothing
+ * matches. Each path side is matched on its own, so an upload with a full
+ * local path and a relative remote one factors both. */
 int
 parallel_verify_prefix_match(struct sftp_parallel *fleet, const char *path,
     const char **rel)
@@ -572,6 +580,9 @@ parallel_verify_prefix_match(struct sftp_parallel *fleet, const char *path,
 	return best;
 }
 
+/* Rebuild a full path from a prefix index and the relative suffix stored with
+ * it. A negative index means the item held the whole path, so rel is copied
+ * as-is. Always returns allocated memory; the caller frees it. */
 char *
 parallel_verify_prefix_join(struct sftp_parallel *fleet, int idx, const char *rel)
 {
@@ -592,10 +603,10 @@ parallel_verify_prefix_join(struct sftp_parallel *fleet, int idx, const char *re
 
 /*
  * Empty the prefix pool (free the dir strings, keep the array allocation for
- * reuse).  Called by a verify wave AFTER every parked item has been verified
+ * reuse). Called by a verify wave AFTER every parked item has been verified
  * and freed, so nothing references the pool indices anymore - new parks after
- * the wave re-register their dirs.  Relieves both the byte budget and the
- * INT16_MAX pool cap.  Submitter thread only.
+ * the wave re-register their dirs. Relieves both the byte budget and the
+ * INT16_MAX pool cap. Submitter thread only.
  */
 void
 parallel_verify_prefix_pool_reset(struct sftp_parallel *fleet)
@@ -613,10 +624,10 @@ parallel_verify_prefix_pool_reset(struct sftp_parallel *fleet)
 
 /*
  * Allocate a parked whole-file verify item in ONE block: the fixed header
- * followed by "local_rel\0remote_rel\0".  This is the single point that owns
+ * followed by "local_rel\0remote_rel\0". This is the single point that owns
  * the item's size arithmetic - both copies use the SAME measured lengths used
  * to size the allocation (terminating NUL included), so bytes copied can never
- * exceed bytes allocated.  The PATH_MAX guard is belt-and-suspenders: these are
+ * exceed bytes allocated. The PATH_MAX guard is belt-and-suspenders: these are
  * transfer paths that already opened files (so each is <= PATH_MAX), but it
  * stops a corrupt length from wrapping the size_t add into a short allocation.
  */
@@ -644,8 +655,8 @@ verify_whole_item_new(int local_prefix, const char *local_rel,
  * Park a completed whole-file (non-range-split) transfer for the verify phase.
  * Stores a lightweight verify_whole_item with paths held RELATIVE to a
  * registered directory prefix (the long common prefix lives once in the pool,
- * not in two full paths per file).  No match (non-recursive / disparate) falls
- * back to full paths.  The verify handler rebuilds local/remote.
+ * not in two full paths per file). No match (non-recursive / disparate) falls
+ * back to full paths. The verify handler rebuilds local/remote.
  */
 void
 parallel_verify_park_whole_file(struct sftp_parallel *fleet, const char *local_path,
@@ -694,8 +705,8 @@ parallel_verify_job_free(struct verify_job *j)
 /*
  * Build a per-file verify job from a completed range tracker: copy the transfer
  * ranges (vslots) - the teed source hashes among them - into the job and resolve
- * the direction.  Upload (REMOTE target): local=source/remote=dest, teed source
- * hashes apply.  Download (LOCAL target): local=dest/remote=source, no teed.
+ * the direction. Upload (REMOTE target): local=source/remote=dest, teed source
+ * hashes apply. Download (LOCAL target): local=dest/remote=source, no teed.
  */
 static struct verify_job *
 build_verify_job(struct sftp_range_tracker *t)
@@ -740,13 +751,13 @@ verify_units_append(struct sftp_work_unit ***units, int *nunits, int *ucap,
 
 /*
  * Submit the parked files as SFTP_OP_VERIFY work units, drained by the idle
- * workers over their own connections.  Range-split files with teed source
+ * workers over their own connections. Range-split files with teed source
  * hashes (verified upload, server advertises sftp-hash-range) fan ONE unit per
  * transfer range across the pool (range-granular within-file parallel verify);
  * each shares the file's verify job and the last range to finish frees it.
  * Range-split files WITHOUT teed hashes (verified download, or a pre-19 server)
  * and parked whole-file items each get one whole-file verify unit carrying a
- * lightweight verify_whole_item.  Returns the total UNIT count (= chunks +
+ * lightweight verify_whole_item. Returns the total UNIT count (= chunks +
  * whole-file units, not files) for the phase meter.
  */
 int
@@ -800,9 +811,9 @@ parallel_verify_phase_submit(struct sftp_parallel *fleet)
 				verify_units_append(&units, &nunits, &ucap, u);
 			}
 		} else {
-			/* No teed hashes: whole-file verify.  t->path is the
+			/* No teed hashes: whole-file verify. t->path is the
 			 * written file (LOCAL target = download, REMOTE = upload);
-			 * resolve to local/remote.  These are range-split files
+			 * resolve to local/remote. These are range-split files
 			 * (few), and no prefix pool applies here, so hold the full
 			 * paths (prefix = -1). */
 			struct verify_whole_item *it;
@@ -842,9 +853,9 @@ parallel_verify_phase_submit(struct sftp_parallel *fleet)
 }
 
 /*
- * Resolve the effective per-unit retry budget.  See the comment at the
+ * Resolve the effective per-unit retry budget. See the comment at the
  * HPN_MAX_RETRIES_* defines near the top of this file for the full
- * policy.  Definition lives here because struct sftp_parallel is
+ * policy. Definition lives here because struct sftp_parallel is
  * opaque earlier in the file; the forward decl appears alongside the
  * defines.
  */
@@ -864,15 +875,15 @@ parallel_unit_max_retries(struct sftp_parallel *fleet)
  *
  * Two waiters watch this counter and they need different edges.
  * sftp_parallel_wait sleeps until the fleet is idle, so it needs the zero
- * transition.  A producer throttled by sftp_parallel_await_capacity sleeps
+ * transition. A producer throttled by sftp_parallel_await_capacity sleeps
  * until there is room under the ceiling, so it needs the edge where pending
- * falls below outstanding_cap - reached long before zero.  Signalling only at
+ * falls below outstanding_cap - reached long before zero. Signalling only at
  * zero leaves that producer to fall out on its timeout instead, which makes
  * the timeout the mechanism rather than the backstop and limits how fast work
  * can reach the fleet to one ceiling per timeout period.
  *
  * Only the crossing is signalled, not every decrement below the ceiling: the
- * latter would broadcast once per completed file for no gain.  Decrements are
+ * latter would broadcast once per completed file for no gain. Decrements are
  * serialised by the mutex so every value is visited and the crossing cannot
  * be skipped, and a waiter tests the same predicate under the same mutex, so
  * there is no lost wakeup.
@@ -899,7 +910,7 @@ parallel_unit_pending_dec(struct sftp_parallel *fleet)
 
 /*
  * Return this parallel's bundle byte target (HPNBundleSize or the
- * compile-time default).  Eligibility against it is decided by the
+ * compile-time default). Eligibility against it is decided by the
  * shared hpn_bundle_file_eligible() in sftp-hpn-bundle.h, one source
  * of truth with the serial walk accumulator.
  */
@@ -919,9 +930,9 @@ static int submit_download_maybe_split(struct sftp_parallel *fleet, struct sftp_
     off_t file_size, mode_t mode);
 
 /*
- * Roll back one bundle member's submit accounting and free it.  Used when a
+ * Roll back one bundle member's submit accounting and free it. Used when a
  * flush can't push (queue shut down) - mirrors parallel_unit_submit's own
- * push-fail backout so pending / queued_bytes stay balanced.
+ * push-fail backout so pending stays balanced.
  */
 static void
 parallel_bundle_member_pushfail(struct sftp_parallel *fleet,
@@ -930,9 +941,6 @@ parallel_bundle_member_pushfail(struct sftp_parallel *fleet,
 	pthread_mutex_lock(&fleet->pending_mu);
 	pending_dec_locked(fleet);
 	pthread_mutex_unlock(&fleet->pending_mu);
-	if (u->size > 0)
-		__atomic_fetch_sub(&fleet->queued_bytes, (uint64_t)u->size,
-		    __ATOMIC_RELAXED);
 	parallel_unit_free(u);
 }
 
@@ -942,9 +950,8 @@ parallel_bundle_member_pushfail(struct sftp_parallel *fleet,
  *   n == 1  -> push the lone member as an ordinary unit (a bundle of one is
  *              pointless; it still transfers, just un-bundled).
  *   n >= 2  -> wrap the members in a SFTP_OP_BUNDLE_* container and push that.
- * Members keep the pending / queued_bytes accounting they took at add time;
- * the container is a transport shell (its ->size = sum of member bytes drives
- * the single pickup subtraction at worker dispatch).
+ * Members keep the pending accounting they took at add time; the
+ * container is a transport shell (its ->size = the sum of member bytes).
  */
 static void
 parallel_bundle_flush(struct sftp_parallel *fleet)
@@ -983,25 +990,24 @@ parallel_bundle_flush(struct sftp_parallel *fleet)
 }
 
 /*
- * Add a bundle-eligible small file to the accumulator.  It takes the same
- * pending / queued_bytes accounting as an individual unit (members are real
+ * Add a bundle-eligible small file to the accumulator. It takes the same
+ * pending accounting as an individual unit (members are real
  * work units; the bundle just transports them), then accumulates and
  * flushes a full bundle at the framed-byte or file-count cap. Submit
  * thread only; there is no lock here by design.
+ * Producer-side grouping exists because worker-side accumulation raced
+ * at startup: the thundering herd stranded a transfer's first files as
+ * un-bundled single round trips.
  */
 static int
 parallel_bundle_add(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 {
-	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
 	uint64_t target = (fleet->cfg.bundle_size > 0)
 	    ? fleet->cfg.bundle_size : BUNDLE_TARGET_BYTES_DEFAULT;
 
 	pthread_mutex_lock(&fleet->pending_mu);
 	fleet->pending++;
 	pthread_mutex_unlock(&fleet->pending_mu);
-	if (add_bytes)
-		__atomic_fetch_add(&fleet->queued_bytes, add_bytes,
-		    __ATOMIC_RELAXED);
 
 	/* A bundle carries one direction; flush a pending one of the other op. */
 	if (fleet->bundle_pending_n > 0 && fleet->bundle_pending_op != u->op)
@@ -1033,6 +1039,8 @@ parallel_bundle_add(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 	return 0;
 }
 
+/* Flush a partially-filled producer-side bundle (the tail). Called from
+ * sftp_parallel_wait once a command has finished submitting. */
 void
 parallel_bundle_flush_pending(struct sftp_parallel *fleet)
 {
@@ -1056,14 +1064,14 @@ parallel_unit_submit(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 		return -1;
 	}
 	/* u is contractually non-NULL (callers build units via make_unit() /
-	 * xcalloc, which fatal on OOM).  Guard once here so the derefs below
+	 * xcalloc, which fatal on OOM). Guard once here so the derefs below
 	 * need no per-site NULL check. */
 	if (u == NULL)
 		return -1;
 	/* Bundle-eligibility gate: when bundle mode is enabled and the
 	 * unit's file size exceeds the per-target threshold, mark it
 	 * ineligible so the worker routes it through the single-file
-	 * path (which may further range-split it).  Range and resume
+	 * path (which may further range-split it). Range and resume
 	 * units are never bundle-eligible regardless of size - handled
 	 * by their op-type elsewhere. */
 	if (fleet->cfg.use_bundle && u->size > 0 &&
@@ -1073,31 +1081,24 @@ parallel_unit_submit(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 	}
 	/* Producer-side bundle assembly: group eligible small files into whole
 	 * bundles here (single submit thread) so workers pull a complete bundle
-	 * rather than racing to accumulate one.  Everything else - large/range/
+	 * rather than racing to accumulate one. Everything else - large/range/
 	 * resume units, and worker re-submits (always bundle_ineligible) - takes
 	 * the individual path below. */
 	if (fleet->cfg.use_bundle && !u->bundle_ineligible &&
 	    (u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_DOWNLOAD))
 		return parallel_bundle_add(fleet, u);
-	uint64_t add_bytes = (u->size > 0) ? (uint64_t)u->size : 0;
 	pthread_mutex_lock(&fleet->pending_mu);
 	fleet->pending++;
 	pthread_mutex_unlock(&fleet->pending_mu);
-	if (add_bytes)
-		__atomic_fetch_add(&fleet->queued_bytes, add_bytes,
-		    __ATOMIC_RELAXED);
 	if (sftp_workqueue_push(fleet->q, u) != 0) {
 		pthread_mutex_lock(&fleet->pending_mu);
 		pending_dec_locked(fleet);
 		pthread_mutex_unlock(&fleet->pending_mu);
-		if (add_bytes)
-			__atomic_fetch_sub(&fleet->queued_bytes, add_bytes,
-			    __ATOMIC_RELAXED);
 		parallel_unit_free(u);
 		return -1;
 	}
 	/* Genuinely NEW work: wake any workers parked in the cap-gate's
-	 * activity wait.  Deliberately NOT done inside the queue's push -
+	 * activity wait. Deliberately NOT done inside the queue's push -
 	 * the cap-gate's own requeue pushes there, and kicking from push
 	 * created a wake->pass->requeue->kick feedback storm (measured:
 	 * denials 6M -> 109M, four cores burned). */
@@ -1106,11 +1107,13 @@ parallel_unit_submit(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 }
 
 /*
- * Worker-context re-queue (non-blocking).  A worker that blocks on a full fleet->q
- * it also drains can self-deadlock (fatal at -j1).  Try the queue; on full,
+ * Worker-context re-queue (non-blocking). A worker that blocks on a full fleet->q
+ * it also drains can self-deadlock (fatal at -j1). Try the queue; on full,
  * park the unit on the retry-overflow list (existing allocation, FIFO,
- * reporter-drained).  pending/queued_bytes are unchanged - the unit stays
- * pending wherever it sits, so callers must NOT re-account here.
+ * reporter-drained). pending is unchanged - the unit stays pending
+ * wherever it sits, so callers must not re-account here. Returns 0 if
+ * the unit was placed (queue or overflow), -1 only if the queue is shut
+ * down - the caller does the give-up bookkeeping.
  */
 int
 parallel_worker_requeue(struct sftp_parallel *fleet, struct sftp_work_unit *u,
@@ -1123,7 +1126,7 @@ parallel_worker_requeue(struct sftp_parallel *fleet, struct sftp_work_unit *u,
 	if (rc < 0)
 		return -1;	/* queue shut down -> caller gives up */
 
-	/* rc > 0: queue full.  Park on the overflow list; never block. */
+	/* rc > 0: queue full. Park on the overflow list; never block. */
 	pthread_mutex_lock(&fleet->retry_overflow_mu);
 	u->overflow_next = NULL;
 	u->overflow_front = front;
@@ -1141,8 +1144,8 @@ parallel_worker_requeue(struct sftp_parallel *fleet, struct sftp_work_unit *u,
 
 /*
  * Reporter-context: move overflow-parked units back into fleet->q while it has
- * room.  Each re-enters via its original front/tail intent (a worker blocked
- * in pop wakes on trypush's not_empty signal).  Stops at the first unit that
+ * room. Each re-enters via its original front/tail intent (a worker blocked
+ * in pop wakes on trypush's not_empty signal). Stops at the first unit that
  * won't fit (queue full again) or on shutdown, re-parking it at the head so
  * FIFO order and the pending invariant hold.
  */
@@ -1184,8 +1187,8 @@ parallel_retry_overflow_drain(struct sftp_parallel *fleet)
 }
 
 /*
- * Stop/abort cleanup: free any units still parked on the overflow list.  Run
- * after the workers and reporter have joined (no concurrent access).  These
+ * Stop/abort cleanup: free any units still parked on the overflow list. Run
+ * after the workers and reporter have joined (no concurrent access). These
  * units never reached a worker, so freeing mirrors a drained queue item.
  */
 void
@@ -1205,10 +1208,10 @@ parallel_retry_overflow_free(struct sftp_parallel *fleet)
 		u->overflow_next = NULL;
 		/* Each parked unit still owes its shared range_tracker exactly
 		 * one finalize (invariant I1); parallel_unit_free never touches
-		 * the tracker.  Without this the tracker's remaining never
+		 * the tracker. Without this the tracker's remaining never
 		 * reaches 0, so the tracker (plus its path/src_path/vslots)
-		 * leaks and the incomplete-file finalize is skipped.  Mirror the
-		 * abort queue-drain in sftp_parallel_stop.  A NULL tracker
+		 * leaks and the incomplete-file finalize is skipped. Mirror the
+		 * abort queue-drain in sftp_parallel_stop. A NULL tracker
 		 * (whole-file / bundle units) is a no-op. */
 		(void)parallel_unit_tracker_finalize(u->range_tracker, 1, NULL);
 		parallel_unit_free(u);
@@ -1217,13 +1220,13 @@ parallel_retry_overflow_free(struct sftp_parallel *fleet)
 }
 
 /*
- * Whole-file submit for a resumed and/or verified transfer.  resume/verify
+ * Whole-file submit for a resumed and/or verified transfer. resume/verify
  * disable speculative range-splitting: range-split resume is the deferred
  * sparse-hole case, so the file goes as one unit where sftp_upload/
- * sftp_download's hash gate applies.  The unsupported-remote check fires
+ * sftp_download's hash gate applies. The unsupported-remote check fires
  * HERE, in the main (submit) thread - a fatal() inside a worker would fight
  * fault isolation, and hpn-check-file support is identical across workers,
- * so one up-front check on the control connection suffices.  'remote' is the
+ * so one up-front check on the control connection suffices. 'remote' is the
  * path named in the failure message; 'src'/'dst' follow make_unit's
  * per-op convention (upload: local→remote; download: remote→local).
  */
@@ -1244,13 +1247,13 @@ submit_resume_whole_file(struct sftp_parallel *fleet, struct sftp_conn *conn,
 
 /*
  * Parallel verified-resume split (project_verify_refill_parallel): an
- * existing partial destination divides the file at its EOF.  Everything
+ * existing partial destination divides the file at its EOF. Everything
  * past dest EOF is KNOWN missing - the pwrite highwater guarantees no
  * data exists there, the same fact the serial gate's dest-EOF clamp
  * relies on - so the tail [dest_size, src_size) submits as ordinary
- * range units, no hashing.  The overlap [0, dest_size) submits as
+ * range units, no hashing. The overlap [0, dest_size) submits as
  * RESUME_SPAN units that each hash-compare their span and splice only
- * mismatched runs (the shared verify+repair engine).  Every unit is
+ * mismatched runs (the shared verify+repair engine). Every unit is
  * built here in the submit thread under ONE range tracker, so
  * completion, verify parking, retries, and failure semantics are
  * exactly those of an ordinary range-split file - and the spans hash
@@ -1326,7 +1329,7 @@ submit_resume_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 				    "failed", i, remote);
 			/* Synthesise failures for the unsubmitted pieces so
 			 * the tracker reaches remaining=0 (see the sibling
-			 * comment in submit_upload_ranges).  Tracker is dead
+			 * comment in submit_upload_ranges). Tracker is dead
 			 * to this function after the call. */
 			(void)parallel_unit_tracker_finalize_n(tracker,
 			    n - i, 1, NULL);
@@ -1340,7 +1343,7 @@ submit_resume_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
  * Estimate the parked-verify footprint of a file BEFORE it transfers, so the
  * memory gate can be charged at SUBMIT time (a leading signal the submitter
  * sees) rather than at park time (a lagging signal it misses - on download the
- * walker submits everything before anything parks).  Same formula as the actual
+ * walker submits everything before anything parks). Same formula as the actual
  * park in parallel_verify_park_whole_file, using the same prefix factoring, so
  * the estimate equals the real item size.
  */
@@ -1388,9 +1391,9 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		/*
 		 * Resume onto an existing shorter partial: split into
 		 * known-missing tail ranges + overlap reconcile spans (see
-		 * submit_resume_split).  Gated on BOTH resume extensions so
+		 * submit_resume_split). Gated on BOTH resume extensions so
 		 * the whole-file fallback keeps sole ownership of the
-		 * -Z-against-unsupported-server fatal.  Absent/equal/larger
+		 * -Z-against-unsupported-server fatal. Absent/equal/larger
 		 * destinations keep the whole-file gate (fresh, identical-
 		 * skip, and target-larger semantics live there).
 		 */
@@ -1414,7 +1417,7 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	/* When a control connection is supplied, route through the
 	 * speculative-split decision so a single large file produces
 	 * multiple range work units (feeds the byte-based scale-up
-	 * trigger).  Otherwise, fall back to a whole-file unit. */
+	 * trigger). Otherwise, fall back to a whole-file unit. */
 	else if (conn != NULL)
 		rc = submit_upload_maybe_split(fleet, conn, local_path, remote_path,
 		    size, mode);
@@ -1424,7 +1427,7 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	/* Memory gate: charge this file's parked-verify footprint NOW, at submit
 	 * (a leading signal), then drain if the outstanding total is over budget.
 	 * Submit blocks during the drain - that block IS the backpressure that
-	 * paces submission with verification.  Main thread only. */
+	 * paces submission with verification. Main thread only. */
 	if (fleet != NULL && fleet->cfg.verify_transfer) {
 		uint64_t est = parallel_verify_item_bytes_estimate(fleet,
 		    local_path, remote_path);
@@ -1485,7 +1488,7 @@ sftp_parallel_submit_download(struct sftp_parallel *fleet,
 		rc = parallel_unit_submit(fleet,
 		    make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path, size, mode));
 	/* Memory gate (see submit_upload): charge the footprint at submit, drain
-	 * if over budget.  This is what makes the trigger fire on DOWNLOAD too -
+	 * if over budget. This is what makes the trigger fire on DOWNLOAD too -
 	 * the walker submits all units before any file parks, so charging at
 	 * submit is the only point that sees the memory coming. */
 	if (fleet != NULL && fleet->cfg.verify_transfer) {
@@ -1504,12 +1507,12 @@ sftp_parallel_submit_download(struct sftp_parallel *fleet,
 
 /*
  * Validate / normalise stripe_size for use as a chunk-boundary alignment
- * unit.  Returns 1 if we have a usable stripe_size and the caller may
+ * unit. Returns 1 if we have a usable stripe_size and the caller may
  * align byte-ranges to it; 0 means fall back to plain even division.
  *
  * Mutates *info in place for the GPFS heuristic only: GPFS exposes no
  * per-OST stripe via SFTP fs-info, so we substitute its statvfs
- * block_size as the alignment unit.  Other filesystems are taken at
+ * block_size as the alignment unit. Other filesystems are taken at
  * face value - only stripe_size matters downstream, and overly-large
  * values simply collapse range-splitting back toward whole-file
  * uploads (the alignment-up-to-stripe rounding pushes per_range past
@@ -1521,7 +1524,7 @@ stripe_info_viable(struct sftp_fs_info *info, const char *path)
 	if (strcmp(info->fs_type, "gpfs") == 0 && info->stripe_size == 0) {
 		/* Valid GPFS block sizes are 256 KiB–16 MiB per IBM
 		 * Spectrum Scale docs; anything else is a bogus statvfs
-		 * return or a fs_type false positive.  Bail rather than
+		 * return or a fs_type false positive. Bail rather than
 		 * guessing. */
 		if (info->block_size < 256 * 1024 ||
 		    info->block_size > 16 * 1024 * 1024) {
@@ -1539,12 +1542,14 @@ stripe_info_viable(struct sftp_fs_info *info, const char *path)
 }
 
 /*
- * One-shot lazy fs-info accessor.  Both submit_upload_maybe_split and
+ * One-shot lazy fs-info accessor. Both submit_upload_maybe_split and
  * submit_download_maybe_split need the destination filesystem's stripe geometry
  * for chunk alignment; we query it once and cache it on the orchestrator.
  * Returns 1 if we got usable stripe info, 0 if alignment should fall back
- * to plain file_size/num_ranges.  Output goes in *info_out (caller may
+ * to plain file_size/num_ranges. Output goes in *info_out (caller may
  * inspect info->stripe_size etc).
+ * Caching matters at high RTT: querying fs-info synchronously per large
+ * file stalls the walker between submissions.
  */
 static int
 get_cached_fs_info(struct sftp_parallel *fleet, struct sftp_conn *conn,
@@ -1562,12 +1567,12 @@ get_cached_fs_info(struct sftp_parallel *fleet, struct sftp_conn *conn,
 }
 
 /*
- * Populate the one-shot fs-info cache up front.  A submit issued while a
+ * Populate the one-shot fs-info cache up front. A submit issued while a
  * streamed reply is draining must send nothing on that connection, and the
  * lazy query above is the one thing in the download submit path that would;
- * doing it here means the drain finds the answer already cached.  Warming with
+ * doing it here means the drain finds the answer already cached. Warming with
  * the walk root matches what the first file would have asked for, since the
- * cache is per-orchestrator rather than per-path.  No-op once cached.
+ * cache is per-orchestrator rather than per-path. No-op once cached.
  */
 void
 sftp_parallel_prewarm_fs_info(struct sftp_parallel *fleet, struct sftp_conn *conn,
@@ -1580,10 +1585,10 @@ sftp_parallel_prewarm_fs_info(struct sftp_parallel *fleet, struct sftp_conn *con
 	(void)get_cached_fs_info(fleet, conn, remote_path, &info);
 }
 
-/* How long a capacity wait sleeps before re-testing on its own.  Only one of
+/* How long a capacity wait sleeps before re-testing on its own. Only one of
  * the three fleet->pending decrement sites broadcasts pending_cv (the push-fail
  * backout paths do not), so this bounds a missed wake to one re-test rather
- * than a wedged walk.  A completion normally wakes the wait immediately and
+ * than a wedged walk. A completion normally wakes the wait immediately and
  * this never fires, so second resolution is all it needs. */
 #define AWAIT_CAPACITY_POLL_SEC  1
 
@@ -1599,8 +1604,8 @@ sftp_parallel_prewarm_fs_info(struct sftp_parallel *fleet, struct sftp_conn *con
  *
  * Called from the walk, so blocking here stops the caller reading the
  * discover-tree reply and TCP back-pressure reaches the server, which stops
- * producing records.  Workers drain on their own connections and broadcast
- * as they complete, so they cannot be blocked by this wait.  Returns
+ * producing records. Workers drain on their own connections and broadcast
+ * as they complete, so they cannot be blocked by this wait. Returns
  * immediately once an abort is set, so a failed or interrupted fleet does
  * not leave the walk parked here.
  */
@@ -1624,12 +1629,19 @@ sftp_parallel_await_capacity(struct sftp_parallel *fleet)
 }
 
 /*
- * Resolve the range-split minimum file size, in bytes.  Precedence:
+ * Resolve the range-split minimum file size, in bytes. Precedence:
  *   1. cfg.range_split_min_mb (set by -M CLI flag, sftp.c)
  *   2. RANGE_SPLIT_MIN_SIZE_DEFAULT (2 GiB)
  *
- * Values are clamped to [FLOOR, CEILING] = [64 MiB, 10 GiB].  Logs the
+ * Values are clamped to [FLOOR, CEILING] = [64 MiB, 10 GiB]. Logs the
  * chosen value once per orchestrator at default verbosity.
+ *
+ * The 2 GiB default came out of a measured sweep across Lustre and ext4.
+ * The scheme it replaced derived a per-file range count, which forced
+ * absurdly large ranges on big files and rested on an oversubscription
+ * premise that measurement contradicts: more and smaller ranges fade
+ * throughput rather than balancing the tail. Tail balancing belongs at
+ * the endgame, not in the range size.
  */
 uint64_t
 parallel_unit_split_min_size(struct sftp_parallel *fleet)
@@ -1674,7 +1686,7 @@ make_download_range_unit(const char *remote_path, const char *local_path,
 /*
  * Pre-create remote file at the correct size, then split the local file
  * into num_ranges byte ranges and submit one SFTP_OP_UPLOAD_RANGE work unit
- * per range.  The pre-creation step (open+setstat+close) is synchronous on
+ * per range. The pre-creation step (open+setstat+close) is synchronous on
  * conn so all ranges see a fully allocated remote file before any worker
  * starts writing.
  *
@@ -1695,7 +1707,7 @@ submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
 
 	/* Lazy creation: the file is created by the first worker that
 	 * dispatches a range for it (parallel_unit_ensure_file), so an
-	 * interrupted transfer leaves no empty placeholders.  Fail fast
+	 * interrupted transfer leaves no empty placeholders. Fail fast
 	 * here on an unusable destination: stat the target DIRECTORY so a
 	 * bad path/permissions surfaces at submit, not as per-unit retry
 	 * churn at first write. */
@@ -1716,7 +1728,7 @@ submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	    (long long)range_size, (double)range_size / (1024.0*1024.0));
 
 	/* Count effective (positive-length) ranges first so the tracker
-	 * knows the exact number of completions to wait for.  Mirrors the
+	 * knows the exact number of completions to wait for. Mirrors the
 	 * download path; see submit_download_ranges for rationale. */
 	for (i = 0; i < num_ranges; i++) {
 		off_t offset = (off_t)i * range_size;
@@ -1729,7 +1741,7 @@ submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	if (effective_ranges == 0)
 		return -1;
 
-	/* Upload: remote file is the target, local file is the source.  Tag the
+	/* Upload: remote file is the target, local file is the source. Tag the
 	 * tracker for post-transfer verify when verify transfer is on, so the
 	 * last range to finalize runs the whole-file integrity check (range
 	 * units do not pass through execute_unit's whole-file verify). */
@@ -1764,7 +1776,7 @@ submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
 			/* Synthesise failures for the ranges we never
 			 * submitted so the tracker reaches remaining=0 and
 			 * the incomplete-file reporting runs (the file is
-			 * left in place, resumable).  NULL worker is fine.
+			 * left in place, resumable). NULL worker is fine.
 			 * One batch call; the tracker may be freed inside
 			 * and is dead to this function afterwards. */
 			(void)parallel_unit_tracker_finalize_n(tracker,
@@ -1810,7 +1822,7 @@ submit_download_ranges(struct sftp_parallel *fleet,
 	    (long long)range_size, (double)range_size / (1024.0*1024.0));
 
 	/* Count ranges with positive length first so the tracker knows the
-	 * exact number of completions to wait for.  A trailing range may be
+	 * exact number of completions to wait for. A trailing range may be
 	 * vacuous if the caller's range_size × num_ranges rounded past
 	 * file_size. */
 	for (i = 0; i < num_ranges; i++) {
@@ -1836,7 +1848,7 @@ submit_download_ranges(struct sftp_parallel *fleet,
 		    (file_size - offset) : range_size;
 		struct sftp_work_unit *ru = make_download_range_unit(remote_path,
 		    local_path, offset, length, tracker);
-		/* Record the range geometry for the range-granular verify.  Download
+		/* Record the range geometry for the range-granular verify. Download
 		 * tees no source hash, so valid stays 0 and the verify reads the
 		 * dest range back; only off/len are needed here. */
 		if (ru != NULL && tracker->vslots != NULL) {
@@ -1856,9 +1868,9 @@ submit_download_ranges(struct sftp_parallel *fleet,
 			/* Synthesise failures for the ranges we never
 			 * submitted so the tracker reaches remaining=0 and
 			 * the incomplete-file reporting runs (the file is
-			 * left in place, resumable).  Without this the
-			 * tracker leaks.  No worker context here, so pass
-			 * NULL.  One batch call; the tracker may be freed
+			 * left in place, resumable). Without this the
+			 * tracker leaks. No worker context here, so pass
+			 * NULL. One batch call; the tracker may be freed
 			 * inside and is dead to this function afterwards. */
 			(void)parallel_unit_tracker_finalize_n(tracker,
 			    effective_ranges - i, 1, NULL);
@@ -1869,16 +1881,16 @@ submit_download_ranges(struct sftp_parallel *fleet,
 }
 
 /*
- * Shared range-split decision used by both directions.  Returns 1 and fills
+ * Shared range-split decision used by both directions. Returns 1 and fills
  * *range_size / *num_ranges when the file should be split into ranges, or 0
- * to fall back to a whole-file transfer.  Range splitting needs a known file
+ * to fall back to a whole-file transfer. Range splitting needs a known file
  * size (callers pass it from the local stat / the SFTP directory listing /
  * the glob attrib cache); a zero/too-small size, a sub-floor file, or the
  * HPN_NO_RANGE_SPLIT escape hatch all return 0.
  *
  * Range COUNT = file_size / floor (parallel_unit_split_min_size, default
  * 2 GiB, -M override): the floor is the single knob and governs range SIZE;
- * there is no count cap.  Range SIZE is stripe-aligned when hpn-fs-info
+ * there is no count cap. Range SIZE is stripe-aligned when hpn-fs-info
  * reports Lustre/GPFS geometry (adjacent ranges target different OSTs),
  * otherwise plain file_size/num_ranges.
  */
@@ -1917,9 +1929,9 @@ compute_range_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		 * original n ranges of range_size would overshoot EOF - ranges
 		 * that start past EOF and a negative-length final range (the
 		 * submit_*_ranges path takes the last length as file_size -
-		 * offset).  Recompute the range COUNT from the inflated size so
+		 * offset). Recompute the range COUNT from the inflated size so
 		 * the ranges tile the file exactly (each stripe-aligned; the last
-		 * is the remainder).  n only shrinks here since range_size >=
+		 * is the remainder). n only shrinks here since range_size >=
 		 * per_range; if it drops below 2 the stripe-aligned split is not
 		 * worth doing, so fall back to the whole-file path.
 		 */
@@ -1927,7 +1939,7 @@ compute_range_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		if (n < 2)
 			return 0;
 	} else {
-		/* No stripe geometry from hpn-fs-info.  The server now resolves
+		/* No stripe geometry from hpn-fs-info. The server now resolves
 		 * the Lustre default (sftp-lustre.c lustre_get_stripe walks up to
 		 * a concrete default), so a zero stripe here means a non-striped
 		 * filesystem (ext4/xfs/NFS/etc.) - use plain even division. */

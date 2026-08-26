@@ -32,7 +32,7 @@
  * in benchmark/env-vars-reference.md is promoted from env vars.
  *
  * Both hpnsftp and (future) hpnscp call sftp_parallel_apply_ssh_config()
- * to populate pcfg before invoking sftp_parallel_start().  This keeps
+ * to populate pcfg before invoking sftp_parallel_start(). This keeps
  * the readconf.o dependency contained in one small object file rather
  * than pulling it into the much larger sftp-parallel.o.
  */
@@ -60,7 +60,7 @@
 /*
  * Mirror of ssh.c's process_config_files(), trimmed to what we need:
  * read user and system ssh_config (or the explicit -F file) into the
- * supplied Options struct.  Sets *want_final_pass=1 if any parsed
+ * supplied Options struct. Sets *want_final_pass=1 if any parsed
  * directive depended on the final-pass resolution (Match blocks).
  *
  * Returns 0 on success or -1 if the explicit user config file was
@@ -117,7 +117,7 @@ process_config_files(const char *user_config_file, struct passwd *pw,
  * collected by sftp.c's argv parser (parallel_extra_o), NULL-terminated;
  * each entry is applied via process_config_line() AFTER the config files
  * are read but BEFORE fill_default_options(), matching the order ssh.c
- * uses so command-line overrides win over config values.  May be NULL.
+ * uses so command-line overrides win over config values. May be NULL.
  *
  * Returns 0 on success, -1 on failure.
  */
@@ -157,7 +157,7 @@ resolve_ssh_config(const char *host, const char *user_config_file,
 
 	/*
 	 * Apply -o overrides from the command line so they trump config
-	 * values, matching how ssh.c handles -o.  Without this, options
+	 * values, matching how ssh.c handles -o. Without this, options
 	 * like `-o HPNLustreStripeCount=0` silently fail to override the
 	 * config defaults.
 	 */
@@ -207,7 +207,7 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 		return -1;
 	}
 
-	/* Map the resolved Options into pcfg.  Future ssh_config-promoted
+	/* Map the resolved Options into pcfg. Future ssh_config-promoted
 	 * options append additional assignments here. */
 	pcfg->use_bundle  = (options.hpn_use_bundle != 0);
 	pcfg->writer_pool = (options.hpn_writer_pool != 0);
@@ -253,7 +253,7 @@ sftp_resolve_hpn_lustre_stripe_count(const char *host,
 
 /*
  * Adaptive throughput-outlier stall detection defaults, shared by hpnsftp
- * and hpnscp so the two stay in lockstep.  On by default in parallel mode
+ * and hpnscp so the two stay in lockstep. On by default in parallel mode
  * with conservative WAN-bulk settings (the values were settled by testing;
  * the env-var overrides that once existed were removed in the 19.0 dev-knob
  * cull): path-health floor in kbps (0 disables the detector), the outlier

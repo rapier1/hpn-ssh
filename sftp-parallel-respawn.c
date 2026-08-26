@@ -20,7 +20,7 @@
  * sftp-parallel-respawn.c - worker spawn / respawn lifecycle for the
  * parallel SFTP orchestrator: ssh child launch and teardown, the
  * in-flight-spawn kill registry, the deferred respawn thread, and
- * respawn dispatch.  Split from sftp-parallel.c; moves are verbatim.
+ * respawn dispatch. Split from sftp-parallel.c; moves are verbatim.
  */
 
 #include "includes.h"
@@ -102,7 +102,7 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 		 * attack - a co-tenant who predicts our child PID can't
 		 * pre-create the path as either a symlink to a sensitive
 		 * file (→ DoS via O_TRUNC equivalent) or as a file they own
-		 * (→ info leak via redirected stderr).  On any failure
+		 * (→ info leak via redirected stderr). On any failure
 		 * (including O_EXCL collision) we fall through to inherited
 		 * stderr, which is the safe default.
 		 */
@@ -152,11 +152,11 @@ spawn_worker_ssh(const struct sftp_parallel_config *cfg,
 		 * When -W is set, force at least -v so the captured stderr
 		 * files actually contain something useful: ssh is silent on
 		 * a successful handshake, and an empty log file is a
-		 * usability footgun.  We take the MAX of the two so a user
+		 * usability footgun. We take the MAX of the two so a user
 		 * who explicitly asked for -vv (or higher) gets that level
 		 * - we never decrease their requested verbosity.
 		 *
-		 * SSH itself accepts at most -vvv (three -v's).  Cap there
+		 * SSH itself accepts at most -vvv (three -v's). Cap there
 		 * to avoid wasted argv slots. */
 		{
 			int v = cfg->verbose_level;
@@ -260,18 +260,18 @@ spawning_pid_deregister(struct sftp_parallel *fleet, pid_t pid)
 }
 
 /* A respawn whose connect+handshake has not completed in this many seconds is
- * wedged.  ConnectTimeout bounds only the TCP connect, not the post-connect
+ * wedged. ConnectTimeout bounds only the TCP connect, not the post-connect
  * kex/auth, so a server that accepts the socket then stalls the handshake
  * blocks spawn_one_worker in sftp_init indefinitely - pinning pending_respawns
  * above 0, which suppresses the dead-end abort net and deadlocks the transfer
- * (fatal at -j1).  Generous: a healthy spawn finishes in well under a second
+ * (fatal at -j1). Generous: a healthy spawn finishes in well under a second
  * even with PQ kex, and a false SIGTERM merely costs one retried respawn. */
 #define HPN_RESPAWN_STALL_SEC 30
 
 /* SIGTERM any in-flight spawn stalled past HPN_RESPAWN_STALL_SEC: the child's
  * exit fails sftp_init on the pipe EOF, which deregisters the pid and resolves
  * the respawn (pending_respawns--), letting the normal reap/retry/abort
- * recovery proceed.  Called every reporter tick (the blocked spawn thread
+ * recovery proceed. Called every reporter tick (the blocked spawn thread
  * cannot time itself out). */
 void
 parallel_respawn_sweep_stalled(struct sftp_parallel *fleet)
@@ -328,13 +328,13 @@ spawn_one_worker(struct sftp_parallel *fleet)
 		goto fail;
 	}
 	/* From here until sftp_init returns we may block for a full connect
-	 * timeout inside the child.  Register the child so abort/stop can
+	 * timeout inside the child. Register the child so abort/stop can
 	 * SIGTERM it (the pipe EOF fails sftp_init within ms), and re-check
 	 * the flags AFTER registering: a teardown that swept the registry
 	 * just before our registration is caught here and we self-kill. */
 	if (!spawning_pid_register(fleet, worker->ssh_pid)) {
 		/* Registry full (SFTP_PARALLEL_MAX_WORKERS spawns already in
-		 * flight - pathological, e.g. a spawn storm).  An unregistered
+		 * flight - pathological, e.g. a spawn storm). An unregistered
 		 * child cannot be found by abort/stop's SIGTERM sweep, so
 		 * proceeding would pin teardown for a full connect timeout.
 		 * Reap it now and fail the spawn; respawn_owed persists, so the
@@ -366,7 +366,7 @@ spawn_one_worker(struct sftp_parallel *fleet)
 	sftp_set_yield_flag(worker->conn, &worker->yield_req);
 	/* Propagate verify transfer to this worker conn: the main conn gets
 	 * it at sftp_init time, but worker conns are created here and must be
-	 * told explicitly.  Without it the upload's inline source-hash
+	 * told explicitly. Without it the upload's inline source-hash
 	 * accumulator never arms (verify falls back to a second full read). */
 	sftp_conn_set_verify_transfer(worker->conn, fleet->cfg.verify_transfer);
 
@@ -447,8 +447,8 @@ respawn_worker_thread(void *arg)
 	}
 
 	/* The orchestrator may have been told to abort/stop while we slept
-	 * (user interrupt, fleet abort, session teardown).  Bail WITHOUT
-	 * spawning: a replacement would join a dead fleet.  This check is
+	 * (user interrupt, fleet abort, session teardown). Bail WITHOUT
+	 * spawning: a replacement would join a dead fleet. This check is
 	 * also what makes the detached-thread lifetime safe - stop() drains
 	 * pending_respawns before freeing fleet, and that drain returns promptly
 	 * only because we exit here instead of attempting a connection. */
@@ -462,7 +462,7 @@ respawn_worker_thread(void *arg)
 	/*
 	 * Once spawn_one_worker returns, worker is owned by the fleet (already
 	 * inserted into fleet->workers[] and running its thread), so the reporter
-	 * reap can pthread_join + destroy + free it at any moment.  Do NOT
+	 * reap can pthread_join + destroy + free it at any moment. Do NOT
 	 * dereference worker here - a success only needs the NULL check.
 	 */
 	struct sftp_worker *worker = spawn_one_worker(fleet);
@@ -481,7 +481,7 @@ respawn_worker_thread(void *arg)
 }
 
 /*
- * Drive worker respawn dispatch for the reporter's slow tick.  Takes
+ * Drive worker respawn dispatch for the reporter's slow tick. Takes
  * the count of non-voluntary worker exits seen on this tick and:
  *
  *   - absorbs them into respawn_owed (the persistent backlog)
@@ -496,29 +496,29 @@ respawn_worker_thread(void *arg)
  * Returns 1 if the reporter should break out of its main loop; 0 otherwise.
  *
  * Cooldown policy (escalating + decaying, best-effort, no count cap):
- *   Two entry triggers, one action.  PRIMARY: a systemic peer-stall burst -
+ *   Two entry triggers, one action. PRIMARY: a systemic peer-stall burst -
  *   >= max(PEER_STALL_SYSTEMIC_MIN, PEER_STALL_SYSTEMIC_FRAC_PCT% of
  *   num_streams) peer-stall worker deaths within the PEER_STALL_WINDOW
- *   (~10 s) - means the backend is saturated fleet-wide.  BACKSTOP: the cause-
+ *   (~10 s) - means the backend is saturated fleet-wide. BACKSTOP: the cause-
  *   agnostic epoch ceiling (RESPAWN_MULTIPLIER x num_streams respawns).
  *   Either pauses respawns for the current cooldown level (BASE, doubling per
  *   burst to CAP); sustained healthy throughput halves the level per DECAY_SEC
- *   and ends an active pause early.  There is NO cooldown-count abort: under a
+ *   and ends an active pause early. There is NO cooldown-count abort: under a
  *   transient backend stall we back off and retry indefinitely, surfacing the
- *   condition rather than dropping data.  Pausing respawns shrinks the fleet
+ *   condition rather than dropping data. Pausing respawns shrinks the fleet
  *   to its functional subset - that IS the concurrency-shedding back-pressure
  *   on the saturated backend.
  *
  * Localized vs systemic:
  *   Below the systemic threshold a peer-stall death is localized: chunk 1 has
  *   already re-queued the unit (front of the FIFO) and any worker steals it -
- *   no cooldown.  Only a fleet-wide burst trips the back-off.
+ *   no cooldown. Only a fleet-wide burst trips the back-off.
  *
  * Per-worker scope (deliberate, retained from 2026-05-30):
- *   The gate is session-wide, not per-worker.  If one bad worker is ever
+ *   The gate is session-wide, not per-worker. If one bad worker is ever
  *   shown to starve the budget, add a per-worker sliding-window thrash
  *   detector (time-windowed, not lifetime-capped) - do not add until the
- *   data shows it matters.  A respawn-EFFECTIVENESS trigger ("last K probes
+ *   data shows it matters. A respawn-EFFECTIVENESS trigger ("last K probes
  *   each re-stalled within T") is the truer signal than fleet-fraction and
  *   is the next candidate; deferred for now.
  */
@@ -550,7 +550,7 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 	 * Systemic peer-stall detector: push this tick's delta of peer-stall
 	 * worker deaths into a rolling window (mirrors the sync_stall window);
 	 * a window sum at/above the systemic threshold means the backend is
-	 * saturated fleet-wide.  The same reporter thread increments
+	 * saturated fleet-wide. The same reporter thread increments
 	 * peer_stall_terminations (in the reap just above) and reads it here,
 	 * so no extra lock is needed.
 	 */
@@ -572,7 +572,7 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 
 	/*
 	 * Path-health streak drives both the cooldown-level decay and the
-	 * early exit from an active pause.  "Healthy" = the freshest raw max
+	 * early exit from an active pause. "Healthy" = the freshest raw max
 	 * throughput is at or above the configured floor (default 2000 kbps).
 	 */
 	int healthy = (fleet->cfg.tput_path_healthy_kbps > 0) &&
@@ -620,10 +620,10 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 	}
 
 	/*
-	 * Cooldown entry.  Two triggers, one action: a systemic peer-stall
+	 * Cooldown entry. Two triggers, one action: a systemic peer-stall
 	 * burst (primary) or the cause-agnostic epoch ceiling (backstop).
 	 * Pause respawns for the current escalating level, then double it
-	 * (capped) for the next burst.  No count cap, no abort - best-effort.
+	 * (capped) for the next burst. No count cap, no abort - best-effort.
 	 */
 	if (!in_cooldown && fleet->respawn_owed > 0 &&
 	    (systemic || fleet->respawn_epoch_count >= respawn_ceil)) {
@@ -652,7 +652,7 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 	} else if (cur_workers == 0) {
 		/* Fleet empty: launch a SINGLE probe rather than num_streams
 		 * fresh connections, so we don't slam a possibly-still-
-		 * saturated backend.  A healthy probe refills normally on the
+		 * saturated backend. A healthy probe refills normally on the
 		 * following ticks; a re-stall escalates the cooldown.
 		 *
 		 * Gate on pending_respawns == 0: the probe's respawn thread
@@ -660,7 +660,7 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 		 * longer than the reporter tick (~1s), so without this guard the
 		 * next tick(s) still see cur_workers == 0 and launch additional
 		 * probes - the exact connection storm the single-probe design
-		 * exists to avoid.  One probe in flight is enough. */
+		 * exists to avoid. One probe in flight is enough. */
 		to_spawn = (fleet->pending_respawns == 0 &&
 		    (fleet->respawn_owed > 0 || pending > 0)) ? 1 : 0;
 	} else {
@@ -689,7 +689,7 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 		    respawn_worker_thread, fleet) == 0) {
 			(void)pthread_detach(rtid);
 			/* Drain backlog only on success; a failed create
-			 * leaves owed in place so we retry next tick.  A probe
+			 * leaves owed in place so we retry next tick. A probe
 			 * (owed may be 0) doesn't underflow the backlog. */
 			if (fleet->respawn_owed > 0)
 				fleet->respawn_owed--;
@@ -706,7 +706,7 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 	/*
 	 * Genuine dead-end abort: every worker gone, units still pending, NOT
 	 * in a cooldown pause, and no respawn is in flight - i.e. a probe
-	 * could not even be launched (pthread_create failing).  A backend
+	 * could not even be launched (pthread_create failing). A backend
 	 * stall is deliberately NOT this case: there we are in cooldown (or
 	 * have a probe pending), so we wait and retry indefinitely rather than
 	 * dropping the transfer.

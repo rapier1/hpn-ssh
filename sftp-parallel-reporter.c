@@ -20,7 +20,7 @@
  * sftp-parallel-reporter.c - the reporter thread for the parallel SFTP
  * orchestrator: progress aggregation, worker reaping and death
  * classification, respawn triggering, flare/CSV/fleet-sample
- * observability.  Split from sftp-parallel.c; moves are verbatim.
+ * observability. Split from sftp-parallel.c; moves are verbatim.
  */
 
 #include "includes.h"
@@ -106,8 +106,8 @@ parallel_stats_snapshot(struct sftp_parallel *fleet, uint64_t *bytes_out,
 
 /*
  * Classify and log how a reaped worker died, using the wait status plus
- * worker->doomed (did WE kill it?).  Diagnostic only - it changes no control
- * flow; the caller respawns regardless.  Death modes:
+ * worker->doomed (did WE kill it?). Diagnostic only - it changes no control
+ * flow; the caller respawns regardless. Death modes:
  *
  *   - doomed                  : the watchdog terminated it (reason already
  *                               logged when it was doomed).
@@ -146,7 +146,7 @@ classify_worker_death(const struct sftp_worker *worker, int have_status, int sta
 	 * own: startup deaths, dropped connections, slow-worker cycling)
 	 * heartbeat at debug only - they still count toward the ordinal
 	 * and the end-of-transfer summary, which remains the complete
-	 * record.  Rare/meaningful causes (wedge, peer-stall brake,
+	 * record. Rare/meaningful causes (wedge, peer-stall brake,
 	 * endgame stall, crashes) stay user-visible.
 	 */
 	if (worker->doomed) {
@@ -235,13 +235,13 @@ classify_worker_death(const struct sftp_worker *worker, int have_status, int sta
 
 	/*
 	 * One-time heads-up once the cumulative reconnect count crosses a
-	 * fleet-scaled threshold.  The per-respawn lines above show the churn
-	 * happening; this names it as a path-reliability concern.  Keyed on the
+	 * fleet-scaled threshold. The per-respawn lines above show the churn
+	 * happening; this names it as a path-reliability concern. Keyed on the
 	 * session-wide death_ordinal (survives per-worker respawn, unlike the
 	 * old per-struct reconnect_count which reset every respawn and so never
-	 * reached its threshold).  Fires ahead of the give-up thresholds
+	 * reached its threshold). Fires ahead of the give-up thresholds
 	 * (FLEET_ABORT_UNPRODUCTIVE_MULT / RESPAWN_MULTIPLIER); suppressed
-	 * during teardown.  Reporter thread only - no lock needed.
+	 * during teardown. Reporter thread only - no lock needed.
 	 */
 	if (fleet != NULL && !fleet->abort_flag && !fleet->stopped &&
 	    !fleet->churn_notice_emitted &&
@@ -255,7 +255,7 @@ classify_worker_death(const struct sftp_worker *worker, int have_status, int sta
 
 /*
  * Reap workers that have marked themselves exited (connection died,
- * fault-injected exit, or fatal protocol violation).  Every exit is
+ * fault-injected exit, or fatal protocol violation). Every exit is
  * involuntary - the orchestrator always respawns.
  *
  * Two phases for clean locking: collect-under-lock, then join-and-free
@@ -279,9 +279,9 @@ reporter_reap_exited_workers(struct sftp_parallel *fleet)
 		exited = worker->exited;
 		bt     = worker->bytes_total;
 		/* Capture bytes_total before the worker leaves the array
-		 * so the aggregate stays monotonic.  live_bytes was reset
+		 * so the aggregate stays monotonic. live_bytes was reset
 		 * to 0 at the worker's last completion so it is not
-		 * double-counted.  Same for the wired/unit counters - they
+		 * double-counted. Same for the wired/unit counters - they
 		 * used to die with the struct, undercounting every
 		 * post-respawn aggregate. */
 		if (exited) {
@@ -313,7 +313,7 @@ reporter_reap_exited_workers(struct sftp_parallel *fleet)
 		struct sftp_worker *worker = to_reap[i];
 		pthread_join(worker->tid, NULL);
 		/* Worker thread has exited; no concurrent writer, so this read
-		 * needs no lock.  Lifetime committed bytes feed the fleet-abort
+		 * needs no lock. Lifetime committed bytes feed the fleet-abort
 		 * unproductive-death streak below. */
 		uint64_t lifetime_bytes = worker->bytes_total;
 		if (worker->conn) sftp_free(worker->conn);
@@ -322,14 +322,14 @@ reporter_reap_exited_workers(struct sftp_parallel *fleet)
 		int s = 0, reaped = 0;
 		if (worker->ssh_pid > 0) {
 			/* Belt-and-suspenders: may already be dead from
-			 * SIGTERM above.  A child that self-exited is already a
+			 * SIGTERM above. A child that self-exited is already a
 			 * zombie, so this SIGKILL is a no-op and waitpid still
 			 * returns its real exit code. */
 			(void)kill(worker->ssh_pid, SIGKILL);
 			reaped = (waitpid(worker->ssh_pid, &s, 0) == worker->ssh_pid);
 		}
 		/* Classify and account EVERY reaped worker, not only those with
-		 * a live ssh_pid.  An in-array worker always has ssh_pid > 0
+		 * a live ssh_pid. An in-array worker always has ssh_pid > 0
 		 * today (set before insertion, cleared only at teardown
 		 * post-join), so the pid<=0 path is unreachable now - but if
 		 * that ever changes, still classify the death (no wait status)
@@ -339,7 +339,7 @@ reporter_reap_exited_workers(struct sftp_parallel *fleet)
 		    (reaped && WIFEXITED(s)) ? WEXITSTATUS(s) : -1;
 		/* Fleet-abort signal: a worker that died without ever committing
 		 * a byte, and not as a clean end-of-queue exit, is a respawn
-		 * that failed to take hold.  The streak resets in
+		 * that failed to take hold. The streak resets in
 		 * parallel_watchdog_sync_check on any sign of life. */
 		int clean = reaped && WIFEXITED(s) && WEXITSTATUS(s) == 0;
 		if (lifetime_bytes == 0 && !clean)
@@ -352,13 +352,13 @@ reporter_reap_exited_workers(struct sftp_parallel *fleet)
 }
 
 /*
- * Operator-facing flare for degraded episodes.  Called once per reporter
+ * Operator-facing flare for degraded episodes. Called once per reporter
  * slow-tick AFTER the watchdog and respawn dispatch, so cooldown state and
- * born_slow_accepting are fresh.  A "degraded episode" is any contiguous
+ * born_slow_accepting are fresh. A "degraded episode" is any contiguous
  * stretch where we are backing off respawns (cooldown active) or accepting
- * slow-but-working workers (born-slow gated off).  Edge-triggered: one notice
+ * slow-but-working workers (born-slow gated off). Edge-triggered: one notice
  * when it opens, a periodic reminder (escalating notice->warning) while it
- * lasts, a recovery notice when it closes.  Best-effort framing throughout -
+ * lasts, a recovery notice when it closes. Best-effort framing throughout -
  * a degraded episode is the transfer slowing down and adapting, NOT failing.
  * On a clean transfer degraded is always 0 and this is a no-op.
  */
@@ -390,7 +390,7 @@ reporter_flare(struct sftp_parallel *fleet)
 	}
 
 	if (!fleet->flare_in_episode) {
-		/* Rising edge: open an episode.  No countdown - the cooldown
+		/* Rising edge: open an episode. No countdown - the cooldown
 		 * level escalates/decays and isn't actionable; just the state. */
 		fleet->flare_in_episode = 1;
 		fleet->flare_episode_start_s = now_s;
@@ -435,13 +435,13 @@ reporter_flare(struct sftp_parallel *fleet)
 
 /*
  * Tail trend detector - phase B of the tail-elimination design
- * (2026-06-12): TELEMETRY ONLY.  Samples the fleet aggregate rate once
+ * (2026-06-12): TELEMETRY ONLY. Samples the fleet aggregate rate once
  * per reporter tick into a small ring; a would-arm EPISODE opens when
  * the decline/projection signals AND the structural conjunction hold
  * (queue empty, walker done, READY capacity, holder lagging the
- * busy-fleet median), and closes when any condition clears.  Episode
+ * busy-fleet median), and closes when any condition clears. Episode
  * boundaries are logged under HPN_PARALLEL_TRACE for tuning; nothing is
- * actuated.  Constants and rationale: sftp-parallel-internal.h.
+ * actuated. Constants and rationale: sftp-parallel-internal.h.
  */
 /* Median over a worker's personal rate window (all valid samples).
  * Returns 0 when the worker lacks WORKER_RATE_MIN_SAMPLES of history -
@@ -492,9 +492,9 @@ tail_quarter_median(const uint64_t *ring, int count, int idx, int newest)
 /*
  * Phase C (HPNTailRedistribute): a confirmed episode asks the slowest
  * lagging holder to cooperatively yield its unstarted remainder for
- * redistribution.  One yield per episode latch; fires only when the
+ * redistribution. One yield per episode latch; fires only when the
  * holder's own projected remaining tail is long enough to be worth the
- * handoff.  No-op unless the env gate armed it at parallel start.
+ * handoff. No-op unless the env gate armed it at parallel start.
  */
 static void
 tail_fire_yield(struct sftp_parallel *fleet, struct sftp_worker *tgt,
@@ -549,7 +549,7 @@ tail_detector_tick(struct sftp_parallel *fleet, uint64_t bytes_now)
 		uint64_t worst_proj_sec = 0;
 		uint64_t baseline = 0, worst_holder_med = 0;
 		/* Phase C yield target: the SLOWEST lagging holder (and its
-		 * own projection).  Captured under workers_mu; safe to use
+		 * own projection). Captured under workers_mu; safe to use
 		 * after unlock because reaping runs on this same thread. */
 		struct sftp_worker *yield_tgt = NULL;
 		uint64_t yield_tgt_med = 0, yield_tgt_proj = 0;
@@ -677,7 +677,7 @@ tail_detector_tick(struct sftp_parallel *fleet, uint64_t bytes_now)
 				 * Persistence gate: contention reshuffles
 				 * and post-respawn ramps look identical to
 				 * a straggler for a few seconds; only a
-				 * condition that HOLDS is actionable.  The
+				 * condition that HOLDS is actionable. The
 				 * episode start backdates to when the lag
 				 * began, so reported durations stay true.
 				 */
@@ -730,10 +730,10 @@ tail_detector_tick(struct sftp_parallel *fleet, uint64_t bytes_now)
 
 /*
  * ENV-VAR HPN_PARALLEL_TRACE per-tick fleet sample (2026-06-05 midstream-freeze
- * probe).  One line: absolute time, work-queue depth, walker phase, then each
+ * probe). One line: absolute time, work-queue depth, walker phase, then each
  * worker's phase + cumulative bytes + ssh child pid, plus the fleet total.
  * Per-worker and total bytes are cumulative, so consecutive samples give the
- * per-worker and fleet throughput series.  The pid lets us correlate a worker
+ * per-worker and fleet throughput series. The pid lets us correlate a worker
  * with its transport's HPN TCPSAMPLE lines (which carry getpid()).
  */
 static void
@@ -781,7 +781,7 @@ reporter_emit_fleetsample(struct sftp_parallel *fleet)
  * Leave the resume-check stretch: restore the transfer meter's label and
  * total (the stretch swapped them for the "resume check" sub-meter), clear
  * the frame flag, and restart the display ratchet - hash bytes are not
- * transfer bytes, so the published counter must not carry over.  Idempotent.
+ * transfer bytes, so the published counter must not carry over. Idempotent.
  */
 static void
 resume_stretch_restore(struct sftp_parallel *fleet)
@@ -812,7 +812,7 @@ parallel_reporter_thread(void *arg)
 
 		/* Propagate caller's interrupt signal (e.g. SIGINT / Ctrl+C).
 		 * sftp_parallel_abort is idempotent; calling it every tick while
-		 * the flag stays set is harmless.  Record the CAUSE first so
+		 * the flag stays set is harmless. Record the CAUSE first so
 		 * the abort fallout is reported as an interrupt, not errors. */
 		if (fleet->ext_interrupt_flag != NULL && *fleet->ext_interrupt_flag) {
 			fleet->abort_user = 1;
@@ -825,12 +825,12 @@ parallel_reporter_thread(void *arg)
 		 * session dies (^C on a -R launcher), no signal crosses the
 		 * ssh hop - the client sends none on death, sshd refuses
 		 * session signals, and sshd never kills no-tty children on
-		 * connection loss.  The only observable is the session's
+		 * connection loss. The only observable is the session's
 		 * plumbing dying: sshd-session's exit closes the read ends of
-		 * BOTH our stdout and stderr together.  Poll both (no I/O, no
+		 * BOTH our stdout and stderr together. Poll both (no I/O, no
 		 * display dependency - works under -q with no meter): both
 		 * dead means our session is gone, so cancel instead of
-		 * orphaning a transfer the user just aborted.  One dead pipe
+		 * orphaning a transfer the user just aborted. One dead pipe
 		 * alone (stdout piped to a reader that exited) keeps stock
 		 * pass-through behavior.
 		 */
@@ -856,13 +856,13 @@ parallel_reporter_thread(void *arg)
 		parallel_stats_snapshot(fleet, &bytes, NULL, NULL);
 		if (fleet->verify_phase_active && fleet->verify_total_units > 0) {
 			resume_stretch_restore(fleet);	/* safety: never both */
-			/* Post-transfer verify phase: byte-granular meter.  Counter
+			/* Post-transfer verify phase: byte-granular meter. Counter
 			 * = bytes of fully-verified files (verify_done_bytes) + every
 			 * worker's in-flight count for the file it is hashing right
 			 * now (fed each second by the server hash heartbeat / local
-			 * read-back).  This advances smoothly even when a single
+			 * read-back). This advances smoothly even when a single
 			 * huge file is the whole phase, instead of the old file-count
-			 * fraction that jumped 0->100% at completion.  Snap to the
+			 * fraction that jumped 0->100% at completion. Snap to the
 			 * exact total once all units are done so the bar lands at
 			 * 100% (the last heartbeat may trail the final bytes). */
 			uint64_t done_units = __atomic_load_n(
@@ -876,8 +876,8 @@ parallel_reporter_thread(void *arg)
 				 * xreallocarray(fleet->workers) (and the reap loop can
 				 * remove/free a worker) during the verify phase -
 				 * a worker whose conn drops mid-hash is reaped and
-				 * respawned.  Iterating workers[]/worker->conn unlocked
-				 * would race that realloc/free (UAF/OOB).  Mirror
+				 * respawned. Iterating workers[]/worker->conn unlocked
+				 * would race that realloc/free (UAF/OOB). Mirror
 				 * the sibling fleet-sample/reap/CSV loops, which all
 				 * hold this lock; the body is only a cheap atomic
 				 * getter. */
@@ -902,11 +902,11 @@ parallel_reporter_thread(void *arg)
 			/*
 			 * Resume-check stretch (-Z UX): no transfer byte has
 			 * moved yet, but workers may be hashing existing
-			 * partials (chunked resume).  Render that as a
+			 * partials (chunked resume). Render that as a
 			 * "resume check" sub-meter - total from the conn
 			 * hash-op markers, progress from the same inflight
 			 * feed the verify meter uses - instead of a frozen
-			 * 0% transfer bar.  Markers self-clear on staleness,
+			 * 0% transfer bar. Markers self-clear on staleness,
 			 * so a finished or abandoned hash drops out alone.
 			 * Same workers_mu discipline as the sibling loops.
 			 */
@@ -957,15 +957,15 @@ parallel_reporter_thread(void *arg)
 			    (off_t)(bytes - fleet->progress_bytes_baseline) : 0;
 		}
 		/*
-		 * Monotonic publish.  The raw aggregate steps BACKWARD when a
+		 * Monotonic publish. The raw aggregate steps BACKWARD when a
 		 * worker dies or a unit is requeued mid-transfer: its live_bytes
-		 * leave the sum until the redo re-transfers them.  Publishing
+		 * leave the sum until the redo re-transfers them. Publishing
 		 * the dip makes the meter show a 0-rate tick and then absorb the
 		 * whole recovery in one interval - an impossible rate spike
-		 * (0 then multi-GB/s).  Ratchet the DISPLAY counter instead: the
+		 * (0 then multi-GB/s). Ratchet the DISPLAY counter instead: the
 		 * meter holds through the redo and resumes at the true rate.
 		 * Detectors are unaffected - they read the raw snapshot (bytes),
-		 * not this counter.  Meter restarts (new command, verify phase)
+		 * not this counter. Meter restarts (new command, verify phase)
 		 * reset the counter outside this tick, so the ratchet only
 		 * applies within one meter's lifetime.
 		 */
@@ -979,7 +979,7 @@ parallel_reporter_thread(void *arg)
 			fleet->aggregate_progress_counter = newpos;
 		/* HPN status relay: keep the frame emitter's fleet telemetry
 		 * fresh (stored unconditionally; only read when frame mode
-		 * is armed).  Same lock discipline as the sibling fleet
+		 * is armed). Same lock discipline as the sibling fleet
 		 * loops. */
 		{
 			u_int fr_active = 0, fr_stalled = 0;
@@ -1063,14 +1063,14 @@ parallel_reporter_thread(void *arg)
 			(void)parallel_watchdog_check(fleet);
 
 			/* SIGTERM any respawn wedged in its handshake past the
-			 * stall deadline.  The blocked spawn thread cannot time
+			 * stall deadline. The blocked spawn thread cannot time
 			 * itself out, so the reporter does it: otherwise the
 			 * stalled respawn pins pending_respawns and deadlocks the
 			 * abort net (fatal at -j1). */
 			parallel_respawn_sweep_stalled(fleet);
 
 			/* Move any worker re-queue overflow back into fleet->q as it
-			 * frees up.  Workers park here (instead of blocking) when
+			 * frees up. Workers park here (instead of blocking) when
 			 * a re-queue hits a full queue; draining from the reporter
 			 * is what keeps that non-blocking path live. */
 			parallel_retry_overflow_drain(fleet);
@@ -1088,7 +1088,7 @@ parallel_reporter_thread(void *arg)
 				break;
 
 			/* Operator flare: episode-level notices for degraded
-			 * stretches (cooldown / accepting slow workers).  Runs
+			 * stretches (cooldown / accepting slow workers). Runs
 			 * after dispatch so cooldown + born_slow_accepting are
 			 * fresh; no-op on a clean transfer. */
 			reporter_flare(fleet);

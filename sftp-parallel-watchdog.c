@@ -19,8 +19,46 @@
 /*
  * sftp-parallel-watchdog.c - worker health policy for the parallel SFTP
  * orchestrator: per-tick inactivity/throughput heuristics, doom
- * decisions and SIGKILL escalation, fleet sync-stall detection.  Split
+ * decisions and SIGKILL escalation, fleet sync-stall detection. Split
  * from sftp-parallel.c; moves are verbatim.
+ */
+
+/*
+ * -- Worker state lattice ---------------------------------------------
+ *
+ * Three orthogonal state machines govern a worker's lifecycle. struct
+ * sftp_worker carries one flag for each, tagged (A)/(B)/(C) at the
+ * member; this file drives (A) and (B) and consumes (C).
+ *
+ * (A) Liveness classification (watchdog-written):
+ *       HEALTHY -> STALLED -> DEAD
+ *     De-escalation (DEAD -> HEALTHY) never happens; once the watchdog
+ *     declares DEAD, that worker is doomed and reaped. Set under
+ *     workers_mu; mostly diagnostic.
+ *
+ * (B) Doom progression (watchdog-owned):
+ *       not doomed -> doomed (SIGTERM sent) -> [SIGKILL escalation if
+ *       not yet exited]
+ *     The doomed flag prevents double-SIGTERM across ticks. doom_ms is
+ *     the SIGTERM timestamp, consulted by the SIGKILL-escalation
+ *     deadline.
+ *
+ * (C) Exit lifecycle (worker-owned):
+ *       alive -> exited
+ *     Set by the worker thread itself just before pthread_exit; read
+ *     by the reporter for pthread_join + reap. Every reap is followed
+ *     by a respawn - there is no voluntary exit path.
+ *
+ * Valid combinations:
+ *   (HEALTHY, not doomed, not exited)  - normal running
+ *   (STALLED, not doomed, not exited)  - silent but not killed
+ *   (DEAD,    doomed,     not exited)  - SIGTERMed, awaiting thread exit
+ *   (DEAD,    doomed,     exited)      - ready to reap + respawn
+ *
+ * Brief race window after the watchdog's transition: (DEAD, not
+ * doomed, not exited) holds for a few lines until SIGTERM is sent; no
+ * other thread observes it (the transition and SIGTERM happen in the
+ * same workers_mu critical section).
  */
 
 #include "includes.h"
@@ -79,14 +117,14 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 	/* First pass: compute per-worker raw kbps, update EMA, find maxima.
 	 *
 	 * Use bytes_total + live_bytes (continuous progress) rather than
-	 * bytes_total alone (file-completion-granular).  Without live_bytes,
+	 * bytes_total alone (file-completion-granular). Without live_bytes,
 	 * a worker mid-transfer shows bytes_delta=0 for several seconds then
 	 * a spike at completion - the outlier ticks oscillate and the consec
 	 * counter never sticks.
 	 *
 	 * EMA smoothing (alpha default 0.2, ~5-tick time constant) prevents
 	 * a single-tick burst from one worker from instantly spiking the
-	 * threshold and falsely classifying slower-but-healthy peers.  The
+	 * threshold and falsely classifying slower-but-healthy peers. The
 	 * raw max is kept separately so the path-health gate (step 3) still
 	 * reacts immediately to actual path state. */
 	for (int i = 0; i < fleet->num_workers; i++) {
@@ -114,7 +152,7 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 		worker->tput_check_bytes = now_bytes;
 		worker->tput_check_ms = now;
 
-		/* EMA update.  Skip when the worker has no unit in flight so
+		/* EMA update. Skip when the worker has no unit in flight so
 		 * idle gaps between files don't decay the EMA toward zero and
 		 * produce spurious outlier warnings when the next unit starts.
 		 * Cold-start: seed EMA from first real measurement so a fast
@@ -125,7 +163,7 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 		 * New-unit detection: when unit_start_ms changes (worker picked
 		 * up a fresh work unit), reset EMA and warmup so the EMA builds
 		 * from actual current throughput rather than the stale frozen
-		 * value.  Without this reset the frozen healthy EMA makes the
+		 * value. Without this reset the frozen healthy EMA makes the
 		 * else-branch clear tput_outlier_ticks on the first tick of every
 		 * new unit, preventing the consec counter from ever reaching the
 		 * STALLED threshold on a persistently slow worker. */
@@ -221,11 +259,11 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 		}
 
 		if (in_flight == 0) {
-			/* Pause - don't reset.  A persistently slow worker
+			/* Pause - don't reset. A persistently slow worker
 			 * oscillates between in-flight and idle between units;
 			 * resetting here wipes the accumulated consec count and
 			 * prevents the detector from ever reaching the STALLED
-			 * threshold.  Skipping the tick (without clearing) lets
+			 * threshold. Skipping the tick (without clearing) lets
 			 * consec carry across unit boundaries, so a worker that
 			 * is consistently slow across multiple units gets caught.
 			 * The counter is cleared only when EMA >= threshold
@@ -234,9 +272,9 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 		}
 
 		/*
-		 * TCP slow-start gate.  A worker must transfer at least
+		 * TCP slow-start gate. A worker must transfer at least
 		 * (peer-throughput × path_rtt × RAMP_RTTS) bytes before its
-		 * EMA is comparable to the path max.  Without this, a fresh
+		 * EMA is comparable to the path max. Without this, a fresh
 		 * worker is condemned as an outlier while its cwnd is still
 		 * ramping - the very failure mode that drove respawn-churn
 		 * loops when one worker died and its replacement got killed
@@ -250,7 +288,7 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 			 * max_ema_kbps is KiB/s (bytes/s / 1024; see the raw-kbps
 			 * computation in the first pass), so the ramp-window byte
 			 * budget is KiB/s * 1024 (-> bytes/s) * path_rtt_us / 1e6
-			 * (-> bytes per RTT) * RAMP_RTTS.  The old "/ 8000" assumed
+			 * (-> bytes per RTT) * RAMP_RTTS. The old "/ 8000" assumed
 			 * the rate was in kilobits/s, which made warmup_bytes ~8x
 			 * too small and lifted the slow-start gate far too early -
 			 * the exact premature-outlier-kill / respawn-churn this
@@ -289,7 +327,7 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 			/* Guard now > unit_start before the unsigned subtraction:
 			 * the worker can store a fresh unit_start_ms after we
 			 * sampled `now`, so unit_start > now would wrap to a huge
-			 * delta and spuriously trip the cap.  Matches the sibling
+			 * delta and spuriously trip the cap. Matches the sibling
 			 * since_unit_start_ms guard in watchdog_check_one_worker. */
 			int past_time_cap = (unit_start > 0 && now > unit_start &&
 			    now - unit_start >
@@ -302,7 +340,7 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 		}
 
 		/* Hash-op gate: a worker mid-hash (fresh marker on its conn)
-		 * is byte-silent by design - zero kbps is not evidence.  Zero
+		 * is byte-silent by design - zero kbps is not evidence. Zero
 		 * BOTH streak counters rather than merely holding the kill:
 		 * ticks accumulated across a long hash would otherwise fire
 		 * the instant the marker goes stale (~3s after the engine
@@ -332,10 +370,10 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 
 		/* Born-slow tracking: per-worker counter of consecutive ticks
 		 * the EMA stayed below an ABSOLUTE floor (a fraction of the
-		 * configured tput_path_healthy_kbps).  Unlike the peer-based
+		 * configured tput_path_healthy_kbps). Unlike the peer-based
 		 * outlier above, this fires even when all peers are slow -
 		 * the case where a connection comes up in a bad state from
-		 * the start and pipelining can't lift it.  The kill itself
+		 * the start and pipelining can't lift it. The kill itself
 		 * happens in parallel_watchdog_check; we just track the
 		 * streak here. */
 		{
@@ -354,15 +392,15 @@ watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 }
 
 /*
- * Synchronous-stall detector.  Called once per slow-tick (~1s).
+ * Synchronous-stall detector. Called once per slow-tick (~1s).
  *
  * Measures aggregate bytes transferred (completions + in-progress writes)
- * across all live workers since the previous slow-tick.  If the delta is
+ * across all live workers since the previous slow-tick. If the delta is
  * zero while at least one worker has a unit in flight, it is a synchronous
  * stall: all writers hit the same storage bottleneck simultaneously.
  *
  * Keeps a rolling window of SYNC_STALL_WINDOW slow-ticks and logs the
- * stall fraction when the window closes.  Observation-only for now;
+ * stall fraction when the window closes. Observation-only for now;
  * the fraction is intended as a future congestion-aware scale-down signal.
  */
 void
@@ -393,7 +431,7 @@ parallel_watchdog_sync_check(struct sftp_parallel *fleet)
 	fleet->sync_stall_prev_bytes = now_bytes;
 
 	/* First sample: prev_bytes was 0, so delta spans all bytes ever
-	 * moved - not an interval.  Skip both accruals below via a
+	 * moved - not an interval. Skip both accruals below via a
 	 * dedicated flag, NOT the window position: window_pos wraps to 0
 	 * every SYNC_STALL_WINDOW ticks, and guarding on it zeroed
 	 * noprogress_consec_ticks at each wrap - capping it at
@@ -407,7 +445,7 @@ parallel_watchdog_sync_check(struct sftp_parallel *fleet)
 	pthread_mutex_unlock(&fleet->pending_mu);
 
 	/* Sync-stall observer (write-cache saturation signal): zero aggregate
-	 * progress WHILE a unit is in flight.  First tick: prev_bytes was 0 so
+	 * progress WHILE a unit is in flight. First tick: prev_bytes was 0 so
 	 * delta = all bytes ever, not a stall. */
 	int stalled_now = (!first_tick && delta == 0 &&
 	    total_in_flight > 0);
@@ -415,7 +453,7 @@ parallel_watchdog_sync_check(struct sftp_parallel *fleet)
 		fleet->sync_stall_ticks++;
 
 	/* Fleet-abort no-progress window: zero aggregate progress while work
-	 * REMAINS and no worker is heart-beating.  Unlike the observer above this
+	 * REMAINS and no worker is heart-beating. Unlike the observer above this
 	 * does NOT require a unit in flight, so it still accrues when every worker
 	 * is failing to connect (bad keys, dead backend) and holds no unit - the
 	 * case total_in_flight == 0 would otherwise mask. */
@@ -427,17 +465,17 @@ parallel_watchdog_sync_check(struct sftp_parallel *fleet)
 
 	/* Any sign of life resets the unproductive-death streak: a worker moved
 	 * bytes this tick, or one is heart-beating through a long verify/hash
-	 * (watchdog-paused).  Either way the fleet is not dead. */
+	 * (watchdog-paused). Either way the fleet is not dead. */
 	if (delta > 0 || any_paused)
 		fleet->unproductive_deaths = 0;
 
 	/*
-	 * Fleet abort.  Give up on the whole transfer only when EVERY base
+	 * Fleet abort. Give up on the whole transfer only when EVERY base
 	 * condition holds: zero aggregate fleet progress for the window, NO
 	 * worker heart-beating (a verify/hash would hold the watchdog pause),
 	 * FLEET_ABORT_UNPRODUCTIVE_MULT * num_streams consecutive respawns that
 	 * each died without producing a byte (reconnects are not taking hold), and
-	 * work still pending.  A single worker still moving data or heart-beating
+	 * work still pending. A single worker still moving data or heart-beating
 	 * keeps the
 	 * transfer alive - the no-progress window and the unproductive-death
 	 * streak both reset on any sign of life above.
@@ -473,7 +511,7 @@ parallel_watchdog_sync_check(struct sftp_parallel *fleet)
 }
 
 /*
- * Per-worker health classification and dooming action.  Returns 1 if
+ * Per-worker health classification and dooming action. Returns 1 if
  * the worker was DEAD (or just transitioned to DEAD this tick), 0
  * otherwise - caller uses this to drive the workers_mu "any_dead"
  * tally.
@@ -498,7 +536,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 	 * toward reap - nothing the inactivity heuristics decide matters
 	 * anymore, and re-evaluating them re-triggers the doom branches
 	 * every tick (observed: one ENDGAME-REAP log line per second
-	 * against a worker that cannot die mid-phase).  Doom is
+	 * against a worker that cannot die mid-phase). Doom is
 	 * once-per-death; only the SIGKILL escalation below still runs. */
 	if (worker->doomed) {
 		pthread_mutex_unlock(&worker->mu);
@@ -520,13 +558,13 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 	 * (resume check / verify / repair) - byte-silent by design but
 	 * provably alive, since the marker is refreshed every second by the
 	 * server hash heartbeat (or per-chunk locally) and self-clears ~3s
-	 * after the engine stops.  The watchdog pause already gates the
+	 * after the engine stops. The watchdog pause already gates the
 	 * per-tick classifiers below while its lease is held; this marker
 	 * adds what the pause does not cover: the throughput-streak
 	 * accumulators in watchdog_sample_throughput (which never consult
 	 * the pause), the short tail between the engine's explicit
 	 * watchdog_resume and the first post-hash bytes, and defense in
-	 * depth should a lease ever lapse mid-op.  Hard evidence (ssh child
+	 * depth should a lease ever lapse mid-op. Hard evidence (ssh child
 	 * exit, reap) is unaffected; a genuinely wedged hash stops
 	 * refreshing and the gate reopens within seconds.
 	 */
@@ -540,14 +578,14 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 
 	/*
 	 * Effective silence: time since we last observed forward
-	 * progress in bytes.  Tracks (bytes_total + live_bytes), which
+	 * progress in bytes. Tracks (bytes_total + live_bytes), which
 	 * climbs continuously during an active transfer regardless of
-	 * unit size.  Replaces the older completion-based timer that
+	 * unit size. Replaces the older completion-based timer that
 	 * misfired on whole-file uploads of large files (a 10 GiB file
 	 * at 2 Gbps takes ~50 s - close to STALL_THRESHOLD_SEC, any
 	 * writeback dip would trip a false DEAD).
 	 *
-	 * Updated only by this thread; no atomics needed.  On first
+	 * Updated only by this thread; no atomics needed. On first
 	 * tick last_progress_ms is 0, so we seed it from now without
 	 * touching last_progress_bytes (which is also 0).
 	 */
@@ -561,7 +599,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 	 * while the fleet idles at the prompt between commands, so without
 	 * this a worker dispatching the FIRST unit of the next transfer
 	 * carries the whole idle gap as accrued silence - and the endgame
-	 * reaper fires at 0% of a fresh put on a warm fleet.  (Sibling of
+	 * reaper fires at 0% of a fresh put on a warm fleet. (Sibling of
 	 * the paused-tick re-seed below: silence is measured from the most
 	 * recent of byte-progress / held lease / unit dispatch.) */
 	if (unit_start > worker->last_progress_ms)
@@ -577,9 +615,9 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		 *
 		 * waitpid(WNOHANG|WNOWAIT) returns the pid if the child
 		 * has exited (including zombies), 0 if it is still running,
-		 * and -1/ECHILD if it has already been reaped.  WNOWAIT
+		 * and -1/ECHILD if it has already been reaped. WNOWAIT
 		 * leaves the zombie in place so the reap loop's blocking
-		 * waitpid still succeeds.  kill(0) alone misses the
+		 * waitpid still succeeds. kill(0) alone misses the
 		 * SIGKILL-then-zombie case because a zombie's pid is still
 		 * present in the process table. */
 		if (worker->ssh_pid > 0) {
@@ -597,9 +635,9 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		 * Watchdog pause: a code path on the worker side (typically
 		 * a verify-hash phase, but the primitive is generic) has
 		 * declared a window of legitimate non-byte-transfer work via
-		 * sftp_hpn_watchdog_pause().  Suppress every inactivity-based
+		 * sftp_hpn_watchdog_pause(). Suppress every inactivity-based
 		 * heuristic below - none of them can tell "stuck" from
-		 * "legitimately quiet" during the declared window.  The
+		 * "legitimately quiet" during the declared window. The
 		 * SSH-child-gone check above still ran; that's the only
 		 * positive-death signal and never gets suppressed.
 		 *
@@ -614,7 +652,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 				 * the silence clock so that when the lease
 				 * ends, silence is measured from lease END,
 				 * not from the last byte moved BEFORE the
-				 * quiet phase.  Without this, a verify that
+				 * quiet phase. Without this, a verify that
 				 * hashes for minutes carries a minutes-stale
 				 * clock into its first post-hash tick - the
 				 * suppression vanishes with the lease, the
@@ -632,7 +670,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		 * flagged stuck is now making progress ON THIS UNIT, the range
 		 * unstuck - clear the flag so a later born-dead on the same
 		 * numeric offset (e.g. a different file in a -r transfer) is
-		 * judged fresh rather than wrongly suppressed.  Key on
+		 * judged fresh rather than wrongly suppressed. Key on
 		 * w_live_bytes (current-unit progress) ONLY: w_bytes_total is
 		 * lifetime, and a PROVEN worker handed the stuck range always
 		 * has it > 0 from its earlier range, which would clear the
@@ -648,13 +686,13 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		}
 
 		/*
-		 * Born-dead fast-kill.  Worker popped a unit but has zero
+		 * Born-dead fast-kill. Worker popped a unit but has zero
 		 * forward progress (no completions, no bytes ever, no live
-		 * bytes on the current unit) for BORN_DEAD_KILL_SEC.  This is
+		 * bytes on the current unit) for BORN_DEAD_KILL_SEC. This is
 		 * unambiguous: the SSH session reached the SFTP layer (the
 		 * worker thread popped a unit) but no bytes have flowed at
-		 * all.  Almost always a server-side channel-window freeze
-		 * (e.g. Lustre OST stall).  Kill fast so the respawn slot
+		 * all. Almost always a server-side channel-window freeze
+		 * (e.g. Lustre OST stall). Kill fast so the respawn slot
 		 * gets a fresh SSH session into the same dst - usually that
 		 * one lands on a healthier server-side path and recovers the
 		 * capacity within ~5s instead of ~24s.
@@ -670,13 +708,13 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		 *    has passed that auth + first OPEN should have completed
 		 */
 		/*
-		 * Born-dead eligibility.  A FRESH worker (never moved a byte)
-		 * is the classic case.  But a PROVEN worker that took over an
+		 * Born-dead eligibility. A FRESH worker (never moved a byte)
+		 * is the classic case. But a PROVEN worker that took over an
 		 * already-flagged stuck range is the case scan-idle creates:
 		 * the deferred respawn routes the requeued stuck range onto an
 		 * idle proven worker (bytes_total > 0), which is otherwise
 		 * born-dead-immune - so the same-offset cascade never forms
-		 * and the suppression never fires.  Make such a worker
+		 * and the suppression never fires. Make such a worker
 		 * eligible too (zero progress on the CURRENT unit, on the
 		 * known-stuck offset), without touching any byte counter.
 		 */
@@ -693,7 +731,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 			 * landed on this exact range_offset, so the range is
 			 * stuck server-side, not the connection - killing
 			 * again (and reassigning to yet another worker) just
-			 * feeds the cascade.  Suppress the fast-kill and WAIT;
+			 * feeds the cascade. Suppress the fast-kill and WAIT;
 			 * the silence/isolation brake below stays the backstop
 			 * if the connection really is dead.
 			 */
@@ -737,15 +775,15 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		    effective_silence_ms > 0) {
 			/*
 			 * Isolation: the queue is empty but this worker still
-			 * has in-flight units (keeping pending > 0).  No other
+			 * has in-flight units (keeping pending > 0). No other
 			 * worker can take over - if it never progresses,
 			 * sftp_parallel_wait hangs forever, so this is the one
 			 * silence path that MUST eventually reap even the last
-			 * worker.  Under wait-not-kill we are patient about it:
+			 * worker. Under wait-not-kill we are patient about it:
 			 * reap only at the WORKER_SILENCE_BRAKE_SEC backstop
 			 * (above the transport's peer-stall brake), letting a
 			 * recoverable stall on the last unit drain rather than
-			 * churning a respawn into the same backend.  A last
+			 * churning a respawn into the same backend. A last
 			 * worker stuck at the START of a unit (0 bytes ever) is
 			 * still caught fast by born-dead above; this backstop is
 			 * for one that produced, then went silent mid-stream.
@@ -785,7 +823,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		 * Adaptive throughput-outlier flag. tput_outlier_ticks is
 		 * set by watchdog_sample_throughput above and is non-zero
 		 * only when (a) the feature is enabled and (b) the fastest
-		 * worker meets the path-healthy floor.  It surfaces workers
+		 * worker meets the path-healthy floor. It surfaces workers
 		 * running far below their siblings - the cwnd-collapse
 		 * signature the time-based detector misses because such a
 		 * worker still completes the occasional file, just slowly.
@@ -796,12 +834,12 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		 * their siblings run at line rate (observed 2026-07-09: 2 of
 		 * 4 range-split workers at ~20 Mbps against ~500 Mbps peers,
 		 * silence=0s, actively transferring - the old kill here
-		 * aborted the whole single-file transfer).  A respawn
+		 * aborted the whole single-file transfer). A respawn
 		 * inherits the same contention, so killing buys nothing and
-		 * risks the transfer.  Genuinely degraded sessions are still
+		 * risks the transfer. Genuinely degraded sessions are still
 		 * killed by born-slow below (absolute floor + healthy-peer +
 		 * cooldown gates); genuinely wedged ones by the silence
-		 * paths above.  STALLED keeps the condition visible in the
+		 * paths above. STALLED keeps the condition visible in the
 		 * reporter's worker telemetry.
 		 */
 		if (next == WORKER_HEALTHY && !hashing &&
@@ -815,20 +853,20 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		}
 
 		/*
-		 * Born-slow fast-kill.  A connection that came up in a low-
+		 * Born-slow fast-kill. A connection that came up in a low-
 		 * cwnd / small-recv-window state and never recovers presents
 		 * as a worker whose EMA throughput stays persistently below a
-		 * small fraction of the healthy floor.  Killing triggers the
+		 * small fraction of the healthy floor. Killing triggers the
 		 * normal respawn machinery; a fresh SSH session may land in a
 		 * healthier TCP state.
 		 *
 		 * Gated two ways (see the BORN_SLOW_* comment block): fire only
 		 * when a healthy peer exists (this worker is a true outlier, not
 		 * part of a whole-fleet stall) AND only when no respawn cooldown
-		 * is active.  Repeated born-slow kills are respawns, so they push
+		 * is active. Repeated born-slow kills are respawns, so they push
 		 * respawn_epoch_count and trip the escalating cooldown, which
 		 * then suppresses born-slow and lets the slow workers run
-		 * (best-effort) until the path recovers.  No separate budget.
+		 * (best-effort) until the path recovers. No separate budget.
 		 */
 		if (next != WORKER_DEAD
 		    && !worker->doomed
@@ -856,7 +894,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 				doom_reason = "born_slow";
 			} else {
 				/* Gated off: no healthy peer (whole-fleet stall) or a
-				 * cooldown is active.  Accept this slow-but-working
+				 * cooldown is active. Accept this slow-but-working
 				 * worker rather than churning a respawn; count it so
 				 * reporter_flare can surface "accepting N slow
 				 * worker(s)" - also the live signal for whether this
@@ -901,10 +939,10 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 		}
 		/*
 		 * Past this point: state-transition logging, doom (SIGTERM),
-		 * and SIGKILL escalation.  All three honor whatever value
+		 * and SIGKILL escalation. All three honor whatever value
 		 * `next` has now (whether set by an inactivity heuristic
 		 * above OR by the SSH-child-gone check, which fires
-		 * regardless of pause).  None of them is an inactivity
+		 * regardless of pause). None of them is an inactivity
 		 * inference, so pause is no longer relevant.
 		 */
 		if (next != prev) {
@@ -992,9 +1030,9 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 	/* SIGKILL escalation: if a doomed worker hasn't exited within
 	 * SIGKILL_ESCALATION_SEC, the SSH child is hung in its clean-
 	 * shutdown path (broken socket) and the worker thread is blocked
-	 * on its stdout pipe.  SIGKILL closes the pipes immediately, the
+	 * on its stdout pipe. SIGKILL closes the pipes immediately, the
 	 * worker thread sees EOF/EPIPE on its next I/O call, sets
-	 * exited=1, and gets reaped.  Without this we deadlock: the
+	 * exited=1, and gets reaped. Without this we deadlock: the
 	 * SIGKILL-on-reap path is gated on exited=1. */
 	if (worker->doomed && !worker->exited && worker->doom_ms > 0 && worker->ssh_pid > 0 &&
 	    now - worker->doom_ms >
@@ -1037,7 +1075,7 @@ parallel_watchdog_check(struct sftp_parallel *fleet)
 	pthread_mutex_lock(&fleet->workers_mu);
 
 	/* Endgame-idle gate: walker done, queue drained, and >=1 worker holds
-	 * no in-flight unit (idle in pop, free to take over).  Only then does
+	 * no in-flight unit (idle in pop, free to take over). Only then does
 	 * the per-worker isolation branch fast-reap a stuck straggler. */
 	int walker_done = (__atomic_load_n(&fleet->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE);
@@ -1053,7 +1091,7 @@ parallel_watchdog_check(struct sftp_parallel *fleet)
 	int endgame_idle = (walker_done && !queue_has_work && n_idle > 0);
 
 	/* Adaptive throughput sample for outlier detection (no-op if
-	 * cfg.tput_path_healthy_kbps == 0).  Sets worker->tput_outlier_ticks. */
+	 * cfg.tput_path_healthy_kbps == 0). Sets worker->tput_outlier_ticks. */
 	watchdog_sample_throughput(fleet, now);
 
 	for (int i = 0; i < fleet->num_workers; i++) {

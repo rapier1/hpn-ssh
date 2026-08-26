@@ -24,17 +24,17 @@
  * A dead connection propagates up through execute_unit back to the worker loop,
  * which re-queues the in-flight unit (if under MAX_RETRIES) and then exits.
  *
- * MAX_RETRIES = Retry budget per work unit.  Default 3 attempts (1st + 2 retries).
+ * MAX_RETRIES = Retry budget per work unit. Default 3 attempts (1st + 2 retries).
  *
  * Configured via ssh_config HPNMaxRetries copied to pcfg->max_retries.
  * Valid range is [1, 20]:
- *   - 1 = no retries (one attempt total).  Useful for diagnosing
+ *   - 1 = no retries (one attempt total). Useful for diagnosing
  *     transient-vs-permanent failures: every failure is final.
- *   - 3 = default.  Covers ordinary network hiccups; doesn't punish
+ *   - 3 = default. Covers ordinary network hiccups; doesn't punish
  *     permanent failures (permission denied, disk full) with much
  *     wasted retry time.
- *   - 20 = upper bound.  For demonstrably flaky networks where the
- *     transport layer hasn't yet self-recovered.  Above this the
+ *   - 20 = upper bound. For demonstrably flaky networks where the
+ *     transport layer hasn't yet self-recovered. Above this the
  *     retry storm itself becomes the load problem.
  *
  * The reporter's watchdog detects dead workers via kill(0) probes and elapsed
@@ -101,7 +101,7 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
 		return base;
 
 	target = (cfg->bundle_size > 0)
-	    ? cfg->bundle_size : BUNDLE_TARGET_BYTES;
+	    ? cfg->bundle_size : BUNDLE_TARGET_BYTES_DEFAULT;
 	per_bundle = (size_t)(target / BUNDLE_QUEUE_FILE_HINT);
 	if (per_bundle < UPLOAD_BATCH_SIZE)
 		per_bundle = UPLOAD_BATCH_SIZE;
@@ -119,15 +119,15 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
 
 /*
  * Ceiling on outstanding FILES, for a producer that enumerates far faster
- * than the fleet drains (the discover-tree walk).  Counted in files rather
+ * than the fleet drains (the discover-tree walk). Counted in files rather
  * than queued objects because the queue is heterogeneous: a bundle is one
  * object carrying thousands of files, while a file too large to bundle is one
- * object carrying one.  Only a file count is meaningful for both.
+ * object carrying one. Only a file count is meaningful for both.
  *
- * Sized from the MAXIMUM a bundle can hold.  Real packing varies with the workload.
+ * Sized from the MAXIMUM a bundle can hold. Real packing varies with the workload.
  * The byte target, the member cap, and the download path-list limit each
  * bind in different cases. A ceiling derived from any one of them starves the
- * others.  Against the hard maximum every worker is guaranteed its two
+ * others. Against the hard maximum every worker is guaranteed its two
  * bundles whatever the packing, so the ceiling bounds memory without ever
  * being the thing that limits throughput.
  *
@@ -145,9 +145,9 @@ outstanding_file_cap(const struct sftp_parallel_config *cfg)
 
 /*
  * Walker-side failure recorder: bumps the aggregate counter and adds
- * "path: error" to the failed-paths list in one shot.  `err` may be
+ * "path: error" to the failed-paths list in one shot. `err` may be
  * NULL when no errno-style message is available (e.g. depth limit,
- * "not a directory").  Single-call helper because every walker
+ * "not a directory"). Single-call helper because every walker
  * skip-on-error site does both - bump + list.
  */
 void
@@ -169,9 +169,9 @@ sftp_parallel_walker_record_failure(struct sftp_parallel *fleet, const char *pat
 }
 
 /*
- * Publish the walker's current phase (enum sftp_walker_phase).  Public so the
+ * Publish the walker's current phase (enum sftp_walker_phase). Public so the
  * walker in sftp-parallel-walk.c can mark itself blocked/enumerating without
- * seeing struct sftp_parallel's internals.  Relaxed atomic; observability only.
+ * seeing struct sftp_parallel's internals. Relaxed atomic; observability only.
  */
 void
 sftp_parallel_set_walker_phase(struct sftp_parallel *fleet, int phase)
@@ -208,8 +208,8 @@ hpn_strlist_free(struct hpn_strlist *list)
 }
 
 /*
- * Append `entry` to the list.  Always bumps `total`; only allocates a
- * new entry if `used < cap`.  Silently drops the string contents when
+ * Append `entry` to the list. Always bumps `total`; only allocates a
+ * new entry if `used < cap`. Silently drops the string contents when
  * over cap so memory stays bounded; the count is preserved so the
  * user knows how many were dropped.
  */
@@ -226,10 +226,10 @@ hpn_strlist_append(struct hpn_strlist *list, const char *entry)
 }
 
 /*
- * Drain the list.  Returns the total append count seen, and (when
+ * Drain the list. Returns the total append count seen, and (when
  * `out` is non-NULL) transfers ownership of the held strings to the
- * caller via *out / *out_used.  The list itself is reset to empty
- * but remains usable for further appends.  Caller frees each string
+ * caller via *out / *out_used. The list itself is reset to empty
+ * but remains usable for further appends. Caller frees each string
  * and the array.
  */
 uint64_t
@@ -277,7 +277,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 
 	fleet->cfg = *cfg;
 	/* cfg.port may point to a stack buffer in the caller that is only
-	 * valid until the enclosing scope exits.  Copy it into fleet->cfg_port_buf
+	 * valid until the enclosing scope exits. Copy it into fleet->cfg_port_buf
 	 * so the orchestrator owns the string for its entire lifetime. */
 	if (cfg->port && cfg->port[0]) {
 		strlcpy(fleet->cfg_port_buf, cfg->port, sizeof(fleet->cfg_port_buf));
@@ -293,7 +293,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 
 	/* Parked-verify memory gate: fleet-wide budget on parked-path bytes.
 	 * When the parked set crosses this the submitter runs a verify wave
-	 * (parallel_verify_maybe_wave).  64 MiB, validated across a range of
+	 * (parallel_verify_maybe_wave). 64 MiB, validated across a range of
 	 * values as a reasonable batching-vs-RAM balance. Basically, if we are
 	 * doing verification then do it occasionally during the transfer.*/
 	fleet->verify_park_budget = 64 * 1024 * 1024;
@@ -301,23 +301,23 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	fleet->session_start_ms = monotime_ms();
 
 	/* Fleet-abort zero-progress window, resolved from ssh_config
-	 * HPNStallAbortTimeout (default 60 s).  The abort also requires no worker
+	 * HPNStallAbortTimeout (default 60 s). The abort also requires no worker
 	 * heartbeating and FLEET_ABORT_UNPRODUCTIVE_MULT * num_streams
 	 * unproductive respawns (see parallel_watchdog_sync_check); this knob
-	 * only sizes the window.  0 disables the abort entirely. */
+	 * only sizes the window. 0 disables the abort entirely. */
 	fleet->noprogress_abort_s = cfg->stall_abort_timeout;
 	if (fleet->noprogress_abort_s < 0)
 		fleet->noprogress_abort_s = 0;
 
 	/* Enable tail redistribution (cooperative yield of a confirmed-lagging
-	 * endgame holder) from HPNTailRedistribute.  Default ON.
+	 * endgame holder) from HPNTailRedistribute. Default ON.
 	 * off leaves the tail detector as telemetry only. */
 	fleet->tail_redistribute = cfg->tail_redistribute;
 
 	/* Auto-repair: on a post-transfer verify mismatch, re-transfer the
-	 * bad ranges and re-verify, bounded by a per-range attempt cap.  ON by
+	 * bad ranges and re-verify, bounded by a per-range attempt cap. ON by
 	 * default; disabled by the -X VerifyRepair=no CLI token
-	 * (cfg->no_verify_repair).  The attempt cap is fixed at 3. */
+	 * (cfg->no_verify_repair). The attempt cap is fixed at 3. */
 	sftp_hpn_verify_repair_resolve(cfg->no_verify_repair,
 	    &fleet->verify_repair_enabled, &fleet->verify_repair_attempts);
 	fleet->last_worker_exit_code = -1;	/* no worker reaped yet */
@@ -337,7 +337,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	hpn_strlist_init(&fleet->failed_paths, HPN_FAILED_PATHS_MAX);
 	hpn_strlist_init(&fleet->verify_failed_paths, HPN_FAILED_PATHS_MAX);
 
-	/* 1. Workqueue. Sized for cfg->num_streams.  Respawned workers
+	/* 1. Workqueue. Sized for cfg->num_streams. Respawned workers
 	 * reuse the same queue, so capacity is set once at startup. */
 	fleet->outstanding_cap = (uint64_t)outstanding_file_cap(cfg);
 	fleet->q = sftp_workqueue_new(work_queue_depth(cfg));
@@ -354,7 +354,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	/* 3. Spawn workers in parallel to overlap SSH handshakes, but cap
 	 * the number of simultaneous unauthenticated connections to stay
 	 * under the server's MaxStartups limit (default 10:30:100).
-	 8 in it's own clode block to limit namespace/declaration */
+	 * In its own code block to limit namespace/declaration scope. */
 	{
 		int n = cfg->num_streams;
 		int max_in_flight = cfg->max_auth_concurrent > 0
@@ -444,7 +444,7 @@ sftp_parallel_wait(struct sftp_parallel *fleet, struct sftp_conn *conn)
 	 * path - then wait for those units to drain before returning. */
 	if (!fleet->abort_flag) {
 		/* All verify units: range-split trackers (verify_pending) plus
-		 * whole-file items (verify_whole_pending).  Whole-file transfers
+		 * whole-file items (verify_whole_pending). Whole-file transfers
 		 * park only in the latter, so gating the meter on verify_pending_n
 		 * alone left the common case with no verify progress at all. */
 		int vn = fleet->verify_pending_n + fleet->verify_whole_pending_n;
@@ -530,7 +530,7 @@ sftp_parallel_wait(struct sftp_parallel *fleet, struct sftp_conn *conn)
 }
 
 /*
- * Verify wave - this is the mid transfer verification.  Hard pause + full drain run
+ * Verify wave - this is the mid transfer verification. Hard pause + full drain run
  * mid-transfer to bound the parked-path memory: pause the in-flight transfers, drain
  * the entire parked set through the verify phase, wait for it, then reset the
  * prefix pool.
@@ -564,10 +564,10 @@ parallel_verify_wave(struct sftp_parallel *fleet)
 
 /*
  * Trigger check, called by the submitter after each unit (see the tail of
- * sftp_parallel_submit_upload / _download).  Runs a verify wave when the parked
+ * sftp_parallel_submit_upload / _download). Runs a verify wave when the parked
  * set is over its byte budget, or the prefix pool nears its INT16_MAX cap
  * (wave a little early so dirs keep factoring rather than degrading to full
- * paths).  No-op until something is parked.
+ * paths). No-op until something is parked.
  */
 void
 parallel_verify_maybe_wave(struct sftp_parallel *fleet)
@@ -597,13 +597,13 @@ sftp_parallel_abort(struct sftp_parallel *fleet)
 		sftp_workqueue_shutdown(fleet->q);
 
 	/*
-	 * Close every worker's SSH FDs.  Without this, a worker blocked in
+	 * Close every worker's SSH FDs. Without this, a worker blocked in
 	 * get_msg / send_msg on the SSH socket won't notice abort_flag
 	 * until the server eventually drops the connection (seconds to
-	 * minutes).  Closing the FD here makes the blocked read return
+	 * minutes). Closing the FD here makes the blocked read return
 	 * EBADF / 0 immediately; the worker propagates the I/O failure,
 	 * exits execute_unit, sees abort_flag at the top of its loop, and
-	 * thread-exits within milliseconds.  pthread_join in
+	 * thread-exits within milliseconds. pthread_join in
 	 * sftp_parallel_free can then return promptly.
 	 *
 	 * Set the FD to -1 after closing so parallel_respawn_teardown_ssh (called
@@ -630,7 +630,7 @@ sftp_parallel_abort(struct sftp_parallel *fleet)
 		 * survived the terminal's SIGINT - that worker hangs in
 		 * pipe_write until the child dies naturally, holding
 		 * stop()'s join (and the user's exit) hostage for the
-		 * server's grace timeout.  Kill the child: the broken pipe
+		 * server's grace timeout. Kill the child: the broken pipe
 		 * fails the write immediately and the worker unwinds. */
 		if (worker->ssh_pid > 0)
 			(void)kill(worker->ssh_pid, SIGTERM);
@@ -682,7 +682,7 @@ sftp_parallel_set_path_rtt(struct sftp_parallel *fleet, uint64_t rtt_us)
 	/* RTT-dependent born-dead threshold: ~100 round-trips, i.e. rtt_ms/10
 	 * seconds (rtt_us/10000), with the mantissa dropped, floored at
 	 * BORN_DEAD_KILL_SEC (5s, RTT <= ~59ms) and capped at BORN_DEAD_SEC_MAX
-	 * (40s, RTT >= ~400ms).  A transient backend stall takes ~O(RTT) to
+	 * (40s, RTT >= ~400ms). A transient backend stall takes ~O(RTT) to
 	 * clear, so the kill threshold must scale with RTT or it over-fires on
 	 * high-RTT paths (see the BORN_DEAD_* comment). */
 	if (rtt_us > 0) {
@@ -755,7 +755,7 @@ sftp_parallel_stop(struct sftp_parallel *fleet)
 		}
 		pthread_mutex_unlock(&fleet->workers_mu);
 
-		/* Reporter is gone - no concurrent reaping.  Join any worker
+		/* Reporter is gone - no concurrent reaping. Join any worker
 		 * threads it had not already reaped. */
 		for (int i = 0; i < fleet->num_workers; i++) {
 			struct sftp_worker *worker = fleet->workers[i];
@@ -815,7 +815,7 @@ sftp_parallel_stop(struct sftp_parallel *fleet)
 	showprogress = fleet->saved_showprogress;
 
 	/* Bundle accumulator: normally drained by parallel_bundle_flush_pending
-	 * at wait.  Free any leftover (e.g. aborted before wait) so the member
+	 * at wait. Free any leftover (e.g. aborted before wait) so the member
 	 * units and the array don't leak. */
 	for (int i = 0; i < fleet->bundle_pending_n; i++)
 		parallel_unit_free(fleet->bundle_pending[i]);
@@ -824,7 +824,7 @@ sftp_parallel_stop(struct sftp_parallel *fleet)
 
 	/* Verify-pending: range trackers + whole-file items parked at completion
 	 * but never submitted as verify units (e.g. aborted before wait's verify
-	 * phase).  Free both lists so neither leaks. */
+	 * phase). Free both lists so neither leaks. */
 	for (int i = 0; i < fleet->verify_pending_n; i++)
 		parallel_verify_tracker_free(fleet->verify_pending[i]);
 	free(fleet->verify_pending);
@@ -842,7 +842,7 @@ sftp_parallel_stop(struct sftp_parallel *fleet)
 
 	/* Worker re-queue overflow: units parked here when a worker hit a full
 	 * queue, never drained back (abort/shutdown before the reporter moved
-	 * them).  Threads have joined by now, so free without locking concerns. */
+	 * them). Threads have joined by now, so free without locking concerns. */
 	parallel_retry_overflow_free(fleet);
 	pthread_mutex_destroy(&fleet->verify_pending_mu);
 	pthread_mutex_destroy(&fleet->retry_overflow_mu);
@@ -987,11 +987,11 @@ sftp_parallel_progress_start(struct sftp_parallel *fleet, const char *label,
 
 /*
  * Update a running transfer meter after it was started with an unknown (0)
- * total.  The discover-tree download driver calls this once the enumeration has
+ * total. The discover-tree download driver calls this once the enumeration has
  * drained and the full byte total and file count are known, so the aggregate
  * meter switches from rate-only to a real percentage and ETA, and (if the
  * client deferred its count via _start_counted) the label is rewritten to
- * "<verb> N files in parallel".  No-op before the meter starts.
+ * "<verb> N files in parallel". No-op before the meter starts.
  */
 void
 sftp_parallel_progress_set_total(struct sftp_parallel *fleet, off_t total_bytes,
@@ -1020,7 +1020,7 @@ sftp_parallel_progress_set_total(struct sftp_parallel *fleet, off_t total_bytes,
  * Start a parallel download meter whose file count is not yet known (a
  * directory download - the real count arrives with the discover-tree walk).
  * Shows a count-less "<verb> files in parallel" until _set_total rewrites it to
- * "<verb> N files in parallel".  verb is the tool's own word ("Fetching" for
+ * "<verb> N files in parallel". verb is the tool's own word ("Fetching" for
  * sftp, "Downloading" for scp).
  */
 void
@@ -1053,7 +1053,7 @@ sftp_parallel_progress_stop(struct sftp_parallel *fleet)
 		return;
 	/* The reporter advances the aggregate counter only on its tick, so
 	 * the final units land between ticks and the meter's forced last
-	 * refresh paints a stale 99%.  Snap to the LIVE meter's own total:
+	 * refresh paints a stale 99%. Snap to the LIVE meter's own total:
 	 * the verify meter counts hash WORK-bytes (2x the moved bytes -
 	 * project_hash_work_meter_design), so painting the transfer-byte
 	 * snapshot onto it would land the completion line at 50%. */
@@ -1101,7 +1101,7 @@ sftp_parallel_progress_stop(struct sftp_parallel *fleet)
 }
 
 /* ----------------------------------------------------------------
- * Read-only accessors for walker-helper fields.  Exposed so the
+ * Read-only accessors for walker-helper fields. Exposed so the
  * recursive walkers in sftp-parallel-walk.c can read config and
  * abort state without seeing struct sftp_parallel's internals.
  * ---------------------------------------------------------------- */
@@ -1142,9 +1142,9 @@ sftp_parallel_set_preserve(struct sftp_parallel *fleet, int on)
 /*
  * Register the directory of a single transferred path so whole-file verify
  * items can store it relative to a shared prefix (held once) instead of the
- * full path per file.  The recursive walker registers command roots itself;
+ * full path per file. The recursive walker registers command roots itself;
  * this is the glob / direct-dispatch path (process_put/process_get), which
- * bypasses the walker.  No-op unless verify is enabled.  Call with both the
+ * bypasses the walker. No-op unless verify is enabled. Call with both the
  * local and the remote path of each file; the dedup keeps the pool small for
  * the common flat-glob case (one or two distinct directories).
  */
@@ -1182,7 +1182,7 @@ sftp_parallel_is_aborting(const struct sftp_parallel *fleet)
 }
 
 /* 1 iff the abort was caused by the user's interrupt (Ctrl-C), as opposed
- * to a fleet failure.  Drives the interrupt-aware messaging. */
+ * to a fleet failure. Drives the interrupt-aware messaging. */
 int
 sftp_parallel_user_abort(const struct sftp_parallel *fleet)
 {
@@ -1282,10 +1282,10 @@ sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
 }
 
 /*
- * Drain the verify transfer post-transfer mismatch list.  Same
+ * Drain the verify transfer post-transfer mismatch list. Same
  * as sftp_parallel_drain_failed_paths above: returns the total mismatch count and
  * (when out_paths is non-NULL) transfers ownership of the path strings to
- * the caller.  A non-zero return means hpnsftp should exit
+ * the caller. A non-zero return means hpnsftp should exit
  * SFTP_EX_VERIFY_FAILED.
  */
 uint64_t
