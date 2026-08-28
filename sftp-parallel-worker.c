@@ -916,7 +916,7 @@ worker_run_batch_pipelined(struct sftp_worker *worker,
 		worker_record_start(worker);
 	}
 
-	/* send() drains batch_prev_pending, if any, after its phase 1
+	/* send() drains batch_prev_pending, if any, after its own
 	 * opens are on the wire; that overlap is the win. */
 	new_pending = sftp_upload_batch_send(worker->conn, entries, batch_n,
 	    fleet->cfg.preserve_flag, fleet->cfg.fsync_flag,
@@ -1149,11 +1149,13 @@ worker_run_bundle_download(struct sftp_worker *worker,
 }
 
 /*
- * Dispatch a pre-formed bundle container (SFTP_OP_BUNDLE_*). The producer
- * grouped the members, so there is no accumulation race here: detach the
- * member array, run it through the existing array-based bundle path (which
- * finalises and frees each member via worker_finalize_one_entry), then free
- * the now-memberless shell.
+ * Dispatches a bundle container that the producer already grouped, so there
+ * is no accumulation race here. The member array is detached first, run
+ * through the same array-based path a worker-accumulated batch uses, and the
+ * empty shell freed.
+ *
+ * The shell carries no pending count of its own; each member was counted
+ * when it joined the accumulator and is discounted by its own retirement.
  */
 static void
 worker_dispatch_bundle_container(struct sftp_worker *worker,
@@ -1173,16 +1175,14 @@ worker_dispatch_bundle_container(struct sftp_worker *worker,
 }
 
 /*
- * Execute a single work unit through the non-batch path: drain any
- * deferred pipelined batch (its STATUSes would corrupt the next RPC),
- * mark the worker as actively working, run execute_unit, and hand the
- * result to worker_process_result.
+ * Runs one work unit outside the batch paths: drains any deferred pipelined
+ * batch first, since its unread replies would corrupt the next request, then
+ * runs the unit and hands the result to worker_process_result.
  *
- * Used in three places by parallel_worker_thread:
- *   - the batch_n == 1 branch (batch loop collected only one unit)
- *   - the leftover-after-batch dispatch
- *   - the outer else branch (DOWNLOAD without bundle, RANGE ops,
- *     mkdir, etc.)
+ * Called from three places in parallel_worker_thread: when the batch loop
+ * collected only one unit, for a unit popped during collection that did not
+ * belong in the batch, and for everything that never enters a batch at all,
+ * which is downloads without bundling, range units, and resume spans.
  */
 static void
 worker_execute_single(struct sftp_worker *worker, struct sftp_work_unit *unit)
@@ -1206,10 +1206,14 @@ worker_execute_single(struct sftp_worker *worker, struct sftp_work_unit *unit)
 }
 
 /*
- * One-time worker setup: signal mask, env-var parsing for the bundle
- * and batch-pipeline kill switches, and per-worker bundle target.
- * Sampled once at startup; survives the worker's lifetime. Factored
- * out of parallel_worker_thread to keep the main loop body readable.
+ * One-time worker setup, run before the loop starts: block SIGALRM so the
+ * progress meter's timer ticks reach only the main thread and the reporter,
+ * mark the worker as holding no range, and settle whether this worker will
+ * bundle.
+ *
+ * Bundling needs both sides to agree: HPNUseBundle must not be off in
+ * ssh_config, and the server must advertise the extension. Failing either,
+ * the worker falls back to the pipelined batch path.
  */
 static void
 worker_thread_init(struct sftp_worker *worker)
@@ -1225,16 +1229,13 @@ worker_thread_init(struct sftp_worker *worker)
 	 * stuck-range detector compares against this. */
 	__atomic_store_n(&worker->unit_offset, (int64_t)-1, __ATOMIC_RELAXED);
 
-	/* Phase 5 bundle-mode: ON by default when the server advertises
-	 * hpn-bundle@hpnssh.org. Disabled when:
-	 *   - HPNUseBundle no   in ssh_config (resolved by sftp.c via
-	 *                       `hpnssh -G host`; stored in fleet->cfg.use_bundle)
-	 *   - server doesn't advertise the hpn-bundle extension
-	 * Either forces the Phase-4 pipelined batch fallback. */
-	worker->bundle_target_bytes = (worker->parent->cfg.bundle_size > 0)
-	    ? worker->parent->cfg.bundle_size
-	    : BUNDLE_TARGET_BYTES_DEFAULT;
+	/* set our bundle size */ 
+	if (worker->parent->cfg.bundle_size > 0)
+		worker->bundle_target_bytes = worker->parent->cfg.bundle_size;
+	else
+		worker->bundle_target_bytes = BUNDLE_TARGET_BYTES_DEFAULT;
 
+	/* can we use the bundle method? Might be disabled or not available */
 	if (worker->parent->cfg.use_bundle == 0) {
 		debug_ft("worker %d: bundle disabled by "
 		    "ssh_config HPNUseBundle no", worker->id);
@@ -1244,36 +1245,29 @@ worker_thread_init(struct sftp_worker *worker)
 		    worker->id, (unsigned long long)worker->bundle_target_bytes);
 	} else {
 		debug_ft("worker %d: server lacks hpn-bundle extension, "
-		    "using Phase-4 batch fallback", worker->id);
+		    "using the pipelined batch fallback", worker->id);
 	}
 }
 
 /*
- * Post-iteration termination check: returns 1 if the worker should
- * break out of the main loop (protocol-violation strike 1, or
- * connection died), 0 otherwise. Strike 2 fatal()s the process and
- * never returns.
+ * Post-iteration check: returns 1 when the worker should break out of the
+ * loop, either because its connection died or because it hit a protocol
+ * violation. A second violation in one session does not return at all - it
+ * fatals the process.
  *
- * Protocol-violation two-strikes policy:
- *   Strike 1 - log loudly, bump fleet->protocol_violations. The conn is
- *     already dead (set by sftp_hpn_set_protocol_violation in
- *     sftp-client.c) so we fall through to the conn_is_dead branch
- *     immediately below and break out. Reporter's respawn machinery
- *     replaces us with a fresh SSH child; transfer continues.
- *   Strike 2 (lifetime per hpnsftp process) - sustained pattern,
- *     not bad luck. fatal(). The OS reaps remaining SSH children
- *     when the parent dies. Current unit cleanup was already done by
- *     worker_process_result / batch result loop.
+ * The threshold is a fixed count rather than a rate because a correctly
+ * functioning server produces zero violations regardless of worker count or
+ * transfer length: the SSH MAC catches in-channel tampering below this
+ * layer, so anything arriving here is already abnormal. One is tolerated
+ * because a single bit-flip on a long transfer is a known and
+ * benign-but-noisy hardware failure. Two is a pattern, which means a buggy
+ * or compromised server or a persistent fault, and papering over that would
+ * be worse than stopping.
  *
- * Threshold is a fixed count (2), not a rate: a correctly-functioning
- * server produces zero violations regardless of worker count or
- * transfer length - SSH MAC catches all in-channel tampering below
- * this layer. Anything reaching here is, by definition, abnormal.
- *
- * Possible causes: random bit-flip on a long transfer (historical NIC
- * silicon bug - common, benign-but-noisy, want to tolerate one) or
- * buggy/compromised server / persistent hardware fault (rare but
- * serious - must not paper over).
+ * Strike 1 leaves the unit cleanup already done by worker_process_result or
+ * the batch result loop, and the reporter's respawn machinery replaces the
+ * worker. Strike 2 exits the process; the OS reaps the remaining SSH
+ * children.
  */
 static int
 worker_should_terminate(struct sftp_worker *worker)
@@ -1298,9 +1292,7 @@ worker_should_terminate(struct sftp_worker *worker)
 		error_f("worker %d: protocol violation #%d - killing "
 		    "worker and respawning; one more this session "
 		    "will exit hpnsftp", worker->id, total);
-		/* fall through to the conn_is_dead branch below: the
-		 * conn is already marked dead by the protocol-violation
-		 * handler in sftp-client.c. */
+		return 1;	/* the conn is dead either way */
 	}
 
 	if (sftp_conn_is_dead(worker->conn)) {
@@ -1310,6 +1302,155 @@ worker_should_terminate(struct sftp_worker *worker)
 		return 1;
 	}
 	return 0;
+}
+
+/*
+ * Collects units that can travel with `first` into batch[], stopping at the
+ * batch size, the byte cap, the fetch-request cap, or the first unit that
+ * does not belong. Returns how many units are in the batch, always at least
+ * one. A unit that was popped and rejected is handed back through
+ * leftover_out for the caller to run on its own.
+ */
+static int
+worker_collect_batch(struct sftp_worker *worker, struct sftp_work_unit *first,
+    struct sftp_work_unit **batch, int batch_cap,
+    struct sftp_work_unit **leftover_out)
+{
+	struct sftp_parallel *fleet = worker->parent;
+	enum sftp_op batch_op = first->op;
+	int batch_n = 0;
+	/* Byte cap: bundle mode uses the smaller per-bundle target so each tar
+	 * stream still composes well with the other parallel streams. The first
+	 * unit is always taken, even when it alone exceeds the cap, so a single
+	 * large file is never orphaned. */
+	uint64_t batch_bytes = 0;
+	uint64_t batch_byte_cap;
+	/* A download bundle lists every member's remote path in one
+	 * hpn-bundle-fetch request, so collection also stops before that list
+	 * overflows SFTP_MAX_MSG_LENGTH. An upload streams its paths inside the
+	 * tar and is immune. Cost per member is a 4-byte length plus the path;
+	 * the cap leaves room for one PATH_MAX overshoot, since the gate is
+	 * checked after the last add, plus the request header. */
+	uint64_t batch_path_bytes = 0;
+
+	if (first->size > 0)
+		batch_bytes = (uint64_t)first->size;
+	if (worker->bundle_enabled)
+		batch_byte_cap = worker->bundle_target_bytes;
+	else
+		batch_byte_cap = UPLOAD_BATCH_BYTE_CAP;
+
+	*leftover_out = NULL;
+	batch[batch_n++] = first;
+	if (batch_op == SFTP_OP_DOWNLOAD) {
+		batch_path_bytes = 4;
+		if (first->src_path != NULL)
+			batch_path_bytes += strlen(first->src_path);
+	}
+	/* In bundle mode the byte gate is strict, so a unit is only popped when
+	 * there is budget left for it. The soft gate popped one unit too many:
+	 * with batch_bytes already at the cap it still popped, then discarded
+	 * the unit to the leftover path, costing exactly one bundle-eligible
+	 * unit per batch. The non-bundle path keeps the soft gate so a single
+	 * larger-than-target unit is not orphaned. */
+	while (batch_n < batch_cap && !fleet->abort_flag &&
+	    (worker->bundle_enabled
+	        ? batch_bytes <  batch_byte_cap
+	        : batch_bytes <= batch_byte_cap) &&
+	    (batch_op != SFTP_OP_DOWNLOAD ||
+	        batch_path_bytes < BUNDLE_DL_FETCH_REQ_MAX)) {
+		void *next_item = NULL;
+		if (sftp_workqueue_trypop(fleet->q, &next_item) != 0)
+			break;	/* queue empty or shutdown */
+		struct sftp_work_unit *next_unit = next_item;
+		/* Even with the strict gate a unit can overshoot on its own,
+		 * so it still needs a fits check. Bundle-ineligibility at
+		 * parallel_unit_submit bounds unit size to a quarter of the
+		 * cap, which makes this rare. */
+		int fits = 1;
+		if (worker->bundle_enabled && next_unit->size > 0 &&
+		    batch_bytes + (uint64_t)next_unit->size > batch_byte_cap)
+			fits = 0;
+		if (next_unit->op != batch_op ||
+		    next_unit->bundle_ineligible || !fits) {
+			/* Wrong op, not bundleable, or no room: stop here and
+			 * let the caller run it by itself. */
+			*leftover_out = next_unit;
+			break;
+		}
+		batch[batch_n++] = next_unit;
+		if (next_unit->size > 0)
+			batch_bytes += (uint64_t)next_unit->size;
+		if (batch_op == SFTP_OP_DOWNLOAD) {
+			batch_path_bytes += 4;
+			if (next_unit->src_path != NULL)
+				batch_path_bytes += strlen(next_unit->src_path);
+		}
+	}
+	return batch_n;
+}
+
+/*
+ * Collects a batch around `first` and dispatches it: a batch of one takes the
+ * single-unit path, a download batch is bundle-fetched, and an upload batch is
+ * either bundled into a tar stream or sent through the pipelined batch path,
+ * depending on whether this worker bundles. A leftover from collection runs
+ * afterwards.
+ */
+static void
+worker_run_batch(struct sftp_worker *worker, struct sftp_work_unit *first)
+{
+	struct sftp_parallel *fleet = worker->parent;
+	struct sftp_work_unit **batch;
+	struct sftp_work_unit *leftover = NULL;
+	int batch_cap, batch_n;
+
+	/* Bundle mode is byte-capped rather than count-capped, so it allows far
+	 * more files per batch than the pipelined path; hence the heap array. */
+	if (worker->bundle_enabled)
+		batch_cap = BUNDLE_BATCH_MAX_FILES;
+	else
+		batch_cap = UPLOAD_BATCH_SIZE;
+	batch = xcalloc((size_t)batch_cap, sizeof(*batch));
+	batch_n = worker_collect_batch(worker, first, batch, batch_cap,
+	    &leftover);
+
+	__atomic_store_n(&worker->phase, WPH_RUN, __ATOMIC_RELAXED);
+	if (batch_n == 1) {
+		worker_execute_single(worker, batch[0]);
+	} else if (first->op == SFTP_OP_DOWNLOAD) {
+		/* The eligibility gate in the worker loop guarantees bundle
+		 * mode and server support, so bundle-fetch is the only
+		 * dispatch for a multi-unit download batch. Synchronous, with
+		 * no carry-over state. */
+		worker_run_bundle_download(worker, batch, batch_n);
+	} else if (worker->bundle_enabled) {
+		/* One tar stream through a single open, writes and close.
+		 * Synchronous; the pipelined carry-over state stays NULL. */
+		worker_run_bundle(worker, batch, batch_n);
+	} else {
+		/* Pipelined batch: this batch's close collection is deferred
+		 * and the previous batch's results are finalised inside. */
+		worker_run_batch_pipelined(worker, batch, batch_n);
+	}
+
+	/* The leftover was popped inside the collection loop, bypassing the
+	 * dispatch gate in the worker loop. Unlike a batch member, which is
+	 * always a whole-file unit with no tracker, a leftover can be a range
+	 * unit, so it claims its writer slot here to stay balanced with the
+	 * release in worker_process_result. A NULL tracker acquires trivially
+	 * and releases as a no-op. */
+	if (leftover != NULL) {
+		if (parallel_unit_writer_acquire(leftover->range_tracker)) {
+			worker_execute_single(worker, leftover);
+		} else if (parallel_worker_requeue(fleet, leftover,
+		    /*front=*/0) != 0) {
+			/* The queue shut down under us: full give-up
+			 * bookkeeping, not a silent drop. */
+			worker_give_up_pushfail(fleet, worker, leftover);
+		}
+	}
+	free(batch);
 }
 
 /*
@@ -1348,10 +1489,6 @@ worker_should_terminate(struct sftp_worker *worker)
  * aborts, or when worker_should_terminate says this worker should stop. On
  * the way out it drains any deferred batch, closes a warm file handle it may
  * still be holding, and marks itself exited so the reporter can join it.
- *
- * TODO: collecting the batch is about a hundred lines in the middle of this
- * loop. Moving it into its own function would leave the loop as pop, check,
- * dispatch, publish, which is what it actually is.
  */
 void *
 parallel_worker_thread(void *arg)
@@ -1371,7 +1508,7 @@ parallel_worker_thread(void *arg)
 			break;
 		void *item = NULL;
 		__atomic_store_n(&worker->phase, WPH_POP_WAIT, __ATOMIC_RELAXED);
-		/* Phase 4 gap 1 deadlock guard: if we have a deferred
+		/* Deferred-batch deadlock guard: if we have a deferred
 		 * pipelined batch with pending CLOSE-STATUSes in the
 		 * SSH socket buffer, we cannot block on the workqueue
 		 * without first reading those replies - TCP back-pressure
@@ -1448,15 +1585,19 @@ parallel_worker_thread(void *arg)
 		}
 		unit->yield_from = 0;
 		/*
-		 * HPN per-inode concurrent-writer cap. Range units of one file
-		 * share a tracker; only writer_cap of them may run at once. If
-		 * this file is already at its cap, return the unit to the queue
-		 * and look for other work (e.g. another file's ranges). Bounded
-		 * spin: after one full pass over the queue turns up nothing but
-		 * capped units (a single-file transfer), sleep ~2 ms so the
-		 * surplus workers idle cheaply until an active writer finishes
-		 * and frees a slot. Whole-file and bundle units have no tracker
-		 * and always pass. */
+		 * Per-inode concurrent-writer cap. Range units of one file share
+		 * a tracker and only writer_cap of them may write at once, so a
+		 * unit whose file is at its cap goes back on the queue and the
+		 * worker looks for another file's work. Whole file and bundle
+		 * units have no tracker and always pass.
+		 *
+		 * Once a full pass over the queue turns up nothing but capped
+		 * units, which is what a single-file transfer looks like, the
+		 * worker parks on the queue's activity channel rather than
+		 * spinning pop and requeue (measured at ~6M futile cycles on one
+		 * large file). It wakes on a slot release or any push; the 250 ms
+		 * timeout is a backstop, not the path.
+		 */
 		if (!parallel_unit_writer_acquire(unit->range_tracker)) {
 			/* Push-fail = the queue shut down under us (abort).
 			 * The unit can never run: do the full give-up
@@ -1466,16 +1607,10 @@ parallel_worker_thread(void *arg)
 			if (parallel_worker_requeue(fleet, unit, /*front=*/0) != 0)
 				worker_give_up_pushfail(fleet, worker, unit);
 			__atomic_store_n(&worker->unit_start_ms, 0, __ATOMIC_RELEASE);
-			/* Availability intent: cap-gate parking = available for
-			 * OTHER files, blocked on this one's writer cap. */
+			/* Availability intent: parked on this file's cap, but
+			 * available for any other file. */
 			__atomic_store_n(&worker->avail, WORKER_AVAIL_CAPPED,
 			    __ATOMIC_RELAXED);
-			/* A full pass over the queue found only capped units:
-			 * park on the queue's activity channel instead of
-			 * spinning pop/requeue (measured: ~6M futile cycles
-			 * per large single-file transfer). Exact wakeup on
-			 * slot release or any push; the 100ms timeout is a
-			 * backstop, never the path. */
 			if (++capped_passes >=
 			    (int)sftp_workqueue_depth(fleet->q) + 1) {
 				sftp_workqueue_wait_activity(fleet->q, 250);
@@ -1499,32 +1634,23 @@ parallel_worker_thread(void *arg)
 		    __ATOMIC_RELAXED);
 
 		/*
-		 * Batch-open optimisation for uploads: accumulate up to
-		 * UPLOAD_BATCH_SIZE upload units using non-blocking trypop,
-		 * then pipeline all N SSH_FXP_OPEN requests before waiting for
-		 * any handle (1 RTT for N opens instead of 1 RTT each). Same
-		 * pipelining for closes.
-		 * Falls back to single-unit execution if the first unit is
-		 * not an upload or if the batch stays at size 1.
-		 */
-		/* Phase 5 (download side): only batch DOWNLOAD units when
-		 * the server advertises hpn-bundle-fetch and the worker has
-		 * bundle mode on; otherwise downloads continue down the
-		 * single-unit branch (Phase 4 pipelining for downloads is
-		 * still future work).
+		 * Uploads collect into a batch so that N opens go out in one
+		 * round trip instead of N, with the closes pipelined the same
+		 * way. Downloads only collect when they can be bundled, which
+		 * needs bundle mode on this worker and hpn-bundle-fetch on the
+		 * server; download pipelining is still future work. Either way a
+		 * batch of one falls back to single-unit execution.
 		 *
-		 * A unit whose earlier bundle attempt failed at the wire (server
-		 * refused, cap exceeded, transport error) is not eligible either.
-		 * Its retry goes through sftp_download or sftp_upload directly.
-		 * Without that, the unit would fail as a bundle, retry as a
-		 * bundle, and fail again until it ran out of retries and was
-		 * lost. */
+		 * A unit whose earlier bundle attempt failed at the wire is not
+		 * eligible: its retry goes through sftp_upload or sftp_download
+		 * directly, or it would fail as a bundle, retry as a bundle, and
+		 * repeat until it ran out of retries and was lost.
+		 */
 		int batch_eligible_download =
 		    (unit->op == SFTP_OP_DOWNLOAD &&
 		     !unit->bundle_ineligible &&
 		     worker->bundle_enabled &&
 		     sftp_conn_has_hpn_bundle_fetch(worker->conn));
-		enum sftp_op batch_op = unit->op;
 
 		if (unit->op == SFTP_OP_BUNDLE_UPLOAD ||
 		    unit->op == SFTP_OP_BUNDLE_DOWNLOAD) {
@@ -1535,165 +1661,7 @@ parallel_worker_thread(void *arg)
 			worker_dispatch_bundle_container(worker, unit);
 		} else if ((unit->op == SFTP_OP_UPLOAD &&
 		    !unit->bundle_ineligible) || batch_eligible_download) {
-			/* Bundle mode is byte-capped (bundle_target_bytes), so allow
-			 * many more than UPLOAD_BATCH_SIZE files per batch; heap-
-			 * allocate since the bundle ceiling is large. */
-			int batch_cap = worker->bundle_enabled
-			    ? BUNDLE_BATCH_MAX_FILES : UPLOAD_BATCH_SIZE;
-			struct sftp_work_unit **batch =
-			    xcalloc((size_t)batch_cap, sizeof(*batch));
-			struct sftp_work_unit *leftover = NULL;
-			int batch_n = 0;
-			/* Soft byte cap: keep adding while batch_bytes is at or
-			 * below the cap. The first unit is always added even if
-			 * its size alone exceeds the cap (so a single huge file
-			 * is never orphaned). See UPLOAD_BATCH_BYTE_CAP.
-			 *
-			 * Phase 5: in bundle mode use the smaller
-			 * worker->bundle_target_bytes cap so each tar stream stays
-			 * small enough to compose well with parallel streams. */
-			uint64_t batch_bytes = (unit->size > 0) ?
-			    (uint64_t)unit->size : 0;
-			const uint64_t batch_byte_cap = worker->bundle_enabled
-			    ? worker->bundle_target_bytes
-			    : UPLOAD_BATCH_BYTE_CAP;
-			/* Download bundles list every member's remote path in ONE
-			 * hpn-bundle-fetch request, so the batch must also stop
-			 * before that path list overflows SFTP_MAX_MSG_LENGTH
-			 * (upload streams paths inside the tar - immune). Track the
-			 * request cost: 4-byte cstring length + remote path
-			 * (src_path) per member. The cap leaves room for one
-			 * PATH_MAX overshoot (the gate is checked after the last
-			 * add) plus the ~44-byte request header. */
-			uint64_t batch_path_bytes = 0;
-			const uint64_t batch_fetch_req_cap =
-			    BUNDLE_DL_FETCH_REQ_MAX;
-
-			batch[batch_n++] = unit;
-			if (batch_op == SFTP_OP_DOWNLOAD)
-				batch_path_bytes = 4 +
-				    (unit->src_path ? strlen(unit->src_path) : 0);
-			/* Gate: in bundle mode, stop iterating BEFORE
-			 * popping a unit that we have no room for. The
-			 * original soft gate (`batch_bytes <= cap`) tripped
-			 * one iteration too late: when batch_bytes already
-			 * equals cap, the gate was true, so it popped the
-			 * next unit and only then discovered it could not
-			 * fit, making it a leftover. That
-			 * popped-just-to-discard pattern was a fencepost
-			 * costing exactly one bundle-eligible unit per
-			 * batch, forcing that unit through the slow per-
-			 * file leftover dispatch.
-			 *
-			 * In bundle mode, gate strictly so we don't pop
-			 * unless there's free byte budget. Non-bundle path
-			 * keeps the soft `<=` cap so a single
-			 * larger-than-target unit isn't orphaned by a
-			 * stricter gate. */
-			while (batch_n < batch_cap && !fleet->abort_flag &&
-			    (worker->bundle_enabled
-			        ? batch_bytes <  batch_byte_cap
-			        : batch_bytes <= batch_byte_cap) &&
-			    (batch_op != SFTP_OP_DOWNLOAD ||
-			        batch_path_bytes < batch_fetch_req_cap)) {
-				void *next_item = NULL;
-				if (sftp_workqueue_trypop(fleet->q, &next_item) != 0)
-					break; /* queue empty or shutdown */
-				struct sftp_work_unit *next_unit = next_item;
-				/* Even with the strict gate, a unit of
-				 * non-uniform size may overshoot the cap on
-				 * its own (e.g. batch_bytes=1 MiB, cap=4 MiB,
-				 * popped unit=4 MiB, projected total 5 MiB).
-				 * Still need a fits check; that unit goes to
-				 * leftover dispatch. Bundle-ineligibility at
-				 * parallel_unit_submit() bounds unit size to cap/4 so this
-				 * branch is rare in practice. */
-				int fits = 1;
-				if (worker->bundle_enabled && next_unit->size > 0 &&
-				    batch_bytes + (uint64_t)next_unit->size >
-				    batch_byte_cap) {
-					fits = 0;
-				}
-				if (next_unit->op == batch_op &&
-				    !next_unit->bundle_ineligible && fits) {
-					batch[batch_n++] = next_unit;
-					if (next_unit->size > 0)
-						batch_bytes +=
-						    (uint64_t)next_unit->size;
-					if (batch_op == SFTP_OP_DOWNLOAD)
-						batch_path_bytes += 4 +
-						    (next_unit->src_path
-						    ? strlen(next_unit->src_path)
-						    : 0);
-				} else {
-					/* Off-op, bundle-ineligible, OR
-					 * would-overshoot: stop collecting
-					 * and dispatch next_unit via the post-batch
-					 * leftover path. */
-					leftover = next_unit;
-					break;
-				}
-			}
-
-			__atomic_store_n(&worker->phase, WPH_RUN, __ATOMIC_RELAXED);
-			if (batch_n == 1) {
-				/* Single file - skip batch overhead. */
-				worker_execute_single(worker, batch[0]);
-			} else if (batch_op == SFTP_OP_DOWNLOAD) {
-				/*
-				 * Phase 5 (download side): the eligibility
-				 * gate above guarantees worker->bundle_enabled and
-				 * the server has hpn-bundle-fetch, so the only
-				 * dispatch for a multi-unit DOWNLOAD batch is
-				 * bundle-fetch. Synchronous; no pipelined
-				 * carry-over state on the download bundle path.
-				 */
-				worker_run_bundle_download(worker, batch, batch_n);
-			} else if (worker->bundle_enabled) {
-				/*
-				 * Phase 5 (upload side): bundle this batch as
-				 * a tar stream and ship through one
-				 * OPEN/WRITE x N/CLOSE. Synchronous; the
-				 * pipelined-batch carry-over state
-				 * (batch_prev_pending et al) is unused on the
-				 * bundle path and stays NULL.
-				 */
-				worker_run_bundle(worker, batch, batch_n);
-			} else {
-				/*
-				 * True batch. Phase 4 gap 1:
-				 * worker_run_batch_pipelined handles the entries
-				 * array, send/finish, and per-entry finalisation.
-				 * THIS batch's phase 5 is deferred; the PREVIOUS
-				 * batch's results are finalised inside the helper.
-				 */
-				worker_run_batch_pipelined(worker, batch, batch_n);
-			}
-
-			/* Process the leftover non-batch unit (if any). It was
-			 * popped inside the batch loop, bypassing the dispatch
-			 * gate at the top of the loop, so a range leftover must
-			 * claim its per-inode writer slot here too - or requeue
-			 * if the file is at cap - to keep acquire/release
-			 * balanced (worker_process_result always releases).
-			 * NULL-tracker leftovers (whole-file uploads) acquire
-			 * trivially and release as a no-op. */
-			if (leftover != NULL) {
-				if (parallel_unit_writer_acquire(
-				    leftover->range_tracker)) {
-					worker_execute_single(worker, leftover);
-				} else {
-					/* Non-blocking re-queue; a give-up here
-					 * means the queue shut down under us:
-					 * full bookkeeping, not a silent drop
-					 * (see the cap-gate site). */
-					if (parallel_worker_requeue(fleet,
-					    leftover, /*front=*/0) != 0)
-						worker_give_up_pushfail(fleet, worker,
-						    leftover);
-				}
-			}
-			free(batch);	/* heap batch; bundle mode can exceed UPLOAD_BATCH_SIZE */
+			worker_run_batch(worker, unit);
 		} else {
 			/* Download (no bundle) or any range op - all bypass
 			 * the upload-batch path. */
@@ -1710,7 +1678,7 @@ parallel_worker_thread(void *arg)
 		if (worker_should_terminate(worker))
 			break;
 	}
-	/* Phase 4 gap 1: drain any deferred pipelined batch state before
+	/* Drain any deferred pipelined batch state before
 	 * exiting. If the connection died, this is a best-effort drain
 	 * (sftp_upload_batch_finish handles a dead conn by marking entries
 	 * failed and freeing). */
