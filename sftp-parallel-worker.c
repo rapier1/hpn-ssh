@@ -34,6 +34,15 @@
  * Also here: the one-time worker setup, the rule for when a worker should
  * stop, and the cache of a still-open remote file handle that lets
  * consecutive ranges of the same file skip a reopen.
+ *
+ * Three access disciplines run through the file, chosen by who can see the
+ * data rather than by what thread the code runs on. A work unit belongs to
+ * one worker from pop to free, so its fields are plain. Fields the reporter
+ * or the watchdog read while this thread writes them are relaxed atomics,
+ * where a stale read only paints a stale meter. The per-worker counters take
+ * worker->mu instead, because a reader needs them to agree with each other.
+ * A stronger order appears only where one value publishes others, as with
+ * the acquire-release on verify_job->ranges_left.
  */
 
 #include "includes.h"
@@ -61,42 +70,36 @@
 #include "sftp-parallel-internal.h"
 
 /*
- * Worker-side failed-path recorder. Formats "path: cause" and appends
- * to the orchestrator's failed-paths list. If `explicit_cause` is
- * NULL we pull from hpn_get_last_error() - the TLS-captured most-
- * recent ERROR-level log message on this thread, set automatically
- * inside do_log(). This is how a failed sftp_upload / sftp_download
- * gets its error text into the summary without any plumbing through
- * the RPC API.
+ * Records one path the fleet could not deliver, as "path: cause", in the
+ * fleet's failed-paths list. The end of run summary prints that list, so this
+ * is what turns a give-up into something the user sees rather than something
+ * buried in the log.
  *
- * Falls back to "(no error captured)" when neither source has a
- * message - shouldn't happen in practice for a real give-up.
+ * The cause comes from the caller. Both give-up paths capture it before they
+ * do anything else, because the text they want is the most recent error log
+ * line on this thread and their own give-up logging would overwrite it. That
+ * captured text is cleared at the end here, so the next failure on this
+ * thread starts from nothing rather than inheriting this one.
  *
- * Called only at give-up sites in worker_process_result and
- * worker_finalize_one_entry (NOT on retry).
+ * Called only from worker_give_up_unit and worker_give_up_pushfail, never on
+ * a retry.
  */
 static void
 worker_record_failed_path(struct sftp_parallel *fleet,
     struct sftp_work_unit *unit, const char *explicit_cause)
 {
 	char        buf[PATH_MAX + 256];
-	const char *path = (unit && unit->src_path) ? unit->src_path : "(unknown)";
-	const char *cause;
+	const char *path = unit->src_path;
 
-	if (explicit_cause != NULL && *explicit_cause != '\0') {
-		cause = explicit_cause;
-	} else {
-		const char *captured = hpn_get_last_error();
-		cause = (captured && *captured)
-		    ? captured : "(no error captured)";
-	}
+	/* these should never be necessary */
+	if (explicit_cause == NULL)
+		explicit_cause = "(unknown cause)";
+	if (path == NULL)
+		path = "(unknown path)";
 
-	snprintf(buf, sizeof(buf), "%s: %s", path, cause);
+	snprintf(buf, sizeof(buf), "%s: %s", path, explicit_cause);
 	hpn_strlist_append(&fleet->failed_paths, buf);
 
-	/* Reset so the next failure on this thread starts clean instead
-	 * of stale. Captured-error contract: it reflects the most recent
-	 * error AT THE TIME we record the failure. */
 	hpn_clear_last_error();
 }
 
@@ -139,23 +142,18 @@ worker_record_completion(struct sftp_worker *worker, off_t bytes, int success)
 /*
  * Verify transfer (parallel): verify one just-transferred whole file
  * end-to-end on the worker's connection and record a mismatch in the
- * orchestrator's thread-safe verify_failed_paths list. Never fails the
- * unit - a mismatch is surfaced in the summary + exit code, not retried.
+ * orchestrator's verify_failed_paths list. Never fails the unit.
+ * A mismatch is surfaced in the summary + exit code, not retried.
  */
-void
+static void
 parallel_verify_one(struct sftp_worker *worker, const char *local_path,
     const char *remote_path, int local_is_target)
 {
 	struct sftp_parallel *fleet = worker->parent;
-	/*
-	 * Shared verify + auto-repair core: whole-file mode (len 0 -> the engine
-	 * stats the file and verifies span [0, size)). On a content mismatch it
-	 * splices the mismatched 64 MiB chunks (>= chunk-hash floor) or
-	 * re-transmits whole (smaller), bounded by the attempt cap + convergence.
-	 * The one implementation every verify path uses. No teed hash: the
-	 * decoupled verify may run on a different worker than the uploader (the
-	 * size-keyed accumulator could hold another same-size file's hash).
-	 */
+	/* Whole-file mode: len 0 makes the engine verify span [0, size). No
+	 * teed hash is passed, because the decoupled verify may run on a
+	 * different worker than the one that uploaded the file, and the
+	 * size-keyed accumulator could hold another same-size file's hash. */
 	int repaired = 0;
 	int verify_rc = sftp_hpn_verify_repair(worker->conn, local_path, remote_path,
 	    local_is_target, /*off=*/0, /*len=*/0,
@@ -163,31 +161,31 @@ parallel_verify_one(struct sftp_worker *worker, const char *local_path,
 	    fleet->verify_repair_enabled, fleet->verify_repair_attempts, &repaired);
 
 	/* TransferLog: under -V the transfer line was deferred to this,
-	 * the file's FINAL status. Unverifiable (verify_rc < 0) transferred fine
+	 * the file's final status. Unverifiable (verify_rc < 0) transferred fine
 	 * but cannot claim "verified" - log it as plain success. Size
 	 * from the local side, which exists in both directions. The
-	 * DESTINATION path names the file. */
+	 * destination path names the file. */
 	if (transferlog_active()) {
 		struct stat local_st;
 		long long size = (stat(local_path, &local_st) == 0) ?
 		    (long long)local_st.st_size : -1;
-		enum transferlog_status st;
+		enum transferlog_status status;
 
 		if (verify_rc > 0)
-			st = TRANSFERLOG_FAILED;
+			status = TRANSFERLOG_FAILED;
 		else if (verify_rc < 0)
-			st = TRANSFERLOG_SUCCESS;
+			status = TRANSFERLOG_SUCCESS;
 		else
-			st = repaired ? TRANSFERLOG_REPAIRED :
+			status = repaired ? TRANSFERLOG_REPAIRED :
 			    TRANSFERLOG_VERIFIED;
-		transferlog_file(st, size,
+		transferlog_file(status, size,
 		    local_is_target ? local_path : remote_path);
 	}
 	if (verify_rc == 0)
 		return;	/* verified good (possibly after repair) */
 	if (verify_rc < 0) {
 		logit("VERIFY SKIPPED: \"%s\": server lacks "
-		    "sftp-hash-range@hpnssh.org or read error",
+		    "hpn-check-file@hpnssh.org or read error",
 		    remote_path);
 		return;
 	}
@@ -293,14 +291,12 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 			int verify_rc;
 
 			/*
-			 * One verify+repair of this transfer-range chunk, inline on
-			 * this worker's own conn: verify the chunk and, on a content
-			 * mismatch, splice the bad 64 MiB sub-chunks in place
-			 * (bounded by the attempt cap + convergence) - the same
-			 * engine the whole-file path uses. 0 = good/repaired,
-			 * 1 = unrepairable, -1 = unverifiable (warn only, not a
-			 * content failure). Each chunk worker repairs only its own
-			 * index idx - no cross-worker coordination.
+			 * Verify this chunk on the worker's own conn, splicing the
+			 * bad 64 MiB sub-chunks in place on a mismatch. Each worker
+			 * repairs only its own index, with no cross-worker
+			 * coordination. Returns 0 for good or repaired, 1 for
+			 * unrepairable, and -1 for unverifiable, which warns rather
+			 * than counting as a content failure.
 			 */
 			int repaired = 0;
 
@@ -320,11 +316,11 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 				    __ATOMIC_RELAXED);
 			unit->verify_job = NULL;
 
-			/* Meter: this chunk's WORK (both legs) is done. End
-			 * the op BEFORE folding - the opposite order lets a
-			 * reporter tick count the chunk twice (a rate spike);
-			 * the dip this order leaves is absorbed by the
-			 * reporter's monotonic publish. */
+			/* Meter: this chunk's hash work is done, both legs. End
+			 * the op before folding, because the other order lets a
+			 * reporter tick count the chunk twice and publish a rate
+			 * spike, while the dip this order leaves is absorbed by
+			 * the reporter's monotonic publish. */
 			sftp_conn_hash_op_end(worker->conn);
 			__atomic_fetch_add(&fleet->verify_done_bytes,
 			    2 * (uint64_t)job->lens[idx], __ATOMIC_RELAXED);
@@ -359,19 +355,19 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 					long long size =
 					    (stat(job->local_path, &local_st) == 0) ?
 					    (long long)local_st.st_size : -1;
-					enum transferlog_status st;
+					enum transferlog_status status;
 
 					if (j_failed)
-						st = TRANSFERLOG_FAILED;
+						status = TRANSFERLOG_FAILED;
 					else if (__atomic_load_n(
 					    &job->any_repaired, __ATOMIC_RELAXED))
-						st = TRANSFERLOG_REPAIRED;
+						status = TRANSFERLOG_REPAIRED;
 					else if (__atomic_load_n(
 					    &job->any_unverified, __ATOMIC_RELAXED))
-						st = TRANSFERLOG_SUCCESS;
+						status = TRANSFERLOG_SUCCESS;
 					else
-						st = TRANSFERLOG_VERIFIED;
-					transferlog_file(st, size,
+						status = TRANSFERLOG_VERIFIED;
+					transferlog_file(status, size,
 					    job->local_is_target ?
 					    job->local_path : job->remote_path);
 				}
@@ -451,11 +447,9 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 		}
 		break;
 	case SFTP_OP_UPLOAD_RANGE: {
-		/* Range-split resume gate + post-transfer verify happen at
-		 * the orchestrator/finalize level, not per-range; see
-		 * project_parallel_resume_verify_design (Phase 1 follow-up).
-		 * The warm handle (built from the worker's cache) is reused
-		 * across consecutive same-file ranges and synced back. */
+		/* Resume and post-transfer verify are decided per file at the
+		 * orchestrator and finalize level, not per range. The warm
+		 * handle comes from the worker's cache and is synced back. */
 		struct sftp_range_warm warm = {
 			worker->warm_handle, worker->warm_handle_len, worker->warm_dst_path
 		};
@@ -498,16 +492,14 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 		/*
 		 * Verified-resume overlap span: reconcile [offset, length) of
 		 * the existing partial against the source through the shared
-		 * verify+repair engine - hash-compare in chunks, splice only
-		 * the mismatched runs. Repair is FORCED on regardless of the
-		 * user's verify-repair setting: for resume, the repair IS the
-		 * transfer. The engine's hash legs bracket the conn's
-		 * hash-op accessors, so the resume-check meter and the
-		 * watchdog's hash gate cover this exactly like the serial
-		 * gate. 0 = span now matches the source (possibly after
-		 * splicing); anything else takes the normal retry path
-		 * (verify_repair is idempotent, so a whole-span retry after a
-		 * worker death re-hashes and re-splices safely).
+		 * verify and repair engine, which hash-compares in chunks and
+		 * splices only the runs that differ. Repair is forced on
+		 * whatever the user's setting, because for a resume the repair
+		 * is the transfer. The engine opens a hash op on the conn, so
+		 * the resume-check meter and the watchdog's hash gate see this
+		 * work as they do the serial path. Anything but 0 takes the
+		 * normal retry path; the engine is idempotent, so a whole-span
+		 * retry after a worker death re-hashes and re-splices safely.
 		 */
 		int local_is_target = (unit->range_tracker != NULL &&
 		    unit->range_tracker->target == SFTP_RANGE_TARGET_LOCAL);
@@ -556,18 +548,39 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 }
 
 /*
- * Permanent give-up of a work unit after MAX_RETRIES. Snapshots the
- * cause from the TLS-captured most-recent ERROR log BEFORE the give-up
- * log clobbers it, then does all the bookkeeping in one place:
- *   - log give-up at error level
- *   - record per-worker completion as failure
- *   - decrement orchestrator pending counter
- *   - finalize range tracker (NULL-safe; only meaningful for range units)
- *   - append path + cause to failed-paths list
- *   - free the unit
+ * The bookkeeping every permanent give-up owes the rest of the fleet: the
+ * worker's counters, the transfer log, the file's range tracker, the
+ * failed-paths list the end of run summary prints, and last of all the
+ * pending count. The unit is freed at the end, so the caller must treat it
+ * as dead.
+ */
+static void
+worker_retire_failed_unit(struct sftp_parallel *fleet, struct sftp_worker *worker,
+    struct sftp_work_unit *unit, const char *cause)
+{
+	worker_record_completion(worker, 0, 0);
+	/* TransferLog: a whole-file give-up is the file's final status, while
+	 * range and span give-ups are logged once at tracker finalize. */
+	if (unit->op == SFTP_OP_UPLOAD || unit->op == SFTP_OP_DOWNLOAD)
+		transferlog_file(TRANSFERLOG_FAILED, (long long)unit->size,
+		    unit->dst_path);
+	(void)parallel_unit_tracker_finalize(unit->range_tracker, 1, worker);
+	worker_record_failed_path(fleet, unit, cause);
+	/* Dropping pending is what wakes sftp_parallel_wait, so it goes last,
+	 * after everything this worker still had to do with shared state. The
+	 * success path in worker_process_result orders it the same way. */
+	parallel_unit_pending_dec(fleet);
+	parallel_unit_free(unit);
+}
+
+/*
+ * Gives up on a work unit for good, either because it ran out of retries or
+ * because the failure was one that retrying cannot clear. Takes a copy of
+ * the thread's most recent error log line first, since the give-up log below
+ * would otherwise overwrite the text that explains the failure.
  *
- * `log_prefix` distinguishes the caller in the give-up log ("unit" for
- * single-unit dispatch, "batch unit" for pipelined-batch).
+ * log_prefix names the caller in the give-up log, "unit" for single dispatch
+ * and "batch unit" for a member of a pipelined batch.
  */
 static void
 worker_give_up_unit(struct sftp_parallel *fleet, struct sftp_worker *worker,
@@ -575,69 +588,109 @@ worker_give_up_unit(struct sftp_parallel *fleet, struct sftp_worker *worker,
 {
 	char        cause[256];
 	const char *captured = hpn_get_last_error();
+	const char *path = unit->src_path;
 
-	strlcpy(cause,
-	    (captured && *captured) ? captured : "(no error captured)",
-	    sizeof(cause));
+	if (captured == NULL || *captured == '\0')
+		captured = "(no error captured)";
+	strlcpy(cause, captured, sizeof(cause));
+	if (path == NULL)
+		path = "(unknown path)";
 
 	error_f("worker %d: %s failed after %d attempts: %s",
-	    worker->id, log_prefix, unit->attempt,
-	    unit->src_path ? unit->src_path : "(null)");
-	worker_record_completion(worker, 0, 0);
-	parallel_unit_pending_dec(fleet);
-	/* TransferLog: whole-file give-up is the file's final status;
-	 * range/span give-ups log once at tracker finalize instead. */
-	if (unit->op == SFTP_OP_UPLOAD || unit->op == SFTP_OP_DOWNLOAD)
-		transferlog_file(TRANSFERLOG_FAILED, (long long)unit->size,
-		    unit->dst_path);
-	(void)parallel_unit_tracker_finalize(unit->range_tracker, 1, worker);
-	worker_record_failed_path(fleet, unit, cause);
-	parallel_unit_free(unit);
+	    worker->id, log_prefix, unit->attempt, path);
+	worker_retire_failed_unit(fleet, worker, unit, cause);
 }
 
 /*
- * Push-fail give-up: the workqueue refused our retry submission
- * (shutdown in progress), so this unit can never run. Same bookkeeping
- * as worker_give_up_unit but with an explicit cause string ("queue
- * shutdown") and no give-up log line - the push-fail itself is the
- * diagnostic.
+ * Gives up on a unit the workqueue refused to take back, which happens when
+ * the queue is shutting down. The unit can never run, so it gets the same
+ * bookkeeping with "queue shutdown" as the cause.
  *
- * Caller must have already failed sftp_workqueue_push BEFORE calling
- * this; we just clean up.
+ * Nothing logs this on its own: the queue does not log a refused push and
+ * this path deliberately stays quiet, since a shutting-down fleet would
+ * otherwise emit one line per undelivered unit. What the user sees is the
+ * failed-paths entry in the end of run summary.
+ *
+ * The caller has already tried the push and failed; this only cleans up.
  */
 static void
 worker_give_up_pushfail(struct sftp_parallel *fleet, struct sftp_worker *worker,
     struct sftp_work_unit *unit)
 {
-	worker_record_completion(worker, 0, 0);
-	parallel_unit_pending_dec(fleet);
-	if (unit->op == SFTP_OP_UPLOAD || unit->op == SFTP_OP_DOWNLOAD)
-		transferlog_file(TRANSFERLOG_FAILED, (long long)unit->size,
-		    unit->dst_path);
-	(void)parallel_unit_tracker_finalize(unit->range_tracker, 1, worker);
-	worker_record_failed_path(fleet, unit, "queue shutdown");
-	parallel_unit_free(unit);
+	worker_retire_failed_unit(fleet, worker, unit, "queue shutdown");
 }
 
-/* Handle the result of executing a single work unit (retry or completion). */
+/*
+ * Decides whether a failed unit goes back on the queue or is given up on,
+ * and carries out whichever it is. This is the retry policy for every path:
+ * a dead connection or a cooperative yield requeues without spending an
+ * attempt and jumps the queue, anything else spends one and goes to the
+ * tail. A permission denied on a live connection is permanent, since no
+ * number of retries can clear it.
+ *
+ * The increment sits inside the condition on purpose: a transient or a yield
+ * short-circuits before it, which is how those two requeue for free. The
+ * push is non-blocking because a worker must never block on a full queue it
+ * also drains, which self-deadlocks at -j1.
+ */
+static void
+worker_retry_or_give_up(struct sftp_parallel *fleet, struct sftp_worker *worker,
+    struct sftp_work_unit *unit, int transient, int yielded,
+    const char *log_prefix)
+{
+	if (!transient && sftp_conn_saw_perm_denied(worker->conn))
+		unit->no_retry = 1;
+	if (!unit->no_retry &&
+	    (transient || yielded ||
+	    ++unit->attempt < parallel_unit_max_retries(fleet))) {
+		if (parallel_worker_requeue(fleet, unit, transient || yielded) != 0)
+			worker_give_up_pushfail(fleet, worker, unit);
+		else if (yielded)
+			sftp_workqueue_kick(fleet->q);
+		return;
+	}
+	worker_give_up_unit(fleet, worker, unit, log_prefix);
+}
+
+/*
+ * Decides what happens to a unit after the worker has run it, and owns the
+ * retry policy.
+ *
+ * A success records the bytes, writes the transfer log line for a whole
+ * file, finalizes the file's range tracker, and frees the unit.
+ *
+ * A failure is classified first. A dead connection is transient and
+ * blameless: this worker is about to exit and be replaced, so the unit
+ * returns to the queue without charging its retry budget. A failure on a
+ * live connection is ambiguous and does charge it, bounded by the retry
+ * limit. A permission denied on a live connection is permanent and gives up
+ * at once, since no number of retries can clear it.
+ *
+ * A partially landed range requeues as just its unlanded remainder, and
+ * because it made progress its retry budget is reset. That way a flaky but
+ * advancing range cannot run out of retries at 90 percent transferred.
+ *
+ * Transients and cooperative yields go to the front of the queue so another
+ * worker takes them promptly; an ambiguous retry goes to the tail so the
+ * same worker does not immediately re-pop and re-fail it.
+ */
 static void
 worker_process_result(struct sftp_worker *worker, struct sftp_work_unit *unit, int rc)
 {
 	struct sftp_parallel *fleet = worker->parent;
 
-	/* Cooperative yield (phase C): consume+clear the request whatever
-	 * the outcome - a unit that completed despite the flag (race with
-	 * its own finish) must not poison the next dispatch. A yielded
-	 * non-success on a LIVE connection is voluntary: requeue the
-	 * remainder without charging the retry budget. */
+	/* Cooperative yield: consume and clear the request whatever the
+	 * outcome, so a unit that completed despite the flag does not poison
+	 * the next dispatch. A yielded failure on a live connection is
+	 * voluntary and requeues without charging the retry budget. */
 	int yielded = __atomic_exchange_n(&worker->yield_req, 0, __ATOMIC_RELAXED);
 
-	/* HPN: free the per-inode writer slot claimed in parallel_worker_thread's
+	/* Free the per-inode writer slot claimed in parallel_worker_thread's
 	 * dispatch gate. Reached exactly once per executed unit on every
-	 * path (success, retry-requeue, give-up), so retries release here and
-	 * re-acquire when re-dispatched. NULL tracker (non-range) = no-op.
-	 * The kick wakes workers parked in the cap-gate's wait_activity so a
-	 * freed slot is picked up immediately instead of on the timeout. */
+	 * path, so retries release here and re-acquire when re-dispatched.
+	 * NULL tracker = no-op. The kick wakes workers parked in the
+	 * cap-gate's wait_activity so a freed slot is picked up immediately
+	 * instead of on the timeout. */
 	if (unit->range_tracker != NULL) {
 		parallel_unit_writer_release(unit->range_tracker);
 		sftp_workqueue_kick(fleet->q);
@@ -655,61 +708,39 @@ worker_process_result(struct sftp_worker *worker, struct sftp_work_unit *unit, i
 			    TRANSFERLOG_SUCCESS, (long long)unit->size,
 			    unit->dst_path);
 		/*
-		 * Range tracker: this range finished cleanly. Finalize BEFORE
-		 * decrementing pending. For the last range of a verified file,
-		 * finalize runs the whole-file post-transfer verify on this
-		 * worker's own live conn; dropping pending to 0 first would wake
-		 * sftp_parallel_wait and let the main thread tear the conn down
-		 * mid-verify (a broken pipe on the hpn-check-file send). The
-		 * unit is not truly complete until verified, so it stays pending
-		 * across the verify. Last completer for the file frees the
-		 * tracker. (Verify-off: finalize is the same fast bookkeeping,
-		 * so the reorder is a no-op in timing.)
+		 * Range tracker: this range finished cleanly. Finalize before
+		 * decrementing pending, because finalize writes the transfer log
+		 * line and, for the last range of the file, either parks the
+		 * tracker for the verify phase or frees it. Dropping pending to
+		 * zero is what wakes sftp_parallel_wait, so it goes after the
+		 * worker is done with that shared state. The give-up path in
+		 * worker_retire_failed_unit orders it the same way.
 		 */
 		(void)parallel_unit_tracker_finalize(unit->range_tracker, 0, worker);
 		parallel_unit_pending_dec(fleet);
 		parallel_unit_free(unit);
 	} else {
 		/*
-		 * Failure. A dead connection (wedge / peer-stall / transport
-		 * drop) is a TRANSIENT, blameless failure: this worker is about
-		 * to break the main loop and be respawned, so we re-queue the
-		 * unit WITHOUT charging unit->attempt - peer-stall churn must not
-		 * burn the retry budget and abandon the byte-range (the br008
-		 * j8 data-loss bug). Only a failure on a still-LIVE connection
-		 * (ambiguous server error) charges unit->attempt and stays bounded
-		 * by MAX_RETRIES.
-		 *
-		 * Re-queue position differs by class:
-		 *   transient -> push_front: the worker exits, so a different
-		 *     worker pops this unit next; jumping ahead of fresh work
-		 *     lets the partially-complete file (and its range tracker)
-		 *     finish promptly instead of waiting behind the whole queue.
-		 *   ambiguous -> push (tail): the SAME live worker loops back
-		 *     and would otherwise immediately re-pop and re-fail the
-		 *     unit, burning MAX_RETRIES in a tight loop; the tail gives
-		 *     the transient condition time to clear before the retry.
+		 * Failure. Transient means the connection is dead and this worker
+		 * is about to be replaced; ambiguous means it failed on a live
+		 * connection. Not charging the retry budget for a transient
+		 * matters: peer-stall churn burning through the budget is what
+		 * abandoned byte ranges in the br008 j8 data-loss bug.
 		 */
 		int transient = sftp_conn_is_dead(worker->conn);
 
-		/* HPN: a server PERMISSION_DENIED on a still-live connection
-		 * is permanent - retrying cannot clear it. Mark the unit
-		 * no_retry so it fails now instead of burning MAX_RETRIES. */
-		if (!transient && sftp_conn_saw_perm_denied(worker->conn))
-			unit->no_retry = 1;
-
-		/* A yield on a connection that DIED during the wind-down is
-		 * not a yield - it is an ordinary death; the transient path
-		 * already handles it (and the respawned worker can't defer). */
+		/* A yield on a connection that died during the wind-down is not a
+		 * yield but an ordinary death, which the transient path already
+		 * handles; a respawned worker cannot defer anything. */
 		if (transient)
 			yielded = 0;
 
 		/*
-		 * Highwater resume (HPN): the failed attempt confirmed
+		 * Highwater resume: the failed attempt confirmed
 		 * acked_bytes contiguous bytes on the target, so the unit
-		 * requeues as just its unlanded remainder - worker death
+		 * requeues as just its unlanded remainder. Worker death
 		 * costs the in-flight window, not the whole range. Progress
-		 * also RESETS the retry budget: attempts only count when
+		 * also resets the retry budget. Attempts only count when
 		 * they were fruitless, so a flaky-but-advancing range cannot
 		 * exhaust retries and give up at 90% transferred. The
 		 * tracker is untouched: same unit, same single finalize.
@@ -725,44 +756,51 @@ worker_process_result(struct sftp_worker *worker, struct sftp_work_unit *unit, i
 			    (long long)unit->range_length,
 			    (long long)unit->acked_bytes,
 			    yielded ? " (cooperative yield)" : "");
+			/* Those acked bytes really landed on the target, so
+			 * credit them now. The retry carries only the
+			 * remainder, and live_bytes is add-only and about to
+			 * be reset, so this is the one chance to count them. */
+			pthread_mutex_lock(&worker->mu);
+			worker->bytes_total += (uint64_t)unit->acked_bytes;
+			pthread_mutex_unlock(&worker->mu);
 			unit->range_offset += unit->acked_bytes;
 			unit->range_length -= unit->acked_bytes;
 			unit->size = unit->range_length;
 			unit->attempt = 0;
 			unit->acked_bytes = 0;
 		}
+		/* This attempt is done with. Clear the live counter the way
+		 * worker_finalize_one_entry does, so the next attempt starts
+		 * from zero instead of inheriting this one's bytes. */
+		__atomic_store_n(&worker->live_bytes, 0, __ATOMIC_RELAXED);
 
-		/* Yield handoff: mark the remainder so dispatch gives a
-		 * DIFFERENT worker first crack at it (one courtesy defer). */
-		unit->yield_from = yielded ? worker->id + 1 : 0;
+		/* Yield handoff: mark the remainder so dispatch gives another
+		 * worker first crack at it, one courtesy defer. */
+		if (yielded)
+			unit->yield_from = worker->id + 1;
+		else
+			unit->yield_from = 0;
 
-		if (!unit->no_retry &&
-		    (transient || yielded ||
-		    ++unit->attempt < parallel_unit_max_retries(fleet))) {
-			/* Yields jump the queue like transients: the parked
-			 * READY fleet should pick the remainder up NOW. Non-
-			 * blocking: a worker must never block on a full queue it
-			 * also drains (self-deadlock, fatal at -j1). */
-			if (parallel_worker_requeue(fleet, unit,
-			    transient || yielded) != 0)
-				worker_give_up_pushfail(fleet, worker, unit);
-			else if (yielded)
-				sftp_workqueue_kick(fleet->q);
-		} else {
-			worker_give_up_unit(fleet, worker, unit, "unit");
-		}
+		worker_retry_or_give_up(fleet, worker, unit, transient, yielded,
+		    "unit");
 	}
 }
 
 /*
- * Record the result of one batch entry: success counts a completion;
- * failure re-queues the unit for retry or, past the retry budget,
- * gives it up permanently.
+ * Retires one member of a completed batch or bundle. A success counts the
+ * bytes, writes the transfer log line, and, when verifying, parks the file
+ * for the post-transfer verify phase. Any non-zero result (rc) is a failure and
+ * goes through the same retry decision as a single unit.
+ *
+ * This is where the pipelined upload batch and the bundle path converge, so
+ * parking here is what gives both of them verify coverage. Single files and
+ * range-split files park in execute_unit and at tracker finalize instead.
  */
 static void
 worker_finalize_one_entry(struct sftp_parallel *fleet, struct sftp_worker *worker,
     struct sftp_work_unit *unit, int rc)
 {
+	/* anything other than rc == 0 indicates a failure */
 	if (rc == 0) {
 		worker_record_completion(worker, unit->size, 1);
 		/* TransferLog: batched/bundled member success is final here
@@ -770,84 +808,89 @@ worker_finalize_one_entry(struct sftp_parallel *fleet, struct sftp_worker *worke
 		if (!fleet->cfg.verify_transfer)
 			transferlog_file(TRANSFERLOG_SUCCESS,
 			    (long long)unit->size, unit->dst_path);
-		/*
-		 * Verify transfer: park every completed batched/bundled member
-		 * for the post-transfer verify phase. This is the one point the
-		 * pipelined upload batch AND the bundle members converge, so
-		 * parking here gives verify-on coverage to both - the single-file
-		 * and range-split paths park in execute_unit / finalize.
-		 */
-		if (fleet->cfg.verify_transfer) {
-			if (unit->op == SFTP_OP_UPLOAD)
-				parallel_verify_park_whole_file(fleet, unit->src_path,
-				    unit->dst_path, /*local_is_target=*/0);
-			else if (unit->op == SFTP_OP_DOWNLOAD)
-				parallel_verify_park_whole_file(fleet, unit->dst_path,
-				    unit->src_path, /*local_is_target=*/1);
-		}
+		else if (unit->op == SFTP_OP_UPLOAD)
+			parallel_verify_park_whole_file(fleet, unit->src_path,
+			    unit->dst_path, /*local_is_target=*/0);
+		else if (unit->op == SFTP_OP_DOWNLOAD)
+			parallel_verify_park_whole_file(fleet, unit->dst_path,
+			    unit->src_path, /*local_is_target=*/1);
 		parallel_unit_pending_dec(fleet);
 		parallel_unit_free(unit);
 		return;
 	}
 	int transient = sftp_conn_is_dead(worker->conn);
-	/* HPN: a live-conn PERMISSION_DENIED is permanent (same rule as
-	 * worker_process_result) - don't retry it. */
-	if (!transient && sftp_conn_saw_perm_denied(worker->conn))
-		unit->no_retry = 1;
-	if (!unit->no_retry &&
-	    (transient || ++unit->attempt < parallel_unit_max_retries(fleet))) {
-		/*
-		 * Transient (dead-conn) failures re-queue WITHOUT charging
-		 * unit->attempt and jump to the FRONT so the partial file finishes
-		 * promptly; ambiguous (live-conn) failures charge the budget
-		 * and go to the TAIL. See the full rationale in
-		 * worker_process_result.
-		 */
-		__atomic_store_n(&worker->live_bytes, 0, __ATOMIC_RELAXED);
-		/* Non-blocking: a failed bundle re-queues all its members here,
-		 * and a blocking push on a full queue the sole consumer also
-		 * drains is the -j1 self-deadlock this whole path exists to
-		 * avoid. */
-		if (parallel_worker_requeue(fleet, unit, transient) != 0)
-			worker_give_up_pushfail(fleet, worker, unit);
-		return;
-	}
-	worker_give_up_unit(fleet, worker, unit, "batch unit");
+
+	/* This attempt is over: clear the live counter so the next one starts
+	 * from zero. A batch member is a whole file, so there is no partially
+	 * landed remainder to credit the way a range unit has. */
+	__atomic_store_n(&worker->live_bytes, 0, __ATOMIC_RELAXED);
+	worker_retry_or_give_up(fleet, worker, unit, transient, /*yielded=*/0,
+	    "batch unit");
 }
 
 /*
- * Finish the carried-over previous batch, if any: run
- * sftp_upload_batch_finish on it, feed the per-entry results through
- * worker_finalize_one_entry, and free the heap arrays. Called before
- * handling any non-batch work and at parallel_worker_thread exit.
+ * Retires the members of the carried-over batch and clears it. The caller
+ * has already collected that batch's replies, either through
+ * sftp_upload_batch_finish or through the drain that runs inside
+ * sftp_upload_batch_send, so every entry result is final by the time we get
+ * here. No-op when nothing is carried over.
  */
 static void
-worker_drain_pipeline(struct sftp_worker *worker)
+worker_finalize_prev_batch(struct sftp_worker *worker)
 {
 	struct sftp_parallel *fleet = worker->parent;
-	if (worker->batch_prev_pending == NULL)
+
+	if (worker->batch_prev_units == NULL)
 		return;
-	sftp_conn_clear_perm_denied(worker->conn); /* HPN: scope to this batch drain */
-	(void)sftp_upload_batch_finish(worker->conn, worker->batch_prev_pending);
 	for (int i = 0; i < worker->batch_prev_n; i++)
 		worker_finalize_one_entry(fleet, worker,
 		    worker->batch_prev_units[i],
 		    worker->batch_prev_entries[i].result);
 	free(worker->batch_prev_units);
 	free(worker->batch_prev_entries);
-	worker->batch_prev_pending = NULL;
 	worker->batch_prev_units   = NULL;
 	worker->batch_prev_entries = NULL;
 	worker->batch_prev_n       = 0;
 }
 
 /*
- * Run one upload batch, pipelined. Allocates heap entry and unit
- * arrays so they survive into the next iteration, calls
- * sftp_upload_batch_send (which drains the previous batch as part of
- * its first phase), finalizes the previous batch, then saves this
- * batch as the new carry-over. On send failure this batch is
- * finalized inline with no carry.
+ * Finishes the batch whose CLOSE collection was deferred while the next
+ * batch's opens went out, retires each member through
+ * worker_finalize_one_entry, and clears the carry-over state.
+ *
+ * Called before this worker does anything that is not another batch, and
+ * again on the way out. Doing it before a blocking pop matters: the deferred
+ * replies are already in the socket, and blocking on an empty queue without
+ * reading them stalls the server behind TCP back-pressure.
+ *
+ * The permission-denied signal is cleared first so a denial from an earlier
+ * unit cannot make every member of this batch permanent. The pending struct
+ * is freed by sftp_upload_batch_finish; the two arrays are ours to free.
+ */
+static void
+worker_drain_pipeline(struct sftp_worker *worker)
+{
+	if (worker->batch_prev_pending == NULL)
+		return;
+	sftp_conn_clear_perm_denied(worker->conn); /* scope to this batch drain */
+	(void)sftp_upload_batch_finish(worker->conn, worker->batch_prev_pending);
+	worker->batch_prev_pending = NULL; /* freed elsewhere */
+	worker_finalize_prev_batch(worker);
+}
+
+/*
+ * Sends one upload batch with its opens pipelined, and keeps the previous
+ * batch's replies moving at the same time.
+ *
+ * The entry and unit arrays are heap allocated because they outlive this
+ * call: they belong to the batch that is still in flight when the worker
+ * returns to its loop. sftp_upload_batch_send drains the previous batch
+ * inside its first phase, so those replies are collected while this batch's
+ * opens are already on the wire, which is the point of the split. Its
+ * members are retired here once that drain has run.
+ *
+ * A failed send marks every entry in both batches failed and returns NULL,
+ * so this batch is retired immediately and nothing is carried over.
  */
 static void
 worker_run_batch_pipelined(struct sftp_worker *worker,
@@ -858,7 +901,7 @@ worker_run_batch_pipelined(struct sftp_worker *worker,
 	struct sftp_work_unit **units;
 	struct sftp_upload_batch_pending *new_pending;
 
-	/* HPN: scope the permanent-denial signal to this batch's drain. */
+	/* scope the permanent-denial signal to this batch's drain. */
 	sftp_conn_clear_perm_denied(worker->conn);
 
 	/* Pipelined path: heap-allocate the entry and unit arrays so they
@@ -873,8 +916,8 @@ worker_run_batch_pipelined(struct sftp_worker *worker,
 		worker_record_start(worker);
 	}
 
-	/* send() drains batch_prev_pending (if any) AFTER its phase 1
-	 * OPENs are on the wire - that overlap is the win. */
+	/* send() drains batch_prev_pending, if any, after its phase 1
+	 * opens are on the wire; that overlap is the win. */
 	new_pending = sftp_upload_batch_send(worker->conn, entries, batch_n,
 	    fleet->cfg.preserve_flag, fleet->cfg.fsync_flag,
 	    fleet->cfg.inplace_flag,
@@ -882,22 +925,12 @@ worker_run_batch_pipelined(struct sftp_worker *worker,
 	/* batch_prev_pending has been freed inside send. */
 	worker->batch_prev_pending = NULL;
 
-	/* Now finalise the prev batch's results (entries already populated
-	 * by the drain that just ran inside send). */
-	if (worker->batch_prev_units != NULL) {
-		for (int i = 0; i < worker->batch_prev_n; i++)
-			worker_finalize_one_entry(fleet, worker,
-			    worker->batch_prev_units[i],
-			    worker->batch_prev_entries[i].result);
-		free(worker->batch_prev_units);
-		free(worker->batch_prev_entries);
-		worker->batch_prev_units   = NULL;
-		worker->batch_prev_entries = NULL;
-		worker->batch_prev_n       = 0;
-	}
+	/* The prev batch's entries were populated by the drain that just ran
+	 * inside send, so its members can be retired now. */
+	worker_finalize_prev_batch(worker);
 
 	if (new_pending == NULL) {
-		/* THIS batch's send failed. Every entry has result == -1;
+		/* This batch's send failed. Every entry has result == -1;
 		 * finalise inline and don't carry over. */
 		for (int i = 0; i < batch_n; i++)
 			worker_finalize_one_entry(fleet, worker, units[i],
@@ -914,19 +947,26 @@ worker_run_batch_pipelined(struct sftp_worker *worker,
 }
 
 /*
- * Shared tail for worker_run_bundle{,_download}: account the wired member
- * bytes, log the per-bundle timing line, apply the SERVER_CANT single-file
- * downgrade, and finalize each unit with its per-entry result. The two
- * callers differ only in the entry-struct type, so they copy the per-entry
- * results into `results[]` before calling here. `label`/`use_logit` select
- * the log tag and level (upload at debug, download at logit).
+ * Shared tail for the two bundle paths: accounts the member bytes, logs one
+ * line per bundle, decides what a bundle-level failure means for the members,
+ * and retires each of them with its own result.
+ *
+ * Two failures are handled here. A server that cannot bundle at all marks the
+ * members ineligible so they fall back to the per-file path. A server whose
+ * request policy denies this class of transfer stops the whole run, since
+ * every remaining file would be denied one at a time anyway. A transport
+ * failure is deliberately neither: those units bundle fine on a healthy
+ * worker, so they stay eligible and requeue as ordinary transients.
+ *
+ * The two callers differ only in their entry struct, so they copy the
+ * per-entry results into results[] first. label is the log tag.
  */
 static void
 worker_finish_bundle(struct sftp_parallel *fleet, struct sftp_worker *worker,
     struct sftp_work_unit **batch, int batch_n, int bundle_rc,
     const int *results, uint64_t total_bytes,
     uint64_t t_start_ms, uint64_t t_end_ms,
-    const char *label, int use_logit)
+    const char *label)
 {
 	uint64_t elapsed_ms = t_end_ms - t_start_ms;
 	off_t wired_data = 0;
@@ -938,56 +978,47 @@ worker_finish_bundle(struct sftp_parallel *fleet, struct sftp_worker *worker,
 			ok_count++;
 			wired_data += batch[i]->size;
 		}
-	/* Count member DATA (not the tar-framed wire stream) for the run
-	 * summary, so it reflects what the user moved - not the bundling wire
-	 * overhead - and is not mislabeled "skipped via resume". Only the ok
+	/* Count member data, not the tar-framed wire stream, for the run
+	 * summary, so it reflects what the user moved. Only the ok
 	 * members; failed ones re-transfer and are counted on that path. */
 	sftp_conn_bytes_wired_add(worker->conn, (uint64_t)wired_data);
 	if (elapsed_ms > 0)
 		mibps = ((double)total_bytes / (1024.0 * 1024.0)) /
 		    ((double)elapsed_ms / 1e3);
-	/* One stderr line per bundle; format chosen so the harness can grep
-	 * the tag and parse the key=value fields. */
-	if (use_logit)
-		logit("%s worker=%d files=%d ok=%d bytes=%llu elapsed_ms=%llu "
-		    "MiBps=%.2f", label, worker->id, batch_n, ok_count,
-		    (unsigned long long)total_bytes,
-		    (unsigned long long)elapsed_ms, mibps);
-	else
-		debug("%s worker=%d files=%d ok=%d bytes=%llu elapsed_ms=%llu "
-		    "MiBps=%.2f", label, worker->id, batch_n, ok_count,
-		    (unsigned long long)total_bytes,
-		    (unsigned long long)elapsed_ms, mibps);
+	/* One stderr line per bundle; format for easy grepping */
+	debug("%s worker=%d files=%d ok=%d bytes=%llu elapsed_ms=%llu "
+	    "MiBps=%.2f", label, worker->id, batch_n, ok_count,
+	    (unsigned long long)total_bytes,
+	    (unsigned long long)elapsed_ms, mibps);
 
 	/*
-	 * Downgrade to single-file ONLY when the server itself can't bundle
-	 * (SERVER_CANT: refused open / no extension) - a permanent, connection-
-	 * agnostic reason any worker would hit. A TRANSPORT_FAILED (this
-	 * worker's connection died mid-bundle) is NOT such a reason: the units
-	 * bundle fine on a healthy worker, so leave them eligible and let
+	 * Downgrade to single-file only when the server itself cannot bundle
+	 * due to a permanent, connection agnostic reason any worker would hit.
+	 * A TRANSPORT_FAILED is not such a reason. The units bundle fine on
+	 * a healthy worker, so leave them eligible and let
 	 * worker_finalize_one_entry re-queue them (the dead-conn transient
-	 * path). Marking them ineligible here was the bundle-ineligible
-	 * poisoning that dragged the whole fleet to single-file speed when a
-	 * few connections wedged (2026-06-05 8-pass campaign).
+	 * path). Marking them ineligible here is a bundle-ineligible
+	 * poisoning that can cause significant performance issues.
 	 */
 	if (bundle_rc == SFTP_HPN_BUNDLE_POLICY_DENIED) {
 		/*
 		 * The server's -P/-p request policy forbids this whole class of
 		 * transfer - every file would be denied. Fail this batch with
-		 * no per-file fallback and stop the ENTIRE transfer: abort_flag
+		 * no per-file fallback and stop the entire transfer: abort_flag
 		 * halts each worker at the top of its loop and the workqueue
 		 * shutdown wakes any blocked in pop, so we don't grind through
-		 * and re-deny every remaining file (the 100k-file / 200k-RTT
-		 * pathology). Only a confirmed policy tag reaches here, so a
-		 * real per-file ACL still takes the SERVER_CANT fallback below.
+		 * and re-deny every remaining file. Only a confirmed policy
+		 * tag reaches here, so a real per-file ACL still takes the
+		 * SERVER_CANT fallback below.
 		 */
 		for (i = 0; i < batch_n; i++)
 			batch[i]->no_retry = 1;
-		if (!fleet->policy_denied) {
-			fleet->policy_denied = 1;
+		/* Exchange, not test-then-set: two workers denied in the same
+		 * instant would otherwise both print the line. */
+		if (__atomic_exchange_n(&fleet->policy_denied, 1,
+		    __ATOMIC_RELAXED) == 0)
 			logit("transfer stopped: server request policy denies "
 			    "this class of transfer");
-		}
 		fleet->abort_flag = 1;
 		if (fleet->q != NULL)
 			sftp_workqueue_shutdown(fleet->q);
@@ -998,11 +1029,11 @@ worker_finish_bundle(struct sftp_parallel *fleet, struct sftp_worker *worker,
 
 	/*
 	 * A bundle member has not yet had its own per-file open/write attempted,
-	 * so the per-conn saw_perm_denied flag - whether stale from a prior unit
-	 * on this worker or set by the bundle's own container OPEN - must not
+	 * so the per-conn saw_perm_denied flag (whether stale from a prior unit
+	 * on this worker or set by the bundle's own container OPEN) must not
 	 * decide the members' no_retry. Clear it so a SERVER_CANT bundle's
-	 * members fall back to the per-file path, where each member's OWN denial
-	 * (if any) sets no_retry. POLICY_DENIED already set no_retry explicitly
+	 * members fall back to the per-file path, where each member's own denial
+	 * sets no_retry. POLICY_DENIED already set no_retry explicitly
 	 * above; TRANSPORT_FAILED is guarded by !transient in the finalizer.
 	 */
 	sftp_conn_clear_perm_denied(worker->conn);
@@ -1012,21 +1043,18 @@ worker_finish_bundle(struct sftp_parallel *fleet, struct sftp_worker *worker,
 }
 
 /*
- * Bundle-mode analogue of worker_run_batch_pipelined. When
- * worker->bundle_enabled the batch of small files is packed into a single
- * tar stream and shipped through one OPEN/WRITE/CLOSE sequence on a
- * fresh bundle handle, eliminating the per-file open/close round trip
- * that limits the pipelined batch path on high-RTT links.
+ * Bundle-mode analogue of worker_run_batch_pipelined. The batch of small
+ * files is packed into a single tar stream and shipped through one
+ * OPEN/WRITE/CLOSE on a fresh bundle handle, which removes the per-file open
+ * and close round trip that limits the pipelined path on high-RTT links.
  *
- * Per-entry success is signalled via the result field set by
- * sftp_hpn_bundle_upload. On bundle failure every entry is marked
- * failed and the units retry individually through
- * worker_finalize_one_entry; no batch-wide retry is needed because
- * the units remain individual work-queue entries.
+ * sftp_hpn_bundle_upload reports success per entry. When the bundle itself
+ * fails every entry is marked failed and the members retry individually,
+ * with no batch-wide retry needed: they are still separate work-queue units.
  *
- * Synchronous: no overlap with the next batch. Could be relaxed by
- * splitting send and finish like the pipelined path; not worth the
- * complexity until benchmarks show bundle close latency is a problem.
+ * TODO: this path is synchronous, so nothing overlaps the next batch. It
+ * could be split into send and finish like the pipelined path, which is only
+ * worth the complexity if a benchmark shows bundle close latency mattering.
  */
 static void
 worker_run_bundle(struct sftp_worker *worker,
@@ -1034,6 +1062,7 @@ worker_run_bundle(struct sftp_worker *worker,
 {
 	struct sftp_parallel *fleet = worker->parent;
 	struct sftp_hpn_bundle_upload_entry *entries;
+	struct sftp_bundle_opts opts;
 	int *results;
 	uint64_t total_bytes = 0, t_start_ms, t_end_ms;
 	int i, bundle_rc;
@@ -1050,34 +1079,35 @@ worker_run_bundle(struct sftp_worker *worker,
 	}
 
 	t_start_ms = monotime_ms();
-	/* dest_dir = "" - each remote_path is treated as an absolute path by
+	/* dest_dir = "" Each remote_path is treated as an absolute path by
 	 * the server-side bundle handler. This avoids computing a common
-	 * prefix across the batch; the server's bundle extractor calls mkdir_p
+	 * prefix across the batch. The server's bundle extractor calls mkdir_p
 	 * on each containing directory anyway. Slight wire-size cost (full
 	 * path repeated in every tar header) but trivial vs the small-file
 	 * payloads. */
+	opts.preserve = fleet->cfg.preserve_flag;
+	opts.fsync = fleet->cfg.fsync_flag;
+	opts.writer_pool = fleet->cfg.writer_pool;
 	bundle_rc = sftp_hpn_bundle_upload(worker->conn, "", entries, batch_n,
-	    fleet->cfg.preserve_flag, fleet->cfg.fsync_flag, fleet->cfg.writer_pool,
-	    fleet->cfg.bundle_size);
+	    &opts, fleet->cfg.bundle_size);
 	t_end_ms = monotime_ms();
 
 	for (i = 0; i < batch_n; i++)
 		results[i] = entries[i].result;
-	worker_finish_bundle(fleet, worker, batch, batch_n, bundle_rc, results, total_bytes,
-	    t_start_ms, t_end_ms, "BUNDLE", 0);
+	
+	worker_finish_bundle(fleet, worker, batch, batch_n, bundle_rc, results,
+            total_bytes, t_start_ms, t_end_ms, "BUNDLE");
 
 	free(entries);
 	free(results);
 }
 
 /*
- * Download-side counterpart of worker_run_bundle: builds the entries array
- * from a batch of SFTP_OP_DOWNLOAD units (src_path = remote, dst_path =
- * local), asks the server to pack the listed paths via
- * sftp_hpn_bundle_download, then shares worker_finish_bundle for
- * byte-accounting, the per-bundle log line, the SERVER_CANT single-file
- * downgrade, and per-entry finalisation (which re-queues failures via the
- * normal retry path).
+ * Download counterpart of worker_run_bundle. Builds the entry array from a
+ * batch of download units, with each unit's source path as the remote and
+ * its destination as the local, and asks the server to pack those paths into
+ * one tar stream. worker_finish_bundle does the accounting, the log line,
+ * the failure handling, and the per-member retirement.
  */
 static void
 worker_run_bundle_download(struct sftp_worker *worker,
@@ -1085,6 +1115,7 @@ worker_run_bundle_download(struct sftp_worker *worker,
 {
 	struct sftp_parallel *fleet = worker->parent;
 	struct sftp_hpn_bundle_download_entry *entries;
+	struct sftp_bundle_opts opts;
 	int *results;
 	uint64_t total_bytes = 0, t_start_ms, t_end_ms;
 	int i, bundle_rc;
@@ -1101,15 +1132,17 @@ worker_run_bundle_download(struct sftp_worker *worker,
 	}
 
 	t_start_ms = monotime_ms();
+	opts.preserve = fleet->cfg.preserve_flag;
+	opts.fsync = fleet->cfg.fsync_flag;
+	opts.writer_pool = fleet->cfg.writer_pool;
 	bundle_rc = sftp_hpn_bundle_download(worker->conn, entries, batch_n,
-	    fleet->cfg.preserve_flag, fleet->cfg.writer_pool, fleet->cfg.fsync_flag,
-	    NULL);
+	    &opts, /*progress=*/NULL);
 	t_end_ms = monotime_ms();
 
 	for (i = 0; i < batch_n; i++)
 		results[i] = entries[i].result;
 	worker_finish_bundle(fleet, worker, batch, batch_n, bundle_rc, results, total_bytes,
-	    t_start_ms, t_end_ms, "BUNDLE-DL", 0);
+	    t_start_ms, t_end_ms, "BUNDLE-DL");
 
 	free(entries);
 	free(results);
@@ -1306,6 +1339,10 @@ worker_should_terminate(struct sftp_worker *worker)
  * the reporter run on another thread and can only see these fields: which
  * phase it is in, whether it is busy, idle, or blocked on a writer cap, when
  * it picked up its current unit, and that unit's size and offset.
+ *
+ * A worker blocking for work keeps any warm file handle open. It is closed
+ * when the worker takes a unit for a different file, or on the way out, so an
+ * idle worker can hold a file open on the server for the length of its wait.
  *
  * The loop ends when the queue is shut down and empty, when the fleet
  * aborts, or when worker_should_terminate says this worker should stop. On

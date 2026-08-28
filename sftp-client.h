@@ -385,10 +385,22 @@ enum sftp_hpn_bundle_result {
 						* transfer, do not fall back */
 };
 
+/*
+ * Per-transfer flags shared by both bundle entry points. They travel in a
+ * struct rather than as positional ints because all three are int and a
+ * transposed pair compiles cleanly, moves every byte correctly, and only
+ * shows up as a feature that quietly stopped working.
+ */
+struct sftp_bundle_opts {
+	int preserve;		/* preserve mode and times */
+	int fsync;		/* fsync each file after writing */
+	int writer_pool;	/* extract through the writer pool */
+};
+
 int sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n,
-    int preserve_flag, int fsync_flag, int writer_pool, uint64_t bundle_size);
+    const struct sftp_bundle_opts *opts, uint64_t bundle_size);
 
 /* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
 int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
@@ -459,10 +471,13 @@ int sftp_conn_has_file_layout(struct sftp_conn *conn);
  * then untars locally into each `entries[].local_path`.  Per-entry result
  * codes are written into entries[i].result (0 = ok, -1 = skipped/failed).
  *
- * Returns 0 if the bundle transaction succeeded (even if some per-entry
- * results are -1), -1 if the server refused the extension or the
- * transaction failed at the wire level (in which case every entry is
- * marked -1 and the caller should fall back to per-file downloads).
+ * Returns an enum sftp_hpn_bundle_result: OK when the transaction
+ * succeeded, even if some per-entry results are -1; SERVER_CANT when the
+ * server refused or lacks the extension; TRANSPORT_FAILED when this
+ * connection died mid-bundle; POLICY_DENIED when the server's request
+ * policy forbids the whole class. Any non-OK return marks every entry -1.
+ * The caller must keep SERVER_CANT and TRANSPORT_FAILED apart: only the
+ * former justifies falling back to per-file downloads.
  *
  * Implementation lives in sftp-hpn-client.c.
  */
@@ -474,8 +489,7 @@ struct sftp_hpn_bundle_download_entry {
 
 int sftp_hpn_bundle_download(struct sftp_conn *conn,
     struct sftp_hpn_bundle_download_entry *entries, int n,
-    int preserve_flag, int writer_pool, int fsync_flag,
-    off_t *progress);
+    const struct sftp_bundle_opts *opts, off_t *progress);
 
 /* ── END Phase 5 ─────────────────────────────────────────────────────────*/
 

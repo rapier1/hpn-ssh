@@ -627,8 +627,11 @@ bundle_dl_stream_drain_inflight(struct bundle_dl_stream *s)
 int
 sftp_hpn_bundle_download(struct sftp_conn *conn,
     struct sftp_hpn_bundle_download_entry *entries, int n,
-    int preserve_flag, int writer_pool, int fsync_flag, off_t *progress)
+    const struct sftp_bundle_opts *opts, off_t *progress)
 {
+	const int preserve_flag = opts->preserve;
+	const int fsync_flag = opts->fsync;
+	const int writer_pool = opts->writer_pool;
 	struct sshbuf *msg = NULL;
 	u_char *handle = NULL;
 	size_t  handle_len = 0;
@@ -1238,8 +1241,11 @@ int
 sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n,
-    int preserve_flag, int fsync_flag, int writer_pool, uint64_t bundle_size)
+    const struct sftp_bundle_opts *opts, uint64_t bundle_size)
 {
+	const int preserve_flag = opts->preserve;
+	const int fsync_flag = opts->fsync;
+	const int writer_pool = opts->writer_pool;
 	struct sshbuf *msg = NULL;
 	u_char *handle = NULL;
 	size_t handle_len = 0;

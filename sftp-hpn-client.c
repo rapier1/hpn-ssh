@@ -1386,6 +1386,7 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
     int verify, int fsync_flag, int inplace_flag)
 {
 	struct sftp_hpn_bundle_upload_entry *entries;
+	struct sftp_bundle_opts opts;
 	int i, rc, failures = 0;
 
 	entries = xcalloc(acc->n, sizeof(*entries));
@@ -1393,9 +1394,11 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 		entries[i].local_path = acc->src_paths[i];
 		entries[i].remote_path = acc->dst_paths[i];
 	}
-	rc = sftp_hpn_bundle_upload(conn, "", entries, acc->n,
-	    preserve_flag, fsync_flag,
-	    sftp_conn_hpn(conn)->bundle_cfg.writer_pool, acc->target);
+	opts.preserve = preserve_flag;
+	opts.fsync = fsync_flag;
+	opts.writer_pool = sftp_conn_hpn(conn)->bundle_cfg.writer_pool;
+	rc = sftp_hpn_bundle_upload(conn, "", entries, acc->n, &opts,
+	    acc->target);
 	switch (rc) {
 	case SFTP_HPN_BUNDLE_OK:
 		for (i = 0; i < acc->n; i++) {
@@ -1459,6 +1462,7 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 	 * here never touches the parallel aggregate meter. */
 	extern int showprogress;
 	struct sftp_hpn_bundle_download_entry *entries;
+	struct sftp_bundle_opts opts;
 	int i, rc, dr, failures = 0;
 	off_t meter_ctr = 0, meter_total = 0;
 	char meter_label[32];
@@ -1484,9 +1488,11 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 		    HPN_METER_DOM_TRANSFER, meter_label, meter_total,
 		    &meter_ctr, (u_int)acc->n);
 	}
-	rc = sftp_hpn_bundle_download(conn, entries, acc->n,
-	    preserve_flag, sftp_conn_hpn(conn)->bundle_cfg.writer_pool,
-	    fsync_flag, meter_on ? &meter_ctr : NULL);
+	opts.preserve = preserve_flag;
+	opts.fsync = fsync_flag;
+	opts.writer_pool = sftp_conn_hpn(conn)->bundle_cfg.writer_pool;
+	rc = sftp_hpn_bundle_download(conn, entries, acc->n, &opts,
+	    meter_on ? &meter_ctr : NULL);
 	if (meter_on)
 		hpn_meter_stop(hpn_meter_serial(), acc);
 	switch (rc) {

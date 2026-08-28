@@ -588,8 +588,7 @@ struct sftp_worker {
 	int64_t            unit_offset;
 	/* Warm remote handle held across consecutive same-file range writes,
 	 * which avoids the close/reopen dip at range boundaries. Worker thread
-	 * only. Closed on file change, before a blocking idle pop, and on
-	 * worker exit. */
+	 * only. Closed on file change and on worker exit. */
 	u_char            *warm_handle;        /* open remote handle, or NULL */
 	size_t             warm_handle_len;
 	char              *warm_dst_path;      /* file warm_handle is open on */
@@ -722,8 +721,9 @@ struct sftp_parallel {
 	 * cooldowns and pthread failures so a long-lived transfer doesn't
 	 * drift below num_streams over time. */
 	int                         respawn_owed;
-	/* Under workers_mu; abort if any non-zero; exposed via stats for
-	 * post-mortem inspection. */
+	/* Under workers_mu. One violation costs the worker its connection and
+	 * a respawn; the second in a session exits hpnsftp. Exposed via stats
+	 * for post-mortem inspection. */
 	int                         protocol_violations;
 
 	/* Files the walker dropped before they could become work units (stat or
@@ -799,7 +799,9 @@ struct sftp_parallel {
 	pthread_t                   reporter_tid;
 	int                         reporter_started;
 
-	/* Pending counter for sftp_parallel_wait. */
+	/* Files still owed to sftp_parallel_wait. Counted per work unit, never
+	 * per queue object: a bundle container transports many units and is
+	 * not itself counted, so its members are what raise and lower this. */
 	pthread_mutex_t             pending_mu;
 	pthread_cond_t              pending_cv;
 	uint64_t                    pending;
@@ -1038,10 +1040,8 @@ uint64_t parallel_unit_split_min_size(struct sftp_parallel *);
 int	 parallel_unit_ensure_file(struct sftp_conn *,
 	    struct sftp_work_unit *);
 
-/* sftp-parallel-worker.c - worker thread and per-unit verify */
+/* sftp-parallel-worker.c - the worker thread */
 void	*parallel_worker_thread(void *);
-void	 parallel_verify_one(struct sftp_worker *, const char *local_path,
-	    const char *remote_path, int local_is_target);
 
 void	 parallel_verify_prefix_register(struct sftp_parallel *, const char *dir);
 int	 parallel_verify_prefix_match(struct sftp_parallel *, const char *path,
