@@ -45,9 +45,17 @@ struct sftp_workqueue;
 struct sftp_parallel;
 struct sftp_hpn_dirattr_list;	/* deferred dir attrs */
 
-#define HPN_MAX_RETRIES_DEFAULT 3  /* how many times to try a transfer */
-#define HPN_MAX_RETRIES_MIN     1  /* obviously we have to try once */
-#define HPN_MAX_RETRIES_MAX     20 /* excessively large number of tries */
+/*
+ * Retry budget per work unit, from ssh_config HPNMaxRetries. The default of
+ * 3 covers an ordinary network hiccup without spending much time on a
+ * failure that will never clear, like a permission denial or a full disk. A
+ * budget of 1 makes every failure final, which is how to tell a transient
+ * fault from a permanent one. The ceiling of 20 is for a demonstrably flaky
+ * path; past that the retry storm is itself the load problem.
+ */
+#define HPN_MAX_RETRIES_DEFAULT 3
+#define HPN_MAX_RETRIES_MIN     1
+#define HPN_MAX_RETRIES_MAX     20
 
 #define REPORTER_TICK_MS        200
 #define DEFAULT_TRANSFER_BUFLEN 131072	/* 128 KB; matches sftp-client.c */
