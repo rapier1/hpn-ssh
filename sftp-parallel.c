@@ -455,7 +455,7 @@ verify_phase_start_meter(struct sftp_parallel *fleet, int vn)
 	uint64_t moved = 0;
 	off_t vtotal;
 
-	parallel_stats_snapshot(fleet, &moved, NULL, NULL);
+	parallel_stats_snapshot(fleet, &moved);
 	if (moved > fleet->progress_bytes_baseline)
 		vtotal = (off_t)(moved - fleet->progress_bytes_baseline);
 	else
@@ -999,7 +999,7 @@ sftp_parallel_progress_start(struct sftp_parallel *fleet, const char *label,
 	/* Snapshot current accumulated bytes across all workers so the meter
 	 * shows only bytes moved in this transfer, not prior transfers in the
 	 * same session. */
-	parallel_stats_snapshot(fleet, &fleet->progress_bytes_baseline, NULL, NULL);
+	parallel_stats_snapshot(fleet, &fleet->progress_bytes_baseline);
 	fleet->aggregate_progress_counter = 0;
 	/* AGGREGATE kind: an unknown (0) total renders rate-only, and after
 	 * this returns the reporter is the only thread that updates the
@@ -1089,7 +1089,7 @@ sftp_parallel_progress_stop(struct sftp_parallel *fleet)
 	if (fleet->verify_meter_total > 0) {
 		fleet->aggregate_progress_counter = fleet->verify_meter_total;
 	} else {
-		parallel_stats_snapshot(fleet, &bytes, NULL, NULL);
+		parallel_stats_snapshot(fleet, &bytes);
 		if (bytes >= fleet->progress_bytes_baseline)
 			fleet->aggregate_progress_counter =
 			    (off_t)(bytes - fleet->progress_bytes_baseline);

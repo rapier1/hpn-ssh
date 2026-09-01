@@ -299,5 +299,6 @@ typedef struct statm_t {
 
 void read_mem_stats(struct statm_t *, int);
 int fips_enabled();
+void sort_u64(uint64_t *, int);	/* HPN */
 
 #endif /* _MISC_H */

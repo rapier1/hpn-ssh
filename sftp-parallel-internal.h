@@ -57,7 +57,17 @@ struct sftp_hpn_dirattr_list;	/* deferred dir attrs */
 #define HPN_MAX_RETRIES_MIN     1
 #define HPN_MAX_RETRIES_MAX     20
 
+/* DO NOT CHANGE. The reporter's loop period, and the unit that a great
+ * deal of tuning is counted in. Several windows are measured in ticks or
+ * slow-ticks rather than in time - the tail and per-worker rate rings, the
+ * EMA warmup, the born-slow counter, the sync-stall observer, the peer-stall
+ * window - so changing this retunes all of them at once. Worse, the fleet
+ * abort counts slow-ticks against HPNStallAbortTimeout, which is in seconds,
+ * so a different tick makes the configured timeout wrong by that ratio. */
 #define REPORTER_TICK_MS        200
+/* One second at the tick above; the reporter's slower cadence for the
+ * watchdog pass, the reap loop and the fleet sample. */
+#define REPORTER_SLOW_TICKS     (1000 / REPORTER_TICK_MS)
 #define DEFAULT_TRANSFER_BUFLEN 131072	/* 128 KB; matches sftp-client.c */
 #define DEFAULT_NUM_REQUESTS    1024	/* 128 * 1024 = 128 MB per stream */
 
@@ -307,6 +317,20 @@ enum worker_avail {
 	WORKER_AVAIL_BUSY   = 0,	/* holds a dispatched unit */
 	WORKER_AVAIL_READY  = 1,	/* waiting in pop for work */
 	WORKER_AVAIL_CAPPED = 2,	/* idle at this file's writer cap */
+};
+
+/* Why the watchdog doomed a worker. Set at whichever DEAD site fires and
+ * read by the reap classifier; worker_doom_reason_name renders it for
+ * logs. */
+enum worker_doom_reason {
+	WDR_NONE = 0,
+	WDR_CHILD_GONE,		/* ssh child vanished */
+	WDR_BORN_DEAD,		/* no bytes within the born-dead window */
+	WDR_DEAD,		/* no progress, past the silence brake */
+	WDR_ENDGAME_STRAGGLER,	/* stalled holding the last work */
+	WDR_ISOLATION,		/* far below the fleet, others idle */
+	WDR_ISO_STALL,		/* isolation, and no progress either */
+	WDR_BORN_SLOW		/* persistently under the floor since birth */
 };
 
 /* What a worker is currently doing, for diagnostics only. Nothing reads
@@ -621,7 +645,7 @@ struct sftp_worker {
 	int                doomed;
 	/* (B) which watchdog path doomed it (born_dead/isolation/stall/
 	 * dead/born_slow); emitted in the reap trace. */
-	const char        *doom_reason;
+	enum worker_doom_reason doom_reason;
 	/* (B) monotonic ms when SIGTERM was sent; read by the SIGKILL
 	 * escalation deadline. */
 	uint64_t           doom_ms;
@@ -1010,13 +1034,13 @@ struct sftp_parallel {
 };
 
 /* sftp-parallel-watchdog.c - worker health policy */
+const char *worker_doom_reason_name(enum worker_doom_reason);
 int	 parallel_watchdog_check(struct sftp_parallel *);
 void	 parallel_watchdog_sync_check(struct sftp_parallel *);
 
 /* sftp-parallel-reporter.c - reporter thread (reap/respawn/observe) */
 void	*parallel_reporter_thread(void *);
-void	 parallel_stats_snapshot(struct sftp_parallel *, uint64_t *,
-	    uint64_t *, uint64_t *);
+void	 parallel_stats_snapshot(struct sftp_parallel *, uint64_t *);
 
 /* hpn_strlist - small string-list utility (lives in sftp-parallel.c) */
 void	 hpn_strlist_init(struct hpn_strlist *, size_t);

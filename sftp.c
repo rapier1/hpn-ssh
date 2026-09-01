@@ -1190,18 +1190,7 @@ parallel_orch_launch(struct sftp_conn *conn)
 				    ((t1 - t0) * 1e6);
 			}
 			if (got > 0) {
-				/* Simple insertion sort + median. */
-				for (int i = 1; i < got; i++) {
-					uint64_t v = samples[i];
-					int j = i - 1;
-					while (j >= 0 &&
-					    samples[j] > v) {
-						samples[j+1] =
-						    samples[j];
-						j--;
-					}
-					samples[j+1] = v;
-				}
+				sort_u64(samples, got);
 				uint64_t rtt_us = samples[got / 2];
 				sftp_parallel_set_path_rtt(
 				    parallel_orch, rtt_us);

@@ -3369,3 +3369,21 @@ get_homedir(void)
 
 	return NULL;
 }
+
+/* HPN: ascending insertion sort for a small array of uint64_t. Used to take
+ * the median of a sample window. The callers sort tens of elements at most,
+ * so the simple algorithm costs less than a qsort call and needs no
+ * comparator function. */
+void
+sort_u64(uint64_t *samples, int count)
+{
+	int i, j;
+
+	for (i = 1; i < count; i++) {
+		uint64_t val = samples[i];
+
+		for (j = i; j > 0 && samples[j - 1] > val; j--)
+			samples[j] = samples[j - 1];
+		samples[j] = val;
+	}
+}

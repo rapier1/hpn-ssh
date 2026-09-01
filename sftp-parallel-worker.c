@@ -984,7 +984,7 @@ worker_finish_bundle(struct sftp_parallel *fleet, struct sftp_worker *worker,
 	sftp_conn_bytes_wired_add(worker->conn, (uint64_t)wired_data);
 	if (elapsed_ms > 0)
 		mibps = ((double)total_bytes / (1024.0 * 1024.0)) /
-		    ((double)elapsed_ms / 1e3);
+		    ((double)elapsed_ms / 1000);
 	/* One stderr line per bundle; format for easy grepping */
 	debug("%s worker=%d files=%d ok=%d bytes=%llu elapsed_ms=%llu "
 	    "MiBps=%.2f", label, worker->id, batch_n, ok_count,

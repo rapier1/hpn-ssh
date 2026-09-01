@@ -102,6 +102,23 @@
  * noisy or to confirm the rwnd rescue has already fired. For now we
  * rely on local byte deltas only.
  */
+/* Render a doom reason for the logs. */
+const char *
+worker_doom_reason_name(enum worker_doom_reason reason)
+{
+	switch (reason) {
+	case WDR_CHILD_GONE:        return "child_gone";
+	case WDR_BORN_DEAD:         return "born_dead";
+	case WDR_DEAD:              return "dead";
+	case WDR_ENDGAME_STRAGGLER: return "endgame_straggler";
+	case WDR_ISOLATION:         return "isolation";
+	case WDR_ISO_STALL:         return "iso_stall";
+	case WDR_BORN_SLOW:         return "born_slow";
+	case WDR_NONE:              return "(none)";
+	}
+	return "(none)";
+}
+
 static void
 watchdog_sample_throughput(struct sftp_parallel *fleet, uint64_t now)
 {
@@ -524,7 +541,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
     uint64_t now, int queue_has_work, int endgame_idle)
 {
 	enum worker_health prev, next;
-	const char *doom_reason = NULL;	/* set at whichever DEAD site fires */
+	enum worker_doom_reason doom_reason = WDR_NONE;
 	int stalled_slow = 0;		/* STALLED via the outlier flag: the
 					 * worker is progressing, just slow -
 					 * the transition log must not claim
@@ -627,7 +644,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 			if (wr == worker->ssh_pid ||
 			    (wr == -1 && errno == ECHILD)) {
 				next = WORKER_DEAD;
-				doom_reason = "child_gone";
+				doom_reason = WDR_CHILD_GONE;
 			}
 		}
 
@@ -759,7 +776,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 				    (long long)off,
 				    fleet->born_dead_stuck_count);
 				next = WORKER_DEAD;
-				doom_reason = "born_dead";
+				doom_reason = WDR_BORN_DEAD;
 			}
 		}
 
@@ -768,7 +785,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 			uint64_t s = effective_silence_ms / 1000ULL;
 			if (s > WORKER_SILENCE_BRAKE_SEC) {
 				next = WORKER_DEAD;
-				doom_reason = "dead";
+				doom_reason = WDR_DEAD;
 			} else if (s > STALL_THRESHOLD_SEC)
 				next = WORKER_STALLED;
 		} else if (!queue_has_work && in_flight > 0 &&
@@ -805,17 +822,17 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 					    "endgame straggler", worker->id,
 					    (unsigned long long)s);
 				next = WORKER_DEAD;
-				doom_reason = "endgame_straggler";
+				doom_reason = WDR_ENDGAME_STRAGGLER;
 			} else if (s > (uint64_t)WORKER_SILENCE_BRAKE_SEC &&
 			    fleet->cfg.tput_path_healthy_kbps > 0 &&
 			    worker->tput_ema_warmup_ticks >= TPUT_EMA_WARMUP_TICKS &&
 			    worker->tput_ema_kbps <
 			        fleet->cfg.tput_path_healthy_kbps) {
 				next = WORKER_DEAD;
-				doom_reason = "isolation";
+				doom_reason = WDR_ISOLATION;
 			} else if (s > WORKER_SILENCE_BRAKE_SEC) {
 				next = WORKER_DEAD;
-				doom_reason = "iso_stall";
+				doom_reason = WDR_ISO_STALL;
 			}
 		}
 
@@ -891,7 +908,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 				    (unsigned long long)floor,
 				    worker->tput_below_floor_ticks);
 				next = WORKER_DEAD;
-				doom_reason = "born_slow";
+				doom_reason = WDR_BORN_SLOW;
 			} else {
 				/* Gated off: no healthy peer (whole-fleet stall) or a
 				 * cooldown is active. Accept this slow-but-working
@@ -935,7 +952,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 			    (unsigned long long)w_bytes_total,
 			    (pu > now)
 			        ? (long long)((pu - now) / 1000ULL) : 0LL,
-			    (int)next, doom_reason ? doom_reason : "(none)");
+			    (int)next, worker_doom_reason_name(doom_reason));
 		}
 		/*
 		 * Past this point: state-transition logging, doom (SIGTERM),
@@ -976,7 +993,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 				    "(since_completion=%llus, "
 				    "since_unit_start=%llus)",
 				    worker->id,
-				    doom_reason ? doom_reason : "?",
+				    worker_doom_reason_name(doom_reason),
 				    (long)worker->ssh_pid,
 				    (unsigned long long)
 				    (effective_silence_ms / 1000ULL),
@@ -1013,8 +1030,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 				 * something the user needs to act on, so it
 				 * stays out of the default output.
 				 */
-				if (doom_reason != NULL && strcmp(doom_reason,
-				    "endgame_straggler") == 0) {
+				if (doom_reason == WDR_ENDGAME_STRAGGLER) {
 					debug_ft("worker %d: endgame straggler "
 					    "(no progress %llus at end of "
 					    "transfer) - reaping, re-bundling on "
