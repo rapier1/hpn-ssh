@@ -227,13 +227,13 @@ struct sftp_parallel_config {
 
 	/*
 	 * Adaptive throughput-based stall detection, enabled iff
-	 * tput_path_healthy_kbps > 0.
+	 * tput_path_healthy_bytes_s > 0.
 	 *
 	 * The time-based watchdog misses a worker whose cwnd has collapsed but
 	 * which still completes the occasional file, so this compares each
 	 * worker against the fastest peer rather than against a fixed floor.
 	 * Comparing against a peer is what makes it safe to act on: when the
-	 * fastest worker is itself under tput_path_healthy_kbps the path is the
+	 * fastest worker is itself under tput_path_healthy_bytes_s the path is the
 	 * bottleneck, and when every worker is equally slow there is no
 	 * outlier. Neither case does anything, because respawning would only
 	 * churn.
@@ -245,15 +245,15 @@ struct sftp_parallel_config {
 	 * peers run at line rate, and a respawn inherits the contention. Kills
 	 * come only from the silence paths and born-slow.
 	 *
-	 * Starting values for WAN bulk transfer: 2000 kbps path-healthy, 0.25
+	 * Starting values for WAN bulk transfer: 2 MiB/s path-healthy, 0.25
 	 * outlier fraction, 5 consecutive ticks, 0.2 EMA alpha.
 	 *
 	 * The sampling itself is watchdog_sample_throughput().
 	 */
-	uint64_t     tput_path_healthy_kbps;
+	uint64_t     tput_path_healthy_bytes_s;
 	double       tput_outlier_fraction;
 	int          tput_consec_required;
-	double       tput_ema_alpha;  /* EMA smoothing [0,1]; 0 = default 0.2 */
+	double       tput_ema_alpha;  /* EMA smoothing factor, [0,1] */
 };
 
 /*

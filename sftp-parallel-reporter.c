@@ -34,6 +34,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <errno.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -429,7 +430,8 @@ reporter_flare(struct sftp_parallel *fleet)
 	/* Sustained: reminder on a multiplicative back-off cadence (prompt
 	 * first, then spacing out), escalating to warning wording once the
 	 * episode has been prolonged. */
-	if (now_s - fleet->flare_last_reminder_s >= fleet->flare_reminder_interval_s) {
+	if (now_s - fleet->flare_last_reminder_s >=
+	    fleet->flare_reminder_interval_s) {
 		time_t since = now_s - fleet->flare_episode_start_s;
 		uint64_t pending;
 		fleet->flare_last_reminder_s = now_s;
@@ -454,7 +456,7 @@ reporter_flare(struct sftp_parallel *fleet)
 /* Tail trend detector, implemented from here to tail_detector_tick. It
  * looks for one worker still grinding through a long unit after the rest
  * of the fleet has run out of work. This was happening a lot so the
- * effort is worth it. 
+ * effort is worth it.
  *
  * Either of two signals arms it: the fleet aggregate rate declining by
  * TAIL_DECLINE_PCT across the sample ring, or the slowest holder's
@@ -524,7 +526,8 @@ tail_fire_yield(struct sftp_parallel *fleet, struct sftp_worker *holder,
 	__atomic_store_n(&holder->yield_req, 1, __ATOMIC_RELAXED);
 	fleet->tail_yield_fired = 1;
 	if (getenv("HPN_PARALLEL_TRACE") != NULL)
-		logit("HPN TAIL-YIELD worker=%d holder_med_tput=%llu holder_remain_time=%llus",
+		logit("HPN TAIL-YIELD worker=%d holder_med_tput=%llu "
+		    "holder_remain_time=%llus",
 		    holder->id, (unsigned long long)holder_med_tput,
 		    (unsigned long long)holder_remain_time);
 	else
@@ -717,9 +720,9 @@ tail_arm_check(struct sftp_parallel *fleet, uint64_t now)
 			    "ready=%d ready_hist=%d "
 			    "lagging=%d yield_med_tput=%llu "
 			    "ready_baseline=%llu",
-			    (double)now / 1e3,
+			    (double)now / 1000,
 			    (double)(now -
-			    fleet->tail_lag_start_ms) / 1e3,
+			    fleet->tail_lag_start_ms) / 1000,
 			    trend,
 			    (unsigned long long)longest_remain_time,
 			    (unsigned long long)med_old,
@@ -735,12 +738,16 @@ tail_arm_check(struct sftp_parallel *fleet, uint64_t now)
 	return 1;
 }
 
+/* One detector tick, called from the reporter loop with the fleet's current
+ * total bytes. Feeds the aggregate rate ring, and once the ring is full and
+ * the structural conditions hold, asks tail_arm_check whether a tail is
+ * present. Closes an open episode as soon as the condition stops holding. */
 static void
 tail_detector_tick(struct sftp_parallel *fleet, uint64_t bytes_now)
 {
 	uint64_t now = monotime_ms();
 	int would_arm = 0;
-	int walker_done = 0;
+	int walker_done;
 
 	/* Per-tick rate sample into the ring. */
 	if (fleet->tail_prev_ms != 0 && now > fleet->tail_prev_ms &&
@@ -758,44 +765,56 @@ tail_detector_tick(struct sftp_parallel *fleet, uint64_t bytes_now)
 	if (fleet->tail_ring_count < TAIL_RING_TICKS)
 		return;	/* window not full yet */
 
-	/* Structural conjunction first (cheap, and required for an arm). */
+	/* Cheap structural test before the per-worker scan. A tail only
+	 * matters once the walker is done and the queue is empty. */
 	walker_done = (__atomic_load_n(&fleet->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE); /*boolean*/
 	if (walker_done && sftp_workqueue_depth(fleet->q) == 0)
 		would_arm = tail_arm_check(fleet, now);
 
-	if (!would_arm)
-		fleet->tail_lag_start_ms = 0;	/* condition broke: re-confirm */
-	if (fleet->tail_episode && !would_arm) {
-		if (getenv("HPN_PARALLEL_TRACE") != NULL)
-			logit("HPN TAIL-EPISODE-END t=%.3f dur=%.1fs "
-			    "pending=%llu",
-			    (double)now / 1e3,
-			    (double)(now - fleet->tail_episode_ms) / 1e3,
-			    (unsigned long long)fleet->pending);
-		fleet->tail_episode = 0;
-		fleet->tail_yield_fired = 0;	/* re-arm for the next episode */
+	/* Condition holds. tail_arm_check has already done whatever this
+	 * tick called for, so there is nothing to unwind. */
+	if (would_arm)
+		return;
+
+	/* The condition stopped holding. Restart the confirm window, and
+	 * close the episode if one was open. */
+	fleet->tail_lag_start_ms = 0;
+	if (!fleet->tail_episode)
+		return;
+	if (getenv("HPN_PARALLEL_TRACE") != NULL) {
+		uint64_t pending;
+
+		pthread_mutex_lock(&fleet->pending_mu);
+		pending = fleet->pending;
+		pthread_mutex_unlock(&fleet->pending_mu);
+		logit("HPN TAIL-EPISODE-END t=%.3f dur=%.1fs "
+		    "pending=%llu",
+		    (double)now / 1000,
+		    (double)(now - fleet->tail_episode_ms) / 1000,
+		    (unsigned long long)pending);
 	}
+	fleet->tail_episode = 0;
+	fleet->tail_yield_fired = 0;	/* re-arm for the next episode */
 }
 
-/* ENV-VAR HPN_PARALLEL_TRACE per-tick fleet sample (2026-06-05 midstream-freeze
- * probe). One line: absolute time, work-queue depth, walker phase, then each
- * worker's phase + cumulative bytes + ssh child pid, plus the fleet total.
- * Per-worker and total bytes are cumulative, so consecutive samples give the
- * per-worker and fleet throughput series. The pid lets us correlate a worker
- * with its transport's HPN TCPSAMPLE lines (which carry getpid()). */
+/* ENV-VAR HPN_PARALLEL_TRACE per-tick fleet sample. One line: absolute time,
+ * work-queue depth, walker phase, then each worker's phase + cumulative bytes
+ * + ssh child pid, plus the fleet total. Per-worker and total bytes are
+ * cumulative, so consecutive samples give the per-worker and fleet throughput
+ * series. The pid lets us correlate a worker with its transport's HPN
+ * TCPSAMPLE lines (which carry getpid()). */
 static void
 reporter_emit_fleetsample(struct sftp_parallel *fleet)
 {
-	static int on = -1;
+	static int trace_on = -1;
 	char line[4096];
 	size_t off;
 	uint64_t total = 0;
-	int i;
 
-	if (on < 0)
-		on = (getenv("HPN_PARALLEL_TRACE") != NULL);
-	if (!on)
+	if (trace_on < 0)
+		trace_on = (getenv("HPN_PARALLEL_TRACE") != NULL);
+	if (!trace_on)
 		return;
 
 	off = (size_t)snprintf(line, sizeof(line),
@@ -804,20 +823,29 @@ reporter_emit_fleetsample(struct sftp_parallel *fleet)
 	    walker_phase_name(__atomic_load_n(&fleet->walker_phase,
 	        __ATOMIC_RELAXED)));
 
+	/* The loop guard carries the safety here, not the casts. snprintf
+	 * returns what it would have written, so off can overshoot the
+	 * buffer on truncation, and a -1 on encoding error wraps it. Either
+	 * way the guard then fails and the loop stops, and line is
+	 * NUL-terminated regardless. The 64 is headroom for one worker
+	 * entry, which runs to about 45 characters. */
 	pthread_mutex_lock(&fleet->workers_mu);
-	for (i = 0; i < fleet->num_workers && off < sizeof(line) - 64; i++) {
+	for (int i = 0; i < fleet->num_workers && off < sizeof(line) - 64;
+	    i++) {
 		struct sftp_worker *worker = fleet->workers[i];
-		uint64_t wb;
+		uint64_t worker_bytes;
+
 		pthread_mutex_lock(&worker->mu);
-		wb = worker->bytes_total +
+		worker_bytes = worker->bytes_total +
 		    __atomic_load_n(&worker->live_bytes, __ATOMIC_RELAXED);
 		pthread_mutex_unlock(&worker->mu);
-		total += wb;
+		total += worker_bytes;
 		off += (size_t)snprintf(line + off, sizeof(line) - off,
 		    " w%d:%s:%llu:%ld", worker->id,
 		    worker_phase_name(__atomic_load_n(&worker->phase,
 		        __ATOMIC_RELAXED)),
-		    (unsigned long long)wb, (long)worker->ssh_pid);
+		    (unsigned long long)worker_bytes,
+		    (long)worker->ssh_pid);
 	}
 	total += fleet->retired_bytes;
 	pthread_mutex_unlock(&fleet->workers_mu);
@@ -828,7 +856,9 @@ reporter_emit_fleetsample(struct sftp_parallel *fleet)
 /* Leave the resume-check stretch: restore the transfer meter's label and
  * total (the stretch swapped them for the "resume check" sub-meter), clear
  * the frame flag, and restart the display ratchet - hash bytes are not
- * transfer bytes, so the published counter must not carry over. Idempotent. */
+ * transfer bytes, so the published counter must not carry over. Idempotent.
+ * a "stretch" is a period of time where the progressmeter is borrowed to
+ * display something other than throughput - verification process for example. */
 static void
 resume_stretch_restore(struct sftp_parallel *fleet)
 {
@@ -839,6 +869,156 @@ resume_stretch_restore(struct sftp_parallel *fleet)
 	hpn_meter_retotal(&fleet->meter, fleet, fleet->progress_total_bytes);
 	fleet->aggregate_progress_counter = 0;
 	hpn_pm_set_phase(HPNS_F_RESUME, 0);
+}
+
+/* Meter position during the verify phase: bytes of fully verified files
+ * plus every worker's in-flight hash count for the file it is hashing
+ * right now. */
+static off_t
+reporter_verify_meter_pos(struct sftp_parallel *fleet)
+{
+	off_t newpos;
+
+	/* Post-transfer verify phase: byte-granular meter. Counter
+	 * = bytes of fully-verified files (verify_done_bytes) + every
+	 * worker's in-flight count for the file it is hashing right
+	 * now (fed each second by the server hash heartbeat / local
+	 * read-back). This advances smoothly even when a single
+	 * huge file is the whole phase, instead of the old file-count
+	 * fraction that jumped 0->100% at completion. Snap to the
+	 * exact total once all units are done so the bar lands at
+	 * 100% (the last heartbeat may trail the final bytes). */
+	uint64_t done_units = __atomic_load_n(
+	    &fleet->verify_done_units, __ATOMIC_RELAXED);
+	if (done_units >= fleet->verify_total_units) {
+		newpos = fleet->verify_meter_total;
+	} else {
+		uint64_t hashed = __atomic_load_n(
+		    &fleet->verify_done_bytes, __ATOMIC_RELAXED);
+		/* workers_mu: a detached respawn thread can
+		 * xreallocarray(fleet->workers) (and the reap loop can
+		 * remove/free a worker) during the verify phase -
+		 * a worker whose conn drops mid-hash is reaped and
+		 * respawned. Iterating workers[]/worker->conn unlocked
+		 * would race that realloc/free (UAF/OOB). Mirror
+		 * the sibling fleet-sample/reap/CSV loops, which all
+		 * hold this lock; the body is only a cheap atomic
+		 * getter. */
+		pthread_mutex_lock(&fleet->workers_mu);
+		for (int i = 0; i < fleet->num_workers; i++) {
+			struct sftp_worker *worker = fleet->workers[i];
+			uint64_t d, t;
+
+			if (worker == NULL || worker->conn == NULL)
+				continue;
+			sftp_conn_hash_work_live(worker->conn,
+			    &d, &t);
+			hashed += d;
+		}
+		pthread_mutex_unlock(&fleet->workers_mu);
+		if (hashed > (uint64_t)fleet->verify_meter_total)
+			hashed = (uint64_t)fleet->verify_meter_total;
+		newpos = (off_t)hashed;
+	}
+	return newpos;
+}
+
+/* Drive the resume-check stretch, entering it if a worker has started
+ * hashing and leaving it if none is. Returns the meter position to
+ * publish, which is hash bytes while the stretch owns the meter. */
+static off_t
+resume_stretch_update(struct sftp_parallel *fleet)
+{
+	off_t newpos;
+
+	/* Resume-check stretch (-Z UX): no transfer byte has
+	 * moved yet, but workers may be hashing existing
+	 * partials (chunked resume). Render that as a
+	 * "resume check" sub-meter - total from the conn
+	 * hash-op markers, progress from the same inflight
+	 * feed the verify meter uses - instead of a frozen
+	 * 0% transfer bar. Markers self-clear on staleness,
+	 * so a finished or abandoned hash drops out alone.
+	 * Same workers_mu discipline as the sibling loops. */
+	uint64_t rtotal = 0, rdone = 0;
+
+	pthread_mutex_lock(&fleet->workers_mu);
+	for (int i = 0; i < fleet->num_workers; i++) {
+		struct sftp_worker *worker = fleet->workers[i];
+		uint64_t d, t;
+
+		if (worker == NULL || worker->conn == NULL)
+			continue;
+		sftp_conn_hash_work_live(worker->conn, &d, &t);
+		rtotal += t;
+		rdone += d;
+	}
+	pthread_mutex_unlock(&fleet->workers_mu);
+	if (rtotal > 0) {
+		if (!fleet->resume_stretch_on) {
+			fleet->resume_stretch_on = 1;
+			/* Save the transfer meter's label
+			 * and total for the restore; the
+			 * reporter owns the meter, so
+			 * reading them here is safe. */
+			strlcpy(fleet->progress_label_saved,
+			    fleet->meter.label,
+			    sizeof(fleet->progress_label_saved));
+			fleet->progress_total_bytes =
+			    fleet->meter.total;
+			hpn_meter_relabel(&fleet->meter, fleet,
+			    "resume check");
+			fleet->aggregate_progress_counter = 0;
+			hpn_pm_set_phase(
+			    HPNS_F_RESUME, 1);
+		}
+		hpn_meter_retotal(&fleet->meter, fleet,
+		    (off_t)rtotal);
+		if (rdone > rtotal)
+			rdone = rtotal;
+		newpos = (off_t)rdone;
+	} else {
+		resume_stretch_restore(fleet);
+		newpos = 0;
+	}
+	return newpos;
+}
+
+/* Refresh the fleet telemetry the status-frame emitter reads. Stored
+ * unconditionally; only consumed when frame mode is armed. */
+static void
+reporter_publish_relay(struct sftp_parallel *fleet)
+{
+	u_int n_active = 0, n_stalled = 0;
+
+	pthread_mutex_lock(&fleet->workers_mu);
+	for (int i = 0; i < fleet->num_workers; i++) {
+		struct sftp_worker *worker = fleet->workers[i];
+		int exited, health;
+
+		if (worker == NULL)
+			continue;
+		/* workers_mu covers the array, not its contents. Both
+		 * fields are written under worker->mu, so snapshot them
+		 * the way every sibling loop here does. */
+		pthread_mutex_lock(&worker->mu);
+		exited = worker->exited;
+		health = worker->health;
+		pthread_mutex_unlock(&worker->mu);
+		if (exited)
+			continue;
+		if (health == WORKER_STALLED)
+			n_stalled++;
+		else if (health != WORKER_DEAD)
+			n_active++;
+	}
+	pthread_mutex_unlock(&fleet->workers_mu);
+	hpn_pm_set_workers(n_active, n_stalled);
+	hpn_pm_set_files(
+	    (u_int)__atomic_load_n(&fleet->files_submitted,
+	        __ATOMIC_RELAXED),
+	    (u_int)__atomic_load_n(&fleet->files_total,
+	        __ATOMIC_RELAXED));
 }
 
 void *
@@ -852,7 +1032,17 @@ parallel_reporter_thread(void *arg)
 	int slow_tick_counter = 0;
 
 	while (1) {
-		nanosleep(&sleep_ts, NULL);
+		struct timespec req = sleep_ts, rem;
+		uint64_t bytes;
+		off_t newpos;
+
+		/* A progress meter arms alarm(1) and SIGALRM is unmasked on
+		 * this thread, so a bare nanosleep gets cut short about once
+		 * a second and the remainder is discarded. Everything below
+		 * is counted in ticks, so finish the sleep rather than let
+		 * tick length depend on whether a meter is running. */
+		while (nanosleep(&req, &rem) == -1 && errno == EINTR)
+			req = rem;
 		if (fleet->stopped)
 			break;
 
@@ -895,155 +1085,37 @@ parallel_reporter_thread(void *arg)
 			}
 		}
 
-		uint64_t bytes;
-		off_t newpos;
 		parallel_stats_snapshot(fleet, &bytes);
 		if (fleet->verify_phase_active && fleet->verify_total_units > 0) {
 			resume_stretch_restore(fleet);	/* safety: never both */
-			/* Post-transfer verify phase: byte-granular meter. Counter
-			 * = bytes of fully-verified files (verify_done_bytes) + every
-			 * worker's in-flight count for the file it is hashing right
-			 * now (fed each second by the server hash heartbeat / local
-			 * read-back). This advances smoothly even when a single
-			 * huge file is the whole phase, instead of the old file-count
-			 * fraction that jumped 0->100% at completion. Snap to the
-			 * exact total once all units are done so the bar lands at
-			 * 100% (the last heartbeat may trail the final bytes). */
-			uint64_t done_units = __atomic_load_n(
-			    &fleet->verify_done_units, __ATOMIC_RELAXED);
-			if (done_units >= fleet->verify_total_units) {
-				newpos = fleet->verify_meter_total;
-			} else {
-				uint64_t hashed = __atomic_load_n(
-				    &fleet->verify_done_bytes, __ATOMIC_RELAXED);
-				/* workers_mu: a detached respawn thread can
-				 * xreallocarray(fleet->workers) (and the reap loop can
-				 * remove/free a worker) during the verify phase -
-				 * a worker whose conn drops mid-hash is reaped and
-				 * respawned. Iterating workers[]/worker->conn unlocked
-				 * would race that realloc/free (UAF/OOB). Mirror
-				 * the sibling fleet-sample/reap/CSV loops, which all
-				 * hold this lock; the body is only a cheap atomic
-				 * getter. */
-				pthread_mutex_lock(&fleet->workers_mu);
-				for (int wi = 0; wi < fleet->num_workers; wi++) {
-					struct sftp_worker *worker = fleet->workers[wi];
-					uint64_t d, t;
-
-					if (worker == NULL || worker->conn == NULL)
-						continue;
-					sftp_conn_hash_work_live(worker->conn,
-					    &d, &t);
-					hashed += d;
-				}
-				pthread_mutex_unlock(&fleet->workers_mu);
-				if (hashed > (uint64_t)fleet->verify_meter_total)
-					hashed = (uint64_t)fleet->verify_meter_total;
-				newpos = (off_t)hashed;
-			}
+			newpos = reporter_verify_meter_pos(fleet);
 		} else if (bytes == fleet->progress_bytes_baseline &&
 		    fleet->progress_meter_started) {
-			/* Resume-check stretch (-Z UX): no transfer byte has
-			 * moved yet, but workers may be hashing existing
-			 * partials (chunked resume). Render that as a
-			 * "resume check" sub-meter - total from the conn
-			 * hash-op markers, progress from the same inflight
-			 * feed the verify meter uses - instead of a frozen
-			 * 0% transfer bar. Markers self-clear on staleness,
-			 * so a finished or abandoned hash drops out alone.
-			 * Same workers_mu discipline as the sibling loops. */
-			uint64_t rtotal = 0, rdone = 0;
-
-			pthread_mutex_lock(&fleet->workers_mu);
-			for (int wi = 0; wi < fleet->num_workers; wi++) {
-				struct sftp_worker *worker = fleet->workers[wi];
-				uint64_t d, t;
-
-				if (worker == NULL || worker->conn == NULL)
-					continue;
-				sftp_conn_hash_work_live(worker->conn, &d, &t);
-				rtotal += t;
-				rdone += d;
-			}
-			pthread_mutex_unlock(&fleet->workers_mu);
-			if (rtotal > 0) {
-				if (!fleet->resume_stretch_on) {
-					fleet->resume_stretch_on = 1;
-					/* Save the transfer meter's label
-					 * and total for the restore; the
-					 * reporter owns the meter, so
-					 * reading them here is safe. */
-					strlcpy(fleet->progress_label_saved,
-					    fleet->meter.label,
-					    sizeof(fleet->progress_label_saved));
-					fleet->progress_total_bytes =
-					    fleet->meter.total;
-					hpn_meter_relabel(&fleet->meter, fleet,
-					    "resume check");
-					fleet->aggregate_progress_counter = 0;
-					hpn_pm_set_phase(
-					    HPNS_F_RESUME, 1);
-				}
-				hpn_meter_retotal(&fleet->meter, fleet,
-				    (off_t)rtotal);
-				if (rdone > rtotal)
-					rdone = rtotal;
-				newpos = (off_t)rdone;
-			} else {
-				resume_stretch_restore(fleet);
-				newpos = 0;
-			}
+			newpos = resume_stretch_update(fleet);
 		} else {
 			resume_stretch_restore(fleet);
 			newpos = bytes > fleet->progress_bytes_baseline ?
 			    (off_t)(bytes - fleet->progress_bytes_baseline) : 0;
 		}
-		/* Monotonic publish. The raw aggregate steps BACKWARD when a
-		 * worker dies or a unit is requeued mid-transfer: its live_bytes
+		/* Monotonic publish. The raw aggregate steps backward when a
+		 * worker dies or a unit is requeued, since its live_bytes
 		 * leave the sum until the redo re-transfers them. Publishing
-		 * the dip makes the meter show a 0-rate tick and then absorb the
-		 * whole recovery in one interval - an impossible rate spike
-		 * (0 then multi-GB/s). Ratchet the DISPLAY counter instead: the
-		 * meter holds through the redo and resumes at the true rate.
-		 * Detectors are unaffected - they read the raw snapshot (bytes),
-		 * not this counter. Meter restarts (new command, verify phase)
-		 * reset the counter outside this tick, so the ratchet only
-		 * applies within one meter's lifetime. */
-		/* Publish only while a meter is running: the main thread
-		 * resets the counter at meter boundaries (progress_start,
-		 * verify start) with no lock, and a raciness-window publish
-		 * would be pinned by the ratchet for the whole next meter
-		 * instead of self-correcting on the following tick. */
+		 * that dip would show a zero-rate tick and then swallow the
+		 * whole recovery in one interval. Ratchet the display counter
+		 * instead; the detectors read the raw snapshot, not this.
+		 *
+		 * Only while a meter is running: the main thread resets this
+		 * counter at meter boundaries without a lock, and a publish
+		 * landing in that window would stay pinned for the whole next
+		 * meter. */
 		if (fleet->progress_meter_started &&
 		    newpos > fleet->aggregate_progress_counter)
 			fleet->aggregate_progress_counter = newpos;
-		/* HPN status relay: keep the frame emitter's fleet telemetry
+		/* status relay: keep the frame emitter's fleet telemetry
 		 * fresh (stored unconditionally; only read when frame mode
 		 * is armed). Same lock discipline as the sibling fleet
 		 * loops. */
-		{
-			u_int fr_active = 0, fr_stalled = 0;
-
-			pthread_mutex_lock(&fleet->workers_mu);
-			for (int wi = 0; wi < fleet->num_workers; wi++) {
-				struct sftp_worker *worker = fleet->workers[wi];
-
-				if (worker == NULL || worker->exited)
-					continue;
-				if (worker->health == WORKER_STALLED)
-					fr_stalled++;
-				else if (worker->health != WORKER_DEAD)
-					fr_active++;
-			}
-			pthread_mutex_unlock(&fleet->workers_mu);
-			hpn_pm_set_workers(fr_active,
-			    fr_stalled);
-			hpn_pm_set_files(
-			    (u_int)__atomic_load_n(&fleet->files_submitted,
-			        __ATOMIC_RELAXED),
-			    (u_int)__atomic_load_n(&fleet->files_total,
-			        __ATOMIC_RELAXED));
-		}
+		reporter_publish_relay(fleet);
 
 		/* Fold in what a walker posted (the total and file count
 		 * from a drained enumeration). The reporter is the only
@@ -1052,23 +1124,22 @@ parallel_reporter_thread(void *arg)
 		 * stretch has the meter, so a post never lands in the
 		 * stretch's hash-byte total. */
 		if (fleet->progress_meter_started && !fleet->resume_stretch_on) {
-			off_t addb = __atomic_exchange_n(
+			off_t add_bytes = __atomic_exchange_n(
 			    &fleet->posted_total_add, 0, __ATOMIC_RELAXED);
-			u_int addf = __atomic_exchange_n(
+			u_int add_files = __atomic_exchange_n(
 			    &fleet->posted_files_add, 0, __ATOMIC_RELAXED);
 
-			if (addb > 0 || addf > 0) {
-				hpn_meter_add_total(&fleet->meter, fleet, addb, addf);
+			if (add_bytes > 0 || add_files > 0) {
+				hpn_meter_add_total(&fleet->meter, fleet,
+				    add_bytes, add_files);
 				if (fleet->progress_verb[0] != '\0' &&
 				    fleet->meter.nfiles > 0) {
 					char lbl[HPN_METER_LABEL_MAX];
 
 					snprintf(lbl, sizeof(lbl),
 					    "%s %u %s in parallel",
-					    fleet->progress_verb,
-					    fleet->meter.nfiles,
-					    fleet->meter.nfiles == 1 ?
-					    "file" : "files");
+					    fleet->progress_verb, fleet->meter.nfiles,
+					    fleet->meter.nfiles == 1 ? "file" : "files");
 					hpn_meter_relabel(&fleet->meter, fleet, lbl);
 				}
 			}
@@ -1084,7 +1155,8 @@ parallel_reporter_thread(void *arg)
 		} else if (fleet->progress_meter_started)
 			refresh_progress_meter(0);
 
-		/* Tail trend detector (phase B: telemetry only). */
+		/* Watch for an endgame tail: one worker still working
+		 * while the rest of the fleet has run dry. */
 		tail_detector_tick(fleet, bytes);
 
 		/* Liveness checks on a slower cadence: cheaper, and watchdog
@@ -1098,7 +1170,7 @@ parallel_reporter_thread(void *arg)
 			 * and SIGTERMs newly DEAD ones. We don't abort here;
 			 * the reap loop below joins exited workers and spawns
 			 * replacements. */
-			(void)parallel_watchdog_check(fleet);
+			parallel_watchdog_check(fleet);
 
 			/* SIGTERM any respawn wedged in its handshake past the
 			 * stall deadline. The blocked spawn thread cannot time

@@ -103,16 +103,6 @@ worker_record_failed_path(struct sftp_parallel *fleet,
 	hpn_clear_last_error();
 }
 
-/* Count one unit sent to this worker. Need to lock to prevent
- * potential overwrites/inconsistency. */
-static void
-worker_record_start(struct sftp_worker *worker)
-{
-	pthread_mutex_lock(&worker->mu);
-	worker->units_started++;
-	pthread_mutex_unlock(&worker->mu);
-}
-
 /* Retire one dispatched unit. Success adds its bytes and counts a completion,
  * failure only counts; bytes is ignored on the failure path. Clears the
  * live counters so the unit is not counted twice, and stamps
@@ -913,7 +903,6 @@ worker_run_batch_pipelined(struct sftp_worker *worker,
 		entries[i].remote_path = batch[i]->dst_path;
 		entries[i].result      = 0;
 		units[i]               = batch[i];
-		worker_record_start(worker);
 	}
 
 	/* send() drains batch_prev_pending, if any, after its own
@@ -1075,7 +1064,6 @@ worker_run_bundle(struct sftp_worker *worker,
 		entries[i].result      = 0;
 		if (batch[i]->size > 0)
 			total_bytes += (uint64_t)batch[i]->size;
-		worker_record_start(worker);
 	}
 
 	t_start_ms = monotime_ms();
@@ -1128,7 +1116,6 @@ worker_run_bundle_download(struct sftp_worker *worker,
 		entries[i].result      = 0;
 		if (batch[i]->size > 0)
 			total_bytes += (uint64_t)batch[i]->size;
-		worker_record_start(worker);
 	}
 
 	t_start_ms = monotime_ms();
@@ -1200,7 +1187,6 @@ worker_execute_single(struct sftp_worker *worker, struct sftp_work_unit *unit)
 		return;
 	}
 	worker_drain_pipeline(worker);
-	worker_record_start(worker);
 	int rc = execute_unit(worker, unit);
 	worker_process_result(worker, unit, rc);
 }

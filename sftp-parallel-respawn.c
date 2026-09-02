@@ -573,10 +573,10 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 	/*
 	 * Path-health streak drives both the cooldown-level decay and the
 	 * early exit from an active pause. "Healthy" = the freshest raw max
-	 * throughput is at or above the configured floor (default 2000 kbps).
+	 * throughput is at or above the configured floor (default 2 MiB/s).
 	 */
-	int healthy = (fleet->cfg.tput_path_healthy_kbps > 0) &&
-	    (fleet->tput_last_raw_max_kbps >= fleet->cfg.tput_path_healthy_kbps);
+	int healthy = (fleet->cfg.tput_path_healthy_bytes_s > 0) &&
+	    (fleet->tput_last_raw_max_bytes_s >= fleet->cfg.tput_path_healthy_bytes_s);
 	if (healthy) {
 		if (fleet->respawn_healthy_since_s == 0) {
 			fleet->respawn_healthy_since_s = now_s;
@@ -608,9 +608,12 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 		    RESPAWN_COOLDOWN_DECAY_SEC) {
 			/* debug-level: the operator-facing recovery line is the
 			 * reporter_flare falling-edge notice. */
+			char rate[FMT_SCALED_STRSIZE];
+
+			fmt_scaled((long long)
+			    fleet->tput_last_raw_max_bytes_s, rate);
 			debug_ft("respawn cooldown ended early: path healthy "
-			    "(%llukbps) for %ds - resuming respawns",
-			    (unsigned long long)fleet->tput_last_raw_max_kbps,
+			    "(%sB/s) for %ds - resuming respawns", rate,
 			    RESPAWN_COOLDOWN_DECAY_SEC);
 			fleet->respawn_resume_s = 0;
 			fleet->respawn_epoch_count = 0;

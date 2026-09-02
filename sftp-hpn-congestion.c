@@ -55,7 +55,7 @@
  *      detection is COMPARATIVE -- it needs peers to measure a worker
  *      against.  With a single worker (-j 1), or when peers go idle,
  *      that comparison has no signal, and the intended absolute-floor
- *      fallback keys on a configured "healthy kbps" floor that is not
+ *      fallback keys on a configured healthy-rate floor that is not
  *      currently wired up.  TCP_INFO gives a peer-independent verdict:
  *      this socket is objectively wedged, regardless of what anyone
  *      else is doing.  Closing this blind spot is the original

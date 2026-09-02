@@ -256,16 +256,15 @@ sftp_resolve_hpn_lustre_stripe_count(const char *host,
  * and hpnscp so the two stay in lockstep. On by default in parallel mode
  * with conservative WAN-bulk settings (the values were settled by testing;
  * the env-var overrides that once existed were removed in the 19.0 dev-knob
- * cull): path-health floor in kbps (0 disables the detector), the outlier
+ * cull): path-health floor in bytes/s (0 disables the detector), the outlier
  * fraction of the fastest peer's EMA, the consecutive outlier ticks before
- * STALLED (DEAD at 2N), and the EMA smoothing factor (0 = use the 0.2
- * default at evaluation time).
+ * STALLED (DEAD at 2N), and the EMA smoothing factor.
  */
 void
 sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg)
 {
-	pcfg->tput_path_healthy_kbps = 2000;	/* path-health floor (kbps) */
+	pcfg->tput_path_healthy_bytes_s = 2000 * 1024;	/* ~2 MiB/s floor */
 	pcfg->tput_outlier_fraction  = 0.25;	/* outlier fraction */
 	pcfg->tput_consec_required   = 5;	/* consecutive stalled ticks */
-	pcfg->tput_ema_alpha         = 0.0;	/* 0 = use the 0.2 default downstream */
+	pcfg->tput_ema_alpha         = 0.2;	/* EMA smoothing, ~5-tick constant */
 }

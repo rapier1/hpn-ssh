@@ -1147,15 +1147,15 @@ parallel_orch_launch(struct sftp_conn *conn)
 	/* Mirror to debug for batch-mode runs (quiet=1). */
 	debug_f("parallel mode: -j %d defer_parallel_wait=%d",
 	    parallel_num_streams, defer_parallel_wait);
-	if (pcfg.tput_path_healthy_kbps > 0) {
-		double eff_alpha = pcfg.tput_ema_alpha > 0.0
-		    ? pcfg.tput_ema_alpha : 0.2;
-		debug_f("tput-outlier detection: healthy_kbps=%llu "
-		    "frac=%.2f consec=%d ema_alpha=%.2f",
-		    (unsigned long long)pcfg.tput_path_healthy_kbps,
+	if (pcfg.tput_path_healthy_bytes_s > 0) {
+		char healthy[FMT_SCALED_STRSIZE];
+
+		fmt_scaled((long long)pcfg.tput_path_healthy_bytes_s, healthy);
+		debug_f("tput-outlier detection: healthy=%sB/s "
+		    "frac=%.2f consec=%d ema_alpha=%.2f", healthy,
 		    pcfg.tput_outlier_fraction,
 		    pcfg.tput_consec_required,
-		    eff_alpha);
+		    pcfg.tput_ema_alpha);
 	}
 	parallel_orch = sftp_parallel_start(&pcfg);
 	if (parallel_orch == NULL) {

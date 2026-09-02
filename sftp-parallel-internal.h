@@ -198,7 +198,7 @@ struct sftp_hpn_dirattr_list;	/* deferred dir attrs */
 
 /* Born-slow fast-kill threshold. A worker that has completed at least
  * one unit (so NOT born-dead) but whose EMA throughput is persistently
- * below BORN_SLOW_FLOOR_FRAC x cfg.tput_path_healthy_kbps for
+ * below BORN_SLOW_FLOOR_FRAC x cfg.tput_path_healthy_bytes_s for
  * BORN_SLOW_TICKS consecutive samples is killed, in the hope the
  * respawn lands a TCP connection in a better state.
  *
@@ -572,7 +572,6 @@ struct sftp_worker {
 	volatile uint64_t  live_bytes;
 	/* enum worker_phase; relaxed atomic, read by the reporter. */
 	volatile int       phase;
-	uint64_t           units_started;     /* dispatched, may be in flight */
 	uint64_t           units_completed;
 	uint64_t           units_failed;
 	uint64_t           last_completion_ms; /* monotonic ms of last finish */
@@ -584,16 +583,16 @@ struct sftp_worker {
 	uint64_t           last_progress_bytes;
 
 	/* Adaptive throughput-based stall detection, updated at each watchdog
-	 * tick. See cfg.tput_path_healthy_kbps in sftp-parallel.h for the
-	 * algorithm. */
+	 * tick. Reporter thread only, so these need no lock. See
+	 * cfg.tput_path_healthy_bytes_s in sftp-parallel.h for the algorithm. */
 	uint64_t           tput_check_bytes;     /* bytes_total at last check */
 	uint64_t           tput_check_ms;        /* monotime of last check */
-	uint64_t           tput_current_kbps;    /* most recent raw estimate */
-	uint64_t           tput_ema_kbps;        /* EMA-smoothed estimate */
+	uint64_t           tput_current_bytes_s;  /* most recent raw estimate */
+	uint64_t           tput_ema_bytes_s;      /* EMA-smoothed estimate */
 	int                tput_ema_warmup_ticks; /* ticks since EMA cold-start */
 	int                tput_outlier_ticks;   /* consecutive outlier ticks */
 	/* Consecutive ticks where EMA < BORN_SLOW_FLOOR_FRAC x
-	 * cfg.tput_path_healthy_kbps; drives born-slow fast-kill. */
+	 * cfg.tput_path_healthy_bytes_s; drives born-slow fast-kill. */
 	int                tput_below_floor_ticks;
 	/* unit_start_ms at the last tick; a change means a new unit, which
 	 * resets the EMA so a stale value cannot suppress outlier detection. */
@@ -748,7 +747,7 @@ struct sftp_parallel {
 	time_t                      respawn_resume_s;
 	/* Freshest raw max from the watchdog; used by the throughput
 	 * gate. */
-	uint64_t                    tput_last_raw_max_kbps;
+	uint64_t                    tput_last_raw_max_bytes_s;
 	/* Involuntary deaths reaped but not yet replaced; carries across
 	 * cooldowns and pthread failures so a long-lived transfer doesn't
 	 * drift below num_streams over time. */
@@ -1035,7 +1034,7 @@ struct sftp_parallel {
 
 /* sftp-parallel-watchdog.c - worker health policy */
 const char *worker_doom_reason_name(enum worker_doom_reason);
-int	 parallel_watchdog_check(struct sftp_parallel *);
+void	 parallel_watchdog_check(struct sftp_parallel *);
 void	 parallel_watchdog_sync_check(struct sftp_parallel *);
 
 /* sftp-parallel-reporter.c - reporter thread (reap/respawn/observe) */
