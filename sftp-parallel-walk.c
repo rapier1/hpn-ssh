@@ -16,8 +16,7 @@
  *
  */
 
-/*
- * sftp-parallel-walk.c - recursive directory walkers for the
+/* sftp-parallel-walk.c - recursive directory walkers for the
  * parallel-streams orchestrator.
  *
  * The walker runs on the producer (caller) thread and uses the control
@@ -38,8 +37,7 @@
  * sftp_parallel is visible. It is reached directly in only two places,
  * the deferred dir-attr list in parallel_dirattrs and the config block.
  * Everything else goes through the orchestrator's sftp_parallel_*
- * functions.
- */
+ * functions. */
 
 #include "includes.h"
 
@@ -61,13 +59,11 @@
 #include "sftp-parallel-internal.h"	/* parallel_verify_prefix_register */
 #include "progressmeter.h"	/* pm_mprintf */
 
-/*
- * Parallel upload sink for the shared upload driver
+/* Parallel upload sink for the shared upload driver
  * (sftp_upload_walk_consume). It submits each file to the worker fleet,
  * applies the Lustre layout and worker phases, defers remote dir attrs onto
  * the parallel list, and records per-entry failures on the walker. The
- * callback-table pattern is documented on struct sftp_upload_sink.
- */
+ * callback-table pattern is documented on struct sftp_upload_sink. */
 struct parallel_ul_sink {
 	struct sftp_upload_sink	 base;
 	struct sftp_parallel	*fleet;
@@ -75,16 +71,12 @@ struct parallel_ul_sink {
 	int	resume, verify;
 };
 
-/*
- * Parallel download sink for the shared discover-tree consumer
- * (sftp_tree_download_consume): create local dirs with Lustre-layout parity,
- * submit regular files to the worker fleet, defer directory attrs, and
- * record per-entry failures on the walker. Mirrors what parallel_download_
- * walk does per entry; the shared consumer supplies the iteration. The
- * stream is drained before the first submit (see sftp_hpn_discover_tree);
- * overlapping discovery with worker transfers is a future optimization
- * (design section 9).
- */
+/* Parallel download sink for the shared discover-tree consumer
+ * (sftp_tree_download_consume): create local dirs with Lustre-layout
+ * parity, submit regular files to the worker fleet, defer directory attrs,
+ * and record per-entry failures on the walker. Files are handed over as
+ * their records arrive rather than after the stream drains; see
+ * streams_files. */
 struct parallel_dl_sink {
 	struct sftp_tree_dl_sink	 base;
 	struct sftp_parallel		*fleet;
@@ -92,8 +84,9 @@ struct parallel_dl_sink {
 	int	preserve_flag, resume, verify;
 };
 
-/* Lazy accessor for the deferred directory-attribute list (applied at
- * the end of sftp_parallel_wait; see sftp-parallel-internal.h). */
+/* Lazy accessor for the deferred directory-attribute list, applied at the
+ * end of sftp_parallel_wait. Walker thread only, so the allocation needs
+ * no lock. */
 static struct sftp_hpn_dirattr_list *
 parallel_dirattrs(struct sftp_parallel *fleet)
 {
@@ -101,6 +94,8 @@ parallel_dirattrs(struct sftp_parallel *fleet)
 		fleet->dirattrs = xcalloc(1, sizeof(*fleet->dirattrs));
 	return fleet->dirattrs;
 }
+
+/* Upload sink callbacks: the driver calls these as it walks the local tree. */
 
 static void
 parallel_ul_enter_dir(struct sftp_upload_sink *sink, const char *src,
@@ -115,6 +110,10 @@ parallel_ul_enter_dir(struct sftp_upload_sink *sink, const char *src,
 	sftp_parallel_set_walker_phase(ctx->fleet, SFTP_WKP_ENUM);
 }
 
+/* Hand one regular file to the fleet. A refused submit is recorded two
+ * ways: during an abort it is expected, so it lands as "interrupted",
+ * otherwise as a real failure. Both strings reach the end-of-transfer
+ * failed-path list, so the wording is what the user ends up reading. */
 static int
 parallel_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
     const char *dst, const struct stat *src_sb)
@@ -173,6 +172,10 @@ parallel_ul_aborting(struct sftp_upload_sink *sink)
 	return sftp_parallel_is_aborting(ctx->fleet);
 }
 
+/* Upload the tree at src to dst. This creates the root destination
+ * directory itself, because every deeper directory is created by its
+ * parent level's pipelined mkdir batch and sftp_upload_walk_consume
+ * assumes dst already exists. The shared driver does the walking. */
 int
 sftp_parallel_upload_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify)
@@ -203,15 +206,12 @@ sftp_parallel_upload_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		pm_mprintf("Entering %s\n", src);
 	/* Register this command's roots as prefixes so whole-file verify items
 	 * store paths relative to them (upload: local root = src, remote = dst).
-	 * Gated on the orchestrator's verify_transfer (same flag the park checks);
+	 * Gated on verify_transfer, the same flag that gates the park, because
 	 * the per-command `verify` arg is not reliably set for putv. */
 	if (fleet->cfg.verify_transfer) {
 		parallel_verify_prefix_register(fleet, src);
 		parallel_verify_prefix_register(fleet, dst);
 	}
-	/* Create the root destination directory before walking; deeper
-	 * directories are created by their parent level's pipelined mkdir
-	 * batch, so sftp_upload_walk_consume assumes dst exists. */
 	if (stat(src, &root_sb) == -1 || !S_ISDIR(root_sb.st_mode)) {
 		error("stat local \"%s\": not a directory", src);
 		sftp_parallel_walker_record_failure(fleet, src,
@@ -233,6 +233,13 @@ sftp_parallel_upload_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	return rc;
 }
 
+/* Download sink callbacks: the consumer calls these per discovered entry. */
+
+/* Create one local directory for a discovered entry. The directory is made
+ * with owner write and execute forced on so its contents can land, so mode
+ * differing from tmpmode is how sftp_hpn_ensure_local_dir reports that the
+ * real mode still has to be restored. That fixup is deferred to the end of
+ * the transfer. */
 static int
 parallel_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
     const char *dst, Attrib *attrs)
@@ -257,6 +264,10 @@ parallel_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
 	return 0;
 }
 
+/* Hand one regular file to the fleet. Size and mode come out of the server's
+ * attrs because the submit API takes plain scalars rather than an Attrib. A
+ * server that sends neither leaves the size at 0 and the mode for umask to
+ * decide. Refusals are recorded as in parallel_ul_xfer_file. */
 static int
 parallel_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
     const char *dst, Attrib *attrs)
@@ -321,10 +332,35 @@ parallel_dl_set_total(struct sftp_tree_dl_sink *sink, off_t total_bytes,
 	sftp_parallel_progress_set_total(ctx->fleet, total_bytes, nfiles);
 }
 
+/* Download the tree at src to dst. Unlike the upload walker this does not
+ * create the root itself: both consumers create every directory, root
+ * included, through the sink, and the NULL attrs argument tells them to
+ * stat the remote source for the root's own attrs. */
 int
 sftp_parallel_download_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *src, const char *dst, int print_flag, int resume, int verify)
 {
+	struct parallel_dl_sink	 sink = {
+		.base = {
+			.make_dir = parallel_dl_make_dir,
+			.xfer_file = parallel_dl_xfer_file,
+			.fail = parallel_dl_fail,
+			.aborting = parallel_dl_aborting,
+			.set_total = parallel_dl_set_total,
+			/* Submitting only enqueues work for the fleet, so
+			 * files can be handed over as they are discovered
+			 * instead of after the stream drains.  See
+			 * streams_files. */
+			.streams_files = 1,
+		},
+		.fleet = fleet,
+		.conn = conn,
+		.preserve_flag = sftp_parallel_preserve_flag(fleet),
+		.resume = resume,
+		.verify = verify,
+	};
+	int			 streamed, rc;
+
 	if (fleet == NULL || conn == NULL || src == NULL || dst == NULL) {
 		errno = EINVAL;
 		return -1;
@@ -332,51 +368,33 @@ sftp_parallel_download_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
 		pm_mprintf("Retrieving %s\n", src);
 	/* Register this command's roots as prefixes (download: local root = dst,
-	 * remote = src). Gated on verify_transfer (same flag the park checks). */
+	 * remote = src). Gated on verify_transfer, the same flag that gates
+	 * the park. */
 	if (fleet->cfg.verify_transfer) {
 		parallel_verify_prefix_register(fleet, dst);
 		parallel_verify_prefix_register(fleet, src);
 	}
-	{
-		struct parallel_dl_sink sink = {
-			.base = {
-				.make_dir = parallel_dl_make_dir,
-				.xfer_file = parallel_dl_xfer_file,
-				.fail = parallel_dl_fail,
-				.aborting = parallel_dl_aborting,
-				.set_total = parallel_dl_set_total,
-				/* Submitting only enqueues work for the fleet,
-				 * so files can be handed over as they are
-				 * discovered instead of after the stream
-				 * drains. See streams_files. */
-				.streams_files = 1,
-			},
-			.fleet = fleet,
-			.conn = conn,
-			.preserve_flag = sftp_parallel_preserve_flag(fleet),
-			.resume = resume,
-			.verify = verify,
-		};
-		/* HPN: one streamed enumeration when the server supports it,
-		 * else the recursive readdir fallback; both replay through the
-		 * same parallel sink. This sink hands each file over as its
-		 * record arrives rather than queueing the tree, which is legal
-		 * only because submitting enqueues work for the fleet and
-		 * sends nothing on the connection carrying the reply. See
-		 * streams_files. */
-		/* The submit path queries the destination filesystem's stripe
-		 * geometry once and caches it. Do that now: during a streamed
-		 * enumeration the connection is carrying the reply and cannot
-		 * also carry that query. */
-		if (sftp_conn_has_discover_tree(conn))
-			sftp_parallel_prewarm_fs_info(fleet, conn, src);
-		int rc = sftp_conn_has_discover_tree(conn) ?
-		    sftp_tree_download_consume(conn, src, dst, NULL,
-		        sftp_parallel_follow_link_flag(fleet), &sink.base) :
-		    sftp_readdir_download_consume(conn, src, dst, 0,
-		        HPN_WALK_MAX_DEPTH, NULL,
-		        sftp_parallel_follow_link_flag(fleet), &sink.base);
-		sftp_parallel_set_walker_phase(fleet, SFTP_WKP_DONE);
-		return rc;
-	}
+	streamed = sftp_conn_has_discover_tree(conn);
+
+	/* The submit path queries the destination filesystem's stripe geometry
+	 * once and caches it. Do that now: during a streamed enumeration the
+	 * connection is carrying the reply and cannot also carry that query. */
+	if (streamed)
+		sftp_parallel_prewarm_fs_info(fleet, conn, src);
+
+	/* One streamed enumeration when the server supports it, else the
+	 * recursive readdir fallback; both replay through the same parallel
+	 * sink. This sink hands each file over as its record arrives rather
+	 * than queueing the tree, which is legal only because submitting
+	 * enqueues work for the fleet and sends nothing on the connection
+	 * carrying the reply. See streams_files. */
+	if (streamed)
+		rc = sftp_tree_download_consume(conn, src, dst, NULL,
+		    sftp_parallel_follow_link_flag(fleet), &sink.base);
+	else
+		rc = sftp_readdir_download_consume(conn, src, dst, 0,
+		    HPN_WALK_MAX_DEPTH, NULL,
+		    sftp_parallel_follow_link_flag(fleet), &sink.base);
+	sftp_parallel_set_walker_phase(fleet, SFTP_WKP_DONE);
+	return rc;
 }
