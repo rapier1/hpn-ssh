@@ -407,10 +407,18 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		}
 		for (int i = 0; i < n; i++) {
 			pthread_join(stids[i], NULL);
-			if (!sctx[i].succeeded) {
+			if (sctx[i].succeeded)
+				continue;
+			/* Under an abort the failure is manufactured - we
+			 * killed the spawn ourselves - so it is expected
+			 * fallout rather than news. Either way the launch
+			 * is abandoned. */
+			if (fleet->abort_flag || fleet->stopped)
+				debug_ft("worker %d setup abandoned (abort)",
+				    i);
+			else
 				error_ft("worker %d setup failed", i);
-				failed = 1;
-			}
+			failed = 1;
 		}
 		pthread_mutex_destroy(&auth_mu);
 		pthread_cond_destroy(&auth_cv);

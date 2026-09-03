@@ -1032,7 +1032,7 @@ parallel_reporter_thread(void *arg)
 	int slow_tick_counter = 0;
 
 	while (1) {
-		struct timespec req = sleep_ts, rem;
+		struct timespec tick = sleep_ts, remaining;
 		uint64_t bytes;
 		off_t newpos;
 
@@ -1041,8 +1041,8 @@ parallel_reporter_thread(void *arg)
 		 * a second and the remainder is discarded. Everything below
 		 * is counted in ticks, so finish the sleep rather than let
 		 * tick length depend on whether a meter is running. */
-		while (nanosleep(&req, &rem) == -1 && errno == EINTR)
-			req = rem;
+		while (nanosleep(&tick, &remaining) == -1 && errno == EINTR)
+			tick = remaining;
 		if (fleet->stopped)
 			break;
 
