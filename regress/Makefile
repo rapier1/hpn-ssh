@@ -81,6 +81,7 @@ LTESTS= 	connect \
 		sftp-parallel \
 		sftp-parallel-resume \
 		sftp-parallel-respawn \
+		sftp-parallel-tput \
 		sftp-bundle \
 		sftp-bundle-caps \
 		sftp-range-split \

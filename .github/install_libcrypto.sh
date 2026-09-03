@@ -69,7 +69,7 @@ fi
 
 git checkout ${ver}
 make clean >/dev/null 2>&1 || true
-${dryrun} ./config no-threads shared ${opts} --prefix=${destdir} \
+${dryrun} ./config shared ${opts} --prefix=${destdir} \
     -Wl,-rpath,${destdir}/lib64
 ${dryrun} make -j4
 ${dryrun} sudo make install_sw
