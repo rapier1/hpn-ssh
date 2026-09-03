@@ -2640,63 +2640,64 @@ struct serial_dl_sink {
 
 static int
 serial_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
-    const char *dst, Attrib *a)
+    const char *dst, Attrib *attrs)
 {
-	struct serial_dl_sink	*s = (struct serial_dl_sink *)sink;
+	struct serial_dl_sink	*ctx = (struct serial_dl_sink *)sink;
 	mode_t			 mode, tmpmode;
-	Attrib			 da;
+	Attrib			 defrd_attrs;
 
-	if (s->print_flag && s->print_flag != SFTP_PROGRESS_ONLY)
+	if (ctx->print_flag && ctx->print_flag != SFTP_PROGRESS_ONLY)
 		pm_mprintf("Retrieving %s\n", src);
-	if (sftp_hpn_ensure_local_dir(dst, a, &mode, &tmpmode) != 0)
+	if (sftp_hpn_ensure_local_dir(dst, attrs, &mode, &tmpmode) != 0)
 		return -1;
-	da = *a;
-	if (!s->preserve_flag)
-		da.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-	if (s->preserve_flag || mode != tmpmode)
-		sftp_hpn_dirattrs_defer_local(s->dirs, dst, mode, tmpmode, &da);
+	defrd_attrs = *attrs;
+	if (!ctx->preserve_flag)
+		defrd_attrs.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
+	if (ctx->preserve_flag || mode != tmpmode)
+		sftp_hpn_dirattrs_defer_local(ctx->dirs, dst, mode, tmpmode,
+		    &defrd_attrs);
 	return 0;
 }
 
 static int
 serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
-    const char *dst, Attrib *a)
+    const char *dst, Attrib *attrs)
 {
-	struct serial_dl_sink	*s = (struct serial_dl_sink *)sink;
+	struct serial_dl_sink	*ctx = (struct serial_dl_sink *)sink;
 	int			 dr;
 
-	if ((a->flags & SSH2_FILEXFER_ATTR_SIZE) &&
-	    sftp_hpn_bundle_acc_eligible(s->bacc, a->size)) {
-		if (sftp_hpn_bundle_acc_add(s->bacc, src, dst,
-		    (long long)a->size)) {
-			int fr = sftp_hpn_bundle_acc_flush(s->conn, s->bacc,
-			    s->preserve_flag, s->print_flag, s->verify,
-			    s->fsync_flag, s->inplace_flag);
+	if ((attrs->flags & SSH2_FILEXFER_ATTR_SIZE) &&
+	    sftp_hpn_bundle_acc_eligible(ctx->bacc, attrs->size)) {
+		if (sftp_hpn_bundle_acc_add(ctx->bacc, src, dst,
+		    (long long)attrs->size)) {
+			int fr = sftp_hpn_bundle_acc_flush(ctx->conn, ctx->bacc,
+			    ctx->preserve_flag, ctx->print_flag, ctx->verify,
+			    ctx->fsync_flag, ctx->inplace_flag);
 			if (fr < 0)		/* hard failure: stop the walk */
-				s->fatal = 1;
+				ctx->fatal = 1;
 			if (fr != 0)
 				return -1;
 		}
 		return 0;
 	}
 
-	dr = sftp_download(s->conn, src, dst, a, s->preserve_flag,
-	    s->resume_flag, s->fsync_flag, s->inplace_flag, s->verify);
+	dr = sftp_download(ctx->conn, src, dst, attrs, ctx->preserve_flag,
+	    ctx->resume_flag, ctx->fsync_flag, ctx->inplace_flag, ctx->verify);
 	if (dr == -1) {
 		error("Download of file %s to %s failed", src, dst);
-		transferlog_file(TRANSFERLOG_FAILED, (long long)a->size, dst);
+		transferlog_file(TRANSFERLOG_FAILED, (long long)attrs->size, dst);
 		return -1;
 	}
 	if (dr == 1) {
 		fmprintf(hpn_pm_active() ? stderr : stdout,
 		    "File skipped: %s: Identical.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED, (long long)a->size, dst);
+		transferlog_file(TRANSFERLOG_SKIPPED, (long long)attrs->size, dst);
 	} else if (dr == 2) {
 		fmprintf(hpn_pm_active() ? stderr : stdout,
 		    "File skipped: %s: Target is larger than source.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED, (long long)a->size, dst);
-	} else if (!sftp_conn_verify_transfer_enabled(s->conn)) {
-		transferlog_file(TRANSFERLOG_SUCCESS, (long long)a->size, dst);
+		transferlog_file(TRANSFERLOG_SKIPPED, (long long)attrs->size, dst);
+	} else if (!sftp_conn_verify_transfer_enabled(ctx->conn)) {
+		transferlog_file(TRANSFERLOG_SUCCESS, (long long)attrs->size, dst);
 	}
 	return 0;
 }
@@ -2714,7 +2715,9 @@ serial_dl_fail(struct sftp_tree_dl_sink *sink, const char *path,
 static int
 serial_dl_aborting(struct sftp_tree_dl_sink *sink)
 {
-	return interrupted || ((struct serial_dl_sink *)sink)->fatal;
+	struct serial_dl_sink	*ctx = (struct serial_dl_sink *)sink;
+
+	return interrupted || ctx->fatal;
 }
 
 int
@@ -3351,50 +3354,55 @@ static void
 serial_ul_enter_dir(struct sftp_upload_sink *sink, const char *src,
     const char *dst)
 {
-	struct serial_ul_sink	*s = (struct serial_ul_sink *)sink;
+	struct serial_ul_sink	*ctx = (struct serial_ul_sink *)sink;
 
-	(void)dst;
-	if (s->print_flag && s->print_flag != SFTP_PROGRESS_ONLY)
+	(void)dst;	/* shared signature, only the parallel sink uses it */
+	if (ctx->print_flag && ctx->print_flag != SFTP_PROGRESS_ONLY)
 		pm_mprintf("Entering %s\n", src);
 }
 
 static int
 serial_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
-    const char *dst, const struct stat *sb)
+    const char *dst, const struct stat *src_sb)
 {
-	struct serial_ul_sink	*s = (struct serial_ul_sink *)sink;
+	struct serial_ul_sink	*ctx = (struct serial_ul_sink *)sink;
 	int			 ur;
 
-	if (sftp_hpn_bundle_acc_eligible(s->bacc, (uint64_t)sb->st_size)) {
-		if (sftp_hpn_bundle_acc_add(s->bacc, src, dst,
-		    (long long)sb->st_size)) {
-			int fr = sftp_hpn_bundle_acc_flush(s->conn, s->bacc,
-			    s->preserve_flag, s->print_flag, s->verify,
-			    s->fsync_flag, s->inplace_flag);
+	if (sftp_hpn_bundle_acc_eligible(ctx->bacc,
+	    (uint64_t)src_sb->st_size)) {
+		if (sftp_hpn_bundle_acc_add(ctx->bacc, src, dst,
+		    (long long)src_sb->st_size)) {
+			int fr = sftp_hpn_bundle_acc_flush(ctx->conn, ctx->bacc,
+			    ctx->preserve_flag, ctx->print_flag, ctx->verify,
+			    ctx->fsync_flag, ctx->inplace_flag);
 			if (fr < 0)		/* hard failure: stop the walk */
-				s->fatal = 1;
+				ctx->fatal = 1;
 			if (fr != 0)
 				return -1;
 		}
 		return 0;
 	}
-	ur = sftp_upload(s->conn, src, dst, s->preserve_flag, s->resume,
-	    s->verify, s->fsync_flag, s->inplace_flag);
+	ur = sftp_upload(ctx->conn, src, dst, ctx->preserve_flag, ctx->resume,
+	    ctx->verify, ctx->fsync_flag, ctx->inplace_flag);
 	if (ur == -1) {
 		error("upload \"%s\" to \"%s\" failed", src, dst);
-		transferlog_file(TRANSFERLOG_FAILED, (long long)sb->st_size, dst);
+		transferlog_file(TRANSFERLOG_FAILED,
+		    (long long)src_sb->st_size, dst);
 		return -1;
 	}
 	if (ur == 1) {
 		fmprintf(hpn_pm_active() ? stderr : stdout,
 		    "File skipped: %s: Identical.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED, (long long)sb->st_size, dst);
+		transferlog_file(TRANSFERLOG_SKIPPED,
+		    (long long)src_sb->st_size, dst);
 	} else if (ur == 2) {
 		fmprintf(hpn_pm_active() ? stderr : stdout,
 		    "File skipped: %s: Target is larger than source.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED, (long long)sb->st_size, dst);
-	} else if (!sftp_conn_verify_transfer_enabled(s->conn)) {
-		transferlog_file(TRANSFERLOG_SUCCESS, (long long)sb->st_size, dst);
+		transferlog_file(TRANSFERLOG_SKIPPED,
+		    (long long)src_sb->st_size, dst);
+	} else if (!sftp_conn_verify_transfer_enabled(ctx->conn)) {
+		transferlog_file(TRANSFERLOG_SUCCESS,
+		    (long long)src_sb->st_size, dst);
 	}
 	return 0;
 }
@@ -3407,12 +3415,11 @@ serial_ul_before_mkdir(struct sftp_upload_sink *sink)
 
 static void
 serial_ul_defer_dir(struct sftp_upload_sink *sink, const char *dst,
-    const Attrib *a, int created)
+    const Attrib *attrs)
 {
-	struct serial_ul_sink	*s = (struct serial_ul_sink *)sink;
+	struct serial_ul_sink	*ctx = (struct serial_ul_sink *)sink;
 
-	if (created || s->preserve_flag)
-		sftp_hpn_dirattrs_defer_remote(s->dirs, dst, a);
+	sftp_hpn_dirattrs_defer_remote(ctx->dirs, dst, attrs);
 }
 
 static void
@@ -3428,7 +3435,9 @@ serial_ul_fail(struct sftp_upload_sink *sink, const char *path,
 static int
 serial_ul_aborting(struct sftp_upload_sink *sink)
 {
-	return interrupted || ((struct serial_ul_sink *)sink)->fatal;
+	struct serial_ul_sink	*ctx = (struct serial_ul_sink *)sink;
+
+	return interrupted || ctx->fatal;
 }
 
 int
@@ -5160,14 +5169,14 @@ struct crossload_sink {
 
 static int
 crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
-    Attrib *a)
+    Attrib *attrs)
 {
-	struct crossload_sink	*s = (struct crossload_sink *)sink;
-	Attrib		 curdir = *a, newdir;
+	struct crossload_sink	*ctx = (struct crossload_sink *)sink;
+	Attrib		 curdir = *attrs, newdir;
 	mode_t		 mode;
 	int		 created = 0;
 
-	if (s->print_flag && s->print_flag != SFTP_PROGRESS_ONLY)
+	if (ctx->print_flag && ctx->print_flag != SFTP_PROGRESS_ONLY)
 		pm_mprintf("Retrieving %s\n", src);
 
 	curdir.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
@@ -5186,10 +5195,10 @@ crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *
 	 * SFTP has no portable EEXIST, so on a mkdir failure check whether the
 	 * path already exists as a directory.
 	 */
-	if (sftp_mkdir(s->to, dst, &curdir, 0) == 0) {
+	if (sftp_mkdir(ctx->to, dst, &curdir, 0) == 0) {
 		created = 1;
 	} else {
-		if (sftp_stat(s->to, dst, 0, &newdir) != 0)
+		if (sftp_stat(ctx->to, dst, 0, &newdir) != 0)
 			return -1;
 		if (!S_ISDIR(newdir.perm)) {
 			error("\"%s\" exists but is not a directory", dst);
@@ -5198,18 +5207,19 @@ crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *
 	}
 	curdir.perm = mode;	/* the real mode, for the deferred setstat */
 
-	if (created || s->preserve_flag)
-		sftp_hpn_dirattrs_defer_remote(s->dirs, dst, &curdir);
+	if (created || ctx->preserve_flag)
+		sftp_hpn_dirattrs_defer_remote(ctx->dirs, dst, &curdir);
 	return 0;
 }
 
 static int
 crossload_xfer_file(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
-    Attrib *a)
+    Attrib *attrs)
 {
-	struct crossload_sink	*s = (struct crossload_sink *)sink;
+	struct crossload_sink	*ctx = (struct crossload_sink *)sink;
 
-	if (sftp_crossload(s->from, s->to, src, dst, a, s->preserve_flag) == -1) {
+	if (sftp_crossload(ctx->from, ctx->to, src, dst, attrs,
+	    ctx->preserve_flag) == -1) {
 		error("crossload \"%s\" to \"%s\" failed", src, dst);
 		return -1;
 	}

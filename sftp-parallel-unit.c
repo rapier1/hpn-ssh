@@ -273,7 +273,7 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
 		    u->mode != 0 ? u->mode : 0644, &permanent);
 	} else {
 		int fd = open(t->path, O_WRONLY | O_CREAT,
-		    u->mode != 0 ? u->mode : 0644);
+		    u->mode != 0 ? u->mode : 0666);
 		if (fd >= 0)
 			close(fd);
 		else {
@@ -1376,6 +1376,11 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *local_path, const char *remote_path, off_t size, mode_t mode,
     int resume, int verify)
 {
+	/* Do not preserve set[ug]id or the sticky bit here, as we do not
+	 * preserve ownership.  The serial paths mask the same way, so a
+	 * transfer gets the same permissions with or without -j. */
+	mode &= 0777;
+
 	/* A new command is submitting, so demote walker-phase DONE back to
 	 * SUBMIT: sftp_parallel_wait leaves it DONE, and the endgame
 	 * machinery must re-gate for this command's units. Main thread
@@ -1453,6 +1458,11 @@ sftp_parallel_submit_download(struct sftp_parallel *fleet,
     const char *remote_path, const char *local_path, off_t size, mode_t mode,
     int resume, int verify)
 {
+	/* Do not preserve set[ug]id or the sticky bit here, as we do not
+	 * preserve ownership.  The serial paths mask the same way, so a
+	 * transfer gets the same permissions with or without -j. */
+	mode &= 0777;
+
 	/* Demote DONE back to SUBMIT (see sftp_parallel_submit_upload). */
 	if (fleet != NULL && __atomic_load_n(&fleet->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)

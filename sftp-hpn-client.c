@@ -2464,6 +2464,10 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 	}
 	free(subdirs);
 
-	sink->defer_dir(sink, dst, &a, created);
+	/* A directory needs its attrs fixed up after its contents land if we
+	 * created it (it was made with restrictive bits) or if -p asked for
+	 * the source's own. Gate it here so both sinks just record. */
+	if (created || preserve_flag)
+		sink->defer_dir(sink, dst, &a);
 	return ret;
 }

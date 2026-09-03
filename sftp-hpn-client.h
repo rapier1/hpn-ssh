@@ -453,13 +453,13 @@ void sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl);
  */
 struct sftp_tree_dl_sink {
 	/* Create the local directory dst for a dir entry (remote path src,
-	 * attrs a) and defer its attributes; src is for progress output only.
+	 * attrs) and defer its attributes; src is for progress output only.
 	 * Returns 0, or -1 (having recorded failure). */
 	int  (*make_dir)(struct sftp_tree_dl_sink *sink, const char *src,
-	         const char *dst, Attrib *a);
-	/* Transfer regular file src -> dst (attrs a).  Returns 0 or -1. */
+	         const char *dst, Attrib *attrs);
+	/* Transfer regular file src -> dst (attrs).  Returns 0 or -1. */
 	int  (*xfer_file)(struct sftp_tree_dl_sink *sink, const char *src,
-	         const char *dst, Attrib *a);
+	         const char *dst, Attrib *attrs);
 	/* Record a per-entry failure (reason is a short static string). */
 	void (*fail)(struct sftp_tree_dl_sink *sink, const char *path,
 	         const char *reason);
@@ -549,14 +549,16 @@ struct sftp_upload_sink {
 	 * applies the Lustre layout to dst and enters the enumerate phase. */
 	void (*enter_dir)(struct sftp_upload_sink *sink, const char *src,
 	         const char *dst);
-	/* Transfer a regular local file src -> dst (local stat sb).  0 or -1. */
+	/* Transfer a regular local file src -> dst (src_sb is src's local
+	 * stat).  0 or -1. */
 	int  (*xfer_file)(struct sftp_upload_sink *sink, const char *src,
-	         const char *dst, const struct stat *sb);
+	         const char *dst, const struct stat *src_sb);
 	/* Before the pipelined mkdir batch (parallel enters the mkdir phase). */
 	void (*before_mkdir)(struct sftp_upload_sink *sink);
-	/* Defer this directory's final remote attrs (gated created||preserve). */
+	/* Defer this directory's final remote attrs. The driver applies the
+	 * created-or-preserve gate, so a call here means they are wanted. */
 	void (*defer_dir)(struct sftp_upload_sink *sink, const char *dst,
-	         const Attrib *a, int created);
+	         const Attrib *attrs);
 	/* Record a per-entry failure (reason a short static string). */
 	void (*fail)(struct sftp_upload_sink *sink, const char *path,
 	         const char *reason);

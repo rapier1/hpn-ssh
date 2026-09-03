@@ -1397,7 +1397,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 				if (ga.flags & SSH2_FILEXFER_ATTR_SIZE)
 					fsize = (off_t)ga.size;
 				if (ga.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
-					fmode = ga.perm & 07777;
+					fmode = ga.perm;
 			}
 			/* Glob / direct dispatch bypasses the walker; register
 			 * both sides' directories so whole-file verify factors

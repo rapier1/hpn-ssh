@@ -2236,7 +2236,7 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 		}
 	} else if (parallel_orch != NULL) {
 		if (sftp_parallel_submit_upload(parallel_orch, conn, src,
-		    abs_dst, st.st_size, st.st_mode & 07777,
+		    abs_dst, st.st_size, st.st_mode,
 		    resume_flag, resume_flag) != 0) {
 			error("failed to upload file %s to %s", src, targ);
 			errs = 1;
@@ -2573,7 +2573,7 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 				if (ga.flags & SSH2_FILEXFER_ATTR_SIZE)
 					fsize = (off_t)ga.size;
 				if (ga.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
-					fmode = ga.perm & 07777;
+					fmode = ga.perm;
 			}
 			if (sftp_parallel_submit_download(parallel_orch, conn,
 			    g.gl_pathv[i], abs_dst, fsize, fmode,
