@@ -20,21 +20,17 @@
  * sftp-parallel-config.c - bridge between ssh_config and the
  * parallel-streams orchestrator config.
  *
- * Reads the user's ssh_config files using the same machinery as
- * hpnssh (two-pass parsing with Match-block resolution) and copies
- * relevant HPN options into a `struct sftp_parallel_config`.
+ * Reads the user's ssh_config files using the same machinery as hpnssh
+ * (command line first, then two-pass parsing with Match-block
+ * resolution) and copies the HPN keywords into a
+ * `struct sftp_parallel_config`: HPNUseBundle, HPNWriterPool,
+ * HPNTailRedistribute, HPNMaxRetries, HPNStallAbortTimeout,
+ * HPNBundleSize, HPNMaxAuthConcurrent and HPNLustreStripeCount.
  *
- * Today this maps a single keyword:
- *   HPNUseBundle yes|no  ->  pcfg->use_bundle
- *
- * Future ssh_config-promoted options (BundleSize,
- * ParallelStreamsAuthConcurrent, etc.) plug in here as the inventory
- * in benchmark/env-vars-reference.md is promoted from env vars.
- *
- * Both hpnsftp and (future) hpnscp call sftp_parallel_apply_ssh_config()
- * to populate pcfg before invoking sftp_parallel_start(). This keeps
- * the readconf.o dependency contained in one small object file rather
- * than pulling it into the much larger sftp-parallel.o.
+ * Both hpnsftp and hpnscp call sftp_parallel_apply_ssh_config() to
+ * populate pcfg before invoking sftp_parallel_start(). This keeps the
+ * readconf.o dependency contained in one small object file rather than
+ * pulling it into the much larger sftp-parallel.o.
  */
 
 #include "includes.h"
@@ -48,13 +44,11 @@
 #include <unistd.h>
 
 #include "log.h"
-#include "misc.h"
+#include "misc.h"		/* struct ForwardOptions, for readconf.h */
 #include "pathnames.h"
-#include "ssh.h"
+#include "ssh.h"		/* SSH_MAX_*_FILES, for readconf.h */
 #include "readconf.h"
 #include "sftp-parallel.h"
-#include "sshbuf.h"
-#include "sshkey.h"
 #include "xmalloc.h"
 
 /*
@@ -63,6 +57,12 @@
  * supplied Options struct. Sets *want_final_pass=1 if any parsed
  * directive depended on the final-pass resolution (Match blocks).
  *
+ * `host` and `original_host` are readconf's own two names for the
+ * target: `host` after any Hostname substitution, matched by Match host
+ * and expanded as %h, and `original_host` as the user typed it, matched
+ * by Match originalhost and expanded as %n. They are the same value
+ * until a Hostname directive has been read.
+ *
  * Returns 0 on success or -1 if the explicit user config file was
  * provided but couldn't be opened (matches ssh.c's fatal() behaviour
  * loosely - we return an error instead of exiting, since the caller
@@ -70,40 +70,42 @@
  */
 static int
 process_config_files(const char *user_config_file, struct passwd *pw,
-    const char *host, const char *host_name, int final_pass,
+    const char *host, const char *original_host, int final_pass,
     int *want_final_pass, Options *options)
 {
 	char buf[PATH_MAX];
+	int final_flag = 0;
 	int r;
+
+	if (final_pass)
+		final_flag = SSHCONF_FINAL;
 
 	if (user_config_file != NULL) {
 		if (strcasecmp(user_config_file, "none") == 0)
 			return 0;
-		if (!read_config_file(user_config_file, pw, host, host_name,
+		if (!read_config_file(user_config_file, pw, host, original_host,
 		    /* remote_command */ NULL, options,
-		    SSHCONF_USERCONF |
-		    (final_pass ? SSHCONF_FINAL : 0),
-		    want_final_pass))
+		    SSHCONF_USERCONF | final_flag, want_final_pass))
 			return -1;
 		return 0;
 	}
 
-	/* User's ssh_config (best-effort; many systems lack it). */
-	if (pw != NULL && pw->pw_dir != NULL) {
+	/* User's ssh_config (best-effort; many systems lack it). The caller
+	 * guarantees pw: the system-wide read below hands it to
+	 * read_config_file, which dereferences it unconditionally. */
+	if (pw->pw_dir != NULL) {
 		r = snprintf(buf, sizeof(buf), "%s/%s", pw->pw_dir,
 		    _PATH_SSH_USER_CONFFILE);
 		if (r > 0 && (size_t)r < sizeof(buf))
-			(void)read_config_file(buf, pw, host, host_name,
+			(void)read_config_file(buf, pw, host, original_host,
 			    /* remote_command */ NULL, options,
-			    SSHCONF_CHECKPERM | SSHCONF_USERCONF |
-			    (final_pass ? SSHCONF_FINAL : 0),
+			    SSHCONF_CHECKPERM | SSHCONF_USERCONF | final_flag,
 			    want_final_pass);
 	}
 
 	/* System-wide config. */
-	(void)read_config_file(_PATH_HOST_CONFIG_FILE, pw, host, host_name,
-	    /* remote_command */ NULL, options,
-	    final_pass ? SSHCONF_FINAL : 0, want_final_pass);
+	(void)read_config_file(_PATH_HOST_CONFIG_FILE, pw, host, original_host,
+	    /* remote_command */ NULL, options, final_flag, want_final_pass);
 
 	return 0;
 }
@@ -114,10 +116,11 @@ process_config_files(const char *user_config_file, struct passwd *pw,
  * afterward, including on a -1 return.
  *
  * `extra_argv` is the array of command-line `-o KEY=VALUE` strings
- * collected by sftp.c's argv parser (parallel_extra_o), NULL-terminated;
- * each entry is applied via process_config_line() AFTER the config files
- * are read but BEFORE fill_default_options(), matching the order ssh.c
- * uses so command-line overrides win over config values. May be NULL.
+ * collected by sftp.c's argv parser (parallel_extra_o), NULL-terminated.
+ * Each entry is applied via process_config_line() BEFORE any config file
+ * is read, which is what gives the command line priority over both
+ * ssh_config and any Match block: readconf keeps the first value it
+ * obtains. May be NULL.
  *
  * Returns 0 on success, -1 on failure.
  */
@@ -127,15 +130,41 @@ resolve_ssh_config(const char *host, const char *user_config_file,
 {
 	struct passwd *pw;
 	int want_final_pass = 0;
-	const char *host_name;
+	const char *resolved_host;
 
 	initialize_options(options);
 	options->host_arg = xstrdup(host);
+	/* The fleet's workers connect as `hpnssh -s sftp`, so Match
+	 * sessiontype has to resolve here the way it will for them. */
+	options->session_type = SESSION_TYPE_SUBSYSTEM;
 
 	pw = getpwuid(getuid());
 	if (pw == NULL) {
 		debug_f("getpwuid failed; skipping ssh_config parse");
 		return -1;
+	}
+
+	/*
+	 * Apply -o overrides before reading any config file. readconf is
+	 * first-wins (see parse_multistate), so whatever sets a value first
+	 * keeps it: ssh.c gets -o precedence by parsing it in the getopt
+	 * loop, ahead of process_config_files, and this has to do the same
+	 * or a keyword present in ssh_config would silently beat the
+	 * command line.
+	 */
+	if (extra_argv != NULL) {
+		for (int i = 0; extra_argv[i] != NULL; i++) {
+			char *line = xstrdup(extra_argv[i]);
+			if (process_config_line(options, pw,
+			    host, host, "", line, "command-line",
+			    0, NULL, SSHCONF_USERCONF) != 0) {
+				error_f("bad -o option \"%s\"",
+				    extra_argv[i]);
+				free(line);
+				return -1;
+			}
+			free(line);
+		}
 	}
 
 	/* Pass 1: read config without Match-resolution, find out whether
@@ -150,31 +179,10 @@ resolve_ssh_config(const char *host, const char *user_config_file,
 	/* Pass 2: if any Match block referenced final-pass data, re-read
 	 * with the resolved hostname. */
 	if (want_final_pass) {
-		host_name = options->hostname ? options->hostname : host;
-		(void)process_config_files(user_config_file, pw, host,
-		    host_name, /* final_pass */ 1, NULL, options);
-	}
-
-	/*
-	 * Apply -o overrides from the command line so they trump config
-	 * values, matching how ssh.c handles -o. Without this, options
-	 * like `-o HPNLustreStripeCount=0` silently fail to override the
-	 * config defaults.
-	 */
-	if (extra_argv != NULL) {
-		for (int i = 0; extra_argv[i] != NULL; i++) {
-			char *line = xstrdup(extra_argv[i]);
-			if (process_config_line(options, pw,
-			    host ? host : "", host ? host : "", "",
-			    line, "command-line", 0, NULL,
-			    SSHCONF_USERCONF) != 0) {
-				error_f("bad -o option \"%s\"",
-				    extra_argv[i]);
-				free(line);
-				return -1;
-			}
-			free(line);
-		}
+		resolved_host = options->hostname != NULL ?
+		    options->hostname : host;
+		(void)process_config_files(user_config_file, pw,
+		    resolved_host, host, /* final_pass */ 1, NULL, options);
 	}
 
 	fill_default_options(options);
@@ -188,18 +196,28 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 {
 	Options options;
 
-	if (pcfg == NULL || host == NULL || *host == '\0')
+	if (pcfg == NULL)
 		return -1;
 
-	/* Sensible defaults if anything below fails. */
+	/*
+	 * Establish the defaults before any early return. Both callers
+	 * discard our return value, so pcfg has to be usable whether or not
+	 * the rest of this function runs. These mirror what
+	 * fill_default_options() would produce (readconf.c); bundle_size
+	 * takes the shared constant so the orchestrator never sees 0.
+	 */
 	pcfg->use_bundle  = 1;
 	pcfg->writer_pool = 1;
 	pcfg->tail_redistribute = 1;
 	pcfg->max_retries = 3;
 	pcfg->stall_abort_timeout = 60;
-	pcfg->bundle_size = 0;  /* 0 = let worker use compile-time default */
+	pcfg->bundle_size = HPN_BUNDLE_SIZE_DEFAULT;
 	pcfg->max_auth_concurrent = 0;  /* 0 = auto */
+	pcfg->lustre_stripe_count = -1;  /* -1 = auto */
 	pcfg->verify_transfer = 0;  /* default off */
+
+	if (host == NULL || *host == '\0')
+		return -1;
 
 	if (resolve_ssh_config(host, user_config_file, extra_argv,
 	    &options) < 0) {
@@ -207,16 +225,19 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 		return -1;
 	}
 
-	/* Map the resolved Options into pcfg. Future ssh_config-promoted
-	 * options append additional assignments here. */
+	/* Map the resolved Options into pcfg. */
 	pcfg->use_bundle  = (options.hpn_use_bundle != 0);
 	pcfg->writer_pool = (options.hpn_writer_pool != 0);
 	pcfg->tail_redistribute = (options.hpn_tail_redistribute != 0);
 	pcfg->max_retries = options.hpn_max_retries;
 	pcfg->stall_abort_timeout = options.hpn_stall_abort_timeout;
-	pcfg->bundle_size = (options.hpn_bundle_size > 0)
-	    ? (uint64_t)options.hpn_bundle_size : 0;
+	/* fill_default_options() clamps this into [MIN, MAX], so the guard is
+	 * not about zero: it stops the -1 "unset" sentinel from casting to a
+	 * 16-exabyte target if this ever runs on an unfilled Options. */
+	if (options.hpn_bundle_size > 0)
+		pcfg->bundle_size = (uint64_t)options.hpn_bundle_size;
 	pcfg->max_auth_concurrent = options.hpn_max_auth_concurrent;
+	pcfg->lustre_stripe_count = options.hpn_lustre_stripe_count;
 	/* verify_transfer is NOT an ssh_config option; it is requested per
 	 * transfer via -V (scp) / put-getv (sftp) and stays at the default 0
 	 * here, toggled later by the caller. */
@@ -235,30 +256,11 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	return 0;
 }
 
-int
-sftp_resolve_hpn_lustre_stripe_count(const char *host,
-    const char *user_config_file, char *const *extra_argv)
-{
-	Options options;
-	int r = -1;	/* default: auto */
-
-	if (host == NULL || *host == '\0')
-		return -1;
-	if (resolve_ssh_config(host, user_config_file, extra_argv,
-	    &options) == 0)
-		r = options.hpn_lustre_stripe_count;
-	free_options(&options);
-	return r;
-}
-
 /*
  * Adaptive throughput-outlier stall detection defaults, shared by hpnsftp
  * and hpnscp so the two stay in lockstep. On by default in parallel mode
- * with conservative WAN-bulk settings (the values were settled by testing;
- * the env-var overrides that once existed were removed in the 19.0 dev-knob
- * cull): path-health floor in bytes/s (0 disables the detector), the outlier
- * fraction of the fastest peer's EMA, the consecutive outlier ticks before
- * STALLED (DEAD at 2N), and the EMA smoothing factor.
+ * with conservative WAN-bulk settings, settled by testing. A path-health
+ * floor of 0 disables the detector entirely.
  */
 void
 sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg)

@@ -1215,11 +1215,8 @@ worker_thread_init(struct sftp_worker *worker)
 	 * stuck-range detector compares against this. */
 	__atomic_store_n(&worker->unit_offset, (int64_t)-1, __ATOMIC_RELAXED);
 
-	/* set our bundle size */ 
-	if (worker->parent->cfg.bundle_size > 0)
-		worker->bundle_target_bytes = worker->parent->cfg.bundle_size;
-	else
-		worker->bundle_target_bytes = BUNDLE_TARGET_BYTES_DEFAULT;
+	/* set our bundle size */
+	worker->bundle_target_bytes = worker->parent->cfg.bundle_size;
 
 	/* can we use the bundle method? Might be disabled or not available */
 	if (worker->parent->cfg.use_bundle == 0) {

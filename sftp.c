@@ -3483,6 +3483,7 @@ main(int argc, char **argv)
 	size_t copy_buffer_len = 0;
 	size_t num_requests = 0;
 	int no_verify_repair = 0;	/* -X VerifyRepair=no -> 1 */
+	int lustre_stripe_count = -1;	/* HPNLustreStripeCount: -1 = auto */
 	long long llv, limit_kbps = 0;
 
 	/* Pass-through state for the parallel-streams ControlMaster.
@@ -3990,9 +3991,11 @@ main(int argc, char **argv)
 
 		memset(&bcfg, 0, sizeof(bcfg));
 		if (sftp_parallel_apply_ssh_config(&bcfg, host,
-		    parallel_config_file, parallel_extra_o) == 0)
+		    parallel_config_file, parallel_extra_o) == 0) {
 			sftp_conn_set_bundle_config(conn, bcfg.use_bundle,
 			    bcfg.bundle_size, bcfg.writer_pool);
+			lustre_stripe_count = bcfg.lustre_stripe_count;
+		}
 	}
 
 	if (!quiet) {
@@ -4067,9 +4070,7 @@ main(int argc, char **argv)
 	 * so the parallel upload-walker's dir-layout decision site can see
 	 * it.  Value: -1 = auto (use -j N), 0 = feature off, >0 = explicit.
 	 */
-	sftp_conn_set_lustre_stripe_count(conn,
-	    sftp_resolve_hpn_lustre_stripe_count(host, parallel_config_file,
-	        parallel_extra_o));
+	sftp_conn_set_lustre_stripe_count(conn, lustre_stripe_count);
 
 	err = interactive_loop(conn, file1, file2);
 

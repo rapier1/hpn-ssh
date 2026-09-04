@@ -202,6 +202,11 @@ struct sftp_parallel_config {
 	 * clamped to [1 MiB, 256 MiB]. 0 = unset, use the default. */
 	uint64_t     bundle_size;
 
+	/* Lustre stripe count from ssh_config HPNLustreStripeCount
+	 * (EXPERIMENTAL). -1 = auto (use -j N), 0 = feature off,
+	 * >0 = explicit count. */
+	int          lustre_stripe_count;
+
 	/* Transfer flags applied to every submitted unit */
 	/* _Atomic: per-command set_preserve() (main) races worker reads */
 	_Atomic int  preserve_flag;
@@ -335,16 +340,6 @@ int sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
  * between the two.
  */
 void sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg);
-
-/*
- * Resolve HPNLustreStripeCount from ssh_config for a host.
- * `extra_argv` plumbing as above.
- * Returns: -1 = auto (default), 0 = feature off, >0 = explicit count.
- * Used by the parallel orchestrator to decide whether (and at what count)
- * to issue hpn-file-layout requests before file creation.
- */
-int sftp_resolve_hpn_lustre_stripe_count(const char *host,
-    const char *user_config_file, char *const *extra_argv);
 
 /*
  * Submit a work unit. These calls copy the path strings; the caller retains

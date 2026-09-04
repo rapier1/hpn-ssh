@@ -78,11 +78,8 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
 	if (!cfg->use_bundle)
 		return base;
 
-	/* get the size of our bundle */
-	if (cfg->bundle_size > 0)
-		target = cfg->bundle_size;
-	else
-		target = BUNDLE_TARGET_BYTES_DEFAULT;
+	/* Bundle size: always set, see sftp_parallel_apply_ssh_config. */
+	target = cfg->bundle_size;
 
 	/* per bundle = estimate of number of files in a bundle */
 	per_bundle = (size_t)(target / BUNDLE_QUEUE_FILE_HINT);

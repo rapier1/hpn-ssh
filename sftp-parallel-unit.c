@@ -917,9 +917,9 @@ parallel_unit_pending_dec(struct sftp_parallel *fleet)
 static uint64_t
 bundle_target_for(const struct sftp_parallel *fleet)
 {
-	return (fleet != NULL && fleet->cfg.bundle_size > 0)
-	    ? fleet->cfg.bundle_size
-	    : BUNDLE_TARGET_BYTES_DEFAULT;
+	if (fleet == NULL)
+		return BUNDLE_TARGET_BYTES_DEFAULT;
+	return fleet->cfg.bundle_size;
 }
 
 static int submit_upload_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
@@ -1002,8 +1002,7 @@ parallel_bundle_flush(struct sftp_parallel *fleet)
 static int
 parallel_bundle_add(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 {
-	uint64_t target = (fleet->cfg.bundle_size > 0)
-	    ? fleet->cfg.bundle_size : BUNDLE_TARGET_BYTES_DEFAULT;
+	uint64_t target = fleet->cfg.bundle_size;
 
 	pthread_mutex_lock(&fleet->pending_mu);
 	fleet->pending++;
