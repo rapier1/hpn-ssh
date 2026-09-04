@@ -107,10 +107,11 @@ thread_loop_cleanup(void *x)
 	pthread_mutex_unlock((pthread_mutex_t *)x);
 }
 
-#ifdef __APPLE__
 /* Check if we should exit, we are doing both cancel and exit condition
- * since on OSX threads seem to occasionally fail to notice when they have
- * been cancelled. We want to have a backup to make sure that we won't hang
+ * since threads can fail to notice that they have been cancelled: on OSX
+ * natively, and on any platform when running under valgrind, whose
+ * scheduler does not deliver a cancel to a thread parked in
+ * pthread_cond_wait(). We want a backup to make sure that we won't hang
  * when the main process join()-s the cancelled thread.
  */
 static void
@@ -125,9 +126,6 @@ thread_loop_check_exit(struct aes_mt_ctx_st *aes_mt_ctx)
 	if (exit_flag)
 		pthread_exit(NULL);
 }
-#else
-# define thread_loop_check_exit(s)
-#endif /* __APPLE__ */
 
 /*
  * Helper function to terminate the helper threads
@@ -137,12 +135,23 @@ stop_and_join_pregen_threads(struct aes_mt_ctx_st *aes_mt_ctx)
 {
 	int i;
 
-#ifdef __APPLE__
 	/* notify threads that they should exit */
 	pthread_rwlock_wrlock(&aes_mt_ctx->stop_lock);
-	aes_mt_ctx->exit_flag = TRUE;
+	aes_mt_ctx->exit_flag = 1;
 	pthread_rwlock_unlock(&aes_mt_ctx->stop_lock);
-#endif /* __APPLE__ */
+
+	/*
+	 * Wake anything parked in pthread_cond_wait() so that it rechecks
+	 * the exit flag and leaves via thread_loop_check_exit(). Without
+	 * this a parked thread can only be removed by pthread_cancel(),
+	 * which leaves the join below blocked indefinitely whenever that
+	 * cancel is not delivered.
+	 */
+	for (i = 0; i < NUMKQ; i++) {
+		pthread_mutex_lock(&aes_mt_ctx->q[i].lock);
+		pthread_cond_broadcast(&aes_mt_ctx->q[i].cond);
+		pthread_mutex_unlock(&aes_mt_ctx->q[i].lock);
+	}
 
 	/* Cancel pregen threads */
 	for (i = 0; i < SSH_CIPHER_THREADS; i++) {
@@ -357,10 +366,8 @@ void *aes_mt_newctx_256(void *provctx)
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
 		pthread_rwlock_init(&aes_mt_ctx->tid_lock, NULL);
-#ifdef __APPLE__
 		pthread_rwlock_init(&aes_mt_ctx->stop_lock, NULL);
-		aes_mt_ctx->exit_flag = FALSE;
-#endif /* __APPLE__ */
+		aes_mt_ctx->exit_flag = 0;
 
 		aes_mt_ctx->state = HAVE_NONE;
 
@@ -385,10 +392,8 @@ void *aes_mt_newctx_192(void *provctx)
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
 		pthread_rwlock_init(&aes_mt_ctx->tid_lock, NULL);
-#ifdef __APPLE__
 		pthread_rwlock_init(&aes_mt_ctx->stop_lock, NULL);
-		aes_mt_ctx->exit_flag = FALSE;
-#endif /* __APPLE__ */
+		aes_mt_ctx->exit_flag = 0;
 
 		aes_mt_ctx->state = HAVE_NONE;
 
@@ -413,10 +418,8 @@ void *aes_mt_newctx_128(void *provctx)
 
 	if ((aes_mt_ctx != NULL) && (evp_ctx != NULL)) {
 		pthread_rwlock_init(&aes_mt_ctx->tid_lock, NULL);
-#ifdef __APPLE__
 		pthread_rwlock_init(&aes_mt_ctx->stop_lock, NULL);
-		aes_mt_ctx->exit_flag = FALSE;
-#endif /* __APPLE__ */
+		aes_mt_ctx->exit_flag = 0;
 
 		aes_mt_ctx->state = HAVE_NONE;
 
@@ -473,10 +476,8 @@ int aes_mt_start_threads(void *vevp_ctx, const u_char *key,
 		/* tell the pregen threads to exit */
 		stop_and_join_pregen_threads(aes_mt_ctx);
 
-#ifdef __APPLE__
 		/* reset the exit flag */
-		aes_mt_ctx->exit_flag = FALSE;
-#endif /* __APPLE__ */
+		aes_mt_ctx->exit_flag = 0;
 
 		/* Start over getting key & iv */
 		aes_mt_ctx->state = HAVE_NONE;

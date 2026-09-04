@@ -117,10 +117,8 @@ struct aes_mt_ctx_st {
 	pthread_t	        tid[SSH_CIPHER_THREADS];
 	pthread_rwlock_t        tid_lock;
 	struct kq	        q[NUMKQ];
-#ifdef __APPLE__
 	pthread_rwlock_t        stop_lock;
 	int		        exit_flag;
-#endif /* __APPLE__ */
 };
 
 /* this holds an array of evp context pointers that are
