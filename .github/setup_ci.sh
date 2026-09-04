@@ -319,21 +319,3 @@ if [ ! -z "${EPHEMERAL_VM}" ]; then
 	;;
     esac
 fi
-
-# If we're running on an ephemeral VM, set a random password and set
-# up to run the password auth test.
-if [ ! -z "${EPHEMERAL_VM}" ]; then
-
-    # This is the github "target" as specified in the yml file.
-    # In particular, ubuntu-latest sets the password field to the locked
-    # value, so unless we reset it here most of the tests will fail.
-    case "${target}" in
-    ubuntu-*)
-	echo ${target} target: setting random password.
-	openssl rand -base64 9 >regress/password
-	pw=$(tr -d '\n' <regress/password | openssl passwd -6 -stdin)
-	sudo usermod --password "${pw}" runner
-	sudo usermod --unlock runner
-	;;
-    esac
-fi

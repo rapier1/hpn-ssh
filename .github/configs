@@ -233,8 +233,13 @@ case "$config" in
 	tests5="rekey"
 	tests6="agent-restrict kextype sftp"
 	tests7="kextype sftp-perm keygen-comment percent"
+	# PAM affects authentication and session setup/teardown only,
+	# so there is no point running the whole suite against a PAM
+	# build.  kbdint tests keyboard-interactive via PAM and is only
+	# activated when UsePAM is set (see run_test.sh).
+	testspam="kbdint connect login-timeout envpass exit-status"
 	case "$config" in
-	    valgrind-1|valgrind-pam)
+	    valgrind-1)
 		# All tests except agent-timeout (which is flaky under valgrind),
 		# connection-timeout (which doesn't work since it's so slow)
 		# and hostbased (since valgrind won't let ssh exec keysign).
@@ -242,6 +247,9 @@ case "$config" in
 		SKIP_LTESTS="agent-timeout connection-timeout hostbased"
 		SKIP_LTESTS="$SKIP_LTESTS penalty-expire"
 		SKIP_LTESTS="$SKIP_LTESTS ${tests2} ${tests3} ${tests4} ${tests5} ${tests6} ${tests7}"
+		;;
+	    valgrind-pam-1)
+		LTESTS="${testspam}"
 		;;
 	    valgrind-2)
 		LTESTS="${tests2}"
