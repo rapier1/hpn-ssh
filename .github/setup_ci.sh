@@ -50,7 +50,7 @@ EOD
 		echo success
 	fi
 
-	PACKAGES="$PACKAGES,autoconf,automake,cygwin-devel,gcc-core"
+	PACKAGES="$PACKAGES,autoconf,automake,cygwin-devel=3.6.10-1,gcc-core"
 	PACKAGES="$PACKAGES,make,openssl,libssl-devel,zlib-devel"
 	;;
 *-darwin*)
