@@ -51,7 +51,7 @@ if [ "${abi_compat_test}" = "y" ]; then
 		ver="${major}.$((${minor} + 1))"
 		echo selecting next release branch ${ver}
 		;;
-	openssl-3.*.*)
+	openssl-[34].*.*)
 		major=$(echo ${ver} | cut -f1 -d.)
 		minor=$(echo ${ver} | cut -f2 -d.)
 		patch=$(echo ${ver} | cut -f3 -d.)
@@ -69,7 +69,7 @@ fi
 
 git checkout ${ver}
 make clean >/dev/null 2>&1 || true
-${dryrun} ./config no-threads shared ${opts} --prefix=${destdir} \
+${dryrun} ./config shared ${opts} --prefix=${destdir} \
     -Wl,-rpath,${destdir}/lib64
 ${dryrun} make -j4
 ${dryrun} sudo make install_sw

@@ -112,10 +112,8 @@ struct aes_mt_ctx_st {
 	pthread_t	        tid[MAX_THREADS]; /* 32 */
 	pthread_rwlock_t        tid_lock;
 	struct kq	        q[MAX_NUMKQ]; /* 33 */
-#ifdef __APPLE__
 	pthread_rwlock_t        stop_lock;
 	int		        exit_flag;
-#endif /* __APPLE__ */
 	int                     ongoing; /* possibly not needed */
 };
 

@@ -8,8 +8,8 @@ PACKAGES="tmux"
 echo Running as:
 id
 
-echo Environment:
-set
+echo Saving environment to runner-env.txt
+set >runner-env.txt
 
  . .github/configs ${config}
 
@@ -20,17 +20,37 @@ case "$host" in
 	PACKAGER=setup
 	echo Setting CYGWIN system environment variable.
 	setx CYGWIN "winsymlinks:native"
-	echo Removing extended ACLs so umask works as expected.
-	set -x
-	setfacl -b . regress
-	icacls regress /c /t /q /Inheritance:d
-	icacls regress /c /t /q /Grant ${USERNAME}:F
-	icacls regress /c /t /q /Remove:g "Authenticated Users" \
-	     BUILTIN\\Administrators BUILTIN Everyone System Users
-	takeown /F regress
+	echo Removing extended ACLs on regress so umask works as expected.
+	echo "Original ACLs"
 	icacls regress
-	set +x
-	PACKAGES="$PACKAGES,autoconf,automake,cygwin-devel,gcc-core"
+	setfacl -b regress
+	icacls regress /c /t /q /grant 'BUILTIN\Administrators:(RX)'
+	echo "Modifiled ACLs"
+	icacls regress
+
+	echo Enabling OpenSSL rh-allow-sha1-signatures for unit tests.
+	cp /etc/pki/tls/openssl.cnf /etc/pki/tls/openssl.cnf.bak
+	cat >>/etc/pki/tls/openssl.cnf <<EOD
+[openssl_init]
+alg_section = evp_properties
+
+[evp_properties]
+rh-allow-sha1-signatures = yes
+EOD
+	openssl list -providers -provider legacy
+	printf "Test openssl signing with RSA+SHA1: "
+	openssl genpkey -quiet -algorithm RSA -out private_key.pem -pkeyopt rsa_keygen_bits:2048
+	openssl pkey -in private_key.pem -pubout -out public_key.pem
+	if ! openssl dgst -sha1 -sign private_key.pem -out signature.sig public_key.pem; then
+		echo fail
+		echo "openssl could not sign with RSA+SHA1."
+		cp /etc/pki/tls/openssl.cnf /etc/pki/tls/openssl.cnf.bak regress/
+		exit 1
+	else
+		echo success
+	fi
+
+	PACKAGES="$PACKAGES,autoconf,automake,cygwin-devel=3.6.10-1,gcc-core"
 	PACKAGES="$PACKAGES,make,openssl,libssl-devel,zlib-devel"
 	;;
 *-darwin*)
@@ -87,82 +107,88 @@ echo "Setting up for '$TARGETS'"
 for TARGET in $TARGETS; do
     case $TARGET in
     default|without-openssl|without-zlib|c89)
-        # nothing to do
-        ;;
+	# nothing to do
+	;;
     clang-sanitize*)
-        PACKAGES="$PACKAGES clang-12"
-        ;;
+	PACKAGES="$PACKAGES clang-12"
+	;;
     cygwin-release)
-        PACKAGES="$PACKAGES libcrypt-devel libfido2-devel libkrb5-devel"
-        ;;
+	PACKAGES="$PACKAGES libcrypt-devel libfido2-devel libkrb5-devel"
+	;;
     gcc-sanitize*)
-        ;;
+	;;
     clang-*|gcc-*)
-        compiler=$(echo $TARGET | sed 's/-Werror//')
-        PACKAGES="$PACKAGES $compiler"
-        ;;
+	compiler=$(echo $TARGET | sed 's/-Werror//')
+	PACKAGES="$PACKAGES $compiler"
+	;;
     krb5)
-        PACKAGES="$PACKAGES libkrb5-dev libnss-wrapper krb5-admin-server"
+	PACKAGES="$PACKAGES libkrb5-dev libnss-wrapper krb5-admin-server"
 	;;
     heimdal)
-        PACKAGES="$PACKAGES heimdal-dev libnss-wrapper krb5-admin-server"
-        ;;
+	PACKAGES="$PACKAGES heimdal-dev libnss-wrapper krb5-admin-server"
+	;;
     libedit)
 	case "$PACKAGER" in
 	setup)	PACKAGES="$PACKAGES libedit-devel" ;;
 	apt)	PACKAGES="$PACKAGES libedit-dev" ;;
 	esac
-        ;;
+	;;
     *pam)
 	case "$PACKAGER" in
 	apt)	PACKAGES="$PACKAGES libpam0g-dev" ;;
 	esac
-        ;;
+	;;
     sk)
-        INSTALL_FIDO_PPA="yes"
-        PACKAGES="$PACKAGES libfido2-dev libu2f-host-dev libcbor-dev"
-        ;;
+	INSTALL_FIDO_PPA="yes"
+	PACKAGES="$PACKAGES libfido2-dev libu2f-host-dev libcbor-dev"
+	;;
     selinux)
-        PACKAGES="$PACKAGES libselinux1-dev selinux-policy-dev libaudit-dev"
-        ;;
+	PACKAGES="$PACKAGES libselinux1-dev selinux-policy-dev libaudit-dev"
+	;;
     hardenedmalloc)
-        INSTALL_HARDENED_MALLOC=yes
-        ;;
+	INSTALL_HARDENED_MALLOC=yes
+	# Need clang >= 19 for constexpr and >= 20 for avx10.1-512
+	PACKAGES="$PACKAGES clang-20"
+	;;
     musl)
 	PACKAGES="$PACKAGES musl-tools"
 	;;
     tcmalloc)
-        PACKAGES="$PACKAGES libgoogle-perftools-dev"
-        ;;
+	PACKAGES="$PACKAGES libgoogle-perftools-dev"
+	;;
     openssl-noec)
 	INSTALL_OPENSSL=OpenSSL_1_1_1k
 	SSLCONFOPTS="no-ec"
 	;;
     openssl-*)
-        INSTALL_OPENSSL=$(echo ${TARGET} | cut -f2 -d-)
-        case ${INSTALL_OPENSSL} in
-          1.1.1_stable)	INSTALL_OPENSSL="OpenSSL_1_1_1-stable" ;;
-          1.*)	INSTALL_OPENSSL="OpenSSL_$(echo ${INSTALL_OPENSSL} | tr . _)" ;;
-          3.*)	INSTALL_OPENSSL="openssl-${INSTALL_OPENSSL}" ;;
-        esac
-        PACKAGES="${PACKAGES} putty-tools dropbear-bin"
+	INSTALL_OPENSSL=$(echo ${TARGET} | cut -f2 -d-)
+	case ${INSTALL_OPENSSL} in
+	  1.1.1_stable)	INSTALL_OPENSSL="OpenSSL_1_1_1-stable" ;;
+	  1.*)	INSTALL_OPENSSL="OpenSSL_$(echo ${INSTALL_OPENSSL} | tr . _)" ;;
+	  master)	;;
+	  *)	INSTALL_OPENSSL="openssl-${INSTALL_OPENSSL}" ;;
+	esac
+	PACKAGES="${PACKAGES} putty-tools dropbear-bin"
        ;;
     libressl-*)
-        INSTALL_LIBRESSL=$(echo ${TARGET} | cut -f2 -d-)
-        case ${INSTALL_LIBRESSL} in
-          master) ;;
-          *) INSTALL_LIBRESSL="$(echo ${TARGET} | cut -f2 -d-)" ;;
-        esac
-        PACKAGES="${PACKAGES} putty-tools dropbear-bin"
+	INSTALL_LIBRESSL=$(echo ${TARGET} | cut -f2 -d-)
+	case ${INSTALL_LIBRESSL} in
+	  master) ;;
+	  *) INSTALL_LIBRESSL="$(echo ${TARGET} | cut -f2 -d-)" ;;
+	esac
+	PACKAGES="${PACKAGES} putty-tools dropbear-bin"
        ;;
     boringssl)
-        INSTALL_BORINGSSL=1
-        PACKAGES="${PACKAGES} cmake ninja-build"
+	INSTALL_BORINGSSL=1
+	PACKAGES="${PACKAGES} cmake ninja-build"
        ;;
     aws-lc)
-        INSTALL_AWSLC=1
-        PACKAGES="${PACKAGES} cmake ninja-build"
-        ;;
+	INSTALL_AWSLC=1
+	PACKAGES="${PACKAGES} cmake ninja-build"
+	;;
+    dropbear-versions)
+	INSTALL_DROPBEAR=main
+	;;
     putty-*)
 	INSTALL_PUTTY=0.83
 	PACKAGES="${PACKAGES} cmake"
@@ -173,8 +199,8 @@ for TARGET in $TARGETS; do
     zlib-*)
        ;;
     *) echo "Invalid option '${TARGET}'"
-        exit 1
-        ;;
+	exit 1
+	;;
     esac
 done
 
@@ -221,7 +247,8 @@ if [ "${INSTALL_HARDENED_MALLOC}" = "yes" ]; then
     (cd ${HOME} &&
      git clone https://github.com/GrapheneOS/hardened_malloc.git &&
      cd ${HOME}/hardened_malloc &&
-     make && sudo cp out/libhardened_malloc.so /usr/lib/)
+     clang-20 --version &&
+     make CC=clang-20 && sudo cp out/libhardened_malloc.so /usr/lib/)
 fi
 
 if [ ! -z "${INSTALL_OPENSSL}" ]; then
@@ -231,20 +258,20 @@ fi
 
 if [ ! -z "${INSTALL_LIBRESSL}" ]; then
     if [ "${INSTALL_LIBRESSL}" = "master" ]; then
-        (mkdir -p ${HOME}/libressl && cd ${HOME}/libressl &&
-         git clone https://github.com/libressl-portable/portable.git &&
-         cd ${HOME}/libressl/portable &&
-         git checkout ${INSTALL_LIBRESSL} &&
-         sh update.sh && sh autogen.sh &&
-         ./configure --prefix=/opt/libressl &&
-         make && sudo make install)
+	(mkdir -p ${HOME}/libressl && cd ${HOME}/libressl &&
+	 git clone https://github.com/libressl-portable/portable.git &&
+	 cd ${HOME}/libressl/portable &&
+	 git checkout ${INSTALL_LIBRESSL} &&
+	 sh update.sh && sh autogen.sh &&
+	 ./configure --prefix=/opt/libressl &&
+	 make && sudo make install)
     else
-        LIBRESSL_URLBASE=https://cdn.openbsd.org/pub/OpenBSD/LibreSSL
-        (cd ${HOME} &&
-         wget ${LIBRESSL_URLBASE}/libressl-${INSTALL_LIBRESSL}.tar.gz &&
-         tar xfz libressl-${INSTALL_LIBRESSL}.tar.gz &&
-         cd libressl-${INSTALL_LIBRESSL} &&
-         ./configure --prefix=/opt/libressl && make && sudo make install)
+	LIBRESSL_URLBASE=https://cdn.openbsd.org/pub/OpenBSD/LibreSSL
+	(cd ${HOME} &&
+	 wget ${LIBRESSL_URLBASE}/libressl-${INSTALL_LIBRESSL}.tar.gz &&
+	 tar xfz libressl-${INSTALL_LIBRESSL}.tar.gz &&
+	 cd libressl-${INSTALL_LIBRESSL} &&
+	 ./configure --prefix=/opt/libressl && make && sudo make install)
     fi
 fi
 
@@ -272,26 +299,11 @@ if [ ! -z "${INSTALL_ZLIB}" ]; then
      sudo make install prefix=/opt/zlib)
 fi
 
+if [ ! -z "${INSTALL_DROPBEAR}" ]; then
+	.github/install_dropbear.sh "${INSTALL_DROPBEAR}"
+fi
 if [ ! -z "${INSTALL_PUTTY}" ]; then
 	.github/install_putty.sh "${INSTALL_PUTTY}"
-fi
-
-# If we're running on an ephemeral VM, set a random password and set
-# up to run the password auth test.
-if [ ! -z "${EPHEMERAL_VM}" ]; then
-
-    # This is the github "target" as specified in the yml file.
-    # In particular, ubuntu-latest sets the password field to the locked
-    # value, so unless we reset it here most of the tests will fail.
-    case "${target}" in
-    ubuntu-*)
-	echo ${target} target: setting random password.
-	openssl rand -base64 9 >regress/password
-	pw=$(tr -d '\n' <regress/password | openssl passwd -6 -stdin)
-	sudo usermod --password "${pw}" runner
-	sudo usermod --unlock runner
-	;;
-    esac
 fi
 
 # If we're running on an ephemeral VM, set a random password and set

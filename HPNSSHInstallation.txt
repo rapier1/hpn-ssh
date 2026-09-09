@@ -19,6 +19,13 @@ What you need to install is dependent on your distribution but will include:
 * OpenSSL development package
    * Debian: libssl-dev
    * Fedora: openssl-devel
+   * OpenSSL must be built with thread support. This is the default, so
+     packaged versions will work. If you build OpenSSL yourself, do not
+     pass "no-threads" to its config script. HPN-SSH uses threads for the
+     parallel ChaCha20 and AES-CTR ciphers, and without thread support in
+     OpenSSL sessions can abort with a memory error during transfers.
+     To check an installation you already have:
+        grep -r OPENSSL_THREADS <openssl-prefix>/include/openssl/
 * Alternatively you can use LIbreSSL
    * However, in this case we suggest compiling and installing libressl manually as
      there are few maintained linux packages for LibreSSL.
