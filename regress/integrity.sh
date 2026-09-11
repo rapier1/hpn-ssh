@@ -4,9 +4,9 @@
 tid="integrity"
 cp $OBJ/sshd_proxy $OBJ/sshd_proxy_bak
 
-# start at byte 3000 (i.e. after kex) and corrupt at different offsets
+# start at byte 4500 (i.e. after kex) and corrupt at different offsets
 tries=10
-startoffset=3000
+startoffset=3500
 macs=`${SSH} -Q mac`
 
 # The following are not MACs, but ciphers with integrated integrity. They are
