@@ -104,6 +104,7 @@ fips_enabled()
 		 * again fail to returning fips being disabled
 		 */
 		debug3_f("Error processing fips_enabled.");
+		fclose(fips_enabled);
 		return 0;
 	}
 
@@ -113,6 +114,7 @@ fips_enabled()
 	else
 		debug3_f("FIPS mode is enabled.");
 
+	fclose(fips_enabled);
 	return mode;
 }
 
