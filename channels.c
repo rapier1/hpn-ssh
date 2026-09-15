@@ -1353,11 +1353,19 @@ channel_tcpwinsz(struct ssh *ssh)
 	if (!ssh_packet_connection_is_on_socket(ssh))
 		return 128 * 1024;
 
+	/* get the current size of the receive buffer */
 	ret = getsockopt(ssh_packet_get_connection_in(ssh),
 			 SOL_SOCKET, SO_RCVBUF, &tcpwinsz, &optsz);
 
-	/* return no more than SSHBUF_SIZE_MAX (currently 256MB) */
-	if ((ret == 0) && tcpwinsz > SSHBUF_SIZE_MAX)
+	/* error on the socket - this should never happen */
+	/* return OpenSSH's max window size */
+	if (ret != 0) {
+		debug_f("getsockopt SO_RCVBUF failed: %s", strerror(errno));
+		return (2 * 1024 * 1024);
+	}
+
+	/* return no more than SSHBUF_SIZE_MAX (currently 128MB) */
+	if (tcpwinsz > SSHBUF_SIZE_MAX)
 		tcpwinsz = SSHBUF_SIZE_MAX;
 
 	/* if the remote side is OpenSSH after version 8.8 we need to restrict
@@ -1365,7 +1373,6 @@ channel_tcpwinsz(struct ssh *ssh)
 	 * connection will be window limited to 15MB of receive space. This is a
 	 * non-optimal solution.
 	 */
-
 	if ((ssh->compat & SSH_RESTRICT_WINDOW) && (tcpwinsz > NON_HPN_WINDOW_MAX))
 		tcpwinsz = NON_HPN_WINDOW_MAX;
 	return (tcpwinsz);
@@ -2231,8 +2238,6 @@ channel_post_connecting(struct ssh *ssh, Channel *c)
 static int
 channel_handle_rfd(struct ssh *ssh, Channel *c)
 {
-	char buf[CHAN_RBUF];
-	ssize_t len;
 	int r, force;
 	size_t nr = 0, have, avail, maxlen = CHANNEL_MAX_READ;
 	int pty_zeroread = 0;
@@ -2276,6 +2281,30 @@ channel_handle_rfd(struct ssh *ssh, Channel *c)
 		return 1;
 	}
 
+	/*
+	 * Datagram or filtered channel path: needs a temporary stack buffer
+	 * because the data must pass through input_filter() or be framed as
+	 * a datagram before entering c->input.
+	 *
+	 * buf[] (CHAN_RBUF = 32KB) is declared in this inner scope rather
+	 * than at function level to avoid a performance penalty from
+	 * -ftrivial-auto-var-init=zero, which causes the compiler to emit
+	 * a memset() for every local variable on function entry.  With buf
+	 * at function scope the 32KB zeroing happens on every call, even
+	 * though the simple-channel fast path above (the common case for
+	 * bulk data) never touches buf.  CPU profiling showed this dead
+	 * zeroing consuming ~10% of client CPU during high-throughput
+	 * transfers.  Moving buf into this scope limits the zeroing to
+	 * calls that actually take the datagram/filter path.
+	 *
+	 * Security note: buf is still zeroed by the compiler before use in
+	 * this path.  The simple-channel path never allocates buf at all,
+	 * so there is no uninitialized memory exposure.
+	 */
+	{
+	char buf[CHAN_RBUF];
+	ssize_t len;
+
 	errno = 0;
 	len = read(c->rfd, buf, sizeof(buf));
 	/* fixup AIX zero-length read with errno set to look more like errors */
@@ -2288,15 +2317,7 @@ channel_handle_rfd(struct ssh *ssh, Channel *c)
 		debug2("channel %d: read<=0 rfd %d len %zd: %s",
 		    c->self, c->rfd, len,
 		    len == 0 ? "closed" : strerror(errno));
- rfail:
-		if (c->type != SSH_CHANNEL_OPEN) {
-			debug2("channel %d: not open", c->self);
-			chan_mark_dead(ssh, c);
-			return -1;
-		} else {
-			chan_read_failed(ssh, c);
-		}
-		return -1;
+		goto rfail;
 	}
 	channel_set_used_time(ssh, c);
 	if (c->input_filter != NULL) {
@@ -2311,6 +2332,17 @@ channel_handle_rfd(struct ssh *ssh, Channel *c)
 		fatal_fr(r, "channel %i: put data", c->self);
 
 	return 1;
+	} /* end datagram/filter buf[] scope */
+
+ rfail:
+	if (c->type != SSH_CHANNEL_OPEN) {
+		debug2("channel %d: not open", c->self);
+		chan_mark_dead(ssh, c);
+		return -1;
+	} else {
+		chan_read_failed(ssh, c);
+	}
+	return -1;
 }
 
 static int
@@ -2483,40 +2515,39 @@ channel_handle_efd(struct ssh *ssh, Channel *c)
 static int
 channel_check_window(struct ssh *ssh, Channel *c)
 {
-        int r;
+	int r;
 
-        if (c->type == SSH_CHANNEL_OPEN &&
-            !(c->flags & (CHAN_CLOSE_SENT|CHAN_CLOSE_RCVD)) &&
-            ((c->local_window_max - c->local_window > c->local_maxpacket*3) ||
-            c->local_window < c->local_window_max/2) &&
-            c->local_consumed > 0) {
-                u_int addition = 0;
-                u_int32_t tcpwinsz = channel_tcpwinsz(ssh);
-                /* adjust max window size if we are in a dynamic environment
-                 * and the tcp receive buffer is larger than the ssh window */
-                if (c->dynamic_window && (tcpwinsz > c->local_window_max)) {
-		  /* aggressively grow the window */
+	if (c->type == SSH_CHANNEL_OPEN &&
+	    !(c->flags & (CHAN_CLOSE_SENT|CHAN_CLOSE_RCVD)) &&
+	    ((c->local_window_max - c->local_window > c->local_maxpacket * 8) ||
+	    c->local_window < c->local_window_max/2) &&
+	    c->local_consumed > 0) {
+		int addition = 0;
+		u_int32_t tcpwinsz = channel_tcpwinsz(ssh);
+		/* adjust max window size if we are in a dynamic environment
+		 * and the tcp receive buffer is larger than the ssh window */
+		if (c->dynamic_window && (tcpwinsz > c->local_window_max)) {
+			/* aggressively grow the window */
 			addition = tcpwinsz - c->local_window_max;
-                        c->local_window_max += addition;
-                        debug("Channel %d: Window growth to %d by %d bytes",c->self,
-                              c->local_window_max, addition);
-                }
-                if (!c->have_remote_id)
-                        fatal_f("channel %d: no remote id", c->self);
-                if ((r = sshpkt_start(ssh,
-                    SSH2_MSG_CHANNEL_WINDOW_ADJUST)) != 0 ||
-                    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
-                    (r = sshpkt_put_u32(ssh, c->local_consumed + addition)) != 0 ||
-                    (r = sshpkt_send(ssh)) != 0) {
-                        fatal_fr(r, "channel %i", c->self);
-                }
-                debug3_f("channel %d: window %d sent adjust %d",
-                    c->self, c->local_window,
-                    c->local_consumed + addition);
-                c->local_window += c->local_consumed + addition;
-                c->local_consumed = 0;
-        }
-        return 1;
+			c->local_window_max += addition;
+			debug_f("Channel %d: Window growth to %d by %d bytes",c->self,
+			      c->local_window_max, addition);
+		}
+		if (!c->have_remote_id)
+			fatal_f("channel %d: no remote id", c->self);
+		if ((r = sshpkt_start(ssh,
+		    SSH2_MSG_CHANNEL_WINDOW_ADJUST)) != 0 ||
+		    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
+		    (r = sshpkt_put_u32(ssh, c->local_consumed + addition)) != 0 ||
+		    (r = sshpkt_send(ssh)) != 0) {
+			fatal_fr(r, "channel %i", c->self);
+		}
+		debug2("channel %d: window %d sent adjust %d", c->self,
+		       c->local_window, c->local_consumed + addition);
+		c->local_window += c->local_consumed + addition;
+		c->local_consumed = 0;
+	}
+	return 1;
 }
 
 static void

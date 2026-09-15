@@ -28,7 +28,9 @@
 #include <sys/types.h>
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdarg.h>
 
 #include "xmalloc.h"
@@ -131,12 +133,23 @@ compat_banner(struct ssh *ssh, const char *version)
 			debug_f("match: %s pat %s compat 0x%08x",
 			    version, check[i].pat, check[i].bugs);
 			ssh->compat = check[i].bugs;
-			/* Check to see if the remote side is OpenSSH and not HPN */
-			/* TODO: update to new matching process */
-			if ((strstr(version, "OpenSSH_8.9") != NULL) ||
-			    (strstr(version, "OpenSSH_9") != NULL)) {
-				ssh->compat |= SSH_RESTRICT_WINDOW;
-				debug("Restricting advertised window size.");
+			/*
+			 * Restrict the advertised window for OpenSSH 8.9 and
+			 * later unless the peer is HPN-SSH or a DynamicWindow
+			 * build. Those carry the buffer changes that avoid
+			 * the large-window pathology the cap works around.
+			 */
+			if (strstr(version, "hpn") == NULL &&
+			    strstr(version, "DynWin") == NULL) {
+				const char *op;
+				int omaj = 0, omin = 0;
+
+				if ((op = strstr(version, "OpenSSH_")) != NULL &&
+				    sscanf(op, "OpenSSH_%d.%d", &omaj, &omin) == 2 &&
+				    (omaj >= 9 || (omaj == 8 && omin >= 9))) {
+					ssh->compat |= SSH_RESTRICT_WINDOW;
+					debug("Restricting advertised window size.");
+				}
 			}
 			return;
 		}

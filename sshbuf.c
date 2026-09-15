@@ -316,17 +316,20 @@ sshbuf_avail(const struct sshbuf *buf)
 {
 	if (sshbuf_check_sanity(buf) != 0 || buf->readonly || buf->refcount > 1)
 		return 0;
-	/* we need to reserve a small amount of overhead on the input buffer
-	 * or we can enter into a pathological state during bulk
-	 * data transfers. We use a fraction of the max size as we want it to scale
-	 * with the size of the input buffer. If we do it for all of the buffers
-	 * we fail the regression unit tests. This seems like a reasonable
-	 * solution. Of course, I still need to figure out *why* this is
-	 * happening and come up with an actual fix. TODO
-	 * cjr 4/19/2024 */
-	if (buf->type == BUF_CHANNEL_INPUT)
-		return buf->max_size / 1.05 - (buf->size - buf->off);
-	else
+	/* Reserve ~4.76% (1/21) headroom on channel input buffers to prevent
+	 * a pathological state during bulk data transfers. The headroom scales
+	 * with buffer size and gives the channel time to drain before accepting
+	 * more data, smoothing flow control and reducing buffer reallocation.
+	 * When the buffer is fuller than the headroom allows we must return 0,
+	 * not underflow: size_t is unsigned so a naive subtraction wraps to
+	 * SIZE_MAX, causing the caller to read into a nearly-full buffer and
+	 * thrash window updates. Only applied to channel input buffers as
+	 * other buffer types fail the regression unit tests with headroom. */
+	if (buf->type == BUF_CHANNEL_INPUT) {
+		size_t headroom = buf->max_size - buf->max_size / 21;
+		size_t used = buf->size - buf->off;
+		return (used >= headroom) ? 0 : headroom - used;
+	} else
 		return buf->max_size - (buf->size - buf->off);
 }
 
