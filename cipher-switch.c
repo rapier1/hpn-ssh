@@ -59,6 +59,10 @@ cipher_switch(struct ssh *ssh) {
 	if (strstr(send, "ctr") || strstr(recv, "ctr")) {
 		debug("Serial to parallel AES-CTR cipher swap");
 		/* cipher_reset_multithreaded(); */
+		/* mark MT active so the promotion in ssh_set_newkeys only
+		 * happens when we deliberately switched here. Without this a
+		 * later rekey would promote to MT even under DisableMTAES. */
+		ssh->mt_enabled = 1;
 		ssh_packet_set_authenticated(ssh);
 		packet_request_rekeying();
 	}
