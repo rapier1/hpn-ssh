@@ -1,4 +1,4 @@
-/* $OpenBSD: monitor_wrap.c,v 1.142 2025/09/25 06:31:42 djm Exp $ */
+/* $OpenBSD: monitor_wrap.c,v 1.148 2026/07/21 06:17:42 djm Exp $ */
 /*
  * Copyright 2002 Niels Provos <provos@citi.umich.edu>
  * Copyright 2002 Markus Friedl <markus@openbsd.org>
@@ -29,6 +29,7 @@
 
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/queue.h>
 #include <sys/wait.h>
 
 #include <errno.h>
@@ -45,7 +46,6 @@
 #include <openssl/evp.h>
 #endif
 
-#include "openbsd-compat/sys-queue.h"
 #include "xmalloc.h"
 #include "ssh.h"
 #ifdef WITH_OPENSSL
@@ -106,8 +106,13 @@ mm_log_handler(LogLevel level, int forced, const char *msg, void *ctx)
 		fatal_f("bad length %zu", len);
 	POKE_U32(sshbuf_mutable_ptr(log_msg), len - 4);
 	if (atomicio(vwrite, mon->m_log_sendfd,
-	    sshbuf_mutable_ptr(log_msg), len) != len)
+	    sshbuf_mutable_ptr(log_msg), len) != len) {
+		if (errno == EPIPE) {
+			debug_f("write: %s", strerror(errno));
+			cleanup_exit(255);
+		}
 		fatal_f("write: %s", strerror(errno));
+	}
 	sshbuf_free(log_msg);
 }
 
@@ -249,6 +254,21 @@ mm_choose_dh(int min, int nbits, int max)
 }
 #endif
 
+void
+mm_sshkey_setcompat(struct ssh *ssh)
+{
+	struct sshbuf *m;
+	int r;
+
+	debug3_f("entering");
+	if ((m = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u32(m, ssh->compat)) != 0)
+		fatal_fr(r, "assemble");
+
+	mm_request_send(pmonitor->m_recvfd, MONITOR_REQ_SETCOMPAT, m);
+}
+
 int
 mm_sshkey_sign(struct ssh *ssh, struct sshkey *key, u_char **sigp, size_t *lenp,
     const u_char *data, size_t datalen, const char *hostkey_alg,
@@ -282,55 +302,20 @@ mm_sshkey_sign(struct ssh *ssh, struct sshkey *key, u_char **sigp, size_t *lenp,
 void
 mm_decode_activate_server_options(struct ssh *ssh, struct sshbuf *m)
 {
-	const u_char *p;
-	size_t len;
-	u_int i;
-	ServerOptions *newopts;
+	struct sshbuf *config;
 	int r;
+	u_int i;
 
-	if ((r = sshbuf_get_string_direct(m, &p, &len)) != 0)
+	if ((r = sshbuf_froms(m, &config)) != 0)
 		fatal_fr(r, "parse opts");
-	if (len != sizeof(*newopts))
-		fatal_f("option block size mismatch");
-	newopts = xcalloc(sizeof(*newopts), 1);
-	memcpy(newopts, p, sizeof(*newopts));
+	if ((r = deserialise_server_options(config, &options)) != 0)
+		fatal_fr(r, "deserialise_server_options");
+	sshbuf_free(config);
 
-#define M_CP_STROPT(x) do { \
-		if (newopts->x != NULL && \
-		    (r = sshbuf_get_cstring(m, &newopts->x, NULL)) != 0) \
-			fatal_fr(r, "parse %s", #x); \
-	} while (0)
-#define M_CP_STRARRAYOPT(x, nx) do { \
-		newopts->x = newopts->nx == 0 ? \
-		    NULL : xcalloc(newopts->nx, sizeof(*newopts->x)); \
-		for (i = 0; i < newopts->nx; i++) { \
-			if ((r = sshbuf_get_cstring(m, \
-			    &newopts->x[i], NULL)) != 0) \
-				fatal_fr(r, "parse %s", #x); \
-		} \
-	} while (0)
-	/* See comment in servconf.h */
-	COPY_MATCH_STRING_OPTS();
-#undef M_CP_STROPT
-#undef M_CP_STRARRAYOPT
-
-	copy_set_server_options(&options, newopts, 1);
 	log_change_level(options.log_level);
 	log_verbose_reset();
 	for (i = 0; i < options.num_log_verbose; i++)
 		log_verbose_add(options.log_verbose[i]);
-
-	/* use the macro hell to clean up too */
-#define M_CP_STROPT(x) free(newopts->x)
-#define M_CP_STRARRAYOPT(x, nx) do { \
-		for (i = 0; i < newopts->nx; i++) \
-			free(newopts->x[i]); \
-		free(newopts->x); \
-	} while (0)
-	COPY_MATCH_STRING_OPTS();
-#undef M_CP_STROPT
-#undef M_CP_STRARRAYOPT
-	free(newopts);
 }
 
 #define GETPW(b, id) \
@@ -399,6 +384,8 @@ out:
 	server_process_permitopen(ssh);
 	server_process_channel_timeouts(ssh);
 	kex_set_server_sig_algs(ssh, options.pubkey_accepted_algos);
+	ssh_packet_set_rekey_limits(ssh, options.rekey_limit,
+	    options.rekey_interval);
 	sshbuf_free(m);
 
 	return (pw);
@@ -865,22 +852,19 @@ mm_terminate(void)
 /* Request state information */
 
 void
-mm_get_state(struct ssh *ssh, struct include_list *includes,
-    struct sshbuf *conf, struct sshbuf **confdatap,
+mm_get_state(struct ssh *ssh,
+    ServerOptions *opts, struct sshbuf **confdatap,
     uint64_t *timing_secretp,
     struct sshbuf **hostkeysp, struct sshbuf **keystatep,
     u_char **pw_namep,
     struct sshbuf **authinfop, struct sshbuf **auth_optsp)
 {
-	struct sshbuf *m, *inc;
-	u_char *cp;
-	size_t len;
+	struct sshbuf *m, *config;
 	int r;
-	struct include_item *item;
 
 	debug3_f("entering");
 
-	if ((m = sshbuf_new()) == NULL || (inc = sshbuf_new()) == NULL)
+	if ((m = sshbuf_new()) == NULL || (config = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 
 	mm_request_send(pmonitor->m_recvfd, MONITOR_REQ_STATE, m);
@@ -889,12 +873,11 @@ mm_get_state(struct ssh *ssh, struct include_list *includes,
 	mm_request_receive_expect(pmonitor->m_recvfd,
 	    MONITOR_ANS_STATE, m);
 
-	if ((r = sshbuf_get_string(m, &cp, &len)) != 0 ||
+	if ((r = sshbuf_froms(m, &config)) != 0 ||
 	    (r = sshbuf_get_u64(m, timing_secretp)) != 0 ||
 	    (r = sshbuf_froms(m, hostkeysp)) != 0 ||
 	    (r = sshbuf_get_stringb(m, ssh->kex->server_version)) != 0 ||
-	    (r = sshbuf_get_stringb(m, ssh->kex->client_version)) != 0 ||
-	    (r = sshbuf_get_stringb(m, inc)) != 0)
+	    (r = sshbuf_get_stringb(m, ssh->kex->client_version)) != 0)
 		fatal_fr(r, "parse config");
 
 	/* postauth */
@@ -906,24 +889,11 @@ mm_get_state(struct ssh *ssh, struct include_list *includes,
 		    (r = sshbuf_froms(m, auth_optsp)) != 0)
 			fatal_fr(r, "parse config postauth");
 	}
+	if ((r = deserialise_server_options(config, opts)) != 0)
+		fatal_fr(r, "deserialise_server_options");
 
-	if (conf != NULL && (r = sshbuf_put(conf, cp, len)))
-		fatal_fr(r, "sshbuf_put");
-
-	while (sshbuf_len(inc) != 0) {
-		item = xcalloc(1, sizeof(*item));
-		if ((item->contents = sshbuf_new()) == NULL)
-			fatal_f("sshbuf_new failed");
-		if ((r = sshbuf_get_cstring(inc, &item->selector, NULL)) != 0 ||
-		    (r = sshbuf_get_cstring(inc, &item->filename, NULL)) != 0 ||
-		    (r = sshbuf_get_stringb(inc, item->contents)) != 0)
-			fatal_fr(r, "parse includes");
-		TAILQ_INSERT_TAIL(includes, item, entry);
-	}
-
-	free(cp);
 	sshbuf_free(m);
-	sshbuf_free(inc);
+	sshbuf_free(config);
 
 	debug3_f("done");
 }

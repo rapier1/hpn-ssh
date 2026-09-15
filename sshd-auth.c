@@ -1,4 +1,4 @@
-/* $OpenBSD: sshd-auth.c,v 1.9 2025/09/15 04:52:12 djm Exp $ */
+/* $OpenBSD: sshd-auth.c,v 1.18 2026/07/27 12:28:52 markus Exp $ */
 /*
  * SSH2 implementation:
  * Privilege Separation:
@@ -32,12 +32,11 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/tree.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-
-#include "openbsd-compat/sys-tree.h"
-#include "openbsd-compat/sys-queue.h"
+#include <sys/queue.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -250,6 +249,7 @@ list_hostkey_types(void)
 			/* FALLTHROUGH */
 		case KEY_ECDSA:
 		case KEY_ED25519:
+		case KEY_MLDSA44_ED25519:
 		case KEY_ECDSA_SK:
 		case KEY_ED25519_SK:
 			append_hostkey_type(b, sshkey_ssh_name(key));
@@ -269,6 +269,7 @@ list_hostkey_types(void)
 			/* FALLTHROUGH */
 		case KEY_ECDSA_CERT:
 		case KEY_ED25519_CERT:
+		case KEY_MLDSA44_ED25519_CERT:
 		case KEY_ECDSA_SK_CERT:
 		case KEY_ED25519_SK_CERT:
 			append_hostkey_type(b, sshkey_ssh_name(key));
@@ -293,6 +294,7 @@ get_hostkey_public_by_type(int type, int nid, struct ssh *ssh)
 		case KEY_RSA_CERT:
 		case KEY_ECDSA_CERT:
 		case KEY_ED25519_CERT:
+		case KEY_MLDSA44_ED25519_CERT:
 		case KEY_ECDSA_SK_CERT:
 		case KEY_ED25519_SK_CERT:
 			key = host_certificates[i];
@@ -413,14 +415,13 @@ parse_hostkeys(struct sshbuf *hostkeys)
 }
 
 static void
-recv_privsep_state(struct ssh *ssh, struct sshbuf *conf,
-    uint64_t *timing_secretp)
+recv_privsep_state(struct ssh *ssh, ServerOptions *o, uint64_t *timing_secretp)
 {
 	struct sshbuf *hostkeys;
 
 	debug3_f("begin");
 
-	mm_get_state(ssh, &includes, conf, NULL, timing_secretp,
+	mm_get_state(ssh, o, NULL, timing_secretp,
 	    &hostkeys, NULL, NULL, NULL, NULL);
 	parse_hostkeys(hostkeys);
 
@@ -440,11 +441,9 @@ main(int ac, char **av)
 	extern int optind;
 	int r, opt, have_key = 0;
 	int sock_in = -1, sock_out = -1, rexeced_flag = 0;
-	char *line;
 	u_int i;
 	mode_t new_umask;
 	Authctxt *authctxt;
-	struct connection_info *connection_info = NULL;
 	sigset_t sigmask;
 	uint64_t timing_secret = 0;
 
@@ -483,17 +482,16 @@ main(int ac, char **av)
 	    "C:E:b:c:f:g:h:k:o:p:u:46DGQRTdeiqrtV")) != -1) {
 		switch (opt) {
 		case '4':
-			options.address_family = AF_INET;
+			/* ignore */
 			break;
 		case '6':
-			options.address_family = AF_INET6;
+			/* ignore */
 			break;
 		case 'f':
-			config_file_name = optarg;
+			/* ignore */
 			break;
 		case 'c':
-			servconf_add_hostcert("[command-line]", 0,
-			    &options, optarg);
+			/* ignore */
 			break;
 		case 'd':
 			if (debug_flag == 0) {
@@ -520,46 +518,28 @@ main(int ac, char **av)
 			/* ignored */
 			break;
 		case 'q':
-			options.log_level = SYSLOG_LEVEL_QUIET;
+			/* ignored */
 			break;
 		case 'b':
 			/* protocol 1, ignored */
 			break;
 		case 'p':
-			options.ports_from_cmdline = 1;
-			if (options.num_ports >= MAX_PORTS) {
-				fprintf(stderr, "too many ports.\n");
-				exit(1);
-			}
-			options.ports[options.num_ports++] = a2port(optarg);
-			if (options.ports[options.num_ports-1] <= 0) {
-				fprintf(stderr, "Bad port number.\n");
-				exit(1);
-			}
+			/* ignored */
 			break;
 		case 'g':
-			if ((options.login_grace_time = convtime(optarg)) == -1) {
-				fprintf(stderr, "Invalid login grace time.\n");
-				exit(1);
-			}
+			/* ignored */
 			break;
 		case 'k':
 			/* protocol 1, ignored */
 			break;
 		case 'h':
-			servconf_add_hostkey("[command-line]", 0,
-			    &options, optarg, 1);
+			/* ignored */
 			break;
 		case 't':
 		case 'T':
 		case 'G':
-			fatal("test/dump modes not supported");
-			break;
 		case 'C':
-			connection_info = server_get_connection_info(ssh, 0, 0);
-			if (parse_server_match_testspec(connection_info,
-			    optarg) == -1)
-				exit(1);
+			fatal("test/dump modes not supported");
 			break;
 		case 'u':
 			utmp_len = (u_int)strtonum(optarg, 0, HOST_NAME_MAX+1+1, NULL);
@@ -569,11 +549,7 @@ main(int ac, char **av)
 			}
 			break;
 		case 'o':
-			line = xstrdup(optarg);
-			if (process_server_config_line(&options, line,
-			    "command-line", 0, NULL, NULL, &includes) != 0)
-				exit(1);
-			free(line);
+			/* ignored */
 			break;
 		case 'V':
 			fprintf(stderr, "%s, %s\n",
@@ -587,10 +563,6 @@ main(int ac, char **av)
 
 	if (!rexeced_flag)
 		fatal("sshd-auth should not be executed directly");
-
-#ifdef WITH_OPENSSL
-	OpenSSL_add_all_algorithms();
-#endif
 
 	log_init(__progname,
 	    options.log_level == SYSLOG_LEVEL_NOT_SET ?
@@ -642,10 +614,7 @@ main(int ac, char **av)
 	if ((cfg = sshbuf_new()) == NULL)
 		fatal("sshbuf_new config buf failed");
 	setproctitle("%s", "[session-auth early]");
-	recv_privsep_state(ssh, cfg, &timing_secret);
-	parse_server_config(&options, "rexec", cfg, &includes, NULL, 1);
-	/* Fill in default values for those options not explicitly set. */
-	fill_default_server_options(&options);
+	recv_privsep_state(ssh, &options, &timing_secret);
 	options.timing_secret = timing_secret; /* XXX eliminate from unpriv */
 	ssh_packet_set_qos(ssh, options.ip_qos_interactive,
 	    options.ip_qos_bulk);
@@ -720,8 +689,8 @@ main(int ac, char **av)
 	setproctitle("%s", "[session-auth]");
 
 	/* Executed child processes don't need these. */
-	fcntl(sock_out, F_SETFD, FD_CLOEXEC);
-	fcntl(sock_in, F_SETFD, FD_CLOEXEC);
+	FD_CLOSEONEXEC(sock_out);
+	FD_CLOSEONEXEC(sock_in);
 
 	ssh_signal(SIGPIPE, SIG_IGN);
 	ssh_signal(SIGALRM, SIG_DFL);
@@ -753,9 +722,6 @@ main(int ac, char **av)
 	if ((loginmsg = sshbuf_new()) == NULL)
 		fatal("sshbuf_new loginmsg failed");
 	auth_debug_reset();
-
-	/* Enable challenge-response authentication for privilege separation */
-	privsep_challenge_enable();
 
 #ifdef GSSAPI
 	/* Cache supported mechanism OIDs for later use */
@@ -806,9 +772,8 @@ do_ssh2_kex(struct ssh *ssh)
 	struct kex *kex;
 	int r;
 
-	if (options.rekey_limit || options.rekey_interval)
-		ssh_packet_set_rekey_limits(ssh, options.rekey_limit,
-		    options.rekey_interval);
+	ssh_packet_set_rekey_limits(ssh, options.rekey_limit,
+	    options.rekey_interval);
 
 	if (options.compression == COMP_NONE)
 		compression = "none";
@@ -818,6 +783,14 @@ do_ssh2_kex(struct ssh *ssh)
 	    options.ciphers, options.macs, compression, hkalgs);
 
 	free(hkalgs);
+
+	if ((r = kex_exchange_identification(ssh, -1,
+	    options.version_addendum)) != 0)
+		sshpkt_fatal(ssh, r, "banner exchange");
+	mm_sshkey_setcompat(ssh); /* tell monitor */
+
+	if ((ssh->compat & SSH_BUG_NOREKEY))
+		debug("client does not support rekeying");
 
 	/* start key exchange */
 	if ((r = kex_setup(ssh, myproposal)) != 0)
@@ -833,10 +806,9 @@ do_ssh2_kex(struct ssh *ssh)
 	kex->kex[KEX_DH_GRP18_SHA512] = kex_gen_server;
 	kex->kex[KEX_DH_GEX_SHA1] = kexgex_server;
 	kex->kex[KEX_DH_GEX_SHA256] = kexgex_server;
-# ifdef OPENSSL_HAS_ECC
 	kex->kex[KEX_ECDH_SHA2] = kex_gen_server;
-# endif /* OPENSSL_HAS_ECC */
-#endif /* WITH_OPENSSL */
+	kex->kex[KEX_KEM_MLKEM768ECDH_SHA256] = kex_gen_server;
+#endif
 	kex->kex[KEX_C25519_SHA256] = kex_gen_server;
 	kex->kex[KEX_KEM_SNTRUP761X25519_SHA512] = kex_gen_server;
 	kex->kex[KEX_KEM_MLKEM768X25519_SHA256] = kex_gen_server;

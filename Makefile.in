@@ -102,19 +102,20 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
 	smult_curve25519_ref.o \
 	poly1305.o chacha.o cipher-chachapoly.o cipher-chachapoly-libcrypto.o \
 	ssh-ed25519.o digest-openssl.o digest-libc.o \
-	hmac.o ed25519.o hash.o \
+	libcrux-mlkem-mldsa.o ssh-mldsa-eddsa.o \
+	hmac.o ed25519.o ed25519-openssl.o \
 	kex.o kex-names.o kexdh.o kexgex.o kexecdh.o kexc25519.o \
-	kexgexc.o kexgexs.o \
+	kexgexc.o kexgexs.o kexmlkem768ecdh.o \
 	kexsntrup761x25519.o kexmlkem768x25519.o sntrup761.o kexgen.o \
 	sftp-realpath.o platform-pledge.o platform-tracing.o platform-misc.o \
-	sshbuf-io.o misc-agent.o
+	sshbuf-io.o misc-agent.o ssherr-libcrypto.o
 
 P11OBJS= ssh-pkcs11-client.o
 
 SKOBJS=	ssh-sk-client.o
 
 SSHOBJS= ssh.o readconf.o clientloop.o sshtty.o \
-	sshconnect.o sshconnect2.o mux.o $(P11OBJS) $(SKOBJS)
+	sshconnect.o sshconnect2.o mux.o ssh-pkcs11.o $(SKOBJS)
 
 SSHDOBJS=sshd.o \
 	platform-listen.o \
@@ -150,7 +151,7 @@ SSHD_AUTH_OBJS=sshd-auth.o \
 	sftp-server.o sftp-common.o \
 	uidswap.o $(P11OBJS) $(SKOBJS)
 
-SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-glob.o
+SFTP_CLIENT_OBJS=sftp-common.o sftp-client.o sftp-glob.o ssherr-nolibcrypto.o
 
 SCP_OBJS=	scp.o progressmeter.o $(SFTP_CLIENT_OBJS)
 
@@ -164,11 +165,11 @@ SSHKEYSIGN_OBJS=ssh-keysign.o readconf.o uidswap.o $(P11OBJS) $(SKOBJS)
 
 P11HELPER_OBJS=	ssh-pkcs11-helper.o ssh-pkcs11.o $(SKOBJS)
 
-SKHELPER_OBJS=	ssh-sk-helper.o ssh-sk.o sk-usbhid.o
+SKHELPER_OBJS=	ssh-sk-helper.o ssh-sk.o sk-usbhid.o ssherr-nolibcrypto.o
 
 SSHKEYSCAN_OBJS=ssh-keyscan.o $(P11OBJS) $(SKOBJS)
 
-SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-server-main.o
+SFTPSERVER_OBJS=sftp-common.o sftp-server.o sftp-server-main.o ssherr-nolibcrypto.o
 
 SFTP_OBJS=	sftp.o sftp-usergroup.o progressmeter.o $(SFTP_CLIENT_OBJS)
 
@@ -315,8 +316,12 @@ clean:	regressclean
 	rm -f regress/unittests/kex/test_kex$(EXEEXT)
 	rm -f regress/unittests/match/*.o
 	rm -f regress/unittests/match/test_match$(EXEEXT)
+	rm -f regress/unittests/crypto/*.o
+	rm -f regress/unittests/crypto/test_crypto$(EXEEXT)
 	rm -f regress/unittests/misc/*.o
 	rm -f regress/unittests/misc/test_misc$(EXEEXT)
+	rm -f regress/unittests/servconf/*.o
+	rm -f regress/unittests/servconf/test_servconf$(EXEEXT)
 	rm -f regress/unittests/sshbuf/*.o
 	rm -f regress/unittests/sshbuf/test_sshbuf$(EXEEXT)
 	rm -f regress/unittests/sshkey/*.o
@@ -376,6 +381,7 @@ distclean:	regressclean
 	rm -f *.out core opensshd.init openssh.xml
 	rm -f Makefile buildpkg.sh config.h config.status
 	rm -f survey.sh openbsd-compat/regress/Makefile *~ 
+	rm -rf openbsd-compat/include
 	rm -rf autom4te.cache
 	rm -f regress/check-perm
 	rm -f regress/mkdtemp
@@ -393,8 +399,12 @@ distclean:	regressclean
 	rm -f regress/unittests/kex/test_kex
 	rm -f regress/unittests/match/*.o
 	rm -f regress/unittests/match/test_match
+	rm -f regress/unittests/crypto/*.o
+	rm -f regress/unittests/crypto/test_crypto
 	rm -f regress/unittests/misc/*.o
 	rm -f regress/unittests/misc/test_misc
+	rm -f regress/unittests/servconf/*.o
+	rm -f regress/unittests/servconf/test_servconf
 	rm -f regress/unittests/sshbuf/*.o
 	rm -f regress/unittests/sshbuf/test_sshbuf
 	rm -f regress/unittests/sshkey/*.o
@@ -577,7 +587,9 @@ regress-prep:
 	$(MKDIR_P) `pwd`/regress/unittests/hostkeys
 	$(MKDIR_P) `pwd`/regress/unittests/kex
 	$(MKDIR_P) `pwd`/regress/unittests/match
+	$(MKDIR_P) `pwd`/regress/unittests/crypto
 	$(MKDIR_P) `pwd`/regress/unittests/misc
+	$(MKDIR_P) `pwd`/regress/unittests/servconf
 	$(MKDIR_P) `pwd`/regress/unittests/sshbuf
 	$(MKDIR_P) `pwd`/regress/unittests/sshkey
 	$(MKDIR_P) `pwd`/regress/unittests/sshsig
@@ -728,6 +740,21 @@ regress/unittests/match/test_match$(EXEEXT): \
 	    regress/unittests/test_helper/libtest_helper.a \
 	    -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(TESTLIBS)
 
+UNITTESTS_TEST_CRYPTO_OBJS=\
+	regress/unittests/crypto/test_ed25519.o \
+	regress/unittests/crypto/test_mldsa.o \
+	regress/unittests/crypto/test_mldsa_eddsa.o \
+	regress/unittests/crypto/test_mlkem.o \
+	regress/unittests/crypto/tests.o \
+	$(P11OBJS) $(SKOBJS)
+
+regress/unittests/crypto/test_crypto$(EXEEXT): \
+    ${UNITTESTS_TEST_CRYPTO_OBJS} \
+    regress/unittests/test_helper/libtest_helper.a libssh.a
+	$(LD) -o $@ $(LDFLAGS) $(UNITTESTS_TEST_CRYPTO_OBJS) \
+	    regress/unittests/test_helper/libtest_helper.a \
+	    -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(TESTLIBS)
+
 UNITTESTS_TEST_MISC_OBJS=\
 	regress/unittests/misc/tests.o \
 	regress/unittests/misc/test_parse.o \
@@ -747,6 +774,19 @@ regress/unittests/misc/test_misc$(EXEEXT): \
 	    regress/unittests/test_helper/libtest_helper.a \
 	    -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(TESTLIBS)
 
+UNITTESTS_TEST_SERVCONF_OBJS=\
+	regress/unittests/servconf/tests.o \
+	servconf.o \
+	groupaccess.o \
+	$(P11OBJS) $(SKOBJS)
+
+regress/unittests/servconf/test_servconf$(EXEEXT): \
+    ${UNITTESTS_TEST_SERVCONF_OBJS} \
+    regress/unittests/test_helper/libtest_helper.a libssh.a
+	$(LD) -o $@ $(LDFLAGS) $(UNITTESTS_TEST_SERVCONF_OBJS) \
+	    regress/unittests/test_helper/libtest_helper.a \
+	    -lssh -lopenbsd-compat -lssh -lopenbsd-compat $(TESTLIBS)
+
 UNITTESTS_TEST_UTF8_OBJS=\
 	regress/unittests/utf8/tests.o
 
@@ -761,7 +801,7 @@ regress/unittests/utf8/test_utf8$(EXEEXT): \
 SK_DUMMY_OBJS=\
 	regress/misc/sk-dummy/sk-dummy.lo \
 	regress/misc/sk-dummy/fatal.lo \
-	ed25519.lo hash.lo
+	ed25519.lo ed25519-openssl.lo
 
 SK_DUMMY_LIBRARY=@SK_DUMMY_LIBRARY@
 
@@ -798,7 +838,9 @@ regress-unit-binaries: regress-prep $(REGRESSLIBS) \
 	regress/unittests/hostkeys/test_hostkeys$(EXEEXT) \
 	regress/unittests/kex/test_kex$(EXEEXT) \
 	regress/unittests/match/test_match$(EXEEXT) \
+	regress/unittests/crypto/test_crypto$(EXEEXT) \
 	regress/unittests/misc/test_misc$(EXEEXT) \
+	regress/unittests/servconf/test_servconf$(EXEEXT) \
 	regress/unittests/sshbuf/test_sshbuf$(EXEEXT) \
 	regress/unittests/sshkey/test_sshkey$(EXEEXT) \
 	regress/unittests/sshsig/test_sshsig$(EXEEXT) \
@@ -826,6 +868,7 @@ TEST_SSH_SSHD="$(BUILDDIR)/sshd"
 
 interop-tests t-exec file-tests extra-tests: regress-prep regress-binaries $(TARGETS)
 	cd $(srcdir)/regress || exit $$?; \
+	AWK='@AWK@' \
 	EGREP='@EGREP@' \
 	OPENSSL_BIN='@OPENSSL_BIN@' \
 	$(MAKE) \
@@ -858,6 +901,7 @@ interop-tests t-exec file-tests extra-tests: regress-prep regress-binaries $(TAR
 		TEST_SSH_DROPBEARKEY="@DROPBEARKEY@" \
 		TEST_SSH_DROPBEARCONVERT="@DROPBEARCONVERT@" \
 		TEST_SSH_DBCLIENT="@DBCLIENT@" \
+		TEST_SSH_TMUX="@TMUX@" \
 		TEST_SSH_IPV6="@TEST_SSH_IPV6@" \
 		TEST_SSH_UTF8="@TEST_SSH_UTF8@" \
 		TEST_SHELL="$(TEST_SHELL)" \

@@ -1,4 +1,4 @@
-/* 	$OpenBSD: test_sshbuf_getput_crypto.c,v 1.4 2025/05/12 05:42:02 tb Exp $ */
+/* 	$OpenBSD: test_sshbuf_getput_crypto.c,v 1.5 2026/03/06 06:57:33 dtucker Exp $ */
 /*
  * Regress test for sshbuf.h buffer API
  *
@@ -16,10 +16,8 @@
 #include <string.h>
 
 #include <openssl/bn.h>
+#include <openssl/ec.h>
 #include <openssl/objects.h>
-#ifdef OPENSSL_HAS_NISTP256
-# include <openssl/ec.h>
-#endif
 #include "openbsd-compat/openssl-compat.h"
 
 #include "../test_helper/test_helper.h"
@@ -32,7 +30,9 @@ void
 sshbuf_getput_crypto_tests(void)
 {
 	struct sshbuf *p1;
-	BIGNUM *bn, *bn2;
+	const u_char *d;
+	size_t s;
+	BIGNUM *bn, *bn2, *bn_x, *bn_y;
 	const char *hexbn1 = "0102030405060708090a0b0c0d0e0f10";
 	/* This one has MSB set to test bignum2 encoding negative-avoidance */
 	const char *hexbn2 = "f0e0d0c0b0a0908070605040302010007fff11";
@@ -45,10 +45,6 @@ sshbuf_getput_crypto_tests(void)
 		0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10, 0x00,
 		0x7f, 0xff, 0x11
 	};
-#if defined(OPENSSL_HAS_ECC) && defined(OPENSSL_HAS_NISTP256)
-	const u_char *d;
-	size_t s;
-	BIGNUM *bn_x, *bn_y;
 	int ec256_nid = NID_X9_62_prime256v1;
 	char *ec256_x = "0C828004839D0106AA59575216191357"
 		        "34B451459DADB586677EF9DF55784999";
@@ -67,7 +63,6 @@ sshbuf_getput_crypto_tests(void)
 	};
 	EC_KEY *eck;
 	EC_POINT *ecp;
-#endif
 	int r;
 
 #define MKBN(b, bnn) \
@@ -82,7 +77,7 @@ sshbuf_getput_crypto_tests(void)
 	ASSERT_PTR_NE(p1, NULL);
 	ASSERT_INT_EQ(sshbuf_put_bignum2(p1, bn), 0);
 	ASSERT_SIZE_T_EQ(sshbuf_len(p1), sizeof(expbn1) + 4);
-	ASSERT_U32_EQ(PEEK_U32(sshbuf_ptr(p1)), (u_int32_t)BN_num_bytes(bn));
+	ASSERT_U32_EQ(PEEK_U32(sshbuf_ptr(p1)), (uint32_t)BN_num_bytes(bn));
 	ASSERT_MEM_EQ(sshbuf_ptr(p1) + 4, expbn1, sizeof(expbn1));
 	BN_free(bn);
 	sshbuf_free(p1);
@@ -106,7 +101,7 @@ sshbuf_getput_crypto_tests(void)
 	ASSERT_PTR_NE(p1, NULL);
 	ASSERT_INT_EQ(sshbuf_put_bignum2(p1, bn), 0);
 	ASSERT_SIZE_T_EQ(sshbuf_len(p1), sizeof(expbn2) + 4 + 1); /* MSB */
-	ASSERT_U32_EQ(PEEK_U32(sshbuf_ptr(p1)), (u_int32_t)BN_num_bytes(bn) + 1);
+	ASSERT_U32_EQ(PEEK_U32(sshbuf_ptr(p1)), (uint32_t)BN_num_bytes(bn) + 1);
 	ASSERT_U8_EQ(*(sshbuf_ptr(p1) + 4), 0x00);
 	ASSERT_MEM_EQ(sshbuf_ptr(p1) + 5, expbn2, sizeof(expbn2));
 	BN_free(bn);
@@ -221,7 +216,6 @@ sshbuf_getput_crypto_tests(void)
 	sshbuf_free(p1);
 	TEST_DONE();
 
-#if defined(OPENSSL_HAS_ECC) && defined(OPENSSL_HAS_NISTP256)
 	TEST_START("sshbuf_put_ec");
 	eck = EC_KEY_new_by_curve_name(ec256_nid);
 	ASSERT_PTR_NE(eck, NULL);
@@ -273,7 +267,6 @@ sshbuf_getput_crypto_tests(void)
 	BN_free(bn);
 	BN_free(bn2);
 	TEST_DONE();
-#endif
 }
 
 #endif /* WITH_OPENSSL */

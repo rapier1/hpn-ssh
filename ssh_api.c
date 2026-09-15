@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh_api.c,v 1.32 2024/10/18 05:14:51 djm Exp $ */
+/* $OpenBSD: ssh_api.c,v 1.35 2026/07/27 12:28:52 markus Exp $ */
 /*
  * Copyright (c) 2012 Markus Friedl.  All rights reserved.
  *
@@ -128,13 +128,12 @@ ssh_init(struct ssh **sshp, int is_server, struct kex_params *kex_params)
 		ssh->kex->kex[KEX_DH_GRP18_SHA512] = kex_gen_server;
 		ssh->kex->kex[KEX_DH_GEX_SHA1] = kexgex_server;
 		ssh->kex->kex[KEX_DH_GEX_SHA256] = kexgex_server;
-# ifdef OPENSSL_HAS_ECC
 		ssh->kex->kex[KEX_ECDH_SHA2] = kex_gen_server;
-# endif
 #endif /* WITH_OPENSSL */
 		ssh->kex->kex[KEX_C25519_SHA256] = kex_gen_server;
 		ssh->kex->kex[KEX_KEM_SNTRUP761X25519_SHA512] = kex_gen_server;
 		ssh->kex->kex[KEX_KEM_MLKEM768X25519_SHA256] = kex_gen_server;
+		ssh->kex->kex[KEX_KEM_MLKEM768ECDH_SHA256] = kex_gen_server;
 		ssh->kex->load_host_public_key=&_ssh_host_public_key;
 		ssh->kex->load_host_private_key=&_ssh_host_private_key;
 		ssh->kex->sign=&_ssh_host_key_sign;
@@ -147,13 +146,12 @@ ssh_init(struct ssh **sshp, int is_server, struct kex_params *kex_params)
 		ssh->kex->kex[KEX_DH_GRP18_SHA512] = kex_gen_client;
 		ssh->kex->kex[KEX_DH_GEX_SHA1] = kexgex_client;
 		ssh->kex->kex[KEX_DH_GEX_SHA256] = kexgex_client;
-# ifdef OPENSSL_HAS_ECC
 		ssh->kex->kex[KEX_ECDH_SHA2] = kex_gen_client;
-# endif
 #endif /* WITH_OPENSSL */
 		ssh->kex->kex[KEX_C25519_SHA256] = kex_gen_client;
 		ssh->kex->kex[KEX_KEM_SNTRUP761X25519_SHA512] = kex_gen_client;
 		ssh->kex->kex[KEX_KEM_MLKEM768X25519_SHA256] = kex_gen_client;
+		ssh->kex->kex[KEX_KEM_MLKEM768ECDH_SHA256] = kex_gen_client;
 		ssh->kex->verify_host_key =&_ssh_verify_host_key;
 	}
 	*sshp = ssh;
@@ -255,7 +253,7 @@ int
 ssh_packet_next(struct ssh *ssh, u_char *typep)
 {
 	int r;
-	u_int32_t seqnr;
+	uint32_t seqnr;
 	u_char type;
 
 	/*

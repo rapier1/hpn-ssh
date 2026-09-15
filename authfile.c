@@ -1,4 +1,4 @@
-/* $OpenBSD: authfile.c,v 1.147 2025/08/29 03:50:38 djm Exp $ */
+/* $OpenBSD: authfile.c,v 1.152 2026/07/07 04:04:16 djm Exp $ */
 /*
  * Copyright (c) 2000, 2013 Markus Friedl.  All rights reserved.
  *
@@ -27,7 +27,6 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/uio.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -36,14 +35,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <limits.h>
 
-#include "cipher.h"
-#include "ssh.h"
 #include "log.h"
 #include "authfile.h"
-#include "misc.h"
-#include "atomicio.h"
 #include "sshkey.h"
 #include "sshbuf.h"
 #include "ssherr.h"
@@ -203,6 +197,7 @@ sshkey_try_load_public(struct sshkey **kp, const char *filename,
 	char *line = NULL, *cp;
 	size_t linesize = 0;
 	int r;
+	struct stat st;
 	struct sshkey *k = NULL;
 
 	if (kp == NULL)
@@ -212,6 +207,11 @@ sshkey_try_load_public(struct sshkey **kp, const char *filename,
 		*commentp = NULL;
 	if ((f = fopen(filename, "r")) == NULL)
 		return SSH_ERR_SYSTEM_ERROR;
+	if (fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode) &&
+	    st.st_size > SSHBUF_SIZE_MAX) {
+		fclose(f);
+		return SSH_ERR_INVALID_FORMAT;
+	}
 	if ((k = sshkey_new(KEY_UNSPEC)) == NULL) {
 		fclose(f);
 		return SSH_ERR_ALLOC_FAIL;
@@ -327,6 +327,7 @@ sshkey_load_private_cert(int type, const char *filename, const char *passphrase,
 	case KEY_ECDSA:
 #endif /* WITH_OPENSSL */
 	case KEY_ED25519:
+	case KEY_MLDSA44_ED25519:
 	case KEY_UNSPEC:
 		break;
 	default:

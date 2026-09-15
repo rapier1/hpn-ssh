@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-pkcs11.c,v 1.73 2025/10/08 21:02:16 djm Exp $ */
+/* $OpenBSD: ssh-pkcs11.c,v 1.78 2026/03/03 09:57:25 dtucker Exp $ */
 /*
  * Copyright (c) 2010 Markus Friedl.  All rights reserved.
  * Copyright (c) 2014 Pedro Martelletto. All rights reserved.
@@ -23,15 +23,12 @@
 #include <sys/time.h>
 
 #include <sys/types.h>
+#include <sys/queue.h>
 #include <stdarg.h>
 #include <stdio.h>
 
-#include <ctype.h>
 #include <string.h>
 #include <dlfcn.h>
-
-#include "openbsd-compat/sys-queue.h"
-#include "openbsd-compat/openssl-compat.h"
 
 #ifdef WITH_OPENSSL
 #include "openbsd-compat/openssl-compat.h"
@@ -89,7 +86,7 @@ TAILQ_HEAD(, pkcs11_key) pkcs11_keys; /* XXX a tree would be better */
 
 int pkcs11_interactive = 0;
 
-#if defined(OPENSSL_HAS_ECC) || defined(OPENSSL_HAS_ED25519)
+#ifdef WITH_OPENSSL
 static void
 ossl_error(const char *msg)
 {
@@ -625,7 +622,6 @@ pkcs11_sign_rsa(struct sshkey *key,
 	return ret;
 }
 
-#ifdef OPENSSL_HAS_ECC
 static int
 pkcs11_sign_ecdsa(struct sshkey *key,
     u_char **sigp, size_t *lenp,
@@ -709,7 +705,6 @@ pkcs11_sign_ecdsa(struct sshkey *key,
 	free(sig);
 	return ret;
 }
-#endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 
 static int
@@ -852,7 +847,6 @@ pkcs11_key_included(struct sshkey ***keysp, int *nkeys, struct sshkey *key)
 }
 
 #ifdef WITH_OPENSSL
-#ifdef OPENSSL_HAS_ECC
 static struct sshkey *
 pkcs11_fetch_ecdsa_pubkey(struct pkcs11_provider *p, CK_ULONG slotidx,
     CK_OBJECT_HANDLE *obj)
@@ -935,8 +929,8 @@ pkcs11_fetch_ecdsa_pubkey(struct pkcs11_provider *p, CK_ULONG slotidx,
 		ossl_error("d2i_ASN1_OCTET_STRING failed");
 		goto fail;
 	}
-	attrp = octet->data;
-	if (o2i_ECPublicKey(&ec, &attrp, octet->length) == NULL) {
+	attrp = ASN1_STRING_get0_data(octet);
+	if (o2i_ECPublicKey(&ec, &attrp, ASN1_STRING_length(octet)) == NULL) {
 		ossl_error("o2i_ECPublicKey failed");
 		goto fail;
 	}
@@ -986,7 +980,6 @@ fail:
 
 	return (key);
 }
-#endif /* OPENSSL_HAS_ECC */
 
 static struct sshkey *
 pkcs11_fetch_rsa_pubkey(struct pkcs11_provider *p, CK_ULONG slotidx,
@@ -1211,18 +1204,14 @@ pkcs11_fetch_x509_pubkey(struct pkcs11_provider *p, CK_ULONG slotidx,
 	X509_NAME		*x509_name = NULL;
 	EVP_PKEY		*evp;
 	RSA			*rsa = NULL;
-
+	EC_KEY			*ec = NULL;
 	struct sshkey		*key = NULL;
-	int			 i, success = -1;
+	int			 r, i, nid, success = -1;
 	const u_char		*cp;
 	char			*subject = NULL;
 #ifdef OPENSSL_HAS_ED25519
 	size_t			len;
 #endif /* OPENSSL_HAS_ED25519 */
-#ifdef OPENSSL_HAS_ECC
-	EC_KEY			*ec = NULL;
-	int			r, nid;
-#endif
 
 	*keyp = NULL;
 	*labelp = NULL;
@@ -1317,7 +1306,6 @@ pkcs11_fetch_x509_pubkey(struct pkcs11_provider *p, CK_ULONG slotidx,
 			goto out;
 		/* success */
 		success = 0;
-#ifdef OPENSSL_HAS_ECC
 	} else if (EVP_PKEY_base_id(evp) == EVP_PKEY_EC) {
 		if (EVP_PKEY_get0_EC_KEY(evp) == NULL) {
 			error("invalid x509; no ec key");
@@ -1356,7 +1344,6 @@ pkcs11_fetch_x509_pubkey(struct pkcs11_provider *p, CK_ULONG slotidx,
 			goto out;
 		/* success */
 		success = 0;
-#endif /* OPENSSL_HAS_ECC */
 #ifdef OPENSSL_HAS_ED25519
 	} else if (EVP_PKEY_base_id(evp) == EVP_PKEY_ED25519) {
 		if ((key = sshkey_new(KEY_UNSPEC)) == NULL ||
@@ -1388,9 +1375,7 @@ pkcs11_fetch_x509_pubkey(struct pkcs11_provider *p, CK_ULONG slotidx,
 		free(cert_attr[i].pValue);
 	X509_free(x509);
 	RSA_free(rsa);
-#ifdef OPENSSL_HAS_ECC
 	EC_KEY_free(ec);
-#endif /* OPENSSL_HAS_ECC */
 	if (success != 0 || key == NULL) {
 		sshkey_free(key);
 		free(subject);
@@ -1486,7 +1471,7 @@ pkcs11_fetch_certs(struct pkcs11_provider *p, CK_ULONG slotidx,
 		case CKC_X_509:
 			if (pkcs11_fetch_x509_pubkey(p, slotidx, &obj,
 			    &key, &label) != 0) {
-				error("failed to fetch key");
+				debug_f("failed to fetch key");
 				continue;
 			}
 			break;
@@ -1596,11 +1581,9 @@ pkcs11_fetch_keys(struct pkcs11_provider *p, CK_ULONG slotidx,
 		case CKK_RSA:
 			key = pkcs11_fetch_rsa_pubkey(p, slotidx, &obj);
 			break;
-#ifdef OPENSSL_HAS_ECC
 		case CKK_ECDSA:
 			key = pkcs11_fetch_ecdsa_pubkey(p, slotidx, &obj);
 			break;
-#endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 		case CKK_EC_EDWARDS:
 			key = pkcs11_fetch_ed25519_pubkey(p, slotidx, &obj);
@@ -1613,7 +1596,7 @@ pkcs11_fetch_keys(struct pkcs11_provider *p, CK_ULONG slotidx,
 		}
 
 		if (key == NULL) {
-			error("failed to fetch key");
+			debug_f("failed to fetch key");
 			continue;
 		}
 		note_key(p, slotidx, __func__, key);
@@ -1652,7 +1635,7 @@ fail:
 
 static struct sshkey *
 pkcs11_rsa_generate_private_key(struct pkcs11_provider *p, CK_ULONG slotidx,
-    char *label, CK_ULONG bits, CK_BYTE keyid, u_int32_t *err)
+    char *label, CK_ULONG bits, CK_BYTE keyid, uint32_t *err)
 {
 	struct pkcs11_slotinfo	*si;
 	char			*plabel = label ? label : "";
@@ -1772,7 +1755,7 @@ static struct ec_curve_info {
 
 static struct sshkey *
 pkcs11_ecdsa_generate_private_key(struct pkcs11_provider *p, CK_ULONG slotidx,
-    char *label, CK_ULONG bits, CK_BYTE keyid, u_int32_t *err)
+    char *label, CK_ULONG bits, CK_BYTE keyid, uint32_t *err)
 {
 	struct pkcs11_slotinfo	*si;
 	char			*plabel = label ? label : "";
@@ -1890,7 +1873,7 @@ pkcs11_register_provider(char *provider_id, char *pin,
 	p = xcalloc(1, sizeof(*p));
 	p->name = xstrdup(provider_id);
 	p->handle = handle;
-	/* setup the pkcs11 callbacks */
+	/* set up the pkcs11 callbacks */
 	if ((rv = (*getfunctionlist)(&f)) != CKR_OK) {
 		error("C_GetFunctionList for provider %s failed: %lu",
 		    provider_id, rv);
@@ -2074,17 +2057,15 @@ pkcs11_sign(struct sshkey *key,
     const char *sk_pin, u_int compat)
 {
 	switch (key->type) {
+#ifdef WITH_OPENSSL
 	case KEY_RSA:
 	case KEY_RSA_CERT:
-#ifdef WITH_OPENSSL
 		return pkcs11_sign_rsa(key, sigp, lenp, data, datalen,
 		    alg, sk_provider, sk_pin, compat);
-#ifdef OPENSSL_HAS_ECC
 	case KEY_ECDSA:
 	case KEY_ECDSA_CERT:
 		return pkcs11_sign_ecdsa(key, sigp, lenp, data, datalen,
 		    alg, sk_provider, sk_pin, compat);
-#endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 	case KEY_ED25519:
 	case KEY_ED25519_CERT:
@@ -2104,7 +2085,7 @@ pkcs11_key_free(struct sshkey *key)
 #ifdef WITH_PKCS11_KEYGEN
 struct sshkey *
 pkcs11_gakp(char *provider_id, char *pin, unsigned int slotidx, char *label,
-    unsigned int type, unsigned int bits, unsigned char keyid, u_int32_t *err)
+    unsigned int type, unsigned int bits, unsigned char keyid, uint32_t *err)
 {
 	struct pkcs11_provider	*p = NULL;
 	struct pkcs11_slotinfo	*si;
@@ -2170,7 +2151,7 @@ out:
 
 struct sshkey *
 pkcs11_destroy_keypair(char *provider_id, char *pin, unsigned long slotidx,
-    unsigned char keyid, u_int32_t *err)
+    unsigned char keyid, uint32_t *err)
 {
 	struct pkcs11_provider	*p = NULL;
 	struct pkcs11_slotinfo	*si;
@@ -2249,11 +2230,9 @@ pkcs11_destroy_keypair(char *provider_id, char *pin, unsigned long slotidx,
 		case CKK_RSA:
 			k = pkcs11_fetch_rsa_pubkey(p, slotidx, &obj);
 			break;
-#ifdef OPENSSL_HAS_ECC
 		case CKK_ECDSA:
 			k = pkcs11_fetch_ecdsa_pubkey(p, slotidx, &obj);
 			break;
-#endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 		case CKK_EC_EDWARDS:
 			k = pkcs11_fetch_ed25519_pubkey(p, slotidx, &obj);

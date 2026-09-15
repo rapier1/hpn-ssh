@@ -1,4 +1,4 @@
-/* $OpenBSD: pathnames.h,v 1.36 2025/08/29 03:50:38 djm Exp $ */
+/* $OpenBSD: pathnames.h,v 1.37 2026/06/14 03:59:34 djm Exp $ */
 
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
@@ -37,8 +37,9 @@
 #define _PATH_SERVER_CONFIG_FILE	SSHDIR "/sshd_config"
 #define _PATH_HOST_CONFIG_FILE		SSHDIR "/ssh_config"
 #define _PATH_HOST_ECDSA_KEY_FILE	SSHDIR "/ssh_host_ecdsa_key"
-#define _PATH_HOST_ED25519_KEY_FILE	SSHDIR "/ssh_host_ed25519_key"
 #define _PATH_HOST_RSA_KEY_FILE		SSHDIR "/ssh_host_rsa_key"
+#define _PATH_HOST_ED25519_KEY_FILE	SSHDIR "/ssh_host_ed25519_key"
+#define _PATH_HOST_MLDSA44_ED25519_KEY_FILE SSHDIR "/ssh_host_mldsa44_ed25519_key"
 #define _PATH_DH_MODULI			SSHDIR "/moduli"
 
 #ifndef _PATH_SSH_PROGRAM
@@ -90,6 +91,7 @@
 #define _PATH_SSH_CLIENT_ID_ED25519	_PATH_SSH_USER_DIR "/id_ed25519"
 #define _PATH_SSH_CLIENT_ID_ECDSA_SK	_PATH_SSH_USER_DIR "/id_ecdsa_sk"
 #define _PATH_SSH_CLIENT_ID_ED25519_SK	_PATH_SSH_USER_DIR "/id_ed25519_sk"
+#define _PATH_SSH_CLIENT_ID_MLDSA44_ED25519 _PATH_SSH_USER_DIR "/id_mldsa44_ed25519"
 
 /*
  * Configuration file in user's home directory.  This file need not be
@@ -169,6 +171,9 @@
 #ifndef _PATH_SFTP_SERVER
 #define _PATH_SFTP_SERVER		"/usr/libexec/sftp-server"
 #endif
+#ifndef _PATH_LS
+#define _PATH_LS			"ls"
+#endif
 
 /* chroot directory for unprivileged user when UsePrivilegeSeparation=yes */
 #ifndef _PATH_PRIVSEP_CHROOT_DIR
@@ -177,11 +182,7 @@
 
 /* for passwd change */
 #ifndef _PATH_PASSWD_PROG
-#define _PATH_PASSWD_PROG             "/usr/bin/passwd"
-#endif
-
-#ifndef _PATH_LS
-#define _PATH_LS			"ls"
+#define _PATH_PASSWD_PROG		"/usr/bin/passwd"
 #endif
 
 /* Askpass program define */

@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-ed25519.c,v 1.20 2025/07/24 06:12:08 djm Exp $ */
+/* $OpenBSD: ssh-ed25519.c,v 1.23 2026/07/30 03:39:39 djm Exp $ */
 /*
  * Copyright (c) 2013 Markus Friedl <markus@openbsd.org>
  *
@@ -30,7 +30,6 @@
 #define SSHKEY_INTERNAL
 #include "sshkey.h"
 #include "ssherr.h"
-#include "ssh.h"
 
 static void
 ssh_ed25519_cleanup(struct sshkey *k)
@@ -84,7 +83,8 @@ ssh_ed25519_generate(struct sshkey *k, int bits)
 	if ((k->ed25519_pk = malloc(ED25519_PK_SZ)) == NULL ||
 	    (k->ed25519_sk = malloc(ED25519_SK_SZ)) == NULL)
 		return SSH_ERR_ALLOC_FAIL;
-	crypto_sign_ed25519_keypair(k->ed25519_pk, k->ed25519_sk);
+	if (crypto_sign_ed25519_keypair(k->ed25519_pk, k->ed25519_sk) != 0)
+		return SSH_ERR_CRYPTO_ERROR;
 	return 0;
 }
 

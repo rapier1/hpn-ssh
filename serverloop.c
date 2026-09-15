@@ -1,4 +1,4 @@
-/* $OpenBSD: serverloop.c,v 1.244 2025/09/25 06:23:19 jsg Exp $ */
+/* $OpenBSD: serverloop.c,v 1.248 2026/07/14 01:05:05 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -41,6 +41,7 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/queue.h>
 
 #include <netinet/in.h>
 
@@ -55,7 +56,6 @@
 #include <unistd.h>
 #include <stdarg.h>
 
-#include "openbsd-compat/sys-queue.h"
 #include "xmalloc.h"
 #include "packet.h"
 #include "sshbuf.h"
@@ -178,12 +178,15 @@ wait_until_can_do_something(struct ssh *ssh,
 	 * start the clock to terminate the connection.
 	 */
 	if (options.unused_connection_timeout != 0) {
-		if (channel_still_open(ssh) || unused_connection_expiry == 0) {
+		if (channel_still_open(ssh))
+			unused_connection_expiry = 0;
+		else if (unused_connection_expiry == 0) {
 			unused_connection_expiry = now +
 			    options.unused_connection_timeout;
 		}
-		ptimeout_deadline_monotime(&timeout, unused_connection_expiry);
 	}
+	if (unused_connection_expiry != 0)
+		ptimeout_deadline_monotime(&timeout, unused_connection_expiry);
 
 	/*
 	 * if using client_alive, set the max timeout accordingly,
@@ -399,7 +402,7 @@ server_loop2(struct ssh *ssh, Authctxt *authctxt)
 }
 
 static int
-server_input_keep_alive(int type, u_int32_t seq, struct ssh *ssh)
+server_input_keep_alive(int type, uint32_t seq, struct ssh *ssh)
 {
 	debug("Got %d/%u for keepalive", type, seq);
 	/*
@@ -520,7 +523,8 @@ server_request_tun(struct ssh *ssh)
 		ssh_packet_send_debug(ssh, "Unsupported tunnel device mode.");
 		return NULL;
 	}
-	if ((options.permit_tun & mode) == 0) {
+	if ((options.permit_tun & mode) == 0 || options.disable_forwarding ||
+	    auth_opts->restricted) {
 		ssh_packet_send_debug(ssh, "Server has rejected tunnel device "
 		    "forwarding");
 		return NULL;
@@ -607,7 +611,7 @@ server_request_session(struct ssh *ssh)
 }
 
 static int
-server_input_channel_open(int type, u_int32_t seq, struct ssh *ssh)
+server_input_channel_open(int type, uint32_t seq, struct ssh *ssh)
 {
 	Channel *c = NULL;
 	char *ctype = NULL;
@@ -751,7 +755,7 @@ server_input_hostkeys_prove(struct ssh *ssh, struct sshbuf **respp)
 }
 
 static int
-server_input_global_request(int type, u_int32_t seq, struct ssh *ssh)
+server_input_global_request(int type, uint32_t seq, struct ssh *ssh)
 {
 	char *rtype = NULL;
 	u_char want_reply = 0;
@@ -856,7 +860,7 @@ server_input_global_request(int type, u_int32_t seq, struct ssh *ssh)
 }
 
 static int
-server_input_channel_req(int type, u_int32_t seq, struct ssh *ssh)
+server_input_channel_req(int type, uint32_t seq, struct ssh *ssh)
 {
 	Channel *c;
 	int r, success = 0;

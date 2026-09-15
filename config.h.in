@@ -34,7 +34,7 @@
 /* getline is not what we expect */
 #undef BROKEN_GETLINE
 
-/* FreeBSD glob does not do what we need */
+/* Do not use system glob */
 #undef BROKEN_GLOB
 
 /* Define if you system's inet_ntoa is busted (e.g. Irix gcc issue) */
@@ -216,6 +216,9 @@
 /* Have attribute nonnull */
 #undef HAVE_ATTRIBUTE__NONNULL__
 
+/* compiler supports nonstring attribute */
+#undef HAVE_ATTRIBUTE__NONSTRING__
+
 /* OpenBSD's gcc has sentinel */
 #undef HAVE_ATTRIBUTE__SENTINEL__
 
@@ -362,6 +365,10 @@
 /* Define to 1 if you have the declaration of `howmany', and to 0 if you
    don't. */
 #undef HAVE_DECL_HOWMANY
+
+/* Define to 1 if you have the declaration of `htobe32', and to 0 if you
+   don't. */
+#undef HAVE_DECL_HTOBE32
 
 /* Define to 1 if you have the declaration of `htole64', and to 0 if you
    don't. */
@@ -1052,8 +1059,11 @@
 /* Define to 1 if you have the `openpty' function. */
 #undef HAVE_OPENPTY
 
-/* as a macro */
-#undef HAVE_OPENSSL_ADD_ALL_ALGORITHMS
+/* Define to 1 if you have the <openssl/configuration.h> header file. */
+#undef HAVE_OPENSSL_CONFIGURATION_H
+
+/* Define to 1 if you have the <openssl/opensslconf.h> header file. */
+#undef HAVE_OPENSSL_OPENSSLCONF_H
 
 /* Define to 1 if you have the `OpenSSL_version' function. */
 #undef HAVE_OPENSSL_VERSION
@@ -1623,6 +1633,9 @@
 /* Define to 1 if the system has the type `unsigned long long'. */
 #undef HAVE_UNSIGNED_LONG_LONG
 
+/* Define to 1 if you have the `unveil' function. */
+#undef HAVE_UNVEIL
+
 /* Define to 1 if you have the `updwtmp' function. */
 #undef HAVE_UPDWTMP
 
@@ -1804,23 +1817,8 @@
 /* Define if EVP_DigestUpdate returns void */
 #undef OPENSSL_EVP_DIGESTUPDATE_VOID
 
-/* OpenSSL has ECC */
-#undef OPENSSL_HAS_ECC
-
 /* libcrypto has ed25519 support */
 #undef OPENSSL_HAS_ED25519
-
-/* libcrypto has NID_X9_62_prime256v1 */
-#undef OPENSSL_HAS_NISTP256
-
-/* libcrypto has NID_secp384r1 */
-#undef OPENSSL_HAS_NISTP384
-
-/* libcrypto has NID_secp521r1 */
-#undef OPENSSL_HAS_NISTP521
-
-/* libcrypto is missing AES 192 and 256 bit functions */
-#undef OPENSSL_LOBOTOMISED_AES
 
 /* Define if you want the OpenSSL internally seeded PRNG only */
 #undef OPENSSL_PRNG_ONLY
@@ -1858,6 +1856,9 @@
 
 /* need inet in pledge for setsockopt IP_TOS */
 #undef PLEDGE_EXTRA_INET
+
+/* Define if poll 2nd arg is ulong */
+#undef POLL_NFDS_T_ULONG
 
 /* Port number of PRNGD/EGD random number socket */
 #undef PRNGD_PORT
@@ -1929,9 +1930,6 @@
 /* sshd PAM service name */
 #undef SSHD_PAM_SERVICE
 
-/* Define if pam_chauthtok wants real uid set to the unpriv'ed user */
-#undef SSHPAM_CHAUTHTOK_NEEDS_RUID
-
 /* Use audit debugging module */
 #undef SSH_AUDIT_EVENTS
 
@@ -1984,6 +1982,9 @@
 
 /* Define this if you want to use libkafs' AFS support */
 #undef USE_AFS
+
+/* Enable brainpool */
+#undef USE_BRAINPOOLP256R1
 
 /* Use BSM audit module */
 #undef USE_BSM_AUDIT

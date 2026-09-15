@@ -650,8 +650,10 @@ ac_includes_default="\
 
 ac_header_c_list=
 ac_subst_vars='LTLIBOBJS
+COMPATINCLUDES
 CFLAGS_NOPIE
 LDFLAGS_NOPIE
+TMUX
 DROPBEARCONVERT
 DROPBEARKEY
 DBCLIENT
@@ -689,7 +691,6 @@ LIBEDIT
 LDNSCONFIG
 LIBOBJS
 TESTLIBS
-COMPATINCLUDES
 LD
 PATH_PASSWD_PROG
 STARTUP_SCRIPT_SHELL
@@ -5224,8 +5225,10 @@ printf "%s\n" "no" >&6; }
 fi
 
 
-# Extract the first word of "nroff awf", so it can be a program name with args.
-set dummy nroff awf; ac_word=$2
+for ac_prog in nroff awf
+do
+  # Extract the first word of "$ac_prog", so it can be a program name with args.
+set dummy $ac_prog; ac_word=$2
 { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
 printf %s "checking for $ac_word... " >&6; }
 if test ${ac_cv_path_NROFF+y}
@@ -5268,6 +5271,9 @@ else
 printf "%s\n" "no" >&6; }
 fi
 
+
+  test -n "$NROFF" && break
+done
 
 # Extract the first word of "mandoc", so it can be a program name with args.
 set dummy mandoc; ac_word=$2
@@ -10897,6 +10903,36 @@ printf "%s\n" "no" >&6; }
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
 
+saved_CFLAGS="$CFLAGS"
+CFLAGS="$CFLAGS -Werror"
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking if compiler supports __nonstring__ attribute on char arrays" >&5
+printf %s "checking if compiler supports __nonstring__ attribute on char arrays... " >&6; }
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+#include <stdlib.h>
+int
+main (void)
+{
+ char __attribute__ ((__nonstring__)) h[5] = "hello"; return h[0]!='h';
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+printf "%s\n" "#define HAVE_ATTRIBUTE__NONSTRING__ 1" >>confdefs.h
+
+else $as_nop
+   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+CFLAGS="$saved_CFLAGS"
+
 if test "x$no_attrib_nonnull" != "x1" ; then
 
 printf "%s\n" "#define HAVE_ATTRIBUTE__NONNULL__ 1" >>confdefs.h
@@ -11097,12 +11133,6 @@ ac_fn_c_check_header_compile "$LINENO" "getopt.h" "ac_cv_header_getopt_h" "$ac_i
 if test "x$ac_cv_header_getopt_h" = xyes
 then :
   printf "%s\n" "#define HAVE_GETOPT_H 1" >>confdefs.h
-
-fi
-ac_fn_c_check_header_compile "$LINENO" "glob.h" "ac_cv_header_glob_h" "$ac_includes_default"
-if test "x$ac_cv_header_glob_h" = xyes
-then :
-  printf "%s\n" "#define HAVE_GLOB_H 1" >>confdefs.h
 
 fi
 ac_fn_c_check_header_compile "$LINENO" "ia.h" "ac_cv_header_ia_h" "$ac_includes_default"
@@ -11441,8 +11471,9 @@ fi
 # platform.  Usually these are just empty, but in some cases they'll include
 # the equivalent file.  This avoids having to wrap those includes in
 # '#ifdef HAVE_FOO_H'.  If we create any such headers, add the path to includes.
+COMPATINCLUDESDIR="openbsd-compat/include"
 COMPATINCLUDES=""
-       for ac_header in endian.h ifaddrs.h libgen.h paths.h netgroup.h nlist.h poll.h stdint.h sys/mman.h sys/stat.h sys/time.h sys/un.h time.h util.h
+       for ac_header in endian.h ifaddrs.h libgen.h paths.h netgroup.h nlist.h poll.h stdint.h sys/mman.h sys/stat.h sys/statvfs.h sys/time.h sys/un.h time.h util.h
 do :
   as_ac_Header=`printf "%s\n" "ac_cv_header_$ac_header" | $as_tr_sh`
 ac_fn_c_check_header_compile "$LINENO" "$ac_header" "$as_ac_Header" "$ac_includes_default"
@@ -11452,9 +11483,12 @@ then :
 #define `printf "%s\n" "HAVE_$ac_header" | $as_tr_cpp` 1
 _ACEOF
 
+	# Remove any old shims.
+	rm -f "$COMPATINCLUDESDIR/$ac_header"
+
 else $as_nop
 
-	COMPATINCLUDES="openbsd-compat/include"
+	COMPATINCLUDES="$COMPATINCLUDESDIR"
 	header="$COMPATINCLUDES/$ac_header"
 	dir=`dirname "$header"`
 	mkdir -p "$dir"
@@ -11469,6 +11503,20 @@ fi
 
 done
 
+for include in sys/queue.h sys/tree.h; do
+	COMPATINCLUDES="$COMPATINCLUDESDIR"
+	header="$COMPATINCLUDES/$include"
+	dir=`dirname "$header"`
+	mkdir -p "$dir"
+	case "$include" in
+	sys/queue.h)
+		echo '#include "openbsd-compat/sys-queue.h"'
+		;;
+	sys/tree.h)
+		echo '#include "openbsd-compat/sys-tree.h"'
+		;;
+	esac >"$header"
+done
 
 ac_fn_check_decl "$LINENO" "le32toh" "ac_cv_have_decl_le32toh" "
 #ifdef HAVE_SYS_TYPES_H
@@ -11527,6 +11575,25 @@ else $as_nop
   ac_have_decl=0
 fi
 printf "%s\n" "#define HAVE_DECL_HTOLE64 $ac_have_decl" >>confdefs.h
+ac_fn_check_decl "$LINENO" "htobe32" "ac_cv_have_decl_htobe32" "
+#ifdef HAVE_SYS_TYPES_H
+# include <sys/types.h>
+#endif
+#ifdef HAVE_STDINT_H
+# include <stdint.h>
+#endif
+#ifdef HAVE_ENDIAN_H
+# include <endian.h>
+#endif
+
+" "$ac_c_undeclared_builtin_options" "CFLAGS"
+if test "x$ac_cv_have_decl_htobe32" = xyes
+then :
+  ac_have_decl=1
+else $as_nop
+  ac_have_decl=0
+fi
+printf "%s\n" "#define HAVE_DECL_HTOBE32 $ac_have_decl" >>confdefs.h
 
 
 # On some platforms (eg SunOS4) sys/audit.h requires sys/[time|types|label.h]
@@ -11979,9 +12046,6 @@ printf "%s\n" "#define LOGIN_NEEDS_UTMPX 1" >>confdefs.h
 printf "%s\n" "#define SPT_TYPE SPT_REUSEARGV" >>confdefs.h
 
 
-printf "%s\n" "#define SSHPAM_CHAUTHTOK_NEEDS_RUID 1" >>confdefs.h
-
-
 printf "%s\n" "#define PTY_ZEROREAD 1" >>confdefs.h
 
 
@@ -12247,9 +12311,7 @@ fi
 
 	printf "%s\n" "#define BROKEN_SETREGID 1" >>confdefs.h
 
-
-printf "%s\n" "#define BROKEN_GLOB 1" >>confdefs.h
-
+	broken_glob=yes  # OS X glob does not do what we expect
 
 printf "%s\n" "#define BIND_8_COMPAT 1" >>confdefs.h
 
@@ -12917,9 +12979,7 @@ printf "%s\n" "#define SSH_TUN_NO_L2 1" >>confdefs.h
 
 fi
 
-
-printf "%s\n" "#define BROKEN_GLOB 1" >>confdefs.h
-
+	broken_glob=yes # FreeBSD glob does not do what we need
 	TEST_MALLOC_OPTIONS="AJRX"
 	# Preauth crypto occasionally uses file descriptors for crypto offload
 	# and will crash if they cannot be opened.
@@ -13026,9 +13086,6 @@ fi
 	printf "%s\n" "#define LOGIN_NEEDS_UTMPX 1" >>confdefs.h
 
 	printf "%s\n" "#define PAM_TTY_KLUDGE 1" >>confdefs.h
-
-
-printf "%s\n" "#define SSHPAM_CHAUTHTOK_NEEDS_RUID 1" >>confdefs.h
 
 	printf "%s\n" "#define LOCKED_PASSWD_STRING \"*LK*\"" >>confdefs.h
 
@@ -15216,6 +15273,33 @@ printf "%s\n" "#define calloc rpl_calloc" >>confdefs.h
 
 fi
 
+
+  for ac_func in glob
+do :
+  ac_fn_c_check_func "$LINENO" "glob" "ac_cv_func_glob"
+if test "x$ac_cv_func_glob" = xyes
+then :
+  printf "%s\n" "#define HAVE_GLOB 1" >>confdefs.h
+         for ac_header in glob.h
+do :
+  ac_fn_c_check_header_compile "$LINENO" "glob.h" "ac_cv_header_glob_h" "$ac_includes_default"
+if test "x$ac_cv_header_glob_h" = xyes
+then :
+  printf "%s\n" "#define HAVE_GLOB_H 1" >>confdefs.h
+ use_system_glob=yes
+else $as_nop
+  use_system_glob=no
+fi
+
+done
+
+else $as_nop
+  use_system_glob=no
+
+fi
+
+done
+
 # Check for ALTDIRFUNC glob() extension
 { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for GLOB_ALTDIRFUNC support" >&5
 printf %s "checking for GLOB_ALTDIRFUNC support... " >&6; }
@@ -15243,6 +15327,7 @@ else $as_nop
 
 		{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
 printf "%s\n" "no" >&6; }
+		use_system_glob=no
 
 
 fi
@@ -15276,6 +15361,8 @@ else $as_nop
 
 		{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
 printf "%s\n" "no" >&6; }
+		use_system_glob=no
+
 
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
@@ -15313,6 +15400,7 @@ else $as_nop
 
 		{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
 printf "%s\n" "no" >&6; }
+		use_system_glob=no
 
 
 fi
@@ -15327,7 +15415,35 @@ else $as_nop
   ac_have_decl=0
 fi
 printf "%s\n" "#define HAVE_DECL_GLOB_NOMATCH $ac_have_decl" >>confdefs.h
+if test $ac_have_decl = 1
+then :
 
+else $as_nop
+  use_system_glob=no
+fi
+
+
+if test "x$broken_glob" = "xyes"; then
+
+printf "%s\n" "#define BROKEN_GLOB 1" >>confdefs.h
+
+	use_system_glob=no
+fi
+
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking if we can use the system glob" >&5
+printf %s "checking if we can use the system glob... " >&6; }
+if test "x$use_system_glob" = "xyes" ; then
+	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+	# Remove any old shims.
+	rm -f "$COMPATINCLUDESDIR/glob.h"
+else
+	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+	COMPATINCLUDES="$COMPATINCLUDESDIR"
+	mkdir -p "$COMPATINCLUDES"
+	echo '#include "openbsd-compat/glob.h"' >$COMPATINCLUDES/glob.h
+fi
 
 ac_fn_check_decl "$LINENO" "VIS_ALL" "ac_cv_have_decl_VIS_ALL" "#include <vis.h>
 " "$ac_c_undeclared_builtin_options" "CFLAGS"
@@ -16649,12 +16765,6 @@ then :
   printf "%s\n" "#define HAVE_GETOPT 1" >>confdefs.h
 
 fi
-ac_fn_c_check_func "$LINENO" "getpagesize" "ac_cv_func_getpagesize"
-if test "x$ac_cv_func_getpagesize" = xyes
-then :
-  printf "%s\n" "#define HAVE_GETPAGESIZE 1" >>confdefs.h
-
-fi
 ac_fn_c_check_func "$LINENO" "getpeereid" "ac_cv_func_getpeereid"
 if test "x$ac_cv_func_getpeereid" = xyes
 then :
@@ -16701,12 +16811,6 @@ ac_fn_c_check_func "$LINENO" "getttyent" "ac_cv_func_getttyent"
 if test "x$ac_cv_func_getttyent" = xyes
 then :
   printf "%s\n" "#define HAVE_GETTTYENT 1" >>confdefs.h
-
-fi
-ac_fn_c_check_func "$LINENO" "glob" "ac_cv_func_glob"
-if test "x$ac_cv_func_glob" = xyes
-then :
-  printf "%s\n" "#define HAVE_GLOB 1" >>confdefs.h
 
 fi
 ac_fn_c_check_func "$LINENO" "group_from_gid" "ac_cv_func_group_from_gid"
@@ -17181,6 +17285,12 @@ ac_fn_c_check_func "$LINENO" "unsetenv" "ac_cv_func_unsetenv"
 if test "x$ac_cv_func_unsetenv" = xyes
 then :
   printf "%s\n" "#define HAVE_UNSETENV 1" >>confdefs.h
+
+fi
+ac_fn_c_check_func "$LINENO" "unveil" "ac_cv_func_unveil"
+if test "x$ac_cv_func_unveil" = xyes
+then :
+  printf "%s\n" "#define HAVE_UNVEIL 1" >>confdefs.h
 
 fi
 ac_fn_c_check_func "$LINENO" "updwtmpx" "ac_cv_func_updwtmpx"
@@ -19187,7 +19297,37 @@ if ac_fn_c_try_link "$LINENO"
 then :
 
 else $as_nop
-  as_fn_error $? "*** working libcrypto not found, check config.log" "$LINENO" 5
+
+	    # As of early 2026, BoringSSL libcrypto needs -lstdc++ for
+	    # destructors so try that before giving up.
+	    LIBS="$LIBS -lstdc++"
+	    CHANNELLIBS="$CHANNELLIBS -lstdc++"
+	    cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.  */
+char RAND_add ();
+int
+main (void)
+{
+return RAND_add ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+
+else $as_nop
+
+		as_fn_error $? "*** working libcrypto not found, check config.log" "$LINENO" 5
+
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam \
     conftest$ac_exeext conftest.$ac_ext
@@ -19340,8 +19480,9 @@ then :
 			100*|10100*) # 1.0.x, 1.1.0x
 				as_fn_error $? "OpenSSL >= 1.1.1 required (have \"$ssl_showver\")" "$LINENO" 5
 				;;
-			101*)   ;; # 1.1.x
-			200*)   # LibreSSL
+			101*)   openssl_impl="openssl" # 1.1.x
+				;;
+			200*)   openssl_impl="libressl"
 				lver=`echo "$sslver" | sed 's/.*libressl-//'`
 				case "$lver" in
 				2*|300*) # 2.x, 3.0.0
@@ -19350,7 +19491,7 @@ then :
 				*) ;;	# Assume all other versions are good.
 				esac
 				;;
-			30*|40*)
+			30*|40*) openssl_impl="openssl"
 				# OpenSSL 3 & 4; we use the 1.1x API
 				# https://openssl.org/policies/general/versioning-policy.html
 				CPPFLAGS="$CPPFLAGS -DOPENSSL_API_COMPAT=0x10100000L"
@@ -19452,7 +19593,7 @@ printf %s "checking if programs using OpenSSL functions will link... " >&6; }
 int
 main (void)
 {
- ERR_load_crypto_strings();
+ OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
   ;
   return 0;
 }
@@ -19476,7 +19617,7 @@ printf %s "checking if programs using OpenSSL need -ldl... " >&6; }
 int
 main (void)
 {
- ERR_load_crypto_strings();
+ OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
   ;
   return 0;
 }
@@ -19502,6 +19643,26 @@ rm -f core conftest.err conftest.$ac_objext conftest.beam \
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam \
     conftest$ac_exeext conftest.$ac_ext
+
+	ac_fn_check_decl "$LINENO" "OPENSSL_IS_AWSLC" "ac_cv_have_decl_OPENSSL_IS_AWSLC" "#include <openssl/base.h>
+
+" "$ac_c_undeclared_builtin_options" "CFLAGS"
+if test "x$ac_cv_have_decl_OPENSSL_IS_AWSLC" = xyes
+then :
+  openssl_impl="aws-lc"
+fi
+	ac_fn_check_decl "$LINENO" "OPENSSL_IS_BORINGSSL" "ac_cv_have_decl_OPENSSL_IS_BORINGSSL" "#include <openssl/base.h>
+
+" "$ac_c_undeclared_builtin_options" "CFLAGS"
+if test "x$ac_cv_have_decl_OPENSSL_IS_BORINGSSL" = xyes
+then :
+  openssl_impl="boringssl"
+fi
+
+	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking OpenSSL implementation" >&5
+printf %s "checking OpenSSL implementation... " >&6; }
+	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $openssl_impl" >&5
+printf "%s\n" "$openssl_impl" >&6; }
 
 	ac_fn_c_check_func "$LINENO" "BN_is_prime_ex" "ac_cv_func_BN_is_prime_ex"
 if test "x$ac_cv_func_BN_is_prime_ex" = xyes
@@ -19577,27 +19738,6 @@ then :
 fi
 
 
-	# OpenSSL_add_all_algorithms may be a macro.
-	ac_fn_c_check_func "$LINENO" "OpenSSL_add_all_algorithms" "ac_cv_func_OpenSSL_add_all_algorithms"
-if test "x$ac_cv_func_OpenSSL_add_all_algorithms" = xyes
-then :
-
-printf "%s\n" "#define HAVE_OPENSSL_ADD_ALL_ALGORITHMS 1" >>confdefs.h
-
-else $as_nop
-  ac_fn_check_decl "$LINENO" "OpenSSL_add_all_algorithms" "ac_cv_have_decl_OpenSSL_add_all_algorithms" "#include <openssl/evp.h>
-
-" "$ac_c_undeclared_builtin_options" "CFLAGS"
-if test "x$ac_cv_have_decl_OpenSSL_add_all_algorithms" = xyes
-then :
-
-printf "%s\n" "#define HAVE_OPENSSL_ADD_ALL_ALGORITHMS 1" >>confdefs.h
-
-fi
-
-fi
-
-
 	# LibreSSL/OpenSSL API differences
 	ac_fn_c_check_func "$LINENO" "EC_POINT_get_affine_coordinates" "ac_cv_func_EC_POINT_get_affine_coordinates"
 if test "x$ac_cv_func_EC_POINT_get_affine_coordinates" = xyes
@@ -19656,19 +19796,42 @@ fi
 
 
 	if test "x$openssl_engine" = "xyes" ; then
+		ac_fn_c_check_header_compile "$LINENO" "openssl/opensslconf.h" "ac_cv_header_openssl_opensslconf_h" "$ac_includes_default"
+if test "x$ac_cv_header_openssl_opensslconf_h" = xyes
+then :
+  printf "%s\n" "#define HAVE_OPENSSL_OPENSSLCONF_H 1" >>confdefs.h
+
+fi
+ac_fn_c_check_header_compile "$LINENO" "openssl/configuration.h" "ac_cv_header_openssl_configuration_h" "$ac_includes_default"
+if test "x$ac_cv_header_openssl_configuration_h" = xyes
+then :
+  printf "%s\n" "#define HAVE_OPENSSL_CONFIGURATION_H 1" >>confdefs.h
+
+fi
+
 		{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for OpenSSL ENGINE support" >&5
 printf %s "checking for OpenSSL ENGINE support... " >&6; }
 		cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 
+	#ifdef HAVE_OPENSSL_OPENSSLCONF_H
+	# include <openssl/opensslconf.h>
+	#endif
+	#ifdef HAVE_OPENSSL_CONFIGURATION_H
+	# include <openssl/configuration.h>
+	#endif
 	#include <openssl/engine.h>
 
 int
 main (void)
 {
 
+				#ifndef OPENSSL_NO_ENGINE
 				ENGINE_load_builtin_engines();
 				ENGINE_register_all_complete();
+				#else
+				#error "OPENSSL_NO_ENGINE"
+				#endif
 
   ;
   return 0;
@@ -19688,45 +19851,6 @@ else $as_nop
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
 	fi
-
-	# Check for OpenSSL without EVP_aes_{192,256}_cbc
-	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether OpenSSL lacks support for AES 192/256" >&5
-printf %s "checking whether OpenSSL lacks support for AES 192/256... " >&6; }
-	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-
-	#include <stdlib.h>
-	#include <string.h>
-	#include <openssl/evp.h>
-
-int
-main (void)
-{
-
-		exit(EVP_aes_192_cbc() == NULL || EVP_aes_256_cbc() == NULL);
-
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_link "$LINENO"
-then :
-
-			{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
-printf "%s\n" "no" >&6; }
-
-else $as_nop
-
-			{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
-printf "%s\n" "yes" >&6; }
-
-printf "%s\n" "#define OPENSSL_LOBOTOMISED_AES 1" >>confdefs.h
-
-
-
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.beam \
-    conftest$ac_exeext conftest.$ac_ext
 
 	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking if EVP_DigestUpdate returns an int" >&5
 printf %s "checking if EVP_DigestUpdate returns an int... " >&6; }
@@ -19795,8 +19919,8 @@ fi
 
 
 	# Check complete ECC support in OpenSSL
-	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether OpenSSL has NID_X9_62_prime256v1" >&5
-printf %s "checking whether OpenSSL has NID_X9_62_prime256v1... " >&6; }
+	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether OpenSSL has ECC support" >&5
+printf %s "checking whether OpenSSL has ECC support... " >&6; }
 	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 
@@ -19812,6 +19936,8 @@ main (void)
 {
 
 		EC_KEY *e = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+		EC_KEY *f = EC_KEY_new_by_curve_name(NID_secp384r1);
+		EC_KEY *g = EC_KEY_new_by_curve_name(NID_secp521r1);
 		const EVP_MD *m = EVP_sha256(); /* We need this too */
 
   ;
@@ -19822,177 +19948,20 @@ if ac_fn_c_try_link "$LINENO"
 then :
    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
 printf "%s\n" "yes" >&6; }
-		  enable_nistp256=1
 else $as_nop
-   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
-printf "%s\n" "no" >&6; }
+   as_fn_error $? "libcrypto does not have required ECC support" "$LINENO" 5
 
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam \
     conftest$ac_exeext conftest.$ac_ext
-
-	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether OpenSSL has NID_secp384r1" >&5
-printf %s "checking whether OpenSSL has NID_secp384r1... " >&6; }
-	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-
-	#include <openssl/ec.h>
-	#include <openssl/ecdh.h>
-	#include <openssl/ecdsa.h>
-	#include <openssl/evp.h>
-	#include <openssl/objects.h>
-	#include <openssl/opensslv.h>
-
-int
-main (void)
-{
-
-		EC_KEY *e = EC_KEY_new_by_curve_name(NID_secp384r1);
-		const EVP_MD *m = EVP_sha384(); /* We need this too */
-
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_link "$LINENO"
-then :
-   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
-printf "%s\n" "yes" >&6; }
-		  enable_nistp384=1
-else $as_nop
-   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
-printf "%s\n" "no" >&6; }
-
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.beam \
-    conftest$ac_exeext conftest.$ac_ext
-
-	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether OpenSSL has NID_secp521r1" >&5
-printf %s "checking whether OpenSSL has NID_secp521r1... " >&6; }
-	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-
-	#include <openssl/ec.h>
-	#include <openssl/ecdh.h>
-	#include <openssl/ecdsa.h>
-	#include <openssl/evp.h>
-	#include <openssl/objects.h>
-	#include <openssl/opensslv.h>
-
-int
-main (void)
-{
-
-		EC_KEY *e = EC_KEY_new_by_curve_name(NID_secp521r1);
-		const EVP_MD *m = EVP_sha512(); /* We need this too */
-
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_link "$LINENO"
-then :
-   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
-printf "%s\n" "yes" >&6; }
-		  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking if OpenSSL's NID_secp521r1 is functional" >&5
-printf %s "checking if OpenSSL's NID_secp521r1 is functional... " >&6; }
-		  if test "$cross_compiling" = yes
-then :
-   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: cross-compiling: assuming yes" >&5
-printf "%s\n" "$as_me: WARNING: cross-compiling: assuming yes" >&2;}
-			  enable_nistp521=1
-
-else $as_nop
-  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-
-	#include <stdlib.h>
-	#include <openssl/ec.h>
-	#include <openssl/ecdh.h>
-	#include <openssl/ecdsa.h>
-	#include <openssl/evp.h>
-	#include <openssl/objects.h>
-	#include <openssl/opensslv.h>
-
-int
-main (void)
-{
-
-			EC_KEY *e = EC_KEY_new_by_curve_name(NID_secp521r1);
-			const EVP_MD *m = EVP_sha512(); /* We need this too */
-			exit(e == NULL || m == NULL);
-
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_run "$LINENO"
-then :
-   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
-printf "%s\n" "yes" >&6; }
-			  enable_nistp521=1
-else $as_nop
-   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
-printf "%s\n" "no" >&6; }
-fi
-rm -f core *.core core.conftest.* gmon.out bb.out conftest$ac_exeext \
-  conftest.$ac_objext conftest.beam conftest.$ac_ext
-fi
-
-else $as_nop
-  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
-printf "%s\n" "no" >&6; }
-
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.beam \
-    conftest$ac_exeext conftest.$ac_ext
-
-	if test x$enable_nistp256 = x1 || test x$enable_nistp384 = x1 || \
-	    test x$enable_nistp521 = x1; then
-
-printf "%s\n" "#define OPENSSL_HAS_ECC 1" >>confdefs.h
-
-		ac_fn_c_check_func "$LINENO" "EC_KEY_METHOD_new" "ac_cv_func_EC_KEY_METHOD_new"
+	# Check for EC_KEY_METHOD support for ECDSA PKCS#11
+	ac_fn_c_check_func "$LINENO" "EC_KEY_METHOD_new" "ac_cv_func_EC_KEY_METHOD_new"
 if test "x$ac_cv_func_EC_KEY_METHOD_new" = xyes
 then :
   printf "%s\n" "#define HAVE_EC_KEY_METHOD_NEW 1" >>confdefs.h
 
 fi
 
-		openssl_ecc=yes
-	else
-		openssl_ecc=no
-	fi
-	if test x$enable_nistp256 = x1; then
-
-printf "%s\n" "#define OPENSSL_HAS_NISTP256 1" >>confdefs.h
-
-	else
-		unsupported_algorithms="$unsupported_algorithms \
-			ecdsa-sha2-nistp256 \
-			ecdh-sha2-nistp256 \
-			ecdsa-sha2-nistp256-cert-v01@openssh.com"
-	fi
-	if test x$enable_nistp384 = x1; then
-
-printf "%s\n" "#define OPENSSL_HAS_NISTP384 1" >>confdefs.h
-
-	else
-		unsupported_algorithms="$unsupported_algorithms \
-			ecdsa-sha2-nistp384 \
-			ecdh-sha2-nistp384 \
-			ecdsa-sha2-nistp384-cert-v01@openssh.com"
-	fi
-	if test x$enable_nistp521 = x1; then
-
-printf "%s\n" "#define OPENSSL_HAS_NISTP521 1" >>confdefs.h
-
-	else
-		unsupported_algorithms="$unsupported_algorithms \
-			ecdh-sha2-nistp521 \
-			ecdsa-sha2-nistp521 \
-			ecdsa-sha2-nistp521-cert-v01@openssh.com"
-	fi
 
 	# Check libcrypto ED25519 support
 	ac_fn_c_check_func "$LINENO" "EVP_PKEY_get_raw_public_key" "ac_cv_func_EVP_PKEY_get_raw_public_key"
@@ -20016,6 +19985,10 @@ printf %s "checking whether OpenSSL has ED25519 support... " >&6; }
 
 	#include <string.h>
 	#include <openssl/evp.h>
+	#include <openssl/opensslconf.h>
+	#ifdef OPENSSL_NO_EC
+	# error "OpenSSL has no EC support."
+	#endif
 
 int
 main (void)
@@ -20048,18 +20021,33 @@ printf "%s\n" "no" >&6; }
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam \
     conftest$ac_exeext conftest.$ac_ext
+
+	case "$openssl_impl" in
+	aws-lc|boringssl)
+		# Brainpool does not work with AWC-LS or BoringSSL.
+		unsupported_algorithms="$unsupported_algorithms mlkem768brainpoolp256r1-sha256"
+		;;
+	*)
+		ac_fn_check_decl "$LINENO" "NID_brainpoolP256r1" "ac_cv_have_decl_NID_brainpoolP256r1" "#include <openssl/evp.h>
+
+" "$ac_c_undeclared_builtin_options" "CFLAGS"
+if test "x$ac_cv_have_decl_NID_brainpoolP256r1" = xyes
+then :
+
+printf "%s\n" "#define USE_BRAINPOOLP256R1 1" >>confdefs.h
+
+fi
+		;;
+	esac
+
 fi
 
 # PKCS11/U2F depend on OpenSSL and dlopen().
 enable_pkcs11=yes
 enable_sk=yes
 
-ac_fn_check_decl "$LINENO" "OPENSSL_IS_AWSLC" "ac_cv_have_decl_OPENSSL_IS_AWSLC" "#include <openssl/base.h>
-
-" "$ac_c_undeclared_builtin_options" "CFLAGS"
-if test "x$ac_cv_have_decl_OPENSSL_IS_AWSLC" = xyes
-then :
-  enable_pkcs11="disabled; PKCS#11 not supported with AWS-LC"
+if test "x$openssl_impl" = "xaws-lc"; then
+	enable_pkcs11="disabled; PKCS#11 not supported with AWS-LC"
 fi
 if test "x$ac_cv_func_dlopen" != "xyes" ; then
 	enable_pkcs11="disabled; missing dlopen(3)"
@@ -20893,6 +20881,44 @@ printf "%s\n" "#define HAVE_NFDS_T 1" >>confdefs.h
 
 fi
 
+
+if test "x$ac_cv_type_nfds_t" != "xyes"; then
+	{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking if poll nfds_t is unsigned long" >&5
+printf %s "checking if poll nfds_t is unsigned long... " >&6; }
+	cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include <sys/types.h>
+#ifdef HAVE_POLL_H
+#include <poll.h>
+#endif
+#ifdef HAVE_SYS_POLL_H
+#include <sys/poll.h>
+#endif
+	    int poll(struct pollfd *, unsigned long, int timeout);
+
+int
+main (void)
+{
+return poll(0, 0, 0);
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+printf "%s\n" "#define POLL_NFDS_T_ULONG 1" >>confdefs.h
+
+else $as_nop
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+fi
 
 # Decide which sandbox style to use
 sandbox_arg=""
@@ -26850,6 +26876,51 @@ printf "%s\n" "no" >&6; }
 fi
 
 
+# Extract the first word of "tmux", so it can be a program name with args.
+set dummy tmux; ac_word=$2
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
+printf %s "checking for $ac_word... " >&6; }
+if test ${ac_cv_path_TMUX+y}
+then :
+  printf %s "(cached) " >&6
+else $as_nop
+  case $TMUX in
+  [\\/]* | ?:[\\/]*)
+  ac_cv_path_TMUX="$TMUX" # Let the user override the test with a path.
+  ;;
+  *)
+  as_save_IFS=$IFS; IFS=$PATH_SEPARATOR
+for as_dir in $PATH
+do
+  IFS=$as_save_IFS
+  case $as_dir in #(((
+    '') as_dir=./ ;;
+    */) ;;
+    *) as_dir=$as_dir/ ;;
+  esac
+    for ac_exec_ext in '' $ac_executable_extensions; do
+  if as_fn_executable_p "$as_dir$ac_word$ac_exec_ext"; then
+    ac_cv_path_TMUX="$as_dir$ac_word$ac_exec_ext"
+    printf "%s\n" "$as_me:${as_lineno-$LINENO}: found $as_dir$ac_word$ac_exec_ext" >&5
+    break 2
+  fi
+done
+  done
+IFS=$as_save_IFS
+
+  ;;
+esac
+fi
+TMUX=$ac_cv_path_TMUX
+if test -n "$TMUX"; then
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $TMUX" >&5
+printf "%s\n" "$TMUX" >&6; }
+else
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+fi
+
+
 
 CFLAGS="${CFLAGS} ${CFLAGS_AFTER}"
 LDFLAGS="${LDFLAGS} ${LDFLAGS_AFTER}"
@@ -26857,6 +26928,7 @@ LDFLAGS="${LDFLAGS} ${LDFLAGS_AFTER}"
 # Make a copy of CFLAGS/LDFLAGS without PIE options.
 LDFLAGS_NOPIE=`echo "$LDFLAGS" | sed 's/^-pie //;s/ -pie//g'`
 CFLAGS_NOPIE=`echo "$CFLAGS" | sed 's/^-fPIE //;s/ -fPIE//g'`
+
 
 
 

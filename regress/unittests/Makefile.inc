@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile.inc,v 1.18 2025/05/06 06:05:48 djm Exp $
+#	$OpenBSD: Makefile.inc,v 1.20 2026/04/23 12:57:47 claudio Exp $
 
 .include <bsd.own.mk>
 .include <bsd.obj.mk>
@@ -35,9 +35,9 @@ CDIAGFLAGS+=	-Wcomment
 CDIAGFLAGS+=	-Wformat
 CDIAGFLAGS+=	-Wformat-security
 CDIAGFLAGS+=	-Wimplicit
-CDIAGFLAGS+=	-Winline
 CDIAGFLAGS+=	-Wmissing-declarations
 CDIAGFLAGS+=	-Wmissing-prototypes
+CDIAGFLAGS+=	-Wold-style-definition
 CDIAGFLAGS+=	-Wparentheses
 CDIAGFLAGS+=	-Wpointer-arith
 CDIAGFLAGS+=	-Wreturn-type
@@ -50,9 +50,6 @@ CDIAGFLAGS+=	-Wtrigraphs
 CDIAGFLAGS+=	-Wuninitialized
 CDIAGFLAGS+=	-Wunused
 CDIAGFLAGS+=	-Wno-unused-parameter
-.if ${COMPILER_VERSION:L} != "gcc3"
-CDIAGFLAGS+=	-Wold-style-definition
-.endif
 
 SSHREL=../../../../../usr.bin/ssh
 

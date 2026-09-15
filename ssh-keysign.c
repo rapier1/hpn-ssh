@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-keysign.c,v 1.78 2025/09/25 06:25:38 djm Exp $ */
+/* $OpenBSD: ssh-keysign.c,v 1.81 2026/06/14 03:59:34 djm Exp $ */
 /*
  * Copyright (c) 2002 Markus Friedl.  All rights reserved.
  *
@@ -185,15 +185,15 @@ main(int argc, char **argv)
 	char *host, *fp, *pkalg;
 	size_t slen, dlen;
 
-	if (pledge("stdio rpath getpw dns id", NULL) != 0)
-		fatal("%s: pledge: %s", __progname, strerror(errno));
-
 	/* Ensure that stdin and stdout are connected */
 	if ((fd = open(_PATH_DEVNULL, O_RDWR)) < 2)
 		exit(1);
 	/* Leave /dev/null fd iff it is attached to stderr */
 	if (fd > 2)
 		close(fd);
+
+	if (pledge("stdio rpath getpw dns id", NULL) != 0)
+		fatal("%s: pledge: %s", __progname, strerror(errno));
 
 	for (i = 0; i < NUM_KEYTYPES; i++)
 		key_fd[i] = -1;
@@ -203,6 +203,7 @@ main(int argc, char **argv)
 	key_fd[i++] = open(_PATH_HOST_ECDSA_KEY_FILE, O_RDONLY);
 	key_fd[i++] = open(_PATH_HOST_ED25519_KEY_FILE, O_RDONLY);
 	key_fd[i++] = open(_PATH_HOST_RSA_KEY_FILE, O_RDONLY);
+	key_fd[i++] = open(_PATH_HOST_MLDSA44_ED25519_KEY_FILE, O_RDONLY);
 
 	if ((pw = getpwuid(getuid())) == NULL)
 		fatal("getpwuid failed");

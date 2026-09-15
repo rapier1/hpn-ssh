@@ -1,4 +1,4 @@
-/*	$OpenBSD: test_helper.c,v 1.14 2025/04/15 04:00:42 djm Exp $	*/
+/*	$OpenBSD: test_helper.c,v 1.18 2026/06/22 12:08:33 dtucker Exp $	*/
 /*
  * Copyright (c) 2011 Damien Miller <djm@mindrot.org>
  *
@@ -22,7 +22,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/time.h>
- 
+
 #include <assert.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -59,7 +59,7 @@
 #define BENCH_COLUMN_WIDTH	40
 
 #define MINIMUM(a, b)    (((a) < (b)) ? (a) : (b))
- 
+
 #define TEST_CHECK_INT(r, pred) do {		\
 		switch (pred) {			\
 		case TEST_EQ:			\
@@ -151,7 +151,7 @@ main(int argc, char **argv)
 
 	seed_rng();
 #ifdef WITH_OPENSSL
-	ERR_load_crypto_strings();
+	OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
 #endif
 
 	/* Handle systems without __progname */
@@ -448,7 +448,7 @@ assert_mem(const char *file, int line, const char *a1, const char *a2,
 }
 
 static int
-memvalcmp(const u_int8_t *s, u_char v, size_t l, size_t *where)
+memvalcmp(const uint8_t *s, u_char v, size_t l, size_t *where)
 {
 	size_t i;
 
@@ -560,7 +560,7 @@ assert_char(const char *file, int line, const char *a1, const char *a2,
 
 void
 assert_u8(const char *file, int line, const char *a1, const char *a2,
-    u_int8_t aa1, u_int8_t aa2, enum test_predicate pred)
+    uint8_t aa1, uint8_t aa2, enum test_predicate pred)
 {
 	TEST_CHECK(aa1, aa2, pred);
 	test_header(file, line, a1, a2, "U8", pred);
@@ -571,7 +571,7 @@ assert_u8(const char *file, int line, const char *a1, const char *a2,
 
 void
 assert_u16(const char *file, int line, const char *a1, const char *a2,
-    u_int16_t aa1, u_int16_t aa2, enum test_predicate pred)
+    uint16_t aa1, uint16_t aa2, enum test_predicate pred)
 {
 	TEST_CHECK(aa1, aa2, pred);
 	test_header(file, line, a1, a2, "U16", pred);
@@ -582,7 +582,7 @@ assert_u16(const char *file, int line, const char *a1, const char *a2,
 
 void
 assert_u32(const char *file, int line, const char *a1, const char *a2,
-    u_int32_t aa1, u_int32_t aa2, enum test_predicate pred)
+    uint32_t aa1, uint32_t aa2, enum test_predicate pred)
 {
 	TEST_CHECK(aa1, aa2, pred);
 	test_header(file, line, a1, a2, "U32", pred);
@@ -593,7 +593,7 @@ assert_u32(const char *file, int line, const char *a1, const char *a2,
 
 void
 assert_u64(const char *file, int line, const char *a1, const char *a2,
-    u_int64_t aa1, u_int64_t aa2, enum test_predicate pred)
+    uint64_t aa1, uint64_t aa2, enum test_predicate pred)
 {
 	TEST_CHECK(aa1, aa2, pred);
 	test_header(file, line, a1, a2, "U64", pred);
@@ -601,6 +601,47 @@ assert_u64(const char *file, int line, const char *a1, const char *a2,
 	    (unsigned long long)aa1, (unsigned long long)aa1);
 	fprintf(stderr, "%12s = 0x%016llx %llu\n", a2,
 	    (unsigned long long)aa2, (unsigned long long)aa2);
+	test_die();
+}
+
+void
+assert_double(const char *file, int line, const char *a1, const char *a2,
+    double aa1, double aa2, enum test_predicate pred)
+{
+	const double epsilon = 0.000000001;
+
+	switch (pred) {
+	case TEST_EQ:
+		if (fabs(aa1 - aa2) < epsilon)
+			return;
+		break;
+	case TEST_NE:
+		if (fabs(aa1 - aa2) >= epsilon)
+			return;
+		break;
+	case TEST_LT:
+		if (aa1 < aa2)
+			return;
+		break;
+	case TEST_LE:
+		if (aa1 <= aa2)
+			return;
+		break;
+	case TEST_GT:
+		if (aa1 > aa2)
+			return;
+		break;
+	case TEST_GE:
+		if (aa1 >= aa2)
+			return;
+		break;
+	default:
+		abort();
+	}
+
+	test_header(file, line, a1, a2, "DOUBLE", pred);
+	fprintf(stderr, "%12s = %f\n", a1, aa1);
+	fprintf(stderr, "%12s = %f\n", a2, aa2);
 	test_die();
 }
 
@@ -619,6 +660,20 @@ static double
 tstod(const struct timespec *ts)
 {
 	return (double)ts->tv_sec + ((double)ts->tv_nsec / 1000000000.0);
+}
+
+void
+hex2bin(uint8_t *bin, const char *hex, size_t len)
+{
+	size_t i;
+	unsigned int v;
+
+	/* Don't use %hhx since it's C99 and older platforms don't have it. */
+	for (i = 0; i < len; i++) {
+		ASSERT_INT_EQ(sscanf(hex + i * 2, "%02x", &v), 1);
+		ASSERT_U_INT_LE(v, 256);
+		bin[i] = (uint8_t)v;
+	}
 }
 
 void

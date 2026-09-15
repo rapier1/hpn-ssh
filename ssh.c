@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh.c,v 1.619 2025/09/25 07:05:11 djm Exp $ */
+/* $OpenBSD: ssh.c,v 1.637 2026/08/07 05:03:56 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -43,10 +43,8 @@
 #include "includes.h"
 
 #include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/resource.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
 
@@ -62,7 +60,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <unistd.h>
 #include <limits.h>
 #include <locale.h>
@@ -75,12 +72,10 @@
 #include <openssl/err.h>
 #endif
 #include "openbsd-compat/openssl-compat.h"
-#include "openbsd-compat/sys-queue.h"
 
 #include "xmalloc.h"
 #include "ssh.h"
 #include "ssh2.h"
-#include "canohost.h"
 #include "compat.h"
 #include "cipher.h"
 #include "packet.h"
@@ -90,7 +85,6 @@
 #include "authfd.h"
 #include "authfile.h"
 #include "pathnames.h"
-#include "dispatch.h"
 #include "clientloop.h"
 #include "log.h"
 #include "misc.h"
@@ -98,12 +92,9 @@
 #include "sshconnect.h"
 #include "kex.h"
 #include "mac.h"
-#include "sshpty.h"
 #include "match.h"
-#include "msg.h"
 #include "version.h"
 #include "ssherr.h"
-#include "myproposal.h"
 #include "utf8.h"
 
 #ifdef ENABLE_PKCS11
@@ -177,7 +168,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-"usage: ssh [-46AaCfGgKkMNnqsTtVvXxYy] [-B bind_interface] [-b bind_address]\n"
+"usage: ssh [-46AaCfGgKkMNnqsTtVvXxYyZ] [-B bind_interface] [-b bind_address]\n"
 "           [-c cipher_spec] [-D [bind_address:]port] [-E log_file]\n"
 "           [-e escape_char] [-F configfile] [-I pkcs11] [-i identity_file]\n"
 "           [-J destination] [-L address] [-l login_name] [-m mac_spec]\n"
@@ -408,6 +399,7 @@ check_follow_cname(int direct, char **namep, const char *cname)
 		    "\"%s\" => \"%s\"", *namep, cname);
 		free(*namep);
 		*namep = xstrdup(cname);
+		lowercase(*namep);
 		return 1;
 	}
 	return 0;
@@ -621,63 +613,6 @@ set_addrinfo_port(struct addrinfo *addrs, int port)
 	}
 }
 
-static void
-ssh_conn_info_free(struct ssh_conn_info *cinfo)
-{
-	if (cinfo == NULL)
-		return;
-	free(cinfo->conn_hash_hex);
-	free(cinfo->shorthost);
-	free(cinfo->uidstr);
-	free(cinfo->keyalias);
-	free(cinfo->thishost);
-	free(cinfo->host_arg);
-	free(cinfo->portstr);
-	free(cinfo->remhost);
-	free(cinfo->remuser);
-	free(cinfo->homedir);
-	free(cinfo->locuser);
-	free(cinfo->jmphost);
-	free(cinfo);
-}
-
-static int
-valid_hostname(const char *s)
-{
-	size_t i;
-
-	if (*s == '-')
-		return 0;
-	for (i = 0; s[i] != 0; i++) {
-		if (strchr("'`\"$\\;&<>|(){},", s[i]) != NULL ||
-		    isspace((u_char)s[i]) || iscntrl((u_char)s[i]))
-			return 0;
-	}
-	return 1;
-}
-
-static int
-valid_ruser(const char *s)
-{
-	size_t i;
-
-	if (*s == '-')
-		return 0;
-	for (i = 0; s[i] != 0; i++) {
-		if (iscntrl((u_char)s[i]))
-			return 0;
-		if (strchr("'`\";&<>|(){}", s[i]) != NULL)
-			return 0;
-		/* Disallow '-' after whitespace */
-		if (isspace((u_char)s[i]) && s[i + 1] == '-')
-			return 0;
-		/* Disallow \ in last position */
-		if (s[i] == '\\' && s[i + 1] == '\0')
-			return 0;
-	}
-	return 1;
-}
-
 /*
  * Main program for the ssh client.
  */
@@ -686,7 +621,7 @@ main(int ac, char **av)
 {
 	struct ssh *ssh = NULL;
 	int i, r, opt, exit_status, use_syslog, direct, timeout_ms;
-	int was_addr, config_test = 0, opt_terminated = 0, want_final_pass = 0;
+	int was_addr, config_test = 0, dump_pubkeys = 0, opt_terminated = 0, want_final_pass = 0;
 	int user_on_commandline = 0, user_was_default = 0, user_expanded = 0;
 	char *p, *cp, *line, *argv0, *logfile, *args;
 	char cname[NI_MAXHOST], thishost[NI_MAXHOST];
@@ -765,8 +700,9 @@ main(int ac, char **av)
 	argv0 = av[0];
 
  again:
-	while ((opt = getopt(ac, av, "1246ab:c:e:fgi:kl:m:no:p:qstvx"
-	    "AB:CD:E:F:GI:J:KL:MNO:P:Q:R:S:TVw:W:XYy")) != -1) { /* HUZdhjruz */
+	/* remaining: HUdhjruz */
+	while ((opt = getopt(ac, av, "1246ACGKMNTVXYZafgknqstvxy"
+	    "B:D:E:F:I:J:L:O:P:Q:R:S:W:b:c:e:i:l:m:o:p:w:")) != -1) {
 		switch (opt) {
 		case '1':
 			fatal("SSH protocol v.1 is no longer supported");
@@ -806,6 +742,9 @@ main(int ac, char **av)
 			options.forward_x11 = 1;
 			options.forward_x11_trusted = 1;
 			break;
+		case 'Z':
+			dump_pubkeys = 1;
+			break;
 		case 'g':
 			options.fwd_opts.gateway_ports = 1;
 			break;
@@ -817,6 +756,10 @@ main(int ac, char **av)
 				fatal("Multiplexing command already specified");
 			if (strcmp(optarg, "check") == 0)
 				muxclient_command = SSHMUX_COMMAND_ALIVE_CHECK;
+			else if (strcmp(optarg, "conninfo") == 0)
+				muxclient_command = SSHMUX_COMMAND_CONNINFO;
+			else if (strcmp(optarg, "channels") == 0)
+				muxclient_command = SSHMUX_COMMAND_CHANINFO;
 			else if (strcmp(optarg, "forward") == 0)
 				muxclient_command = SSHMUX_COMMAND_FORWARD;
 			else if (strcmp(optarg, "exit") == 0)
@@ -925,9 +868,9 @@ main(int ac, char **av)
 			}
 			if (options.proxy_command != NULL)
 				fatal("Cannot specify -J with ProxyCommand");
-			if (parse_jump(optarg, &options, 1) == -1)
+			if (parse_jump(optarg, &options, 1, 1) == -1)
+
 				fatal("Invalid -J argument");
-			options.proxy_command = xstrdup("none");
 			break;
 		case 't':
 			if (options.request_tty == REQUEST_TTY_YES)
@@ -1177,8 +1120,15 @@ main(int ac, char **av)
 	if (!host)
 		usage();
 
-	if (!valid_hostname(host))
+	/*
+	 * Validate commandline-specified values that end up in %tokens
+	 * before they are used in config parsing.
+	 */
+	if (options.user != NULL && !ssh_valid_ruser(options.user))
+		fatal("remote username contains invalid characters");
+	if (!ssh_valid_hostname(host))
 		fatal("hostname contains invalid characters");
+
 	options.host_arg = xstrdup(host);
 
 	/* Initialize the command to execute on remote host. */
@@ -1348,7 +1298,8 @@ main(int ac, char **av)
 			sshbin = "ssh";
 
 		/* Consistency check */
-		if (options.proxy_command != NULL)
+		if (options.proxy_command != NULL &&
+		    strcasecmp(options.proxy_command, "none") != 0)
 			fatal("inconsistent options: ProxyCommand+ProxyJump");
 		/* Never use FD passing for ProxyJump */
 		options.proxy_use_fdpass = 0;
@@ -1490,7 +1441,7 @@ main(int ac, char **av)
 	 * via configuration (i.e. not expanded) are not subject to validation.
 	 */
 	if ((user_on_commandline || user_expanded) &&
-	    !valid_ruser(options.user))
+	    !ssh_valid_ruser(options.user))
 		fatal("remote username contains invalid characters");
 
 	/* Now User is expanded, store it and calculate hash. */
@@ -1531,12 +1482,13 @@ main(int ac, char **av)
 		options.identity_agent = cp;
 	}
 
-	if (options.revoked_host_keys != NULL) {
-		p = tilde_expand_filename(options.revoked_host_keys, getuid());
+	for (j = 0; j < options.num_revoked_host_keys; j++) {
+		p = tilde_expand_filename(options.revoked_host_keys[j],
+		    getuid());
 		cp = default_client_percent_dollar_expand(p, cinfo);
 		free(p);
-		free(options.revoked_host_keys);
-		options.revoked_host_keys = cp;
+		free(options.revoked_host_keys[j]);
+		options.revoked_host_keys[j] = cp;
 	}
 
 	if (options.forward_agent_sock_path != NULL) {
@@ -1683,10 +1635,43 @@ main(int ac, char **av)
 	if (options.control_path != NULL) {
 		int sock;
 		if ((sock = muxclient(options.control_path)) >= 0) {
-			ssh_packet_set_connection(ssh, sock, sock);
+			if (ssh_packet_set_connection(ssh, sock, sock) == NULL)
+				fatal("ssh_packet_set_connection failed");
 			ssh_packet_set_mux(ssh);
 			goto skip_connect;
 		}
+	}
+
+	/* load options.identity_files */
+	load_public_identity_files(cinfo);
+
+	/* optionally set the SSH_AUTHSOCKET_ENV_NAME variable */
+	if (options.identity_agent &&
+	    strcmp(options.identity_agent, SSH_AUTHSOCKET_ENV_NAME) != 0) {
+		if (strcmp(options.identity_agent, "none") == 0) {
+			unsetenv(SSH_AUTHSOCKET_ENV_NAME);
+		} else {
+			cp = options.identity_agent;
+			/* legacy (limited) format */
+			if (cp[0] == '$' && cp[1] != '{') {
+				if (!valid_env_name(cp + 1)) {
+					fatal("Invalid IdentityAgent "
+					    "environment variable name %s", cp);
+				}
+				if ((p = getenv(cp + 1)) == NULL)
+					unsetenv(SSH_AUTHSOCKET_ENV_NAME);
+				else
+					setenv(SSH_AUTHSOCKET_ENV_NAME, p, 1);
+			} else {
+				/* identity_agent specifies a path directly */
+				setenv(SSH_AUTHSOCKET_ENV_NAME, cp, 1);
+			}
+		}
+	}
+
+	if (dump_pubkeys) {
+		pubkey_dump(ssh);
+		exit(0);
 	}
 
 	/*
@@ -1772,39 +1757,14 @@ main(int ac, char **av)
 			L_CERT(_PATH_HOST_ECDSA_KEY_FILE, 0);
 			L_CERT(_PATH_HOST_ED25519_KEY_FILE, 1);
 			L_CERT(_PATH_HOST_RSA_KEY_FILE, 2);
+			L_CERT(_PATH_HOST_MLDSA44_ED25519_KEY_FILE, 3);
 			L_PUBKEY(_PATH_HOST_ECDSA_KEY_FILE, 4);
 			L_PUBKEY(_PATH_HOST_ED25519_KEY_FILE, 5);
 			L_PUBKEY(_PATH_HOST_RSA_KEY_FILE, 6);
+			L_PUBKEY(_PATH_HOST_MLDSA44_ED25519_KEY_FILE, 7);
 			if (loaded == 0)
 				debug("HostbasedAuthentication enabled but no "
 				   "local public host keys could be loaded.");
-		}
-	}
-
-	/* load options.identity_files */
-	load_public_identity_files(cinfo);
-
-	/* optionally set the SSH_AUTHSOCKET_ENV_NAME variable */
-	if (options.identity_agent &&
-	    strcmp(options.identity_agent, SSH_AUTHSOCKET_ENV_NAME) != 0) {
-		if (strcmp(options.identity_agent, "none") == 0) {
-			unsetenv(SSH_AUTHSOCKET_ENV_NAME);
-		} else {
-			cp = options.identity_agent;
-			/* legacy (limited) format */
-			if (cp[0] == '$' && cp[1] != '{') {
-				if (!valid_env_name(cp + 1)) {
-					fatal("Invalid IdentityAgent "
-					    "environment variable name %s", cp);
-				}
-				if ((p = getenv(cp + 1)) == NULL)
-					unsetenv(SSH_AUTHSOCKET_ENV_NAME);
-				else
-					setenv(SSH_AUTHSOCKET_ENV_NAME, p, 1);
-			} else {
-				/* identity_agent specifies a path directly */
-				setenv(SSH_AUTHSOCKET_ENV_NAME, cp, 1);
-			}
 		}
 	}
 
@@ -1832,8 +1792,8 @@ main(int ac, char **av)
 	ssh_signal(SIGCHLD, main_sigchld_handler);
 
 	/* Log into the remote system.  Never returns if the login fails. */
-	ssh_login(ssh, &sensitive_data, host, (struct sockaddr *)&hostaddr,
-	    options.port, pw, timeout_ms, cinfo);
+	ssh_login(ssh, &sensitive_data, host, &hostaddr, options.port,
+	    pw, timeout_ms, cinfo);
 
 	/* We no longer need the private host keys.  Clear them now. */
 	if (sensitive_data.nkeys != 0) {
@@ -1952,13 +1912,23 @@ forwarding_success(void)
 	}
 }
 
+struct rfwd_confirm_ctx {
+	int fid;
+};
+
 /* Callback for remote forward global requests */
 static void
-ssh_confirm_remote_forward(struct ssh *ssh, int type, u_int32_t seq, void *ctxt)
+ssh_confirm_remote_forward(struct ssh *ssh, int type, uint32_t seq, void *ctxt)
 {
-	struct Forward *rfwd = (struct Forward *)ctxt;
+	struct rfwd_confirm_ctx *rctx = (struct rfwd_confirm_ctx *)ctxt;
+	struct Forward *rfwd;
 	u_int port;
 	int r;
+
+	if (rctx->fid < 0 || rctx->fid >= options.num_remote_forwards)
+		fatal_f("invalid forwarding ID %d", rctx->fid);
+	rfwd = &options.remote_forwards[rctx->fid];
+	freezero(rctx, sizeof(*rctx));
 
 	/* XXX verbose() on failure? */
 	debug("remote forward %s for: listen %s%s%d, connect %s:%d",
@@ -2137,6 +2107,8 @@ ssh_init_forwarding(struct ssh *ssh, char **ifname)
 
 	/* Initiate remote TCP/IP port forwardings. */
 	for (i = 0; i < options.num_remote_forwards; i++) {
+		struct rfwd_confirm_ctx *rctx;
+
 		debug("Remote connections from %.200s:%d forwarded to "
 		    "local address %.200s:%d",
 		    (options.remote_forwards[i].listen_path != NULL) ?
@@ -2151,9 +2123,10 @@ ssh_init_forwarding(struct ssh *ssh, char **ifname)
 		if ((options.remote_forwards[i].handle =
 		    channel_request_remote_forwarding(ssh,
 		    &options.remote_forwards[i])) >= 0) {
+			rctx = xcalloc(1, sizeof(*rctx));
+			rctx->fid = i;
 			client_register_global_confirm(
-			    ssh_confirm_remote_forward,
-			    &options.remote_forwards[i]);
+			    ssh_confirm_remote_forward, rctx);
 			forward_confirms_pending++;
 		} else if (options.exit_on_forward_failure)
 			fatal("Could not request remote forwarding.");
@@ -2198,7 +2171,6 @@ ssh_session2_setup(struct ssh *ssh, int id, int success, void *arg)
 {
 	extern char **environ;
 	const char *display, *term;
-	int r;
 	char *proto = NULL, *data = NULL;
 
 	if (!success)
@@ -2220,12 +2192,8 @@ ssh_session2_setup(struct ssh *ssh, int id, int success, void *arg)
 	}
 
 	check_agent_present();
-	if (options.forward_agent) {
-		debug("Requesting authentication agent forwarding.");
-		channel_request_start(ssh, id, "auth-agent-req@openssh.com", 0);
-		if ((r = sshpkt_send(ssh)) != 0)
-			fatal_fr(r, "send packet");
-	}
+	if (options.forward_agent)
+		client_channel_reqest_agent_forwarding(ssh, id);
 
 	if ((term = lookup_env_in_list("TERM", options.setenv,
 	    options.num_setenv)) == NULL || *term == '\0')

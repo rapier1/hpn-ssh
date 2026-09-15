@@ -1,4 +1,4 @@
-/* 	$OpenBSD: test_iterate.c,v 1.10 2025/05/06 06:05:48 djm Exp $ */
+/* 	$OpenBSD: test_iterate.c,v 1.11 2025/11/17 09:59:13 dtucker Exp $ */
 /*
  * Regress test for hostfile.h hostkeys_foreach()
  *
@@ -87,11 +87,6 @@ check(struct hostkey_foreach_line *l, void *_ctx)
 	expected_keytype = (parse_key || expected->no_parse_keytype < 0) ?
 	    expected->l.keytype : expected->no_parse_keytype;
 
-#ifndef OPENSSL_HAS_ECC
-	if (expected->l.keytype == KEY_ECDSA ||
-	    expected->no_parse_keytype == KEY_ECDSA)
-		skip = 1;
-#endif /* OPENSSL_HAS_ECC */
 #ifndef WITH_OPENSSL
 	if (expected->l.keytype == KEY_RSA ||
 	    expected->no_parse_keytype == KEY_RSA ||
@@ -133,7 +128,7 @@ check(struct hostkey_foreach_line *l, void *_ctx)
 			ASSERT_INT_EQ(sshkey_equal(l->key, expected->l.key), 1);
 		}
 	}
-	if (parse_key && !(l->comment == NULL && expected->l.comment == NULL))
+	if (parse_key && l->comment != NULL && expected->l.comment != NULL)
 		ASSERT_STRING_EQ(l->comment, expected->l.comment);
 	return 0;
 }
@@ -147,10 +142,6 @@ prepare_expected(struct expected *expected, size_t n)
 	for (i = 0; i < n; i++) {
 		if (expected[i].key_file == NULL)
 			continue;
-#ifndef OPENSSL_HAS_ECC
-		if (expected[i].l.keytype == KEY_ECDSA)
-			continue;
-#endif /* OPENSSL_HAS_ECC */
 #ifndef WITH_OPENSSL
 		switch (expected[i].l.keytype) {
 		case KEY_RSA:

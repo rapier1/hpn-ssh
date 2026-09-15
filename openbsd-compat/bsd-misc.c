@@ -18,6 +18,7 @@
 #include "includes.h"
 
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #ifdef HAVE_SYS_SELECT_H
 # include <sys/select.h>
 #endif
@@ -409,6 +410,14 @@ pledge(const char *promises, const char *execpromises)
 }
 #endif
 
+#ifndef HAVE_UNVEIL
+int
+unveil(const char *path, const char *permissions)
+{
+	return 0;
+}
+#endif
+
 #ifndef HAVE_MBTOWC
 /* a mbtowc that only supports ASCII */
 int
@@ -446,7 +455,7 @@ bzero(void *b, size_t n)
 int
 raise(int sig)
 {
-	kill(getpid(), sig);
+	return kill(getpid(), sig);
 }
 #endif
 

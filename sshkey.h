@@ -1,4 +1,4 @@
-/* $OpenBSD: sshkey.h,v 1.70 2025/08/29 03:50:38 djm Exp $ */
+/* $OpenBSD: sshkey.h,v 1.74 2026/06/14 03:59:34 djm Exp $ */
 
 /*
  * Copyright (c) 2000, 2001 Markus Friedl.  All rights reserved.
@@ -30,23 +30,17 @@
 
 #ifdef WITH_OPENSSL
 #include <openssl/rsa.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
 #include <openssl/evp.h>
-# ifdef OPENSSL_HAS_ECC
-#  include <openssl/ec.h>
-#  include <openssl/ecdsa.h>
-# else /* OPENSSL_HAS_ECC */
-#  define EC_KEY	void
-#  define EC_GROUP	void
-#  define EC_POINT	void
-# endif /* OPENSSL_HAS_ECC */
 #define SSH_OPENSSL_VERSION OpenSSL_version(OPENSSL_VERSION)
-#else /* WITH_OPENSSL */
-# define BIGNUM		void
-# define RSA		void
-# define EC_KEY		void
-# define EC_GROUP	void
-# define EC_POINT	void
-# define EVP_PKEY	void
+#else /* OPENSSL */
+#define BIGNUM		void
+#define RSA		void
+#define EC_KEY		void
+#define EC_GROUP	void
+#define EC_POINT	void
+#define EVP_PKEY	void
 #define SSH_OPENSSL_VERSION "without OpenSSL"
 #endif /* WITH_OPENSSL */
 
@@ -67,6 +61,8 @@ enum sshkey_types {
 	KEY_ECDSA_SK_CERT,
 	KEY_ED25519_SK,
 	KEY_ED25519_SK_CERT,
+	KEY_MLDSA44_ED25519,
+	KEY_MLDSA44_ED25519_CERT,
 	KEY_UNSPEC
 };
 
@@ -98,22 +94,22 @@ enum sshkey_private_format {
 #define SSHKEY_FLAG_EXT		0x0001
 
 #define SSHKEY_CERT_MAX_PRINCIPALS	256
-/* XXX opaquify? */
+/* XXX opacify? */
 struct sshkey_cert {
 	struct sshbuf	*certblob; /* Kept around for use on wire */
 	u_int		 type; /* SSH2_CERT_TYPE_USER or SSH2_CERT_TYPE_HOST */
-	u_int64_t	 serial;
+	uint64_t	 serial;
 	char		*key_id;
 	u_int		 nprincipals;
 	char		**principals;
-	u_int64_t	 valid_after, valid_before;
+	uint64_t	 valid_after, valid_before;
 	struct sshbuf	*critical;
 	struct sshbuf	*extensions;
 	struct sshkey	*signature_key;
 	char		*signature_type;
 };
 
-/* XXX opaquify? */
+/* XXX opacify? */
 struct sshkey {
 	int	 type;
 	int	 flags;
@@ -124,6 +120,9 @@ struct sshkey {
 	/* KEY_ED25519 and KEY_ED25519_SK */
 	u_char	*ed25519_sk;
 	u_char	*ed25519_pk;
+	/* KEY_MLDSA44_ED25519 */
+	u_char	*mldsa_ed25519_sk;
+	u_char	*mldsa_ed25519_pk;
 	/* KEY_ECDSA_SK and KEY_ED25519_SK */
 	char	*sk_application;
 	uint8_t	sk_flags;
@@ -218,12 +217,12 @@ int	 sshkey_match_keyname_to_sigalgs(const char *, const char *);
 int	 sshkey_to_certified(struct sshkey *);
 int	 sshkey_drop_cert(struct sshkey *);
 int	 sshkey_cert_copy(const struct sshkey *, struct sshkey *);
-int	 sshkey_cert_check_authority(const struct sshkey *, int, int, int,
+int	 sshkey_cert_check_authority(const struct sshkey *, int, int,
     uint64_t, const char *, const char **);
-int	 sshkey_cert_check_authority_now(const struct sshkey *, int, int, int,
+int	 sshkey_cert_check_authority_now(const struct sshkey *, int, int,
     const char *, const char **);
 int	 sshkey_cert_check_host(const struct sshkey *, const char *,
-    int , const char *, const char **);
+    const char *, const char **);
 size_t	 sshkey_format_cert_validity(const struct sshkey_cert *,
     char *, size_t) __attribute__((__bounded__(__string__, 2, 3)));
 int	 sshkey_check_cert_sigtype(const struct sshkey *, const char *);
@@ -329,16 +328,12 @@ int	check_rsa_length(const RSA *rsa); /* XXX remove */
 #endif
 #endif
 
-#if !defined(WITH_OPENSSL)
-# undef RSA
-# undef EC_KEY
-# undef EC_GROUP
-# undef EC_POINT
-# undef EVP_PKEY
-#elif !defined(OPENSSL_HAS_ECC)
-# undef EC_KEY
-# undef EC_GROUP
-# undef EC_POINT
-#endif
+#ifndef WITH_OPENSSL
+#undef RSA
+#undef EC_KEY
+#undef EC_GROUP
+#undef EC_POINT
+#undef EVP_PKEY
+#endif /* WITH_OPENSSL */
 
 #endif /* SSHKEY_H */
