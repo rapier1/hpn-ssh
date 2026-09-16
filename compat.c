@@ -123,6 +123,8 @@ compat_banner(struct ssh *ssh, const char *version)
 					SSH_BUG_UTF8TTYMODE },
 		{ "Twisted_*",		0 },
 		{ "Twisted*",		SSH_BUG_DEBUG },
+		/* MobaXterm's SFTP engine, see kex_input_newkeys */
+		{ "SecureBlackbox*",	SSH_BUG_STRICT_KEX_REKEY },
 		{ NULL,			0 }
 	};
 

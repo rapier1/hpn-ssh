@@ -530,6 +530,7 @@ kex_input_newkeys(int type, uint32_t seq, struct ssh *ssh)
 	struct kex *kex = ssh->kex;
 	int r, initial = (kex->flags & KEX_INITIAL) != 0;
 	char *cp, **prop;
+	const char *rekey_denylist;
 
 	debug("SSH2_MSG_NEWKEYS received");
 	if (kex->ext_info_c && initial)
@@ -541,13 +542,27 @@ kex_input_newkeys(int type, uint32_t seq, struct ssh *ssh)
 	if ((r = ssh_set_newkeys(ssh, MODE_IN)) != 0)
 		return r;
 	if (initial) {
-		/* Remove initial KEX signalling from proposal for rekeying */
+		/*
+		 * Remove initial KEX signalling from proposal for rekeying.
+		 * SecureBlackbox re-derives strict KEX from every KEXINIT
+		 * instead of latching it at the initial exchange. Without
+		 * the marker in the rekey it stops resetting its sequence
+		 * number while we still reset ours and the MAC desyncs, so
+		 * keep advertising kex-strict to it on rekeys. Compliant
+		 * peers ignore the marker after the initial exchange.
+		 */
+		if (ssh->compat & SSH_BUG_STRICT_KEX_REKEY) {
+			rekey_denylist = kex->server ?
+			    "ext-info-s" : "ext-info-c";
+		} else {
+			rekey_denylist = kex->server ?
+			    "ext-info-s,kex-strict-s-v00@openssh.com" :
+			    "ext-info-c,kex-strict-c-v00@openssh.com";
+		}
 		if ((r = kex_buf2prop(kex->my, NULL, &prop)) != 0)
 			return r;
 		if ((cp = match_filter_denylist(prop[PROPOSAL_KEX_ALGS],
-		    kex->server ?
-		    "ext-info-s,kex-strict-s-v00@openssh.com" :
-		    "ext-info-c,kex-strict-c-v00@openssh.com")) == NULL) {
+		    rekey_denylist)) == NULL) {
 			error_f("match_filter_denylist failed");
 			goto fail;
 		}

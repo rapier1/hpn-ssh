@@ -46,6 +46,7 @@
 /* #define unused		0x00010000 */
 /* #define unused		0x00020000 */
 /* #define unused		0x00040000 */
+#define SSH_BUG_STRICT_KEX_REKEY	0x00080000
 /* #define unused		0x00100000 */
 #define SSH_BUG_EXTEOF		0x00200000
 #define SSH_BUG_PROBE		0x00400000
