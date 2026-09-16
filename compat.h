@@ -46,6 +46,7 @@
 /* #define unused		0x00010000 */
 /* #define unused		0x00020000 */
 /* #define unused		0x00040000 */
+#define SSH_BUG_STRICT_KEX_REKEY	0x00080000 /* peer wants kex-strict on rekeys */
 #define SSH_HPNSSH		0x00100000 /* basically a notice that this is HPN aware */
 #define SSH_BUG_EXTEOF		0x00200000
 #define SSH_BUG_PROBE		0x00400000

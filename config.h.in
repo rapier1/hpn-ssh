@@ -1007,6 +1007,9 @@
 /* define if you have mode_t data type */
 #undef HAVE_MODE_T
 
+/* OS Supports MPTCP */
+#undef HAVE_MPTCP
+
 /* Some systems put nanosleep outside of libc */
 #undef HAVE_NANOSLEEP
 
@@ -1820,6 +1823,9 @@
 /* libcrypto has ed25519 support */
 #undef OPENSSL_HAS_ED25519
 
+/* Libcrypto supports Poly1305 MAC EVP */
+#undef OPENSSL_HAVE_POLY_EVP
+
 /* Define if you want the OpenSSL internally seeded PRNG only */
 #undef OPENSSL_PRNG_ONLY
 
@@ -2046,6 +2052,9 @@
 
 /* use libcrypto for cryptography */
 #undef WITH_OPENSSL
+
+/* With OpenSSL3 */
+#undef WITH_OPENSSL3
 
 /* Define if you want SELinux support. */
 #undef WITH_SELINUX
