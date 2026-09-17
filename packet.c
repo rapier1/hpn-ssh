@@ -1115,7 +1115,7 @@ ssh_set_newkeys(struct ssh *ssh, int mode)
 #endif
 	if ((r = cipher_init(ccp, enc->cipher, enc->key, enc->key_len, enc->iv,
 	    enc->iv_len, crypt_type ? state->p_send.seqnr : state->p_read.seqnr,
-	    crypt_type, state->after_authentication)) != 0)
+	    crypt_type, state->after_authentication && ssh->mt_enabled)) != 0)
 		return r;
 	if (!state->cipher_warning_done &&
 	    (wmsg = cipher_warning_message(*ccp)) != NULL) {
