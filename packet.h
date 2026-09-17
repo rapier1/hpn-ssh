@@ -94,6 +94,13 @@ struct ssh {
 
 	/* track if we have disabled the mac as well */
 	int none_mac;
+
+	/* HPN: MT ciphers are active for this connection. Set only by
+	 * cipher_switch(), which runs solely when the MT ciphers are not
+	 * disabled by config (DisableMTAES) and FIPS mode is off. Gates the
+	 * post-auth promotion of aes-ctr to the threaded implementation so a
+	 * later rekey cannot silently switch to MT once it was disabled. */
+	int mt_enabled;
 };
 
 typedef int (ssh_packet_hook_fn)(struct ssh *, struct sshbuf *,
