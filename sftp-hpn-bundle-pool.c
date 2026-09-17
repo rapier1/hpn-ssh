@@ -96,7 +96,7 @@ static int
 bundle_write_one(struct bundle_write_pool *pool, struct bundle_write_job *job)
 {
 	int    fd, rc = 0;
-	mode_t perm = pool->preserve ? (job->mode & 07777) : 0644;
+	mode_t perm = pool->preserve ? (job->mode & 0777) : 0644;
 	size_t off  = 0;
 
 	/* open WITHOUT O_TRUNC; ftruncate below sets the authoritative size
@@ -123,17 +123,20 @@ bundle_write_one(struct bundle_write_pool *pool, struct bundle_write_job *job)
 		}
 		off += (size_t)n;
 	}
-	if (rc == 0 && pool->preserve) {
-		struct timespec ts[2];
-		(void)fchmod(fd, (mode_t)(job->mode & 07777));
-		ts[0].tv_sec = job->mtime; ts[0].tv_nsec = 0;
-		ts[1].tv_sec = job->mtime; ts[1].tv_nsec = 0;
-		(void)futimens(fd, ts);
-	}
 	if (rc == 0 && ftruncate(fd, (off_t)job->len) != 0) {
 		error_f("hpn-bundle: ftruncate \"%s\": %s",
 		    job->full_path, strerror(errno));
 		rc = -1;
+	}
+	/* After the ftruncate, which updates mtime when it changes the size. */
+	if (rc == 0 && pool->preserve) {
+		struct timespec ts[2];
+		(void)fchmod(fd, (mode_t)(job->mode & 0777));
+		ts[0].tv_sec = job->mtime;
+		ts[0].tv_nsec = 0;
+		ts[1].tv_sec = job->mtime;
+		ts[1].tv_nsec = 0;
+		(void)futimens(fd, ts);
 	}
 	if (rc == 0 && pool->do_fsync && fsync(fd) != 0) {
 		error_f("hpn-bundle: fsync \"%s\": %s",

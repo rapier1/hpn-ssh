@@ -1397,8 +1397,7 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 	opts.preserve = preserve_flag;
 	opts.fsync = fsync_flag;
 	opts.writer_pool = sftp_conn_hpn(conn)->bundle_cfg.writer_pool;
-	rc = sftp_hpn_bundle_upload(conn, "", entries, acc->n, &opts,
-	    acc->target);
+	rc = sftp_hpn_bundle_upload(conn, "", entries, acc->n, &opts);
 	switch (rc) {
 	case SFTP_HPN_BUNDLE_OK:
 		for (i = 0; i < acc->n; i++) {

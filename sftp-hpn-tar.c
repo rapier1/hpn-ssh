@@ -502,8 +502,13 @@ parser_handle_header(struct sftp_hpn_tar_parser *p)
 		return -1;
 	}
 
+	/* Hand the consumers permission bits only. setuid, setgid and
+	 * sticky are dropped here so every bundle extract, client download
+	 * and server upload alike, matches the serial and parallel paths
+	 * (see commit 5ad50d925): neither preserves ownership, so a transfer
+	 * must not create a file with those bits set. */
 	if (p->cb->entry_cb != NULL &&
-	    p->cb->entry_cb(p->ctx, path, size_v, (mode_t)(mode_v & 07777),
+	    p->cb->entry_cb(p->ctx, path, size_v, (mode_t)(mode_v & 0777),
 	    (time_t)mtime_v) != 0) {
 		parser_set_error(p, "entry_cb rejected \"%s\"", path);
 		return -1;

@@ -235,7 +235,7 @@ bundle_writer_pool_allowed(void)
 }
 
 static struct hpn_bundle_state *
-bundle_state_new(const char *dest_dir, uint32_t flags, uint64_t bundle_size)
+bundle_state_new(const char *dest_dir, uint32_t flags)
 {
 	struct hpn_bundle_state *s = calloc(1, sizeof(*s));
 	if (s == NULL)
@@ -413,7 +413,7 @@ bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
 		return 0;
 	}
 
-	mode_t perm = preserve ? (mode & 07777) : 0644;
+	mode_t perm = preserve ? (mode & 0777) : 0644;
 	/*
 	 * HPN bundle-truncation fix (#4): open WITHOUT O_TRUNC.  A connection
 	 * that dies mid-bundle leaves a lagging server still draining buffered
@@ -521,16 +521,6 @@ bundle_upload_entry_end_cb(void *ctx)
 	}
 
 	if (s->cur_fd >= 0) {
-		if (preserve) {
-			struct timespec ts[2];
-			/* Exact mode: open(O_CREAT, perm) is subject to umask
-			 * and is ignored entirely on a pre-existing file, so
-			 * force the bits here to match real SFTP -p. */
-			(void)fchmod(s->cur_fd, (mode_t)(s->cur_mode & 07777));
-			ts[0].tv_sec = s->cur_mtime; ts[0].tv_nsec = 0;
-			ts[1].tv_sec = s->cur_mtime; ts[1].tv_nsec = 0;
-			(void)futimens(s->cur_fd, ts);
-		}
 		/*
 		 * HPN bundle-truncation fix (#4): set the authoritative file size
 		 * here, at entry completion (replaces the open-time O_TRUNC dropped
@@ -543,6 +533,20 @@ bundle_upload_entry_end_cb(void *ctx)
 			error_f("hpn-bundle: ftruncate \"%s\": %s",
 			    s->cur_full_path, strerror(errno));
 			rc = -1;
+		}
+		if (preserve) {
+			struct timespec ts[2];
+			/* Exact mode: open(O_CREAT, perm) is subject to umask
+			 * and is ignored entirely on a pre-existing file, so
+			 * force the bits here to match real SFTP -p. After the
+			 * ftruncate, which updates mtime whenever it changes the
+			 * size. */
+			(void)fchmod(s->cur_fd, (mode_t)(s->cur_mode & 0777));
+			ts[0].tv_sec = s->cur_mtime;
+			ts[0].tv_nsec = 0;
+			ts[1].tv_sec = s->cur_mtime;
+			ts[1].tv_nsec = 0;
+			(void)futimens(s->cur_fd, ts);
 		}
 		if (do_fsync && fsync(s->cur_fd) != 0) {
 			error_f("hpn-bundle: fsync \"%s\": %s",
@@ -760,7 +764,6 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
 	char *dest_dir = NULL;
 	uint32_t flags = 0;
-	uint64_t bundle_size = 0;
 	struct sshbuf *msg = NULL;
 	struct hpn_bundle_state *s = NULL;
 	int handle = -1;
@@ -777,13 +780,12 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	}
 
 	if ((r = sshbuf_get_cstring(iqueue, &dest_dir, NULL)) != 0 ||
-	    (r = sshbuf_get_u32(iqueue, &flags)) != 0 ||
-	    (r = sshbuf_get_u64(iqueue, &bundle_size)) != 0) {
+	    (r = sshbuf_get_u32(iqueue, &flags)) != 0) {
 		error_f("parse hpn-bundle-open: %s", ssh_err(r));
 		goto fail;
 	}
-	debug3("request %u: hpn-bundle-open dest=\"%s\" flags=0x%x bundle=%llu",
-	    id, dest_dir, flags, (unsigned long long)bundle_size);
+	debug3("request %u: hpn-bundle-open dest=\"%s\" flags=0x%x",
+	    id, dest_dir, flags);
 
 	/* Make sure the destination directory exists (mkdir -p semantics).
 	 * Don't fail if it already exists.  Empty dest_dir means the client
@@ -800,7 +802,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 
-	s = bundle_state_new(dest_dir, flags, bundle_size);
+	s = bundle_state_new(dest_dir, flags);
 	if (s == NULL) {
 		status = SSH2_FX_FAILURE;
 		goto fail;

@@ -400,7 +400,7 @@ struct sftp_bundle_opts {
 int sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n,
-    const struct sftp_bundle_opts *opts, uint64_t bundle_size);
+    const struct sftp_bundle_opts *opts);
 
 /* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
 int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
