@@ -16,88 +16,66 @@
  *
  */
 
-/*
- * sftp-hpn-bundle-server.c - server-side SFTP bundle protocol.
+/* sftp-hpn-bundle-server.c - server side of the SFTP bundle protocol.
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- * Extracted from sftp-hpn-server.c on 2026-05-31 as part of the
- * structural refactor described in project_hpn_code_organization_vision.md.
+ * Upload, hpn-bundle-open@hpnssh.org: process_hpn_bundle_open creates
+ * the handle, sftp_hpn_server_bundle_write feeds each WRITE payload to
+ * the sftp-hpn-tar.h parser, and the parser callbacks (entry_cb,
+ * data_cb, entry_end_cb) extract the entries. With the writer pool
+ * active, the default, each file is buffered whole and handed to a
+ * pool thread. With it off the callbacks open, write and close inline.
+ * sftp_hpn_server_bundle_close checks that the end marker arrived,
+ * joins the pool and releases the state.
  *
- * Contents:
- *   - struct hpn_bundle_state + lifecycle (UPLOAD parser-driven,
- *     FETCH writer-driven)
- *   - Env-driven enable toggle (HPN_USE_BUNDLE from sshd-session)
- *   - Parser callbacks (entry_cb opens output fd + (D) mkdir cache +
- *     (E) fallocate; data_cb writes inline; entry_end_cb closes +
- *     applies metadata)
- *   - sftp_hpn_server_bundle_write / _read / _close handlers
- *   - sftp_hpn_server_is_bundle_handle / _enabled accessors
- *   - process_hpn_bundle_open / _fetch RPC handlers (called via the
- *     dispatcher in sftp-hpn-server.c)
+ * Download, hpn-bundle-fetch@hpnssh.org: process_hpn_bundle_fetch
+ * checks each requested file, queues it into the sftp-hpn-tar.h writer
+ * and installs the handle. sftp_hpn_server_bundle_read packs archive
+ * bytes on demand for each READ. Close only releases the state.
  *
- * Cross-file linkage:
- *   - handle_new_bundle / _get / _free / _is_bundle are extern functions
- *     implemented in sftp-server.c (handle table internals).
- *   - sftp-hpn-tar.h provides the streaming codec (parser + writer).
- *
- * Copyright (c) 2024-2026 Pittsburgh Supercomputing Center / HPN-SSH project.
- * See LICENCE for redistribution terms.
- */
+ * The handle table slots (handle_new_bundle and friends) live in
+ * sftp-server.c. Both extended-request handlers are called from the
+ * dispatcher in sftp-hpn-server.c. The operator toggles HPNUseBundle
+ * and HPNWriterPool arrive as sftp-server argv flags (-B and -O). */
 
 #include "includes.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
-#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <pthread.h>
 
-#include "xmalloc.h"
 #include "ssherr.h"
 #include "sshbuf.h"
 #include "log.h"
-#include "misc.h"		/* mkdir_p */
+#include "misc.h"		/* mkdir_p, put_u32 */
 #include "sftp.h"
-#include "sftp-common.h"
 #include "sftp-hpn-bundle.h"	/* HPN_BUNDLE_FLAG_* */
-#include "sftp-hpn-server.h"	/* public accessor prototypes + ext names */
 #include "sftp-hpn-bundle-server.h"
 #include "sftp-hpn-tar.h"
 #include "sftp-hpn-bundle-pool.h"	/* shared writer pool (extract overlap) */
 
-/* Bundle handle mode: upload (client streams WRITE-by-WRITE, server
- * extracts at close) vs. fetch (server packs tar up-front, client
- * drains via READ, close just releases). */
+/* Bundle handle mode. An upload handle extracts entries as the WRITEs
+ * arrive and close checks for the end of archive. A fetch handle queues
+ * the files at open and packs them on demand as the READs arrive. */
 enum hpn_bundle_mode {
 	HPN_BUNDLE_MODE_UPLOAD = 0,   /* hpn-bundle-open */
-	HPN_BUNDLE_MODE_FETCH  = 1,   /* hpn-bundle-fetch */
+	HPN_BUNDLE_MODE_FETCH  = 1    /* hpn-bundle-fetch */
 };
 
-/* ── Bundle handle state (codec-based) ──────────────────────────────────
- *
- * Both UPLOAD and FETCH bundles stream through the sftp-hpn-tar codec
- * instead of buffering the whole tar in RAM.  Memory per worker is
- * O(1) - just the codec's 512-byte header scratch + the currently-open
- * output file (UPLOAD) or the currently-reading input file (FETCH).
- *
- * UPLOAD path (hpn-bundle-open):
- *   bundle_state holds a parser + per-entry tracking (open fd, remaining
- *   bytes, mode/mtime, last-mkdir cache for dir pre-create optimisation).
- *   sftp_hpn_server_bundle_write feeds the parser; entry callbacks open
- *   the output file, write bytes, then close + apply metadata.
- *
- * FETCH path (hpn-bundle-fetch):
- *   bundle_state holds a writer with all paths queued (finish() called
- *   at OPEN time).  sftp_hpn_server_bundle_read drives pack_next() to
- *   produce bytes on demand into the SFTP DATA reply. */
-
+/* Per-handle bundle state. An upload handle owns the parser, the
+ * per-entry fields the callbacks fill in, and the writer pool when it is
+ * active. A fetch handle owns the writer, with every file queued and
+ * finished at open time. The other mode's fields stay zero, apart from
+ * cur_fd, which is -1 so the destructor never closes fd 0. With the
+ * pool active, memory per handle is the file being accumulated plus the
+ * pool's byte budget of queued files. Inline writes buffer nothing. */
 struct hpn_bundle_state {
 	enum hpn_bundle_mode mode;
 	char    *dest_dir;          /* UPLOAD: dir to extract into; FETCH: NULL */
@@ -105,22 +83,18 @@ struct hpn_bundle_state {
 
 	/* UPLOAD-mode fields. */
 	struct sftp_hpn_tar_parser *parser;
-	uint64_t bytes_received;    /* cumulative WRITE bytes fed to parser */
-	uint64_t next_write_off;    /* expected SSH_FXP_WRITE offset */
+	uint64_t bytes_received;    /* file data bytes the parser delivered */
+	uint64_t next_write_offset; /* expected SSH_FXP_WRITE offset */
+	int      end_seen;          /* the parser saw the end marker */
 	/* Per-entry state set by the parser callbacks. */
-	char    *cur_full_path;     /* malloc'd dest_dir + "/" + entry path */
+	char    *cur_full_path;     /* malloc'd path of the current entry */
 	int      cur_fd;            /* open output fd, or -1 */
 	uint64_t cur_size;          /* declared size from header */
-	mode_t   cur_mode;
-	time_t   cur_mtime;
-	char    *last_mkdir_dir;    /* last parent dir already mkdir_p'd (D) */
+	mode_t   cur_mode;          /* from the entry header */
+	time_t   cur_mtime;         /* from the entry header */
+	char    *last_mkdir_dir;    /* last parent dir already mkdir_p'd */
 
-	/* Parallel writer pool (NULL = serial inline writes; set when the pool
-	 * is enabled - on by default, unless the operator disabled it via
-	 * HPNWriterPool or the client sent HPN_BUNDLE_FLAG_NO_POOL).  When
-	 * active the parser callbacks buffer each file and hand a complete-file
-	 * job to the pool, so the per-file open/write/close (Lustre MDS
-	 * round-trips) overlap. */
+	/* Writer pool, NULL when writes are inline. */
 	struct bundle_write_pool *pool;
 	u_char  *cur_job_buf;       /* pool: current file's data buffer */
 	size_t   cur_job_filled;    /* pool: bytes accumulated so far */
@@ -128,33 +102,38 @@ struct hpn_bundle_state {
 	/* FETCH-mode fields. */
 	struct sftp_hpn_tar_writer *writer;
 	uint64_t bytes_produced;    /* cumulative pack_next bytes returned */
-	uint64_t next_read_off;     /* expected SSH_FXP_READ offset */
 	uint64_t fetch_total_size;  /* sum of declared file sizes (logged) */
 };
 
-/* Flag constants and HPN_BUNDLE_BLOCK_BYTES live in sftp-hpn-bundle.h, the
- * shared HPN-only header.  Single source of truth for client + server. */
+/* HPN operator toggles parsed from argv (-B and -O) in sftp-server.c. */
+extern int    sftp_server_hpn_use_bundle(void);
+extern int    sftp_server_hpn_writer_pool(void);
 
-/*
- * Operator master toggle (sshd_config: HPNUseBundle).  When 0, the
- * server omits the hpn-bundle* extensions from SSH_FXP_VERSION and
- * refuses bundle-open / bundle-fetch with SSH2_FX_OP_UNSUPPORTED.
- * Read from the HPN_USE_BUNDLE env var that sshd-session sets from
- * options.hpn_use_bundle.  Defaults to 1 when the env var is absent
- * or unparseable (preserves prior behaviour for callers that haven't
- * propagated the option).
- *
- * Cached after the first lookup so the hot path is a simple read.
- */
-static int    bundle_enabled    = -1;   /* -1 = uninitialised */
+/* Bundle slots of the handle table, implemented in sftp-server.c so this
+ * file needs nothing of the table internals. */
+extern int    handle_new_bundle(void *opaque);
+extern void  *handle_get_bundle(int handle);
+extern void   handle_free_bundle(int handle);
+extern int    handle_is_bundle(int handle);
 
-/*
- * Compose and enqueue an SSH_FXP_STATUS failure reply on oqueue.
- * Shared by the fail labels of process_hpn_bundle_open and
- * process_hpn_bundle_fetch - both handlers reply with the same
- * 5-field STATUS shape on error (only the error-tag string differs,
- * which we pass through for the fatal_fr() log line).
- */
+/* Parser callbacks, the path-safety check and the state destructor,
+ * defined below. */
+static int bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
+    mode_t mode, time_t mtime);
+static int bundle_upload_data_cb(void *ctx, const u_char *data, size_t len);
+static int bundle_upload_entry_end_cb(void *ctx);
+static int bundle_path_is_safe(const char *path, const char *dest_dir);
+static void bundle_state_free(struct hpn_bundle_state *state);
+
+static const struct sftp_hpn_tar_callbacks bundle_upload_callbacks = {
+	.entry_cb     = bundle_upload_entry_cb,
+	.data_cb      = bundle_upload_data_cb,
+	.entry_end_cb = bundle_upload_entry_end_cb,
+};
+
+/* Compose and enqueue an SSH_FXP_STATUS failure reply on oqueue. Shared
+ * by the fail labels of both extended-request handlers, which differ
+ * only in the tag used for the fatal log line. */
 static void
 bundle_send_status_failure(struct sshbuf *oqueue, u_int id, int status,
     const char *tag)
@@ -175,659 +154,563 @@ bundle_send_status_failure(struct sshbuf *oqueue, u_int id, int status,
 	sshbuf_free(msg);
 }
 
-/* HPN operator toggles parsed from argv (-B / -O) in sftp-server.c. */
-extern int    sftp_server_hpn_use_bundle(void);
-extern int    sftp_server_hpn_writer_pool(void);
-
+/* Compose and enqueue the SSH_FXP_HANDLE reply both extended-request
+ * handlers send on success. */
 static void
-bundle_enabled_init(void)
+bundle_send_handle_reply(struct sshbuf *oqueue, u_int id, int handle)
 {
-	static int initialised = 0;
+	struct sshbuf *msg;
+	u_char hbuf[sizeof(uint32_t)];
+	int r;
 
-	if (initialised)
-		return;
-
-	/* Operator master toggle (sshd_config: HPNUseBundle), handed to this
-	 * process by sshd via the -B argv flag (see sftp_server_hpn_use_bundle
-	 * in sftp-server.c).  Defaults to 1 (enabled) when not specified. */
-	if (bundle_enabled == -1)
-		bundle_enabled = sftp_server_hpn_use_bundle();
-
-	initialised = 1;
-	debug_f("hpn-bundle: enabled=%d", bundle_enabled);
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	put_u32(hbuf, (uint32_t)handle);
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_HANDLE)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_string(msg, hbuf, sizeof(hbuf))) != 0)
+		fatal_fr(r, "compose handle reply");
+	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+		fatal_fr(r, "enqueue handle reply");
+	sshbuf_free(msg);
 }
 
-/* These callbacks live in sftp-server.c so this module doesn't need
- * to know about the handle table internals. */
-extern int    handle_new_bundle(void *opaque);
-extern void  *handle_get_bundle(int handle);
-extern void   handle_free_bundle(int handle);
-extern int    handle_is_bundle(int handle);
-
-/* Forward declarations for parser callbacks (defined below) and the
- * path-safety check (defined later in the file). */
-static int bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
-    mode_t mode, time_t mtime);
-static int bundle_upload_data_cb(void *ctx, const u_char *data, size_t len);
-static int bundle_upload_entry_end_cb(void *ctx);
-static int bundle_path_is_safe(const char *p, const char *dest_dir);
-
-static const struct sftp_hpn_tar_callbacks bundle_upload_callbacks = {
-	.entry_cb     = bundle_upload_entry_cb,
-	.data_cb      = bundle_upload_data_cb,
-	.entry_end_cb = bundle_upload_entry_end_cb,
-};
-
-/* HPN_WRITER_POOL (sshd_config: HPNWriterPool) - operator master toggle for
- * the server-side bundle writer pool.  Absent/unparseable -> 1 (enabled).
- * Mirrors the HPN_USE_BUNDLE toggle; cached after the first lookup. */
-static int
-bundle_writer_pool_allowed(void)
-{
-	static int  cached = -1;
-
-	if (cached >= 0)
-		return cached;
-	/* Operator master toggle (sshd_config: HPNWriterPool), handed in by
-	 * sshd via the -O argv flag (see sftp_server_hpn_writer_pool). */
-	cached = sftp_server_hpn_writer_pool();
-	return cached;
-}
-
+/* Allocate the state for an upload handle: the parser and, when the
+ * operator allows it and the client did not opt out, the writer pool.
+ * Returns NULL on allocation failure. A pool that fails to start is
+ * logged and the callbacks then write inline. */
 static struct hpn_bundle_state *
 bundle_state_new(const char *dest_dir, uint32_t flags)
 {
-	struct hpn_bundle_state *s = calloc(1, sizeof(*s));
-	if (s == NULL)
+	struct hpn_bundle_state *state;
+	uint64_t budget;
+	int threads;
+
+	if ((state = calloc(1, sizeof(*state))) == NULL)
 		return NULL;
-	s->mode     = HPN_BUNDLE_MODE_UPLOAD;
-	s->dest_dir = strdup(dest_dir);
-	if (s->dest_dir == NULL) {
-		free(s);
+	state->mode   = HPN_BUNDLE_MODE_UPLOAD;
+	state->flags  = flags;
+	state->cur_fd = -1;
+	state->dest_dir = strdup(dest_dir);
+	if (state->dest_dir != NULL)
+		state->parser = sftp_hpn_tar_parser_new(
+		    &bundle_upload_callbacks, state);
+	if (state->dest_dir == NULL || state->parser == NULL) {
+		bundle_state_free(state);
 		return NULL;
 	}
-	s->flags  = flags;
-	s->cur_fd = -1;
-	s->parser = sftp_hpn_tar_parser_new(&bundle_upload_callbacks, s);
-	if (s->parser == NULL) {
-		free(s->dest_dir);
-		free(s);
-		return NULL;
-	}
-	/* Writer pool: on by default, unless the operator disabled it
-	 * (sshd_config HPNWriterPool no -> HPN_WRITER_POOL env) or the client
-	 * asked us to skip it (HPN_BUNDLE_FLAG_NO_POOL).  Operator-off wins. */
-	if (bundle_writer_pool_allowed() &&
+	/* Writer pool, unless the operator turned it off (HPNWriterPool) or
+	 * the client sent HPN_BUNDLE_FLAG_NO_POOL. */
+	if (sftp_server_hpn_writer_pool() &&
 	    (flags & HPN_BUNDLE_FLAG_NO_POOL) == 0) {
-		uint64_t budget = bundle_writer_budget();
-		s->pool = bundle_write_pool_new(bundle_writer_threads(),
+		budget = bundle_writer_budget();
+		threads = bundle_writer_threads();
+		state->pool = bundle_write_pool_new(threads,
 		    (flags & HPN_BUNDLE_FLAG_PRESERVE) != 0,
 		    (flags & HPN_BUNDLE_FLAG_FSYNC) != 0, budget);
-		if (s->pool != NULL)
+		if (state->pool != NULL)
 			debug_f("hpn-bundle: writer pool active (%d threads, "
-			    "%llu-byte budget)", bundle_writer_threads(),
+			    "%llu-byte budget)", threads,
 			    (unsigned long long)budget);
-		/* NULL = pool spawn failed; fall back to serial, harmless. */
+		else
+			error_f("hpn-bundle: writer pool failed to start, "
+			    "writing inline");
 	}
-	return s;
+	return state;
 }
 
-/* Fetch-mode counterpart: no dest_dir (server-side reads, doesn't extract),
- * writer is allocated empty; the fetch handler queues paths into it
- * and calls finish() before installing the handle. */
+/* Allocate the state for a fetch handle: an empty writer that the fetch
+ * handler fills and finishes before installing the handle. There is no
+ * dest_dir, the server only reads, and the request's flags are not kept
+ * because nothing on the fetch path reads them. Returns NULL on
+ * allocation failure. */
 static struct hpn_bundle_state *
-bundle_state_new_fetch(uint32_t flags)
+bundle_state_new_fetch(void)
 {
-	struct hpn_bundle_state *s = calloc(1, sizeof(*s));
-	if (s == NULL)
+	struct hpn_bundle_state *state;
+
+	if ((state = calloc(1, sizeof(*state))) == NULL)
 		return NULL;
-	s->mode   = HPN_BUNDLE_MODE_FETCH;
-	s->flags  = flags;
-	s->cur_fd = -1;
-	s->writer = sftp_hpn_tar_writer_new();
-	if (s->writer == NULL) {
-		free(s);
+	state->mode   = HPN_BUNDLE_MODE_FETCH;
+	state->cur_fd = -1;	/* so bundle_state_free never closes fd 0 */
+	if ((state->writer = sftp_hpn_tar_writer_new()) == NULL) {
+		bundle_state_free(state);
 		return NULL;
 	}
-	return s;
+	return state;
 }
 
+/* Release a bundle state at any point in its life. Safe on NULL. A pool
+ * still attached means an abnormal teardown, so it is joined here and
+ * its error flag is dropped. */
 static void
-bundle_state_free(struct hpn_bundle_state *s)
+bundle_state_free(struct hpn_bundle_state *state)
 {
-	if (s == NULL)
+	if (state == NULL)
 		return;
-	if (s->pool != NULL)		/* abnormal teardown: join + free pool */
-		(void)bundle_write_pool_finish(s->pool);
-	free(s->cur_job_buf);
-	if (s->cur_fd >= 0)
-		(void)close(s->cur_fd);
-	free(s->cur_full_path);
-	free(s->last_mkdir_dir);
-	if (s->parser != NULL)
-		sftp_hpn_tar_parser_free(s->parser);
-	if (s->writer != NULL)
-		sftp_hpn_tar_writer_free(s->writer);
-	free(s->dest_dir);
-	free(s);
+	(void)bundle_write_pool_finish(state->pool);
+	free(state->cur_job_buf);
+	if (state->cur_fd >= 0)
+		(void)close(state->cur_fd);
+	free(state->cur_full_path);
+	free(state->last_mkdir_dir);
+	sftp_hpn_tar_parser_free(state->parser);
+	sftp_hpn_tar_writer_free(state->writer);
+	free(state->dest_dir);
+	free(state);
 }
 
+/* Is this handle a bundle? */
 int
 sftp_hpn_server_is_bundle_handle(int handle)
 {
 	return handle_is_bundle(handle);
 }
 
+/* Did the operator leave bundles on (HPNUseBundle)? */
 int
 sftp_hpn_server_bundle_enabled(void)
 {
-	bundle_enabled_init();	/* ensures bundle_enabled is populated */
-	return bundle_enabled;
+	return sftp_server_hpn_use_bundle();
 }
 
-/* Compose the full destination path for one tar entry.  Returns a
- * malloc'd string on success or NULL on OOM / unsafe path.  *out_safe
- * is set to 0 (unsafe path; caller fails the bundle) or 1 (OK). */
+/* Join dest_dir and an entry path into a malloc'd destination path. An
+ * empty dest_dir means the entry path is used as sent. Returns NULL on
+ * allocation failure. */
 static char *
-bundle_compose_path(const char *dest_dir, const char *entry_path, int *out_safe)
+bundle_compose_path(const char *dest_dir, const char *entry_path)
 {
 	char *full;
+	size_t full_len;
 
-	*out_safe = 0;
-	if (!bundle_path_is_safe(entry_path, dest_dir))
+	if (*dest_dir == '\0')
+		return strdup(entry_path);
+	full_len = strlen(dest_dir) + 1 + strlen(entry_path) + 1;
+	if ((full = malloc(full_len)) == NULL)
 		return NULL;
-	if (*dest_dir == '\0') {
-		full = strdup(entry_path);
-	} else {
-		size_t full_len = strlen(dest_dir) + 1 +
-		    strlen(entry_path) + 1;
-		full = malloc(full_len);
-		if (full != NULL)
-			snprintf(full, full_len, "%s/%s",
-			    dest_dir, entry_path);
-	}
-	if (full == NULL)
-		return NULL;
-	*out_safe = 1;
+	snprintf(full, full_len, "%s/%s", dest_dir, entry_path);
 	return full;
 }
 
-/* Parser entry callback: header parsed, open output fd, mkdir parent.
- *
- * The "last-mkdir-dir" cache (D) skips redundant mkdir_p calls when many
- * consecutive entries share the same parent directory - the common case
- * for many-small bundles.  Without it every file in a 1000-file bundle
- * does its own dirname() + stat() + mkdir() walk; with it most calls
- * are a single strcmp. */
+/* Parser entry callback, one per entry header. Checks and composes the
+ * destination path and makes sure its parent directory exists, then
+ * either allocates the whole-file buffer for the writer pool or opens
+ * the output file for inline writes. The last_mkdir_dir cache skips the
+ * mkdir_p walk when consecutive entries share a parent, the common case
+ * for bundles of many small files. */
 static int
 bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
     mode_t mode, time_t mtime)
 {
-	struct hpn_bundle_state *s = ctx;
-	int    safe;
-	int    preserve = (s->flags & HPN_BUNDLE_FLAG_PRESERVE) != 0;
+	struct hpn_bundle_state *state = ctx;
+	char *full_copy, *parent;
+	mode_t perm;
 
-	s->cur_full_path = bundle_compose_path(s->dest_dir, path, &safe);
-	if (!safe) {
-		error("hpn-bundle: REJECTED unsafe tar pathname \"%s\" "
-		    "(\"..\" component, or absolute path with non-empty "
-		    "dest_dir); possible path-traversal attempt", path);
+	if (!bundle_path_is_safe(path, state->dest_dir)) {
+		error_f("hpn-bundle: rejected entry pathname \"%s\" (empty, "
+		    "has a \"..\" component, or absolute with dest_dir set)",
+		    path);
 		return -1;
 	}
-	if (s->cur_full_path == NULL) {
+	state->cur_full_path = bundle_compose_path(state->dest_dir, path);
+	if (state->cur_full_path == NULL) {
 		error_f("hpn-bundle: out of memory composing path");
 		return -1;
 	}
-	/* Pre-create parent directory.  Skip if last_mkdir_dir matches. */
-	{
-		char *full_copy = strdup(s->cur_full_path);
-		if (full_copy != NULL) {
-			char *parent = dirname(full_copy);
-			if (parent != NULL && strcmp(parent, ".") != 0 &&
-			    strcmp(parent, "/") != 0) {
-				if (s->last_mkdir_dir == NULL ||
-				    strcmp(s->last_mkdir_dir, parent) != 0) {
-					(void)mkdir_p(parent, 0755);
-					free(s->last_mkdir_dir);
-					s->last_mkdir_dir = strdup(parent);
-				}
+	state->cur_size  = size;
+	state->cur_mode  = mode;
+	state->cur_mtime = mtime;
+
+	full_copy = strdup(state->cur_full_path);
+	if (full_copy != NULL) {
+		parent = dirname(full_copy);
+		if (strcmp(parent, ".") != 0 && strcmp(parent, "/") != 0) {
+			if (state->last_mkdir_dir == NULL ||
+			    strcmp(state->last_mkdir_dir, parent) != 0) {
+				(void)mkdir_p(parent, 0755);
+				free(state->last_mkdir_dir);
+				state->last_mkdir_dir = strdup(parent);
 			}
-			free(full_copy);
 		}
+		free(full_copy);
 	}
 
-	if (s->pool != NULL) {
-		/* Parallel path: buffer this file; a pool thread does the
-		 * open/write/close so the per-file MDS round-trips overlap.
-		 * The parent dir was already mkdir'd above (serial, cached). */
-		s->cur_size  = size;
-		s->cur_mode  = mode;
-		s->cur_mtime = mtime;
-		s->cur_job_buf = (size > 0) ? malloc((size_t)size) : NULL;
-		s->cur_job_filled = 0;
-		if (size > 0 && s->cur_job_buf == NULL) {
-			error_f("hpn-bundle: malloc(%llu) for \"%s\"",
-			    (unsigned long long)size, s->cur_full_path);
-			return -1;
+	if (state->pool != NULL) {
+		/* A pool thread does the open, write and close, so only the
+		 * file buffer is set up here. */
+		state->cur_job_filled = 0;
+		state->cur_job_buf = NULL;
+		if (size > 0) {
+			state->cur_job_buf = malloc((size_t)size);
+			if (state->cur_job_buf == NULL) {
+				error_f("hpn-bundle: malloc(%llu) for \"%s\"",
+				    (unsigned long long)size,
+				    state->cur_full_path);
+				return -1;
+			}
 		}
 		return 0;
 	}
 
-	mode_t perm = preserve ? (mode & 0777) : 0644;
-	/*
-	 * HPN bundle-truncation fix (#4): open WITHOUT O_TRUNC.  A connection
-	 * that dies mid-bundle leaves a lagging server still draining buffered
-	 * tar; an O_TRUNC open by that dead writer would truncate the file the
-	 * re-send has already written.  Without O_TRUNC the dead writer can only
-	 * overwrite a prefix with identical bytes and can never shrink the file;
-	 * the authoritative size is set by ftruncate() in entry_end_cb, which
-	 * only a writer that COMPLETES the entry reaches.
-	 */
-	s->cur_fd = open(s->cur_full_path, O_WRONLY | O_CREAT, perm);
-	if (s->cur_fd < 0) {
+	perm = 0644;		/* what a plain SFTP upload without -p gets */
+	if (state->flags & HPN_BUNDLE_FLAG_PRESERVE)
+		perm = mode;
+
+	/* No O_TRUNC. A connection that dies mid-bundle can leave a lagging
+	 * server still draining buffered records while the client's re-send
+	 * writes the same file. Without O_TRUNC that stale writer can only
+	 * overwrite a prefix with identical bytes and never shrink the file.
+	 * The size is set by the ftruncate in entry_end_cb, which only a
+	 * writer that completes the entry reaches. */
+	state->cur_fd = open(state->cur_full_path, O_WRONLY | O_CREAT, perm);
+	if (state->cur_fd < 0) {
 		error_f("hpn-bundle: open \"%s\": %s",
-		    s->cur_full_path, strerror(errno));
+		    state->cur_full_path, strerror(errno));
 		return -1;
 	}
 #ifdef HAVE_POSIX_FALLOCATE
-	/* (E) Pre-allocate extents for fewer fragments + faster sequential
-	 * writes on extents-based FS (ext4 / xfs / lustre).  Failure is
-	 * non-fatal - write() will just allocate on demand. */
+	/* Preallocate the extents. Fewer fragments and faster sequential
+	 * writes on extent-based filesystems. Failure is harmless, write()
+	 * allocates on demand. */
 	if (size > 0)
-		(void)posix_fallocate(s->cur_fd, 0, (off_t)size);
+		(void)posix_fallocate(state->cur_fd, 0, (off_t)size);
 #endif
-	s->cur_size  = size;
-	s->cur_mode  = mode;
-	s->cur_mtime = mtime;
 	return 0;
 }
 
+/* Parser data callback. Appends the bytes to the pool buffer when the
+ * pool is active, otherwise writes them to the file entry_cb opened.
+ * The parser clamps delivered data to the declared entry size, so the
+ * bound check on the pool path only guards against a parser regression
+ * overflowing the buffer. */
 static int
 bundle_upload_data_cb(void *ctx, const u_char *data, size_t len)
 {
-	struct hpn_bundle_state *s = ctx;
+	struct hpn_bundle_state *state = ctx;
 	size_t remaining;
+	ssize_t written;
 
-	if (s->pool != NULL) {
-		/* Parallel path: accumulate into the per-file buffer; the pool
-		 * thread writes it once the entry completes. */
-		/* Defense-in-depth: the parser already clamps delivered data to
-		 * the declared entry size, but bound the memcpy locally too so a
-		 * parser regression cannot overflow the cur_size-sized buffer.
-		 * Written as a subtraction to avoid overflow in the check itself
-		 * (cur_job_filled <= cur_size is the maintained invariant). */
-		if (len > (size_t)s->cur_size - s->cur_job_filled) {
-			error_f("bundle entry data exceeds declared size %llu",
-			    (unsigned long long)s->cur_size);
+	if (state->pool != NULL) {
+		/* Subtraction rather than addition so the check itself cannot
+		 * overflow. cur_job_filled <= cur_size always holds. */
+		if (len > (size_t)state->cur_size - state->cur_job_filled) {
+			error_f("hpn-bundle: entry data exceeds declared size "
+			    "%llu", (unsigned long long)state->cur_size);
 			return -1;
 		}
-		if (s->cur_job_buf != NULL && len > 0)
-			memcpy(s->cur_job_buf + s->cur_job_filled, data, len);
-		s->cur_job_filled += len;
-		s->bytes_received += (uint64_t)len;
-		return 0;
-	}
-
-	remaining = len;
-	if (s->cur_fd < 0)
-		return -1;	/* shouldn't happen - parser always pairs */
-	while (remaining > 0) {
-		ssize_t n = write(s->cur_fd, data, remaining);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			error_f("hpn-bundle: write \"%s\": %s",
-			    s->cur_full_path, strerror(errno));
-			return -1;
+		if (len > 0)
+			memcpy(state->cur_job_buf + state->cur_job_filled,
+			    data, len);
+		state->cur_job_filled += len;
+	} else {
+		remaining = len;
+		while (remaining > 0) {
+			written = write(state->cur_fd, data, remaining);
+			if (written < 0) {
+				if (errno == EINTR)
+					continue;
+				error_f("hpn-bundle: write \"%s\": %s",
+				    state->cur_full_path, strerror(errno));
+				return -1;
+			}
+			data += written;
+			remaining -= (size_t)written;
 		}
-		data      += n;
-		remaining -= (size_t)n;
 	}
-	s->bytes_received += (uint64_t)len;
+	state->bytes_received += (uint64_t)len;
 	return 0;
 }
 
+/* Parser end-of-entry callback. With the pool active, hands the buffered
+ * file to a pool thread as one job. Inline, sets the final size, applies
+ * the preserved mode and mtime, optionally fsyncs, and closes the file.
+ * Returns -1 on any failure, which abandons the bundle. */
 static int
 bundle_upload_entry_end_cb(void *ctx)
 {
-	struct hpn_bundle_state *s = ctx;
-	int preserve = (s->flags & HPN_BUNDLE_FLAG_PRESERVE) != 0;
-	int do_fsync = (s->flags & HPN_BUNDLE_FLAG_FSYNC) != 0;
-	int rc       = 0;
+	struct hpn_bundle_state *state = ctx;
+	struct bundle_write_job *job;
+	struct timespec times[2];
+	int preserve = (state->flags & HPN_BUNDLE_FLAG_PRESERVE) != 0;
+	int do_fsync = (state->flags & HPN_BUNDLE_FLAG_FSYNC) != 0;
+	int rc = 0;
 
-	if (s->pool != NULL) {
-		/* Parallel path: hand the complete file to the writer pool. */
-		struct bundle_write_job *job = calloc(1, sizeof(*job));
-		if (job == NULL) {
+	if (state->pool != NULL) {
+		/* The job takes over the path and the data buffer. On failure
+		 * they stay with the state and bundle_state_free releases
+		 * them. */
+		if ((job = calloc(1, sizeof(*job))) == NULL) {
 			error_f("hpn-bundle: write-job alloc failed");
-			free(s->cur_job_buf);   s->cur_job_buf   = NULL;
-			free(s->cur_full_path); s->cur_full_path = NULL;
 			return -1;
 		}
-		job->full_path = s->cur_full_path;	/* transfer ownership */
-		job->mode      = s->cur_mode;
-		job->mtime     = s->cur_mtime;
-		job->data      = s->cur_job_buf;	/* transfer ownership */
-		job->len       = (size_t)s->cur_size;
-		s->cur_full_path = NULL;
-		s->cur_job_buf   = NULL;
-		if (bundle_pool_enqueue(s->pool, job) != 0) {
+		job->full_path = state->cur_full_path;
+		job->mode      = state->cur_mode;
+		job->mtime     = state->cur_mtime;
+		job->data      = state->cur_job_buf;
+		job->len       = (size_t)state->cur_size;
+		state->cur_full_path = NULL;
+		state->cur_job_buf   = NULL;
+		if (bundle_pool_enqueue(state->pool, job) != 0) {
+			/* A writer thread has already failed. */
 			free(job->full_path);
 			free(job->data);
 			free(job);
-			return -1;	/* a writer already failed; bail */
+			return -1;
 		}
 		return 0;
 	}
 
-	if (s->cur_fd >= 0) {
-		/*
-		 * HPN bundle-truncation fix (#4): set the authoritative file size
-		 * here, at entry completion (replaces the open-time O_TRUNC dropped
-		 * in bundle_upload_entry_cb).  Only a writer that finished the entry
-		 * reaches this point, so a dead connection's abandoned partial never
-		 * shrinks the file; also clears any stale tail left when overwriting
-		 * a larger pre-existing file.
-		 */
-		if (ftruncate(s->cur_fd, (off_t)s->cur_size) != 0) {
-			error_f("hpn-bundle: ftruncate \"%s\": %s",
-			    s->cur_full_path, strerror(errno));
-			rc = -1;
-		}
-		if (preserve) {
-			struct timespec ts[2];
-			/* Exact mode: open(O_CREAT, perm) is subject to umask
-			 * and is ignored entirely on a pre-existing file, so
-			 * force the bits here to match real SFTP -p. After the
-			 * ftruncate, which updates mtime whenever it changes the
-			 * size. */
-			(void)fchmod(s->cur_fd, (mode_t)(s->cur_mode & 0777));
-			ts[0].tv_sec = s->cur_mtime;
-			ts[0].tv_nsec = 0;
-			ts[1].tv_sec = s->cur_mtime;
-			ts[1].tv_nsec = 0;
-			(void)futimens(s->cur_fd, ts);
-		}
-		if (do_fsync && fsync(s->cur_fd) != 0) {
-			error_f("hpn-bundle: fsync \"%s\": %s",
-			    s->cur_full_path, strerror(errno));
-			rc = -1;
-		}
-		if (close(s->cur_fd) != 0) {
-			error_f("hpn-bundle: close \"%s\": %s",
-			    s->cur_full_path, strerror(errno));
-			rc = -1;
-		}
-		s->cur_fd = -1;
+	/* Set the size here rather than with O_TRUNC at open, see the
+	 * comment in bundle_upload_entry_cb. */
+	if (ftruncate(state->cur_fd, (off_t)state->cur_size) != 0) {
+		error_f("hpn-bundle: ftruncate \"%s\": %s",
+		    state->cur_full_path, strerror(errno));
+		rc = -1;
 	}
-	free(s->cur_full_path);
-	s->cur_full_path = NULL;
-	s->cur_size = 0;
+	if (preserve) {
+		/* open(O_CREAT, perm) is subject to umask and ignored on a
+		 * pre-existing file, so force the bits here, after the
+		 * ftruncate, which updates mtime whenever it changes the
+		 * size. */
+		(void)fchmod(state->cur_fd, state->cur_mode);
+		times[0].tv_sec = state->cur_mtime;
+		times[0].tv_nsec = 0;
+		times[1].tv_sec = state->cur_mtime;
+		times[1].tv_nsec = 0;
+		(void)futimens(state->cur_fd, times);
+	}
+	if (do_fsync && fsync(state->cur_fd) != 0) {
+		error_f("hpn-bundle: fsync \"%s\": %s",
+		    state->cur_full_path, strerror(errno));
+		rc = -1;
+	}
+	if (close(state->cur_fd) != 0) {
+		error_f("hpn-bundle: close \"%s\": %s",
+		    state->cur_full_path, strerror(errno));
+		rc = -1;
+	}
+	state->cur_fd = -1;
+	free(state->cur_full_path);
+	state->cur_full_path = NULL;
 	return rc;
 }
 
+/* WRITE on an upload bundle handle. The payload must continue where the
+ * previous one ended, then it goes straight into the parser, whose
+ * callbacks extract the entries. Any parser error fails the bundle. */
 int
 sftp_hpn_server_bundle_write(int handle, uint64_t off,
     const u_char *data, size_t len)
 {
-	struct hpn_bundle_state *s = handle_get_bundle(handle);
-	if (s == NULL)
+	struct hpn_bundle_state *state = handle_get_bundle(handle);
+	int rc;
+
+	if (state == NULL)
 		return SSH2_FX_FAILURE;
-	if (s->mode != HPN_BUNDLE_MODE_UPLOAD) {
+	if (state->mode != HPN_BUNDLE_MODE_UPLOAD) {
 		error_f("hpn-bundle: WRITE on non-upload bundle handle %d",
 		    handle);
 		return SSH2_FX_FAILURE;
 	}
-	/* Client writes monotonically; reject gaps or overlaps. */
-	if (off != s->next_write_off) {
-		error_f("hpn-bundle write offset mismatch: got %llu "
-		    "have %llu",
+	/* The client writes sequentially, so a gap or overlap is a bug. */
+	if (off != state->next_write_offset) {
+		error_f("hpn-bundle: WRITE offset %llu, expected %llu",
 		    (unsigned long long)off,
-		    (unsigned long long)s->next_write_off);
+		    (unsigned long long)state->next_write_offset);
 		return SSH2_FX_FAILURE;
 	}
-	if (s->parser == NULL)
-		return SSH2_FX_FAILURE;
-	/* Feed bytes straight to the parser; entry callbacks open files
-	 * and write data inline (no accumulator).  Streaming preserves
-	 * O(1) per-worker memory regardless of bundle size. */
-	int pr = sftp_hpn_tar_parser_feed(s->parser, data, len);
-	if (pr < 0) {
-		error_f("hpn-bundle WRITE: parser error: %s",
-		    sftp_hpn_tar_parser_error(s->parser));
+	rc = sftp_hpn_tar_parser_feed(state->parser, data, len);
+	if (rc < 0) {
+		error_f("hpn-bundle: parser error: %s",
+		    sftp_hpn_tar_parser_error(state->parser));
 		return SSH2_FX_FAILURE;
 	}
-	s->next_write_off += len;
+	if (rc == 1)		/* parser_feed returns 1 at the end marker */
+		state->end_seen = 1;
+	state->next_write_offset += len;
 	return SSH2_FX_OK;
 }
 
+/* READ on a fetch bundle handle. Packs up to len bytes of archive into
+ * out_buf and reports how many in *out_len. Returns SSH2_FX_EOF once
+ * the archive is exhausted. */
 int
 sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
     size_t len, size_t *out_len)
 {
-	struct hpn_bundle_state *s = handle_get_bundle(handle);
-	if (s == NULL || out_buf == NULL || out_len == NULL)
+	struct hpn_bundle_state *state = handle_get_bundle(handle);
+	size_t produced = 0;
+	/* ssize_t because pack_next returns -1 when a source file fails to
+	 * open or read, or shrinks under it. */
+	ssize_t packed;
+
+	if (state == NULL || out_buf == NULL || out_len == NULL)
 		return SSH2_FX_FAILURE;
-	if (s->mode != HPN_BUNDLE_MODE_FETCH) {
+	if (state->mode != HPN_BUNDLE_MODE_FETCH) {
 		error_f("hpn-bundle: READ on non-fetch bundle handle %d",
 		    handle);
 		return SSH2_FX_FAILURE;
 	}
-	if (s->writer == NULL) {
-		*out_len = 0;
-		return SSH2_FX_EOF;
-	}
-	/* SFTP READs arrive in offset order on a single channel.  Reject
-	 * backward seeks loudly - streaming codec can't replay produced
-	 * bytes.  Forward "gaps" (off > bytes_produced) are silently
-	 * absorbed: they happen naturally when a previous read returned
-	 * fewer than CHUNK_BYTES because the bundle ended mid-chunk.  The
-	 * client fires each read at fixed chunk_index × CHUNK_BYTES, so
-	 * once one read is short, every subsequent read has off >
-	 * bytes_produced.  We just produce whatever's left (probably 0,
-	 * past the EOA marker) and return EOF.  Without this graceful
-	 * absorbtion the client's drain-of-orphan-reads sees STATUS
-	 * FAILURE replies, bails the drain, and the next bundle's READs
-	 * collide with leftover orphan replies on the wire - surfacing as
-	 * "ID mismatch" sftp_conn_die calls and worker abort. */
-	if (off < s->bytes_produced) {
-		error_f("hpn-bundle READ: backward seek %llu (next %llu)",
+	/* READs arrive in offset order. A backward seek is a client bug,
+	 * the codec cannot replay what it produced. A forward gap is
+	 * normal: reads before the end of the archive are always filled,
+	 * and the client fires reads ahead at fixed chunk offsets, so once
+	 * the archive ends mid-chunk every read still in flight starts past
+	 * bytes_produced. Those get whatever is left, usually nothing, and
+	 * then EOF. */
+	if (off < state->bytes_produced) {
+		error_f("hpn-bundle: READ backward seek to %llu, next is %llu",
 		    (unsigned long long)off,
-		    (unsigned long long)s->bytes_produced);
+		    (unsigned long long)state->bytes_produced);
 		return SSH2_FX_FAILURE;
 	}
-
-	/* Fill up to `len` bytes by looping pack_next.  Returns 0 when
-	 * EOA has been emitted and no more bytes will follow. */
-	size_t produced = 0;
+	/* pack_next returns 0 only at the end of the archive. */
 	while (produced < len) {
-		ssize_t n = sftp_hpn_tar_writer_pack_next(s->writer,
+		packed = sftp_hpn_tar_writer_pack_next(state->writer,
 		    out_buf + produced, len - produced);
-		if (n < 0) {
-			error_f("hpn-bundle READ: writer error: %s",
-			    sftp_hpn_tar_writer_error(s->writer));
+		if (packed < 0) {
+			error_f("hpn-bundle: READ writer error: %s",
+			    sftp_hpn_tar_writer_error(state->writer));
 			return SSH2_FX_FAILURE;
 		}
-		if (n == 0)
-			break;	/* EOA */
-		produced += (size_t)n;
+		if (packed == 0)
+			break;
+		/* packed is positive here, the cast only documents the sign. */
+		produced += (size_t)packed;
 	}
 	*out_len = produced;
-	s->bytes_produced += produced;
+	state->bytes_produced += produced;
 	if (produced == 0)
 		return SSH2_FX_EOF;
 	return SSH2_FX_OK;
 }
 
-/*
- * Validate a tar entry pathname before composing it into a destination
- * path.  Rejects:
- *   - NULL or empty
- *   - any "/"-separated component equal to ".." (traversal - always
- *     anomalous for a bundle producer; plain SFTP OPEN never has
- *     reason to encode a "../" climb in a single pathname)
- *   - leading "/" ONLY when dest_dir is non-empty.  When dest_dir is
- *     empty the protocol explicitly delegates path interpretation to
- *     the server's standard SFTP path-resolution (mirroring plain
- *     SFTP OPEN semantics, including absolute paths the user has
- *     permission to write); when dest_dir is non-empty an absolute
- *     pathname composed as "dest_dir/" + "/abs/path" produces weird
- *     semantics that the protocol never intends.
- *
- * Returns 1 if the pathname is safe to extract under the given
- * dest_dir, 0 if it must be rejected.
- */
+/* Validate an entry pathname from the wire before it is joined to
+ * dest_dir. Empty paths and any ".." component are rejected, the client
+ * never produces either. An absolute path is rejected only when
+ * dest_dir is set, since "dest_dir/" + "/abs" means nothing. With an
+ * empty dest_dir the client is supplying complete paths and the usual
+ * SFTP path resolution applies, absolute ones included. Returns 1 when
+ * the path may be extracted, 0 when it must be rejected. */
 static int
-bundle_path_is_safe(const char *p, const char *dest_dir)
+bundle_path_is_safe(const char *path, const char *dest_dir)
 {
-	const char *start, *q;
+	const char *component, *scan;
+	size_t component_len;
 
-	if (p == NULL || *p == '\0')
+	if (path == NULL || *path == '\0')
 		return 0;
-	if (*p == '/' && dest_dir != NULL && *dest_dir != '\0')
+	if (*path == '/' && *dest_dir != '\0')
 		return 0;
-	start = p;
-	for (q = p; ; q++) {
-		if (*q == '/' || *q == '\0') {
-			size_t len = (size_t)(q - start);
-			if (len == 2 && start[0] == '.' && start[1] == '.')
-				return 0;
-			if (*q == '\0')
-				break;
-			start = q + 1;
-		}
+	component = path;
+	/* hand rolled split on '/' and reject on '..' */
+	for (scan = path; ; scan++) {
+		if (*scan != '/' && *scan != '\0')
+			continue;
+		component_len = (size_t)(scan - component);
+		if (component_len == 2 && component[0] == '.' &&
+		    component[1] == '.')
+			return 0;
+		if (*scan == '\0')
+			break;
+		component = scan + 1;
 	}
 	return 1;
 }
 
+/* CLOSE on a bundle handle. A fetch handle only releases its state. An
+ * upload handle also fails on a parser error or a missing end marker,
+ * and joins the writer pool so every file is on disk and any write
+ * failure is in the status before the reply goes out. Always frees the
+ * handle. */
 int
-sftp_hpn_server_bundle_close(int handle, u_int id, struct sshbuf *oqueue)
+sftp_hpn_server_bundle_close(int handle)
 {
-	struct hpn_bundle_state *s = handle_get_bundle(handle);
-	if (s == NULL)
-		return SSH2_FX_FAILURE;
-
-	/* Fetch-mode handles already finished their server-side work in the
-	 * hpn-bundle-fetch handler (queued paths + finish()).  Close is just
-	 * a resource release; the writer's destructor closes any open input
-	 * file and discards the queue. */
-	if (s->mode == HPN_BUNDLE_MODE_FETCH) {
-		debug_f("hpn-bundle close (fetch): handle=%d produced=%llu",
-		    handle, (unsigned long long)s->bytes_produced);
-		bundle_state_free(s);
-		handle_free_bundle(handle);
-		return SSH2_FX_OK;
-	}
-
-	/* UPLOAD: streaming extract already happened during the WRITE
-	 * sequence.  All that remains is to verify the parser reached EOA
-	 * (signalled by the trailing two zero blocks) and release the
-	 * state.  If the parser hasn't seen EOA we accept that as success
-	 * (matches the prior libarchive behaviour where an empty / partial
-	 * stream simply produced no extracted files) but log it. */
+	struct hpn_bundle_state *state = handle_get_bundle(handle);
+	const char *parser_error;
 	int status = SSH2_FX_OK;
-	int preserve = (s->flags & HPN_BUNDLE_FLAG_PRESERVE) != 0;
-	int do_fsync = (s->flags & HPN_BUNDLE_FLAG_FSYNC) != 0;
 
-	debug_f("hpn-bundle close: handle=%d dest=\"%s\" received=%llu "
-	    "preserve=%d fsync=%d",
-	    handle, s->dest_dir,
-	    (unsigned long long)s->bytes_received, preserve, do_fsync);
-
-	const char *perr = sftp_hpn_tar_parser_error(s->parser);
-	if (perr != NULL) {
-		error_f("hpn-bundle close: parser error: %s", perr);
-		status = SSH2_FX_FAILURE;
-	}
-
-	/* Drain + join the writer pool (if active) before replying, so every
-	 * file is on disk and any write error is reflected in the status (and
-	 * a post-transfer verify reads back fully-written files). */
-	if (s->pool != NULL) {
-		if (bundle_write_pool_finish(s->pool) != 0)
+	if (state == NULL)
+		return SSH2_FX_FAILURE;
+	if (state->mode == HPN_BUNDLE_MODE_FETCH) {
+		debug_f("hpn-bundle: close fetch handle=%d produced=%llu",
+		    handle, (unsigned long long)state->bytes_produced);
+	} else {
+		debug_f("hpn-bundle: close upload handle=%d dest=\"%s\" "
+		    "received=%llu flags=0x%x", handle, state->dest_dir,
+		    (unsigned long long)state->bytes_received, state->flags);
+		parser_error = sftp_hpn_tar_parser_error(state->parser);
+		if (parser_error != NULL) {
+			error_f("hpn-bundle: close with parser error: %s",
+			    parser_error);
 			status = SSH2_FX_FAILURE;
-		s->pool = NULL;
+		} else if (!state->end_seen) {
+			error_f("hpn-bundle: close before the end marker, "
+			    "received=%llu",
+			    (unsigned long long)state->bytes_received);
+			status = SSH2_FX_FAILURE;
+		}
+		/* bundle_write_pool_finish frees the pool, so clear the
+		 * pointer before bundle_state_free sees it. */
+		if (bundle_write_pool_finish(state->pool) != 0)
+			status = SSH2_FX_FAILURE;
+		state->pool = NULL;
 	}
-
-	bundle_state_free(s);
+	bundle_state_free(state);
 	handle_free_bundle(handle);
 	return status;
 }
 
-/*
- * Process the hpn-bundle-open@hpnssh.org extended request.
- * Allocates a bundle handle and replies with SSH_FXP_HANDLE.
- * On error replies with SSH_FXP_STATUS / SSH2_FX_FAILURE.
- */
+/* Handle an hpn-bundle-open@hpnssh.org request. The payload is string
+ * dest_dir and u32 flags. Creates the destination directory and an
+ * upload handle and replies with SSH_FXP_HANDLE, or with SSH_FXP_STATUS
+ * on failure. */
 void
 process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
 	char *dest_dir = NULL;
 	uint32_t flags = 0;
-	struct sshbuf *msg = NULL;
-	struct hpn_bundle_state *s = NULL;
-	int handle = -1;
+	struct hpn_bundle_state *state;
+	int handle, saved_errno;
 	int r, status = SSH2_FX_FAILURE;
 
-	/* Operator master toggle: refuse bundle ops with OP_UNSUPPORTED
-	 * when sshd_config has HPNUseBundle=no.  Belt-and-suspenders -
-	 * the extension is normally not advertised in that mode, but a
-	 * misbehaving client could still send a bundle-open. */
+	/* Refuse when HPNUseBundle is off. The extension is not advertised
+	 * then, but a client may still try. */
 	if (!sftp_hpn_server_bundle_enabled()) {
-		debug_f("hpn-bundle-open refused: HPNUseBundle=no");
+		debug_f("hpn-bundle-open: refused, HPNUseBundle=no");
 		status = SSH2_FX_OP_UNSUPPORTED;
 		goto fail;
 	}
-
 	if ((r = sshbuf_get_cstring(iqueue, &dest_dir, NULL)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &flags)) != 0) {
-		error_f("parse hpn-bundle-open: %s", ssh_err(r));
+		error_f("hpn-bundle-open: parse: %s", ssh_err(r));
 		goto fail;
 	}
 	debug3("request %u: hpn-bundle-open dest=\"%s\" flags=0x%x",
 	    id, dest_dir, flags);
 
-	/* Make sure the destination directory exists (mkdir -p semantics).
-	 * Don't fail if it already exists.  Empty dest_dir means the client
-	 * is supplying absolute (or otherwise pre-rooted) per-record paths;
-	 * the per-entry extract loop handles parent-directory creation on
-	 * each record, so the up-front mkdir is unnecessary in that case. */
-	if (*dest_dir != '\0' &&
-	    mkdir_p(dest_dir, 0755) != 0 && errno != EEXIST) {
+	/* Create the destination directory. An empty dest_dir means the
+	 * entries carry complete paths and entry_cb creates each parent. */
+	if (*dest_dir != '\0' && mkdir_p(dest_dir, 0755) != 0) {
+		saved_errno = errno;
 		error_f("hpn-bundle-open: mkdir_p \"%s\": %s",
-		    dest_dir, strerror(errno));
-		status = errno == ENOENT ? SSH2_FX_NO_SUCH_FILE
-		       : errno == EACCES ? SSH2_FX_PERMISSION_DENIED
-		       :                   SSH2_FX_FAILURE;
+		    dest_dir, strerror(saved_errno));
+		if (saved_errno == ENOENT)
+			status = SSH2_FX_NO_SUCH_FILE;
+		else if (saved_errno == EACCES)
+			status = SSH2_FX_PERMISSION_DENIED;
 		goto fail;
 	}
-
-	s = bundle_state_new(dest_dir, flags);
-	if (s == NULL) {
-		status = SSH2_FX_FAILURE;
+	if ((state = bundle_state_new(dest_dir, flags)) == NULL) {
+		error_f("hpn-bundle-open: out of memory");
 		goto fail;
 	}
-
-	handle = handle_new_bundle(s);
-	if (handle < 0) {
+	if ((handle = handle_new_bundle(state)) < 0) {
 		error_f("hpn-bundle-open: handle table full");
-		bundle_state_free(s);
-		status = SSH2_FX_FAILURE;
+		bundle_state_free(state);
 		goto fail;
 	}
-
-	/* Reply with SSH_FXP_HANDLE - standard SFTP framing. */
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	u_char hbuf[sizeof(int32_t)];
-	put_u32(hbuf, (uint32_t)handle);
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_HANDLE)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_string(msg, hbuf, sizeof(hbuf))) != 0)
-		fatal_fr(r, "compose bundle handle reply");
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue bundle handle reply");
-	sshbuf_free(msg);
+	bundle_send_handle_reply(oqueue, id, handle);
 	free(dest_dir);
 	return;
 
@@ -836,154 +719,114 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	free(dest_dir);
 }
 
-/*
- * Process the hpn-bundle-fetch@hpnssh.org extended request.
- *
- * Wire format (after extension name):
- *   u32 flags
- *   u32 n_paths
- *   for i in [0, n_paths): cstring path
- *
- * Streaming model (2026-05-31 libarchive removal):
- *   1. Read each path, stat() it for size/perms/mtime.
- *   2. Queue (src_path, archive_path, mode, size, mtime) into the
- *      writer state machine.
- *   3. Call writer_finish() to signal EOA.
- *   4. Install the bundle_state on the handle table; reply HANDLE.
- *
- * The actual file reads + tar packing happen lazily inside
- * sftp_hpn_server_bundle_read() as the client drains via SSH_FXP_READ.
- * Server memory stays O(1) per bundle (one open file at a time +
- * 512-byte header scratch).
- *
- * Error model: bundle is all-or-nothing.  A per-path stat() failure or
- * non-regular file is logged and skipped (matching upload-side per-
- * entry skip).  There is no per-bundle byte cap and none is needed:
- * streaming keeps server memory O(1) regardless of total bundle size
- * (only one input file is open at a time).  The single client-scaled
- * allocation is the path list, hard-bounded to 65535 entries below.
- * Mid-pack failures surface in bundle_read as SSH2_FX_FAILURE.
- */
+/* Handle an hpn-bundle-fetch@hpnssh.org request. The payload is u32
+ * flags, u32 n_paths and n_paths cstring paths. Each file is checked
+ * and queued into the writer, the archive is finished, and the reply
+ * is SSH_FXP_HANDLE. Packing happens later, in
+ * sftp_hpn_server_bundle_read, as the client reads. A path that cannot
+ * be opened or is not a regular file is logged and left out; the client
+ * sees the missing record and fetches that file on its own. A file that
+ * fails while being packed fails the bundle in bundle_read. */
 void
 process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
-	uint32_t flags = 0, n_paths = 0;
+	uint32_t flags = 0, n_paths = 0, n_queued = 0, i;
 	char **paths = NULL;
-	uint32_t n_collected = 0;
-	struct hpn_bundle_state *s = NULL;
-	struct sshbuf *msg = NULL;
-	int handle = -1;
+	struct hpn_bundle_state *state = NULL;
+	struct stat file_stat;
+	uint64_t file_size;
+	int fd, handle;
 	int r, status = SSH2_FX_FAILURE;
-	uint32_t i;
 
-	/* Operator master toggle (same as bundle-open). */
+	/* Refuse when HPNUseBundle is off, as in bundle-open. */
 	if (!sftp_hpn_server_bundle_enabled()) {
-		debug_f("hpn-bundle-fetch refused: HPNUseBundle=no");
+		debug_f("hpn-bundle-fetch: refused, HPNUseBundle=no");
 		status = SSH2_FX_OP_UNSUPPORTED;
 		goto fail;
 	}
-
 	if ((r = sshbuf_get_u32(iqueue, &flags)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &n_paths)) != 0) {
-		error_f("parse hpn-bundle-fetch header: %s", ssh_err(r));
+		error_f("hpn-bundle-fetch: parse header: %s", ssh_err(r));
 		goto fail;
 	}
-	if (n_paths == 0 || n_paths > 65535) {
+	/* The client never batches more than BUNDLE_BATCH_MAX_FILES, and
+	 * the path list is the one allocation the request sizes. */
+	if (n_paths == 0 || n_paths > BUNDLE_BATCH_MAX_FILES) {
 		error_f("hpn-bundle-fetch: implausible n_paths=%u", n_paths);
 		goto fail;
 	}
-	paths = calloc(n_paths, sizeof(*paths));
-	if (paths == NULL) {
+	if ((paths = calloc(n_paths, sizeof(*paths))) == NULL) {
 		error_f("hpn-bundle-fetch: out of memory");
 		goto fail;
 	}
 	for (i = 0; i < n_paths; i++) {
 		if ((r = sshbuf_get_cstring(iqueue, &paths[i], NULL)) != 0) {
-			error_f("parse hpn-bundle-fetch path[%u]: %s",
+			error_f("hpn-bundle-fetch: parse path[%u]: %s",
 			    i, ssh_err(r));
 			goto fail;
 		}
-		n_collected++;
 	}
-
 	debug3("request %u: hpn-bundle-fetch n=%u flags=0x%x",
 	    id, n_paths, flags);
 
-	s = bundle_state_new_fetch(flags);
-	if (s == NULL) {
+	if ((state = bundle_state_new_fetch()) == NULL) {
 		error_f("hpn-bundle-fetch: out of memory");
 		goto fail;
 	}
-
-	bundle_enabled_init();
+	/* Open rather than stat, so a file this user cannot read is left
+	 * out here instead of failing the whole bundle when pack_next
+	 * reaches it. */
 	for (i = 0; i < n_paths; i++) {
-		struct stat sb;
-		int fd = open(paths[i], O_RDONLY);
-		if (fd < 0) {
+		if ((fd = open(paths[i], O_RDONLY)) < 0) {
 			error_f("hpn-bundle-fetch: open \"%s\": %s",
 			    paths[i], strerror(errno));
 			continue;
 		}
-		if (fstat(fd, &sb) < 0) {
+		if (fstat(fd, &file_stat) < 0) {
 			error_f("hpn-bundle-fetch: fstat \"%s\": %s",
 			    paths[i], strerror(errno));
 			(void)close(fd);
 			continue;
 		}
 		(void)close(fd);
-		if (!S_ISREG(sb.st_mode)) {
-			debug2_f("hpn-bundle-fetch: \"%s\" not regular, skip",
-			    paths[i]);
+		if (!S_ISREG(file_stat.st_mode)) {
+			debug2_f("hpn-bundle-fetch: \"%s\" not regular, "
+			    "left out", paths[i]);
 			continue;
 		}
-		uint64_t fsize = (uint64_t)sb.st_size;
-		if (sftp_hpn_tar_writer_add_file(s->writer,
-		    paths[i], paths[i],
-		    sb.st_mode, fsize, sb.st_mtime) < 0) {
-			error_f("hpn-bundle-fetch: writer_add_file "
-			    "\"%s\" rejected (path too long?)", paths[i]);
+		file_size = (uint64_t)file_stat.st_size;
+		if (sftp_hpn_tar_writer_add_file(state->writer, paths[i],
+		    paths[i], file_stat.st_mode, file_size,
+		    file_stat.st_mtime) < 0) {
+			error_f("hpn-bundle-fetch: writer rejected \"%s\" "
+			    "(path too long or out of memory)", paths[i]);
 			continue;
 		}
-		s->fetch_total_size += fsize;
+		state->fetch_total_size += file_size;
+		n_queued++;
 	}
-	sftp_hpn_tar_writer_finish(s->writer);
+	/* Queue the end marker. Nothing can be added after this. */
+	sftp_hpn_tar_writer_finish(state->writer);
 
-	handle = handle_new_bundle(s);
-	if (handle < 0) {
+	if ((handle = handle_new_bundle(state)) < 0) {
 		error_f("hpn-bundle-fetch: handle table full");
 		goto fail;
 	}
-
-	debug_f("hpn-bundle-fetch: handle=%d n_paths=%u total_size=%llu",
-	    handle, n_paths,
-	    (unsigned long long)s->fetch_total_size);
-
-	s = NULL;	/* ownership transferred to handle table */
-
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	{
-		u_char hbuf[sizeof(int32_t)];
-		put_u32(hbuf, (uint32_t)handle);
-		if ((r = sshbuf_put_u8(msg, SSH2_FXP_HANDLE)) != 0 ||
-		    (r = sshbuf_put_u32(msg, id)) != 0 ||
-		    (r = sshbuf_put_string(msg, hbuf, sizeof(hbuf))) != 0)
-			fatal_fr(r, "compose bundle-fetch handle reply");
-	}
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue bundle-fetch handle reply");
-	sshbuf_free(msg);
-
-	for (i = 0; i < n_collected; i++)
+	debug_f("hpn-bundle-fetch: handle=%d queued=%u of %u total_size=%llu",
+	    handle, n_queued, n_paths,
+	    (unsigned long long)state->fetch_total_size);
+	bundle_send_handle_reply(oqueue, id, handle);
+	for (i = 0; i < n_paths; i++)
 		free(paths[i]);
 	free(paths);
 	return;
 
  fail:
-	if (s != NULL)
-		bundle_state_free(s);
-	for (i = 0; i < n_collected; i++)
-		free(paths[i]);
+	bundle_state_free(state);
+	if (paths != NULL) {
+		for (i = 0; i < n_paths; i++)
+			free(paths[i]);
+	}
 	free(paths);
 	bundle_send_status_failure(oqueue, id, status, "bundle-fetch failure");
 }

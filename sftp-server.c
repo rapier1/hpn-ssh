@@ -957,9 +957,10 @@ process_close(uint32_t id)
 		fatal_fr(r, "parse");
 
 	debug3("request %u: close handle %u", id, handle);
-	/* Phase 5: bundle handles run libarchive extraction at close. */
+	/* Bundle handles were extracted as the WRITEs arrived. Close joins
+	 * the writer pool and reports the result. */
 	if (sftp_hpn_server_is_bundle_handle(handle)) {
-		status = sftp_hpn_server_bundle_close(handle, id, oqueue);
+		status = sftp_hpn_server_bundle_close(handle);
 		send_status(id, status);
 		return;
 	}
@@ -1062,8 +1063,8 @@ process_write(uint32_t id)
 	debug("request %u: write \"%s\" (handle %d) off %llu len %zu",
 	    id, handle_to_name(handle), handle, (unsigned long long)off, len);
 
-	/* Phase 5: bundle handles accumulate the WRITE data for later
-	 * libarchive extraction at close time. */
+	/* Bundle handles feed the WRITE payload to the bundle parser, which
+	 * extracts the entries as they arrive. */
 	if (sftp_hpn_server_is_bundle_handle(handle)) {
 		status = sftp_hpn_server_bundle_write(handle, off, data, len);
 		send_status(id, status);

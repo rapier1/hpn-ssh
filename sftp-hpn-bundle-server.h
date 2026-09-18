@@ -76,22 +76,18 @@ struct sshbuf;
  */
 int sftp_hpn_server_is_bundle_handle(int handle);
 
-/*
- * Feed WRITE bytes for an upload bundle handle into the streaming
- * codec parser.  Entry callbacks open output files, write data, and
- * close on EOA.  Returns SSH2_FX_OK on success or an SSH2_FX_* error.
- */
+/* Feed WRITE bytes for an upload bundle handle into the streaming codec
+ * parser, whose callbacks extract the entries as they arrive, inline or
+ * through the writer pool. Returns SSH2_FX_OK or an SSH2_FX_* error. */
 int sftp_hpn_server_bundle_write(int handle, uint64_t off,
     const u_char *data, size_t len);
 
-/*
- * Close a bundle handle: for UPLOAD, the streaming extract already
- * happened during the WRITE sequence - close just verifies parser
- * state and frees.  For FETCH, close releases the writer and any
- * still-open input file.  Always frees the handle.  Returns the
- * SSH2_FX_* status for the caller to send.
- */
-int sftp_hpn_server_bundle_close(int handle, u_int id, struct sshbuf *oqueue);
+/* Close a bundle handle. For an upload the extract already happened
+ * during the WRITEs, so close fails on a parser error or a missing end
+ * marker, joins the writer pool and frees. For a fetch it releases the
+ * writer and any open input file. Always frees the handle. Returns the
+ * SSH2_FX_* status for the caller to send. */
+int sftp_hpn_server_bundle_close(int handle);
 
 /*
  * Produce up to `len` bytes of tar stream for a fetch-mode bundle
@@ -111,18 +107,12 @@ int sftp_hpn_server_bundle_close(int handle, u_int id, struct sshbuf *oqueue);
 int sftp_hpn_server_bundle_read(int handle, uint64_t off,
     u_char *out_buf, size_t len, size_t *out_len);
 
-/*
- * True iff the bundle path is enabled at this server.  Driven by
- * sshd_config's HPNUseBundle (propagated via the HPN_USE_BUNDLE env
- * var that sshd-session sets).  When false:
- *   - sftp-server.c omits hpn-bundle / hpn-bundle-fetch from the
- *     SSH_FXP_VERSION extension list.
- *   - The bundle handlers refuse bundle-open / bundle-fetch with
- *     SSH2_FX_OP_UNSUPPORTED if a misbehaving client tries anyway.
- *
- * The check is cached after the first call; safe to invoke on any
- * code path without performance concern.
- */
+/* True iff the bundle path is enabled at this server. Driven by
+ * sshd_config's HPNUseBundle, handed to sftp-server as the -B argv flag.
+ * When false sftp-server.c omits hpn-bundle and hpn-bundle-fetch from
+ * the SSH_FXP_VERSION extension list, and the bundle handlers refuse
+ * bundle-open and bundle-fetch with SSH2_FX_OP_UNSUPPORTED if a client
+ * tries anyway. */
 int sftp_hpn_server_bundle_enabled(void);
 
 /*
