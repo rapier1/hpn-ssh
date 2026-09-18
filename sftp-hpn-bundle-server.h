@@ -16,64 +16,32 @@
  *
  */
 
-/*
- * sftp-hpn-bundle-server.h - server-side bundle protocol module.
+/* sftp-hpn-bundle-server.h - server side of the SFTP bundle protocol.
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- *
- * Scope: the server end of the SFTP bundle path -
- *
- *   hpn-bundle-open@hpnssh.org   (upload  - accept tar bytes via WRITE,
- *                                  feed codec parser inline, write files
- *                                  as entries are recognised)
- *   hpn-bundle-fetch@hpnssh.org  (download - accept file list, queue
- *                                  into codec writer, serve READs via
- *                                  pack_next on demand)
- *
- * Most of the server-facing bundle API (sftp_hpn_server_bundle_*) is
- * still declared in sftp-hpn-server.h because sftp-server.c calls
- * those directly from its WRITE / READ / CLOSE dispatch and from
- * process_init's extension advertisement.  This header carries only
- * the two RPC handlers that the dispatcher (sftp_hpn_server_dispatch,
- * in sftp-hpn-server.c) routes by extension name.
- *
- * Module split rationale (2026-05-31): hpn-bundle server protocol +
- * accumulator state had grown to ~1060 lines inside the larger
- * sftp-hpn-server.c (dispatcher, hash-range, file-layout, …).  Moving
- * it out follows the "purpose-named modules" direction in
- * project_hpn_code_organization_vision.md.
- */
+ * Two extended requests: hpn-bundle-open@hpnssh.org, an upload whose
+ * WRITE payloads are fed to the codec parser and extracted as the
+ * entries arrive, and hpn-bundle-fetch@hpnssh.org, a download whose
+ * requested files are queued into the codec writer and packed on
+ * demand as the READs arrive. sftp-server.c routes WRITE, READ and
+ * CLOSE on a bundle handle to the functions here, and advertises the
+ * extension names at session init. The two request handlers are called
+ * by the dispatcher in sftp-hpn-server.c. */
 
 #ifndef _SFTP_HPN_BUNDLE_SERVER_H
 #define _SFTP_HPN_BUNDLE_SERVER_H
 
+/* Extension names, advertised in SSH_FXP_VERSION and routed by the
+ * dispatcher. hpn-bundle is the capability, the other two are the
+ * requests. */
+#define HPN_EXT_BUNDLE          "hpn-bundle@hpnssh.org"
+#define HPN_EXT_BUNDLE_OPEN     "hpn-bundle-open@hpnssh.org"
+#define HPN_EXT_BUNDLE_FETCH    "hpn-bundle-fetch@hpnssh.org"
+
 struct sshbuf;
 
-/* ── Extension wire names (advertised in SSH_FXP_VERSION) ───────────────
- *
- * Strings the dispatcher (sftp-hpn-server.c) routes by, and that
- * sftp-server.c uses in compose_extension at session init.  Moved here
- * from sftp-hpn-server.h during the 2026-05-31 module split - bundle-
- * scope macros belong with the bundle module's other public interface. */
-#define HPN_EXT_BUNDLE          "hpn-bundle@hpnssh.org"         /* capability advert */
-#define HPN_EXT_BUNDLE_OPEN     "hpn-bundle-open@hpnssh.org"    /* upload  bundle open  */
-#define HPN_EXT_BUNDLE_FETCH    "hpn-bundle-fetch@hpnssh.org"   /* download bundle open */
-
-/* ── Bundle handle dispatch (called from sftp-server.c) ─────────────────
- *
- * Bundle handles are allocated by the hpn-bundle-open@hpnssh.org or
- * hpn-bundle-fetch@hpnssh.org extension handlers.  They appear in
- * sftp-server.c's handle table as HANDLE_BUNDLE (a new use type).
- * sftp-server.c's WRITE / READ / CLOSE dispatchers call the helpers
- * below before their standard fd-based dispatch when the handle is
- * marked HANDLE_BUNDLE. */
-
-/*
- * True iff the given handle index refers to a bundle handle allocated
- * by this module.  sftp-server.c calls this in process_write,
- * process_read, and process_close before its standard fd-based
- * dispatch.
- */
+/* Bundle handles live in sftp-server.c's handle table as HANDLE_BUNDLE.
+ * Its WRITE, READ and CLOSE handlers test for one with the predicate
+ * and call the matching function below instead of their fd path. */
 int sftp_hpn_server_is_bundle_handle(int handle);
 
 /* Feed WRITE bytes for an upload bundle handle into the streaming codec
@@ -82,30 +50,20 @@ int sftp_hpn_server_is_bundle_handle(int handle);
 int sftp_hpn_server_bundle_write(int handle, uint64_t off,
     const u_char *data, size_t len);
 
+/* Pack up to len bytes of archive for a fetch bundle handle into
+ * out_buf, setting *out_len. Returns SSH2_FX_OK while data remains and
+ * SSH2_FX_EOF once the archive is exhausted. off must not go backward.
+ * A forward gap is normal once the archive has ended, the client fires
+ * reads ahead at fixed offsets, and yields EOF. */
+int sftp_hpn_server_bundle_read(int handle, uint64_t off,
+    u_char *out_buf, size_t len, size_t *out_len);
+
 /* Close a bundle handle. For an upload the extract already happened
  * during the WRITEs, so close fails on a parser error or a missing end
  * marker, joins the writer pool and frees. For a fetch it releases the
  * writer and any open input file. Always frees the handle. Returns the
  * SSH2_FX_* status for the caller to send. */
 int sftp_hpn_server_bundle_close(int handle);
-
-/*
- * Produce up to `len` bytes of tar stream for a fetch-mode bundle
- * handle into out_buf.  The codec writer packs files into the buffer
- * on demand (no in-memory accumulator).  Returns SSH2_FX_OK with
- * *out_len > 0 while data remains; SSH2_FX_EOF when the writer
- * reaches end-of-archive.
- *
- * Off is monotonic per handle; backward seeks return SSH2_FX_FAILURE.
- * Forward gaps (off > bytes_produced) are absorbed silently - they
- * happen naturally when a previous read returned fewer than CHUNK
- * bytes because the bundle ended mid-chunk.
- *
- * Used by sftp-server.c's process_read for handles where
- * sftp_hpn_server_is_bundle_handle() returns true.
- */
-int sftp_hpn_server_bundle_read(int handle, uint64_t off,
-    u_char *out_buf, size_t len, size_t *out_len);
 
 /* True iff the bundle path is enabled at this server. Driven by
  * sshd_config's HPNUseBundle, handed to sftp-server as the -B argv flag.
@@ -115,23 +73,10 @@ int sftp_hpn_server_bundle_read(int handle, uint64_t off,
  * tries anyway. */
 int sftp_hpn_server_bundle_enabled(void);
 
-/*
- * Process the hpn-bundle-open@hpnssh.org extended request.
- * Allocates a bundle handle (UPLOAD mode) and replies with
- * SSH_FXP_HANDLE.  On error replies with SSH_FXP_STATUS.
- * Called by sftp_hpn_server_dispatch (sftp-hpn-server.c).
- */
+/* The two extended-request handlers. Each creates a bundle handle and
+ * replies with SSH_FXP_HANDLE, or with SSH_FXP_STATUS on failure. */
 void process_hpn_bundle_open(u_int id, struct sshbuf *iqueue,
     struct sshbuf *oqueue);
-
-/*
- * Process the hpn-bundle-fetch@hpnssh.org extended request.
- * Reads each path, stat()s, queues into the codec writer, signals
- * EOA via writer_finish, installs the bundle_state on the handle
- * table, replies with SSH_FXP_HANDLE.  File reads + tar packing
- * happen lazily inside sftp_hpn_server_bundle_read as the client
- * drains via SSH_FXP_READ.  Called by sftp_hpn_server_dispatch.
- */
 void process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue,
     struct sshbuf *oqueue);
 
