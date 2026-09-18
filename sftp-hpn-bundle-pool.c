@@ -16,91 +16,103 @@
  *
  */
 
-/*
- * sftp-hpn-bundle-pool.c - HPN-SSH bundle writer pool (see the header for the
- * design overview).  Used by both the server-side upload extract and the
- * client-side download extract; the producer (parser callbacks) buffers each
- * complete file and enqueues it, and these writer threads do the open/write/
- * close so the per-file MDS round-trips overlap.  Parent dirs are pre-created
- * serially on the producer thread, so the writers only touch independent files.
- */
+/* sftp-hpn-bundle-pool.c - the bundle writer pool, shared by the server
+ * upload extract and the client download extract. The parser callbacks
+ * buffer each complete file and enqueue it, and the writer threads do
+ * the open, write and close, so the per-file metadata round-trips (the
+ * Lustre MDS) overlap. Parent directories are created on the producer
+ * thread, so the writers only touch independent files. Design notes are
+ * in the header. */
 
 #include "includes.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <pthread.h>
 
-#include "log.h"		/* error_f */
-#include "defines.h"		/* HPN_BUNDLE_SIZE_* */
+#include "log.h"
 #include "sftp-hpn-bundle-pool.h"
 
+/* One writer pool. The first group is fixed at construction. Everything
+ * from mu down is shared with the writer threads and touched only with
+ * mu held while any writer thread is alive. */
 struct bundle_write_pool {
 	pthread_t      *threads;
 	int             n_threads;
 	int             max_depth;	/* backpressure: queued-job count cap */
 	uint64_t        max_bytes;	/* backpressure: buffered-byte budget */
+	int             preserve;	/* apply each job's mode and mtime */
+	int             do_fsync;	/* fsync each file before close */
+
 	pthread_mutex_t mu;
-	pthread_cond_t  not_empty;
-	pthread_cond_t  not_full;
-	struct bundle_write_job *head, *tail;
-	int             depth;
+	pthread_cond_t  not_empty;	/* a job was queued, or shutdown */
+	pthread_cond_t  not_full;	/* a job left the queue or finished */
+	struct bundle_write_job *head;	/* FIFO of queued jobs */
+	struct bundle_write_job *tail;
+	int             depth;		/* jobs queued */
+	uint64_t        cur_bytes;	/* bytes held, queued and in write */
+	uint64_t        peak_bytes;	/* high-water mark, logged at finish */
 	int             shutdown;	/* no more jobs will be enqueued */
-	int             error;		/* a writer thread hit an error */
-	int             preserve;
-	int             do_fsync;
-	uint64_t        cur_bytes;	/* held buffer bytes (queued + in-write) */
-	uint64_t        peak_bytes;	/* high-water of cur_bytes (dev metric) */
+	int             error;		/* a writer failed, sticky */
 };
 
-/* Writer-thread count for the bundle extract pool - the fixed compile-time
- * HPN_BUNDLE_WRITER_THREADS_DEFAULT (the measured knee).  The pool is on/off
- * only (HPNWriterPool); the count is not user-tunable. */
+/* Writer-thread count for the pool, the compile-time default from the
+ * header, which is the knee measured in the pool benchmarks. The pool is
+ * on or off via HPNWriterPool, the count is not tunable. */
 int
 bundle_writer_threads(void)
 {
 	return HPN_BUNDLE_WRITER_THREADS_DEFAULT;
 }
 
-/* Backpressure cap on queued jobs (the count backstop; the byte budget is the
- * primary bound).  Derived as max(threads*4, 16); not user-tunable. */
+/* Cap on queued jobs, the count backstop behind the byte budget. Four
+ * per thread, at least 16. */
 static int
 bundle_writer_queue_depth(int n_threads)
 {
 	int n = n_threads * 4;
-	return n < 16 ? 16 : n;
+
+	if (n < 16)
+		return 16;
+	return n;
 }
 
-/* The pool's buffered-byte budget (backpressure) - the fixed compile-time
- * HPN_BUNDLE_WRITER_BUDGET_DEFAULT (16 MiB).  Bounds the pool's RAM regardless
- * of the file-size mix, and sets how many of the biggest eligible files fit in
- * flight.  Not user-tunable; the pool is on/off only via HPNWriterPool. */
+/* The pool's buffered-byte budget, the compile-time default from the
+ * header. Bounds the pool's memory regardless of the file-size mix and
+ * sets how many of the biggest eligible files can be in flight. Not
+ * tunable. */
 uint64_t
 bundle_writer_budget(void)
 {
 	return HPN_BUNDLE_WRITER_BUDGET_DEFAULT;
 }
 
-/* Write one complete file (open/write/perms/truncate/fsync/close).  Mirrors the
- * serial entry_cb+data_cb+entry_end_cb path exactly, so serial and pooled
- * extract produce identical results.  Returns 0 on success, -1 on error. */
+/* Write one complete file: open, write, size, mode and mtime, fsync,
+ * close. Mirrors the inline path in the server's entry callbacks, so
+ * serial and pooled extracts produce the same files. Returns 0 on
+ * success, -1 on error. */
 static int
 bundle_write_one(struct bundle_write_pool *pool, struct bundle_write_job *job)
 {
-	int    fd, rc = 0;
-	mode_t perm = pool->preserve ? (job->mode & 0777) : 0644;
-	size_t off  = 0;
+	struct timespec ts[2];
+	ssize_t written;
+	size_t off = 0;
+	mode_t perm;
+	int fd, rc = 0;
 
-	/* open WITHOUT O_TRUNC; ftruncate below sets the authoritative size
-	 * (the bundle-truncation fix, same as the serial path). */
+	perm = 0644;
+	if (pool->preserve)
+		perm = job->mode;
+
+	/* No O_TRUNC, the ftruncate below sets the size. See the comment in
+	 * bundle_upload_entry_cb in sftp-hpn-bundle-server.c. */
 	fd = open(job->full_path, O_WRONLY | O_CREAT, perm);
 	if (fd < 0) {
 		error_f("hpn-bundle: open \"%s\": %s",
@@ -108,12 +120,14 @@ bundle_write_one(struct bundle_write_pool *pool, struct bundle_write_job *job)
 		return -1;
 	}
 #ifdef HAVE_POSIX_FALLOCATE
+	/* Preallocate the extents. Failure is harmless. */
 	if (job->len > 0)
 		(void)posix_fallocate(fd, 0, (off_t)job->len);
 #endif
+	/* Write the file. */
 	while (off < job->len) {
-		ssize_t n = write(fd, job->data + off, job->len - off);
-		if (n < 0) {
+		written = write(fd, job->data + off, job->len - off);
+		if (written < 0) {
 			if (errno == EINTR)
 				continue;
 			error_f("hpn-bundle: write \"%s\": %s",
@@ -121,23 +135,24 @@ bundle_write_one(struct bundle_write_pool *pool, struct bundle_write_job *job)
 			rc = -1;
 			break;
 		}
-		off += (size_t)n;
+		off += (size_t)written;
 	}
 	if (rc == 0 && ftruncate(fd, (off_t)job->len) != 0) {
 		error_f("hpn-bundle: ftruncate \"%s\": %s",
 		    job->full_path, strerror(errno));
 		rc = -1;
 	}
-	/* After the ftruncate, which updates mtime when it changes the size. */
 	if (rc == 0 && pool->preserve) {
-		struct timespec ts[2];
-		(void)fchmod(fd, (mode_t)(job->mode & 0777));
+		/* open's perm is subject to umask and ignored on an existing
+		 * file, so force the bits here, after the ftruncate. */
+		(void)fchmod(fd, job->mode);
 		ts[0].tv_sec = job->mtime;
 		ts[0].tv_nsec = 0;
 		ts[1].tv_sec = job->mtime;
 		ts[1].tv_nsec = 0;
 		(void)futimens(fd, ts);
 	}
+	/* Sync the file if fsync enabled. */
 	if (rc == 0 && pool->do_fsync && fsync(fd) != 0) {
 		error_f("hpn-bundle: fsync \"%s\": %s",
 		    job->full_path, strerror(errno));
@@ -151,19 +166,24 @@ bundle_write_one(struct bundle_write_pool *pool, struct bundle_write_job *job)
 	return rc;
 }
 
+/* Writer thread body. Takes jobs off the queue until shutdown drains
+ * it. Each job is written, freed, and its bytes returned to the budget.
+ * A failed write sets the sticky error and the thread keeps going, so
+ * the queue still drains and finish can join. */
 static void *
 bundle_write_pool_thread(void *arg)
 {
 	struct bundle_write_pool *pool = arg;
+	struct bundle_write_job *job;
+	uint64_t job_len;
+	int failed;
 
 	for (;;) {
-		struct bundle_write_job *job;
-		uint64_t                 jlen;
-
 		pthread_mutex_lock(&pool->mu);
 		while (pool->head == NULL && !pool->shutdown)
 			pthread_cond_wait(&pool->not_empty, &pool->mu);
-		if (pool->head == NULL) {	/* shutdown and drained */
+		if (pool->head == NULL) {
+			/* Shutdown and the queue is drained. */
 			pthread_mutex_unlock(&pool->mu);
 			break;
 		}
@@ -172,43 +192,64 @@ bundle_write_pool_thread(void *arg)
 		if (pool->head == NULL)
 			pool->tail = NULL;
 		pool->depth--;
+		/* A producer blocked on the count cap can enqueue the next
+		 * job while this one is being written. This signal means a
+		 * queue slot is free. */
 		pthread_cond_signal(&pool->not_full);
 		pthread_mutex_unlock(&pool->mu);
 
-		jlen = (uint64_t)job->len;
-		if (bundle_write_one(pool, job) != 0) {
-			pthread_mutex_lock(&pool->mu);
-			pool->error = 1;
-			pthread_mutex_unlock(&pool->mu);
-		}
+		failed = bundle_write_one(pool, job) != 0;
+		job_len = (uint64_t)job->len;
 		free(job->full_path);
 		free(job->data);
 		free(job);
+
 		pthread_mutex_lock(&pool->mu);
-		pool->cur_bytes -= jlen;	/* buffer released */
-		pthread_cond_signal(&pool->not_full); /* wake byte-blocked producer */
+		if (failed)
+			pool->error = 1;
+		/* The buffer is gone, return its bytes to the budget and wake
+		 * a producer blocked on it. This signal means bytes are free.
+		 * Same condition variable as above, different trigger. */
+		pool->cur_bytes -= job_len;
+		pthread_cond_signal(&pool->not_full);
 		pthread_mutex_unlock(&pool->mu);
 	}
 	return NULL;
 }
 
-/* Enqueue a job, blocking while the queue is at the depth cap (backpressure).
- * Returns -1 if a writer thread has already failed (caller drops the job). */
+/* Whether admitting a job of len bytes must wait. The cur_bytes > 0
+ * guard admits a lone file larger than the whole budget when nothing
+ * else is queued, otherwise it could never be admitted and the producer
+ * would wait forever. Called with mu held. This only exists to simplify
+ * the while loop in bundle_pool_enqueue. */
+static int
+bundle_pool_full(const struct bundle_write_pool *pool, size_t len)
+{
+	if (pool->depth >= pool->max_depth)
+		return 1;
+	if (pool->cur_bytes > 0 && pool->cur_bytes + len > pool->max_bytes)
+		return 1;
+	return 0;
+}
+
+/* Enqueue one complete file, taking ownership of the job. Blocks while
+ * admitting it would exceed the byte budget or the queue is at the count
+ * cap. Returns -1 once a writer has failed, and the job then stays with
+ * the caller. */
 int
-bundle_pool_enqueue(struct bundle_write_pool *pool, struct bundle_write_job *job)
+bundle_pool_enqueue(struct bundle_write_pool *pool,
+    struct bundle_write_job *job)
 {
 	pthread_mutex_lock(&pool->mu);
-	/* Backpressure: block while admitting this file would exceed the byte
-	 * budget (the cur_bytes > 0 guard admits a lone file bigger than the
-	 * whole budget so it can't deadlock), OR the count backstop is hit. */
-	while (((pool->cur_bytes > 0 &&
-	    pool->cur_bytes + (uint64_t)job->len > pool->max_bytes) ||
-	    pool->depth >= pool->max_depth) && !pool->error)
+	/* Wait for the pool to open up. */
+	while (bundle_pool_full(pool, job->len) && !pool->error)
 		pthread_cond_wait(&pool->not_full, &pool->mu);
 	if (pool->error) {
 		pthread_mutex_unlock(&pool->mu);
 		return -1;
 	}
+
+	/* Append the job at the tail of the queue. */
 	job->next = NULL;
 	if (pool->tail != NULL)
 		pool->tail->next = job;
@@ -224,15 +265,17 @@ bundle_pool_enqueue(struct bundle_write_pool *pool, struct bundle_write_job *job
 	return 0;
 }
 
+/* Create the pool and start its writer threads. On any failure whatever
+ * started is joined, everything is freed and NULL is returned, and the
+ * caller writes inline. */
 struct bundle_write_pool *
 bundle_write_pool_new(int n_threads, int preserve, int do_fsync,
     uint64_t budget)
 {
 	struct bundle_write_pool *pool;
-	int i;
+	int i, rc;
 
-	pool = calloc(1, sizeof(*pool));
-	if (pool == NULL)
+	if ((pool = calloc(1, sizeof(*pool))) == NULL)
 		return NULL;
 	pool->n_threads = n_threads;
 	pool->max_depth = bundle_writer_queue_depth(n_threads);
@@ -246,16 +289,17 @@ bundle_write_pool_new(int n_threads, int preserve, int do_fsync,
 	if (pool->threads == NULL)
 		goto fail;
 	for (i = 0; i < n_threads; i++) {
-		if (pthread_create(&pool->threads[i], NULL,
-		    bundle_write_pool_thread, pool) != 0) {
-			/* Join whatever started, then fail -> serial fallback. */
+		rc = pthread_create(&pool->threads[i], NULL,
+		    bundle_write_pool_thread, pool);
+		if (rc != 0) {
+			error_f("hpn-bundle: pthread_create: %s", strerror(rc));
+			/* Shut down and join the threads that did start. */
 			pthread_mutex_lock(&pool->mu);
 			pool->shutdown = 1;
 			pthread_cond_broadcast(&pool->not_empty);
 			pthread_mutex_unlock(&pool->mu);
 			while (--i >= 0)
 				pthread_join(pool->threads[i], NULL);
-			free(pool->threads);
 			goto fail;
 		}
 	}
@@ -264,26 +308,17 @@ bundle_write_pool_new(int n_threads, int preserve, int do_fsync,
 	pthread_mutex_destroy(&pool->mu);
 	pthread_cond_destroy(&pool->not_empty);
 	pthread_cond_destroy(&pool->not_full);
+	free(pool->threads);
 	free(pool);
 	return NULL;
 }
 
-/* Log the pool's final geometry + peak buffered memory at -vvv, for tuning
- * writer-pool sizing without instrumenting a live server. */
-static void
-bundle_pool_emit_stats(const struct bundle_write_pool *pool)
-{
-	debug3("hpn-bundle writer pool: threads=%d depth=%d peak_bytes=%llu",
-	    pool->n_threads, pool->max_depth,
-	    (unsigned long long)pool->peak_bytes);
-}
-
-/* Shut down, join all threads, free any leftover jobs, then destroy + free the
- * pool.  Returns the error flag (nonzero = some file failed). */
+/* Shut the pool down: mark it, wake and join every writer, log the peak
+ * buffered bytes, destroy the synchronization objects and free it.
+ * Returns nonzero if any writer failed. Safe on NULL. */
 int
 bundle_write_pool_finish(struct bundle_write_pool *pool)
 {
-	struct bundle_write_job *job, *next;
 	int i, err;
 
 	if (pool == NULL)
@@ -292,16 +327,16 @@ bundle_write_pool_finish(struct bundle_write_pool *pool)
 	pool->shutdown = 1;
 	pthread_cond_broadcast(&pool->not_empty);
 	pthread_mutex_unlock(&pool->mu);
+	/* Writers exit only once the queue is empty, so after the joins
+	 * there are no jobs left to free. */
 	for (i = 0; i < pool->n_threads; i++)
 		pthread_join(pool->threads[i], NULL);
-	for (job = pool->head; job != NULL; job = next) {	/* defensive */
-		next = job->next;
-		free(job->full_path);
-		free(job->data);
-		free(job);
-	}
 	err = pool->error;
-	bundle_pool_emit_stats(pool);
+	/* Peak buffered bytes at -vvv, for sizing the pool without
+	 * instrumenting a live server. */
+	debug3("hpn-bundle: writer pool threads=%d depth=%d peak_bytes=%llu",
+	    pool->n_threads, pool->max_depth,
+	    (unsigned long long)pool->peak_bytes);
 	pthread_mutex_destroy(&pool->mu);
 	pthread_cond_destroy(&pool->not_empty);
 	pthread_cond_destroy(&pool->not_full);

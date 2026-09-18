@@ -33,8 +33,8 @@
  * complete file and enqueues it; the writer threads do the actual file writes.
  * Files are independent, so there is no ordering constraint.  Backpressure is
  * bounded two ways: a buffered-byte budget (the primary bound on RAM) and a
- * queued-job count cap (a backstop).  Default off (threads == 1 -> the caller's
- * serial path); never required for normal operation.
+ * queued-job count cap (a backstop).  On by default (HPNWriterPool), never
+ * required for normal operation.
  *
  * Error model: all-or-nothing, matching the codec.  A single failed write sets
  * the pool's sticky error; enqueue then returns -1 and finish() reports it, so
@@ -105,11 +105,8 @@ struct bundle_write_pool *bundle_write_pool_new(int n_threads, int preserve,
 int bundle_pool_enqueue(struct bundle_write_pool *pool,
     struct bundle_write_job *job);
 
-/*
- * Shut the pool down, join all threads, free any leftover jobs, destroy and
- * free the pool.  Returns the sticky error flag (nonzero = a file failed).
- * Safe on NULL.
- */
+/* Shut the pool down, join all threads, destroy and free the pool. Returns
+ * the sticky error flag (nonzero = a file failed). Safe on NULL. */
 int bundle_write_pool_finish(struct bundle_write_pool *pool);
 
 #endif /* _SFTP_HPN_BUNDLE_POOL_H */
