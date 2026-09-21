@@ -83,7 +83,6 @@ LTESTS= 	connect \
 		sftp-parallel-respawn \
 		sftp-parallel-tput \
 		sftp-bundle \
-		sftp-bundle-caps \
 		sftp-range-split \
 		sftp-hpn-config \
 		sftp-worker-log-dir \

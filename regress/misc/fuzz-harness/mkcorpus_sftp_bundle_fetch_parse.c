@@ -1,5 +1,22 @@
 /*
- * mkcorpus_sftp_bundle_fetch_parse.c - seed corpus for
+ * Copyright (c) 2026 The Board of Trustees of Carnegie Mellon University.
+ *
+ *  Author: Chris Rapier <rapier@psc.edu>
+ *
+ * This library or code is free software; you can redistribute it and/or
+ * modify it under the terms of the BSD 2 Clause License.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+ * for more details.
+ *
+ * You should have received a copy of the BSD 2-Clause License along with this
+ * code, if not, see https://opensource.org/license/bsd-2-clause.
+ *
+ */
+
+/* mkcorpus_sftp_bundle_fetch_parse.c - seed corpus for
  * sftp_bundle_fetch_parse_fuzz.
  *
  * Emits post-framing hpn-bundle-fetch@hpnssh.org request bodies to
@@ -9,16 +26,13 @@
  *   u32  n_paths
  *   for i in [0, n_paths): cstring path   (u32 length + bytes, no NUL)
  *
- * Seeds span the decode's decision points: the minimal valid request,
- * a multi-path list, an empty-path entry, and n_paths mismatches in
- * both directions (claimed count > paths present, and trailing bytes
- * after the last claimed path) so the fuzzer starts adjacent to the
- * short-read and leftover-bytes branches.
+ * Each seed sits next to one of the decode's branches: the minimal
+ * valid request, a multi-path list, an empty path, a count larger than
+ * the paths supplied, and bytes left over after the last path.
  *
- * Integers are big-endian per SSH wire format, written by hand to keep
- * the generator dependency-free.  Built with plain CFLAGS; invoked by
- * the Makefile `corpus` target and by oss-fuzz's build.sh.
- */
+ * Integers are big-endian per the SSH wire format, written by hand so
+ * the generator has no dependencies. Built with plain CFLAGS by the
+ * Makefile's corpus target. */
 
 #include <sys/stat.h>
 #include <stdio.h>
@@ -126,6 +140,21 @@ main(void)
 	wb_raw(&b, "\xde\xad\xbe\xef", 4);
 	dump("trailing.bin", &b);
 
-	fprintf(stderr, "wrote 5 seeds to %s/\n", CORPUS_DIR);
+	/* zero.bin - n_paths of 0, rejected by the count bound. */
+	wb_u32(&b, 0); wb_u32(&b, 0);
+	dump("zero.bin", &b);
+
+	/* huge.bin - n_paths of 0xffffffff, rejected by the count bound
+	 * before it can drive the allocation. */
+	wb_u32(&b, 0); wb_u32(&b, 0xffffffff); wb_cstring(&b, "p");
+	dump("huge.bin", &b);
+
+	/* badlen.bin - a cstring length prefix far beyond the bytes
+	 * present, for sshbuf's bounds check. */
+	wb_u32(&b, 0); wb_u32(&b, 1); wb_u32(&b, 0xffffffff);
+	wb_raw(&b, "pq", 2);
+	dump("badlen.bin", &b);
+
+	fprintf(stderr, "wrote 8 seeds to %s/\n", CORPUS_DIR);
 	return 0;
 }
