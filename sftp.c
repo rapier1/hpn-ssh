@@ -1446,10 +1446,9 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 	 * verify via the orchestrator) and when verify is off.
 	 */
 	if (!quiet) {
-		size_t vn = sftp_conn_verify_pending_count(conn);
+		int vn = sftp_conn_verify_pending_count(conn);
 		if (vn > 0)
-			mprintf("Verifying %llu file(s)...\n",
-			    (unsigned long long)vn);
+			mprintf("Verifying %d file(s)...\n", vn);
 	}
 	sftp_conn_verify_run_phase(conn);
 
@@ -1658,10 +1657,9 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 	 * verify via the orchestrator) and when verify is off.
 	 */
 	if (!quiet) {
-		size_t vn = sftp_conn_verify_pending_count(conn);
+		int vn = sftp_conn_verify_pending_count(conn);
 		if (vn > 0)
-			mprintf("Verifying %llu file(s)...\n",
-			    (unsigned long long)vn);
+			mprintf("Verifying %d file(s)...\n", vn);
 	}
 	sftp_conn_verify_run_phase(conn);
 

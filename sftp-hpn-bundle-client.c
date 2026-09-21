@@ -537,8 +537,7 @@ bundle_dl_stream_drain_one(struct bundle_dl_stream *stream,
 		sshbuf_free(msg);
 		return -1;
 	}
-	if (monotime_double() - t_start >
-	    SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+	if (monotime_double() - t_start > RDAHEAD_BP_THRESHOLD_SEC)
 		sftp_conn_rdahead_backpressure_signal(stream->conn);
 
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
@@ -1021,7 +1020,7 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t limit)
 		/* if the gap is more than the limit then the path is backing
 		 * up and we need to signal the controller to cut the
 		 * in-flight depth in half */
-		if (gap > SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC)
+		if (gap > RDAHEAD_BP_THRESHOLD_SEC)
 			sftp_conn_rdahead_backpressure_signal(ctx->conn);
 
 		/* get the status. reject malformed status or non status msgs */

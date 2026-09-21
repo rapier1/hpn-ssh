@@ -77,11 +77,10 @@ sntrup761_enc_fuzz: sntrup761_enc_fuzz.o
 sftp_fs_info_fuzz: sftp_fs_info_fuzz.o $(SK_NULL_OBJS) $(COMMON_DEPS)
 	$(CXX) -o $@ sftp_fs_info_fuzz.o $(SK_NULL_OBJS) $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
 
-# sftp_tar_parser_fuzz: the in-tree USTAR parser the product actually
-# runs (replaces the libarchive reader the stale sftp_bundle_extract_fuzz
-# still targets).  Links sftp-hpn-tar.o directly - it is not in libssh.a
-# but its only deps (xmalloc/log/sshbuf) are.  Build ../../../sftp-hpn-tar.o
-# with the same sanitizer opts as libssh (see the top-of-file NB).
+# sftp_tar_parser_fuzz: the in-tree USTAR parser the product runs. Links
+# sftp-hpn-tar.o directly. It is not in libssh.a but its only deps
+# (xmalloc/log/sshbuf) are. Build ../../../sftp-hpn-tar.o with the same
+# sanitizer opts as libssh (see the top-of-file NB).
 sftp_tar_parser_fuzz: sftp_tar_parser_fuzz.o $(SK_NULL_OBJS) ../../../sftp-hpn-tar.o $(COMMON_DEPS)
 	$(CXX) -o $@ sftp_tar_parser_fuzz.o $(SK_NULL_OBJS) ../../../sftp-hpn-tar.o $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
 

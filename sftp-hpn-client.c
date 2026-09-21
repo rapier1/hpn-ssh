@@ -1,16 +1,7 @@
 /*
- * sftp-hpn-client.c - HPN-SSH extensions to the SFTP client connection.
+ * Copyright (c) 2026 The Board of Trustees of Carnegie Mellon University.
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- * Isolating HPN-specific logic here keeps sftp-client.c's diff against
- * upstream small and mechanical.
- *
- * Contents:
- *   - sftp_hpn_conn_init / sftp_hpn_conn_free
- *   - sftp_conn_is_dead      (public API declared in sftp-client.h)
- *   - sftp_set_live_counter  (public API declared in sftp-client.h)
- *
- * Copyright (c) 2024-2026 Pittsburgh Supercomputing Center / HPN-SSH project.
+ *  Author: Chris Rapier <rapier@psc.edu>
  *
  * This library or code is free software; you can redistribute it and/or
  * modify it under the terms of the BSD 2 Clause License.
@@ -25,105 +16,209 @@
  *
  */
 
+/* sftp-hpn-client.c - HPN-SSH extensions to the SFTP client connection,
+ * kept out of sftp-client.c so its diff against upstream stays small.
+ *
+ * Per-connection HPN state, struct sftp_hpn_conn: the dead and
+ * protocol-violation flags, the live counter and yield flag the
+ * parallel watchdog reads, the adaptive read-ahead controller, the
+ * adaptive upload pacer, the hash-operation meter accounting, the
+ * permission and request-policy denial flags, the server's worker cap
+ * and the extension capabilities it advertised. Most of it is reached
+ * through the sftp_conn_* accessors declared in sftp-client.h.
+ *
+ * Transfer helpers: the serial walks' bundle accumulator for upload
+ * and download, deferred directory attribute application, the
+ * hpn-file-layout Lustre stripe request, the hpn-discover-tree fetch,
+ * and the three walk consumers that feed downloads and uploads. */
+
 #include "includes.h"
 
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <dirent.h>
-
 #include <errno.h>
-#include <limits.h>
-#include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
-
-#include <stdarg.h>
-#include <stdio.h>
 
 #include "xmalloc.h"
 #include "log.h"
-#include "misc.h"		/* monotime_double, MINIMUM, MAXIMUM */
-
-/* Needed by the hash-range / check-file / file-layout RPC code that
- * remained in this file after the bundle extraction (2026-05-31).
- * The bundle module owns its own copies of these includes. */
+#include "misc.h" /* monotime_double, MINIMUM, MAXIMUM */
 #include "sftp-common.h"
 #include "sshbuf.h"
-#include "sshkey.h"
 #include "ssherr.h"
 #include "sftp.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"
-#include "progressmeter.h"		/* serial bundle-flush meter */
-#include "sftp-hpn-server.h"	/* hpn-file-layout wire format + status codes */
+#include "progressmeter.h"  /* pm_mprintf */
+/* hpn-file-layout wire format and status codes */
+#include "sftp-hpn-server.h"
 #include "sftp-hpn-client.h"
-#include "sftp-hpn-tree.h"	/* hpn-discover-tree fetch + record codec */
+/* hpn-discover-tree fetch and record codec */
+#include "sftp-hpn-tree.h"	
 #include "hpn-meter.h"	/* progress meter core */
-#include "sftp-hpn-bundle.h"	/* HPN_EXT_HASH_RANGE etc. wire names */
-#include "sftp-hpn-transferlog.h"	/* per-member TransferLog entries */
-#include "utf8.h"		/* mprintf */
+#include "sftp-hpn-bundle.h"  /* bundle flags and eligibility policy */
+#include "sftp-hpn-transferlog.h" /* per-member TransferLog entries */
 
-/* Adaptive upload pacing master switch (-X Pacing=), applied to each new
- * connection at init.  Read-only after option parsing, so parallel workers
- * may consult it without locking. */
-static int sftp_hpn_pace_default = 1;	/* ON by default: wins where the
-					 * duty-cycle pathology lives (j1/j2),
-					 * measured neutral at j4/j8 and on
-					 * fast sinks; -X Pacing=no disables */
+/* forward declaration */
 static uint64_t sftp_hpn_pace_mean(struct sftp_hpn_conn *);
 
+/* Adaptive upload pacing master switch (-X Pacing=), applied to each new
+ * connection at init. On by default: it wins where the duty-cycle
+ * pathology lives, at -j1 and -j2, and measured neutral at -j4, -j8 and
+ * on fast sinks. -X Pacing=no disables it. Read-only after option
+ * parsing, so parallel workers may consult it without locking. */
+static int sftp_hpn_pace_default = 1;
+
+/* Adaptive read-ahead controller. See sftp-hpn-client.h for the
+ * rationale. RDAHEAD_BP_THRESHOLD_SEC lives there too, so the
+ * STATUS-read sites in sftp-client.c share the same constant. */
+#define RDAHEAD_FLOOR		64u	/* smallest depth we ever probe */
+#define RDAHEAD_GROW_PCT	0.15	/* >15% gain keeps doubling */
+#define RDAHEAD_EWMA_ALPHA	0.6	/* weight of the newest window's rate */
+#define RDAHEAD_MIN_WIN_SEC	0.02	/* ignore shorter windows as noise */
+/* At the floor the controller would otherwise wait for a full window of
+ * acks before doubling, tens of seconds on a slow path and the bulk of
+ * the 100 s recovery tails seen after a wedge. After this long at the
+ * floor it doubles once as a probe. If the path is still bad the
+ * backpressure signal shrinks it back, one cycle every 15 s or so. Half
+ * the backpressure threshold, so recovery biases toward depth. */
+#define RDAHEAD_PROBE_INTERVAL_SEC	5.0
+
+/* Adaptive upload pacing. Rate-sample bucket, one ring slot per second
+ * of delivered bytes. */
+#define PACE_BUCKET_MS		1000
+/* Ceiling = 5/4 of the best recent rate: the overshoot bound and the
+ * upward probe. */
+#define PACE_HEADROOM_NUM	5
+#define PACE_HEADROOM_DEN	4
+/* Startup grace: no pacing until a full request pipeline has been acked
+ * and this much wall time has passed, so short transfers never pace. */
+#define PACE_GRACE_MS		1000
+/* Slow-start excision: samples from the first SKIP_MS after the first
+ * ack are discarded, or TCP's ramp would contaminate the mean with rates
+ * that reflect the ramp, not the path or the sink. 3 s covers slow-start
+ * at RTTs up to about 200 ms. At higher RTTs the ramp may leak into the
+ * estimate slightly low, which is the safe direction. */
+#define PACE_SKIP_MS		3000
+/* Re-arm cadence: the actuator is reprogrammed at most this often. Also
+ * the recovery clock, since after an over-correction the ceiling climbs
+ * one HEADROOM step per interval, so convergence is seconds-scale
+ * regardless of file layout. */
+#define PACE_ARM_MS		2000
+/* Hard floor, 32 MiB/s: comfortably below any sink worth protecting and
+ * above the duty-cycle rates the pathology itself produces, so pacing
+ * can never do worse than the disease. A slower sink gets mild
+ * overshoot, which is the unpaced behaviour. */
+#define PACE_FLOOR_BYTES	(32ULL * 1024 * 1024)
+
+/* One entry's position and depth, for sorting the deferred attrs without
+ * disturbing the list itself. */
+struct dirattr_order {
+	int idx;	/* position in the list's v[] */
+	int depth;	/* separator count of the entry's path */
+};
+
+/* A path pair plus attributes collected during a tree walk. Downloads
+ * queue regular files in it, uploads queue subdirectories. src and dst
+ * follow the transfer direction and are owned by the entry. attrs are
+ * the peer's on download and the normalised local stat on upload. */
+struct walk_entry {
+	char	*src;
+	char	*dst;
+	Attrib	 attrs;
+};
+
+/* State threaded through the streaming download consumer, one per
+ * discover-tree walk. */
+struct tree_dl_ctx {
+	/* The walk's roots, borrowed from the caller. Each record's relpath
+	 * is appended to both. */
+	const char			*src;
+	const char			*dst;
+	/* Serial, parallel or third-party sink. */
+	struct sftp_tree_dl_sink	*sink;
+	/* Regular files queued during enumeration and transferred after the
+	 * stream drains. Stays empty for a streaming sink. */
+	struct walk_entry		*files;
+	size_t				 nfiles;
+	size_t				 files_alloc;
+	/* Meter tally for streaming sinks, which transfer during enumeration
+	 * and leave files[] empty. total_overflow marks a byte tally past
+	 * INT64_MAX, after which the meter runs rate-only. */
+	off_t				 streamed_bytes;
+	size_t				 streamed_files;
+	int				 total_overflow;
+	/* -1 after any per-entry failure. */
+	int				 ret;
+};
+
+/* Allocate the per-connection HPN state for a new sftp_conn. Everything
+ * starts zeroed except the three option defaults set here. Dies if
+ * xcalloc fails. */
 struct sftp_hpn_conn *
 sftp_hpn_conn_init(void)
 {
 	struct sftp_hpn_conn *hpn;
 
-	hpn = xcalloc(1, sizeof(struct sftp_hpn_conn));
-	hpn->pace.enabled = sftp_hpn_pace_default;
+	hpn = xcalloc(1, sizeof(*hpn));
+	hpn->pace.enabled = sftp_hpn_pace_default;	/* -X Pacing= switch */
 	hpn->bundle_cfg.use = 1;	/* HPNUseBundle default: yes */
 	hpn->bundle_cfg.writer_pool = 1;	/* HPNWriterPool default: yes */
 	return hpn;
 }
 
+/* Release a connection's HPN state. Frees what the struct owns: the
+ * inline-hash state, the verify queues and the pacing actuator. The
+ * live counter, yield flag and hash meter pointers are borrowed and
+ * left alone. Safe to call with NULL. */
 void
 sftp_hpn_conn_free(struct sftp_hpn_conn *hpn)
 {
+	int i;
+
 	if (hpn == NULL)
 		return;
 	sftp_hpn_src_dispose(hpn);	/* free any in-flight inline-hash state */
-	/* Safety net: pending is normally drained by the verify phase and
-	 * failures handed to sftp.c, both before teardown. */
-	for (size_t i = 0; i < hpn->verify_pending_count; i++) {
+	/* Safety net: verify_pending is normally drained by the verify phase
+	 * and verify_failed_paths handed to sftp.c, both before teardown. */
+	for (i = 0; i < hpn->verify_pending_count; i++) {
 		free(hpn->verify_pending[i].local_path);
 		free(hpn->verify_pending[i].remote_path);
 	}
 	free(hpn->verify_pending);
-	for (size_t i = 0; i < hpn->verify_failed_count; i++)
+	for (i = 0; i < hpn->verify_failed_count; i++)
 		free(hpn->verify_failed_paths[i]);
 	free(hpn->verify_failed_paths);
 	free(hpn->pace.bw);
 	freezero(hpn, sizeof(*hpn));
 }
 
-/*
- * Internal helper called by sftp_conn_is_dead() in sftp-client.c.
+/* Internal helper called by sftp_conn_is_dead() in sftp-client.c.
  * Operates on struct sftp_hpn_conn directly to avoid a dependency on
- * the opaque struct sftp_conn definition.
- */
+ * the opaque struct sftp_conn definition. */
 int
 sftp_hpn_is_dead(struct sftp_hpn_conn *hpn)
 {
 	return hpn != NULL && hpn->dead;
 }
 
+/* A protocol violation is a reply that breaks the SFTP protocol: a
+ * request id other than the one outstanding, or a packet type the
+ * request does not permit. sftp-client.c flags it wherever it decodes
+ * a reply. It points at a MITM or a corrupt server rather than a
+ * dropped connection, so callers abort instead of retrying. */
 int
 sftp_hpn_is_protocol_violation(struct sftp_hpn_conn *hpn)
 {
 	return hpn != NULL && hpn->protocol_violation;
 }
 
+/* Latch a protocol violation. The connection is also marked dead so
+ * every later RPC on it bails. Both flags are sticky. */
 void
 sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *hpn)
 {
@@ -131,32 +226,6 @@ sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *hpn)
 		return;
 	hpn->dead = 1;
 	hpn->protocol_violation = 1;
-}
-
-/*
- * Mark a connection as dead with prominent diagnostic logging, without
- * terminating the process. See header comment for full semantics.
- *
- * Implementation detail: format the message into a stack buffer (avoid
- * heap allocation in error paths), call error() at the standard ERROR
- * log level, then set hpn->dead so subsequent RPC calls bail.
- */
-void
-sftp_hpn_conn_die(struct sftp_hpn_conn *hpn, const char *fmt, ...)
-{
-	char buf[1024];
-	va_list ap;
-
-	va_start(ap, fmt);
-	vsnprintf(buf, sizeof(buf), fmt, ap);
-	va_end(ap);
-
-	/* Distinctive prefix so these are easy to grep out of logs:
-	 * "sftp: connection died: <reason>" */
-	error("sftp: connection died: %s", buf);
-
-	if (hpn != NULL)
-		hpn->dead = 1;
 }
 
 /*
@@ -186,7 +255,7 @@ sftp_hpn_set_yield_flag(struct sftp_hpn_conn *hpn, volatile int *flag)
 	hpn->yield_flag = flag;
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
+/* --------------------------------------------------------------------------
  * Watchdog pause primitive (HPN).  Lets a worker tell the parallel
  * orchestrator's watchdog that it's about to be busy with legitimate
  * non-byte-transfer work (verify-hash phase, fsync after large write,
@@ -199,7 +268,7 @@ sftp_hpn_set_yield_flag(struct sftp_hpn_conn *hpn, volatile int *flag)
  * chunked-resume helpers / sftp_verify_transfer.  Designed to be reusable
  * for any future operation that legitimately pauses byte flow on the SFTP
  * wire for an extended interval.
- * ────────────────────────────────────────────────────────────────────────── */
+ * -------------------------------------------------------------------------- */
 
 void
 sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds)
@@ -272,40 +341,9 @@ sftp_conn_watchdog_resume(struct sftp_conn *conn)
  * progress instead of predicting it.
  */
 
-/* ──────────────────────────────────────────────────────────────────────────
+/* --------------------------------------------------------------------------
  * Adaptive read-ahead controller (HPN).  See sftp-hpn-client.h for rationale.
- * ────────────────────────────────────────────────────────────────────────── */
-
-#define RDAHEAD_FLOOR        64u    /* smallest depth we ever probe */
-#define RDAHEAD_GROW_PCT     0.15   /* >15% throughput gain => keep doubling */
-#define RDAHEAD_EWMA_ALPHA   0.6    /* weight of the newest window's rate */
-#define RDAHEAD_MIN_WIN_SEC  0.02   /* ignore windows shorter than this (noise) */
-
-/*
- * Time-based recovery-probe interval (seconds).  When the controller has
- * been shrunk to floor by Part B's backpressure signal, it would
- * normally wait for a full window of `cur` acks before doubling - at
- * floor=64 on a slow path that can take tens of seconds and was the
- * dominant component of the ~100 s wedge-recovery tails observed in the
- * 2026-05-30 br008 mixed-tree Phase 2b run (iter15, iter16).
- *
- * If we've been at floor with `settled=0` for this long without filling
- * a window, force a doubling without waiting for full-window evidence.
- * This is a probe - if path conditions are still bad, Part B will fire
- * again and shrink us back to floor.  Oscillation cost is bounded:
- * one probe-and-shrink cycle every ~15 s (5 s probe interval + ~10 s
- * Part B detection), which is far better than indefinite floor-stuck
- * behaviour.  Restricted to cur==floor so we never accelerate growth
- * above the BDP knee on healthy paths.
- *
- * Half of Part B's threshold (10 s) is the chosen value: faster than
- * Part B's reaction means we bias toward higher depth, which is the
- * right direction when recovering from a transient wedge.
- */
-#define RDAHEAD_PROBE_INTERVAL_SEC  5.0
-
-/* SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC lives in sftp-hpn-client.h so the
- * STATUS-read sites in sftp-client.c share the same constant. */
+ * -------------------------------------------------------------------------- */
 
 /*
  * Seed the controller for a new connection: cap = num_requests (the -R
@@ -387,7 +425,7 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
 			 * inheriting history from before recovery. */
 			rd->consecutive_bp_at_floor = 0;
 			rd->time_first_at_floor = 0.0;
-			debug2_f("rdahead: time-probe → depth %u -> %u "
+			debug2_f("rdahead: time-probe, depth %u -> %u "
 			    "(forced after %.1fs at floor)",
 			    before, rd->cur, probe_elapsed);
 			return;
@@ -494,10 +532,8 @@ sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *hpn)
 			rd->time_first_at_floor = now;
 		rd->consecutive_bp_at_floor++;
 
-		if (rd->consecutive_bp_at_floor >=
-		    SFTP_HPN_RDAHEAD_REAP_BP_COUNT ||
-		    (now - rd->time_first_at_floor) >
-		    SFTP_HPN_RDAHEAD_REAP_TIME_AT_FLOOR_SEC) {
+		if (rd->consecutive_bp_at_floor >= RDAHEAD_REAP_BP_COUNT ||
+		    (now - rd->time_first_at_floor) > RDAHEAD_REAP_FLOOR_SEC) {
 			debug_f("rdahead: connection persistently degraded "
 			    "(bp_at_floor=%u floor_for=%.1fs); marking dead "
 			    "for orchestrator respawn",
@@ -512,7 +548,7 @@ sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *hpn)
 		}
 	}
 
-	debug2_f("rdahead: backpressure → depth %u -> %u (re-probing)",
+	debug2_f("rdahead: backpressure, depth %u -> %u (re-probing)",
 	    before, rd->cur);
 }
 
@@ -548,7 +584,7 @@ sftp_hpn_rdahead_window(struct sftp_hpn_conn *hpn, size_t nbytes,
 	return (cur < cap) ? cur + 1 : cur;	/* legacy +1 ramp (disabled) */
 }
 
-/* ── BEGIN hpn-file-layout: Lustre auto-stripe (EXPERIMENTAL) ────────────
+/* -- BEGIN hpn-file-layout: Lustre auto-stripe (EXPERIMENTAL) ------------
  *
  * Client side of the hpn-file-layout@hpnssh.org extension.  The caller
  * pre-decides whether to invoke this (Lustre destination + parallel mode
@@ -661,7 +697,7 @@ out:
 	return rc;
 }
 
-/* ── END hpn-file-layout ──────────────────────────────────────────────── */
+/* -- END hpn-file-layout ------------------------------------------------ */
 
 /* ==========================================================================
  * Conn-side bridge wrappers (moved out of sftp-client.c).
@@ -687,17 +723,24 @@ sftp_conn_is_protocol_violation(struct sftp_conn *conn)
 	    sftp_hpn_is_protocol_violation(sftp_conn_hpn(conn));
 }
 
+/* Log a connection failure and latch dead, without terminating the
+ * process. The RPC layer calls this in place of fatal() on paths that
+ * may run inside a parallel worker, where fatal() would take down the
+ * orchestrator. Later RPCs on the connection bail on the dead flag. */
 void
 sftp_conn_die(struct sftp_conn *conn, const char *fmt, ...)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	char buf[1024];
 	va_list ap;
 
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
-
-	sftp_hpn_conn_die(sftp_conn_hpn(conn), "%s", buf);
+	/* Fixed prefix so these are easy to grep out of logs. */
+	error("sftp: connection died: %s", buf);
+	if (hpn != NULL)
+		hpn->dead = 1;
 }
 
 /* Mark `conn` as dead due to a non-recoverable I/O failure - same effect as
@@ -1075,36 +1118,6 @@ sftp_hpn_max_workers_cap(struct sftp_conn *conn)
  * hundreds of small files per second.
  */
 
-/* Rate-sample bucket: one ring slot per second of delivered bytes. */
-#define SFTP_HPN_PACE_BUCKET_MS		1000
-/* Ring length = the estimator's memory, seconds (array size in .h). */
-#define SFTP_HPN_PACE_RING		10
-/* Ceiling = 5/4 x best recent rate: the overshoot bound and the probe. */
-#define SFTP_HPN_PACE_HEADROOM_NUM	5
-#define SFTP_HPN_PACE_HEADROOM_DEN	4
-/* Startup grace: no pacing until a full request pipeline has been acked
- * AND this much wall time has passed - short transfers never pace. */
-#define SFTP_HPN_PACE_GRACE_MS		1000
-/* Slow-start excision: samples from the first SKIP_MS after the first ack
- * are discarded entirely - TCP's ramp would otherwise contaminate the
- * mean with rates that reflect the ramp, not the path or the sink.
- * 3s covers slow-start at RTTs up to ~200ms; at higher RTTs the ramp may
- * leak into the estimate slightly low, which is the safe direction. */
-#define SFTP_HPN_PACE_SKIP_MS		3000
-/* Re-arm cadence: the actuator is reprogrammed at most this often.  Also
- * the recovery clock: after an over-correction the ceiling climbs one
- * HEADROOM step per interval, so convergence is seconds-scale regardless
- * of file layout.  Mid-flow bandwidth_limit_init() at correctly-scaled
- * rates is safe; the earlier "multi-second sleeps" that motivated
- * boundary-only arming were an artifact of the x1024 rate
- * under-programming bug, not of re-initialisation itself. */
-#define SFTP_HPN_PACE_ARM_MS		2000
-/* Hard floor, 32 MiB/s: comfortably below any sink worth protecting and
- * ABOVE the duty-cycle rates the pathology itself produces, so pacing can
- * never do worse than the disease.  A sink slower than this simply gets
- * mild overshoot - i.e., today's behaviour. */
-#define SFTP_HPN_PACE_FLOOR_BYTES	(32ULL * 1024 * 1024)
-
 void
 sftp_hpn_pace_set_enabled(int on)
 {
@@ -1132,24 +1145,24 @@ sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len, u_int num_requests)
 	hpn->pace.bucket_bytes += len;
 
 	dt_ms = now_ms - hpn->pace.bucket_start_ms;
-	if (dt_ms < SFTP_HPN_PACE_BUCKET_MS)
+	if (dt_ms < PACE_BUCKET_MS)
 		return;
 	/* Slow-start excision: throw the bucket away (roll the window but
 	 * record nothing) until SKIP_MS past the first ack. */
-	if (now_ms - hpn->pace.first_ack_ms < SFTP_HPN_PACE_SKIP_MS) {
+	if (now_ms - hpn->pace.first_ack_ms < PACE_SKIP_MS) {
 		hpn->pace.bucket_bytes = 0;
 		hpn->pace.bucket_start_ms = now_ms;
 		return;
 	}
 	rate = hpn->pace.bucket_bytes * 1000 / dt_ms;	/* bytes/sec */
-	hpn->pace.rate_ring[hpn->pace.ring_idx++ % SFTP_HPN_PACE_RING] = rate;
+	hpn->pace.rate_ring[hpn->pace.ring_idx++ % PACE_RING] = rate;
 	hpn->pace.bucket_bytes = 0;
 	hpn->pace.bucket_start_ms = now_ms;
 
 	if (!hpn->pace.active) {
 		if (hpn->pace.acks < num_requests ||
 		    now_ms - hpn->pace.first_ack_ms <
-		    SFTP_HPN_PACE_SKIP_MS + SFTP_HPN_PACE_GRACE_MS)
+		    PACE_SKIP_MS + PACE_GRACE_MS)
 			return;
 		hpn->pace.active = 1;
 		debug2_f("engaged: mean recent rate %llu bytes/s",
@@ -1157,13 +1170,12 @@ sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len, u_int num_requests)
 	}
 
 	/* Time-based re-arm, at most once per ARM interval. */
-	if (now_ms - hpn->pace.last_arm_ms < SFTP_HPN_PACE_ARM_MS)
+	if (now_ms - hpn->pace.last_arm_ms < PACE_ARM_MS)
 		return;
 	best = sftp_hpn_pace_mean(hpn);
 	if (best == 0)
 		return;
-	target_bytes = best *
-	    SFTP_HPN_PACE_HEADROOM_NUM / SFTP_HPN_PACE_HEADROOM_DEN;
+	target_bytes = best * PACE_HEADROOM_NUM / PACE_HEADROOM_DEN;
 	/* Down-step clamp: one re-arm may cut the ceiling by at most half
 	 * (no clamp on the first arm; bw_rate_bits holds bytes x 8).  The
 	 * increase side is inherently bounded (~x5/4 per re-arm, since the
@@ -1175,8 +1187,8 @@ sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len, u_int num_requests)
 	prev_bytes = hpn->pace.bw_rate_bits / 8;
 	if (prev_bytes > 0 && target_bytes < prev_bytes / 2)
 		target_bytes = prev_bytes / 2;
-	if (target_bytes < SFTP_HPN_PACE_FLOOR_BYTES)
-		target_bytes = SFTP_HPN_PACE_FLOOR_BYTES;
+	if (target_bytes < PACE_FLOOR_BYTES)
+		target_bytes = PACE_FLOOR_BYTES;
 	/* Post-famine fast reclaim: if the last bucket consumed >=90%
 	 * of the (famine-cut) ceiling, the sink has recovered - jump
 	 * straight to 80% of the last rising-armed ceiling (= the last
@@ -1230,7 +1242,7 @@ sftp_hpn_pace_mean(struct sftp_hpn_conn *hpn)
 	uint64_t sum = 0;
 	u_int i, n = 0;
 
-	for (i = 0; i < SFTP_HPN_PACE_RING; i++) {
+	for (i = 0; i < PACE_RING; i++) {
 		if (hpn->pace.rate_ring[i] == 0)
 			continue;
 		sum += hpn->pace.rate_ring[i];
@@ -1684,7 +1696,7 @@ sftp_hpn_dirattrs_defer_remote(struct sftp_hpn_dirattr_list *dl,
 
 	memset(d, 0, sizeof(*d));
 	d->path = xstrdup(path);
-	d->a = *a;
+	d->attrs = *a;
 	d->is_local = 0;
 }
 
@@ -1704,13 +1716,6 @@ sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
 		d->mtime = dirattrib->mtime;
 	}
 }
-
-/* One entry's position and depth, for sorting the deferred attrs without
- * disturbing the list itself. */
-struct dirattr_order {
-	int idx;
-	int depth;
-};
 
 /* Depth of a path, counted in separators, for ordering the deferred attrs. */
 static int
@@ -1785,7 +1790,7 @@ sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
 
 		if (!d->is_local) {
 			paths[nr] = d->path;	/* borrowed; list outlives us */
-			attrs[nr] = d->a;
+			attrs[nr] = d->attrs;
 			nr++;
 			continue;
 		}
@@ -1973,32 +1978,6 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 }
 
 /*
- * State threaded through the streaming download consumer.  files[] holds the
- * regular-file transfers queued during enumeration and run after the stream
- * drains; ret accumulates the first per-entry failure.
- */
-struct tree_dl_file {
-	char	*src;
-	char	*dst;
-	Attrib	 a;
-};
-
-struct tree_dl_ctx {
-	const char			*src;
-	const char			*dst;
-	struct sftp_tree_dl_sink	*sink;
-	struct tree_dl_file		*files;
-	size_t				 nfiles, files_alloc;
-	/* Streaming sinks transfer during enumeration and queue nothing, so
-	 * the meter's total and count are tallied here instead of summed from
-	 * files[] afterwards.  Unused when the sink defers. */
-	off_t				 streamed_bytes;
-	size_t				 streamed_files;
-	int				 total_overflow;
-	int				 ret;
-};
-
-/*
  * Per-record callback (see sftp_tree_record_cb).  Directories are created
  * inline: the wire contract emits a parent before its children, so a dir's
  * parent already exists on disk when its record arrives.  Regular files are
@@ -2091,7 +2070,7 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 		}
 		ctx->files[ctx->nfiles].src = new_src;
 		ctx->files[ctx->nfiles].dst = new_dst;
-		ctx->files[ctx->nfiles].a = *a;
+		ctx->files[ctx->nfiles].attrs = *a;
 		ctx->nfiles++;
 		/* new_src / new_dst now owned by the queue */
 		break;
@@ -2173,9 +2152,9 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 		off_t total_bytes = 0;
 
 		for (i = 0; i < ctx.nfiles; i++) {
-			u_int64_t sz = ctx.files[i].a.size;
+			u_int64_t sz = ctx.files[i].attrs.size;
 
-			if ((ctx.files[i].a.flags &
+			if ((ctx.files[i].attrs.flags &
 			    SSH2_FILEXFER_ATTR_SIZE) == 0)
 				continue;
 			/* Sizes come from the peer.  One past off_t, or a sum
@@ -2198,7 +2177,7 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	/* Transfer the files queued during the stream. */
 	for (i = 0; i < ctx.nfiles && !sink->aborting(sink); i++) {
 		if (sink->xfer_file(sink, ctx.files[i].src, ctx.files[i].dst,
-		    &ctx.files[i].a) != 0)
+		    &ctx.files[i].attrs) != 0)
 			ctx.ret = -1;
 	}
  out:
@@ -2303,13 +2282,6 @@ sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
 	return ret;
 }
 
-/* One collected subdirectory awaiting batch creation + recursion. */
-struct upload_walk_subdir {
-	char  *src;
-	char  *dst;
-	Attrib a;
-};
-
 /*
  * Shared upload driver (serial and parallel): enumerate the local directory
  * src, hand each regular file to the sink, collect subdirectories, batch-
@@ -2327,7 +2299,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 	char				*new_src = NULL, *new_dst = NULL;
 	struct stat			 sb;
 	Attrib				 a;
-	struct upload_walk_subdir	*subdirs = NULL;
+	struct walk_entry		*subdirs = NULL;
 	int				 nsub = 0, subcap = 0, i, ret = 0;
 
 	if (depth >= max_depth) {
@@ -2399,7 +2371,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 			subdirs[nsub].src = new_src;
 			subdirs[nsub].dst = new_dst;
 			sftp_hpn_dir_attrs_from_stat(&sb, preserve_flag,
-			    &subdirs[nsub].a);
+			    &subdirs[nsub].attrs);
 			nsub++;
 			new_src = new_dst = NULL;	/* owned by subdirs[] */
 		} else if (S_ISREG(sb.st_mode)) {
@@ -2422,7 +2394,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 
 		for (i = 0; i < nsub; i++) {
 			paths[i] = subdirs[i].dst;
-			attrs[i] = subdirs[i].a;
+			attrs[i] = subdirs[i].attrs;
 		}
 		sink->before_mkdir(sink);	/* parallel: mkdir phase */
 		/* One call: the pipeline windows the requests itself and

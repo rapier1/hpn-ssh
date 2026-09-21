@@ -1372,7 +1372,7 @@ sftp_conn_verify_park(struct sftp_conn *conn, const char *local_path,
 	if (h->live_counter != NULL)
 		return;
 	if (h->verify_pending_count >= h->verify_pending_cap) {
-		size_t newcap = h->verify_pending_cap ?
+		int newcap = h->verify_pending_cap ?
 		    h->verify_pending_cap * 2 : 64;
 		h->verify_pending = xreallocarray(h->verify_pending, newcap,
 		    sizeof(*h->verify_pending));
@@ -1386,7 +1386,7 @@ sftp_conn_verify_park(struct sftp_conn *conn, const char *local_path,
 
 /* Files parked for the classic verify phase; lets the caller print a quiet-
  * gated "Verifying N file(s)..." line before sftp_conn_verify_run_phase. */
-size_t
+int
 sftp_conn_verify_pending_count(struct sftp_conn *conn)
 {
 	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
@@ -1439,7 +1439,7 @@ void
 sftp_conn_verify_run_phase(struct sftp_conn *conn)
 {
 	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
-	size_t i;
+	int i;
 	off_t total = 0, counter = 0;
 	int meter_on = 0;
 	struct stat sb;

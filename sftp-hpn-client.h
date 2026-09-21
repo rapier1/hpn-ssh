@@ -112,6 +112,10 @@ struct sftp_verify_pending_entry {
 
 struct bwlimit;		/* misc.h; kept opaque here */
 
+/* Length of the pacing rate ring, the estimator's memory in seconds.
+ * sftp-hpn-client.c indexes the ring with it. */
+#define PACE_RING	10
+
 /*
  * HPN per-connection state.  Embedded in struct sftp_conn as a single
  * pointer so the upstream struct definition gains exactly one line.
@@ -217,10 +221,10 @@ struct sftp_hpn_conn {
 	 * module that scp does not link.  Both empty on worker conns: the
 	 * orchestrator phase verifies those. */
 	struct sftp_verify_pending_entry *verify_pending;
-	size_t           verify_pending_count;
-	size_t           verify_pending_cap;
+	int              verify_pending_count;
+	int              verify_pending_cap;
 	char           **verify_failed_paths;
-	size_t           verify_failed_count;
+	int              verify_failed_count;
 
 	/* Cumulative SFTP payload bytes that actually crossed the wire on
 	 * this connection: incremented after each successful SSH2_FXP_WRITE
@@ -330,7 +334,7 @@ struct sftp_hpn_conn {
 		 * the ceiling is HEADROOM x the MEAN of these, so stall
 		 * seconds pull the estimate toward the sink's sustained
 		 * rate.  Samples during slow-start are excised. */
-		uint64_t rate_ring[10];
+		uint64_t rate_ring[PACE_RING];
 		u_int    ring_idx;
 		uint64_t last_arm_ms;  /* monotime_ms of last actuator arm */
 		uint64_t bw_rate_bits; /* programmed actuator rate, bits/s */
@@ -406,7 +410,7 @@ struct sftp_hpn_bundle_acc {
  */
 struct sftp_hpn_dirattr {
 	char   *path;
-	Attrib  a;          /* desired final attrs (remote) */
+	Attrib  attrs;      /* desired final attrs (remote) */
 	mode_t  mode;       /* desired final mode (local) */
 	int     is_local;   /* 0: remote setstat; 1: local utimes+chmod */
 	int     set_times;  /* local: dirattrib had ACMODTIME */
@@ -621,7 +625,6 @@ sftp_hpn_bytes_wired_add(struct sftp_hpn_conn *hpn, uint64_t n)
 }
 
 /* Allocate and initialise a zeroed sftp_hpn_conn. Never returns NULL. */
-/* Allocate and initialise a zeroed sftp_hpn_conn. Never returns NULL. */
 struct sftp_hpn_conn *sftp_hpn_conn_init(void);
 
 /* Free an sftp_hpn_conn.  Safe to call with NULL. */
@@ -688,10 +691,10 @@ uint32_t sftp_hpn_rdahead_window(struct sftp_hpn_conn *, size_t nbytes,
  *
  * Used by: do_upload_body, sftp_upload_range, bundle_drain_n.
  */
-#define SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC  10.0
+#define RDAHEAD_BP_THRESHOLD_SEC  10.0
 
 /* Backpressure signal: invoke when a STATUS read blocked longer than
- * SFTP_HPN_RDAHEAD_BP_THRESHOLD_SEC.  Halves the in-flight depth
+ * RDAHEAD_BP_THRESHOLD_SEC.  Halves the in-flight depth
  * (clamped to floor) and clears `settled` so re-probing resumes.  No-op
  * when the controller is disabled.  Threshold detection is the caller's
  * responsibility. */
@@ -719,27 +722,8 @@ void     sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *);
  * discussion at reporter_dispatch_respawns in sftp-parallel.c for why
  * thrash protection stays session-wide for now.
  */
-#define SFTP_HPN_RDAHEAD_REAP_BP_COUNT       5
-#define SFTP_HPN_RDAHEAD_REAP_TIME_AT_FLOOR_SEC  60.0
-
-/*
- * Mark a connection as dead due to a non-recoverable error, log the
- * cause at ERROR level for diagnostic visibility, but do NOT terminate
- * the process. Used by the SFTP RPC layer to replace fatal() in code
- * paths that may run inside a parallel-streams worker, where a true
- * fatal() would crash the entire orchestrator process and take down
- * all other workers.
- *
- * After this is called, sftp_hpn_is_dead() returns true; subsequent
- * RPC calls on this connection short-circuit to error returns. Callers
- * must propagate the failure via their own return value, OR rely on
- * the worker thread's per-unit conn->dead post-check to abandon the
- * unit and exit so the watchdog can respawn.
- *
- * Format string matches fatal() for mechanical conversion.
- */
-void sftp_hpn_conn_die(struct sftp_hpn_conn *, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+#define RDAHEAD_REAP_BP_COUNT   5
+#define RDAHEAD_REAP_FLOOR_SEC  60.0
 
 
 
