@@ -197,59 +197,39 @@ sftp_hpn_conn_free(struct sftp_hpn_conn *hpn)
 	freezero(hpn, sizeof(*hpn));
 }
 
-/* Internal helper called by sftp_conn_is_dead() in sftp-client.c.
- * Operates on struct sftp_hpn_conn directly to avoid a dependency on
- * the opaque struct sftp_conn definition. */
-int
-sftp_hpn_is_dead(struct sftp_hpn_conn *hpn)
-{
-	return hpn != NULL && hpn->dead;
-}
-
-/* A protocol violation is a reply that breaks the SFTP protocol: a
- * request id other than the one outstanding, or a packet type the
- * request does not permit. sftp-client.c flags it wherever it decodes
- * a reply. It points at a MITM or a corrupt server rather than a
- * dropped connection, so callers abort instead of retrying. */
-int
-sftp_hpn_is_protocol_violation(struct sftp_hpn_conn *hpn)
-{
-	return hpn != NULL && hpn->protocol_violation;
-}
-
 /* Latch a protocol violation. The connection is also marked dead so
  * every later RPC on it bails. Both flags are sticky. */
 void
-sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *hpn)
+sftp_conn_set_protocol_violation(struct sftp_conn *conn)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
 	if (hpn == NULL)
 		return;
 	hpn->dead = 1;
 	hpn->protocol_violation = 1;
 }
 
-/*
- * Internal helper called by sftp_set_live_counter() in sftp-client.c.
- * Registers the parallel orchestrator's live-bytes counter for this
- * connection.
- */
+/* Register the parallel orchestrator's live-bytes counter for this
+ * connection. NULL unregisters. */
 void
-sftp_hpn_set_live_counter(struct sftp_hpn_conn *hpn, volatile uint64_t *counter)
+sftp_conn_set_live_counter(struct sftp_conn *conn, volatile uint64_t *counter)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
 	if (hpn == NULL)
 		return;
 	hpn->live_counter = counter;
 }
 
-/*
- * Internal helper called by sftp_set_yield_flag() in sftp-client.c.
- * Registers the parallel orchestrator's cooperative-yield flag for this
- * connection (tail redistribution, phase C); see the field comment in
- * sftp-hpn-client.h.
- */
+/* Register the parallel orchestrator's cooperative-yield flag for this
+ * connection (tail redistribution). See the field comment in
+ * sftp-hpn-client.h. NULL unregisters. */
 void
-sftp_hpn_set_yield_flag(struct sftp_hpn_conn *hpn, volatile int *flag)
+sftp_conn_set_yield_flag(struct sftp_conn *conn, volatile int *flag)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
 	if (hpn == NULL)
 		return;
 	hpn->yield_flag = flag;
@@ -262,7 +242,7 @@ sftp_hpn_set_yield_flag(struct sftp_hpn_conn *hpn, volatile int *flag)
  * bundle accumulate/extract, etc.) for up to N seconds.  Watchdog
  * suppresses its inactivity-based heuristics for this worker until the
  * deadline expires; the SSH-child-gone check still fires regardless.
- * See sftp-hpn-client.h for full semantics.
+ * See sftp-client-internal.h for full semantics.
  *
  * Used now by the verify-hash path in sftp_upload / sftp_download / the
  * chunked-resume helpers / sftp_verify_transfer.  Designed to be reusable
@@ -271,8 +251,9 @@ sftp_hpn_set_yield_flag(struct sftp_hpn_conn *hpn, volatile int *flag)
  * -------------------------------------------------------------------------- */
 
 void
-sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds)
+sftp_conn_watchdog_pause(struct sftp_conn *conn, unsigned int seconds)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	uint64_t deadline_ms;
 	uint64_t cur;
 
@@ -296,18 +277,18 @@ sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds)
 }
 
 void
-sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn)
+sftp_conn_watchdog_resume(struct sftp_conn *conn)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
 	if (hpn == NULL)
 		return;
 	__atomic_store_n(&hpn->watchdog_pause_until_ms, 0,
 	    __ATOMIC_RELAXED);
 }
 
-/* Conn-side wrappers around the watchdog primitives, reaching HPN state
- * through the opaque struct sftp_conn * via sftp_conn_hpn().  Declared in
- * sftp-client-internal.h; moved here from sftp-client.c so the upstream file
- * carries no per-field HPN accessor. */
+/* Deadline of the current watchdog pause in monotonic ms, 0 when none.
+ * Read by the parallel watchdog's classifiers. */
 uint64_t
 sftp_conn_watchdog_pause_until_ms(struct sftp_conn *conn)
 {
@@ -316,18 +297,6 @@ sftp_conn_watchdog_pause_until_ms(struct sftp_conn *conn)
 	if (hpn == NULL)
 		return 0;
 	return __atomic_load_n(&hpn->watchdog_pause_until_ms, __ATOMIC_RELAXED);
-}
-
-void
-sftp_conn_watchdog_pause(struct sftp_conn *conn, unsigned int seconds)
-{
-	sftp_hpn_watchdog_pause(sftp_conn_hpn(conn), seconds);
-}
-
-void
-sftp_conn_watchdog_resume(struct sftp_conn *conn)
-{
-	sftp_hpn_watchdog_resume(sftp_conn_hpn(conn));
 }
 
 /*
@@ -351,8 +320,10 @@ sftp_conn_watchdog_resume(struct sftp_conn *conn)
  * HPN_RDAHEAD=fixed disables adaptation (legacy flat num_requests pipeline).
  */
 void
-sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
+sftp_conn_rdahead_init(struct sftp_conn *conn, uint32_t cap)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
 	if (hpn == NULL)
 		return;
 	memset(&hpn->rd, 0, sizeof(hpn->rd));
@@ -368,7 +339,7 @@ sftp_hpn_rdahead_init(struct sftp_hpn_conn *hpn, uint32_t cap)
  * Current target in-flight depth, or 0 when adaptation is disabled - callers
  * treat 0 as "keep the fixed num_requests pipeline".
  */
-uint32_t
+static uint32_t
 sftp_hpn_rdahead_depth(struct sftp_hpn_conn *hpn)
 {
 	if (hpn == NULL || !hpn->rd.enabled)
@@ -385,8 +356,9 @@ sftp_hpn_rdahead_depth(struct sftp_hpn_conn *hpn)
  * or when disabled.
  */
 void
-sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
+sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	struct sftp_rdahead *rd;
 	double now, elapsed, rate, gain;
 
@@ -497,8 +469,9 @@ sftp_hpn_rdahead_account(struct sftp_hpn_conn *hpn, size_t nbytes)
  * RDAHEAD_BP_THRESHOLD_SEC comment for the design rationale.
  */
 void
-sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *hpn)
+sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	struct sftp_rdahead *rd;
 	uint32_t before;
 	double now;
@@ -558,8 +531,9 @@ sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *hpn)
  * (num_requests) when adaptation is disabled.
  */
 uint32_t
-sftp_hpn_rdahead_cap(struct sftp_hpn_conn *hpn, uint32_t fallback)
+sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	uint32_t d = sftp_hpn_rdahead_depth(hpn);
 
 	return d != 0 ? d : fallback;
@@ -572,12 +546,13 @@ sftp_hpn_rdahead_cap(struct sftp_hpn_conn *hpn, uint32_t fallback)
  * (cur -> cur+1, capped at `cap`) when adaptation is disabled.
  */
 uint32_t
-sftp_hpn_rdahead_window(struct sftp_hpn_conn *hpn, size_t nbytes,
+sftp_conn_rdahead_window(struct sftp_conn *conn, size_t nbytes,
     uint32_t cur, uint32_t cap)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	uint32_t d;
 
-	sftp_hpn_rdahead_account(hpn, nbytes);
+	sftp_conn_rdahead_account(conn, nbytes);
 	d = sftp_hpn_rdahead_depth(hpn);
 	if (d != 0)
 		return d;			/* adaptive depth */
@@ -710,17 +685,27 @@ out:
  * sftp-client-internal.h; call sites are unchanged.
  * ========================================================================== */
 
+/* True once the connection is unusable: set by sftp_conn_die, by an
+ * I/O failure and by a protocol violation. Sticky. */
 int
 sftp_conn_is_dead(struct sftp_conn *conn)
 {
-	return conn != NULL && sftp_hpn_is_dead(sftp_conn_hpn(conn));
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
+	return hpn != NULL && hpn->dead;
 }
 
+/* A protocol violation is a reply that breaks the SFTP protocol: a
+ * request id other than the one outstanding, or a packet type the
+ * request does not permit. sftp-client.c flags it wherever it decodes
+ * a reply. It points at a MITM or a corrupt server rather than a
+ * dropped connection, so callers abort instead of retrying. */
 int
 sftp_conn_is_protocol_violation(struct sftp_conn *conn)
 {
-	return conn != NULL &&
-	    sftp_hpn_is_protocol_violation(sftp_conn_hpn(conn));
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
+	return hpn != NULL && hpn->protocol_violation;
 }
 
 /* Log a connection failure and latch dead, without terminating the
@@ -754,36 +739,11 @@ sftp_conn_set_dead(struct sftp_conn *conn)
 		h->dead = 1;
 }
 
-/* Adaptive read-ahead controller wrappers.  The bundle path works through
- * the opaque struct sftp_conn * and feeds the controller / reads its cap
- * through these; all forward to the sftp_hpn_rdahead_* primitives. */
-uint32_t
-sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback)
-{
-	if (conn == NULL)
-		return fallback;
-	return sftp_hpn_rdahead_cap(sftp_conn_hpn(conn), fallback);
-}
-
-void
-sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes)
-{
-	if (conn != NULL)
-		sftp_hpn_rdahead_account(sftp_conn_hpn(conn), nbytes);
-}
-
-void
-sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn)
-{
-	if (conn != NULL)
-		sftp_hpn_rdahead_backpressure_signal(sftp_conn_hpn(conn));
-}
-
 /* Live-byte accounting wrapper.  The per-worker live counter (armed via
- * sftp_set_live_counter) is what the parallel watchdog's liveness classifiers
- * read; the bundle codec bumps it through this wrapper - without it a worker
- * mid-bundle reads as 0 bytes moved and is killed as born-dead/wedged on any
- * bundle slower than the detection window. */
+ * sftp_conn_set_live_counter) is what the parallel watchdog's liveness
+ * classifiers read; the bundle codec bumps it through this wrapper -
+ * without it a worker mid-bundle reads as 0 bytes moved and is killed as
+ * born-dead/wedged on any bundle slower than the detection window. */
 void
 sftp_conn_live_account(struct sftp_conn *conn, size_t nbytes)
 {
@@ -803,17 +763,17 @@ sftp_conn_bytes_wired(struct sftp_conn *conn)
 	return __atomic_load_n(&h->bytes_wired_payload, __ATOMIC_RELAXED);
 }
 
-/* Conn-level bridge so the bundle module can count wire payload the per-file
- * write loops already count via sftp_hpn_bytes_wired_add - without it,
- * bundle-moved bytes never register as "wired" and the run summary mislabels
- * them as "skipped via resume". */
+/* Account n payload bytes that crossed the wire on this connection, WRITE
+ * payload sent or DATA payload received. Atomic, safe from any thread.
+ * Read back through sftp_conn_bytes_wired. */
 void
 sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n)
 {
-	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 
-	if (h != NULL)
-		sftp_hpn_bytes_wired_add(h, n);
+	if (hpn == NULL || n == 0)
+		return;
+	__atomic_fetch_add(&hpn->bytes_wired_payload, n, __ATOMIC_RELAXED);
 }
 
 /* Unified hash-work accounting (see sftp-hpn-client.h for the model).
@@ -1129,8 +1089,9 @@ sftp_hpn_pace_set_enabled(int on)
  * the actuator on the ARM_MS cadence.  Called from the upload ack-reap
  * path beside the read-ahead controller's hook. */
 void
-sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len, u_int num_requests)
+sftp_conn_pace_ack(struct sftp_conn *conn, size_t len, u_int num_requests)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	uint64_t now_ms, dt_ms, rate, best, target_bytes, rate_bits;
 	uint64_t prev_bytes;
 
@@ -1256,14 +1217,16 @@ sftp_hpn_pace_mean(struct sftp_hpn_conn *hpn)
  * Returns NULL when no limit applies.  Request traffic outside uploads is
  * far below the floor, so the ceiling never binds there. */
 struct bwlimit *
-sftp_hpn_pace_bwlimit(struct sftp_hpn_conn *hpn, struct bwlimit *user_bw,
+sftp_conn_pace_bwlimit(struct sftp_conn *conn, struct bwlimit *user_bw,
     uint64_t user_rate)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
 	/* user_rate is conn->limit_kbps, which -l parsing already scaled to
 	 * the same bits/sec-order units the bucket stores (kbit x 1024), so
 	 * comparing it against bw_rate_bits (bytes x 8) is consistent to
 	 * within the same 2.4% noted at the arming site in
-	 * sftp_hpn_pace_ack. */
+	 * sftp_conn_pace_ack. */
 	if (hpn == NULL || !hpn->pace.active || hpn->pace.bw == NULL)
 		return user_bw;
 	if (user_bw != NULL && user_rate > 0 &&

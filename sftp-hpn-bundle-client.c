@@ -175,7 +175,7 @@ struct bundle_write_ctx {
 	u_int         first_rid;     /* rid of WRITE #0; valid when n_sent > 0 */
 
 	/* Ring of per-WRITE byte counts so bundle_drain_n can feed the exact
-	 * ack size into sftp_hpn_rdahead_account(). Slot n_sent % wsizes_cap
+	 * ack size into sftp_conn_rdahead_account(). Slot n_sent % wsizes_cap
 	 * on store, the slot of the WRITE being drained on read. Sized to
 	 * BUNDLE_MAX_INFLIGHT, the in-flight ceiling, so slots are never
 	 * reused before they are read. NULL if allocation failed, in which

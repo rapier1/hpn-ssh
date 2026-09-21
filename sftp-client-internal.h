@@ -24,6 +24,7 @@
 struct sftp_conn;
 struct sftp_hpn_conn;
 struct sshbuf;
+struct bwlimit;
 
 /*
  * The single bridge from the opaque upstream struct sftp_conn to the HPN
@@ -89,26 +90,50 @@ void sftp_conn_set_dead(struct sftp_conn *conn);
 uint64_t sftp_conn_watchdog_pause_until_ms(struct sftp_conn *conn);
 
 /*
- * Conn-side wrappers around sftp_hpn_watchdog_pause/_resume.  Let HPN
- * extension code that works through the opaque struct sftp_conn * (the
- * chunked-resume helpers, the bundle path, etc.) pause/resume the
- * watchdog without needing to extract conn->hpn manually.  No-op when
- * conn or conn->hpn is NULL.
+ * Watchdog pause: tell the parallel orchestrator's worker-fault watchdog
+ * that this worker is about to spend up to `seconds` doing legitimate
+ * non-byte-transfer work (typically a verify-hash phase, but the primitive
+ * is generic - any code path that knows it will be quiet on the SFTP wire
+ * for an extended interval can use it).  The watchdog suppresses its
+ * inactivity-based kills (born-dead, silence, isolation escalation,
+ * throughput-outlier, born-slow) until the deadline expires or
+ * sftp_conn_watchdog_resume() is called.  The SSH-child-gone check continues
+ * to fire regardless - pause cannot save a worker whose ssh transport has
+ * physically exited.
+ *
+ * Multiple calls extend the pause to the LATER of the existing deadline
+ * and the new deadline; a shorter pause can never shrink a longer one
+ * already in flight.  Auto-expires at the deadline if resume is never
+ * called, bounding any "forgot to clear it" mistake to the declared
+ * duration.  Safe to call from any thread.  No-op when conn or its HPN
+ * state is NULL.
+ *
+ * Pass HPN_HEARTBEAT_REFRESH_SEC (from sftp-hpn-server.h) for the initial
+ * grace window when entering a hash extension call; the server emits
+ * heartbeats during long hashes and each one refreshes the pause for
+ * another HPN_HEARTBEAT_REFRESH_SEC - so the watchdog tracks actual
+ * server progress rather than a size-derived prediction that fell apart
+ * under parallel-worker disk contention.
  */
 void sftp_conn_watchdog_pause(struct sftp_conn *conn, unsigned int seconds);
 void sftp_conn_watchdog_resume(struct sftp_conn *conn);
 
 /*
- * Conn-side wrappers around sftp_hpn_rdahead_cap / _account.  Used by the
- * bundle path in sftp-hpn-client.c (which sees struct sftp_conn as opaque)
- * to bound outstanding bundle WRITEs by the adaptive controller's current
- * depth and to feed accurate per-ack byte counts back to the throughput
- * sampler.  Both return / no-op cleanly when conn or conn->hpn is NULL;
- * sftp_conn_rdahead_cap returns `fallback` in that case so callers see
- * their fixed ceiling instead of zero.
+ * Adaptive read-ahead controller.  init seeds it from the connection's
+ * num_requests (the -R cap) and HPN_RDAHEAD=fixed disables adaptation.
+ * account feeds it the bytes of each completed request and re-sizes the
+ * in-flight depth at window boundaries.  cap returns the current depth,
+ * or `fallback` (the fixed num_requests) when adaptation is off; the
+ * upload sites bound their outstanding requests with it.  window is
+ * account plus the next depth for the download ramp sites: the adaptive
+ * depth, or the legacy +1 ramp from `cur` capped at `cap`.  All no-op or
+ * fall back cleanly when conn or its HPN state is NULL.
  */
-uint32_t sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback);
+void     sftp_conn_rdahead_init(struct sftp_conn *conn, uint32_t cap);
 void     sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes);
+uint32_t sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback);
+uint32_t sftp_conn_rdahead_window(struct sftp_conn *conn, size_t nbytes,
+    uint32_t cur, uint32_t cap);
 
 /*
  * Per-worker live-byte counter bump (no-op when conn/hpn/counter is NULL).
@@ -118,14 +143,43 @@ void     sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes);
 void     sftp_conn_live_account(struct sftp_conn *conn, size_t nbytes);
 
 /*
- * Backpressure signal - caller observed a STATUS read that blocked longer
- * than the controller's wedge-detection threshold (RDAHEAD_BP_THRESHOLD_SEC
- * in sftp-hpn-client.c, currently 10 s).  Forwards to
- * sftp_hpn_rdahead_backpressure_signal, which halves the in-flight depth
- * and re-enters the probe phase.  No-op when conn / conn->hpn is NULL or
- * the controller is disabled.
+ * Backpressure signal: the caller observed a STATUS read that blocked
+ * longer than RDAHEAD_BP_THRESHOLD_SEC (sftp-hpn-client.h) and concluded
+ * the pipeline is wedged.  Halves the in-flight depth, clamped to the
+ * floor, and re-enters the probe phase.  No-op when conn or its HPN state
+ * is NULL or the controller is disabled.
  */
 void sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn);
+
+/*
+ * Adaptive upload pacing (see the pace member of struct sftp_hpn_conn).
+ * ack feeds one WRITE status of len payload bytes to the estimator.
+ * bwlimit returns the token bucket the outbound path should apply, the
+ * tighter of the adaptive ceiling and the user's explicit -l, or NULL
+ * for no limit.  The -X Pacing= master switch is
+ * sftp_hpn_pace_set_enabled in sftp-hpn-client.h.
+ */
+void sftp_conn_pace_ack(struct sftp_conn *conn, size_t len,
+    u_int num_requests);
+struct bwlimit *sftp_conn_pace_bwlimit(struct sftp_conn *conn,
+    struct bwlimit *user_bw, uint64_t user_rate);
+
+/*
+ * Latch a protocol violation on the connection: a reply carried the wrong
+ * request id or a packet type the request does not permit.  Also marks
+ * the connection dead.  Queried with sftp_conn_is_protocol_violation in
+ * sftp-client.h.
+ */
+void sftp_conn_set_protocol_violation(struct sftp_conn *conn);
+
+/*
+ * Register the parallel orchestrator's per-worker live-bytes counter and
+ * cooperative-yield flag on a worker connection.  NULL unregisters.  See
+ * the field comments in sftp-hpn-client.h.
+ */
+void sftp_conn_set_live_counter(struct sftp_conn *conn,
+    volatile uint64_t *counter);
+void sftp_conn_set_yield_flag(struct sftp_conn *conn, volatile int *flag);
 
 /*
  * Set / query the verify transfer enabled state on a connection.

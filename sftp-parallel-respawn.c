@@ -399,9 +399,9 @@ spawn_one_worker(struct sftp_parallel *fleet)
 			error_ft("sftp_init failed");
 		goto fail;
 	}
-	sftp_set_live_counter(worker->conn, &worker->live_bytes);
+	sftp_conn_set_live_counter(worker->conn, &worker->live_bytes);
 	__atomic_store_n(&worker->yield_req, 0, __ATOMIC_RELAXED);
-	sftp_set_yield_flag(worker->conn, &worker->yield_req);
+	sftp_conn_set_yield_flag(worker->conn, &worker->yield_req);
 	/* Propagate verify transfer to this worker conn: the main conn gets
 	 * it at sftp_init time, but worker conns are created here and must be
 	 * told explicitly. Without it the upload's inline source-hash

@@ -191,9 +191,9 @@ struct sftp_hpn_conn {
 	 * orchestrator's inactivity-based heuristics (born-dead, silence,
 	 * isolation, throughput-outlier, born-slow) suppress for this
 	 * worker.  The SSH-child-gone check still fires regardless.  Set by
-	 * sftp_hpn_watchdog_pause() before a long non-byte-transfer
+	 * sftp_conn_watchdog_pause() before a long non-byte-transfer
 	 * operation (verify-hash, fsync after large write, bundle
-	 * accumulate/extract, etc.), cleared by sftp_hpn_watchdog_resume()
+	 * accumulate/extract, etc.), cleared by sftp_conn_watchdog_resume()
 	 * or auto-expires.  Atomic load/store; safe from any thread. */
 	volatile uint64_t watchdog_pause_until_ms;
 
@@ -319,7 +319,7 @@ struct sftp_hpn_conn {
 	 * (~1 RTT delayed); pacing sends to slightly above that rate keeps
 	 * the destination's page cache out of the dirty-limit cliff that
 	 * otherwise collapses single-stream high-RTT uploads into a
-	 * stall/recover duty cycle.  See sftp_hpn_pace_ack() for the
+	 * stall/recover duty cycle.  See sftp_conn_pace_ack() for the
 	 * control law; state is per-connection (per-worker in parallel
 	 * mode).  bw is the reused -l token bucket (struct bwlimit),
 	 * allocated on first activation. */
@@ -610,70 +610,21 @@ void sftp_hpn_src_dispose(struct sftp_hpn_conn *hpn);
 int  sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
 	uint64_t *hash_out);
 
-/*
- * Account `n` payload bytes that just left this connection on a
- * SSH2_FXP_WRITE (upload) or arrived on a SSH2_FXP_DATA (download).
- * Safe with hpn==NULL (no-op) and n==0 (no-op).  Atomic; safe from any
- * thread.  Read back via sftp_conn_bytes_wired() (sftp-client-internal.h).
- */
-static inline void
-sftp_hpn_bytes_wired_add(struct sftp_hpn_conn *hpn, uint64_t n)
-{
-	if (hpn == NULL || n == 0)
-		return;
-	__atomic_fetch_add(&hpn->bytes_wired_payload, n, __ATOMIC_RELAXED);
-}
-
 /* Allocate and initialise a zeroed sftp_hpn_conn. Never returns NULL. */
 struct sftp_hpn_conn *sftp_hpn_conn_init(void);
 
 /* Free an sftp_hpn_conn.  Safe to call with NULL. */
 void sftp_hpn_conn_free(struct sftp_hpn_conn *);
 
-/* Adaptive upload pacing (see the pace member above).  set_enabled is the
- * -X Pacing= switch, consulted at conn init; ack feeds one WRITE status of
- * len payload bytes to the estimator; bwlimit returns the token bucket the
- * outbound path should apply - the TIGHTER of the adaptive ceiling and the
- * user's explicit -l (min composition) - or NULL for no limit. */
+/* Adaptive upload pacing master switch, the -X Pacing= option, consulted
+ * at conn init. The per-connection entry points are declared in
+ * sftp-client-internal.h. */
 void sftp_hpn_pace_set_enabled(int on);
-void sftp_hpn_pace_ack(struct sftp_hpn_conn *hpn, size_t len,
-    u_int num_requests);
-struct bwlimit *sftp_hpn_pace_bwlimit(struct sftp_hpn_conn *hpn,
-    struct bwlimit *user_bw, uint64_t user_rate);
-
-/*
- * Internal helpers called by the thin public-API wrappers in sftp-client.c.
- * These operate on struct sftp_hpn_conn directly so sftp-hpn-client.c has
- * no dependency on the opaque struct sftp_conn.
- */
-int  sftp_hpn_is_dead(struct sftp_hpn_conn *);
-int  sftp_hpn_is_protocol_violation(struct sftp_hpn_conn *);
-void sftp_hpn_set_protocol_violation(struct sftp_hpn_conn *);
-void sftp_hpn_set_live_counter(struct sftp_hpn_conn *, volatile uint64_t *);
-void sftp_hpn_set_yield_flag(struct sftp_hpn_conn *, volatile int *);
-
-/*
- * Adaptive read-ahead (HPN).  init() seeds the controller from the
- * connection's num_requests (the -R cap); account() feeds it bytes as each
- * request completes and re-sizes the window at window boundaries; depth()
- * returns the current target in-flight depth, or 0 when adaptation is
- * disabled (HPN_RDAHEAD=fixed) so the caller falls back to its fixed
- * num_requests pipeline.
- */
-void     sftp_hpn_rdahead_init(struct sftp_hpn_conn *, uint32_t cap);
-void     sftp_hpn_rdahead_account(struct sftp_hpn_conn *, size_t nbytes);
-uint32_t sftp_hpn_rdahead_depth(struct sftp_hpn_conn *);
-/* Higher-level call-site helpers (collapse the repeated cap / ramp logic):
- * _cap = depth-or-fallback for the upload outstanding-cap sites; _window =
- * account + (adaptive depth or legacy +1 ramp) for the download ramp sites. */
-uint32_t sftp_hpn_rdahead_cap(struct sftp_hpn_conn *, uint32_t fallback);
-uint32_t sftp_hpn_rdahead_window(struct sftp_hpn_conn *, size_t nbytes,
-             uint32_t cur, uint32_t cap);
 
 /*
  * Wedge-detection threshold (seconds).  A STATUS read that blocks longer
  * than this is treated as evidence the path is wedged: the caller invokes
- * sftp_hpn_rdahead_backpressure_signal() and the controller multiplicatively
+ * sftp_conn_rdahead_backpressure_signal() and the controller multiplicatively
  * decreases `cur` (analogous to TCP cwnd /= 2 on RTO).
  *
  * 10 s catches every wedge the 2026-05-30 campaign captured (all blocked
@@ -692,13 +643,6 @@ uint32_t sftp_hpn_rdahead_window(struct sftp_hpn_conn *, size_t nbytes,
  * Used by: do_upload_body, sftp_upload_range, bundle_drain_n.
  */
 #define RDAHEAD_BP_THRESHOLD_SEC  10.0
-
-/* Backpressure signal: invoke when a STATUS read blocked longer than
- * RDAHEAD_BP_THRESHOLD_SEC.  Halves the in-flight depth
- * (clamped to floor) and clears `settled` so re-probing resumes.  No-op
- * when the controller is disabled.  Threshold detection is the caller's
- * responsibility. */
-void     sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *);
 
 /*
  * Part D - persistent-degradation reap thresholds.  When the controller
@@ -749,34 +693,6 @@ void     sftp_hpn_rdahead_backpressure_signal(struct sftp_hpn_conn *);
 int sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
     u_int32_t stripe_count, u_int32_t small_threshold, u_int32_t *applied_out,
     u_int32_t *layout_kind_out);
-
-/*
- * Watchdog pause: tell the parallel orchestrator's worker-fault watchdog
- * that this worker is about to spend up to `seconds` doing legitimate
- * non-byte-transfer work (typically a verify-hash phase, but the primitive
- * is generic - any code path that knows it will be quiet on the SFTP wire
- * for an extended interval can use it).  The watchdog suppresses its
- * inactivity-based kills (born-dead, silence, isolation escalation,
- * throughput-outlier, born-slow) until the deadline expires or
- * sftp_hpn_watchdog_resume() is called.  The SSH-child-gone check continues
- * to fire regardless - pause cannot save a worker whose ssh transport has
- * physically exited.
- *
- * Multiple calls extend the pause to the LATER of the existing deadline
- * and the new deadline; a shorter pause can never shrink a longer one
- * already in flight.  Auto-expires at the deadline if resume is never
- * called, bounding any "forgot to clear it" mistake to the declared
- * duration.  Safe to call from any thread.  No-op when hpn is NULL.
- *
- * Pass HPN_HEARTBEAT_REFRESH_SEC (from sftp-hpn-server.h) for the initial
- * grace window when entering a hash extension call; the server emits
- * heartbeats during long hashes and each one refreshes the pause for
- * another HPN_HEARTBEAT_REFRESH_SEC - so the watchdog tracks actual
- * server progress rather than a size-derived prediction that fell apart
- * under parallel-worker disk contention.
- */
-void sftp_hpn_watchdog_pause(struct sftp_hpn_conn *hpn, unsigned int seconds);
-void sftp_hpn_watchdog_resume(struct sftp_hpn_conn *hpn);
 
 /*
  * Compute XXH3_64bits over bytes [offset, offset+length) of the open fd.

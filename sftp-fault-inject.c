@@ -274,7 +274,11 @@ fault_inj_check_send(struct sftp_hpn_conn *hpn, size_t bytes)
 			error("sftp: fault injection: simulating protocol "
 			    "violation after %llu bytes sent",
 			    (unsigned long long)hpn->fault_bytes_sent);
-			sftp_hpn_set_protocol_violation(hpn);
+			/* Only the HPN state is in hand here, so latch both
+			 * flags directly, the way
+			 * sftp_conn_set_protocol_violation does. */
+			hpn->dead = 1;
+			hpn->protocol_violation = 1;
 			return -1;
 		}
 		/* No slot - restore and disarm for this connection. */

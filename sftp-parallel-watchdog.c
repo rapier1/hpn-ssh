@@ -627,7 +627,7 @@ watchdog_check_one_worker(struct sftp_parallel *fleet, struct sftp_worker *worke
 	 * Watchdog pause: a code path on the worker side (typically
 	 * a verify-hash phase, but the primitive is generic) has
 	 * declared a window of legitimate non-byte-transfer work via
-	 * sftp_hpn_watchdog_pause(). Suppress every inactivity-based
+	 * sftp_conn_watchdog_pause(). Suppress every inactivity-based
 	 * heuristic below - none of them can tell "stuck" from
 	 * "legitimately quiet" during the declared window. The
 	 * SSH-child-gone check above still ran; that's the only

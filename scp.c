@@ -925,7 +925,7 @@ main(int argc, char **argv)
                                               "\"%s\": use yes or no", v);
                         } else if (strncasecmp(optarg, "Pacing=", 7) == 0) {
                                 /* Adaptive upload pacing toggle (default
-                                 * yes); see sftp_hpn_pace_ack. */
+                                 * yes); see sftp_conn_pace_ack. */
                                 const char *v = optarg + 7;
                                 if (strcasecmp(v, "no") == 0)
                                         sftp_hpn_pace_set_enabled(0);

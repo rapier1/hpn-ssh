@@ -1025,7 +1025,7 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 		    HPN_METER_FILE, HPN_METER_DOM_TRANSFER,
 		    base != NULL ? base + 1 : target,
 		    (off_t)refetch_total, (off_t *)&live_ctr, 1) == 0) {
-			sftp_set_live_counter(conn, &live_ctr);
+			sftp_conn_set_live_counter(conn, &live_ctr);
 			meter_on = 1;
 		}
 	}
@@ -1083,7 +1083,7 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	rc = 0;
 out:
 	if (meter_on) {
-		sftp_set_live_counter(conn, NULL);
+		sftp_conn_set_live_counter(conn, NULL);
 		hpn_meter_stop(hpn_meter_serial(), conn);
 	}
 	free(ranges);

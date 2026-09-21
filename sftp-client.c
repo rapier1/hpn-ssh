@@ -229,7 +229,7 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 
 	/* HPN adaptive upload pacing: apply the tighter of the adaptive
 	 * ceiling and the user's explicit -l (NULL when neither binds). */
-	bw = sftp_hpn_pace_bwlimit(conn->hpn,
+	bw = sftp_conn_pace_bwlimit(conn,
 	    conn->limit_kbps > 0 ? &conn->bwlimit_out : NULL,
 	    conn->limit_kbps);
 
@@ -402,14 +402,14 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible MITM or "
 		    "server protocol corruption", id, expected_id);
-		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return SSH2_FX_CONNECTION_LOST;
 	}
 	if (type != SSH2_FXP_STATUS) {
 		error_f("expected SSH2_FXP_STATUS(%u) packet, got %u - "
 		    "possible MITM or server protocol corruption",
 		    SSH2_FXP_STATUS, type);
-		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return SSH2_FX_CONNECTION_LOST;
 	}
 
@@ -453,7 +453,7 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 		error("%s: ID mismatch (%u != %u) - possible MITM or "
 		    "server protocol corruption",
 		    errfmt == NULL ? __func__ : errmsg, id, expected_id);
-		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return NULL;
 	}
 	if (type == SSH2_FXP_STATUS) {
@@ -471,7 +471,7 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 		error("%s: expected SSH2_FXP_HANDLE(%u) packet, got %u - "
 		    "possible MITM or server protocol corruption",
 		    errfmt == NULL ? __func__ : errmsg, SSH2_FXP_HANDLE, type);
-		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return NULL;
 	}
 
@@ -502,7 +502,7 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible MITM or "
 		    "server protocol corruption", id, expected_id);
-		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
 	}
 	if (type == SSH2_FXP_STATUS) {
@@ -519,7 +519,7 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 		error_f("expected SSH2_FXP_ATTRS(%u) packet, got %u - "
 		    "possible MITM or server protocol corruption",
 		    SSH2_FXP_ATTRS, type);
-		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
 	}
 	if ((r = decode_attrib(msg, &attr)) != 0) {
@@ -556,7 +556,7 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible MITM or "
 		    "server protocol corruption", id, expected_id);
-		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
 	}
 	if (type == SSH2_FXP_STATUS) {
@@ -573,7 +573,7 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 		error_f("expected SSH2_FXP_EXTENDED_REPLY(%u) packet, "
 		    "got %u - possible MITM or server protocol corruption",
 		    SSH2_FXP_EXTENDED_REPLY, type);
-		sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
 	}
 
@@ -616,7 +616,7 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	ret->num_requests =
 	    num_requests ? num_requests : DEFAULT_NUM_REQUESTS;
 	/* HPN: seed the adaptive read-ahead controller with -R as its ceiling. */
-	sftp_hpn_rdahead_init(ret->hpn, ret->num_requests);
+	sftp_conn_rdahead_init(ret, ret->num_requests);
 	ret->exts = 0;
 	ret->hpn->hpn_max_workers_cap = -1;	/* -1 until/unless the server advertises */
 	ret->limit_kbps = 0;
@@ -833,20 +833,6 @@ sftp_proto_version(struct sftp_conn *conn)
 	return conn->version;
 }
 
-void
-sftp_set_live_counter(struct sftp_conn *conn, volatile uint64_t *counter)
-{
-	if (conn != NULL)
-		sftp_hpn_set_live_counter(conn->hpn, counter);
-}
-
-void
-sftp_set_yield_flag(struct sftp_conn *conn, volatile int *flag)
-{
-	if (conn != NULL)
-		sftp_hpn_set_yield_flag(conn->hpn, flag);
-}
-
 /* Cooperative yield requested for this connection (tail redistribution)?
  * Checked once per loop iteration by the range transfer paths. */
 static int
@@ -892,7 +878,7 @@ sftp_get_limits(struct sftp_conn *conn, struct sftp_limits *limits)
 	if (id != msg_id) {
 		error_f("ID mismatch (%u != %u) - possible protocol corruption",
 		    msg_id, id);
-		sftp_hpn_set_protocol_violation(conn->hpn);
+		sftp_conn_set_protocol_violation(conn);
 		return -1;
 	}
 	if (type != SSH2_FXP_EXTENDED_REPLY) {
@@ -998,7 +984,7 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 		if (id != expected_id) {
 			error_f("ID mismatch (%u != %u) - possible protocol corruption",
 			    id, expected_id);
-			sftp_hpn_set_protocol_violation(conn->hpn);
+			sftp_conn_set_protocol_violation(conn);
 			status = -1;
 			goto out;
 		}
@@ -1016,7 +1002,7 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 		} else if (type != SSH2_FXP_NAME) {
 			error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
 			    "possible protocol corruption", SSH2_FXP_NAME, type);
-			sftp_hpn_set_protocol_violation(conn->hpn);
+			sftp_conn_set_protocol_violation(conn);
 			status = -1;
 			goto out;
 		}
@@ -1455,7 +1441,7 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible protocol corruption",
 		    id, expected_id);
-		sftp_hpn_set_protocol_violation(conn->hpn);
+		sftp_conn_set_protocol_violation(conn);
 		return NULL;
 	}
 
@@ -1473,7 +1459,7 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 	} else if (type != SSH2_FXP_NAME) {
 		error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
 		    "possible protocol corruption", SSH2_FXP_NAME, type);
-		sftp_hpn_set_protocol_violation(conn->hpn);
+		sftp_conn_set_protocol_violation(conn);
 		return NULL;
 	}
 
@@ -1796,7 +1782,7 @@ sftp_readlink(struct sftp_conn *conn, const char *path)
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible protocol corruption",
 		    id, expected_id);
-		sftp_hpn_set_protocol_violation(conn->hpn);
+		sftp_conn_set_protocol_violation(conn);
 		return NULL;
 	}
 
@@ -1810,7 +1796,7 @@ sftp_readlink(struct sftp_conn *conn, const char *path)
 	} else if (type != SSH2_FXP_NAME) {
 		error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
 		    "possible protocol corruption", SSH2_FXP_NAME, type);
-		sftp_hpn_set_protocol_violation(conn->hpn);
+		sftp_conn_set_protocol_violation(conn);
 		return NULL;
 	}
 
@@ -2174,7 +2160,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * server still hashes instead of returning the
 				 * (removed) fully-allocated sentinel.
 				 */
-				sftp_hpn_watchdog_pause(conn->hpn,
+				sftp_conn_watchdog_pause(conn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
 				/* hash-work op: remote leg first here */
 				sftp_conn_hash_op_begin(conn, 2 * size);
@@ -2183,7 +2169,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				sftp_conn_hash_op_leg(conn, size);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    size, &local_hash);
-				sftp_hpn_watchdog_resume(conn->hpn);
+				sftp_conn_watchdog_resume(conn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
 					debug("verified transfer: "
@@ -2242,7 +2228,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * (no trust shortcut), so the comparison below
 				 * is exact.
 				 */
-				sftp_hpn_watchdog_pause(conn->hpn,
+				sftp_conn_watchdog_pause(conn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
 				/* hash-work op: local leg first here */
 				sftp_conn_hash_op_begin(conn,
@@ -2254,7 +2240,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				rret = sftp_hpn_hash_remote_file(conn,
 				    remote_path, (uint64_t)st.st_size,
 				    &remote_hash);
-				sftp_hpn_watchdog_resume(conn->hpn);
+				sftp_conn_watchdog_resume(conn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
 					debug("verified resume: prefix "
@@ -2357,7 +2343,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				break;
 			if (monotime_double() - t_data_start >
 			    RDAHEAD_BP_THRESHOLD_SEC)
-				sftp_hpn_rdahead_backpressure_signal(conn->hpn);
+				sftp_conn_rdahead_backpressure_signal(conn);
 		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &id)) != 0)
@@ -2399,7 +2385,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			if (len > req->len)
 				fatal("Received more data than asked for "
 				    "%zu > %zu", len, req->len);
-			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
+			sftp_conn_bytes_wired_add(conn, (uint64_t)len);
 			if (len == 0) {
 				/* Anti-livelock guard (upstream c1cebbc7c):
 				 * tolerate one zero-length DATA reply, rule
@@ -2477,8 +2463,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					max_req = 1;
 				} else {
 					/* HPN adaptive read-ahead window. */
-					max_req = sftp_hpn_rdahead_window(
-					    conn->hpn, len, max_req,
+					max_req = sftp_conn_rdahead_window(
+					    conn, len, max_req,
 					    conn->num_requests);
 				}
 			}
@@ -2486,7 +2472,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		default:
 			error_f("Expected SSH2_FXP_DATA(%u) packet, got %u - "
 			    "possible protocol corruption", SSH2_FXP_DATA, type);
-			sftp_hpn_set_protocol_violation(conn->hpn);
+			sftp_conn_set_protocol_violation(conn);
 			read_error = 1;
 			/*
 			 * Drain the in-flight TAILQ inline so the outer while
@@ -2880,7 +2866,7 @@ do_upload_body(struct sftp_conn *conn,
 				fatal_fr(r, "compose");
 			if (send_msg(conn, msg) != 0)
 				break;
-			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
+			sftp_conn_bytes_wired_add(conn, (uint64_t)len);
 			debug3("Sent message SSH2_FXP_WRITE I:%u O:%llu S:%u",
 			    id, (unsigned long long)offset, len);
 		} else if (TAILQ_FIRST(&acks) == NULL)
@@ -2900,7 +2886,7 @@ do_upload_body(struct sftp_conn *conn,
 		/* HPN adaptive read-ahead: cap outstanding writes at the
 		 * controller's current depth (num_requests when disabled). */
 		if (id == startid || len == 0 ||
-		    id - ackid >= sftp_hpn_rdahead_cap(conn->hpn,
+		    id - ackid >= sftp_conn_rdahead_cap(conn,
 		    conn->num_requests)) {
 			u_int rid;
 			double t_status_start;
@@ -2917,7 +2903,7 @@ do_upload_body(struct sftp_conn *conn,
 				break;
 			if (monotime_double() - t_status_start >
 			    RDAHEAD_BP_THRESHOLD_SEC)
-				sftp_hpn_rdahead_backpressure_signal(conn->hpn);
+				sftp_conn_rdahead_backpressure_signal(conn);
 			if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 			    (r = sshbuf_get_u32(msg, &rid)) != 0)
 				fatal_fr(r, "parse");
@@ -2954,10 +2940,10 @@ do_upload_body(struct sftp_conn *conn,
 				__atomic_fetch_add(conn->hpn->live_counter, ack->len,
 				    __ATOMIC_RELAXED);
 			/* HPN adaptive read-ahead: feed acked bytes. */
-			sftp_hpn_rdahead_account(conn->hpn, ack->len);
+			sftp_conn_rdahead_account(conn, ack->len);
 			/* HPN adaptive upload pacing: feed the ack-rate
-			 * estimator (see sftp_hpn_pace_ack). */
-			sftp_hpn_pace_ack(conn->hpn, ack->len,
+			 * estimator (see sftp_conn_pace_ack). */
+			sftp_conn_pace_ack(conn, ack->len,
 			    conn->num_requests);
 			/*
 			 * Track both the highest offset acknowledged and the
@@ -3130,7 +3116,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * kill the worker mid-hash.  Auto-expires;
 				 * resume() called explicitly on the success
 				 * paths below for promptness. */
-				sftp_hpn_watchdog_pause(conn->hpn,
+				sftp_conn_watchdog_pause(conn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
 				/*
 				 * Always strict: hash both ends off the platter
@@ -3148,7 +3134,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				    (uint64_t)sb.st_size);
 				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
 				    sb.st_size, &local_hash);
-				sftp_hpn_watchdog_resume(conn->hpn);
+				sftp_conn_watchdog_resume(conn);
 				if (lret == 0 && rret == 0 &&
 				    local_hash == remote_hash) {
 					debug("verified transfer: full-file hash "
@@ -3204,7 +3190,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				uint64_t local_hash, remote_hash;
 				int lret, rret;
 
-				sftp_hpn_watchdog_pause(conn->hpn,
+				sftp_conn_watchdog_pause(conn,
 				    HPN_HEARTBEAT_REFRESH_SEC);
 				/* hash-work op: local leg first here */
 				sftp_conn_hash_op_begin(conn, 2 * c.size);
@@ -3216,7 +3202,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * platter, so the compare below is exact. */
 				rret = sftp_hpn_hash_remote_file(conn, remote_path,
 				    c.size, &remote_hash);
-				sftp_hpn_watchdog_resume(conn->hpn);
+				sftp_conn_watchdog_resume(conn);
 				debug3_f("lret=%d rret=%d local_hash=%016llx "
 				    "remote_hash=%016llx match=%d",
 				    lret, rret,
@@ -3719,7 +3705,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		 * HPN adaptive read-ahead caps the depth (num_requests when
 		 * disabled). */
 		while (!yielded && bytes_left > 0 &&
-		    outstanding < sftp_hpn_rdahead_cap(conn->hpn,
+		    outstanding < sftp_conn_rdahead_cap(conn,
 		    conn->num_requests) && status == SSH2_FX_OK) {
 			size_t want = conn->upload_buflen;
 			if ((off_t)want > bytes_left)
@@ -3766,7 +3752,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			    (r = sshbuf_put_string(msg, data, (size_t)len)) != 0)
 				fatal_fr(r, "compose write");
 			send_msg(conn, msg);
-			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
+			sftp_conn_bytes_wired_add(conn, (uint64_t)len);
 
 			offset    += len;
 			bytes_left -= len;
@@ -3793,7 +3779,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			}
 			if (monotime_double() - t_status_start >
 			    RDAHEAD_BP_THRESHOLD_SEC)
-				sftp_hpn_rdahead_backpressure_signal(conn->hpn);
+				sftp_conn_rdahead_backpressure_signal(conn);
 		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &ackid)) != 0)
@@ -3823,10 +3809,10 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 				first_fail_off = (off_t)ack->offset;
 		} else {
 			/* HPN adaptive read-ahead: feed acked bytes. */
-			sftp_hpn_rdahead_account(conn->hpn, ack->len);
+			sftp_conn_rdahead_account(conn, ack->len);
 			/* HPN adaptive upload pacing: feed the ack-rate
-			 * estimator (see sftp_hpn_pace_ack). */
-			sftp_hpn_pace_ack(conn->hpn, ack->len,
+			 * estimator (see sftp_conn_pace_ack). */
+			sftp_conn_pace_ack(conn, ack->len,
 			    conn->num_requests);
 			if (conn->hpn->live_counter != NULL) {
 				/* Report incremental progress so the
@@ -4048,7 +4034,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			break;
 		}
 		if (monotime_double() - t_data_start > RDAHEAD_BP_THRESHOLD_SEC)
-			sftp_hpn_rdahead_backpressure_signal(conn->hpn);
+			sftp_conn_rdahead_backpressure_signal(conn);
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &id)) != 0)
 			fatal_fr(r, "parse");
@@ -4093,7 +4079,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			if (len > req->len)
 				fatal("received more data than requested "
 				    "%zu > %zu", len, req->len);
-			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
+			sftp_conn_bytes_wired_add(conn, (uint64_t)len);
 			if ((lseek(local_fd, (off_t)req->offset,
 			    SEEK_SET) == -1 ||
 			    atomicio(vwrite, local_fd, data, len) != len) &&
@@ -4125,7 +4111,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			}
 			if (max_req > 0)
 				/* HPN adaptive read-ahead window. */
-				max_req = sftp_hpn_rdahead_window(conn->hpn,
+				max_req = sftp_conn_rdahead_window(conn,
 				    len, max_req, conn->num_requests);
 			break;
 		}
@@ -4133,7 +4119,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			error_f("expected SSH2_FXP_DATA(%u) packet, got %u - "
 			    "possible protocol corruption",
 			    SSH2_FXP_DATA, type);
-			sftp_hpn_set_protocol_violation(conn->hpn);
+			sftp_conn_set_protocol_violation(conn);
 			read_error = 1;
 			if (acked_out != NULL) {
 				off_t f = dl_outstanding_floor(&requests,
@@ -4323,7 +4309,7 @@ batch_phase5_and_cleanup(struct sftp_conn *conn,
 			error_f("batch close: expected SSH2_FXP_STATUS(%d), "
 			    "got %d - connection may be corrupt",
 			    SSH2_FXP_STATUS, type);
-			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+			sftp_conn_set_protocol_violation(conn); /* HPN */
 			batch_fail_all_remaining(bs, entries, n, &any_fail);
 			sshbuf_free(msg);
 			goto cleanup;
@@ -4338,7 +4324,7 @@ batch_phase5_and_cleanup(struct sftp_conn *conn,
 			error_f("batch close ID mismatch: got %u expected %u "
 			    "- possible MITM or server corruption",
 			    rid, bs[i].close_id);
-			sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+			sftp_conn_set_protocol_violation(conn); /* HPN */
 			batch_fail_all_remaining(bs, entries, n, &any_fail);
 			sshbuf_free(msg);
 			goto cleanup;
@@ -4559,7 +4545,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 			    (r = sshbuf_put_string(msg, data, len)) != 0)
 				fatal_fr(r, "compose batch write");
 			send_msg(conn, msg);
-			sftp_hpn_bytes_wired_add(conn->hpn, (uint64_t)len);
+			sftp_conn_bytes_wired_add(conn, (uint64_t)len);
 			sshbuf_free(msg);
 		}
 		free(data);
@@ -4602,7 +4588,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 				error_f("batch write: expected SSH2_FXP_STATUS(%d), "
 				    "got %d - connection may be corrupt",
 				    SSH2_FXP_STATUS, type);
-				sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+				sftp_conn_set_protocol_violation(conn); /* HPN */
 				batch_fail_all_remaining(bs, entries, n, &any_fail);
 				sshbuf_free(msg);
 				goto send_failed;
@@ -4617,7 +4603,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 				error_f("batch write ID mismatch: got %u expected "
 				    "%u - possible MITM or server corruption",
 				    rid, bs[i].write_id);
-				sftp_hpn_set_protocol_violation(conn->hpn); /* HPN */
+				sftp_conn_set_protocol_violation(conn); /* HPN */
 				batch_fail_all_remaining(bs, entries, n, &any_fail);
 				sshbuf_free(msg);
 				goto send_failed;
@@ -4802,7 +4788,7 @@ handle_dest_replies(struct sftp_conn *to, const char *to_path, int synchronous,
 		if (type != SSH2_FXP_STATUS) {
 			error_f("Expected SSH2_FXP_STATUS(%d) packet, got %d - "
 			    "possible protocol corruption", SSH2_FXP_STATUS, type);
-			sftp_hpn_set_protocol_violation(to->hpn);
+			sftp_conn_set_protocol_violation(to);
 			if (*write_errorp == 0)
 				*write_errorp = SSH2_FX_CONNECTION_LOST;
 			/*
@@ -4956,7 +4942,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 		double t_data_start = monotime_double();
 		get_msg(from, msg);
 		if (monotime_double() - t_data_start > RDAHEAD_BP_THRESHOLD_SEC)
-			sftp_hpn_rdahead_backpressure_signal(from->hpn);
+			sftp_conn_rdahead_backpressure_signal(from);
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &id)) != 0)
 			fatal_fr(r, "parse");
@@ -4987,7 +4973,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 			if (len > req->len)
 				fatal("Received more data than asked for "
 				    "%zu > %zu", len, req->len);
-			sftp_hpn_bytes_wired_add(from->hpn, (uint64_t)len);
+			sftp_conn_bytes_wired_add(from, (uint64_t)len);
 			if (len == 0) {
 				/* Same anti-livelock guard and fail-soft
 				 * bail as sftp_download (see the comment
@@ -5015,7 +5001,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 			    (r = sshbuf_put_string(msg, data, len)) != 0)
 				fatal_fr(r, "compose write");
 			send_msg(to, msg);
-			sftp_hpn_bytes_wired_add(to->hpn, (uint64_t)len);
+			sftp_conn_bytes_wired_add(to, (uint64_t)len);
 			debug3("Sent message SSH2_FXP_WRITE I:%u O:%llu S:%zu",
 			    id, (unsigned long long)offset, len);
 			num_upload_req++;
@@ -5054,8 +5040,8 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 				} else {
 					/* HPN adaptive read-ahead
 					 * (origin / read side). */
-					max_req = sftp_hpn_rdahead_window(
-					    from->hpn, len, max_req,
+					max_req = sftp_conn_rdahead_window(
+					    from, len, max_req,
 					    from->num_requests);
 				}
 			}
@@ -5063,7 +5049,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 		default:
 			error_f("Expected SSH2_FXP_DATA(%u) packet, got %u - "
 			    "possible protocol corruption", SSH2_FXP_DATA, type);
-			sftp_hpn_set_protocol_violation(from->hpn);
+			sftp_conn_set_protocol_violation(from);
 			read_error = 1;
 			/* See sftp_download() switch-default for rationale. */
 			while ((req = TAILQ_FIRST(&requests)) != NULL) {
@@ -5343,7 +5329,7 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible protocol corruption",
 		    id, expected_id);
-		sftp_hpn_set_protocol_violation(conn->hpn);
+		sftp_conn_set_protocol_violation(conn);
 		sshbuf_free(uidbuf);
 		sshbuf_free(gidbuf);
 		return -1;
@@ -5364,7 +5350,7 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 	} else if (type != SSH2_FXP_EXTENDED_REPLY) {
 		error_f("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u - "
 		    "possible protocol corruption", SSH2_FXP_EXTENDED_REPLY, type);
-		sftp_hpn_set_protocol_violation(conn->hpn);
+		sftp_conn_set_protocol_violation(conn);
 		sshbuf_free(uidbuf);
 		sshbuf_free(gidbuf);
 		return -1;
