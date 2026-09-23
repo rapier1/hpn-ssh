@@ -63,6 +63,8 @@
 #include "sftp-hpn-bundle.h"  /* bundle flags and eligibility policy */
 #include "sftp-hpn-transferlog.h" /* per-member TransferLog entries */
 
+extern int showprogress;	/* progress gate, defined by sftp.c and scp.c */
+
 /* Adaptive upload pacing master switch (-X Pacing=), applied to each new
  * connection at init. On by default: it wins where the duty-cycle
  * pathology lives, at -j1 and -j2, and measured neutral at -j4, -j8 and
@@ -1396,18 +1398,17 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 	return failures > 0 ? 1 : 0;
 }
 
-/* Download flush: one hpn-bundle-fetch transaction.  Downloads return
- * per-entry results on a successful transaction; entries that failed
- * are re-driven through the per-file path. */
+/* Download half of sftp_hpn_bundle_acc_flush: fetch the batch as one
+ * hpn-bundle-fetch transaction. The server returns a result per file, so
+ * members that failed inside a good transaction are retried one file at
+ * a time. A server that cannot bundle gets every member one file at a
+ * time instead, and bundling stays off for the rest of the session. A
+ * policy denial or a lost connection aborts the walk. */
 static int
 bundle_acc_flush_download(struct sftp_conn *conn,
     struct sftp_hpn_bundle_acc *acc, int preserve_flag,
     int verify, int fsync_flag, int inplace_flag)
 {
-	/* Serial progress gate, owned by sftp-client.c.  Parallel workers call
-	 * sftp_hpn_bundle_download directly rather than this flush, so metering
-	 * here never touches the parallel aggregate meter. */
-	extern int showprogress;
 	struct sftp_hpn_bundle_download_entry *entries;
 	struct sftp_bundle_opts opts;
 	int i, rc, dr, failures = 0;
@@ -1421,13 +1422,13 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 		entries[i].local_path = acc->dst_paths[i];
 		meter_total += acc->sizes[i];
 	}
-	/* Meter the bundle as one unit.  Bundled files never reach
-	 * sftp_download, so without this a serial bundle transfer shows no
-	 * meter at all; non-bundled files keep their own per-file meters. */
-	/* BUNDLE kind: one meter carrying acc->nmembers files, declared at
-	 * start so the frame stream counts every member (review finding #16).
-	 * A bundle of only zero-length files meters too: the kind renders a
-	 * zero total as complete, and its members still count. */
+	/* Meter the bundle as one BUNDLE-kind unit carrying acc->nmembers
+	 * files. Bundled files never reach sftp_download, so without it a
+	 * serial bundle shows no meter at all. Declaring every member at the
+	 * start lets the frame stream count them, and a bundle of only empty
+	 * files meters too, since the kind renders a zero total as complete.
+	 * Parallel workers call sftp_hpn_bundle_download directly, so this
+	 * never touches the parallel aggregate meter. */
 	meter_on = showprogress;
 	if (meter_on) {
 		snprintf(meter_label, sizeof(meter_label), "%d files",
@@ -1436,6 +1437,7 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 		    HPN_METER_DOM_TRANSFER, meter_label, meter_total,
 		    &meter_ctr, (u_int)acc->nmembers);
 	}
+	memset(&opts, 0, sizeof(opts));
 	opts.preserve = preserve_flag;
 	opts.fsync = fsync_flag;
 	opts.writer_pool = sftp_conn_hpn(conn)->bundle_cfg.writer_pool;
