@@ -788,7 +788,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 		uint32_t target;
 		int      drain_rc;
 
-		target = sftp_conn_rdahead_cap(conn, BUNDLE_DL_MAX_INFLIGHT);
+		target = sftp_conn_rdahead_cap(conn);
 		if (target == 0 || target > BUNDLE_DL_MAX_INFLIGHT)
 			target = BUNDLE_DL_MAX_INFLIGHT;
 
@@ -1106,7 +1106,7 @@ bundle_ul_send_write(struct bundle_write_ctx *ctx,
 	 * controller's current depth. When the cap is reached, drain half
 	 * of the in-flight WRITEs so the pipeline stays one window deep
 	 * instead of thrashing on every WRITE. */
-	cap = sftp_conn_rdahead_cap(ctx->conn, BUNDLE_MAX_INFLIGHT);
+	cap = sftp_conn_rdahead_cap(ctx->conn);
 	if (cap == 0 || cap > BUNDLE_MAX_INFLIGHT)
 		cap = BUNDLE_MAX_INFLIGHT;
 	if ((ctx->n_sent - ctx->n_drained) >= cap) {
@@ -1402,7 +1402,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	t_close_done = monotime_double();
 	if (getenv("HPN_PARALLEL_TRACE") != NULL) {
 		uint32_t cap_final =
-		    sftp_conn_rdahead_cap(conn, BUNDLE_MAX_INFLIGHT);
+		    sftp_conn_rdahead_cap(conn);
 		/* ENV-VAR HPN_PARALLEL_TRACE: developer-only per-bundle timing
 		 * breakdown. `enter` is absolute monotonic seconds, so the
 		 * inter-bundle idle for a given worker (conn) in post-

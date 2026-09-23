@@ -1076,7 +1076,7 @@ parallel_orch_launch(struct sftp_conn *conn)
 	{
 		static int worker_cap_applied = 0;
 		if (!worker_cap_applied && parallel_num_streams > 1) {
-			int cap = sftp_hpn_max_workers_cap(conn);
+			int cap = sftp_conn_max_workers_cap(conn);
 			int requested = parallel_num_streams;
 			int eff = requested;
 

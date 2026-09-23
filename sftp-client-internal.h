@@ -120,20 +120,17 @@ void sftp_conn_watchdog_resume(struct sftp_conn *conn);
 
 /*
  * Adaptive read-ahead controller.  init seeds it from the connection's
- * num_requests (the -R cap) and HPN_RDAHEAD=fixed disables adaptation.
- * account feeds it the bytes of each completed request and re-sizes the
- * in-flight depth at window boundaries.  cap returns the current depth,
- * or `fallback` (the fixed num_requests) when adaptation is off; the
- * upload sites bound their outstanding requests with it.  window is
- * account plus the next depth for the download ramp sites: the adaptive
- * depth, or the legacy +1 ramp from `cur` capped at `cap`.  All no-op or
- * fall back cleanly when conn or its HPN state is NULL.
+ * num_requests, the -R cap.  account feeds it the bytes of each completed
+ * request and re-sizes the in-flight depth at window boundaries.  cap
+ * returns the current depth; the upload sites bound their outstanding
+ * requests with it.  window is account plus the new depth, for the
+ * download ramp sites.  All no-op or return the floor when conn or its
+ * HPN state is NULL.
  */
 void     sftp_conn_rdahead_init(struct sftp_conn *conn, uint32_t cap);
 void     sftp_conn_rdahead_account(struct sftp_conn *conn, size_t nbytes);
-uint32_t sftp_conn_rdahead_cap(struct sftp_conn *conn, uint32_t fallback);
-uint32_t sftp_conn_rdahead_window(struct sftp_conn *conn, size_t nbytes,
-    uint32_t cur, uint32_t cap);
+uint32_t sftp_conn_rdahead_cap(struct sftp_conn *conn);
+uint32_t sftp_conn_rdahead_window(struct sftp_conn *conn, size_t nbytes);
 
 /*
  * Per-worker live-byte counter bump (no-op when conn/hpn/counter is NULL).
@@ -240,11 +237,11 @@ void sftp_conn_set_layout_set_declined(struct sftp_conn *conn, int v);
 uint64_t sftp_conn_bytes_wired(struct sftp_conn *conn);
 
 /*
- * Add to the wire-payload counter from outside sftp-client.c (the bundle send
- * path, which bypasses the per-file write loops).  Safe with conn/conn->hpn
- * NULL; atomic, callable from any thread.
+ * Add to the wire-payload counter: the per-file write loops in
+ * sftp-client.c and the bundle send path both feed it.  Safe with
+ * conn/conn->hpn NULL; atomic, callable from any thread.
  */
-void sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t n);
+void sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t nbytes);
 
 /*
  * Unified hash-work accounting (project_hash_work_meter_design): every

@@ -153,7 +153,7 @@ u_int sftp_proto_version(struct sftp_conn *);
  * -1 = not advertised (stock/non-HPN server); 0 = advertised, no cap;
  * N>0 = advertised cap.  Used by the orchestrator to clamp -j.
  */
-int sftp_hpn_max_workers_cap(struct sftp_conn *);
+int sftp_conn_max_workers_cap(struct sftp_conn *);
 
 /* Query server limits */
 int sftp_get_limits(struct sftp_conn *, struct sftp_limits *);
@@ -405,7 +405,9 @@ int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
 
 /*
  * Install the resolved bundling knobs (HPNUseBundle, HPNBundleSize,
- * HPNWriterPool) on the connection for the serial-path recursive walks.
+ * HPNWriterPool) on the connection.  The serial-path recursive walks
+ * read them; scp also re-latches them in parallel mode so the main
+ * connection matches the workers' configuration.
  * Without this call the connection uses the options' documented defaults
  * (bundling on, writer pool on, default bundle size).
  */
@@ -462,6 +464,9 @@ int sftp_conn_has_hash_range(struct sftp_conn *conn);
  * directory before files land in it.  Used by HPNLustreStripeCount.
  */
 int sftp_conn_has_file_layout(struct sftp_conn *conn);
+
+/* True iff the server advertised hpn-fs-info@hpnssh.org. */
+int sftp_conn_has_fs_info(struct sftp_conn *conn);
 
 /*
  * Download-side counterpart of sftp_hpn_bundle_upload.  Asks the server to

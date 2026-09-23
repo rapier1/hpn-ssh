@@ -1494,7 +1494,7 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	 * (The hard SFTP_PARALLEL_MAX_WORKERS ceiling is enforced at parse.)
 	 */
 	{
-		int cap = sftp_hpn_max_workers_cap(conn);
+		int cap = sftp_conn_max_workers_cap(conn);
 		int requested = parallel_num_streams;
 
 		eff_streams = requested;

@@ -2109,7 +2109,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			 * download; the caller asked for verification.  See
 			 * RESUME_INCOMPAT_MSG.
 			 */
-			if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0)
+			if (!sftp_conn_has_hpn_check_file(conn))
 				fatal("\"%s\": %s", remote_path,
 				    RESUME_INCOMPAT_MSG);
 			/* Resume-check meter: spans the hash work below in
@@ -2463,9 +2463,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					max_req = 1;
 				} else {
 					/* HPN adaptive read-ahead window. */
-					max_req = sftp_conn_rdahead_window(
-					    conn, len, max_req,
-					    conn->num_requests);
+					max_req = sftp_conn_rdahead_window(conn,
+					    len);
 				}
 			}
 			break;
@@ -2655,7 +2654,7 @@ serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 	if ((attrs->flags & SSH2_FILEXFER_ATTR_SIZE) &&
 	    sftp_hpn_bundle_acc_eligible(ctx->bacc, attrs->size)) {
 		if (sftp_hpn_bundle_acc_add(ctx->bacc, src, dst,
-		    (long long)attrs->size)) {
+		    (off_t)attrs->size)) {
 			int fr = sftp_hpn_bundle_acc_flush(ctx->conn, ctx->bacc,
 			    ctx->preserve_flag, ctx->print_flag, ctx->verify,
 			    ctx->fsync_flag, ctx->inplace_flag);
@@ -2726,8 +2725,9 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	 * serial and -j modes fetch identical bundles for the same
 	 * corpus.  A no-op unless the server advertises
 	 * hpn-bundle-fetch, HPNUseBundle is on, and this is not a
-	 * resume transfer. */
-	sftp_hpn_bundle_acc_init(&bacc, conn, resume_flag, /*download*/1);
+	 * resume transfer, plain or verified. */
+	sftp_hpn_bundle_acc_init(&bacc, conn, resume_flag || verify,
+	    /*download*/1);
 
 	{
 		struct serial_dl_sink sink = {
@@ -2886,8 +2886,7 @@ do_upload_body(struct sftp_conn *conn,
 		/* HPN adaptive read-ahead: cap outstanding writes at the
 		 * controller's current depth (num_requests when disabled). */
 		if (id == startid || len == 0 ||
-		    id - ackid >= sftp_conn_rdahead_cap(conn,
-		    conn->num_requests)) {
+		    id - ackid >= sftp_conn_rdahead_cap(conn)) {
 			u_int rid;
 			double t_status_start;
 
@@ -3059,7 +3058,7 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	if (verify) {
 		debug3_f("verify=1 inplace_flag=%d exts=0x%x HPN_CHECK_FILE=0x%x",
 		    inplace_flag, conn->exts, SFTP_EXT_HPN_CHECK_FILE);
-		if ((conn->exts & SFTP_EXT_HPN_CHECK_FILE) == 0) {
+		if (!sftp_conn_has_hpn_check_file(conn)) {
 			/* No silent fallback - see RESUME_INCOMPAT_MSG. */
 			fatal("\"%s\": %s", local_path, RESUME_INCOMPAT_MSG);
 		} else if (sftp_stat(conn, remote_path, 1 /* quiet */, &c) == 0
@@ -3357,7 +3356,7 @@ serial_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
 	if (sftp_hpn_bundle_acc_eligible(ctx->bacc,
 	    (uint64_t)src_sb->st_size)) {
 		if (sftp_hpn_bundle_acc_add(ctx->bacc, src, dst,
-		    (long long)src_sb->st_size)) {
+		    src_sb->st_size)) {
 			int fr = sftp_hpn_bundle_acc_flush(ctx->conn, ctx->bacc,
 			    ctx->preserve_flag, ctx->print_flag, ctx->verify,
 			    ctx->fsync_flag, ctx->inplace_flag);
@@ -3445,8 +3444,9 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	 * directories, matching the parallel producer's grouping, so the
 	 * two modes ship identical bundles for the same corpus.  Disabled
 	 * (a no-op) unless the server supports bundles, HPNUseBundle is
-	 * on, and this is not a resume transfer. */
-	sftp_hpn_bundle_acc_init(&bacc, conn, resume, /*download*/0);
+	 * on, and this is not a resume transfer, plain or verified. scp
+	 * expresses its -Z upload resume through verify alone. */
+	sftp_hpn_bundle_acc_init(&bacc, conn, resume || verify, /*download*/0);
 
 	/* Create the root destination directory before walking - every deeper
 	 * directory is created by its parent level's pipelined mkdir batch, so
@@ -3524,7 +3524,7 @@ sftp_fs_info(struct sftp_conn *conn, const char *path, struct sftp_fs_info *info
 
 	memset(info, 0, sizeof(*info));
 
-	if ((conn->exts & SFTP_EXT_HPN_FS_INFO) == 0)
+	if (!sftp_conn_has_fs_info(conn))
 		return -1;
 
 	debug2("Sending SSH2_FXP_EXTENDED(hpn-fs-info@hpnssh.org) \"%s\"", path);
@@ -3705,8 +3705,8 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		 * HPN adaptive read-ahead caps the depth (num_requests when
 		 * disabled). */
 		while (!yielded && bytes_left > 0 &&
-		    outstanding < sftp_conn_rdahead_cap(conn,
-		    conn->num_requests) && status == SSH2_FX_OK) {
+		    outstanding < sftp_conn_rdahead_cap(conn) &&
+		    status == SSH2_FX_OK) {
 			size_t want = conn->upload_buflen;
 			if ((off_t)want > bytes_left)
 				want = (size_t)bytes_left;
@@ -4111,8 +4111,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			}
 			if (max_req > 0)
 				/* HPN adaptive read-ahead window. */
-				max_req = sftp_conn_rdahead_window(conn,
-				    len, max_req, conn->num_requests);
+				max_req = sftp_conn_rdahead_window(conn, len);
 			break;
 		}
 		default:
@@ -5040,9 +5039,8 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 				} else {
 					/* HPN adaptive read-ahead
 					 * (origin / read side). */
-					max_req = sftp_conn_rdahead_window(
-					    from, len, max_req,
-					    from->num_requests);
+					max_req = sftp_conn_rdahead_window(from,
+					    len);
 				}
 			}
 			break;

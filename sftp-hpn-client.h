@@ -87,7 +87,6 @@ struct sftp_rdahead {
 	double   win_start;   /* monotime_double() at window open */
 	double   last_rate;   /* smoothed throughput of previous window (bytes/s) */
 	int      settled;     /* 1 once the knee is found - stop probing */
-	int      enabled;     /* 0 => legacy fixed depth (HPN_RDAHEAD=fixed) */
 
 	/* Part D - persistent-degradation tracking.  Backpressure events
 	 * occurring while already at floor accumulate here.  When the
@@ -331,7 +330,7 @@ struct sftp_hpn_conn {
 		uint64_t bucket_bytes; /* acked bytes in current bucket */
 		uint64_t bucket_start_ms; /* monotime_ms the bucket opened */
 		/* Sliding window of per-second delivered rates (bytes/sec);
-		 * the ceiling is HEADROOM x the MEAN of these, so stall
+		 * the ceiling is 125% of the mean of these, so stall
 		 * seconds pull the estimate toward the sink's sustained
 		 * rate.  Samples during slow-start are excised. */
 		uint64_t rate_ring[PACE_RING];
@@ -367,8 +366,9 @@ struct sftp_hpn_conn {
 struct sftp_hpn_bundle_acc {
 	char **src_paths;	/* upload: local; download: remote */
 	char **dst_paths;	/* upload: remote; download: local */
-	long long *sizes;	/* per-member bytes, for TransferLog */
-	int n, cap;
+	off_t *sizes;		/* per-member bytes, for TransferLog */
+	int nmembers;
+	int members_alloc;
 	uint64_t bytes;		/* accumulated FRAMED bytes (header+path+
 				 * payload per member, matching the
 				 * parallel producer's accounting) */
@@ -418,8 +418,9 @@ struct sftp_hpn_dirattr {
 };
 
 struct sftp_hpn_dirattr_list {
-	struct sftp_hpn_dirattr *v;
-	int n, cap;
+	struct sftp_hpn_dirattr *entries;
+	int nentries;
+	int entries_alloc;
 };
 
 struct sftp_conn;
@@ -583,10 +584,10 @@ int  sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 
 void sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc,
     struct sftp_conn *conn, int resume, int is_download);
-int sftp_hpn_bundle_acc_eligible(struct sftp_hpn_bundle_acc *acc,
+int sftp_hpn_bundle_acc_eligible(const struct sftp_hpn_bundle_acc *acc,
     uint64_t size);
 int sftp_hpn_bundle_acc_add(struct sftp_hpn_bundle_acc *acc,
-    const char *src, const char *dst, long long size);
+    const char *src, const char *dst, off_t size);
 int sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
     struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
     int verify, int fsync_flag, int inplace_flag);
@@ -691,8 +692,8 @@ void sftp_hpn_pace_set_enabled(int on);
  * requested value if the filesystem has fewer OSTs).
  */
 int sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
-    u_int32_t stripe_count, u_int32_t small_threshold, u_int32_t *applied_out,
-    u_int32_t *layout_kind_out);
+    uint32_t stripe_count, uint32_t small_threshold, uint32_t *applied_out,
+    uint32_t *layout_kind_out);
 
 /*
  * Compute XXH3_64bits over bytes [offset, offset+length) of the open fd.

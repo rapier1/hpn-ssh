@@ -560,10 +560,10 @@ sftp_parallel_wait(struct sftp_parallel *fleet, struct sftp_conn *conn)
 	if (fleet->dirattrs != NULL) {
 		if (conn != NULL)
 			sftp_hpn_dirattrs_apply(conn, fleet->dirattrs);
-		else if (fleet->dirattrs->n > 0)
+		else if (fleet->dirattrs->nentries > 0)
 			error_f("no control connection: %d directory "
 			    "attribute(s) not applied.",
-			    fleet->dirattrs->n);
+			    fleet->dirattrs->nentries);
 		sftp_hpn_dirattrs_free(fleet->dirattrs);
 		free(fleet->dirattrs);
 		fleet->dirattrs = NULL;
