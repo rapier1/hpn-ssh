@@ -1413,27 +1413,15 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
 			    NULL, pflag || global_pflag, resume,
 			    fflag || global_fflag, 0, verify);
-			if (dr == -1)
-				err = -1;
-			else if (dr == 1)
-				mprintf("File skipped: %s: Identical.\n",
-				    g.gl_pathv[i]);
-			else if (dr == 2)
-				mprintf("File skipped: %s: Target is larger"
-				    " than source.\n", g.gl_pathv[i]);
-			/* dr==0: parked by sftp_download for the classic
-			 * post-transfer verify phase run below. */
-			if (transferlog_active() && (dr != 0 ||
-			    !sftp_conn_verify_transfer_enabled(conn))) {
-				struct stat lsb;
-				long long sz = (stat(abs_dst, &lsb) == 0) ?
-				    (long long)lsb.st_size : -1;
+			struct stat lsb;
+			off_t sz = -1;
 
-				transferlog_file(dr == -1 ?
-				    TRANSFERLOG_FAILED : (dr == 0 ?
-				    TRANSFERLOG_SUCCESS : TRANSFERLOG_SKIPPED),
-				    sz, abs_dst);
-			}
+			/* Log the local copy's size, -1 when nothing landed. */
+			if (transferlog_active() && stat(abs_dst, &lsb) == 0)
+				sz = lsb.st_size;
+			if (sftp_hpn_report_transfer(conn, dr, g.gl_pathv[i],
+			    abs_dst, sz) == -1)
+				err = -1;
 		}
 		free(abs_dst);
 		abs_dst = NULL;
@@ -1631,22 +1619,10 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			int ur = sftp_upload(conn, g.gl_pathv[i], abs_dst,
 			    pflag || global_pflag, resume, verify,
 			    fflag || global_fflag, 0);
-			if (ur == -1)
+
+			if (sftp_hpn_report_transfer(conn, ur, g.gl_pathv[i],
+			    abs_dst, sb.st_size) == -1)
 				err = -1;
-			else if (ur == 1)
-				mprintf("File skipped: %s: Identical.\n",
-				    g.gl_pathv[i]);
-			else if (ur == 2)
-				mprintf("File skipped: %s: Target is larger"
-				    " than source.\n", g.gl_pathv[i]);
-			/* ur==0: parked by sftp_upload for the classic
-			 * post-transfer verify phase run below. */
-			if (transferlog_active() && (ur != 0 ||
-			    !sftp_conn_verify_transfer_enabled(conn)))
-				transferlog_file(ur == -1 ?
-				    TRANSFERLOG_FAILED : (ur == 0 ?
-				    TRANSFERLOG_SUCCESS : TRANSFERLOG_SKIPPED),
-				    (long long)sb.st_size, abs_dst);
 		}
 	}
 

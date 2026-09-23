@@ -244,6 +244,14 @@ uint64_t sftp_conn_bytes_wired(struct sftp_conn *conn);
 void sftp_conn_bytes_wired_add(struct sftp_conn *conn, uint64_t nbytes);
 
 /*
+ * Report one file transfer's outcome from sftp_download or sftp_upload
+ * (rc -1, 0, 1 or 2): the skip notice, the TransferLog line, success
+ * deferred to the verify phase under -V.  Returns -1 when rc is -1.
+ */
+int sftp_hpn_report_transfer(struct sftp_conn *conn, int rc,
+    const char *src, const char *dst, off_t size);
+
+/*
  * Unified hash-work accounting (project_hash_work_meter_design): every
  * hash phase meters in work-bytes (1 byte of overlap = 2 work-bytes, one
  * per leg).  Engines drive begin/leg/progress; unit-completion sites call

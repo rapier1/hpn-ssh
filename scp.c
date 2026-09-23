@@ -2244,32 +2244,12 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 	} else {
 		int ur = sftp_upload(conn, src, abs_dst, pflag, 0,
 		    resume_flag, 0, 1);
-		if (ur == -1) {
+
+		if (ur == -1)
 			error("failed to upload file %s to %s", src, targ);
+		if (sftp_hpn_report_transfer(conn, ur, src, abs_dst,
+		    st.st_size) == -1)
 			errs = 1;
-			transferlog_file(TRANSFERLOG_FAILED,
-			    (long long)st.st_size, abs_dst);
-		} else if (ur == 1) {
-			/* frame mode: stdout carries binary frames, text on it
-			 * corrupts the relay stream - divert to stderr */
-			fmprintf(hpn_pm_active() ?
-			    stderr : stdout,
-			    "File skipped: %s: Identical.\n", src);
-			transferlog_file(TRANSFERLOG_SKIPPED,
-			    (long long)st.st_size, abs_dst);
-		} else if (ur == 2) {
-			fmprintf(hpn_pm_active() ?
-			    stderr : stdout,
-			    "File skipped: %s: Target is larger than source.\n",
-			    src);
-			transferlog_file(TRANSFERLOG_SKIPPED,
-			    (long long)st.st_size, abs_dst);
-		} else if (!hpn_verify_transfer) {
-			/* TransferLog: success is final only when no verify
-			 * phase follows (with -V the line defers there). */
-			transferlog_file(TRANSFERLOG_SUCCESS,
-			    (long long)st.st_size, abs_dst);
-		}
 	}
 
 	free(abs_dst);
@@ -2583,31 +2563,15 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
 			    NULL, pflag, resume_flag, 0, 1,
 			    resume_flag /* verify */);
-			if (dr == -1)
-				err = -1;
-			else if (dr == 1)
-				fmprintf(hpn_pm_active() ?
-				    stderr : stdout,	/* keep frames clean */
-				    "File skipped: %s: Identical.\n",
-				    g.gl_pathv[i]);
-			else if (dr == 2)
-				fmprintf(hpn_pm_active() ?
-				    stderr : stdout,
-				    "File skipped: %s: Target is larger"
-				    " than source.\n", g.gl_pathv[i]);
-			/* TransferLog: size from the local dest (present on
-			 * success/skip; -1 when the failure left nothing).
-			 * Success defers to the verify phase under -V. */
-			if (transferlog_active() &&
-			    (dr != 0 || !hpn_verify_transfer)) {
-				struct stat lsb;
-				long long sz = (stat(abs_dst, &lsb) == 0) ?
-				    (long long)lsb.st_size : -1;
+			struct stat lsb;
+			off_t sz = -1;
 
-				transferlog_file(dr == -1 ? TRANSFERLOG_FAILED :
-				    (dr == 0 ? TRANSFERLOG_SUCCESS :
-				    TRANSFERLOG_SKIPPED), sz, abs_dst);
-			}
+			/* Log the local copy's size, -1 when nothing landed. */
+			if (transferlog_active() && stat(abs_dst, &lsb) == 0)
+				sz = lsb.st_size;
+			if (sftp_hpn_report_transfer(conn, dr, g.gl_pathv[i],
+			    abs_dst, sz) == -1)
+				err = -1;
 		}
 		free(abs_dst);
 		abs_dst = NULL;

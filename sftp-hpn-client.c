@@ -62,6 +62,7 @@
 #include "hpn-meter.h"	/* progress meter core */
 #include "sftp-hpn-bundle.h"  /* bundle flags and eligibility policy */
 #include "sftp-hpn-transferlog.h" /* per-member TransferLog entries */
+#include "utf8.h"		/* fmprintf */
 
 extern int showprogress;	/* progress gate, defined by sftp.c and scp.c */
 
@@ -1322,6 +1323,40 @@ sftp_hpn_bundle_acc_free(struct sftp_hpn_bundle_acc *acc)
 	acc->enabled = 0;
 }
 
+/* Report one file transfer's outcome from sftp_download or sftp_upload:
+ * rc -1 failed, 0 transferred, 1 skipped as identical, 2 skipped because
+ * the target is larger. Prints the skip notice and writes the TransferLog
+ * line. A success is left for the verify phase to log when -V is on.
+ * Returns -1 when the transfer failed, else 0. */
+int
+sftp_hpn_report_transfer(struct sftp_conn *conn, int rc, const char *src,
+    const char *dst, off_t size)
+{
+	/* In frame mode stdout carries the progress frames, so text goes to
+	 * stderr instead. */
+	FILE *out = hpn_pm_active() ? stderr : stdout;
+
+	switch (rc) {
+	case -1:
+		transferlog_file(TRANSFERLOG_FAILED, size, dst);
+		return -1;
+	case 1:
+		fmprintf(out, "File skipped: %s: Identical.\n", src);
+		transferlog_file(TRANSFERLOG_SKIPPED, size, dst);
+		break;
+	case 2:
+		fmprintf(out, "File skipped: %s: Target is larger than "
+		    "source.\n", src);
+		transferlog_file(TRANSFERLOG_SKIPPED, size, dst);
+		break;
+	default:
+		if (!sftp_conn_verify_transfer_enabled(conn))
+			transferlog_file(TRANSFERLOG_SUCCESS, size, dst);
+		break;
+	}
+	return 0;
+}
+
 /* Upload half of sftp_hpn_bundle_acc_flush: send the batch as one
  * hpn-bundle stream. Upload gets no per-member status back, so the
  * bundle succeeds or fails as a whole. A server that cannot bundle gets
@@ -1352,14 +1387,13 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 	case SFTP_HPN_BUNDLE_OK:
 		for (i = 0; i < acc->nmembers; i++) {
 			/* Mirror the per-file path: park for the classic
-			 * verify phase (no-op unless verify is enabled);
-			 * success is logged now only when verify will not
-			 * log it after checking. */
+			 * verify phase, a no-op unless verify is on, then
+			 * report the success. */
 			sftp_conn_verify_park(conn, acc->src_paths[i],
 			    acc->dst_paths[i], /*local_is_target=*/0);
-			if (!sftp_conn_verify_transfer_enabled(conn))
-				transferlog_file(TRANSFERLOG_SUCCESS,
-				    acc->sizes[i], acc->dst_paths[i]);
+			(void)sftp_hpn_report_transfer(conn, 0,
+			    acc->src_paths[i], acc->dst_paths[i],
+			    acc->sizes[i]);
 		}
 		break;
 	case SFTP_HPN_BUNDLE_SERVER_CANT:
@@ -1372,16 +1406,14 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 			int ur = sftp_upload(conn, acc->src_paths[i],
 			    acc->dst_paths[i], preserve_flag,
 			    /*resume*/0, verify, fsync_flag, inplace_flag);
-			if (ur == -1) {
+
+			if (ur == -1)
 				error("upload \"%s\" to \"%s\" failed",
 				    acc->src_paths[i], acc->dst_paths[i]);
-				transferlog_file(TRANSFERLOG_FAILED,
-				    acc->sizes[i], acc->dst_paths[i]);
+			if (sftp_hpn_report_transfer(conn, ur,
+			    acc->src_paths[i], acc->dst_paths[i],
+			    acc->sizes[i]) == -1)
 				failures++;
-			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
-				transferlog_file(TRANSFERLOG_SUCCESS,
-				    acc->sizes[i], acc->dst_paths[i]);
-			}
 		}
 		break;
 	case SFTP_HPN_BUNDLE_POLICY_DENIED:
@@ -1452,9 +1484,9 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 				sftp_conn_verify_park(conn,
 				    acc->dst_paths[i], acc->src_paths[i],
 				    /*local_is_target=*/1);
-				if (!sftp_conn_verify_transfer_enabled(conn))
-					transferlog_file(TRANSFERLOG_SUCCESS,
-					    acc->sizes[i], acc->dst_paths[i]);
+				(void)sftp_hpn_report_transfer(conn, 0,
+				    acc->src_paths[i], acc->dst_paths[i],
+				    acc->sizes[i]);
 				continue;
 			}
 			/* Per-entry failure: re-drive individually (the
@@ -1462,16 +1494,13 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 			dr = sftp_download(conn, acc->src_paths[i],
 			    acc->dst_paths[i], NULL, preserve_flag,
 			    /*resume*/0, fsync_flag, inplace_flag, verify);
-			if (dr == -1) {
+			if (dr == -1)
 				error("download \"%s\" to \"%s\" failed",
 				    acc->src_paths[i], acc->dst_paths[i]);
-				transferlog_file(TRANSFERLOG_FAILED,
-				    acc->sizes[i], acc->dst_paths[i]);
+			if (sftp_hpn_report_transfer(conn, dr,
+			    acc->src_paths[i], acc->dst_paths[i],
+			    acc->sizes[i]) == -1)
 				failures++;
-			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
-				transferlog_file(TRANSFERLOG_SUCCESS,
-				    acc->sizes[i], acc->dst_paths[i]);
-			}
 		}
 		break;
 	case SFTP_HPN_BUNDLE_SERVER_CANT:
@@ -1482,16 +1511,13 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 			dr = sftp_download(conn, acc->src_paths[i],
 			    acc->dst_paths[i], NULL, preserve_flag,
 			    /*resume*/0, fsync_flag, inplace_flag, verify);
-			if (dr == -1) {
+			if (dr == -1)
 				error("download \"%s\" to \"%s\" failed",
 				    acc->src_paths[i], acc->dst_paths[i]);
-				transferlog_file(TRANSFERLOG_FAILED,
-				    acc->sizes[i], acc->dst_paths[i]);
+			if (sftp_hpn_report_transfer(conn, dr,
+			    acc->src_paths[i], acc->dst_paths[i],
+			    acc->sizes[i]) == -1)
 				failures++;
-			} else if (!sftp_conn_verify_transfer_enabled(conn)) {
-				transferlog_file(TRANSFERLOG_SUCCESS,
-				    acc->sizes[i], acc->dst_paths[i]);
-			}
 		}
 		break;
 	case SFTP_HPN_BUNDLE_POLICY_DENIED:

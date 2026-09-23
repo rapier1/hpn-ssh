@@ -2668,23 +2668,10 @@ serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 
 	dr = sftp_download(ctx->conn, src, dst, attrs, ctx->preserve_flag,
 	    ctx->resume_flag, ctx->fsync_flag, ctx->inplace_flag, ctx->verify);
-	if (dr == -1) {
+	if (dr == -1)
 		error("Download of file %s to %s failed", src, dst);
-		transferlog_file(TRANSFERLOG_FAILED, (long long)attrs->size, dst);
-		return -1;
-	}
-	if (dr == 1) {
-		fmprintf(hpn_pm_active() ? stderr : stdout,
-		    "File skipped: %s: Identical.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED, (long long)attrs->size, dst);
-	} else if (dr == 2) {
-		fmprintf(hpn_pm_active() ? stderr : stdout,
-		    "File skipped: %s: Target is larger than source.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED, (long long)attrs->size, dst);
-	} else if (!sftp_conn_verify_transfer_enabled(ctx->conn)) {
-		transferlog_file(TRANSFERLOG_SUCCESS, (long long)attrs->size, dst);
-	}
-	return 0;
+	return sftp_hpn_report_transfer(ctx->conn, dr, src, dst,
+	    (off_t)attrs->size);
 }
 
 static void
@@ -3369,27 +3356,10 @@ serial_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
 	}
 	ur = sftp_upload(ctx->conn, src, dst, ctx->preserve_flag, ctx->resume,
 	    ctx->verify, ctx->fsync_flag, ctx->inplace_flag);
-	if (ur == -1) {
+	if (ur == -1)
 		error("upload \"%s\" to \"%s\" failed", src, dst);
-		transferlog_file(TRANSFERLOG_FAILED,
-		    (long long)src_sb->st_size, dst);
-		return -1;
-	}
-	if (ur == 1) {
-		fmprintf(hpn_pm_active() ? stderr : stdout,
-		    "File skipped: %s: Identical.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED,
-		    (long long)src_sb->st_size, dst);
-	} else if (ur == 2) {
-		fmprintf(hpn_pm_active() ? stderr : stdout,
-		    "File skipped: %s: Target is larger than source.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED,
-		    (long long)src_sb->st_size, dst);
-	} else if (!sftp_conn_verify_transfer_enabled(ctx->conn)) {
-		transferlog_file(TRANSFERLOG_SUCCESS,
-		    (long long)src_sb->st_size, dst);
-	}
-	return 0;
+	return sftp_hpn_report_transfer(ctx->conn, ur, src, dst,
+	    src_sb->st_size);
 }
 
 static void
