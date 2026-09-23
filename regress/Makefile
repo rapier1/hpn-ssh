@@ -140,6 +140,38 @@ LTESTS= 	connect \
 		ssh-tty \
 		proxyjump
 
+# HPN: named subsets of LTESTS for a partial run by area, for example
+# make tests TESTSET=SFTP or make t-exec TESTSET=SCP. The default runs
+# the full list, and a command-line LTESTS still overrides either.
+TESTSET=	ALL
+ALL_TESTS=	${LTESTS}
+SFTP_TESTS=	sftp sftp-chroot sftp-cmds sftp-badcmds sftp-batch \
+		sftp-glob sftp-perm sftp-resume sftp-verified-resume sftp-uri \
+		sftp-parallel sftp-parallel-resume sftp-parallel-respawn \
+		sftp-parallel-tput sftp-bundle sftp-range-split sftp-hpn-config \
+		sftp-worker-log-dir sftp-verify
+SCP_TESTS=	scp scp3 scp-uri scp-resume
+HPN_TESTS=	connect-mptcp connect-happy-eyeballs connect-memlimit \
+		connect-fallback connect-metrics connect-none-cipher \
+		connect-tcprcvbufpoll transfer-mt-ciphers scp-resume \
+		sftp-verified-resume sftp-parallel sftp-parallel-resume \
+		sftp-parallel-respawn sftp-parallel-tput sftp-bundle \
+		sftp-range-split sftp-hpn-config sftp-worker-log-dir sftp-verify
+TRANSPORT_TESTS=	connect connect-mptcp connect-happy-eyeballs \
+		connect-memlimit connect-fallback connect-metrics \
+		connect-none-cipher connect-tcprcvbufpoll transfer \
+		transfer-mt-ciphers try-ciphers rekey integrity dhgex kextype \
+		proto-version proto-mismatch stderr-data stderr-after-eof \
+		broken-pipe yes-head
+RESUME_TESTS=	sftp-resume sftp-verified-resume scp-resume \
+		sftp-parallel-resume sftp-verify
+PARALLEL_TESTS=	sftp-parallel sftp-parallel-resume sftp-parallel-respawn \
+		sftp-parallel-tput sftp-range-split sftp-worker-log-dir \
+		sftp-bundle
+CONFIG_TESTS=	cfgparse cfgmatch cfgmatchlisten cfginclude servcfginclude \
+		sshcfgparse percent addrmatch host-expand reconfigure \
+		connect-bigconf sftp-hpn-config
+
 INTEROP_TESTS=	putty-transfer putty-ciphers putty-kex conch-ciphers
 INTEROP_TESTS+=	dropbear-ciphers dropbear-kex dropbear-server
 #INTEROP_TESTS+=ssh-com ssh-com-client ssh-com-keygen ssh-com-sftp
@@ -260,7 +292,7 @@ $(OBJ)/t12.out:
 t12: $(OBJ)/t12.out
 	${TEST_SSH_SSHKEYGEN} -lf $(OBJ)/t12.out.pub | grep test-comment-1234 >/dev/null
 
-t-exec:	${LTESTS:=.sh}
+t-exec:	${${TESTSET}_TESTS:=.sh}
 	@if [ "x$?" = "x" ]; then exit 0; fi; \
 	_started=""; test -z "${LTESTS_FROM}" && _started=1 ;\
 	for TEST in ""$?; do \

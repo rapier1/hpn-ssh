@@ -1357,6 +1357,31 @@ sftp_hpn_report_transfer(struct sftp_conn *conn, int rc, const char *src,
 	return 0;
 }
 
+/* Transfer one bundle member on its own, the fallback when the bundle
+ * could not carry it, and report the outcome. Returns -1 when the
+ * transfer failed, else 0. */
+static int
+bundle_member_xfer(struct sftp_conn *conn, struct sftp_hpn_bundle_acc *acc,
+    int i, int preserve_flag, int verify, int fsync_flag, int inplace_flag)
+{
+	const char *src = acc->src_paths[i];
+	const char *dst = acc->dst_paths[i];
+	int rc;
+
+	if (acc->is_download) {
+		rc = sftp_download(conn, src, dst, NULL, preserve_flag,
+		    /*resume*/0, fsync_flag, inplace_flag, verify);
+		if (rc == -1)
+			error("download \"%s\" to \"%s\" failed", src, dst);
+	} else {
+		rc = sftp_upload(conn, src, dst, preserve_flag,
+		    /*resume*/0, verify, fsync_flag, inplace_flag);
+		if (rc == -1)
+			error("upload \"%s\" to \"%s\" failed", src, dst);
+	}
+	return sftp_hpn_report_transfer(conn, rc, src, dst, acc->sizes[i]);
+}
+
 /* Upload half of sftp_hpn_bundle_acc_flush: send the batch as one
  * hpn-bundle stream. Upload gets no per-member status back, so the
  * bundle succeeds or fails as a whole. A server that cannot bundle gets
@@ -1402,19 +1427,10 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 		debug_f("server refused bundle; per-file fallback");
 		sftp_conn_hpn(conn)->bundle_cfg.server_cant = 1;
 		acc->enabled = 0;
-		for (i = 0; i < acc->nmembers; i++) {
-			int ur = sftp_upload(conn, acc->src_paths[i],
-			    acc->dst_paths[i], preserve_flag,
-			    /*resume*/0, verify, fsync_flag, inplace_flag);
-
-			if (ur == -1)
-				error("upload \"%s\" to \"%s\" failed",
-				    acc->src_paths[i], acc->dst_paths[i]);
-			if (sftp_hpn_report_transfer(conn, ur,
-			    acc->src_paths[i], acc->dst_paths[i],
-			    acc->sizes[i]) == -1)
+		for (i = 0; i < acc->nmembers; i++)
+			if (bundle_member_xfer(conn, acc, i, preserve_flag,
+			    verify, fsync_flag, inplace_flag) == -1)
 				failures++;
-		}
 		break;
 	case SFTP_HPN_BUNDLE_POLICY_DENIED:
 		error("bundle upload denied by remote policy; aborting");
@@ -1443,7 +1459,7 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 {
 	struct sftp_hpn_bundle_download_entry *entries;
 	struct sftp_bundle_opts opts;
-	int i, rc, dr, failures = 0;
+	int i, rc, failures = 0;
 	off_t meter_ctr = 0, meter_total = 0;
 	char meter_label[32];
 	int meter_on;
@@ -1491,15 +1507,8 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 			}
 			/* Per-entry failure: re-drive individually (the
 			 * per-file path parks for verify internally). */
-			dr = sftp_download(conn, acc->src_paths[i],
-			    acc->dst_paths[i], NULL, preserve_flag,
-			    /*resume*/0, fsync_flag, inplace_flag, verify);
-			if (dr == -1)
-				error("download \"%s\" to \"%s\" failed",
-				    acc->src_paths[i], acc->dst_paths[i]);
-			if (sftp_hpn_report_transfer(conn, dr,
-			    acc->src_paths[i], acc->dst_paths[i],
-			    acc->sizes[i]) == -1)
+			if (bundle_member_xfer(conn, acc, i, preserve_flag,
+			    verify, fsync_flag, inplace_flag) == -1)
 				failures++;
 		}
 		break;
@@ -1507,18 +1516,10 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 		debug_f("server refused bundle-fetch; per-file fallback");
 		sftp_conn_hpn(conn)->bundle_cfg.server_cant = 1;
 		acc->enabled = 0;
-		for (i = 0; i < acc->nmembers; i++) {
-			dr = sftp_download(conn, acc->src_paths[i],
-			    acc->dst_paths[i], NULL, preserve_flag,
-			    /*resume*/0, fsync_flag, inplace_flag, verify);
-			if (dr == -1)
-				error("download \"%s\" to \"%s\" failed",
-				    acc->src_paths[i], acc->dst_paths[i]);
-			if (sftp_hpn_report_transfer(conn, dr,
-			    acc->src_paths[i], acc->dst_paths[i],
-			    acc->sizes[i]) == -1)
+		for (i = 0; i < acc->nmembers; i++)
+			if (bundle_member_xfer(conn, acc, i, preserve_flag,
+			    verify, fsync_flag, inplace_flag) == -1)
 				failures++;
-		}
 		break;
 	case SFTP_HPN_BUNDLE_POLICY_DENIED:
 		error("bundle download denied by remote policy; aborting");
