@@ -139,18 +139,19 @@ struct tree_dl_ctx {
 	 * is appended to both. */
 	const char			*src;
 	const char			*dst;
-	/* Serial, parallel or third-party sink. */
+	/* Serial, parallel or crossload sink. */
 	struct sftp_tree_dl_sink	*sink;
 	/* Regular files queued during enumeration and transferred after the
 	 * stream drains. Stays empty for a streaming sink. */
 	struct walk_entry		*files;
 	size_t				 nfiles;
 	size_t				 files_alloc;
-	/* Meter tally for streaming sinks, which transfer during enumeration
-	 * and leave files[] empty. total_overflow marks a byte tally past
-	 * INT64_MAX, after which the meter runs rate-only. */
-	off_t				 streamed_bytes;
-	size_t				 streamed_files;
+	/* Meter totals, tallied as each regular file record arrives, but
+	 * only for a sink that takes them (set_total). total_overflow marks
+	 * a byte tally past INT64_MAX, after which the meter runs
+	 * rate-only. */
+	off_t				 total_bytes;
+	size_t				 total_files;
 	int				 total_overflow;
 	/* -1 after any per-entry failure. */
 	int				 ret;
@@ -237,10 +238,10 @@ sftp_conn_set_yield_flag(struct sftp_conn *conn, volatile int *flag)
 }
 
 /* --------------------------------------------------------------------------
- * Watchdog pause primitive (HPN).  Lets a worker tell the parallel
+ * Watchdog pause primitive. Lets a worker tell the parallel
  * orchestrator's watchdog that it's about to be busy with legitimate
  * non-byte-transfer work (verify-hash phase, fsync after large write,
- * bundle accumulate/extract, etc.) for up to N seconds.  Watchdog
+ * bundle accumulate/extract, etc.) for up to N seconds. Watchdog
  * suppresses its inactivity-based heuristics for this worker until the
  * deadline expires; the SSH-child-gone check still fires regardless.
  * Callers pause for HPN_HEARTBEAT_REFRESH_SEC and the server's heartbeats
@@ -298,7 +299,7 @@ sftp_conn_watchdog_pause_until_ms(struct sftp_conn *conn)
 }
 
 /* --------------------------------------------------------------------------
- * Adaptive read-ahead controller (HPN). Probes for the smallest in-flight
+ * Adaptive read-ahead controller. Probes for the smallest in-flight
  * depth that saturates the path, doubling while throughput rises and
  * settling at the knee; -R stays the ceiling. Backpressure halves the
  * depth and a persistent floor marks the connection dead for respawn.
@@ -768,7 +769,7 @@ sftp_conn_hash_op_leg(struct sftp_conn *conn, uint64_t base)
 }
 
 /* Cumulative progress within the current leg (heartbeat figures, local
- * read loops).  Publishes done = leg_base + leg_bytes (clamped to the op
+ * read loops). Publishes done = leg_base + leg_bytes (clamped to the op
  * total), refreshes the liveness stamp, and lands the value on the serial
  * meter bridge when one is registered. */
 void
@@ -828,7 +829,7 @@ sftp_conn_hash_work_live(struct sftp_conn *conn, uint64_t *done_out,
 	*total_out = __atomic_load_n(&hpn->hash_work_total, __ATOMIC_RELAXED);
 }
 
-/* Live total only - the watchdog's "provably hashing" gate. */
+/* Live total only. This is the watchdog's "provably hashing" gate. */
 uint64_t
 sftp_conn_hash_op_live_total(struct sftp_conn *conn)
 {
@@ -1008,7 +1009,7 @@ sftp_conn_max_workers_cap(struct sftp_conn *conn)
 }
 
 /* --------------------------------------------------------------------------
- * Adaptive upload pacing (HPN). WRITE acks arrive at the receiver's true
+ * Adaptive upload pacing. WRITE acks arrive at the receiver's true
  * sustained drain rate, so their rate is the signal: the ceiling is
  * 125% of the mean of recent per-second rates, floored, and armed
  * on the same token bucket -l uses. Holding offered load just under the
@@ -1117,7 +1118,7 @@ sftp_conn_pace_ack(struct sftp_conn *conn, size_t len, u_int num_requests)
 	 * sink speeds up. 125% trades probe speed against overshoot. */
 	target_rate = mean_rate * 5 / 4;
 	/* Down-step clamp: one re-arm may cut the ceiling by at most half
-	 * (no clamp on the first arm; bw_rate_bits holds bytes x 8).  The
+	 * (no clamp on the first arm; bw_rate_bits holds bytes x 8). The
 	 * increase side is inherently bounded (about 25% per re-arm, since the
 	 * mean can only grow as fast as the current ceiling admits); an
 	 * unbounded decrease lets one transient famine window crater a
@@ -1211,7 +1212,7 @@ sftp_conn_set_bundle_config(struct sftp_conn *conn, int use_bundle,
 }
 
 /* --------------------------------------------------------------------------
- * Serial-path bundling (HPN). The recursive walks in sftp-client.c
+ * Serial-path bundling. The recursive walks in sftp-client.c
  * collect bundle-eligible small files here, across directories, and ship
  * each batch as one hpn-bundle upload or hpn-bundle-fetch download on the
  * session connection. The grouping policy is shared with the parallel
@@ -1535,31 +1536,36 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 	return failures > 0 ? 1 : 0;
 }
 
-/* Flush the accumulator: send every file collected since the last flush
- * to the server as one bundle transaction, an hpn-bundle stream for an
- * upload or an hpn-bundle-fetch request for a download, then empty the
- * accumulator for the next batch. The walks call it when
- * sftp_hpn_bundle_acc_add reports the batch full, and once more at the
- * end of the walk for the remainder unless interrupted. Returns 0 when
- * the walk may continue cleanly, 1 when one or more members failed but
- * the walk may continue and the caller marks the transfer failed, and -1
- * to abort: a request-policy denial, which the bundle API contract
- * forbids falling back from, or the session connection dying mid-bundle.
- */
+/* Flush the accumulator: send the batch collected since the last flush as
+ * one bundle, hpn-bundle for an upload or hpn-bundle-fetch for a
+ * download, then empty it. Called when sftp_hpn_bundle_acc_add reports
+ * the batch full and once more at the end of an uninterrupted walk.
+ * Returns 0 on success, 1 when members failed but the walk can go on,
+ * and -1 to abort on a policy denial or a dead connection. */
 int
 sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
     struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
     int verify, int fsync_flag, int inplace_flag)
 {
-	int r;
+	int i, r;
+	off_t file_bytes = 0;
 
+	/* Nothing to send. bundle_acc_flush_upload and _download also rely
+	 * on this: they allocate one entry per member, and xcalloc fatals on
+	 * zero. */
 	if (!acc->enabled || acc->nmembers == 0)
 		return 0;
 
-	if (print_flag && print_flag != SFTP_PROGRESS_ONLY)
-		pm_mprintf("%s bundle: %d files, %llu bytes\n",
+	if (print_flag && print_flag != SFTP_PROGRESS_ONLY) {
+		/* loop to get sum of file sizes. Before we were 
+		 * reporting on the bundle size which included the
+		 * the framing and path byte */
+		for (i = 0; i < acc->nmembers; i++)
+			file_bytes += acc->sizes[i];
+		pm_mprintf("%s bundle: %d files, %lld bytes\n",
 		    acc->is_download ? "Fetching" : "Uploading",
-		    acc->nmembers, (unsigned long long)acc->bytes);
+		    acc->nmembers, (long long)file_bytes);
+	}
 	if (acc->is_download)
 		r = bundle_acc_flush_download(conn, acc, preserve_flag,
 		    verify, fsync_flag, inplace_flag);
@@ -1570,22 +1576,21 @@ sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
 	return r;
 }
 
-/*
- * Shared directory handling - see the header comment in
- * sftp-hpn-client.h.  One implementation for the serial walks
- * (sftp-client.c) and the parallel producer walks
- * (sftp-parallel-walk.c).
- */
+/* --------------------------------------------------------------------------
+ * Shared directory handling, one implementation for the serial walks
+ * in sftp-client.c and the parallel producer in sftp-parallel-walk.c.
+ * Directories are created with the owner write and execute bits forced
+ * on, and their final attributes are deferred to the end of the transfer,
+ * then applied deepest first. Bundles write files after the walk has left
+ * their directory, so a restrictive mode applied inline could block them.
+ * The header comment in sftp-hpn-client.h has the tradeoffs.
+ * -------------------------------------------------------------------------- */
 
-/*
- * Normalise a local stat into the attrs a directory should be created with.
- *
- * Size and owner are dropped because neither is meaningful for a directory
- * we are creating, permissions are masked to the mode bits, and the
- * timestamps are kept only under -p.  Four walks derived these attrs
- * identically before this existed; one definition means a change to what a
- * directory's creation attrs mean is one edit rather than four.
- */
+/* Normalise a local stat into the attrs a directory is created with. Size
+ * and owner are dropped, since neither means anything for a directory we
+ * create. The mode keeps the permission and sticky bits, as stock sftp
+ * does, and the timestamps are kept only under -p. Four walks share this,
+ * so a change to what a directory's creation attrs mean is one edit. */
 void
 sftp_hpn_dir_attrs_from_stat(const struct stat *sb, int preserve_flag,
     Attrib *out)
@@ -1598,25 +1603,26 @@ sftp_hpn_dir_attrs_from_stat(const struct stat *sb, int preserve_flag,
 		out->flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 }
 
-/* Create the remote destination directory with write+exec temporarily
- * forced (restored via the deferred attr application), tolerating an
- * existing directory.  Mirrors the long-standing walk behaviour. */
+/* Create the remote destination directory with the owner write and
+ * execute bits forced on, as stock sftp's upload walk does. The deferred
+ * attrs restore the real mode later. An existing directory is fine.
+ * Sets *created to whether this call made it. Returns -1 when it cannot
+ * be created and nothing usable is there. */
 int
 sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
-    Attrib *a, int *created)
+    const Attrib *attrs, int *created)
 {
+	Attrib mkdir_attrs = *attrs;
 	Attrib dirattrib;
-	u_int32_t saved_perm = a->perm;
-	int r;
 
 	*created = 0;
-	a->perm |= (S_IWUSR|S_IXUSR);
-	r = sftp_mkdir(conn, dst, a, 0);
-	a->perm = saved_perm;
-	if (r == 0) {
+	mkdir_attrs.perm |= (S_IWUSR|S_IXUSR);
+	if (sftp_mkdir(conn, dst, &mkdir_attrs, 0) == 0) {
 		*created = 1;
 		return 0;
 	}
+	/* SFTP has no portable EEXIST, so on a mkdir failure check whether
+	 * the path already exists as a directory. */
 	if (sftp_stat(conn, dst, 0, &dirattrib) != 0)
 		return -1;
 	if (!S_ISDIR(dirattrib.perm)) {
@@ -1626,61 +1632,95 @@ sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
 	return 0;
 }
 
-/* Local (download-side) counterpart: mkdir with write+exec forced,
- * tolerating an existing directory.  Reports the final and temporary
- * modes so the caller can defer the chmod. */
+/* Local counterpart for downloads: create the directory with the remote
+ * mode, or 0777 when the server sent none, plus the owner write and
+ * execute bits. An existing directory is fine, as in stock sftp. Reports
+ * the final and the forced mode so the caller can defer the chmod when
+ * they differ. */
 int
-sftp_hpn_ensure_local_dir(const char *dst, Attrib *dirattrib,
+sftp_hpn_ensure_local_dir(const char *dst, const Attrib *dirattrib,
     mode_t *mode_out, mode_t *tmpmode_out)
 {
 	mode_t mode = 0777, tmpmode;
 
 	if (dirattrib->flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
 		mode = dirattrib->perm & 01777;
+	else
+		debug_f("local \"%s\": server did not send permissions",
+		    dst);
 	tmpmode = mode | (S_IWUSR|S_IXUSR);
-	if (mkdir(dst, tmpmode) == -1 && errno != EEXIST) {
-		error("mkdir %s: %s", dst, strerror(errno));
-		return -1;
+	if (mkdir(dst, tmpmode) == -1) {
+		struct stat sb;
+
+		if (errno != EEXIST) {
+			error("mkdir %s: %s", dst, strerror(errno));
+			return -1;
+		}
+		if (stat(dst, &sb) == -1 || !S_ISDIR(sb.st_mode)) {
+			error("\"%s\" exists but is not a directory", dst);
+			return -1;
+		}
 	}
 	*mode_out = mode;
 	*tmpmode_out = tmpmode;
 	return 0;
 }
 
+/* Return the next free slot in the deferred-attribute list, zeroed,
+ * doubling the list as needed. */
 static struct sftp_hpn_dirattr *
 dirattrs_grow(struct sftp_hpn_dirattr_list *dl)
 {
+	struct sftp_hpn_dirattr *d;
+
 	if (dl->nentries == dl->entries_alloc) {
-		dl->entries_alloc = dl->entries_alloc ?
-		    dl->entries_alloc * 2 : 32;
+		if (dl->entries_alloc == 0)
+			dl->entries_alloc = 32;
+		else
+			dl->entries_alloc *= 2;
 		dl->entries = xreallocarray(dl->entries, dl->entries_alloc,
 		    sizeof(*dl->entries));
 	}
-	return &dl->entries[dl->nentries++];
+	d = &dl->entries[dl->nentries++];
+	memset(d, 0, sizeof(*d));
+	return d;
 }
 
+/* Queue a remote directory's final attrs for a setstat after the
+ * transfer. */
 void
 sftp_hpn_dirattrs_defer_remote(struct sftp_hpn_dirattr_list *dl,
-    const char *path, const Attrib *a)
+    const char *path, const Attrib *attrs)
 {
 	struct sftp_hpn_dirattr *d = dirattrs_grow(dl);
 
-	memset(d, 0, sizeof(*d));
 	d->path = xstrdup(path);
-	d->attrs = *a;
+	d->attrs = *attrs;
 	d->is_local = 0;
 }
 
+/* Queue a local directory's final mode and times, to be applied after
+ * the whole transfer finishes. They cannot be applied when the directory
+ * is created, for two reasons. A read-only mode would stop the files
+ * that belong in the directory from being written. And writing each of
+ * those files updates the directory's modification time, overwriting
+ * any time set earlier. Because bundles can deliver a directory's files
+ * after the walk has moved past it, the end of the transfer is the first
+ * point at which every directory is known to be complete.
+ *
+ * The mode is stored only when it differs from the mode the directory
+ * was created with. (mode_t)-1 means no chmod is needed. */
 void
 sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
     const char *path, mode_t mode, mode_t tmpmode, const Attrib *dirattrib)
 {
 	struct sftp_hpn_dirattr *d = dirattrs_grow(dl);
 
-	memset(d, 0, sizeof(*d));
 	d->path = xstrdup(path);
 	d->is_local = 1;
-	d->mode = (mode != tmpmode) ? mode : (mode_t)-1;
+	d->mode = (mode_t)-1;
+	if (mode != tmpmode)
+		d->mode = mode;
 	if (dirattrib->flags & SSH2_FILEXFER_ATTR_ACMODTIME) {
 		d->set_times = 1;
 		d->atime = dirattrib->atime;
@@ -1690,14 +1730,14 @@ sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
 
 /* Depth of a path, counted in separators, for ordering the deferred attrs. */
 static int
-dirattr_path_depth(const char *p)
+dirattr_path_depth(const char *path)
 {
-	int n = 0;
+	int depth = 0;
 
-	for (; *p != '\0'; p++)
-		if (*p == '/')
-			n++;
-	return n;
+	for (; *path != '\0'; path++)
+		if (*path == '/')
+			depth++;
+	return depth;
 }
 
 /* Deeper paths first; original position breaks ties so the order is
@@ -1713,25 +1753,18 @@ dirattr_deepest_first(const void *va, const void *vb)
 	return a->idx - b->idx;
 }
 
-/* Apply every deferred directory attribute, deepest path first.
- *
- * Order matters, and it cannot be taken from the list.  A directory is
- * created with owner write and execute forced on so the transfer can write
- * into it, and the deferred attrs are what put the real mode back.  Applying
- * a parent first can strip the owner execute bit its own children still need,
- * and every chmod and utimes below it then fails with EACCES - leaving those
- * children with the widened mode this deferral exists to undo.
- *
- * The upload driver defers after recursing, so its insertion order is already
- * children first.  Every download and third-party sink defers inside make_dir,
- * which is parents first, and the discover-tree wire contract emits parents
- * before children as well.  Sorting here makes the result independent of which
- * producer built the list.
- *
- * Remote (upload) setstats go through sftp_setstat_pipeline - one window of
- * outstanding requests rather than a blocking round trip per directory, which
- * is the bulk of the batch's cost on a WAN - and it preserves the order it is
- * given.  Local (download) attrs are plain syscalls, applied inline. */
+/* Apply every deferred directory attribute, deepest path first. It serves both
+ * directions: uploads defer remote setstats and downloads defer local mode and
+ * time changes. The order matters. Directories were created with the owner
+ * write and execute bits forced on, and these attrs put the real mode back. If
+ * a parent went first, its real mode could remove the execute bit its children
+ * still need, and every chmod and utimes below it would then fail with EACCES,
+ * leaving the children with the widened mode. The list cannot supply the order
+ * itself: the upload walk defers children first, but the download and
+ * crossload walks, and the discover-tree stream, defer parents first. Remote
+ * setstats go through sftp_setstat_pipeline, one window of outstanding requests
+ * rather than a round trip per directory, and it keeps the order given. Local
+ * attrs are plain syscalls, applied inline. */
 void
 sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
     struct sftp_hpn_dirattr_list *dl)
@@ -1739,17 +1772,18 @@ sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
 	struct dirattr_order *order;
 	char **paths;
 	Attrib *attrs;
-	int i, nr = 0;
+	int i, nremote = 0;
 
+	/* Nothing deferred, for example a download without -p whose
+	 * directories needed no widening. xcalloc(0) would fatal. */
 	if (dl->nentries == 0)
-		return;		/* nothing deferred (e.g. download, no -p,
-				 * dirs needed no write-enabling) - xcalloc(0)
-				 * would fatal */
+		return;
 
 	paths = xcalloc(dl->nentries, sizeof(*paths));
 	attrs = xcalloc(dl->nentries, sizeof(*attrs));
 	order = xcalloc(dl->nentries, sizeof(*order));
 
+	/* Sort the index of path entries in deepest first order */
 	for (i = 0; i < dl->nentries; i++) {
 		order[i].idx = i;
 		order[i].depth = dirattr_path_depth(dl->entries[i].path);
@@ -1757,15 +1791,20 @@ sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
 	qsort(order, (size_t)dl->nentries, sizeof(*order),
 	    dirattr_deepest_first);
 
+	/* Step through the sorted list */
 	for (i = 0; i < dl->nentries; i++) {
 		struct sftp_hpn_dirattr *d = &dl->entries[order[i].idx];
 
+		/* Don't apply remote entries. Collect it for the
+		 * pipelined batch after the loop. */
 		if (!d->is_local) {
-			paths[nr] = d->path;	/* borrowed; list outlives us */
-			attrs[nr] = d->attrs;
-			nr++;
+			/* borrowed; the list outlives this call */
+			paths[nremote] = d->path;
+			attrs[nremote] = d->attrs;
+			nremote++;
 			continue;
 		}
+		/* Set time */
 		if (d->set_times) {
 			struct timeval tv[2];
 
@@ -1776,14 +1815,17 @@ sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
 				error("local set times on \"%s\": %s",
 				    d->path, strerror(errno));
 		}
+		/* Set mode */
 		if (d->mode != (mode_t)-1 &&
 		    chmod(d->path, d->mode) == -1)
 			error("local chmod directory \"%s\": %s",
 			    d->path, strerror(errno));
 	}
 
-	if (nr > 0)
-		(void)sftp_setstat_pipeline(conn, paths, attrs, nr);
+	/* Send the collected remote setstats (see above) as one batch
+	   rather than one round trip per directory. Downloads collect none. */
+	if (nremote > 0)
+		(void)sftp_setstat_pipeline(conn, paths, attrs, nremote);
 
 	free(paths);
 	free(attrs);
@@ -1802,23 +1844,29 @@ sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl)
 	dl->nentries = dl->entries_alloc = 0;
 }
 
-/* ---- hpn-discover-tree: client fetch ----------------------------------- */
+/* --------------------------------------------------------------------------
+ * Recursive walk drivers shared by the serial walks in sftp-client.c
+ * and the parallel walk in sftp-parallel-walk.c. Each supplies its
+ * own sink. sftp_hpn_discover_tree fetches a remote subtree in one streamed
+ * request. The download driver replays its records through the sink, with
+ * a readdir walk as the fallback when the server lacks the extension. The
+ * upload driver walks the local tree.
+ * -------------------------------------------------------------------------- */
 
-/*
- * Send hpn-discover-tree for root and invoke cb once per discovered entry as
- * the reply streams in.  The reply is one or more EXTENDED_REPLY chunks on
- * the control connection, terminated by an END chunk; the whole stream is
- * drained before returning, so the callback may not issue another request on
- * that connection mid-stream.  See sftp-hpn-tree.h.
- */
+/* Send hpn-discover-tree for root and call cb once per discovered entry as
+ * the reply streams in. The reply is one or more EXTENDED_REPLY chunks on
+ * the control connection, ended by an END chunk, and the whole stream is
+ * drained before returning, so cb must not send another request on that
+ * connection. A nonzero return from cb stops decoding, and the rest of the
+ * stream is read and discarded. See sftp-hpn-tree.h. */
 int
 sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
-    u_int32_t flags, sftp_tree_record_cb cb, void *ctx)
+    uint32_t flags, sftp_tree_record_cb cb, void *ctx)
 {
 	struct sshbuf		*msg;
 	u_int			 id, rid;
 	u_char			 type, version, kind;
-	u_int32_t		 count, i;
+	uint32_t		 count, i;
 	uint64_t		 nrecords;
 	int			 r, rc = -1, done = 0, skip = 0;
 
@@ -1840,9 +1888,9 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 	}
 
 	nrecords = 0;
-	/* The reply streams as many chunks until END, so this connection is
-	 * ours until it drains.  Anything that tries to send on it before then
-	 * is a bug and send_msg says so; see reply_stream_active. */
+	/* The reply arrives as a stream of chunks up to END, so this
+	 * connection is ours until it drains. Sending on it before then is a
+	 * bug, and send_msg fatals on it; see reply_stream_active. */
 	sftp_conn_hpn(conn)->reply_stream_active = 1;
 
 	while (!done) {
@@ -1854,10 +1902,10 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 		}
 		/* A message we cannot decode leaves the stream desynced, and
 		 * the server keeps sending chunks until its END regardless.
-		 * Returning without marking the connection dead lets those
-		 * chunks surface as an id mismatch on whatever command runs
-		 * next, which then fails carrying the wrong path.  The
-		 * neighbouring bail-outs already die for this reason. */
+		 * Leaving the connection alive would let those chunks surface
+		 * as an id mismatch on the next command, which would then fail
+		 * carrying the wrong path. Every bail-out below dies for the
+		 * same reason. */
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
 			sftp_conn_die(conn, "hpn-discover-tree: parse reply "
@@ -1867,20 +1915,25 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 		if (rid != id) {
 			sftp_conn_die(conn, "hpn-discover-tree reply id "
 			    "mismatch (got %u expected %u)", rid, id);
+			sftp_conn_set_protocol_violation(conn);
 			goto out;
 		}
+		/* The server refused the request before streaming anything, so
+		 * the exchange is over and the connection is still in sync. A
+		 * missing root arrives as an error record instead. */
 		if (type == SSH2_FXP_STATUS) {
-			u_int fx = SSH2_FX_FAILURE;
+			u_int fx_status = SSH2_FX_FAILURE;
 
-			(void)sshbuf_get_u32(msg, &fx);
+			(void)sshbuf_get_u32(msg, &fx_status);
 			logit_f("hpn-discover-tree \"%s\": server STATUS %s",
-			    root, fx2txt(fx));
+			    root, fx2txt(fx_status));
 			goto out;
 		}
 		if (type != SSH2_FXP_EXTENDED_REPLY) {
 			sftp_conn_die(conn, "hpn-discover-tree: expected "
 			    "EXTENDED_REPLY(%u), got %u",
 			    SSH2_FXP_EXTENDED_REPLY, type);
+			sftp_conn_set_protocol_violation(conn);
 			goto out;
 		}
 		if ((r = sshbuf_get_u8(msg, &version)) != 0 ||
@@ -1895,18 +1948,18 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 			    "codec version %u", version);
 			goto out;
 		}
-		/* A DATA chunk always carries records: the server flushes one
-		 * only when the record buffer is full or non-empty.  Refusing
-		 * an empty one keeps a peer from parking us in this loop
-		 * forever with chunks that never reach the callback. */
+		/* The server sends a DATA chunk only when it has records to
+		 * flush, so an empty one is malformed. Refusing it keeps a peer
+		 * from parking us in this loop with chunks that never reach the
+		 * callback. */
 		if (count == 0 && kind != HPN_DTREE_CHUNK_END) {
 			sftp_conn_die(conn, "hpn-discover-tree: DATA chunk "
 			    "carries no records");
 			goto out;
 		}
-		/* Terminate a stream that never will.  See
-		 * HPN_DTREE_MAX_RECORDS: this is a backstop against a peer
-		 * that keeps sending, not a limit any real tree meets. */
+		/* Stop a stream that would never end. HPN_DTREE_MAX_RECORDS is
+		 * a backstop against a peer that keeps sending, not a limit any
+		 * real tree reaches. */
 		nrecords += count;
 		if (nrecords > HPN_DTREE_MAX_RECORDS) {
 			sftp_conn_die(conn, "hpn-discover-tree \"%s\": more "
@@ -1914,13 +1967,12 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 			    (unsigned long long)HPN_DTREE_MAX_RECORDS);
 			goto out;
 		}
-		/*
-		 * Once the callback has bowed out, usually an interrupt, stop
-		 * decoding: nothing would be done with the records.  Keep
+		/* Once the callback (cb) has bowed out, usually an interrupt,
+		 * stop decoding: nothing would be done with the records. Keep
 		 * reading chunks to the END marker so the exchange finishes in
-		 * sync and the connection stays usable, but discard each one
-		 * whole rather than parsing a tree that is being thrown away.
-		 */
+		 * sync and the connection stays usable, but discard each
+		 * one whole rather than parsing a tree that is being thrown
+		 * away. */
 		for (i = 0; !skip && i < count; i++) {
 			struct sftp_tree_ent ent;
 
@@ -1949,35 +2001,50 @@ sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 	return rc;
 }
 
-/*
- * Per-record callback (see sftp_tree_record_cb).  Directories are created
+/* Add a peer-reported file size to *total for the meter. A size past off_t,
+ * or a sum that would pass it, would wrap the signed total negative and the
+ * meter would render nonsense. In that case return -1 and leave *total
+ * alone, so the caller can report an unknown total and let the meter run
+ * rate-only. An entry without a size adds nothing. */
+static int
+tree_total_add(off_t *total, const Attrib *attrs)
+{
+	uint64_t size = attrs->size;
+
+	if ((attrs->flags & SSH2_FILEXFER_ATTR_SIZE) == 0)
+		return 0;
+	if (size > (uint64_t)INT64_MAX ||
+	    (uint64_t)*total > (uint64_t)INT64_MAX - size)
+		return -1;
+	*total += (off_t)size;
+	return 0;
+}
+
+/* Per-record callback (see sftp_tree_record_cb). Directories are created
  * inline: the wire contract emits a parent before its children, so a dir's
- * parent already exists on disk when its record arrives.  Regular files are
- * queued and transferred after the stream drains: a transfer issued while the
- * discover-tree reply is still arriving would collide with it on the control
- * connection.  Once the sink signals an abort the callback stops doing work
- * but keeps returning, so the fetch can finish draining the connection clean.
- */
+ * parent already exists on disk when its record arrives. Regular files go
+ * one of two ways. A streaming sink (the parallel fleet) takes each file as
+ * it arrives, so transfer overlaps discovery. Otherwise the file is queued
+ * and transferred after the stream drains, because a transfer issued while
+ * the discover-tree reply is still arriving would collide with it on the
+ * control connection. On abort the callback returns nonzero so the fetch
+ * stops decoding. */
 static int
 tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 {
 	struct tree_dl_ctx	*ctx = vctx;
-	Attrib			*a = &ent->a;
+	Attrib			*attrs = &ent->a;
 	char			*new_src, *new_dst;
 
-	/* Stop the enumeration rather than draining the rest of it silently:
-	 * an interrupt during a large walk otherwise looks wedged until the
-	 * server finishes.  The fetch marks the connection dead. */
+	/* On abort, tell the fetch to stop decoding. It still reads the
+	 * stream to END and discards it, so the connection stays in sync. */
 	if (ctx->sink->aborting(ctx->sink))
 		return -1;
-	/*
-	 * A failure of the walk root itself is encoded with an empty relpath:
-	 * there is no component below the root to name.  Handle it before the
-	 * validator, which rejects "" - correctly, for every record type that
-	 * goes on to build a path from it.  Left to the validator this arrives
-	 * as an accusation that the peer sent a suspect path, and the real
-	 * reason, an unreadable root, is discarded.
-	 */
+	/* A failure of the walk root itself arrives with an empty relpath,
+	 * since there is no component below the root to name. Handle it
+	 * before the validator. The validator rightly rejects "" for every
+	 * record that builds a path from it, but here that would report a
+	 * suspect path and hide the real cause, an unreadable root. */
 	if (ent->rectype == HPN_DTREE_REC_ERROR &&
 	    (ent->relpath == NULL || *ent->relpath == '\0')) {
 		error("remote \"%s\": %s", ctx->src, fx2txt(ent->status));
@@ -1997,54 +2064,52 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 
 	switch (ent->rectype) {
 	case HPN_DTREE_REC_DIR:
-		if (ctx->sink->make_dir(ctx->sink, new_src, new_dst, a) != 0)
+		if (ctx->sink->make_dir(ctx->sink, new_src, new_dst, attrs) != 0)
 			ctx->ret = -1;
 		free(new_src);
 		free(new_dst);
 		break;
 	case HPN_DTREE_REC_REG:
-		if (ctx->sink->streams_files) {
-			/*
-			 * Hand it over now instead of queueing it, so transfer
-			 * overlaps discovery and the driver holds no per-file
-			 * queue.  Legal only because this sink just enqueues
-			 * work for the fleet; reply_stream_active catches it
-			 * immediately if that ever stops being true.  The
-			 * meter figures are tallied here because files[] stays
-			 * empty, with the same overflow fallback the deferred
-			 * sum uses.
-			 */
-			if ((a->flags & SSH2_FILEXFER_ATTR_SIZE) != 0 &&
-			    !ctx->total_overflow) {
-				u_int64_t sz = a->size;
-
-				if (sz > (u_int64_t)INT64_MAX ||
-				    (u_int64_t)ctx->streamed_bytes >
-				    (u_int64_t)INT64_MAX - sz) {
-					ctx->total_overflow = 1;
-					ctx->streamed_bytes = 0;
-				} else
-					ctx->streamed_bytes += (off_t)sz;
+		/* Tally the meter totals only for a sink that takes them. */
+		if (ctx->sink->set_total != NULL) {
+			if (!ctx->total_overflow &&
+			    tree_total_add(&ctx->total_bytes, attrs) != 0) {
+				debug_f("discover-tree \"%s\": file sizes "
+				    "exceed off_t; meter falls back to "
+				    "rate-only", ctx->src);
+				ctx->total_overflow = 1;
+				ctx->total_bytes = 0;
 			}
-			ctx->streamed_files++;
+			ctx->total_files++;
+		}
+		if (ctx->sink->streams_files) {
+			/* Hand it over now instead of queueing it, so transfer
+			 * overlaps discovery. files[] stays empty and the
+			 * fleet holds only its bounded window of pending work
+			 * (sftp_parallel_await_capacity). This is legal only
+			 * because this sink just enqueues work for the fleet.
+			 * reply_stream_active catches it at once if that ever
+			 * stops being true. */
 			if (ctx->sink->xfer_file(ctx->sink, new_src, new_dst,
-			    a) != 0)
+			    attrs) != 0)
 				ctx->ret = -1;
 			free(new_src);
 			free(new_dst);
 			break;
 		}
 		if (ctx->nfiles == ctx->files_alloc) {
-			ctx->files_alloc = ctx->files_alloc ?
-			    ctx->files_alloc * 2 : 256;
+			if (ctx->files_alloc == 0)
+				ctx->files_alloc = 256;
+			else
+				ctx->files_alloc *= 2;
 			ctx->files = xreallocarray(ctx->files,
 			    ctx->files_alloc, sizeof(*ctx->files));
 		}
 		ctx->files[ctx->nfiles].src = new_src;
 		ctx->files[ctx->nfiles].dst = new_dst;
-		ctx->files[ctx->nfiles].attrs = *a;
+		ctx->files[ctx->nfiles].attrs = *attrs;
 		ctx->nfiles++;
-		/* new_src / new_dst now owned by the queue */
+		/* new_src and new_dst are now owned by the queue. */
 		break;
 	case HPN_DTREE_REC_ERROR:
 		error("remote \"%s\": %s", new_src, fx2txt(ent->status));
@@ -2063,12 +2128,37 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 	return 0;
 }
 
-/*
- * Shared download driver: enumerate src via discover-tree and replay each
- * record through the sink as it streams in.  Serial and parallel supply their
- * own sink; the classification, path building, and iteration live here once.
- * See sftp-hpn-client.h.
- */
+/* Resolve the attrs of a remote download root and check that it is a
+ * directory. Shared by the tree and readdir consumers. dirattrib is the
+ * caller's attrs, or NULL to stat src into *statbuf. Returns the attrs to
+ * use, or NULL after reporting the failure to the sink. */
+static Attrib *
+dl_root_attrs(struct sftp_conn *conn, const char *src, Attrib *dirattrib,
+    Attrib *statbuf, struct sftp_tree_dl_sink *sink)
+{
+	/* The caller may not have the root's attrs (top-level calls never
+	 * do), so stat it here. Fail only if that stat fails. */
+	if (dirattrib == NULL) {
+		if (sftp_stat(conn, src, 1, statbuf) != 0) {
+			error("stat remote \"%s\" directory failed", src);
+			sink->fail(sink, src, "remote stat failed");
+			return NULL;
+		}
+		dirattrib = statbuf;
+	}
+	/* it's not actually a directory so this doesn't apply */
+	if (!S_ISDIR(dirattrib->perm)) {
+		error("\"%s\" is not a directory", src);
+		sink->fail(sink, src, "not a directory");
+		return NULL;
+	}
+	return dirattrib;
+}
+
+/* Shared download driver: enumerate src via discover-tree and replay each
+ * record through the sink as it streams in. Serial, parallel and crossload
+ * each supply their own sink, and the classification, path building and
+ * iteration live here once. See sftp-hpn-client.h. */
 int
 sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, Attrib *dirattrib, int follow_link_flag,
@@ -2078,21 +2168,12 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	Attrib			ldirattrib;
 	size_t			i;
 
-	if (dirattrib == NULL) {
-		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
-			error("stat remote \"%s\" directory failed", src);
-			sink->fail(sink, src, "remote stat failed");
-			return -1;
-		}
-		dirattrib = &ldirattrib;
-	}
-	if (!S_ISDIR(dirattrib->perm)) {
-		error("\"%s\" is not a directory", src);
-		sink->fail(sink, src, "not a directory");
+	/* check to see we should excute this download_consume() */ 
+	dirattrib = dl_root_attrs(conn, src, dirattrib, &ldirattrib, sink);
+	if (dirattrib == NULL)
 		return -1;
-	}
-	/* Create the local root; the sink defers its attrs (and, for serial,
-	 * prints the "Retrieving" line). */
+	/* Create the local root. The sink defers its attrs, and the serial
+	 * and crossload sinks print the "Retrieving" line. */
 	if (sink->make_dir(sink, src, dst, dirattrib) != 0)
 		return -1;
 
@@ -2101,6 +2182,10 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	ctx.dst = dst;
 	ctx.sink = sink;
 
+	/* Enumerate the whole subtree in one streamed request. Each record goes
+	 * to tree_dl_consume_record, which creates directories inline and
+	 * either hands regular files to a streaming sink or queues them for the
+	 * loop below. Symlinks are followed only when the caller asks. */
 	if (sftp_hpn_discover_tree(conn, src,
 	    follow_link_flag ? HPN_DTREE_FOLLOW_SYMLINKS : 0,
 	    tree_dl_consume_record, &ctx) != 0) {
@@ -2110,41 +2195,12 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 		goto out;
 	}
 
-	/* The full file list is now in hand (every file was deferred to here),
-	 * so the total size is known.  Hand it to the sink: a parallel download
-	 * switches its aggregate meter from rate-only to a real percentage and
-	 * ETA.  Serial and third-party sinks leave set_total NULL. */
-	if (sink->set_total != NULL && sink->streams_files) {
-		/* Streaming: the files transferred as they arrived, so the
-		 * figures come from the tally.  This lands after the walk, so
-		 * the meter runs rate-only during discovery and gains its
-		 * percentage and ETA once the total is actually known. */
-		sink->set_total(sink, ctx.streamed_bytes, ctx.streamed_files);
-	} else if (sink->set_total != NULL) {
-		off_t total_bytes = 0;
-
-		for (i = 0; i < ctx.nfiles; i++) {
-			u_int64_t sz = ctx.files[i].attrs.size;
-
-			if ((ctx.files[i].attrs.flags &
-			    SSH2_FILEXFER_ATTR_SIZE) == 0)
-				continue;
-			/* Sizes come from the peer.  One past off_t, or a sum
-			 * that would pass it, wraps the signed accumulator into
-			 * a negative total and the meter renders nonsense for
-			 * the rest of the transfer.  Report an unknown total
-			 * instead and let the meter run rate-only. */
-			if (sz > (u_int64_t)INT64_MAX ||
-			    (u_int64_t)total_bytes > (u_int64_t)INT64_MAX - sz) {
-				debug_f("discover-tree \"%s\": file sizes exceed "
-				    "off_t; meter falls back to rate-only", src);
-				total_bytes = 0;
-				break;
-			}
-			total_bytes += (off_t)sz;
-		}
-		sink->set_total(sink, total_bytes, ctx.nfiles);
-	}
+	/* Enumeration is complete, so hand the totals to the sink. An
+	 * aggregate meter switches from rate-only to a real percentage and
+	 * ETA here, which means it runs rate-only during discovery. Serial
+	 * and crossload sinks leave set_total NULL. */
+	if (sink->set_total != NULL)
+		sink->set_total(sink, ctx.total_bytes, ctx.total_files);
 
 	/* Transfer the files queued during the stream. */
 	for (i = 0; i < ctx.nfiles && !sink->aborting(sink); i++) {
@@ -2153,6 +2209,7 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 			ctx.ret = -1;
 	}
  out:
+	/* free everything we alloc'ed */
 	for (i = 0; i < ctx.nfiles; i++) {
 		free(ctx.files[i].src);
 		free(ctx.files[i].dst);
@@ -2161,15 +2218,13 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	return ctx.ret;
 }
 
-/*
- * Fallback recursive readdir download driver (used when the server lacks
- * hpn-discover-tree): enumerate src a directory at a time, recursing into
+/* Fallback recursive readdir download driver, used when the server lacks
+ * hpn-discover-tree. Enumerate src a directory at a time, recursing into
  * subdirectories, and replay each entry through the same sink the tree
- * consumer uses.  Directory attrs are deferred pre-order here rather than the
- * historical post-order; sftp_hpn_dirattrs_apply sorts deepest-first at
- * end-of-walk, so which order a producer records them in does not matter.
- * See sftp-hpn-client.h.
- */
+ * consumer uses. Files go to the sink as they are listed, so memory is one
+ * listing per level of recursion. Directory attrs are deferred in pre-order
+ * here. sftp_hpn_dirattrs_apply sorts them deepest first at the end of the
+ * walk, so the recording order does not matter. See sftp-hpn-client.h. */
 int
 sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, int depth, int max_depth, Attrib *dirattrib,
@@ -2180,27 +2235,22 @@ sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
 	Attrib		  ldirattrib, lsym;
 	int		  ret = 0, i;
 
+	/* Bounds recursion, including symlink loops when following links. */
 	if (depth >= max_depth) {
 		error("Maximum directory depth exceeded: %d levels", depth);
 		sink->fail(sink, src, "max directory depth exceeded");
 		return -1;
 	}
-	if (dirattrib == NULL) {
-		if (sftp_stat(conn, src, 1, &ldirattrib) != 0) {
-			error("stat remote \"%s\" directory failed", src);
-			sink->fail(sink, src, "remote stat failed");
-			return -1;
-		}
-		dirattrib = &ldirattrib;
-	}
-	if (!S_ISDIR(dirattrib->perm)) {
-		error("\"%s\" is not a directory", src);
-		sink->fail(sink, src, "not a directory");
+
+	/* check to see if we should use this download_consume() */
+	dirattrib = dl_root_attrs(conn, src, dirattrib, &ldirattrib, sink);
+	if (dirattrib == NULL)
 		return -1;
-	}
-	/* Create dst; print + Lustre parity + deferred attrs live in make_dir. */
+	/* Create dst. The sink's make_dir also prints progress, matches the
+	 * Lustre layout where supported and defers the attrs. */
 	if (sink->make_dir(sink, src, dst, dirattrib) != 0)
 		return -1;
+	/* Lists the whole directory before any entry is handled. */
 	if (sftp_readdir(conn, src, &entries) == -1) {
 		error("remote readdir \"%s\" failed", src);
 		sink->fail(sink, src, "remote readdir failed");
@@ -2209,40 +2259,45 @@ sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
 
 	for (i = 0; entries[i] != NULL && !sink->aborting(sink); i++) {
 		const char	*filename;
-		Attrib		*a;
+		Attrib		*attrs;
 
+		/* Free the previous entry's paths here so continue needs no
+		 * cleanup. */
 		free(new_dst);
 		free(new_src);
 		filename = entries[i]->filename;
 		new_dst = sftp_path_append(dst, filename);
 		new_src = sftp_path_append(src, filename);
-		a = &entries[i]->a;
+		attrs = &entries[i]->a;
 
-		if (S_ISLNK(a->perm)) {
+		if (S_ISLNK(attrs->perm)) {
 			if (!follow_link_flag) {
 				logit("download \"%s\": not a regular file",
 				    new_src);
 				continue;
 			}
-			/* -L is a dormant upstream stub: resolve the target
-			 * and treat the entry as whatever it points to. */
+			/* scp follows symlinks (sftp does not). Resolve
+			 * the target and treat the entry as whatever it
+			 * points to. */
 			if (sftp_stat(conn, new_src, 1, &lsym) != 0) {
 				error("remote stat \"%s\" failed", new_src);
 				sink->fail(sink, new_src, "remote stat failed");
 				ret = -1;
 				continue;
 			}
-			a = &lsym;
+			attrs = &lsym;
 		}
-		if (S_ISDIR(a->perm)) {
+		if (S_ISDIR(attrs->perm)) {
+			/* readdir lists the directory itself and its parent. */
 			if (strcmp(filename, ".") == 0 ||
 			    strcmp(filename, "..") == 0)
 				continue;
-			if (sftp_readdir_download_consume(conn, new_src, new_dst,
-			    depth + 1, max_depth, a, follow_link_flag, sink) != 0)
+			if (sftp_readdir_download_consume(conn, new_src,
+			    new_dst, depth + 1, max_depth, attrs,
+			    follow_link_flag, sink) != 0)
 				ret = -1;
-		} else if (S_ISREG(a->perm)) {
-			if (sink->xfer_file(sink, new_src, new_dst, a) != 0)
+		} else if (S_ISREG(attrs->perm)) {
+			if (sink->xfer_file(sink, new_src, new_dst, attrs) != 0)
 				ret = -1;
 		} else {
 			logit("download \"%s\": not a regular file", new_src);
@@ -2254,13 +2309,12 @@ sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
 	return ret;
 }
 
-/*
- * Shared upload driver (serial and parallel): enumerate the local directory
- * src, hand each regular file to the sink, collect subdirectories, batch-
- * create them on the control connection (sftp_mkdir_pipeline,
- * chunks, fully drained so a directory exists before its files are written),
- * then recurse into each with its mkdir "created" flag.  See sftp-hpn-client.h.
- */
+/* Shared upload driver for serial and parallel. Enumerate the local
+ * directory src, hand each regular file to the sink and collect the
+ * subdirectories. Create those in one sftp_mkdir_pipeline call on the
+ * control connection, which drains fully, so each directory exists before
+ * its files are written. Then recurse into each, passing whether this walk
+ * created it. dst itself was created by the caller. See sftp-hpn-client.h. */
 int
 sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
     const char *dst, int depth, int max_depth, int created, int preserve_flag,
@@ -2270,15 +2324,18 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 	struct dirent			*dp;
 	char				*new_src = NULL, *new_dst = NULL;
 	struct stat			 sb;
-	Attrib				 a;
+	Attrib				 dir_attrs;
 	struct walk_entry		*subdirs = NULL;
-	int				 nsub = 0, subcap = 0, i, ret = 0;
+	int				 nsubdirs = 0, subdirs_alloc = 0;
+	int				 i, ret = 0;
 
+	/* Bounds recursion, including symlink loops when following links. */
 	if (depth >= max_depth) {
 		error("Maximum directory depth exceeded: %d levels", depth);
 		sink->fail(sink, src, "max directory depth exceeded");
 		return -1;
 	}
+	/* stat, not lstat, so a symlinked root is followed like stock. */
 	if (stat(src, &sb) == -1) {
 		error("stat local \"%s\": %s", src, strerror(errno));
 		sink->fail(sink, src, strerror(errno));
@@ -2292,9 +2349,10 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 
 	/* This directory's source-derived attrs; dst was created by the caller
 	 * (the root by the entry point, deeper dirs by the parent's batch). */
-	sftp_hpn_dir_attrs_from_stat(&sb, preserve_flag, &a);
+	sftp_hpn_dir_attrs_from_stat(&sb, preserve_flag, &dir_attrs);
 
-	sink->enter_dir(sink, src, dst);	/* print / Lustre / enum phase */
+	/* Serial prints progress. Parallel marks the enumeration phase. */
+	sink->enter_dir(sink, src, dst);
 
 	if ((dirp = opendir(src)) == NULL) {
 		error("local opendir \"%s\": %s", src, strerror(errno));
@@ -2307,6 +2365,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 		free(new_dst);
 		free(new_src);
 		new_dst = new_src = NULL;
+		/* Skip empty directory slots (inode 0), as stock does. */
 		if (dp->d_ino == 0)
 			continue;
 		if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0)
@@ -2314,6 +2373,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 		new_dst = sftp_path_append(dst, filename);
 		new_src = sftp_path_append(src, filename);
 
+		/* lstat first so symlinks can be told apart. */
 		if (lstat(new_src, &sb) == -1) {
 			logit("local lstat \"%s\": %s", new_src, strerror(errno));
 			sink->fail(sink, new_src, strerror(errno));
@@ -2325,7 +2385,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 				logit("%s: not a regular file", filename);
 				continue;
 			}
-			/* -L is a dormant upstream stub: follow the target. */
+			/* scp follows symlinks (sftp does not). */
 			if (stat(new_src, &sb) == -1) {
 				logit("local stat \"%s\": %s", new_src,
 				    strerror(errno));
@@ -2334,17 +2394,22 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 				continue;
 			}
 		}
+		/* Hold subdirectories until the listing is done, so they can
+		 * be created in one batch. */
 		if (S_ISDIR(sb.st_mode)) {
-			if (nsub == subcap) {
-				subcap = subcap ? subcap * 2 : 64;
-				subdirs = xreallocarray(subdirs, subcap,
+			if (nsubdirs == subdirs_alloc) {
+				if (subdirs_alloc == 0)
+					subdirs_alloc = 64;
+				else
+					subdirs_alloc *= 2;
+				subdirs = xreallocarray(subdirs, subdirs_alloc,
 				    sizeof(*subdirs));
 			}
-			subdirs[nsub].src = new_src;
-			subdirs[nsub].dst = new_dst;
+			subdirs[nsubdirs].src = new_src;
+			subdirs[nsubdirs].dst = new_dst;
 			sftp_hpn_dir_attrs_from_stat(&sb, preserve_flag,
-			    &subdirs[nsub].attrs);
-			nsub++;
+			    &subdirs[nsubdirs].attrs);
+			nsubdirs++;
 			new_src = new_dst = NULL;	/* owned by subdirs[] */
 		} else if (S_ISREG(sb.st_mode)) {
 			if (sink->xfer_file(sink, new_src, new_dst, &sb) != 0)
@@ -2358,50 +2423,51 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 	(void)closedir(dirp);
 
 	/* Batch-create the collected subdirs, then recurse into each. */
-	if (!sink->aborting(sink) && nsub > 0) {
-		char	**paths = xcalloc(nsub, sizeof(*paths));
-		Attrib	 *attrs = xcalloc(nsub, sizeof(*attrs));
-		u_char	 *cflags = xcalloc(nsub, sizeof(*cflags));
-		u_char	 *ffail = xcalloc(nsub, sizeof(*ffail));
+	if (!sink->aborting(sink) && nsubdirs > 0) {
+		char	**paths = xcalloc(nsubdirs, sizeof(*paths));
+		Attrib	 *attrs = xcalloc(nsubdirs, sizeof(*attrs));
+		u_char	 *created_flags = xcalloc(nsubdirs,
+		    sizeof(*created_flags));
+		u_char	 *failed_flags = xcalloc(nsubdirs,
+		    sizeof(*failed_flags));
 
-		for (i = 0; i < nsub; i++) {
+		for (i = 0; i < nsubdirs; i++) {
 			paths[i] = subdirs[i].dst;
 			attrs[i] = subdirs[i].attrs;
 		}
-		sink->before_mkdir(sink);	/* parallel: mkdir phase */
-		/* One call: the pipeline windows the requests itself and
-		 * drains fully before returning, so chunking on top of it did
-		 * nothing.  MKDIR_BATCH_MAX was 8192 against a window of 64,
-		 * so the loop body ran once for any real directory anyway.
+		/* Parallel marks the mkdir phase here. Serial does nothing. */
+		sink->before_mkdir(sink);
+		/* One call. The pipeline windows the requests itself and
+		 * drains fully before returning.
 		 *
 		 * A directory we could not create is a failed transfer.
 		 * Discarding this count reported success for an upload that
 		 * did not happen: an empty subdirectory transfers nothing, so
 		 * nothing else notices the destination is missing. */
-		if (sftp_mkdir_pipeline(conn, paths, attrs, nsub, cflags,
-		    ffail) > 0)
+		if (sftp_mkdir_pipeline(conn, paths, attrs, nsubdirs,
+		    created_flags, failed_flags) > 0)
 			ret = -1;
 		free(paths);
 		free(attrs);
-		for (i = 0; i < nsub && !sink->aborting(sink); i++) {
-			/* Do not descend into one that failed.  There is
+		for (i = 0; i < nsubdirs && !sink->aborting(sink); i++) {
+			/* Do not descend into one that failed. There is
 			 * nothing to write into, and deferring its attributes
 			 * would setstat whatever does occupy the path. */
-			if (ffail[i]) {
+			if (failed_flags[i]) {
 				sink->fail(sink, subdirs[i].dst,
 				    "remote mkdir failed");
 				continue;
 			}
 			if (sftp_upload_walk_consume(conn, subdirs[i].src,
 			    subdirs[i].dst, depth + 1, max_depth,
-			    (int)cflags[i], preserve_flag, follow_link_flag,
-			    sink) != 0)
+			    (int)created_flags[i], preserve_flag,
+			    follow_link_flag, sink) != 0)
 				ret = -1;
 		}
-		free(cflags);
-		free(ffail);
+		free(created_flags);
+		free(failed_flags);
 	}
-	for (i = 0; i < nsub; i++) {
+	for (i = 0; i < nsubdirs; i++) {
 		free(subdirs[i].src);
 		free(subdirs[i].dst);
 	}
@@ -2411,6 +2477,6 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 	 * created it (it was made with restrictive bits) or if -p asked for
 	 * the source's own. Gate it here so both sinks just record. */
 	if (created || preserve_flag)
-		sink->defer_dir(sink, dst, &a);
+		sink->defer_dir(sink, dst, &dir_attrs);
 	return ret;
 }

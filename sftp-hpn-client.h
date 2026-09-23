@@ -429,11 +429,11 @@ struct sftp_conn;
 void sftp_hpn_dir_attrs_from_stat(const struct stat *sb, int preserve_flag,
     Attrib *out);
 int  sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
-    Attrib *a, int *created);
-int  sftp_hpn_ensure_local_dir(const char *dst, Attrib *dirattrib,
+    const Attrib *attrs, int *created);
+int  sftp_hpn_ensure_local_dir(const char *dst, const Attrib *dirattrib,
     mode_t *mode_out, mode_t *tmpmode_out);
 void sftp_hpn_dirattrs_defer_remote(struct sftp_hpn_dirattr_list *dl,
-    const char *path, const Attrib *a);
+    const char *path, const Attrib *attrs);
 void sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
     const char *path, mode_t mode, mode_t tmpmode, const Attrib *dirattrib);
 void sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
@@ -474,36 +474,35 @@ struct sftp_tree_dl_sink {
 	 * enumerated total bytes and file count so an aggregate meter can
 	 * switch from rate-only to a real percentage and ETA (and rewrite a
 	 * deferred-count label).  NULL for sinks with no such meter (serial
-	 * per-file, third-party); the readdir fallback has no complete total
+	 * per-file, crossload); the readdir fallback has no complete total
 	 * and never calls it. */
 	void (*set_total)(struct sftp_tree_dl_sink *sink, off_t total_bytes,
 	    size_t nfiles);
-	/*
-	 * Set when xfer_file may be called DURING the enumeration rather than
-	 * after it drains, so discovery and transfer overlap and the driver
-	 * holds no per-file queue.  Only legal when xfer_file sends nothing on
-	 * the connection carrying the reply: see reply_stream_active, which
-	 * turns a violation into an immediate failure.
+	/* Set when xfer_file may be called during the enumeration rather than
+	 * after it drains, so discovery and transfer overlap. The driver keeps
+	 * no files[] queue, and the parallel fleet holds only its bounded
+	 * window of pending work (sftp_parallel_await_capacity). This is only
+	 * legal when xfer_file sends nothing on the connection carrying the
+	 * reply. reply_stream_active turns a violation into an immediate
+	 * failure.
 	 *
 	 * The parallel download sink qualifies because it only enqueues work
-	 * for the fleet.  Serial does not (it downloads on this very
-	 * connection) and neither does third-party (it reads from the source
-	 * connection, which is the one streaming), so both leave this clear
-	 * and keep the deferred queue.
-	 */
+	 * for the fleet. Serial does not, because it downloads on this very
+	 * connection. Neither does crossload, which reads from the source
+	 * connection, the one that is streaming. Both leave this clear and
+	 * keep the deferred queue. */
 	int streams_files;
 };
 
-/*
- * Enumerate the remote subtree at src via hpn-discover-tree and replay each
- * entry through sink as it streams in: create dst and every discovered
- * directory inline as its record arrives, queue every regular file, skip
- * symlinks/non-regular entries, surface ERROR records.  The queued files are
- * transferred after the whole stream drains, because a file transfer issued
- * mid-stream would collide with the discover-tree reply on the control
- * connection.  dirattrib is the root's attrs (NULL -> stat it).  Returns 0,
- * or -1 if any entry failed.
- */
+/* Enumerate the remote subtree at src via hpn-discover-tree and replay each
+ * entry through sink as it streams in. dst and every discovered directory
+ * are created inline. Regular files go to the sink as they arrive if it
+ * streams, and otherwise are queued and transferred after the stream
+ * drains, because a transfer issued mid-stream would collide with the
+ * discover-tree reply on the control connection. Symlinks and other
+ * non-regular entries are skipped and ERROR records are reported.
+ * dirattrib is the root's attrs, or NULL to stat it. Returns 0, or -1 if
+ * any entry failed. */
 int  sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, Attrib *dirattrib, int follow_link_flag,
     struct sftp_tree_dl_sink *sink);

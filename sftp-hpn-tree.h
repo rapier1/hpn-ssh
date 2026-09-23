@@ -197,7 +197,7 @@ typedef int (*sftp_tree_record_cb)(void *ctx, struct sftp_tree_ent *ent);
  * on a protocol/transport failure.
  */
 int	sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
-	    u_int32_t flags, sftp_tree_record_cb cb, void *ctx);
+	    uint32_t flags, sftp_tree_record_cb cb, void *ctx);
 
 /* Safety check on a received relative path (no absolute, no "..").  1 = ok. */
 int	sftp_tree_relpath_ok(const char *rel);

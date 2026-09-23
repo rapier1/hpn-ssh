@@ -5124,9 +5124,8 @@ crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *
     Attrib *attrs)
 {
 	struct crossload_sink	*ctx = (struct crossload_sink *)sink;
-	Attrib		 curdir = *attrs, newdir;
-	mode_t		 mode;
-	int		 created = 0;
+	Attrib		 curdir = *attrs;
+	int		 created;
 
 	if (ctx->print_flag && ctx->print_flag != SFTP_PROGRESS_ONLY)
 		pm_mprintf("Retrieving %s\n", src);
@@ -5139,25 +5138,12 @@ crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *
 		curdir.perm = S_IWUSR | S_IXUSR;
 		curdir.flags |= SSH2_FILEXFER_ATTR_PERMISSIONS;
 	}
-	/* Keep the directory writable while its contents transfer. */
-	mode = curdir.perm & 01777;
-	curdir.perm = mode | (S_IWUSR | S_IXUSR);
-
-	/*
-	 * SFTP has no portable EEXIST, so on a mkdir failure check whether the
-	 * path already exists as a directory.
-	 */
-	if (sftp_mkdir(ctx->to, dst, &curdir, 0) == 0) {
-		created = 1;
-	} else {
-		if (sftp_stat(ctx->to, dst, 0, &newdir) != 0)
-			return -1;
-		if (!S_ISDIR(newdir.perm)) {
-			error("\"%s\" exists but is not a directory", dst);
-			return -1;
-		}
-	}
-	curdir.perm = mode;	/* the real mode, for the deferred setstat */
+	/* Keep only the mode bits. The helper forces the owner write and
+	 * execute bits while the contents transfer, and the deferred setstat
+	 * restores this mode. */
+	curdir.perm &= 01777;
+	if (sftp_hpn_ensure_remote_dir(ctx->to, dst, &curdir, &created) != 0)
+		return -1;
 
 	if (created || ctx->preserve_flag)
 		sftp_hpn_dirattrs_defer_remote(ctx->dirs, dst, &curdir);
