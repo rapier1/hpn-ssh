@@ -731,6 +731,16 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 			 * in place of per-directory readdir when present. */
 			ret->exts |= SFTP_EXT_HPN_DISCOVER_TREE;
 			known = 1;
+		} else if (strcmp(name, HPN_EXT_TREE_OPEN) == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			ret->exts |= SFTP_EXT_HPN_TREE_OPEN;
+			known = 1;
+		} else if (strcmp(name, HPN_EXT_TREE_READ) == 0 &&
+		    strcmp((char *)value, "1") == 0) {
+			/* With tree-open, the chunked tree walk. The download
+			 * walks use it in place of per-directory readdir. */
+			ret->exts |= SFTP_EXT_HPN_TREE_READ;
+			known = 1;
 		} else if (strcmp(name, "hpn-bundle@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			/* Phase 5: server can accept tar-format bundles via
@@ -2735,11 +2745,11 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 			.inplace_flag = inplace_flag,
 		};
 
-		/* HPN: one streamed enumeration when the server supports it,
+		/* HPN: the chunked tree walk when the server supports it,
 		 * else the recursive readdir fallback; both replay through the
 		 * same serial sink into the shared bundle accumulator and
 		 * deferred-attr list, so the flush/apply below is identical. */
-		if (sftp_conn_has_discover_tree(conn))
+		if (sftp_conn_has_tree_walk(conn))
 			ret = sftp_tree_download_consume(conn, src_canon, dst,
 			    dirattrib, follow_link_flag, &sink.base);
 		else
@@ -5208,10 +5218,10 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 		return -1;
 	}
 
-	/* Reuse the download drivers with conn set to from. Use discover-tree
-	 * when the origin supports it, else the recursive readdir fallback.
-	 * The sink writes to the destination. */
-	if (sftp_conn_has_discover_tree(from))
+	/* Reuse the download drivers with conn set to from. Use the chunked
+	 * tree walk when the origin supports it, else the recursive readdir
+	 * fallback. The sink writes to the destination. */
+	if (sftp_conn_has_tree_walk(from))
 		ret = sftp_tree_download_consume(from, from_path_canon,
 		    to_path, dirattrib, follow_link_flag, &sink.base);
 	else

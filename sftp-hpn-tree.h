@@ -236,4 +236,27 @@ int	sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
 /* Safety check on a received relative path (no absolute, no "..").  1 = ok. */
 int	sftp_tree_relpath_ok(const char *rel);
 
+/*
+ * Client side of the chunked walk (sftp-hpn-client.c). open sends
+ * hpn-tree-open for root and keeps the server's handle in *walk. read sends
+ * one hpn-tree-read for up to max_records records and calls cb once per
+ * record as the reply arrives, with the same callback contract as above: a
+ * nonzero return stops decoding and the rest of the batch is read and
+ * discarded. *done is set once the walk has reached END. The reply is one
+ * or more messages on the control connection, and read drains them all
+ * before returning, so cb must not send on that connection. close sends
+ * CLOSE for the handle and frees it. Each returns 0, or -1 on failure.
+ */
+struct sftp_tree_walk {
+	u_char	*handle;
+	size_t	 handle_len;
+};
+
+int	sftp_tree_walk_open(struct sftp_conn *conn, const char *root,
+	    uint32_t flags, struct sftp_tree_walk *walk);
+int	sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
+	    uint32_t max_records, sftp_tree_record_cb cb, void *ctx, int *done);
+int	sftp_tree_walk_close(struct sftp_conn *conn,
+	    struct sftp_tree_walk *walk);
+
 #endif /* _SFTP_HPN_TREE_H */

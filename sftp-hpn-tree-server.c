@@ -390,12 +390,17 @@ tree_send_handle(struct sshbuf *oqueue, u_int id, int handle)
 	sshbuf_free(msg);
 }
 
+/* True when handle is an open tree walk. The close hook uses it to route
+ * CLOSE here instead of the fd path. */
 int
 sftp_hpn_tree_is_handle(int handle)
 {
 	return handle_is_tree(handle);
 }
 
+/* Close a tree handle: shut every directory still open on the walk's
+ * path, free the state and the handle slot, and free the session's one
+ * tree slot for the next tree-open. Returns the status for CLOSE. */
 int
 sftp_hpn_tree_close(int handle)
 {

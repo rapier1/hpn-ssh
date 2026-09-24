@@ -420,6 +420,10 @@ int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
 /* True iff the server advertised hpn-discover-tree@hpnssh.org (download). */
 int sftp_conn_has_discover_tree(struct sftp_conn *conn);
 
+/* True iff the server advertised both hpn-tree-open and hpn-tree-read,
+ * the chunked download walk. */
+int sftp_conn_has_tree_walk(struct sftp_conn *conn);
+
 /*
  * True iff the server advertised hpn-check-file@hpnssh.org, i.e. it can
  * answer the XXH3 hash queries that verified resume depends on.  Lets the
