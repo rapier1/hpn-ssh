@@ -138,9 +138,14 @@ decode_attrib(struct sshbuf *b, Attrib *a)
 		if (count > 0x100000)
 			return SSH_ERR_INVALID_FORMAT;
 		for (i = 0; i < count; i++) {
+			type = NULL;
+			data = NULL;
 			if ((r = sshbuf_get_cstring(b, &type, NULL)) != 0 ||
-			    (r = sshbuf_get_string(b, &data, &dlen)) != 0)
+			    (r = sshbuf_get_string(b, &data, &dlen)) != 0) {
+				free(type);
+				free(data);
 				return r;
+			}
 			debug3("Got file attribute \"%.100s\" len %zu",
 			    type, dlen);
 			free(type);

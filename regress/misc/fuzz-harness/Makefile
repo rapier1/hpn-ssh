@@ -18,10 +18,11 @@ TARGETS=pubkey_fuzz sig_fuzz authopt_fuzz authkeys_fuzz sshsig_fuzz \
 	mkcorpus_sntrup761 sntrup761_enc_fuzz sntrup761_dec_fuzz \
 	sftp_fs_info_fuzz \
 	sftp_tar_parser_fuzz sftp_bundle_fetch_parse_fuzz \
+	sftp_dtree_read_fuzz \
 	hpn_status_frame_fuzz hpn3scp_keyscan_fuzz \
 	mkcorpus_sftp_fs_info mkcorpus_sftp_tar_parser \
-	mkcorpus_sftp_bundle_fetch_parse mkcorpus_hpn_status_frame \
-	mkcorpus_hpn3scp_keyscan
+	mkcorpus_sftp_bundle_fetch_parse mkcorpus_sftp_dtree_read \
+	mkcorpus_hpn_status_frame mkcorpus_hpn3scp_keyscan
 
 all: $(TARGETS)
 
@@ -89,6 +90,14 @@ sftp_tar_parser_fuzz: sftp_tar_parser_fuzz.o $(SK_NULL_OBJS) ../../../sftp-hpn-t
 sftp_bundle_fetch_parse_fuzz: sftp_bundle_fetch_parse_fuzz.o $(SK_NULL_OBJS) $(COMMON_DEPS)
 	$(CXX) -o $@ sftp_bundle_fetch_parse_fuzz.o $(SK_NULL_OBJS) $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
 
+# sftp_dtree_read_fuzz: the client side of an hpn-dtree-read reply. The
+# header sequence is mirrored in the harness; the records go through the
+# in-tree codec (sftp-hpn-tree.o, with decode_attrib in sftp-common.o) and
+# the path validator. Neither object is in libssh.a but their deps are.
+# Build both with the same sanitizer opts as libssh (see the top-of-file NB).
+sftp_dtree_read_fuzz: sftp_dtree_read_fuzz.o $(SK_NULL_OBJS) ../../../sftp-hpn-tree.o ../../../sftp-common.o $(COMMON_DEPS)
+	$(CXX) -o $@ sftp_dtree_read_fuzz.o $(SK_NULL_OBJS) ../../../sftp-hpn-tree.o ../../../sftp-common.o $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
+
 # Corpus generators - built with plain CFLAGS (no sanitizer/fuzzer).
 # These are dev tools, not fuzz targets; they emit binary seed files
 # into the matching ./*_corpus/ directory.
@@ -103,6 +112,11 @@ mkcorpus_sftp_tar_parser: mkcorpus_sftp_tar_parser.c ../../../sftp-hpn-tar.o
 
 mkcorpus_sftp_bundle_fetch_parse: mkcorpus_sftp_bundle_fetch_parse.c
 	$(CC) $(CFLAGS) -o $@ mkcorpus_sftp_bundle_fetch_parse.c
+
+# Emits dtree-read seeds through the in-tree record encoder; links the
+# codec objects (plain CFLAGS is fine - this is not a fuzz target).
+mkcorpus_sftp_dtree_read: mkcorpus_sftp_dtree_read.c ../../../sftp-hpn-tree.o ../../../sftp-common.o
+	$(CC) $(CFLAGS) -o $@ mkcorpus_sftp_dtree_read.c ../../../sftp-hpn-tree.o ../../../sftp-common.o $(LDFLAGS) -lssh -lopenbsd-compat -lcrypto
 
 # hpn_status_frame_fuzz: the status-relay frame parser (consumer side in
 # scp.c).  hpn-status-frame.o is libc-only; no other tree objects needed.
@@ -126,10 +140,11 @@ mkcorpus_hpn3scp_keyscan: mkcorpus_hpn3scp_keyscan.c fixed-keys.h
 # Build seeds for the HPN-SSH SFTP-extension fuzzers.  Run this once
 # before invoking the corresponding ./*_fuzz binaries.
 corpus: mkcorpus_sftp_fs_info mkcorpus_sftp_tar_parser \
-	mkcorpus_sftp_bundle_fetch_parse
+	mkcorpus_sftp_bundle_fetch_parse mkcorpus_sftp_dtree_read
 	./mkcorpus_sftp_fs_info
 	./mkcorpus_sftp_tar_parser
 	./mkcorpus_sftp_bundle_fetch_parse
+	./mkcorpus_sftp_dtree_read
 
 .PHONY: corpus
 
