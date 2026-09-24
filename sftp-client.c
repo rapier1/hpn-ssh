@@ -2702,6 +2702,17 @@ serial_dl_aborting(struct sftp_tree_dl_sink *sink)
 	return interrupted || ctx->fatal;
 }
 
+/* Print a walk notice on its own line above the meter, which repaints
+ * below it on its next tick. Follows the meter's own gate, so -q and
+ * batch mode print nothing. */
+static void
+serial_dl_notice(struct sftp_tree_dl_sink *sink, const char *text)
+{
+	(void)sink;
+	if (showprogress)
+		pm_mprintf("%s\n", text);
+}
+
 int
 sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
     Attrib *dirattrib, int preserve_flag, int print_flag, int resume_flag,
@@ -2733,6 +2744,7 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 				.xfer_file = serial_dl_xfer_file,
 				.fail = serial_dl_fail,
 				.aborting = serial_dl_aborting,
+				.notice = serial_dl_notice,
 			},
 			.conn = conn,
 			.bacc = &bacc,

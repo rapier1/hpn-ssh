@@ -456,7 +456,7 @@ void sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl);
  *     single make_dir callback both creates the directory and defers its
  *     attrs. There is no batch-create or before_mkdir step like upload has.
  *   - The plug-in points are make_dir, xfer_file (download or bundle-fetch
- *     versus submit to the fleet), fail, and aborting.
+ *     versus submit to the fleet), fail, aborting and the optional notice.
  */
 struct sftp_tree_dl_sink {
 	/* Create the local directory dst for a dir entry (remote path src,
@@ -472,6 +472,12 @@ struct sftp_tree_dl_sink {
 	         const char *reason);
 	/* True when the walk should stop (interrupt / fleet abort). */
 	int  (*aborting)(struct sftp_tree_dl_sink *sink);
+	/* Optional. Show the user a one-line notice about the walk: that a
+	 * batch of the file list is being fetched, during which the transfer
+	 * pauses, or that an interrupt is waiting for the current batch to
+	 * drain. The serial sink prints it above the meter. NULL for sinks
+	 * whose output should not change (parallel, crossload). */
+	void (*notice)(struct sftp_tree_dl_sink *sink, const char *text);
 	/* Optional.  Once the discover-tree stream has drained, report the
 	 * enumerated total bytes and file count so an aggregate meter can
 	 * switch from rate-only to a real percentage and ETA (and rewrite a

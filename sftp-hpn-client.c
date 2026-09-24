@@ -153,6 +153,9 @@ struct tree_dl_ctx {
 	off_t				 total_bytes;
 	size_t				 total_files;
 	int				 total_overflow;
+	/* Set once the abort notice has been shown, so an interrupt that
+	 * lands mid-batch reports itself once. */
+	int				 abort_noticed;
 	/* -1 after any per-entry failure. */
 	int				 ret;
 };
@@ -2258,10 +2261,16 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 	Attrib			*attrs = &ent->a;
 	char			*new_src, *new_dst;
 
-	/* On abort, tell the fetch to stop decoding. It still reads the
-	 * stream to END and discards it, so the connection stays in sync. */
-	if (ctx->sink->aborting(ctx->sink))
+	/* On abort, tell the read to stop decoding. It still reads the batch
+	 * to its marker and discards it, so the connection stays in sync.
+	 * Say so once, since the user sees a pause before the prompt. */
+	if (ctx->sink->aborting(ctx->sink)) {
+		if (!ctx->abort_noticed && ctx->sink->notice != NULL)
+			ctx->sink->notice(ctx->sink,
+			    "Interrupt: draining file list. Please wait.");
+		ctx->abort_noticed = 1;
 		return -1;
+	}
 	/* A failure of the walk root itself arrives with an empty relpath,
 	 * since there is no component below the root to name. Handle it
 	 * before the validator. The validator rightly rejects "" for every
@@ -2459,6 +2468,10 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	 * queue is transferred and emptied before the next read. Symlinks
 	 * are followed only when the caller asks. */
 	do {
+		/* The transfer pauses while a batch is fetched. Tell the user
+		 * why, on every batch including the first. */
+		if (sink->notice != NULL)
+			sink->notice(sink, "Retrieving file list from server.");
 		if (sftp_tree_walk_read(conn, &walk, chunk,
 		    tree_dl_consume_record, &ctx, &done) != 0) {
 			error("remote tree walk \"%s\" failed", src);
