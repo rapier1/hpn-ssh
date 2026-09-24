@@ -480,19 +480,18 @@ struct sftp_tree_dl_sink {
 	 * and never calls it. */
 	void (*set_total)(struct sftp_tree_dl_sink *sink, off_t total_bytes,
 	    size_t nfiles);
-	/* Set when xfer_file may be called during the enumeration rather than
-	 * after it drains, so discovery and transfer overlap. The driver keeps
-	 * no files[] queue, and the parallel fleet holds only its bounded
-	 * window of pending work (sftp_parallel_await_capacity). This is only
-	 * legal when xfer_file sends nothing on the connection carrying the
-	 * reply. reply_stream_active turns a violation into an immediate
-	 * failure.
+	/* Set when xfer_file may be called during a read rather than after
+	 * the batch, so discovery and transfer overlap. The driver keeps no
+	 * files[] queue, and the parallel fleet holds only its bounded window
+	 * of pending work (sftp_parallel_await_capacity). This is only legal
+	 * when xfer_file sends nothing on the connection carrying the reply.
+	 * reply_stream_active turns a violation into an immediate failure.
 	 *
 	 * The parallel download sink qualifies because it only enqueues work
 	 * for the fleet. Serial does not, because it downloads on this very
 	 * connection. Neither does crossload, which reads from the source
-	 * connection, the one that is streaming. Both leave this clear and
-	 * keep the deferred queue. */
+	 * connection, the one carrying the reply. Both leave this clear and
+	 * keep the per-batch queue. */
 	int streams_files;
 };
 

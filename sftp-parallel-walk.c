@@ -71,12 +71,11 @@ struct parallel_ul_sink {
 	int	resume, verify;
 };
 
-/* Parallel download sink for the shared discover-tree consumer
+/* Parallel download sink for the shared tree walk consumer
  * (sftp_tree_download_consume): create local dirs with Lustre-layout
  * parity, submit regular files to the worker fleet, defer directory attrs,
  * and record per-entry failures on the walker. Files are handed over as
- * their records arrive rather than after the stream drains; see
- * streams_files. */
+ * their records arrive rather than after each batch; see streams_files. */
 struct parallel_dl_sink {
 	struct sftp_tree_dl_sink	 base;
 	struct sftp_parallel		*fleet;
@@ -281,8 +280,8 @@ parallel_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 	if (attrs->flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
 		fmode = attrs->perm;
 
-	/* Streaming hands files over during the discover-tree drain, which
-	 * enumerates far faster than the fleet transfers. Wait for the fleet
+	/* Streaming hands files over while a batch is being read, and the
+	 * server lists far faster than the fleet transfers. Wait for the fleet
 	 * to fall below its outstanding-file ceiling before adding another, so
 	 * the walk's memory tracks the ceiling instead of the tree. Blocking
 	 * here stops us reading the reply, which back-pressures the server. */
@@ -349,8 +348,7 @@ sftp_parallel_download_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
 			.set_total = parallel_dl_set_total,
 			/* Submitting only enqueues work for the fleet, so
 			 * files can be handed over as they are discovered
-			 * instead of after the stream drains.  See
-			 * streams_files. */
+			 * instead of after each batch. See streams_files. */
 			.streams_files = 1,
 		},
 		.fleet = fleet,
@@ -374,18 +372,18 @@ sftp_parallel_download_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		parallel_verify_prefix_register(fleet, dst);
 		parallel_verify_prefix_register(fleet, src);
 	}
-	streamed = sftp_conn_has_discover_tree(conn);
+	streamed = sftp_conn_has_tree_walk(conn);
 
 	/* The submit path queries the destination filesystem's stripe geometry
-	 * once and caches it. Do that now: during a streamed enumeration the
-	 * connection is carrying the reply and cannot also carry that query. */
+	 * once and caches it. Do that now: while a tree-read reply is draining
+	 * the connection is carrying it and cannot also carry that query. */
 	if (streamed)
 		sftp_parallel_prewarm_fs_info(fleet, conn, src);
 
-	/* One streamed enumeration when the server supports it, else the
+	/* The chunked tree walk when the server supports it, else the
 	 * recursive readdir fallback; both replay through the same parallel
 	 * sink. This sink hands each file over as its record arrives rather
-	 * than queueing the tree, which is legal only because submitting
+	 * than queueing the batch, which is legal only because submitting
 	 * enqueues work for the fleet and sends nothing on the connection
 	 * carrying the reply. See streams_files. */
 	if (streamed)

@@ -141,8 +141,8 @@ struct tree_dl_ctx {
 	const char			*dst;
 	/* Serial, parallel or crossload sink. */
 	struct sftp_tree_dl_sink	*sink;
-	/* Regular files queued during enumeration and transferred after the
-	 * stream drains. Stays empty for a streaming sink. */
+	/* Regular files queued during a read and transferred once it ends.
+	 * Stays empty for a streaming sink. */
 	struct walk_entry		*files;
 	size_t				 nfiles;
 	size_t				 files_alloc;
@@ -2377,68 +2377,6 @@ dl_root_attrs(struct sftp_conn *conn, const char *src, Attrib *dirattrib,
 	return dirattrib;
 }
 
-/* The single-stream driver, kept for the parallel sink until it moves to
- * the chunked walk below. Enumerates src in one hpn-discover-tree request
- * and replays each record through the sink as it streams in. */
-static int
-tree_download_consume_stream(struct sftp_conn *conn, const char *src,
-    const char *dst, Attrib *dirattrib, int follow_link_flag,
-    struct sftp_tree_dl_sink *sink)
-{
-	struct tree_dl_ctx	ctx;
-	Attrib			ldirattrib;
-	size_t			i;
-
-	/* Check that the root is a directory before starting a walk. */
-	dirattrib = dl_root_attrs(conn, src, dirattrib, &ldirattrib, sink);
-	if (dirattrib == NULL)
-		return -1;
-	/* Create the local root. The sink defers its attrs, and the serial
-	 * and crossload sinks print the "Retrieving" line. */
-	if (sink->make_dir(sink, src, dst, dirattrib) != 0)
-		return -1;
-
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.src = src;
-	ctx.dst = dst;
-	ctx.sink = sink;
-
-	/* Enumerate the whole subtree in one streamed request. Each record goes
-	 * to tree_dl_consume_record, which creates directories inline and
-	 * either hands regular files to a streaming sink or queues them for the
-	 * loop below. Symlinks are followed only when the caller asks. */
-	if (sftp_hpn_discover_tree(conn, src,
-	    follow_link_flag ? HPN_DTREE_FOLLOW_SYMLINKS : 0,
-	    tree_dl_consume_record, &ctx) != 0) {
-		error("remote tree discovery \"%s\" failed", src);
-		sink->fail(sink, src, "remote tree discovery failed");
-		ctx.ret = -1;
-		goto out;
-	}
-
-	/* Enumeration is complete, so hand the totals to the sink. An
-	 * aggregate meter switches from rate-only to a real percentage and
-	 * ETA here, which means it runs rate-only during discovery. Serial
-	 * and crossload sinks leave set_total NULL. */
-	if (sink->set_total != NULL)
-		sink->set_total(sink, ctx.total_bytes, ctx.total_files);
-
-	/* Transfer the files queued during the stream. */
-	for (i = 0; i < ctx.nfiles && !sink->aborting(sink); i++) {
-		if (sink->xfer_file(sink, ctx.files[i].src, ctx.files[i].dst,
-		    &ctx.files[i].attrs) != 0)
-			ctx.ret = -1;
-	}
- out:
-	/* free everything we alloc'ed */
-	for (i = 0; i < ctx.nfiles; i++) {
-		free(ctx.files[i].src);
-		free(ctx.files[i].dst);
-	}
-	free(ctx.files);
-	return ctx.ret;
-}
-
 /* Free the paths of the files queued so far and empty the queue. The
  * array itself is kept for the next chunk. */
 static void
@@ -2475,11 +2413,13 @@ tree_chunk_records(void)
 }
 
 /* Shared download driver: walk src through the chunked tree walk and
- * replay each record through the sink. Serial and crossload supply their
- * own sink, and the classification, path building and iteration live here
- * once. Each chunk is read in full, then its queued files are transferred,
- * then the next chunk is requested, so memory holds one chunk of the tree
- * and data starts moving after the first. See sftp-hpn-client.h. */
+ * replay each record through the sink. Serial, parallel and crossload each
+ * supply their own sink, and the classification, path building and
+ * iteration live here once. Each chunk is read in full, then its queued
+ * files are transferred, then the next chunk is requested, so memory holds
+ * one chunk of the tree and data starts moving after the first. A
+ * streaming sink takes each file during the read instead, so its queue is
+ * always empty when the transfer loop runs. See sftp-hpn-client.h. */
 int
 sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, Attrib *dirattrib, int follow_link_flag,
@@ -2491,13 +2431,6 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	uint32_t		flags = 0, chunk;
 	size_t			i;
 	int			done = 0;
-
-	/* Parallel still consumes the old single stream. This branch and
-	 * tree_download_consume_stream go when it moves to the chunked
-	 * walk. */
-	if (sink->streams_files)
-		return tree_download_consume_stream(conn, src, dst, dirattrib,
-		    follow_link_flag, sink);
 
 	/* Check that the root is a directory before starting a walk. */
 	dirattrib = dl_root_attrs(conn, src, dirattrib, &ldirattrib, sink);
