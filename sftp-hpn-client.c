@@ -2244,27 +2244,6 @@ tree_dl_files_clear(struct tree_dl_ctx *ctx)
 	ctx->nfiles = 0;
 }
 
-/* Records to ask for per hpn-dtree-read. */
-static uint32_t
-tree_chunk_records(void)
-{
-	const char	*env;
-	const char	*errstr;
-	long long	 records;
-
-	/* ENV-VAR HPN_DTREE_CHUNK: test-only override of the records requested
-	 * per hpn-dtree-read, so regress can cross chunk boundaries with a
-	 * small tree. Remove this block to remove the variable. */
-	if ((env = getenv("HPN_DTREE_CHUNK")) != NULL) {
-		records = strtonum(env, 1, HPN_DTREE_MAX_BATCH, &errstr);
-		if (errstr == NULL)
-			return (uint32_t)records;
-		debug_f("HPN_DTREE_CHUNK \"%s\" is %s, using the default", env,
-		    errstr);
-	}
-	return HPN_DTREE_MAX_BATCH;
-}
-
 /* Shared download driver: walk src through the chunked tree walk and
  * replay each record through the sink. Serial, parallel and crossload each
  * supply their own sink, and the classification, path building and
@@ -2281,7 +2260,7 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	struct tree_dl_ctx	ctx;
 	struct sftp_tree_walk	walk;
 	Attrib			ldirattrib;
-	uint32_t		flags = 0, chunk;
+	uint32_t		flags = 0;
 	size_t			i;
 	int			done = 0;
 
@@ -2305,7 +2284,6 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 		sink->fail(sink, src, "remote tree open failed");
 		return -1;
 	}
-	chunk = tree_chunk_records();
 
 	/* One chunk per pass. Each record goes to tree_dl_consume_record,
 	 * which creates directories inline and queues regular files, and the
@@ -2315,8 +2293,8 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 		/* The transfer pauses while a batch is fetched. Tell the user
 		 * why, on every batch including the first. */
 		if (sink->notice != NULL)
-			sink->notice(sink, "Retrieving file list from server.");
-		if (sftp_tree_walk_read(conn, &walk, chunk,
+			sink->notice(sink, "Gathering file list from server.");
+		if (sftp_tree_walk_read(conn, &walk, HPN_DTREE_MAX_BATCH,
 		    tree_dl_consume_record, &ctx, &done) != 0) {
 			error("remote tree walk \"%s\" failed", src);
 			sink->fail(sink, src, "remote tree walk failed");

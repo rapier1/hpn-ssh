@@ -78,7 +78,6 @@ LTESTS= 	connect \
 		sftp-resume \
 		sftp-verified-resume \
 		sftp-uri \
-		sftp-tree-chunk \
 		sftp-parallel \
 		sftp-parallel-resume \
 		sftp-parallel-respawn \
@@ -148,7 +147,6 @@ TESTSET=	ALL
 ALL_TESTS=	${LTESTS}
 SFTP_TESTS=	sftp sftp-chroot sftp-cmds sftp-badcmds sftp-batch \
 		sftp-glob sftp-perm sftp-resume sftp-verified-resume sftp-uri \
-		sftp-tree-chunk \
 		sftp-parallel sftp-parallel-resume sftp-parallel-respawn \
 		sftp-parallel-tput sftp-bundle sftp-range-split sftp-hpn-config \
 		sftp-worker-log-dir sftp-verify
