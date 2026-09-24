@@ -50,7 +50,7 @@
 #include "sftp-common.h"
 #include "sftp-hpn-server.h"
 #include "sftp-hpn-bundle-server.h"	/* HPN_EXT_BUNDLE_* + bundle dispatch */
-#include "sftp-hpn-tree.h"		/* hpn-discover-tree extension name */
+#include "sftp-hpn-tree.h"		/* tree walk extension names */
 
 
 char *sftp_realpath(const char *, char *); /* sftp-realpath.c */
@@ -159,9 +159,8 @@ static void process_extended_hpn_bundle_open(uint32_t id);
 static void process_extended_hpn_bundle_cap(uint32_t id);
 static void process_extended_hpn_bundle_fetch(uint32_t id);
 static void process_extended_hpn_file_layout(uint32_t id);
-static void process_extended_hpn_discover_tree(uint32_t id);
-static void process_extended_hpn_tree_open(uint32_t id);
-static void process_extended_hpn_tree_read(uint32_t id);
+static void process_extended_hpn_dtree_open(uint32_t id);
+static void process_extended_hpn_dtree_read(uint32_t id);
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -226,12 +225,10 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_hpn_bundle_fetch, 0 },
 	{ "hpn-file-layout", HPN_EXT_FILE_LAYOUT, 0,
 	    process_extended_hpn_file_layout, 1 },
-	{ "hpn-discover-tree", HPN_EXT_DISCOVER_TREE, 0,
-	    process_extended_hpn_discover_tree, 0 },
-	{ "hpn-tree-open", HPN_EXT_TREE_OPEN, 0,
-	    process_extended_hpn_tree_open, 0 },
-	{ "hpn-tree-read", HPN_EXT_TREE_READ, 0,
-	    process_extended_hpn_tree_read, 0 },
+	{ "hpn-dtree-open", HPN_EXT_DTREE_OPEN, 0,
+	    process_extended_hpn_dtree_open, 0 },
+	{ "hpn-dtree-read", HPN_EXT_DTREE_READ, 0,
+	    process_extended_hpn_dtree_read, 0 },
 	{ NULL, NULL, 0, NULL, 0 }
 };
 
@@ -277,10 +274,10 @@ request_policy_names(const struct sftp_handler *h)
 		return "hpn-fs-info,statvfs";
 	/* The chunked tree walk lists directories, so a policy on the
 	 * standard listing ops covers it. */
-	if (strcmp(h->name, "hpn-tree-open") == 0)
-		return "hpn-tree-open,opendir";
-	if (strcmp(h->name, "hpn-tree-read") == 0)
-		return "hpn-tree-read,readdir";
+	if (strcmp(h->name, "hpn-dtree-open") == 0)
+		return "hpn-dtree-open,opendir";
+	if (strcmp(h->name, "hpn-dtree-read") == 0)
+		return "hpn-dtree-read,readdir";
 	return h->name;
 }
 
@@ -923,11 +920,11 @@ process_init(void)
 	compose_extension(msg, "hpn-check-file@hpnssh.org", "1");
 	compose_extension(msg, HPN_EXT_HASH_RANGE, "1");
 	compose_extension(msg, HPN_EXT_FS_INFO, "1");
-	/* Read-only remote-tree enumeration; advertised unconditionally like
-	 * fs-info (no operator toggle - it exposes nothing readdir doesn't). */
-	compose_extension(msg, HPN_EXT_DISCOVER_TREE, "1");
-	compose_extension(msg, HPN_EXT_TREE_OPEN, "1");
-	compose_extension(msg, HPN_EXT_TREE_READ, "1");
+	/* The read-only tree walk, advertised unconditionally like fs-info.
+	 * There is no operator toggle, since it exposes nothing readdir
+	 * does not. */
+	compose_extension(msg, HPN_EXT_DTREE_OPEN, "1");
+	compose_extension(msg, HPN_EXT_DTREE_READ, "1");
 	/* Gate hpn-bundle / hpn-bundle-fetch on the operator-controlled
 	 * master toggle (sshd_config: HPNUseBundle).  When disabled, the
 	 * extensions don't show up in SSH_FXP_VERSION at all - clients
@@ -2093,30 +2090,18 @@ process_extended_hpn_fs_info(uint32_t id)
 	sftp_hpn_server_dispatch(id, HPN_EXT_FS_INFO, iqueue, oqueue);
 }
 
-/*
- * hpn-discover-tree: server-side remote directory enumeration.  Stage 1
- * registers the dispatch so the extension advertises + negotiates; the
- * real streamed walk lands in sftp-hpn-server.c, where this name currently
- * falls through to OP_UNSUPPORTED.
- */
-static void
-process_extended_hpn_discover_tree(uint32_t id)
-{
-	sftp_hpn_server_dispatch(id, HPN_EXT_DISCOVER_TREE, iqueue, oqueue);
-}
-
 /* Chunked tree walk dispatch wrappers. The handlers live in
  * sftp-hpn-tree-server.c. */
 static void
-process_extended_hpn_tree_open(uint32_t id)
+process_extended_hpn_dtree_open(uint32_t id)
 {
-	sftp_hpn_server_dispatch(id, HPN_EXT_TREE_OPEN, iqueue, oqueue);
+	sftp_hpn_server_dispatch(id, HPN_EXT_DTREE_OPEN, iqueue, oqueue);
 }
 
 static void
-process_extended_hpn_tree_read(uint32_t id)
+process_extended_hpn_dtree_read(uint32_t id)
 {
-	sftp_hpn_server_dispatch(id, HPN_EXT_TREE_READ, iqueue, oqueue);
+	sftp_hpn_server_dispatch(id, HPN_EXT_DTREE_READ, iqueue, oqueue);
 }
 
 /* Phase 5: hpn-bundle-open@hpnssh.org dispatch wrapper.  The real

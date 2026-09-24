@@ -21,9 +21,9 @@
  *
  * The walker runs on the producer (caller) thread and uses the control
  * connection (`conn`) for metadata operations: mkdir on the destination
- * tree, and enumeration of the source. Downloads enumerate through one
- * streamed discover-tree request where the server offers it and fall
- * back to recursive readdir otherwise; both replay through the same
+ * tree, and enumeration of the source. Downloads enumerate through the
+ * chunked tree walk where the server offers it and fall back to
+ * recursive readdir otherwise; both replay through the same
  * sink. Regular files are handed to the orchestrator via
  * sftp_parallel_submit_upload / submit_download; the workers transfer
  * them in parallel while the walker continues descending. The caller is
@@ -55,7 +55,7 @@
 #include "sftp-parallel.h"
 #include "xmalloc.h"		/* xcalloc for the deferred dir-attr list */
 #include "sftp-hpn-client.h"	/* shared dir helpers */
-#include "sftp-hpn-tree.h"	/* hpn-discover-tree fetch + records */
+#include "sftp-hpn-tree.h"	/* tree walk records */
 #include "sftp-parallel-internal.h"	/* parallel_verify_prefix_register */
 #include "progressmeter.h"	/* pm_mprintf */
 

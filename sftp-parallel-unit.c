@@ -1612,7 +1612,7 @@ sftp_parallel_prewarm_fs_info(struct sftp_parallel *fleet, struct sftp_conn *con
  * under bundling one object is a bundle carrying thousands of files.
  *
  * Called from the walk, so blocking here stops the caller reading the
- * discover-tree reply and TCP back-pressure reaches the server, which stops
+ * dtree-read reply and TCP back-pressure reaches the server, which stops
  * producing records. Workers drain on their own connections and broadcast
  * as they complete, so they cannot be blocked by this wait. Returns
  * immediately once an abort is set, so a failed or interrupted fleet does

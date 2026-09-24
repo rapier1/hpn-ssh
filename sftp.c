@@ -1278,7 +1278,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 
 		if (g.gl_matchc == 1 && sftp_globpath_is_dir(g.gl_pathv[0])) {
 			/* Single directory: the real file count is unknown
-			 * until the discover-tree walk, so defer it - the label
+			 * until the tree walk ends, so defer it - the label
 			 * is rewritten to "Fetching N files in parallel" once
 			 * the walk drains (see set_total). */
 			sftp_parallel_progress_start_counted(parallel_orch,

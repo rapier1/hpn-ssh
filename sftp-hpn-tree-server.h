@@ -18,8 +18,8 @@
 
 /* sftp-hpn-tree-server.h - server side of the chunked tree walk.
  *
- * Two extended requests. hpn-tree-open@hpnssh.org starts a walk of a
- * directory subtree and returns a handle. hpn-tree-read@hpnssh.org
+ * Two extended requests. hpn-dtree-open@hpnssh.org starts a walk of a
+ * directory subtree and returns a handle. hpn-dtree-read@hpnssh.org
  * returns the next batch of records from that walk. The walk state
  * lives in the handle between requests, so the client drains one batch,
  * transfers what it listed, and asks for the next. The standard CLOSE
@@ -41,8 +41,8 @@ int sftp_hpn_tree_is_handle(int handle);
  * status for the caller to send. */
 int sftp_hpn_tree_close(int handle);
 
-/* The two extended-request handlers. tree-open replies with
- * SSH2_FXP_HANDLE, or SSH2_FXP_STATUS on failure. tree-read replies with
+/* The two extended-request handlers. dtree-open replies with
+ * SSH2_FXP_HANDLE, or SSH2_FXP_STATUS on failure. dtree-read replies with
  * one or more SSH2_FXP_EXTENDED_REPLY messages, or SSH2_FXP_STATUS for a
  * bad handle. */
 void sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue,

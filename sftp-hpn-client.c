@@ -29,8 +29,8 @@
  *
  * Transfer helpers: the serial walks' bundle accumulator for upload
  * and download, deferred directory attribute application, the
- * hpn-file-layout Lustre stripe request, the hpn-discover-tree fetch,
- * and the three walk consumers that feed downloads and uploads. */
+ * hpn-file-layout Lustre stripe request, the chunked tree walk, and the
+ * three walk consumers that feed downloads and uploads. */
 
 #include "includes.h"
 
@@ -57,8 +57,7 @@
 /* hpn-file-layout wire format and status codes */
 #include "sftp-hpn-server.h"
 #include "sftp-hpn-client.h"
-/* hpn-discover-tree fetch and record codec */
-#include "sftp-hpn-tree.h"	
+#include "sftp-hpn-tree.h"	/* tree walk and record codec */
 #include "hpn-meter.h"	/* progress meter core */
 #include "sftp-hpn-bundle.h"  /* bundle flags and eligibility policy */
 #include "sftp-hpn-transferlog.h" /* per-member TransferLog entries */
@@ -132,8 +131,7 @@ struct walk_entry {
 	Attrib	 attrs;
 };
 
-/* State threaded through the streaming download consumer, one per
- * discover-tree walk. */
+/* State threaded through the download consumer, one per tree walk. */
 struct tree_dl_ctx {
 	/* The walk's roots, borrowed from the caller. Each record's relpath
 	 * is appended to both. */
@@ -969,19 +967,13 @@ sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn)
 	return (sftp_conn_exts(conn) & SFTP_EXT_HPN_BUNDLE_FETCH) != 0;
 }
 
-int
-sftp_conn_has_discover_tree(struct sftp_conn *conn)
-{
-	return (sftp_conn_exts(conn) & SFTP_EXT_HPN_DISCOVER_TREE) != 0;
-}
-
 /* True when the server advertised both halves of the chunked tree walk,
- * hpn-tree-open and hpn-tree-read. The download walks pick it over the
+ * hpn-dtree-open and hpn-dtree-read. The download walks pick it over the
  * readdir fallback. */
 int
 sftp_conn_has_tree_walk(struct sftp_conn *conn)
 {
-	u_int both = SFTP_EXT_HPN_TREE_OPEN | SFTP_EXT_HPN_TREE_READ;
+	u_int both = SFTP_EXT_HPN_DTREE_OPEN | SFTP_EXT_HPN_DTREE_READ;
 
 	return (sftp_conn_exts(conn) & both) == both;
 }
@@ -1775,7 +1767,7 @@ dirattr_deepest_first(const void *va, const void *vb)
  * still need, and every chmod and utimes below it would then fail with EACCES,
  * leaving the children with the widened mode. The list cannot supply the order
  * itself: the upload walk defers children first, but the download and
- * crossload walks, and the discover-tree stream, defer parents first. Remote
+ * crossload walks, and the tree walk, defer parents first. Remote
  * setstats go through sftp_setstat_pipeline, one window of outstanding requests
  * rather than a round trip per directory, and it keeps the order given. Local
  * attrs are plain syscalls, applied inline. */
@@ -1861,161 +1853,13 @@ sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl)
 /* --------------------------------------------------------------------------
  * Recursive walk drivers shared by the serial walks in sftp-client.c
  * and the parallel walk in sftp-parallel-walk.c. Each supplies its
- * own sink. sftp_hpn_discover_tree fetches a remote subtree in one streamed
- * request. The download driver replays its records through the sink, with
- * a readdir walk as the fallback when the server lacks the extension. The
- * upload driver walks the local tree.
+ * own sink. The download driver walks a remote subtree in batches through
+ * sftp_tree_walk_open, _read and _close and replays the records through the
+ * sink, with a readdir walk as the fallback when the server lacks the
+ * extension. The upload driver walks the local tree.
  * -------------------------------------------------------------------------- */
 
-/* Send hpn-discover-tree for root and call cb once per discovered entry as
- * the reply streams in. The reply is one or more EXTENDED_REPLY chunks on
- * the control connection, ended by an END chunk, and the whole stream is
- * drained before returning, so cb must not send another request on that
- * connection. A nonzero return from cb stops decoding, and the rest of the
- * stream is read and discarded. See sftp-hpn-tree.h. */
-int
-sftp_hpn_discover_tree(struct sftp_conn *conn, const char *root,
-    uint32_t flags, sftp_tree_record_cb cb, void *ctx)
-{
-	struct sshbuf		*msg;
-	u_int			 id, rid;
-	u_char			 type, version, kind;
-	uint32_t		 count, i;
-	uint64_t		 nrecords;
-	int			 r, rc = -1, done = 0, skip = 0;
-
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-
-	id = sftp_conn_alloc_msg_id(conn);
-	debug3_f("sending hpn-discover-tree \"%s\" flags=0x%x id=%u",
-	    root, flags, id);
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, HPN_EXT_DISCOVER_TREE)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, root)) != 0 ||
-	    (r = sshbuf_put_u32(msg, flags)) != 0)
-		fatal_fr(r, "compose hpn-discover-tree request");
-	if (send_msg(conn, msg) != 0) {
-		logit_f("hpn-discover-tree \"%s\": transport send failed", root);
-		goto out;
-	}
-
-	nrecords = 0;
-	/* The reply arrives as a stream of chunks up to END, so this
-	 * connection is ours until it drains. Sending on it before then is a
-	 * bug, and send_msg fatals on it; see reply_stream_active. */
-	sftp_conn_hpn(conn)->reply_stream_active = 1;
-
-	while (!done) {
-		sshbuf_reset(msg);
-		if (get_msg(conn, msg) != 0) {
-			logit_f("hpn-discover-tree \"%s\": transport receive "
-			    "failed", root);
-			goto out;
-		}
-		/* A message we cannot decode leaves the stream desynced, and
-		 * the server keeps sending chunks until its END regardless.
-		 * Leaving the connection alive would let those chunks surface
-		 * as an id mismatch on the next command, which would then fail
-		 * carrying the wrong path. Every bail-out below dies for the
-		 * same reason. */
-		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
-			sftp_conn_die(conn, "hpn-discover-tree: parse reply "
-			    "header: %s", ssh_err(r));
-			goto out;
-		}
-		if (rid != id) {
-			sftp_conn_die(conn, "hpn-discover-tree reply id "
-			    "mismatch (got %u expected %u)", rid, id);
-			sftp_conn_set_protocol_violation(conn);
-			goto out;
-		}
-		/* The server refused the request before streaming anything, so
-		 * the exchange is over and the connection is still in sync. A
-		 * missing root arrives as an error record instead. */
-		if (type == SSH2_FXP_STATUS) {
-			u_int fx_status = SSH2_FX_FAILURE;
-
-			(void)sshbuf_get_u32(msg, &fx_status);
-			logit_f("hpn-discover-tree \"%s\": server STATUS %s",
-			    root, fx2txt(fx_status));
-			goto out;
-		}
-		if (type != SSH2_FXP_EXTENDED_REPLY) {
-			sftp_conn_die(conn, "hpn-discover-tree: expected "
-			    "EXTENDED_REPLY(%u), got %u",
-			    SSH2_FXP_EXTENDED_REPLY, type);
-			sftp_conn_set_protocol_violation(conn);
-			goto out;
-		}
-		if ((r = sshbuf_get_u8(msg, &version)) != 0 ||
-		    (r = sshbuf_get_u8(msg, &kind)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &count)) != 0) {
-			sftp_conn_die(conn, "hpn-discover-tree: parse chunk "
-			    "header: %s", ssh_err(r));
-			goto out;
-		}
-		if (version != HPN_DTREE_VERSION) {
-			sftp_conn_die(conn, "hpn-discover-tree: unsupported "
-			    "codec version %u", version);
-			goto out;
-		}
-		/* The server sends a DATA chunk only when it has records to
-		 * flush, so an empty one is malformed. Refusing it keeps a peer
-		 * from parking us in this loop with chunks that never reach the
-		 * callback. */
-		if (count == 0 && kind != HPN_DTREE_CHUNK_END) {
-			sftp_conn_die(conn, "hpn-discover-tree: DATA chunk "
-			    "carries no records");
-			goto out;
-		}
-		/* Stop a stream that would never end. HPN_DTREE_MAX_RECORDS is
-		 * a backstop against a peer that keeps sending, not a limit any
-		 * real tree reaches. */
-		nrecords += count;
-		if (nrecords > HPN_DTREE_MAX_RECORDS) {
-			sftp_conn_die(conn, "hpn-discover-tree \"%s\": more "
-			    "than %llu records", root,
-			    (unsigned long long)HPN_DTREE_MAX_RECORDS);
-			goto out;
-		}
-		/* Once the callback (cb) has bowed out, usually an interrupt,
-		 * stop decoding: nothing would be done with the records. Keep
-		 * reading chunks to the END marker so the exchange finishes in
-		 * sync and the connection stays usable, but discard each
-		 * one whole rather than parsing a tree that is being thrown
-		 * away. */
-		for (i = 0; !skip && i < count; i++) {
-			struct sftp_tree_ent ent;
-
-			memset(&ent, 0, sizeof(ent));
-			if ((r = sftp_tree_get_record(msg, &ent.relpath,
-			    &ent.rectype, &ent.a, &ent.status)) != 0) {
-				free(ent.relpath);
-				sftp_conn_die(conn, "hpn-discover-tree: parse "
-				    "record: %s", ssh_err(r));
-				goto out;
-			}
-			skip = cb(ctx, &ent) != 0;
-			free(ent.relpath);
-		}
-		if (kind == HPN_DTREE_CHUNK_END)
-			done = 1;
-	}
-
-	rc = 0;
- out:
-	/* Clear on every exit, including the error gotos: an abandoned stream
-	 * leaves the connection unusable anyway, but a stuck flag would turn
-	 * that into a confusing fatal on the next unrelated request. */
-	sftp_conn_hpn(conn)->reply_stream_active = 0;
-	sshbuf_free(msg);
-	return rc;
-}
-
-/* Send hpn-tree-open for root and keep the handle in *walk. A STATUS
+/* Send hpn-dtree-open for root and keep the handle in *walk. A STATUS
  * reply, which is how the server reports a missing, unreadable or
  * non-directory root, is logged by get_handle with the server's reason. */
 int
@@ -2030,18 +1874,18 @@ sftp_tree_walk_open(struct sftp_conn *conn, const char *root, uint32_t flags,
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	id = sftp_conn_alloc_msg_id(conn);
-	debug3_f("sending hpn-tree-open \"%s\" flags=0x%x id=%u", root, flags,
+	debug3_f("sending hpn-dtree-open \"%s\" flags=0x%x id=%u", root, flags,
 	    id);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, HPN_EXT_TREE_OPEN)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_DTREE_OPEN)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, root)) != 0 ||
 	    (r = sshbuf_put_u32(msg, flags)) != 0)
-		fatal_fr(r, "compose hpn-tree-open request");
+		fatal_fr(r, "compose hpn-dtree-open request");
 	r = send_msg(conn, msg);
 	sshbuf_free(msg);
 	if (r != 0) {
-		logit_f("hpn-tree-open \"%s\": transport send failed", root);
+		logit_f("hpn-dtree-open \"%s\": transport send failed", root);
 		return -1;
 	}
 	walk->handle = get_handle(conn, id, &walk->handle_len,
@@ -2051,7 +1895,7 @@ sftp_tree_walk_open(struct sftp_conn *conn, const char *root, uint32_t flags,
 	return 0;
 }
 
-/* Send one hpn-tree-read and hand each record of the reply to cb. The
+/* Send one hpn-dtree-read and hand each record of the reply to cb. The
  * reply is a run of DATA messages ended by BATCH_END, or by END when the
  * walk is complete, and every message is read before returning, so the
  * connection is ours until then. See reply_stream_active.
@@ -2077,15 +1921,15 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	id = sftp_conn_alloc_msg_id(conn);
-	debug3_f("sending hpn-tree-read max=%u id=%u", max_records, id);
+	debug3_f("sending hpn-dtree-read max=%u id=%u", max_records, id);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, HPN_EXT_TREE_READ)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_DTREE_READ)) != 0 ||
 	    (r = sshbuf_put_string(msg, walk->handle, walk->handle_len)) != 0 ||
 	    (r = sshbuf_put_u32(msg, max_records)) != 0)
-		fatal_fr(r, "compose hpn-tree-read request");
+		fatal_fr(r, "compose hpn-dtree-read request");
 	if (send_msg(conn, msg) != 0) {
-		logit_f("hpn-tree-read: transport send failed");
+		logit_f("hpn-dtree-read: transport send failed");
 		goto out;
 	}
 	sftp_conn_hpn(conn)->reply_stream_active = 1;
@@ -2093,17 +1937,17 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 	while (!finished) {
 		sshbuf_reset(msg);
 		if (get_msg(conn, msg) != 0) {
-			logit_f("hpn-tree-read: transport receive failed");
+			logit_f("hpn-dtree-read: transport receive failed");
 			goto out;
 		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
-			sftp_conn_die(conn, "hpn-tree-read: parse reply "
+			sftp_conn_die(conn, "hpn-dtree-read: parse reply "
 			    "header: %s", ssh_err(r));
 			goto out;
 		}
 		if (rid != id) {
-			sftp_conn_die(conn, "hpn-tree-read reply id mismatch "
+			sftp_conn_die(conn, "hpn-dtree-read reply id mismatch "
 			    "(got %u expected %u)", rid, id);
 			sftp_conn_set_protocol_violation(conn);
 			goto out;
@@ -2115,12 +1959,12 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 			u_int fx_status = SSH2_FX_FAILURE;
 
 			(void)sshbuf_get_u32(msg, &fx_status);
-			logit_f("hpn-tree-read: server STATUS %s",
+			logit_f("hpn-dtree-read: server STATUS %s",
 			    fx2txt(fx_status));
 			goto out;
 		}
 		if (type != SSH2_FXP_EXTENDED_REPLY) {
-			sftp_conn_die(conn, "hpn-tree-read: expected "
+			sftp_conn_die(conn, "hpn-dtree-read: expected "
 			    "EXTENDED_REPLY(%u), got %u",
 			    SSH2_FXP_EXTENDED_REPLY, type);
 			sftp_conn_set_protocol_violation(conn);
@@ -2129,12 +1973,12 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 		if ((r = sshbuf_get_u8(msg, &version)) != 0 ||
 		    (r = sshbuf_get_u8(msg, &kind)) != 0 ||
 		    (r = sshbuf_get_u32(msg, &count)) != 0) {
-			sftp_conn_die(conn, "hpn-tree-read: parse message "
+			sftp_conn_die(conn, "hpn-dtree-read: parse message "
 			    "header: %s", ssh_err(r));
 			goto out;
 		}
-		if (version != HPN_TREE_VERSION) {
-			sftp_conn_die(conn, "hpn-tree-read: unsupported codec "
+		if (version != HPN_DTREE_VERSION) {
+			sftp_conn_die(conn, "hpn-dtree-read: unsupported codec "
 			    "version %u", version);
 			goto out;
 		}
@@ -2143,18 +1987,18 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 		 * parking us in this loop with messages that never reach the
 		 * callback, and bounds a request to max_records messages. */
 		switch (kind) {
-		case HPN_TREE_CHUNK_DATA:
+		case HPN_DTREE_CHUNK_DATA:
 			if (count == 0) {
-				sftp_conn_die(conn, "hpn-tree-read: DATA "
+				sftp_conn_die(conn, "hpn-dtree-read: DATA "
 				    "message carries no records");
 				sftp_conn_set_protocol_violation(conn);
 				goto out;
 			}
 			break;
-		case HPN_TREE_CHUNK_BATCH_END:
-		case HPN_TREE_CHUNK_END:
+		case HPN_DTREE_CHUNK_BATCH_END:
+		case HPN_DTREE_CHUNK_END:
 			if (count != 0) {
-				sftp_conn_die(conn, "hpn-tree-read: end marker "
+				sftp_conn_die(conn, "hpn-dtree-read: end marker "
 				    "carries %u records", count);
 				sftp_conn_set_protocol_violation(conn);
 				goto out;
@@ -2162,7 +2006,7 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 			finished = 1;
 			break;
 		default:
-			sftp_conn_die(conn, "hpn-tree-read: unknown message "
+			sftp_conn_die(conn, "hpn-dtree-read: unknown message "
 			    "kind %u", kind);
 			sftp_conn_set_protocol_violation(conn);
 			goto out;
@@ -2170,7 +2014,7 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 		/* More records than were asked for is the peer's fault. */
 		nrecords += count;
 		if (nrecords > max_records) {
-			sftp_conn_die(conn, "hpn-tree-read: %llu records for a "
+			sftp_conn_die(conn, "hpn-dtree-read: %llu records for a "
 			    "request of %u", (unsigned long long)nrecords,
 			    max_records);
 			sftp_conn_set_protocol_violation(conn);
@@ -2189,14 +2033,14 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 			if ((r = sftp_tree_get_record(msg, &ent.relpath,
 			    &ent.rectype, &ent.a, &ent.status)) != 0) {
 				free(ent.relpath);
-				sftp_conn_die(conn, "hpn-tree-read: parse "
+				sftp_conn_die(conn, "hpn-dtree-read: parse "
 				    "record: %s", ssh_err(r));
 				goto out;
 			}
 			skip = cb(ctx, &ent) != 0;
 			free(ent.relpath);
 		}
-		if (kind == HPN_TREE_CHUNK_END)
+		if (kind == HPN_DTREE_CHUNK_END)
 			*done = 1;
 	}
 	rc = 0;
@@ -2250,10 +2094,10 @@ tree_total_add(off_t *total, const Attrib *attrs)
  * parent already exists on disk when its record arrives. Regular files go
  * one of two ways. A streaming sink (the parallel fleet) takes each file as
  * it arrives, so transfer overlaps discovery. Otherwise the file is queued
- * and transferred after the stream drains, because a transfer issued while
- * the discover-tree reply is still arriving would collide with it on the
- * control connection. On abort the callback returns nonzero so the fetch
- * stops decoding. */
+ * and transferred once the batch ends, because a transfer issued while the
+ * dtree-read reply is still arriving would collide with it on the control
+ * connection. On abort the callback returns nonzero so the read stops
+ * decoding. */
 static int
 tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 {
@@ -2284,7 +2128,7 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 		return 0;
 	}
 	if (!sftp_tree_relpath_ok(ent->relpath)) {
-		error("discover-tree: suspect path \"%s\" under \"%s\"",
+		error("tree walk: suspect path \"%s\" under \"%s\"",
 		    ent->relpath == NULL ? "(null)" : ent->relpath, ctx->src);
 		ctx->sink->fail(ctx->sink, ctx->src, "suspect path");
 		ctx->ret = -1;
@@ -2305,7 +2149,7 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 		if (ctx->sink->set_total != NULL) {
 			if (!ctx->total_overflow &&
 			    tree_total_add(&ctx->total_bytes, attrs) != 0) {
-				debug_f("discover-tree \"%s\": file sizes "
+				debug_f("tree walk \"%s\": file sizes "
 				    "exceed off_t; meter falls back to "
 				    "rate-only", ctx->src);
 				ctx->total_overflow = 1;
@@ -2400,7 +2244,7 @@ tree_dl_files_clear(struct tree_dl_ctx *ctx)
 	ctx->nfiles = 0;
 }
 
-/* Records to ask for per hpn-tree-read. */
+/* Records to ask for per hpn-dtree-read. */
 static uint32_t
 tree_chunk_records(void)
 {
@@ -2408,17 +2252,17 @@ tree_chunk_records(void)
 	const char	*errstr;
 	long long	 records;
 
-	/* ENV-VAR HPN_TREE_CHUNK: test-only override of the records requested
-	 * per hpn-tree-read, so regress can cross chunk boundaries with a
+	/* ENV-VAR HPN_DTREE_CHUNK: test-only override of the records requested
+	 * per hpn-dtree-read, so regress can cross chunk boundaries with a
 	 * small tree. Remove this block to remove the variable. */
-	if ((env = getenv("HPN_TREE_CHUNK")) != NULL) {
-		records = strtonum(env, 1, HPN_TREE_MAX_BATCH, &errstr);
+	if ((env = getenv("HPN_DTREE_CHUNK")) != NULL) {
+		records = strtonum(env, 1, HPN_DTREE_MAX_BATCH, &errstr);
 		if (errstr == NULL)
 			return (uint32_t)records;
-		debug_f("HPN_TREE_CHUNK \"%s\" is %s, using the default", env,
+		debug_f("HPN_DTREE_CHUNK \"%s\" is %s, using the default", env,
 		    errstr);
 	}
-	return HPN_TREE_MAX_BATCH;
+	return HPN_DTREE_MAX_BATCH;
 }
 
 /* Shared download driver: walk src through the chunked tree walk and
@@ -2456,7 +2300,7 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	ctx.sink = sink;
 
 	if (follow_link_flag)
-		flags = HPN_TREE_FOLLOW_SYMLINKS;
+		flags = HPN_DTREE_FOLLOW_SYMLINKS;
 	if (sftp_tree_walk_open(conn, src, flags, &walk) != 0) {
 		sink->fail(sink, src, "remote tree open failed");
 		return -1;
@@ -2499,7 +2343,7 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 }
 
 /* Fallback recursive readdir download driver, used when the server lacks
- * hpn-discover-tree. Enumerate src a directory at a time, recursing into
+ * the tree walk. Enumerate src a directory at a time, recursing into
  * subdirectories, and replay each entry through the same sink the tree
  * consumer uses. Files go to the sink as they are listed, so memory is one
  * listing per level of recursion. Directory attrs are deferred in pre-order

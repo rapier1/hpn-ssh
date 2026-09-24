@@ -417,10 +417,7 @@ void sftp_conn_set_bundle_config(struct sftp_conn *conn, int use_bundle,
 /* True iff the server advertised hpn-bundle-fetch@hpnssh.org (download). */
 int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
 
-/* True iff the server advertised hpn-discover-tree@hpnssh.org (download). */
-int sftp_conn_has_discover_tree(struct sftp_conn *conn);
-
-/* True iff the server advertised both hpn-tree-open and hpn-tree-read,
+/* True iff the server advertised both hpn-dtree-open and hpn-dtree-read,
  * the chunked download walk. */
 int sftp_conn_has_tree_walk(struct sftp_conn *conn);
 

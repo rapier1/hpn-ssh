@@ -17,19 +17,19 @@
  */
 
 /*
- * hpn-discover-tree record codec.
+ * Directory tree walk record codec.
  *
  * Direction-neutral encode/decode for one directory-tree record, shared by
- * the server-side walk emitter (sftp-hpn-server.c) and the client consumer
- * (sftp-hpn-client.c).  A record is:
+ * the server-side walk emitter (sftp-hpn-tree-server.c) and the client
+ * consumer (sftp-hpn-client.c).  A record is:
  *
  *     string  relative-path
  *     byte    rec-type            (HPN_DTREE_REC_*)
  *     ATTRS   attrib              (all types except ERROR)
  *     uint32  status              (ERROR only: SSH2_FX_*)
  *
- * See sftp-hpn-tree.h for the surrounding chunk framing and the design in
- * hpn-discover-tree-design.md.
+ * See sftp-hpn-tree.h for the surrounding message framing and the design in
+ * hpn-chunked-tree-walk-design.md.
  */
 
 #include <sys/types.h>
@@ -83,7 +83,7 @@ sftp_tree_get_record(struct sshbuf *msg, char **relpath, u_char *rectype,
 }
 
 /*
- * Validate a discover-tree relative path before a client builds local or
+ * Validate a tree walk relative path before a client builds local or
  * remote paths from it.  The server generated it, but we never trust the
  * peer.  The whole-relpath analogue of the per-name SFTP_DIRECTORY_CHARS
  * guard the readdir walk applies, and it splits on the same separator set:

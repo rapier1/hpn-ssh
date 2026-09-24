@@ -98,7 +98,7 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
 }
 
 /* Ceiling on outstanding FILES, for a producer that enumerates far faster
- * than the fleet drains (the discover-tree walk). Counted in files rather
+ * than the fleet drains (the tree walk). Counted in files rather
  * than queued objects because the queue is heterogeneous: a bundle is one
  * object carrying thousands of files, while a file too large to bundle is one
  * object carrying one. Only a file count is meaningful for both.
@@ -1019,8 +1019,8 @@ sftp_parallel_progress_start(struct sftp_parallel *fleet, const char *label,
 }
 
 /* Update a running transfer meter after it was started with an unknown (0)
- * total. The discover-tree download driver calls this once the enumeration has
- * drained and the full byte total and file count are known, so the aggregate
+ * total. The tree walk download driver calls this once the walk has reached
+ * END and the full byte total and file count are known, so the aggregate
  * meter switches from rate-only to a real percentage and ETA, and (if the
  * client deferred its count via _start_counted) the label is rewritten to
  * "<verb> N files in parallel". No-op before the meter starts. */
@@ -1047,7 +1047,7 @@ sftp_parallel_progress_set_total(struct sftp_parallel *fleet, off_t total_bytes,
 }
 
 /* Start a parallel download meter whose file count is not yet known (a
- * directory download - the real count arrives with the discover-tree walk).
+ * directory download - the real count arrives with the tree walk).
  * Shows a count-less "<verb> files in parallel" until _set_total rewrites it to
  * "<verb> N files in parallel". verb is the tool's own word ("Fetching" for
  * sftp, "Downloading" for scp). */

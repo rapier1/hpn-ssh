@@ -2096,7 +2096,7 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 				free(da_path);
 				if (is_dir)
 					/* Directory: the real file count arrives
-					 * with the discover-tree walk, so defer
+					 * with the tree walk, so defer
 					 * it (see set_total). */
 					sftp_parallel_progress_start_counted(
 					    parallel_orch, "Downloading", 0);

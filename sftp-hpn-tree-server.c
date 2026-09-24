@@ -18,8 +18,8 @@
 
 /* sftp-hpn-tree-server.c - server side of the chunked tree walk.
  *
- * The server enumerates a directory subtree in batches. tree-open stats
- * and opens the root and returns a handle. Each tree-read resumes the
+ * The server enumerates a directory subtree in batches. dtree-open stats
+ * and opens the root and returns a handle. Each dtree-read resumes the
  * walk from where the last one stopped and emits up to the requested
  * number of records, then a BATCH_END marker, or END once the tree is
  * exhausted. Between reads the walk is paused: the open directories
@@ -33,7 +33,7 @@
  * same order the recursive walk produced: a directory's record precedes
  * its contents, so parents precede children on the wire.
  *
- * One tree handle may be open per session. A second tree-open is
+ * One tree handle may be open per session. A second dtree-open is
  * refused. See hpn-chunked-tree-walk-design.md. */
 
 #include "includes.h"
@@ -68,7 +68,7 @@ extern void   handle_free_tree(int handle);
 extern int    handle_is_tree(int handle);
 
 /* Records buffered per reply message before it is written out. */
-#define TREE_MSG_RECORDS	256
+#define DTREE_MSG_RECORDS	256
 
 /* Byte ceiling on the same message. A record carries the root-relative
  * path, which grows with depth, so a record count alone does not bound
@@ -76,7 +76,7 @@ extern int    handle_is_tree(int handle);
  * SFTP_MAX_MSG_LENGTH, and the client treats an over-long message as
  * fatal. The reserve covers the message header plus one full-length
  * record, since the trigger is tested after the record is appended. */
-#define TREE_MSG_MAX_BYTES \
+#define DTREE_MSG_MAX_BYTES \
     ((size_t)SFTP_MAX_MSG_LENGTH - PATH_MAX - 1024)
 
 /* One open directory on the walk's current path. dev and ino identify
@@ -99,7 +99,7 @@ struct hpn_tree_state {
 	struct tree_level	 level[HPN_WALK_MAX_DEPTH];
 };
 
-/* The reply being built by one tree-read. recbuf holds the records of
+/* The reply being built by one dtree-read. recbuf holds the records of
  * the message in progress. sent counts every record emitted for this
  * request, against the limit the client asked for. */
 struct tree_emit {
@@ -127,7 +127,7 @@ tree_flush(struct tree_emit *emit, u_char kind)
 		fatal_f("sshbuf_new failed");
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
 	    (r = sshbuf_put_u32(msg, emit->id)) != 0 ||
-	    (r = sshbuf_put_u8(msg, HPN_TREE_VERSION)) != 0 ||
+	    (r = sshbuf_put_u8(msg, HPN_DTREE_VERSION)) != 0 ||
 	    (r = sshbuf_put_u8(msg, kind)) != 0 ||
 	    (r = sshbuf_put_u32(msg, emit->count)) != 0 ||
 	    (r = sshbuf_putb(msg, emit->recbuf)) != 0)
@@ -151,9 +151,9 @@ tree_add(struct tree_emit *emit, const char *relpath, u_char rectype,
 	    status)) != 0)
 		fatal_fr(r, "encode tree record");
 	emit->sent++;
-	if (++emit->count >= TREE_MSG_RECORDS ||
-	    sshbuf_len(emit->recbuf) >= TREE_MSG_MAX_BYTES)
-		tree_flush(emit, HPN_TREE_CHUNK_DATA);
+	if (++emit->count >= DTREE_MSG_RECORDS ||
+	    sshbuf_len(emit->recbuf) >= DTREE_MSG_MAX_BYTES)
+		tree_flush(emit, HPN_DTREE_CHUNK_DATA);
 }
 
 /* Is st one of the directories from the root down to the current one?
@@ -400,7 +400,7 @@ sftp_hpn_tree_is_handle(int handle)
 
 /* Close a tree handle: shut every directory still open on the walk's
  * path, free the state and the handle slot, and free the session's one
- * tree slot for the next tree-open. Returns the status for CLOSE. */
+ * tree slot for the next dtree-open. Returns the status for CLOSE. */
 int
 sftp_hpn_tree_close(int handle)
 {
@@ -414,7 +414,7 @@ sftp_hpn_tree_close(int handle)
 	return SSH2_FX_OK;
 }
 
-/* Handle an hpn-tree-open request: string root, uint32 flags. The root
+/* Handle an hpn-dtree-open request: string root, uint32 flags. The root
  * is checked and opened here, so a missing, unreadable or non-directory
  * root fails the request with a status rather than starting a walk
  * that emits one error. */
@@ -430,16 +430,16 @@ sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 
 	if ((r = sshbuf_get_cstring(iqueue, &root, NULL)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &flags)) != 0) {
-		error_f("parse hpn-tree-open request: %s", ssh_err(r));
+		error_f("parse hpn-dtree-open request: %s", ssh_err(r));
 		send_status_oqueue(oqueue, id, SSH2_FX_BAD_MESSAGE);
 		free(root);
 		return;
 	}
-	debug3("request %u: hpn-tree-open \"%s\" flags=0x%x", id, root,
+	debug3("request %u: hpn-dtree-open \"%s\" flags=0x%x", id, root,
 	    flags);
 
 	if (tree_handle != -1) {
-		error_f("hpn-tree-open \"%s\": a tree is already open", root);
+		error_f("hpn-dtree-open \"%s\": a tree is already open", root);
 		goto fail;
 	}
 	if (stat(root, &st) != 0) {
@@ -447,12 +447,12 @@ sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 	if (!S_ISDIR(st.st_mode)) {
-		error_f("hpn-tree-open \"%s\": not a directory", root);
+		error_f("hpn-dtree-open \"%s\": not a directory", root);
 		goto fail;
 	}
 
 	state = xcalloc(1, sizeof(*state));
-	state->follow = (flags & HPN_TREE_FOLLOW_SYMLINKS) != 0;
+	state->follow = (flags & HPN_DTREE_FOLLOW_SYMLINKS) != 0;
 	state->depth = -1;
 	relpath = xstrdup("");
 	if (tree_push(state, root, relpath) != 0) {
@@ -464,7 +464,7 @@ sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	/* The root level owns both paths from here. */
 	root = NULL;
 	if ((handle = handle_new_tree(state)) < 0) {
-		error_f("hpn-tree-open: handle table full");
+		error_f("hpn-dtree-open: handle table full");
 		tree_state_free(state);
 		goto fail;
 	}
@@ -477,10 +477,10 @@ sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	free(root);
 }
 
-/* Handle an hpn-tree-read request: string handle, uint32 max-records.
+/* Handle an hpn-dtree-read request: string handle, uint32 max-records.
  * Emits up to that many records as DATA messages, then BATCH_END while
  * the tree has more, or END once it is exhausted. A read after END
- * replies END again. Zero, or more than HPN_TREE_MAX_BATCH, means the
+ * replies END again. Zero, or more than HPN_DTREE_MAX_BATCH, means the
  * maximum. */
 void
 sftp_hpn_tree_read(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
@@ -494,13 +494,13 @@ sftp_hpn_tree_read(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 
 	if ((r = sshbuf_get_string(iqueue, &hbuf, &hlen)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &max_records)) != 0) {
-		error_f("parse hpn-tree-read request: %s", ssh_err(r));
+		error_f("parse hpn-dtree-read request: %s", ssh_err(r));
 		send_status_oqueue(oqueue, id, SSH2_FX_BAD_MESSAGE);
 		free(hbuf);
 		return;
 	}
 	if (hlen != sizeof(uint32_t)) {
-		error_f("hpn-tree-read: bad handle length %zu", hlen);
+		error_f("hpn-dtree-read: bad handle length %zu", hlen);
 		send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
 		free(hbuf);
 		return;
@@ -508,13 +508,13 @@ sftp_hpn_tree_read(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	handle = (int)get_u32(hbuf);
 	free(hbuf);
 	if ((state = handle_get_tree(handle)) == NULL) {
-		error_f("hpn-tree-read: handle %d is not an open tree", handle);
+		error_f("hpn-dtree-read: handle %d is not an open tree", handle);
 		send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
 		return;
 	}
-	if (max_records == 0 || max_records > HPN_TREE_MAX_BATCH)
-		max_records = HPN_TREE_MAX_BATCH;
-	debug3("request %u: hpn-tree-read handle %d max %u", id, handle,
+	if (max_records == 0 || max_records > HPN_DTREE_MAX_BATCH)
+		max_records = HPN_DTREE_MAX_BATCH;
+	debug3("request %u: hpn-dtree-read handle %d max %u", id, handle,
 	    max_records);
 
 	emit.id = id;
@@ -529,10 +529,10 @@ sftp_hpn_tree_read(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 
 	/* Flush any partial DATA message, then the marker. */
 	if (emit.count > 0)
-		tree_flush(&emit, HPN_TREE_CHUNK_DATA);
+		tree_flush(&emit, HPN_DTREE_CHUNK_DATA);
 	if (state->depth < 0)
-		tree_flush(&emit, HPN_TREE_CHUNK_END);
+		tree_flush(&emit, HPN_DTREE_CHUNK_END);
 	else
-		tree_flush(&emit, HPN_TREE_CHUNK_BATCH_END);
+		tree_flush(&emit, HPN_DTREE_CHUNK_BATCH_END);
 	sshbuf_free(emit.recbuf);
 }

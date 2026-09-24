@@ -55,8 +55,8 @@
 #include "sftp-client.h"
 #include "sftp-hpn-client.h" /* HPN */
 #include "sftp-hpn-server.h" /* hpn-check-file + heartbeat protocol constants */
-#include "sftp-hpn-tree.h"
-#include "hpn-meter.h"	/* progress meter core */ /* hpn-discover-tree extension name */
+#include "sftp-hpn-tree.h"	/* tree walk extension names */
+#include "hpn-meter.h"	/* progress meter core */
 #include "sftp-hpn-transferlog.h"
 #include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
 
@@ -724,22 +724,15 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_HPN_FS_INFO;
 			known = 1;
-		} else if (strcmp(name, HPN_EXT_DISCOVER_TREE) == 0 &&
+		} else if (strcmp(name, HPN_EXT_DTREE_OPEN) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
-			/* Server can enumerate a remote subtree in one
-			 * push-streamed request; the download walks use it
-			 * in place of per-directory readdir when present. */
-			ret->exts |= SFTP_EXT_HPN_DISCOVER_TREE;
+			ret->exts |= SFTP_EXT_HPN_DTREE_OPEN;
 			known = 1;
-		} else if (strcmp(name, HPN_EXT_TREE_OPEN) == 0 &&
-		    strcmp((char *)value, "1") == 0) {
-			ret->exts |= SFTP_EXT_HPN_TREE_OPEN;
-			known = 1;
-		} else if (strcmp(name, HPN_EXT_TREE_READ) == 0 &&
+		} else if (strcmp(name, HPN_EXT_DTREE_READ) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			/* With tree-open, the chunked tree walk. The download
 			 * walks use it in place of per-directory readdir. */
-			ret->exts |= SFTP_EXT_HPN_TREE_READ;
+			ret->exts |= SFTP_EXT_HPN_DTREE_READ;
 			known = 1;
 		} else if (strcmp(name, "hpn-bundle@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
@@ -2616,7 +2609,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 }
 
 /*
- * Serial download sink for the shared discover-tree consumer
+ * Serial download sink for the shared tree walk consumer
  * (sftp_tree_download_consume): create local dirs, bundle or download
  * regular files, defer directory attrs.  Serial has no failure list - the
  * consumer's -1 return carries the error - so fail() is a no-op; aborting()

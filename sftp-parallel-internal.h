@@ -953,7 +953,7 @@ struct sftp_parallel {
 	char                        progress_label_saved[128];
 	/* Deferred file-count verb for the parallel download meter. Empty
 	 * unless the client deferred its count (a directory download, where the
-	 * real file count is unknown until the discover-tree walk); set by
+	 * real file count is unknown until the tree walk ends); set by
 	 * sftp_parallel_progress_start_counted, consumed by _set_total to
 	 * rewrite the label to "<verb> N files in parallel". */
 	char                        progress_verb[16];

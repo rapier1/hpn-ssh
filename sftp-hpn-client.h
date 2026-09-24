@@ -49,9 +49,8 @@
 #define SFTP_EXT_HPN_BUNDLE_FETCH	0x00002000
 #define SFTP_EXT_HASH_RANGE		0x00004000
 #define SFTP_EXT_HPN_FILE_LAYOUT	0x00008000
-#define SFTP_EXT_HPN_DISCOVER_TREE	0x00010000
-#define SFTP_EXT_HPN_TREE_OPEN		0x00020000
-#define SFTP_EXT_HPN_TREE_READ		0x00040000
+#define SFTP_EXT_HPN_DTREE_OPEN		0x00020000
+#define SFTP_EXT_HPN_DTREE_READ		0x00040000
 
 /*
  * Uncomment to enable fault injection (SFTP_FAULT_INJECT / SFTP_FAULT_PROTOCOL
@@ -127,7 +126,7 @@ struct sftp_hpn_conn {
 	int              dead;
 
 	/* Non-zero while a multi-message reply is streaming in on this
-	 * connection (hpn-discover-tree).  A reply is matched to its request
+	 * connection (a dtree-read batch).  A reply is matched to its request
 	 * by reading the next message in wire order, so a second request sent
 	 * inside that window has its reply interleaved with the remaining
 	 * chunks: one reader consumes a message meant for the other and both
@@ -449,9 +448,9 @@ void sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl);
  * on a mode flag and how a callback recovers its context. The download
  * differences are:
  *
- *   - It drives downloads. Both sftp_tree_download_consume (one streamed
- *     discover-tree enumeration) and sftp_readdir_download_consume (the
- *     recursive readdir fallback) use it.
+ *   - It drives downloads. Both sftp_tree_download_consume (the chunked
+ *     tree walk) and sftp_readdir_download_consume (the recursive readdir
+ *     fallback) use it.
  *   - Local directories are created one at a time with a cheap mkdir, so a
  *     single make_dir callback both creates the directory and defers its
  *     attrs. There is no batch-create or before_mkdir step like upload has.
@@ -478,8 +477,8 @@ struct sftp_tree_dl_sink {
 	 * drain. The serial sink prints it above the meter. NULL for sinks
 	 * whose output should not change (parallel, crossload). */
 	void (*notice)(struct sftp_tree_dl_sink *sink, const char *text);
-	/* Optional.  Once the discover-tree stream has drained, report the
-	 * enumerated total bytes and file count so an aggregate meter can
+	/* Optional.  Once the walk has reached END, report the enumerated
+	 * total bytes and file count so an aggregate meter can
 	 * switch from rate-only to a real percentage and ETA (and rewrite a
 	 * deferred-count label).  NULL for sinks with no such meter (serial
 	 * per-file, crossload); the readdir fallback has no complete total
@@ -501,27 +500,24 @@ struct sftp_tree_dl_sink {
 	int streams_files;
 };
 
-/* Enumerate the remote subtree at src via hpn-discover-tree and replay each
- * entry through sink as it streams in. dst and every discovered directory
+/* Walk the remote subtree at src through the chunked tree walk and replay
+ * each entry through sink as it arrives. dst and every listed directory
  * are created inline. Regular files go to the sink as they arrive if it
- * streams, and otherwise are queued and transferred after the stream
- * drains, because a transfer issued mid-stream would collide with the
- * discover-tree reply on the control connection. Symlinks and other
- * non-regular entries are skipped and ERROR records are reported.
- * dirattrib is the root's attrs, or NULL to stat it. Returns 0, or -1 if
- * any entry failed. */
+ * streams, and otherwise are queued and transferred once the batch ends,
+ * because a transfer issued mid-batch would collide with the dtree-read
+ * reply on the control connection. Symlinks and other non-regular entries
+ * are skipped and ERROR records are reported. dirattrib is the root's
+ * attrs, or NULL to stat it. Returns 0, or -1 if any entry failed. */
 int  sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, Attrib *dirattrib, int follow_link_flag,
     struct sftp_tree_dl_sink *sink);
 
-/*
- * Fallback recursive readdir download driver, used when the server lacks
- * hpn-discover-tree.  Enumerates src one directory at a time via sftp_readdir
+/* Fallback recursive readdir download driver, used when the server lacks
+ * the tree walk. Enumerates src one directory at a time via sftp_readdir
  * and replays each entry through the same sink as sftp_tree_download_consume.
  * Recursive (calls itself per subdirectory); max_depth caps the recursion and
- * follow_link_flag mirrors the walks' dormant -L handling.  Returns 0, or -1
- * if any entry failed.
- */
+ * follow_link_flag is the caller's, which scp sets. Returns 0, or -1 if any
+ * entry failed. */
 int  sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, int depth, int max_depth, Attrib *dirattrib,
     int follow_link_flag, struct sftp_tree_dl_sink *sink);
