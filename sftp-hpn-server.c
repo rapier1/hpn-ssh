@@ -74,6 +74,7 @@
 #include "sftp-hpn-bundle.h"
 #include "sftp-hpn-server.h"
 #include "sftp-hpn-tree.h"		/* hpn-discover-tree codec + constants */
+#include "sftp-hpn-tree-server.h"	/* chunked tree walk handlers */
 #include "sftp-hpn-verify-hash.h"		/* sftp_hpn_hash_file_ondisk */
 #include "sftp-hpn-bundle-server.h"	/* process_hpn_bundle_open / _fetch */
 #include "sftp-lustre.h"		/* lustre_set_stripe_fd / _tiered_layout_fd / _get_stripe */
@@ -137,7 +138,7 @@ fstype_from_magic(unsigned long ftype)
  * static and therefore not reachable from here).  Keep in sync if
  * upstream extends the mapping.
  */
-static u_int
+u_int
 errno_to_sftp_status(int e)
 {
 	switch (e) {
@@ -167,7 +168,7 @@ errno_to_sftp_status(int e)
  * and language tag onto oqueue.  Mirrors the inline pattern used by the
  * bundle handlers; factored out for handlers that need it more than once.
  */
-static void
+void
 send_status_oqueue(struct sshbuf *oqueue, u_int id, u_int status)
 {
 	struct sshbuf *msg;
@@ -226,7 +227,7 @@ struct hash_range {
  * main poll loop does not iterate during a handler call).  Order is
  * preserved: pre-handler pending bytes leave first, the heartbeat after.
  */
-static void
+void
 flush_oqueue_blocking(struct sshbuf *oqueue)
 {
 	size_t	len, wrote;
@@ -1140,6 +1141,23 @@ process_hpn_discover_tree(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue
 
 /* ---- END hpn-discover-tree --------------------------------------------- */
 
+/* CLOSE on a handle the HPN modules own. Bundle handles finish their
+ * extract or release their writer, tree handles close their open
+ * directories. See sftp-hpn-server.h. */
+int
+sftp_hpn_server_close_handle(int handle, int *status)
+{
+	if (sftp_hpn_server_is_bundle_handle(handle)) {
+		*status = sftp_hpn_server_bundle_close(handle);
+		return 1;
+	}
+	if (sftp_hpn_tree_is_handle(handle)) {
+		*status = sftp_hpn_tree_close(handle);
+		return 1;
+	}
+	return 0;
+}
+
 void
 sftp_hpn_server_dispatch(u_int id, const char *name,
     struct sshbuf *iqueue, struct sshbuf *oqueue)
@@ -1180,6 +1198,16 @@ sftp_hpn_server_dispatch(u_int id, const char *name,
 	/* Remote-tree enumeration - see process_hpn_discover_tree above. */
 	if (strcmp(name, HPN_EXT_DISCOVER_TREE) == 0) {
 		process_hpn_discover_tree(id, iqueue, oqueue);
+		return;
+	}
+
+	/* Chunked tree walk, in sftp-hpn-tree-server.c. */
+	if (strcmp(name, HPN_EXT_TREE_OPEN) == 0) {
+		sftp_hpn_tree_open(id, iqueue, oqueue);
+		return;
+	}
+	if (strcmp(name, HPN_EXT_TREE_READ) == 0) {
+		sftp_hpn_tree_read(id, iqueue, oqueue);
 		return;
 	}
 

@@ -173,6 +173,17 @@
 
 struct sshbuf;
 
+/* Helpers shared with the other HPN server modules. */
+u_int errno_to_sftp_status(int e);
+void send_status_oqueue(struct sshbuf *oqueue, u_int id, u_int status);
+void flush_oqueue_blocking(struct sshbuf *oqueue);
+
+/* Close hook for the handles the HPN modules own, bundle and tree.
+ * Returns 1 and sets *status when handle was one of them, so
+ * sftp-server.c's CLOSE sends that status instead of taking its fd
+ * path. Returns 0 for a FILE or DIR handle. */
+int sftp_hpn_server_close_handle(int handle, int *status);
+
 /*
  * Dispatch an HPN extension request from sftp-server.c's
  * SSH2_FXP_EXTENDED handler.  The caller has already routed by

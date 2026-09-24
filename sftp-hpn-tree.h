@@ -65,6 +65,40 @@ struct sftp_conn;
 #define HPN_DTREE_CHUNK_END		1	/* terminal; no records          */
 
 /*
+ * Chunked tree walk, which replaces hpn-discover-tree (see
+ * hpn-chunked-tree-walk-design.md). tree-open starts a walk and returns a
+ * handle, tree-read returns the next batch of records from it, and the
+ * standard CLOSE ends it. The record codec below is shared.
+ *
+ * tree-open  (SSH2_FXP_EXTENDED HPN_EXT_TREE_OPEN)
+ *     string  root-path
+ *     uint32  flags                 (HPN_TREE_FOLLOW_SYMLINKS | reserved-0)
+ *   reply:  SSH2_FXP_HANDLE, or SSH2_FXP_STATUS on failure
+ *
+ * tree-read  (SSH2_FXP_EXTENDED HPN_EXT_TREE_READ)
+ *     string  handle
+ *     uint32  max-records           (0, or above HPN_TREE_MAX_BATCH, = max)
+ *   reply:  one or more SSH2_FXP_EXTENDED_REPLY with the same id:
+ *     byte    version               (HPN_TREE_VERSION)
+ *     byte    kind                  (HPN_TREE_CHUNK_*)
+ *     uint32  record-count          (0 for BATCH_END and END)
+ *     record[record-count]
+ *   or SSH2_FXP_STATUS for a bad handle.
+ *
+ * BATCH_END ends a batch with more of the tree to come. END means the walk
+ * is complete, and a read after END replies END again. One tree handle may
+ * be open per session.
+ */
+#define HPN_EXT_TREE_OPEN		"hpn-tree-open@hpnssh.org"
+#define HPN_EXT_TREE_READ		"hpn-tree-read@hpnssh.org"
+#define HPN_TREE_VERSION		1
+#define HPN_TREE_FOLLOW_SYMLINKS	0x00000001u
+#define HPN_TREE_CHUNK_DATA		0
+#define HPN_TREE_CHUNK_BATCH_END	1
+#define HPN_TREE_CHUNK_END		2
+#define HPN_TREE_MAX_BATCH		65536u
+
+/*
  * Record types.  DIR/REG/SYMLINK/OTHER mirror the client's per-entry
  * S_ISDIR/S_ISREG/S_ISLNK dispatch (symlinks are skipped, per OpenSSH).
  * ERROR is an inline marker for a subtree the server could not read

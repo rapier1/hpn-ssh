@@ -160,6 +160,8 @@ static void process_extended_hpn_bundle_cap(uint32_t id);
 static void process_extended_hpn_bundle_fetch(uint32_t id);
 static void process_extended_hpn_file_layout(uint32_t id);
 static void process_extended_hpn_discover_tree(uint32_t id);
+static void process_extended_hpn_tree_open(uint32_t id);
+static void process_extended_hpn_tree_read(uint32_t id);
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -226,6 +228,10 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_hpn_file_layout, 1 },
 	{ "hpn-discover-tree", HPN_EXT_DISCOVER_TREE, 0,
 	    process_extended_hpn_discover_tree, 0 },
+	{ "hpn-tree-open", HPN_EXT_TREE_OPEN, 0,
+	    process_extended_hpn_tree_open, 0 },
+	{ "hpn-tree-read", HPN_EXT_TREE_READ, 0,
+	    process_extended_hpn_tree_read, 0 },
 	{ NULL, NULL, 0, NULL, 0 }
 };
 
@@ -269,6 +275,12 @@ request_policy_names(const struct sftp_handler *h)
 		return "hpn-file-layout,write";
 	if (strcmp(h->name, "hpn-fs-info") == 0)
 		return "hpn-fs-info,statvfs";
+	/* The chunked tree walk lists directories, so a policy on the
+	 * standard listing ops covers it. */
+	if (strcmp(h->name, "hpn-tree-open") == 0)
+		return "hpn-tree-open,opendir";
+	if (strcmp(h->name, "hpn-tree-read") == 0)
+		return "hpn-tree-read,readdir";
 	return h->name;
 }
 
@@ -399,16 +411,17 @@ struct Handle {
 	char *name;
 	uint64_t bytes_read, bytes_write;
 	int next_unused;
-	/* Phase 5: opaque ptr to struct hpn_bundle_state when use==HANDLE_BUNDLE.
-	 * NULL for HANDLE_FILE / HANDLE_DIR.  Owned by sftp-hpn-server.c. */
-	void *bundle_opaque;
+	/* HPN: the module's own state for a HANDLE_BUNDLE or HANDLE_TREE
+	 * handle, NULL for FILE and DIR. Owned by the HPN server modules. */
+	void *hpn_opaque;
 };
 
 enum {
 	HANDLE_UNUSED,
 	HANDLE_DIR,
 	HANDLE_FILE,
-	HANDLE_BUNDLE   /* Phase 5: hpn-bundle-open accumulator */
+	HANDLE_BUNDLE,	/* HPN: hpn-bundle-open accumulator or fetch writer */
+	HANDLE_TREE	/* HPN: a paused chunked tree walk */
 };
 
 static Handle *handles = NULL;
@@ -444,54 +457,96 @@ handle_new(int use, const char *name, int fd, int flags, DIR *dirp)
 	handles[i].flags = flags;
 	handles[i].name = xstrdup(name);
 	handles[i].bytes_read = handles[i].bytes_write = 0;
-	handles[i].bundle_opaque = NULL;
+	handles[i].hpn_opaque = NULL;
 
 	return i;
 }
-
-/* ── BEGIN Phase 5: bundle handle helpers (called from sftp-hpn-server.c) */
-int
-handle_new_bundle(void *opaque)
-{
-	int i = handle_new(HANDLE_BUNDLE, "(bundle)", -1, 0, NULL);
-	if (i < 0)
-		return -1;
-	handles[i].bundle_opaque = opaque;
-	return i;
-}
-
-void *
-handle_get_bundle(int handle)
-{
-	if (handle < 0 || (u_int)handle >= num_handles ||
-	    handles[handle].use != HANDLE_BUNDLE)
-		return NULL;
-	return handles[handle].bundle_opaque;
-}
-
-int
-handle_is_bundle(int handle)
-{
-	return handle >= 0 && (u_int)handle < num_handles &&
-	    handles[handle].use == HANDLE_BUNDLE;
-}
-
-void
-handle_free_bundle(int handle)
-{
-	if (!handle_is_bundle(handle))
-		return;
-	handles[handle].bundle_opaque = NULL;
-	free(handles[handle].name);
-	handles[handle].name = NULL;
-	handle_unused(handle);
-}
-/* ── END Phase 5 ─────────────────────────────────────────────────────── */
 
 static int
 handle_is_ok(int i, int type)
 {
 	return i >= 0 && (u_int)i < num_handles && handles[i].use == type;
+}
+
+/* HPN handle slots, called from the HPN server modules. A bundle or
+ * tree handle carries only the module's opaque state, no fd or DIR. The
+ * per-kind wrappers keep the table's internals here. */
+static int
+handle_new_hpn(int use, const char *name, void *opaque)
+{
+	int i = handle_new(use, name, -1, 0, NULL);
+
+	if (i < 0)
+		return -1;
+	handles[i].hpn_opaque = opaque;
+	return i;
+}
+
+static void *
+handle_get_hpn(int handle, int use)
+{
+	if (!handle_is_ok(handle, use))
+		return NULL;
+	return handles[handle].hpn_opaque;
+}
+
+static void
+handle_free_hpn(int handle, int use)
+{
+	if (!handle_is_ok(handle, use))
+		return;
+	handles[handle].hpn_opaque = NULL;
+	free(handles[handle].name);
+	handles[handle].name = NULL;
+	handle_unused(handle);
+}
+
+int
+handle_new_bundle(void *opaque)
+{
+	return handle_new_hpn(HANDLE_BUNDLE, "(bundle)", opaque);
+}
+
+void *
+handle_get_bundle(int handle)
+{
+	return handle_get_hpn(handle, HANDLE_BUNDLE);
+}
+
+int
+handle_is_bundle(int handle)
+{
+	return handle_is_ok(handle, HANDLE_BUNDLE);
+}
+
+void
+handle_free_bundle(int handle)
+{
+	handle_free_hpn(handle, HANDLE_BUNDLE);
+}
+
+int
+handle_new_tree(void *opaque)
+{
+	return handle_new_hpn(HANDLE_TREE, "(tree)", opaque);
+}
+
+void *
+handle_get_tree(int handle)
+{
+	return handle_get_hpn(handle, HANDLE_TREE);
+}
+
+int
+handle_is_tree(int handle)
+{
+	return handle_is_ok(handle, HANDLE_TREE);
+}
+
+void
+handle_free_tree(int handle)
+{
+	handle_free_hpn(handle, HANDLE_TREE);
 }
 
 static int
@@ -515,7 +570,8 @@ handle_from_string(const u_char *handle, u_int hlen)
 	val = get_u32(handle);
 	if (handle_is_ok(val, HANDLE_FILE) ||
 	    handle_is_ok(val, HANDLE_DIR) ||
-	    handle_is_ok(val, HANDLE_BUNDLE))
+	    handle_is_ok(val, HANDLE_BUNDLE) ||
+	    handle_is_ok(val, HANDLE_TREE))
 		return val;
 	return -1;
 }
@@ -525,7 +581,8 @@ handle_to_name(int handle)
 {
 	if (handle_is_ok(handle, HANDLE_DIR)||
 	    handle_is_ok(handle, HANDLE_FILE) ||
-	    handle_is_ok(handle, HANDLE_BUNDLE))
+	    handle_is_ok(handle, HANDLE_BUNDLE) ||
+	    handle_is_ok(handle, HANDLE_TREE))
 		return handles[handle].name;
 	return NULL;
 }
@@ -869,6 +926,8 @@ process_init(void)
 	/* Read-only remote-tree enumeration; advertised unconditionally like
 	 * fs-info (no operator toggle - it exposes nothing readdir doesn't). */
 	compose_extension(msg, HPN_EXT_DISCOVER_TREE, "1");
+	compose_extension(msg, HPN_EXT_TREE_OPEN, "1");
+	compose_extension(msg, HPN_EXT_TREE_READ, "1");
 	/* Gate hpn-bundle / hpn-bundle-fetch on the operator-controlled
 	 * master toggle (sshd_config: HPNUseBundle).  When disabled, the
 	 * extensions don't show up in SSH_FXP_VERSION at all - clients
@@ -957,10 +1016,8 @@ process_close(uint32_t id)
 		fatal_fr(r, "parse");
 
 	debug3("request %u: close handle %u", id, handle);
-	/* Bundle handles were extracted as the WRITEs arrived. Close joins
-	 * the writer pool and reports the result. */
-	if (sftp_hpn_server_is_bundle_handle(handle)) {
-		status = sftp_hpn_server_bundle_close(handle);
+	/* HPN handles (bundle, tree) close through their own modules. */
+	if (sftp_hpn_server_close_handle(handle, &status)) {
 		send_status(id, status);
 		return;
 	}
@@ -2046,6 +2103,20 @@ static void
 process_extended_hpn_discover_tree(uint32_t id)
 {
 	sftp_hpn_server_dispatch(id, HPN_EXT_DISCOVER_TREE, iqueue, oqueue);
+}
+
+/* Chunked tree walk dispatch wrappers. The handlers live in
+ * sftp-hpn-tree-server.c. */
+static void
+process_extended_hpn_tree_open(uint32_t id)
+{
+	sftp_hpn_server_dispatch(id, HPN_EXT_TREE_OPEN, iqueue, oqueue);
+}
+
+static void
+process_extended_hpn_tree_read(uint32_t id)
+{
+	sftp_hpn_server_dispatch(id, HPN_EXT_TREE_READ, iqueue, oqueue);
 }
 
 /* Phase 5: hpn-bundle-open@hpnssh.org dispatch wrapper.  The real
