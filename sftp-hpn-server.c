@@ -213,8 +213,6 @@ send_status_oqueue(struct sshbuf *oqueue, u_int id, u_int status)
  * client sees a mismatch against its local "full chunk" hash and correctly
  * flags the chunk as incomplete.
  */
-#define SFTP_HASH_RANGE_MAX_RANGES	65536U
-
 struct hash_range {
 	u_int64_t	off;
 	u_int64_t	len;

@@ -55,384 +55,378 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
-/*
- * SIGINT flag, defined in sftp.c (hpnsftp) and scp.c (hpnscp) - both binaries
- * that link this object provide it, and both set it from their SIGINT handler
- * in either the classic or the parallel context.  The auto-repair loop polls
- * it so a multi-attempt repair bails promptly on Ctrl-C instead of grinding
- * through the remaining attempts.
- */
+/* Read buffer for local hashing, and the bytes hashed between watchdog
+ * refreshes and progress reports. */
+#define HASH_RANGE_READ_BUF_LEN	65536
+#define HASH_REFRESH_BYTES	((uint64_t)64 * 1024 * 1024)
+
+/* Chunked resume tunables. CHUNK_SIZE is the re-transfer granularity: at
+ * 64 MiB the per-chunk protocol cost, 16 bytes of request and 8 of reply,
+ * is negligible next to a missed chunk's transfer. Below MIN_FILE_SIZE
+ * the whole-file hash gate is cheaper than the chunked round trip, and
+ * two chunks give an engaged run something to map. The request cap,
+ * SFTP_HASH_RANGE_MAX_RANGES, is shared with the server through
+ * sftp-hpn-server.h; a span with more chunks than that is hashed in
+ * several requests. */
+#define CHUNK_HASH_CHUNK_SIZE			((uint64_t)64 * 1024 * 1024)
+#define CHUNK_HASH_MIN_FILE_SIZE		(2 * CHUNK_HASH_CHUNK_SIZE)
+
+/* SIGINT flag, defined by both binaries that link this file, sftp.c and
+ * scp.c, and set by their handlers. The auto-repair loop polls it so a
+ * multi-attempt repair stops on Ctrl-C instead of grinding on. */
 extern _Atomic sig_atomic_t interrupted;
 
-/* showprogress flag, defined in sftp.c (hpnsftp) and scp.c (hpnscp) -
- * verify_run_phase gates its progress meter on it, same as the transfer
- * loops (off under -q / batch / non-tty). */
+/* Meter gate, also defined by both binaries. The verify phase gates its
+ * progress meter on it like the transfer loops do. */
 extern int showprogress;
-
-/* Chunked resume helpers. The public entry points are declared in
- * sftp-hpn-verify.h; the range hashing below is private to this file. */
 
 /* One (offset, length) range of a batched hash query. The same struct
  * describes the request and, through a parallel hashes array, the reply. */
 struct sftp_hash_range {
-	u_int64_t	off;
-	u_int64_t	len;
+	uint64_t	off;
+	uint64_t	len;
 };
 
-static int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn,
-    const char *path, const struct sftp_hash_range *ranges, u_int n,
-    u_int64_t *hashes_out);
-
-#define HASH_RANGE_READ_BUF_LEN	65536U
-
-/*
- * Tunables for chunked resume.  Defaults chosen per the locked design
- * (project_chunked_resume_plan.md memory):
- *
- *  CHUNK_HASH_CHUNK_SIZE       - granularity of re-transfer.  64 MiB makes
- *                                per-chunk protocol overhead (16 B request,
- *                                8 B response) negligible vs. typical
- *                                missed-chunk transfer cost.
- *  CHUNK_HASH_MIN_FILE_SIZE    - below this, skip the chunked path; the
- *                                full-file hash gate is cheaper than the
- *                                chunked-request round trip on small files.
- *                                Chosen as 2 * CHUNK_SIZE so any engaged
- *                                run has at least two chunks to map.
- *  CHUNK_HASH_MAX_RANGES_PER_REQUEST
- *                              - must match server-side cap in
- *                                sftp-hpn-server.c (SFTP_HASH_RANGE_MAX_RANGES).
- *                                Bounds server-side allocation against an
- *                                unbounded request; the server allocates
- *                                N range + N hash entries up front.  At
- *                                64 MiB chunks this also caps single-file
- *                                chunked-resume at 4 TiB; bigger files
- *                                decline and fall through to the existing
- *                                full-file gate.
- */
-#define CHUNK_HASH_CHUNK_SIZE			((u_int64_t)(64ULL * 1024ULL * 1024ULL))
-#define CHUNK_HASH_MIN_FILE_SIZE		((u_int64_t)(2ULL * CHUNK_HASH_CHUNK_SIZE))
-#define CHUNK_HASH_MAX_RANGES_PER_REQUEST	65536U
-
+/* Hash [offset, offset + length) of an open fd with streaming XXH3. A
+ * short read hashes what was read: a caller comparing against the peer's
+ * hash of the full range then sees a mismatch, which is the right answer
+ * for a truncated file. The watchdog is paused for the hash and the
+ * pause refreshed every HASH_REFRESH_BYTES, along with a report of
+ * progress_base plus the bytes hashed so far to the hash-work op, whose
+ * leg base the caller sets. Returns 0 with the hash in *hash_out, or -1
+ * on a seek, read or hash-state error. Leaves the fd positioned after
+ * the last byte read. */
 static int
-sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
-    u_int64_t *hash_out)
+sftp_hpn_xxhash_local_range(struct sftp_conn *conn, int fd, uint64_t offset,
+    uint64_t length, uint64_t progress_base, uint64_t *hash_out)
 {
-	XXH3_state_t	*state;
-	u_char		 buf[HASH_RANGE_READ_BUF_LEN];
-	u_int64_t	 remaining;
-	ssize_t		 nread;
+	XXH3_state_t *state;
+	u_char buf[HASH_RANGE_READ_BUF_LEN];
+	uint64_t remaining = length;
+	uint64_t since_refresh = 0;
+	ssize_t nread;
+	int rc = -1;
 
+	/* error checking */
 	if (hash_out == NULL || fd < 0) {
 		errno = EINVAL;
 		return -1;
 	}
-
 	if ((state = XXH3_createState()) == NULL) {
 		error_f("XXH3_createState failed");
 		return -1;
 	}
 	if (XXH3_64bits_reset(state) == XXH_ERROR) {
 		error_f("XXH3_64bits_reset failed");
-		XXH3_freeState(state);
-		return -1;
+		goto out;
 	}
-
-	if (length > 0 && lseek(fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
+	if (lseek(fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
 		error_f("lseek to %llu: %s",
 		    (unsigned long long)offset, strerror(errno));
-		XXH3_freeState(state);
-		return -1;
+		goto out;
 	}
 
-	remaining = length;
+	/* Hashing a large file can be minutes of wire silence. Declare the
+	 * pause here and refresh it as the bytes go by: a single window set
+	 * before the call would expire mid-hash and the watchdog would kill
+	 * a worker that is working. */
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+
+	/* read the fd in BUF_LEN chunks */
 	while (remaining > 0) {
-		size_t toread = (size_t)MINIMUM(
-		    (u_int64_t)sizeof(buf), remaining);
+		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf),
+		    remaining);
+
 		nread = read(fd, buf, toread);
 		if (nread == 0)
-			break;	/* short read - caller may treat as
-				 * truncated; we hash what we got */
+			break;	/* short read, hash what we got */
 		if (nread < 0) {
 			if (errno == EINTR)
 				continue;
 			error_f("read at offset %llu: %s",
-			    (unsigned long long)offset, strerror(errno));
-			XXH3_freeState(state);
-			return -1;
+			    (unsigned long long)(offset + length - remaining),
+			    strerror(errno));
+			goto out;
 		}
 		if (XXH3_64bits_update(state, buf, (size_t)nread)
 		    == XXH_ERROR) {
 			error_f("XXH3_64bits_update failed");
-			XXH3_freeState(state);
-			return -1;
+			goto out;
 		}
-		remaining -= (u_int64_t)nread;
+		remaining -= (uint64_t)nread;
+		since_refresh += (uint64_t)nread;
+		/* Renew the pause declared above and report progress. */
+		if (since_refresh >= HASH_REFRESH_BYTES) {
+			sftp_conn_watchdog_pause(conn,
+			    HPN_HEARTBEAT_REFRESH_SEC);
+			sftp_conn_hash_op_progress(conn,
+			    progress_base + (length - remaining));
+			since_refresh = 0;
+		}
 	}
 
-	*hash_out = (u_int64_t)XXH3_64bits_digest(state);
+	*hash_out = (uint64_t)XXH3_64bits_digest(state);
+	rc = 0;
+ out:
 	XXH3_freeState(state);
-	return 0;
+	return rc;
 }
 
-/*
- * Hash the first 'length' bytes of an already-open local file using
- * XXH3_64bits (streaming API).  Seeks to offset 0 before reading.
- * Returns 0 and writes the hash to *hash_out on success, -1 on error.
- */
+/* Hash the first length bytes of an open local file, restoring the fd's
+ * position on return. sftp_hpn_xxhash_local_range describes the watchdog
+ * and progress behavior. Returns 0 with the hash in *hash_out, or -1 on
+ * a seek, read or hash-state error. */
 int
 sftp_hpn_xxhash_local_fd(struct sftp_conn *conn, int fd, uint64_t length,
     uint64_t *hash_out)
 {
-	XXH3_state_t *state;
-	XXH64_hash_t hash;
-	u_char buf[65536];
-	uint64_t remaining = length;
-	ssize_t nread;
 	off_t pos_before;
+	int rc;
 
-	pos_before = lseek(fd, 0, SEEK_CUR);
-	debug3_f("local fd=%d length=%llu fd_pos_before=%lld",
-	    fd, (unsigned long long)length, (long long)pos_before);
-
-	if (lseek(fd, 0, SEEK_SET) == -1) {
+	if ((pos_before = lseek(fd, 0, SEEK_CUR)) == (off_t)-1) {
 		error_f("lseek failed: %s", strerror(errno));
 		return -1;
 	}
-
-	if ((state = XXH3_createState()) == NULL) {
-		error_f("XXH3_createState failed");
-		return -1;
-	}
-	if (XXH3_64bits_reset(state) == XXH_ERROR) {
-		error_f("XXH3_64bits_reset failed");
-		XXH3_freeState(state);
-		return -1;
-	}
-
-	uint64_t since_refresh = 0;
-
-	while (remaining > 0) {
-		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf), remaining);
-
-		/* Hashing a large file is minutes of byte-silence; a single
-		 * pause window before the call expires mid-hash and the
-		 * watchdog/endgame reaper kills a worker that is working.
-		 * Refresh every 64 MiB hashed (the helper is cheap). */
-		since_refresh += toread;
-		if (conn != NULL && since_refresh >= (64ULL << 20)) {
-			sftp_conn_watchdog_pause(conn,
-			    HPN_HEARTBEAT_REFRESH_SEC);
-			/* Feed the hash-work op: this local leg's cumulative
-			 * bytes (callers set the leg base). */
-			sftp_conn_hash_op_progress(conn, length - remaining);
-			since_refresh = 0;
-		}
-		nread = read(fd, buf, toread);
-		if (nread == 0)
-			break; /* EOF before length bytes */
-		if (nread < 0) {
-			error_f("read failed: %s", strerror(errno));
-			XXH3_freeState(state);
-			(void)lseek(fd, pos_before, SEEK_SET);
-			return -1;
-		}
-		if (XXH3_64bits_update(state, buf, (size_t)nread) == XXH_ERROR) {
-			error_f("XXH3_64bits_update failed");
-			XXH3_freeState(state);
-			(void)lseek(fd, pos_before, SEEK_SET);
-			return -1;
-		}
-		remaining -= (uint64_t)nread;
-	}
-	hash = XXH3_64bits_digest(state);
-	XXH3_freeState(state);
-	*hash_out = (uint64_t)hash;
-	debug3_f("local hash of first %llu bytes: %016llx",
-	    (unsigned long long)length, (unsigned long long)*hash_out);
-	if (lseek(fd, pos_before, SEEK_SET) == -1)
+	rc = sftp_hpn_xxhash_local_range(conn, fd, 0, length, 0, hash_out);
+	if (rc == 0)
+		debug3_f("local hash of first %llu bytes: %016llx",
+		    (unsigned long long)length, (unsigned long long)*hash_out);
+	if (lseek(fd, pos_before, SEEK_SET) == (off_t)-1)
 		error_f("lseek restore failed: %s", strerror(errno));
-	return 0;
+	return rc;
 }
 
-/*
- * Request that the sender's sftp-server compute a XXH3_64bits hash of the
- * first 'length' bytes of 'path' using the hpn-check-file@hpnssh.org
- * extension.  Returns 0 and writes the hash value to *hash_out on success,
- * or -1 if the extension is unavailable or an error occurred.
- */
+/* Wait for the reply to hash request id on a connection whose watchdog
+ * the caller has paused. Heartbeats arrive first: EXTENDED_REPLY
+ * messages whose first field, field_width bytes wide, is the sentinel,
+ * followed by the server's bytes hashed so far. Returns 0 with the real
+ * reply's first field in *field and msg positioned after it, 1 for a
+ * STATUS reply with *status set and its text, if any, in *errmsg, which
+ * the caller frees, or -1 with the connection dead: a transport failure
+ * already logged, or a reply that does not fit the request, reported
+ * here. name is the extension's short name for the messages. */
+static int
+hash_reply_wait(struct sftp_conn *conn, const char *name, const char *path,
+    u_int id, int field_width, uint64_t sentinel, struct sshbuf *msg,
+    uint64_t *field, u_int *status, char **errmsg)
+{
+	uint64_t hb_prog, hb_prog_last = 0;
+	time_t hb_now, hb_advance_sec = monotime();
+	u_int rid, field32;
+	u_char type;
+	int r;
+
+	for (;;) {
+		if (get_msg(conn, msg) != 0)
+			return -1;
+		/* A reply that does not fit the request leaves the connection
+		 * desynchronized, so these mark it dead instead of falling
+		 * back: the stray reply would surface in a later request. */
+		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
+		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+			sftp_conn_die(conn, "%s \"%s\": parse reply header: "
+			    "%s", name, path, ssh_err(r));
+			return -1;
+		}
+		if (rid != id) {
+			sftp_conn_die(conn, "%s \"%s\": reply id mismatch "
+			    "(%u != %u)", name, path, rid, id);
+			return -1;
+		}
+		if (type == SSH2_FXP_STATUS) {
+			if ((r = sshbuf_get_u32(msg, status)) != 0) {
+				sftp_conn_die(conn, "%s \"%s\": parse status: "
+				    "%s", name, path, ssh_err(r));
+				return -1;
+			}
+			(void)sshbuf_get_cstring(msg, errmsg, NULL);
+			return 1;
+		}
+		if (type != SSH2_FXP_EXTENDED_REPLY) {
+			sftp_conn_die(conn, "%s \"%s\": expected "
+			    "SSH2_FXP_EXTENDED_REPLY(%u), got %u",
+			    name, path, SSH2_FXP_EXTENDED_REPLY, type);
+			return -1;
+		}
+		if (field_width == 4) {
+			r = sshbuf_get_u32(msg, &field32);
+			*field = field32;
+		} else
+			r = sshbuf_get_u64(msg, field);
+		if (r != 0) {
+			sftp_conn_die(conn, "%s \"%s\": parse reply: %s",
+			    name, path, ssh_err(r));
+			return -1;
+		}
+		if (*field != sentinel)
+			return 0;
+
+		/* A heartbeat. The figure after the sentinel feeds the
+		 * hash-work op and renews the pause; a missing one counts as
+		 * no advance. */
+		hb_now = monotime();
+		if (sshbuf_get_u64(msg, &hb_prog) != 0)
+			hb_prog = hb_prog_last;
+		debug3_f("%s \"%s\" id=%u heartbeat progress=%llu",
+		    name, path, id, (unsigned long long)hb_prog);
+		sftp_conn_hash_op_progress(conn, hb_prog);
+		if (hb_prog > hb_prog_last) {
+			hb_prog_last = hb_prog;
+			hb_advance_sec = hb_now;
+		} else if (hb_now - hb_advance_sec >=
+		    (time_t)HPN_VERIFY_PROGRESS_STALL_SEC) {
+			/* Liveness without progress is a stalled backend. The
+			 * request cannot be abandoned on a live connection, a
+			 * late reply would desync it, so the connection is
+			 * failed instead. */
+			sftp_conn_die(conn, "%s \"%s\": server hash made no "
+			    "progress for %u seconds", name, path,
+			    HPN_VERIFY_PROGRESS_STALL_SEC);
+			return -1;
+		}
+		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	}
+}
+
+/* Ask the server for the XXH3 hash of the first length bytes of path
+ * through hpn-check-file. Returns 0 with the hash in *hash_out, or -1
+ * for a server without the extension, a STATUS reply, which is reported
+ * as an error, or a dead connection. The caller's hash-work op takes
+ * the server's progress. */
 int
 sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
     uint64_t length, uint64_t *hash_out)
 {
 	struct sshbuf *msg;
-	u_int id, rid;
-	u_char type;
-	int r;
+	char *errmsg = NULL;
+	u_int id, status;
+	int r, rc = -1;
 
-	/* Check the extension before allocating msg, so the unsupported-server
-	 * path does not leak an sshbuf (this is called per file). */
 	if (!sftp_conn_has_hpn_check_file(conn)) {
 		debug_f("server does not support hpn-check-file extension");
 		return -1;
 	}
-
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 
 	id = sftp_conn_alloc_msg_id(conn);
+	/* construct and send the path for the file to be checked */
 	debug3_f("sending hpn-check-file for \"%s\" length=%llu id=%u",
 	    path, (unsigned long long)length, id);
-	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "hpn-check-file@hpnssh.org")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_CHECK_FILE)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
 	    (r = sshbuf_put_u64(msg, length)) != 0)
 		fatal_fr(r, "compose");
-	send_msg(conn, msg);
+	if (send_msg(conn, msg) != 0)
+		goto out;
 
-	/*
-	 * Initial watchdog grace covers worker time spent here before the
-	 * first server heartbeat lands.  Each heartbeat received below
-	 * refreshes the pause for another HPN_HEARTBEAT_REFRESH_SEC, so the
-	 * orchestrator never kills us while the server is making forward
-	 * progress.  See sftp-hpn-server.h for the protocol.
-	 */
+	/* the hashing can take a long time so pause the watchdog */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-	/* Hash-work op (begin/leg) is owned by the CALLER; the heartbeats
-	 * below feed progress into it. */
+	r = hash_reply_wait(conn, "hpn-check-file", path, id, 8,
+	    HPN_HASH_CHECK_FILE_HEARTBEAT, msg, hash_out, &status, &errmsg);
+	/* got a response restart the watchdog */
+	sftp_conn_watchdog_resume(conn);
+	if (r == 1)
+		error("hpn-check-file \"%s\": %s", path,
+		    (errmsg != NULL && *errmsg != '\0') ? errmsg :
+		    fx2txt(status));
+	if (r != 0)
+		goto out;
+	debug3_f("remote hash of \"%s\" first %llu bytes: %016llx",
+	    path, (unsigned long long)length, (unsigned long long)*hash_out);
+	rc = 0;
+ out:
+	free(errmsg);
+	sshbuf_free(msg);
+	return rc;
+}
 
-	/* Heartbeats renew the lease (liveness) but carry a progress
-	 * figure precisely because liveness is not enough: a stalled
-	 * backend can heartbeat forever.  No advance for the threshold
-	 * means the connection is treated as failed. */
-	uint64_t hb_prog_last = 0;
-	time_t hb_advance_sec = monotime();
+/* Ask the server for the XXH3 hash of each of the n ranges of path, at
+ * most SFTP_HASH_RANGE_MAX_RANGES of them, through sftp-hash-range.
+ * Returns 0 with the hashes in hashes_out in range order, or -1 for a
+ * server without the extension, a STATUS reply or a dead connection. A
+ * STATUS reply means the server could not hash its own copy, which the
+ * user is told about since it points at that copy's storage even when
+ * the whole-file fallback then succeeds; local_is_target says whether
+ * that copy is the source or the destination. The caller's hash-work op
+ * takes the server's progress. */
+static int
+sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
+    int local_is_target, const struct sftp_hash_range *ranges, u_int n,
+    uint64_t *hashes_out)
+{
+	struct sshbuf *msg;
+	char *errmsg = NULL;
+	uint64_t num_hashes;
+	u_int id, status, i;
+	int r, rc = -1;
 
-	for (;;) {
-		if (get_msg(conn, msg) != 0) {
-			sftp_conn_watchdog_resume(conn);
-			sshbuf_free(msg);
+	/* The request cap is the caller's contract, not a server limit. */
+	if (n == 0 || n > SFTP_HASH_RANGE_MAX_RANGES) {
+		error_f("%u ranges for \"%s\"", n, path);
 		return -1;
-		}
-		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
-			/* A malformed reply must not abort the client - fatal
-			 * here crashes the whole orchestrator when this is one
-			 * of N parallel workers.  Mark the conn dead and return
-			 * -1, matching the ID-mismatch / wrong-type cases below. */
-			sftp_conn_die(conn, "hpn-check-file \"%s\": parse reply "
-			    "header: %s", path, ssh_err(r));
-			sftp_conn_watchdog_resume(conn);
-			sshbuf_free(msg);
-		return -1;
-		}
-		debug3_f("got response type=%u rid=%u (expected id=%u)",
-		    type, rid, id);
-		if (rid != id) {
-			/* Was fatal("ID mismatch (%u != %u)", rid, id); -
-			 * would crash the entire orchestrator if this
-			 * worker is one of N in a parallel-streams
-			 * transfer.  Mark the connection dead and let the
-			 * caller's resume / verify path observe -1. */
-			sftp_conn_die(conn,
-			    "hpn-check-file ID mismatch (%u != %u)",
-			    rid, id);
-			sftp_conn_watchdog_resume(conn);
-			sshbuf_free(msg);
-		return -1;
-		}
-
-		if (type == SSH2_FXP_STATUS) {
-			u_int status;
-			char *errmsg = NULL;
-
-			if ((r = sshbuf_get_u32(msg, &status)) != 0) {
-				sftp_conn_die(conn, "hpn-check-file \"%s\": "
-				    "parse status: %s", path, ssh_err(r));
-				sftp_conn_watchdog_resume(conn);
-				sshbuf_free(msg);
-			return -1;
-			}
-			/* consume error-message and language-tag to leave
-			 * msg clean */
-			(void)sshbuf_get_cstring(msg, &errmsg, NULL);
-			(void)sshbuf_get_cstring(msg, NULL, NULL);
-			error("hpn-check-file \"%s\": %s", path,
-			    (errmsg != NULL && *errmsg != '\0')
-			    ? errmsg : fx2txt(status));
-			debug3_f("server returned status %u for \"%s\"",
-			    status, path);
-			free(errmsg);
-			sftp_conn_watchdog_resume(conn);
-			sshbuf_free(msg);
-		return -1;
-		} else if (type != SSH2_FXP_EXTENDED_REPLY) {
-			/* Was fatal("Expected SSH2_FXP_EXTENDED_REPLY ...");
-			 * - would crash the entire orchestrator if this
-			 * worker is one of N in a parallel-streams
-			 * transfer.  Mark the connection dead and let the
-			 * caller's resume / verify path observe -1. */
-			sftp_conn_die(conn,
-			    "hpn-check-file: expected "
-			    "SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
-			    SSH2_FXP_EXTENDED_REPLY, type);
-			sftp_conn_watchdog_resume(conn);
-			sshbuf_free(msg);
-		return -1;
-		}
-
-		if ((r = sshbuf_get_u64(msg, hash_out)) != 0) {
-			sftp_conn_die(conn, "hpn-check-file \"%s\": parse hash: "
-			    "%s", path, ssh_err(r));
-			sftp_conn_watchdog_resume(conn);
-			sshbuf_free(msg);
-		return -1;
-		}
-
-		/*
-		 * Heartbeat reply: refresh the watchdog pause and wait for
-		 * the next message.  Real hash values never collide with
-		 * the sentinel (probability 1/2^64).
-		 */
-		if (*hash_out == HPN_HASH_CHECK_FILE_HEARTBEAT) {
-			uint64_t hb_prog = 0;
-			time_t hb_now = monotime();
-
-			if ((r = sshbuf_get_u64(msg, &hb_prog)) != 0)
-				hb_prog = hb_prog_last; /* treat as no advance */
-			debug3_f("hpn-check-file heartbeat for \"%s\" id=%u "
-			    "progress=%llu", path, id,
-			    (unsigned long long)hb_prog);
-			/* Server bytes hashed: feed the hash-work op (also
-			 * refreshes the liveness stamp + serial meter). */
-			sftp_conn_hash_op_progress(conn, hb_prog);
-			if (hb_prog > hb_prog_last) {
-				hb_prog_last = hb_prog;
-				hb_advance_sec = hb_now;
-			} else if (hb_now - hb_advance_sec >=
-			    (time_t)HPN_VERIFY_PROGRESS_STALL_SEC) {
-				sftp_conn_die(conn, "hpn-check-file \"%s\": "
-				    "server hash made no progress for %d "
-				    "seconds (stalled backend); treating "
-				    "connection as failed",
-				    path, (int)HPN_VERIFY_PROGRESS_STALL_SEC);
-				sftp_conn_watchdog_resume(conn);
-				sshbuf_free(msg);
-		return -1;
-			}
-			sftp_conn_watchdog_pause(conn,
-			    HPN_HEARTBEAT_REFRESH_SEC);
-			continue;
-		}
-
-		debug3_f("remote hash of \"%s\" first %llu bytes: %016llx",
-		    path, (unsigned long long)length,
-		    (unsigned long long)*hash_out);
-		sftp_conn_watchdog_resume(conn);
-		sshbuf_free(msg);
-		return 0;
 	}
+	if (!sftp_conn_has_hash_range(conn)) {
+		debug_f("server lacks sftp-hash-range; chunked path "
+		    "unavailable");
+		return -1;
+	}
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+
+	/* Compose and send: path, count, then each (offset, length). */
+	id = sftp_conn_alloc_msg_id(conn);
+	debug3_f("sending sftp-hash-range \"%s\" num_ranges=%u id=%u",
+	    path, n, id);
+	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+	    (r = sshbuf_put_u32(msg, id)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_HASH_RANGE)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
+	    (r = sshbuf_put_u32(msg, n)) != 0)
+		fatal_fr(r, "compose");
+	for (i = 0; i < n; i++) {
+		if ((r = sshbuf_put_u64(msg, ranges[i].off)) != 0 ||
+		    (r = sshbuf_put_u64(msg, ranges[i].len)) != 0)
+			fatal_fr(r, "compose range %u", i);
+	}
+	if (send_msg(conn, msg) != 0)
+		goto out;
+
+	/* Wait through the heartbeats for the count, or a STATUS. */
+	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
+	r = hash_reply_wait(conn, "sftp-hash-range", path, id, 4,
+	    HPN_NUM_HASHES_HEARTBEAT, msg, &num_hashes, &status, &errmsg);
+	sftp_conn_watchdog_resume(conn);
+	if (r == 1)
+		logit("sftp-hash-range \"%s\": server reported %s; the %s "
+		    "may have a storage or permission problem", path,
+		    (errmsg != NULL && *errmsg != '\0') ? errmsg :
+		    fx2txt(status),
+		    local_is_target ? "source" : "destination");
+	if (r != 0)
+		goto out;
+
+	/* One hash per range, in request order. */
+	if (num_hashes != n) {
+		sftp_conn_die(conn, "sftp-hash-range \"%s\": %llu hashes for "
+		    "%u ranges", path, (unsigned long long)num_hashes, n);
+		goto out;
+	}
+	for (i = 0; i < n; i++) {
+		if ((r = sshbuf_get_u64(msg, &hashes_out[i])) != 0) {
+			sftp_conn_die(conn, "sftp-hash-range \"%s\": parse "
+			    "hash %u: %s", path, i, ssh_err(r));
+			goto out;
+		}
+	}
+	debug3_f("sftp-hash-range \"%s\": received %u hashes", path, n);
+	rc = 0;
+ out:
+	free(errmsg);
+	sshbuf_free(msg);
+	return rc;
 }
 
 /*
@@ -586,8 +580,8 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 	range.len = (uint64_t)len;
 	sftp_conn_hash_op_leg(conn, (uint64_t)len);
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-	if (sftp_hpn_hash_remote_ranges(conn, remote_path, &range, 1,
-	    &remote_hash) != 0) {
+	if (sftp_hpn_hash_remote_ranges(conn, remote_path, local_is_target,
+	    &range, 1, &remote_hash) != 0) {
 		sftp_conn_watchdog_resume(conn);
 		return -1;
 	}
@@ -611,199 +605,6 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 	return 0;
 }
 
-static int
-sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
-    const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out)
-{
-	struct sshbuf	*msg = NULL;
-	u_int		 id, rid, num_hashes, i;
-	u_char		 type;
-	int		 r;
-	int		 rc = -1;
-
-	if (conn == NULL || path == NULL || ranges == NULL ||
-	    hashes_out == NULL || n == 0) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	if (!sftp_conn_has_hash_range(conn)) {
-		/*
-		 * Expected condition when talking to a pre-19.0 server;
-		 * the caller will fall through to hpn-check-file whole-file
-		 * hashing.  Keep at debug level so it doesn't spam users.
-		 */
-		debug_f("server lacks sftp-hash-range; chunked path "
-		    "unavailable");
-		return -1;
-	}
-
-	if ((msg = sshbuf_new()) == NULL) {
-		error_f("sshbuf_new failed");
-		return -1;
-	}
-
-	id = sftp_conn_alloc_msg_id(conn);
-	debug3_f("sending sftp-hash-range \"%s\" num_ranges=%u id=%u",
-	    path, n, id);
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, HPN_EXT_HASH_RANGE)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, path)) != 0 ||
-	    (r = sshbuf_put_u32(msg, n)) != 0)
-		fatal_fr(r, "compose request header");
-	for (i = 0; i < n; i++) {
-		if ((r = sshbuf_put_u64(msg, ranges[i].off)) != 0 ||
-		    (r = sshbuf_put_u64(msg, ranges[i].len)) != 0)
-			fatal_fr(r, "compose range %u", i);
-	}
-	if (send_msg(conn, msg) != 0) {
-		/* Connection died (worker churn) - the fallback handles it and
-		 * the death already produced its own heartbeat; debug only. */
-		debug_f("sftp-hash-range \"%s\": transport send failed; "
-		    "falling back to whole-file hash", path);
-		goto out;
-	}
-
-	/*
-	 * Initial watchdog grace covers the worker time until the first
-	 * server heartbeat lands.  Each heartbeat refreshes the pause for
-	 * another HPN_HEARTBEAT_REFRESH_SEC so the orchestrator never kills
-	 * us while the server is making forward progress.  See
-	 * sftp-hpn-server.h for the protocol.
-	 */
-	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-	/* Hash-work op (begin/leg) is owned by the CALLER; the heartbeats
-	 * below feed progress into it. */
-
-	/* Heartbeats renew the lease (liveness) but carry a progress
-	 * figure precisely because liveness is not enough: a stalled
-	 * backend can heartbeat forever.  No advance for the threshold
-	 * means the connection is treated as failed. */
-	u_int64_t hb_prog_last = 0;
-	time_t hb_advance_sec = monotime();
-
-	for (;;) {
-		sshbuf_reset(msg);
-
-		if (get_msg(conn, msg) != 0) {
-			/* Same as the send-side: handled fallback, debug only. */
-			debug_f("sftp-hash-range \"%s\": transport receive "
-			    "failed; falling back to whole-file hash", path);
-			break;
-		}
-		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
-			logit_f("sftp-hash-range \"%s\": parse reply header: "
-			    "%s; falling back to whole-file hash",
-			    path, ssh_err(r));
-			break;
-		}
-		if (rid != id) {
-			logit_f("sftp-hash-range \"%s\": reply id mismatch "
-			    "(got %u expected %u); falling back to "
-			    "whole-file hash", path, rid, id);
-			break;
-		}
-
-		if (type == SSH2_FXP_STATUS) {
-			u_int	 status = SSH2_FX_FAILURE;
-			char	*errmsg = NULL;
-
-			(void)sshbuf_get_u32(msg, &status);
-			(void)sshbuf_get_cstring(msg, &errmsg, NULL);
-			/*
-			 * User-visible warning per the chunked-resume design:
-			 * server failure to hash a range indicates a problem
-			 * on the destination (FS corruption, concurrent
-			 * modification, permission change, etc.) and the user
-			 * should know even if the fallback transfer succeeds.
-			 */
-			logit_f("sftp-hash-range \"%s\": server reported "
-			    "error (%s); the destination may have storage / "
-			    "FS / permission issues - falling back to "
-			    "whole-file hash",
-			    path,
-			    (errmsg != NULL && *errmsg != '\0')
-			        ? errmsg : fx2txt(status));
-			free(errmsg);
-			break;
-		}
-		if (type != SSH2_FXP_EXTENDED_REPLY) {
-			logit_f("sftp-hash-range \"%s\": unexpected reply "
-			    "type %u; falling back to whole-file hash",
-			    path, type);
-			break;
-		}
-		if ((r = sshbuf_get_u32(msg, &num_hashes)) != 0) {
-			logit_f("sftp-hash-range \"%s\": parse num_hashes: "
-			    "%s; falling back to whole-file hash",
-			    path, ssh_err(r));
-			break;
-		}
-
-		/*
-		 * Heartbeat reply: refresh the watchdog pause and wait for
-		 * the next message.  Real num_hashes is bounded by the
-		 * SFTP_HASH_RANGE_MAX_RANGES cap (65536), well below the
-		 * sentinel.
-		 */
-		if (num_hashes == HPN_NUM_HASHES_HEARTBEAT) {
-			u_int64_t hb_prog = 0;
-			time_t hb_now = monotime();
-
-			if ((r = sshbuf_get_u64(msg, &hb_prog)) != 0)
-				hb_prog = hb_prog_last; /* treat as no advance */
-			debug3_f("sftp-hash-range \"%s\" id=%u heartbeat "
-			    "progress=%llu", path, id,
-			    (unsigned long long)hb_prog);
-			/* Server bytes hashed: feed the hash-work op (also
-			 * refreshes the liveness stamp + serial meter). */
-			sftp_conn_hash_op_progress(conn, hb_prog);
-			if (hb_prog > hb_prog_last) {
-				hb_prog_last = hb_prog;
-				hb_advance_sec = hb_now;
-			} else if (hb_now - hb_advance_sec >=
-			    (time_t)HPN_VERIFY_PROGRESS_STALL_SEC) {
-				sftp_conn_die(conn, "sftp-hash-range "
-				    "\"%s\": server hash made no progress "
-				    "for %d seconds (stalled backend); "
-				    "treating connection as failed",
-				    path, (int)HPN_VERIFY_PROGRESS_STALL_SEC);
-				break;
-			}
-			sftp_conn_watchdog_pause(conn,
-			    HPN_HEARTBEAT_REFRESH_SEC);
-			continue;
-		}
-
-		if (num_hashes != n) {
-			logit_f("sftp-hash-range \"%s\": server returned %u "
-			    "hashes for %u ranges; falling back to "
-			    "whole-file hash", path, num_hashes, n);
-			break;
-		}
-		for (i = 0; i < n; i++) {
-			if ((r = sshbuf_get_u64(msg, &hashes_out[i])) != 0) {
-				logit_f("sftp-hash-range \"%s\": parse hash "
-				    "%u: %s; falling back to whole-file "
-				    "hash", path, i, ssh_err(r));
-				rc = -1;
-				goto loop_done;
-			}
-		}
-
-		debug3_f("sftp-hash-range \"%s\": received %u hashes", path, n);
-		rc = 0;
-		break;
-	}
-
-loop_done:
-	sftp_conn_watchdog_resume(conn);
-out:
-	sshbuf_free(msg);
-	return rc;
-}
 
 /*
  * Chunked reconciliation of a span [span_off, span_off+span_len) of a file:
@@ -819,8 +620,8 @@ out:
  *
  * Returns 1 (every chunk already matched - nothing to do), 0 (one or more runs
  * spliced successfully), or -1 (declined: server lacks sftp-hash-range, span
- * below the chunk floor, chunk count over the cap, or a local/remote hash or
- * transfer error - the caller falls back to a whole-span re-transmit).  A
+ * below the chunk floor, or a local/remote hash or transfer error - the
+ * caller falls back to a whole-span re-transmit).  A
  * partial failure mid-run leaves the destination indeterminate, hence -1 +
  * fallback.
  */
@@ -830,10 +631,10 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
     off_t span_off, off_t span_len, off_t dest_size, int local_is_target)
 {
 	struct sftp_hash_range	*ranges = NULL;
-	u_int64_t		*local_hashes = NULL;
-	u_int64_t		*remote_hashes = NULL;
-	u_int64_t		 slen, soff, bytes_moved = 0, checked_bytes;
-	u_int64_t		 refetch_total = 0;
+	uint64_t		*local_hashes = NULL;
+	uint64_t		*remote_hashes = NULL;
+	uint64_t		 slen, soff, bytes_moved = 0, checked_bytes;
+	uint64_t		 refetch_total = 0, remote_done = 0;
 	volatile uint64_t	 live_ctr = 0;
 	int			 meter_on = 0;
 	const char		*ing = local_is_target ? "re-fetching"
@@ -841,7 +642,7 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	const char		*ed = local_is_target ? "re-fetched"
 				    : "re-transferred";
 	u_int			 n_chunks, n_check, n_mismatched = 0;
-	u_int			 i;
+	u_int			 i, j, batch;
 	int			 rc = -1;
 
 	if (conn == NULL || local_path == NULL || remote_path == NULL ||
@@ -853,8 +654,8 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 		    "for \"%s\"", local_path);
 		return -1;
 	}
-	slen = (u_int64_t)span_len;
-	soff = (u_int64_t)span_off;
+	slen = (uint64_t)span_len;
+	soff = (uint64_t)span_off;
 	if (slen < CHUNK_HASH_MIN_FILE_SIZE) {
 		debug_f("span %llu of \"%s\" below chunked threshold %llu; "
 		    "declining", (unsigned long long)slen, local_path,
@@ -864,12 +665,6 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 
 	n_chunks = (u_int)((slen + CHUNK_HASH_CHUNK_SIZE - 1) /
 	    CHUNK_HASH_CHUNK_SIZE);
-	if (n_chunks > CHUNK_HASH_MAX_RANGES_PER_REQUEST) {
-		debug_f("span of \"%s\" would need %u chunks > cap %u; "
-		    "declining", local_path, n_chunks,
-		    CHUNK_HASH_MAX_RANGES_PER_REQUEST);
-		return -1;
-	}
 
 	if ((ranges = calloc(n_chunks, sizeof(*ranges))) == NULL ||
 	    (local_hashes = calloc(n_chunks, sizeof(*local_hashes))) == NULL ||
@@ -884,8 +679,8 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	 * the local hash.
 	 */
 	for (i = 0; i < n_chunks; i++) {
-		u_int64_t off = soff + (u_int64_t)i * CHUNK_HASH_CHUNK_SIZE;
-		u_int64_t remain = (soff + slen) - off;
+		uint64_t off = soff + (uint64_t)i * CHUNK_HASH_CHUNK_SIZE;
+		uint64_t remain = (soff + slen) - off;
 		ranges[i].off = off;
 		ranges[i].len = remain < CHUNK_HASH_CHUNK_SIZE
 		    ? remain : CHUNK_HASH_CHUNK_SIZE;
@@ -905,7 +700,7 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	if (dest_size > 0) {
 		for (i = 0; i < n_chunks; i++) {
 			if (ranges[i].off + ranges[i].len >
-			    (u_int64_t)dest_size) {
+			    (uint64_t)dest_size) {
 				n_check = i;
 				break;
 			}
@@ -939,17 +734,13 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	if (n_check > 0)
 		logit("hashing the local copy of \"%s\"", local_path);
 
-	/* Local hashing.  Refresh the pause EVERY chunk: hashing a large span
-	 * locally takes minutes of byte-silence, far past one pause window,
-	 * and the watchdog/endgame reaper would otherwise kill a worker that
-	 * is working hard - then the requeued unit re-hashes from scratch
-	 * (churn, or a livelock for a single-file reputv). */
-	u_int64_t local_done = 0;
+	/* Local hashing. The helper refreshes the pause and reports progress
+	 * as it goes; the per-chunk report here covers a short final chunk. */
+	uint64_t local_done = 0;
 
 	for (i = 0; i < n_check; i++) {
-		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-		if (sftp_hpn_xxhash_local_range(local_fd, ranges[i].off,
-		    ranges[i].len, &local_hashes[i]) != 0) {
+		if (sftp_hpn_xxhash_local_range(conn, local_fd, ranges[i].off,
+		    ranges[i].len, local_done, &local_hashes[i]) != 0) {
 			error_f("local hash failed at chunk %u offset %llu "
 			    "for \"%s\"", i,
 			    (unsigned long long)ranges[i].off, local_path);
@@ -960,17 +751,27 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 		sftp_conn_hash_op_progress(conn, local_done);
 	}
 
-	/* Remote hashing: all-or-nothing over the CHECKED prefix.  Helper
-	 * emits the user-visible warning on failure.  Skipped entirely when
-	 * the clamp left nothing to compare.  Second leg of the work op. */
-	sftp_conn_hash_op_leg(conn, checked_bytes);
+	/* Remote hashing of the checked prefix, in batches of at most
+	 * SFTP_HASH_RANGE_MAX_RANGES, the per-request bound. Each batch is
+	 * all-or-nothing and the helper emits the user-visible warning on a
+	 * failure. This is the second leg of the work op. The server's
+	 * heartbeats report progress from zero for each request, so the leg
+	 * base moves up by the batches already done and the meter stays
+	 * monotone. Skipped entirely when the clamp left nothing to compare. */
 	if (n_check > 0)
 		logit("hashing the remote copy of \"%s\"", remote_path);
-	if (n_check > 0 &&
-	    sftp_hpn_hash_remote_ranges(conn, remote_path, ranges, n_check,
-	    remote_hashes) != 0) {
-		sftp_conn_watchdog_resume(conn);
-		goto out;
+	for (i = 0; i < n_check; i += batch) {
+		batch = n_check - i;
+		if (batch > SFTP_HASH_RANGE_MAX_RANGES)
+			batch = SFTP_HASH_RANGE_MAX_RANGES;
+		sftp_conn_hash_op_leg(conn, checked_bytes + remote_done);
+		if (sftp_hpn_hash_remote_ranges(conn, remote_path, local_is_target,
+		    &ranges[i], batch, &remote_hashes[i]) != 0) {
+			sftp_conn_watchdog_resume(conn);
+			goto out;
+		}
+		for (j = i; j < i + batch; j++)
+			remote_done += ranges[j].len;
 	}
 	sftp_conn_watchdog_resume(conn);
 
@@ -1024,7 +825,7 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 	i = 0;
 	while (i < n_chunks) {
 		u_int run_start;
-		u_int64_t run_off, run_len;
+		uint64_t run_off, run_len;
 		int r;
 
 		if (local_hashes[i] == remote_hashes[i]) {
@@ -1131,7 +932,7 @@ verify_repair_one_pass(struct sftp_conn *conn, const char *local_path,
 {
 	int rc;
 
-	if (span_len > 0 && (u_int64_t)span_len >= CHUNK_HASH_MIN_FILE_SIZE) {
+	if (span_len > 0 && (uint64_t)span_len >= CHUNK_HASH_MIN_FILE_SIZE) {
 		int fd = open(local_path, O_RDONLY);
 
 		if (fd == -1) {

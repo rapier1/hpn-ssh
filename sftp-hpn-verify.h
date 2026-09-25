@@ -31,7 +31,7 @@ struct sftp_hpn_conn;
  * reads the first length bytes of an open fd from offset 0; the remote
  * one asks the server through hpn-check-file. Each returns 0 with the
  * hash in *hash_out, or -1 on an error or a server without the
- * extension. The fd's position after return is undefined. */
+ * extension. The local one restores the fd's position on return. */
 int sftp_hpn_xxhash_local_fd(struct sftp_conn *conn, int fd, uint64_t length,
     uint64_t *hash_out);
 int sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,

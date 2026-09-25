@@ -47,6 +47,11 @@
 #define HPN_EXT_HASH_RANGE   "sftp-hash-range@hpnssh.org"   /* chunked-resume ranged hashing */
 #define HPN_EXT_FILE_LAYOUT  "hpn-file-layout@hpnssh.org"   /* filesystem layout (Lustre stripe today) */
 
+/* Most ranges one sftp-hash-range request may carry. The server allocates
+ * that many range and hash entries up front, and the client caps its
+ * chunked resume requests at the same number. */
+#define SFTP_HASH_RANGE_MAX_RANGES	65536
+
 /*
  * hpn-file-layout@hpnssh.org wire format (revision 1):
  *
