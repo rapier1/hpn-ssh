@@ -80,14 +80,19 @@ extern _Atomic sig_atomic_t interrupted;
  * loops (off under -q / batch / non-tty). */
 extern int showprogress;
 
-/* ── BEGIN sftp-hash-range: client-side helpers ───────────────────────────
- *
- * Helpers for chunked resume.  See sftp-hpn-client.h for the public API
- * and the design rationale at project_chunked_resume_plan.md in memory.
- *
- * sftp_hpn_xxhash_local_range - local XXH3 over an open fd's range
- * sftp_hpn_hash_remote_ranges  - wire-level sftp-hash-range@hpnssh.org query
- */
+/* Chunked resume helpers. The public entry points are declared in
+ * sftp-hpn-verify.h; the range hashing below is private to this file. */
+
+/* One (offset, length) range of a batched hash query. The same struct
+ * describes the request and, through a parallel hashes array, the reply. */
+struct sftp_hash_range {
+	u_int64_t	off;
+	u_int64_t	len;
+};
+
+static int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn,
+    const char *path, const struct sftp_hash_range *ranges, u_int n,
+    u_int64_t *hashes_out);
 
 #define HASH_RANGE_READ_BUF_LEN	65536U
 
@@ -122,7 +127,7 @@ extern int showprogress;
 #define CHUNK_HASH_MIN_FILE_SIZE		((u_int64_t)(2ULL * CHUNK_HASH_CHUNK_SIZE))
 #define CHUNK_HASH_MAX_RANGES_PER_REQUEST	65536U
 
-int
+static int
 sftp_hpn_xxhash_local_range(int fd, u_int64_t offset, u_int64_t length,
     u_int64_t *hash_out)
 {
@@ -543,7 +548,7 @@ verify_readback_progress(void *arg, uint64_t bytes)
 	sftp_conn_hash_op_progress((struct sftp_conn *)arg, bytes);
 }
 
-int
+static int
 sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, off_t off, off_t len, int local_is_target,
     int have_local_hash, uint64_t local_hash,
@@ -620,7 +625,7 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 	return 0;
 }
 
-int
+static int
 sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
     const struct sftp_hash_range *ranges, u_int n, u_int64_t *hashes_out)
 {
