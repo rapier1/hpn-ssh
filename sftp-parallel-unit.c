@@ -633,7 +633,8 @@ parallel_verify_prefix_pool_reset(struct sftp_parallel *fleet)
  */
 static struct verify_whole_item *
 verify_whole_item_new(int local_prefix, const char *local_rel,
-    int remote_prefix, const char *remote_rel, int local_is_target)
+    int remote_prefix, const char *remote_rel, int local_is_target,
+    int have_src_hash, uint64_t src_hash)
 {
 	struct verify_whole_item *it;
 	size_t llen = strlen(local_rel);
@@ -646,6 +647,8 @@ verify_whole_item_new(int local_prefix, const char *local_rel,
 	it->local_prefix = (int16_t)local_prefix;
 	it->remote_prefix = (int16_t)remote_prefix;
 	it->local_is_target = (int8_t)local_is_target;
+	it->have_src_hash = (int8_t)have_src_hash;
+	it->src_hash = have_src_hash ? src_hash : 0;
 	memcpy(it->buf, local_rel, llen + 1);		/* includes NUL */
 	memcpy(it->buf + llen + 1, remote_rel, rlen + 1);
 	return it;
@@ -656,11 +659,13 @@ verify_whole_item_new(int local_prefix, const char *local_rel,
  * Stores a lightweight verify_whole_item with paths held RELATIVE to a
  * registered directory prefix (the long common prefix lives once in the pool,
  * not in two full paths per file). No match (non-recursive / disparate) falls
- * back to full paths. The verify handler rebuilds local/remote.
+ * back to full paths. The verify handler rebuilds local/remote. An upload's
+ * teed source hash rides along so the verify can skip the local read.
  */
 void
 parallel_verify_park_whole_file(struct sftp_parallel *fleet, const char *local_path,
-    const char *remote_path, int local_is_target)
+    const char *remote_path, int local_is_target, int have_src_hash,
+    uint64_t src_hash)
 {
 	struct verify_whole_item *it;
 	const char *lrel = NULL, *rrel = NULL;
@@ -671,7 +676,8 @@ parallel_verify_park_whole_file(struct sftp_parallel *fleet, const char *local_p
 	 * matches nothing and is stored as-is (already short). */
 	lp = parallel_verify_prefix_match(fleet, local_path, &lrel);
 	rp = parallel_verify_prefix_match(fleet, remote_path, &rrel);
-	it = verify_whole_item_new(lp, lrel, rp, rrel, local_is_target);
+	it = verify_whole_item_new(lp, lrel, rp, rrel, local_is_target,
+	    have_src_hash, src_hash);
 
 	pthread_mutex_lock(&fleet->verify_pending_mu);
 	if (fleet->verify_whole_pending_n == fleet->verify_whole_pending_cap) {
@@ -821,10 +827,12 @@ parallel_verify_phase_submit(struct sftp_parallel *fleet)
 
 			if (t->target == SFTP_RANGE_TARGET_LOCAL)
 				it = verify_whole_item_new(-1, t->path,
-				    -1, t->src_path, /*local_is_target=*/1);
+				    -1, t->src_path, /*local_is_target=*/1,
+				    /*have_src_hash=*/0, 0);
 			else
 				it = verify_whole_item_new(-1, t->src_path,
-				    -1, t->path, /*local_is_target=*/0);
+				    -1, t->path, /*local_is_target=*/0,
+				    /*have_src_hash=*/0, 0);
 			parallel_verify_tracker_free(t);
 			u->op = SFTP_OP_VERIFY;
 			u->verify_whole = it;

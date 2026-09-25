@@ -1420,10 +1420,12 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 	case SFTP_HPN_BUNDLE_OK:
 		for (i = 0; i < acc->nmembers; i++) {
 			/* Mirror the per-file path: park for the classic
-			 * verify phase, a no-op unless verify is on, then
-			 * report the success. */
-			sftp_conn_verify_park(conn, acc->src_paths[i],
-			    acc->dst_paths[i], /*local_is_target=*/0);
+			 * verify phase, a no-op unless verify is on, with the
+			 * source hash the bundle writer teed, then report the
+			 * success. */
+			sftp_conn_verify_park_hashed(conn, acc->src_paths[i],
+			    acc->dst_paths[i], entries[i].have_src_hash,
+			    entries[i].src_hash);
 			(void)sftp_hpn_report_transfer(conn, 0,
 			    acc->src_paths[i], acc->dst_paths[i],
 			    acc->sizes[i]);
@@ -1507,7 +1509,7 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 			if (entries[i].result == 0) {
 				sftp_conn_verify_park(conn,
 				    acc->dst_paths[i], acc->src_paths[i],
-				    /*local_is_target=*/1);
+				    /*local_is_target=*/1, acc->sizes[i]);
 				(void)sftp_hpn_report_transfer(conn, 0,
 				    acc->src_paths[i], acc->dst_paths[i],
 				    acc->sizes[i]);

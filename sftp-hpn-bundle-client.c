@@ -1324,7 +1324,8 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		/* add a file to the bundle */
 		if (sftp_hpn_tar_writer_add_file(writer,
 		    entries[i].local_path, entries[i].remote_path,
-		    perm, (uint64_t)sb.st_size, mtime) < 0) {
+		    perm, (uint64_t)sb.st_size, mtime,
+		    &entries[i].src_hash, &entries[i].have_src_hash) < 0) {
 			error_f("hpn-bundle: writer_add_file \"%s\" "
 			    "rejected (path too long?)",
 			    entries[i].remote_path);

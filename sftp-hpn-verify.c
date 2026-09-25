@@ -429,14 +429,16 @@ sftp_hpn_hash_remote_ranges(struct sftp_conn *conn, const char *path,
 	return rc;
 }
 
-/*
- * ── Inline source-hash accumulator (verify transfer 1b) ────────────────
- * The upload reads the whole source to send it; rather than re-read the
- * source a second time at verify, we tee those bytes into a streaming XXH3
- * as they are read.  State lives on conn->hpn so it survives from the upload
- * call to the separate post-transfer verify call.  All entry points are
- * no-ops when not armed or hpn==NULL, so the disabled hot path is untouched.
- */
+/* Inline source hash. An upload reads the whole source to send it, so
+ * rather than read it again at verify, the bytes are teed into a
+ * streaming XXH3 as they go by. The state lives on the connection, one
+ * file at a time: the upload's park takes the finished hash into the
+ * verify entry, or leaves it for the parallel worker to take, before the
+ * next file arms. Every entry point is a no-op when not armed or when
+ * hpn is NULL, so the disabled hot path is untouched. */
+
+/* Start hashing a new source; any earlier state is discarded. A hash
+ * state that cannot be had leaves the tee disarmed and verify re-reads. */
 void
 sftp_hpn_src_arm(struct sftp_hpn_conn *hpn)
 {
@@ -457,6 +459,8 @@ sftp_hpn_src_arm(struct sftp_hpn_conn *hpn)
 	hpn->verify_src_failed = 0;
 }
 
+/* Add the bytes just read from the source. An update failure marks the
+ * hash failed, which finish then discards. */
 void
 sftp_hpn_src_feed(struct sftp_hpn_conn *hpn, const u_char *buf, size_t len)
 {
@@ -470,6 +474,8 @@ sftp_hpn_src_feed(struct sftp_hpn_conn *hpn, const u_char *buf, size_t len)
 	hpn->verify_src_bytes += (uint64_t)len;
 }
 
+/* Digest after the last byte; the result is valid only when no update
+ * failed. */
 void
 sftp_hpn_src_finish(struct sftp_hpn_conn *hpn)
 {
@@ -484,6 +490,8 @@ sftp_hpn_src_finish(struct sftp_hpn_conn *hpn)
 	hpn->verify_src_state = NULL;
 }
 
+/* Drop any state and result: a partial or aborted upload, a park that
+ * did not take the hash, and connection teardown. */
 void
 sftp_hpn_src_dispose(struct sftp_hpn_conn *hpn)
 {
@@ -498,6 +506,9 @@ sftp_hpn_src_dispose(struct sftp_hpn_conn *hpn)
 	hpn->verify_src_bytes = 0;
 }
 
+/* Consume the finished hash, once, if it covers expect_bytes. Returns 0
+ * with the hash in *hash_out, or -1 when there is none or the byte count
+ * differs, in which case the caller reads the source itself. */
 int
 sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
     uint64_t *hash_out)
@@ -508,6 +519,19 @@ sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
 	if (hpn->verify_src_bytes != expect_bytes)
 		return -1;			/* did not cover the whole file */
 	*hash_out = hpn->verify_src_hash;
+	return 0;
+}
+
+/* One-shot form of the tee for a source read in a single buffer, the
+ * pipelined small-file batch. Returns 0 with the hash in *hash_out, or -1
+ * when verify is off or hpn is NULL, so the disabled path does no work. */
+int
+sftp_hpn_src_hash_buf(struct sftp_hpn_conn *hpn, const u_char *buf,
+    size_t len, uint64_t *hash_out)
+{
+	if (hpn == NULL || !hpn->verify_transfer_enabled)
+		return -1;
+	*hash_out = (uint64_t)XXH3_64bits(buf, len);
 	return 0;
 }
 
@@ -573,8 +597,12 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 			return -1;
 		}
 		sftp_conn_watchdog_resume(conn);
-	} else
+	} else {
+		debug_f("verify: teed source hash for \"%s\" [%llu+%llu)",
+		    local_path, (unsigned long long)off,
+		    (unsigned long long)len);
 		sftp_conn_hash_op_progress(conn, (uint64_t)len);
+	}
 
 	range.off = (uint64_t)off;
 	range.len = (uint64_t)len;
@@ -1142,27 +1170,24 @@ sftp_conn_set_verify_repair(struct sftp_conn *conn, int enabled, int attempts)
 	h->verify_repair_attempts = attempts < 1 ? 1 : attempts;
 }
 
-/*
- * Park a just-transferred file for the classic post-transfer verify phase.
- * Called at the end of sftp_upload (local_is_target=0) and sftp_download
- * (local_is_target=1).  No-op unless integrity verify is enabled, and skipped
- * on parallel worker conns - the orchestrator's verify phase handles those
- * (live_counter is the per-worker hook, NULL on the main conn).  Records paths
- * only; the hash compare happens later in sftp_conn_verify_run_phase, mirroring
- * the -j upload-everything-then-verify model instead of stalling each file on a
- * synchronous round-trip.
- */
-void
-sftp_conn_verify_park(struct sftp_conn *conn, const char *local_path,
-    const char *remote_path, int local_is_target)
+/* Park a just-transferred file for the classic post-transfer verify phase,
+ * at the end of sftp_upload (local_is_target 0) and sftp_download (1).
+ * No-op unless verify is enabled, and skipped on parallel worker conns,
+ * whose fleet parks for itself (live_counter is the per-worker hook, NULL
+ * on the main conn). Records the paths and, for an upload whose inline
+ * source hash covered all size bytes, takes that hash so the phase can
+ * skip the local read. The compare itself runs later in
+ * sftp_conn_verify_run_phase, the upload-everything-then-verify model,
+ * instead of stalling each file on a round trip. The hashed form below
+ * is for the serial bundle flush, whose members' hashes come from the
+ * bundle writer rather than the slot. */
+static void
+verify_park_entry(struct sftp_hpn_conn *h, const char *local_path,
+    const char *remote_path, int local_is_target, int have_src_hash,
+    uint64_t src_hash)
 {
-	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
 	struct sftp_verify_pending_entry *e;
 
-	if (!sftp_conn_verify_transfer_enabled(conn))
-		return;
-	if (h->live_counter != NULL)
-		return;
 	if (h->verify_pending_count >= h->verify_pending_cap) {
 		int newcap = h->verify_pending_cap ?
 		    h->verify_pending_cap * 2 : 64;
@@ -1174,6 +1199,40 @@ sftp_conn_verify_park(struct sftp_conn *conn, const char *local_path,
 	e->local_path = xstrdup(local_path);
 	e->remote_path = xstrdup(remote_path);
 	e->local_is_target = local_is_target;
+	e->have_src_hash = have_src_hash;
+	e->src_hash = have_src_hash ? src_hash : 0;
+}
+
+void
+sftp_conn_verify_park(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, int local_is_target, off_t size)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+	uint64_t src_hash = 0;
+	int have_src_hash;
+
+	if (!sftp_conn_verify_transfer_enabled(conn))
+		return;
+	if (h->live_counter != NULL)
+		return;
+	have_src_hash = !local_is_target &&
+	    sftp_hpn_src_take(h, (uint64_t)size, &src_hash) == 0;
+	verify_park_entry(h, local_path, remote_path, local_is_target,
+	    have_src_hash, src_hash);
+}
+
+void
+sftp_conn_verify_park_hashed(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, int have_src_hash, uint64_t src_hash)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (!sftp_conn_verify_transfer_enabled(conn))
+		return;
+	if (h->live_counter != NULL)
+		return;
+	verify_park_entry(h, local_path, remote_path, /*local_is_target=*/0,
+	    have_src_hash, src_hash);
 }
 
 /* Files parked for the classic verify phase; lets the caller print a quiet-
@@ -1217,16 +1276,14 @@ sftp_conn_drain_verify_failures(struct sftp_conn *conn, char ***out_paths,
 	return n;
 }
 
-/*
- * Classic post-transfer verify phase: verify every file parked during the
- * command's transfers, then clear the list.  The single-conn analogue of the
- * -j orchestrator's verify phase - same sftp_hpn_verify_transfer core, same
- * trust_inline_src=0 source re-read (the inline tee cannot span a deferred
- * phase).  Mismatches are recorded on the conn (drained later to the run
- * summary + SFTP_EX_VERIFY_FAILED); they do not fail the transfer.  No-op when
- * nothing was parked (parallel mode, or verify disabled).  Moved from
- * sftp-client.c; reaches HPN state through sftp_conn_hpn().
- */
+/* Classic post-transfer verify phase: verify every file parked during
+ * the command's transfers, then clear the list. The single-conn analogue
+ * of the -j orchestrator's verify phase, on the same verify and repair
+ * engine. An upload's teed source hash rides in its entry, so only files
+ * without one are read locally. Mismatches are recorded on the conn and
+ * drained later to the run summary and SFTP_EX_VERIFY_FAILED; they do not
+ * fail the transfer. No-op when nothing was parked (parallel mode, or
+ * verify disabled). */
 void
 sftp_conn_verify_run_phase(struct sftp_conn *conn)
 {
@@ -1236,6 +1293,8 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 	int meter_on = 0;
 	struct stat sb;
 
+	debug_f("verify phase: %d file(s) parked",
+	    h == NULL ? 0 : h->verify_pending_count);
 	if (h == NULL || h->verify_pending_count == 0)
 		return;
 	/* Size each parked file for the progress-meter total (stat is cheap;
@@ -1276,7 +1335,7 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 			int r = sftp_hpn_verify_repair(conn, e->local_path,
 			    e->remote_path, e->local_is_target,
 			    /*off=*/0, /*len=*/e->size,
-			    /*have_local_hash=*/0, /*local_hash=*/0,
+			    e->have_src_hash, e->src_hash,
 			    h->verify_repair_enabled,
 			    h->verify_repair_attempts, &repaired);
 			/* TransferLog: the file's final status under -V (the

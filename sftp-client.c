@@ -2604,7 +2604,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	 */
 	if (status == SSH2_FX_OK)
 		sftp_conn_verify_park(conn, local_path, remote_path,
-		    /*local_is_target=*/1);
+		    /*local_is_target=*/1, (off_t)size);
 
 	return status == SSH2_FX_OK ? 0 : -1;
 }
@@ -3316,7 +3316,9 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	 */
 	if (r == 0 && status == 0)
 		sftp_conn_verify_park(conn, local_path, remote_path,
-		    /*local_is_target=*/0);
+		    /*local_is_target=*/0, sb.st_size);
+	else
+		sftp_hpn_src_dispose(conn->hpn);	/* no park takes the hash */
 
 	return (r != 0 || status != 0) ? -1 : 0;
 }
@@ -4518,6 +4520,10 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 				any_fail = 1;
 				continue;
 			}
+			/* Tee the source hash for the verify phase; the whole
+			 * file is in the buffer. */
+			entries[i].have_src_hash = sftp_hpn_src_hash_buf(conn->hpn,
+			    data, (size_t)len, &entries[i].src_hash) == 0;
 			/* Send SSH_FXP_WRITE; ACK collected in phase 3b. */
 			bs[i].write_id = conn->msg_id++;
 			if ((msg = sshbuf_new()) == NULL)
@@ -4641,6 +4647,9 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		    entries[i].local_path, entries[i].remote_path,
 		    preserve_flag, fsync_flag, inplace_flag,
 		    /*resume=*/0, /*resume_offset=*/0);
+		/* Take the teed source hash for the verify phase. */
+		entries[i].have_src_hash = sftp_hpn_src_take(conn->hpn,
+		    (uint64_t)bs[i].sb.st_size, &entries[i].src_hash) == 0;
 		if (close(bs[i].local_fd) == -1) {
 			error("batch close local \"%s\": %s",
 			    entries[i].local_path, strerror(errno));

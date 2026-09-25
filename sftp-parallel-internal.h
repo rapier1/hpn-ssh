@@ -393,6 +393,8 @@ struct verify_whole_item {
 	int16_t  local_prefix;		/* pool index, -1 = no prefix */
 	int16_t  remote_prefix;
 	int8_t   local_is_target;	/* 0 = upload, 1 = download */
+	int8_t   have_src_hash;		/* src_hash was teed by the upload */
+	uint64_t src_hash;
 	char     buf[];			/* "local_rel\0remote_rel\0" - one alloc */
 };
 
@@ -529,6 +531,10 @@ struct sftp_work_unit {
 	int      range_index; /* this range's slot in the tracker (0-based) */
 	int      skipped;     /* resume found the target identical or larger */
 	uint64_t range_hash;  /* verify: XXH3 of the source bytes */
+	/* Whole-file upload: the source hash teed during the transfer, on its
+	 * way to the verify park. */
+	int      have_src_hash;
+	uint64_t src_hash;
 	/* Shared by all range units of one file, NULL for the rest. */
 	struct sftp_range_tracker *range_tracker;
 	/* Bundle container: the small-file member units it carries, grouped
@@ -1084,7 +1090,8 @@ void	 parallel_verify_tracker_free(struct sftp_range_tracker *);
 void	 parallel_verify_park(struct sftp_parallel *,
 	    struct sftp_range_tracker *);
 void	 parallel_verify_park_whole_file(struct sftp_parallel *,
-	    const char *local_path, const char *remote_path, int local_is_target);
+	    const char *local_path, const char *remote_path, int local_is_target,
+	    int have_src_hash, uint64_t src_hash);
 int	 parallel_verify_phase_submit(struct sftp_parallel *);
 void	 parallel_verify_job_free(struct verify_job *);
 void	 parallel_verify_maybe_wave(struct sftp_parallel *);

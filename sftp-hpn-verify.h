@@ -83,7 +83,8 @@ int sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
  * struct sftp_hpn_conn. arm starts a streaming XXH3, feed adds bytes as
  * the source is read, finish digests, dispose abandons a partial result,
  * and take returns the hash if it covers expect_bytes. All are no-ops
- * when not armed or hpn is NULL. */
+ * when not armed or hpn is NULL. hash_buf is the one-shot form for a
+ * source read in a single buffer. */
 void sftp_hpn_src_arm(struct sftp_hpn_conn *hpn);
 void sftp_hpn_src_feed(struct sftp_hpn_conn *hpn, const u_char *buf,
     size_t len);
@@ -91,5 +92,7 @@ void sftp_hpn_src_finish(struct sftp_hpn_conn *hpn);
 void sftp_hpn_src_dispose(struct sftp_hpn_conn *hpn);
 int  sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
     uint64_t *hash_out);
+int  sftp_hpn_src_hash_buf(struct sftp_hpn_conn *hpn, const u_char *buf,
+    size_t len, uint64_t *hash_out);
 
 #endif /* SFTP_HPN_VERIFY_H */

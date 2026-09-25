@@ -2,9 +2,9 @@
 #	Placed in the Public Domain.
 #
 #	Exercises the hpn-bundle@hpnssh.org small-file aggregation path,
-#	parallel and serial, in both directions, with and without -p, and
-#	the HPNUseBundle, HPNBundleSize and HPNWriterPool ssh_config
-#	options.
+#	parallel and serial, in both directions, with and without -p, with
+#	and without -V, and the HPNUseBundle, HPNBundleSize and
+#	HPNWriterPool ssh_config options.
 
 tid="sftp bundle path"
 
@@ -114,6 +114,27 @@ check_log() {
 	fi
 }
 
+# Under -V the client log must show that the verify phase ran without a
+# mismatch and, on the upload side, that every non-empty file's source
+# hash came from the transfer's tee rather than a second read. A
+# download reads its destination back, so no teed hash appears there.
+# Empty files are verified on size alone and hash nothing.
+check_verify() {
+	direction="$1"
+	teed=$(grep -c "verify: teed source hash for" ${LOG})
+	if [ "$direction" = put ]; then
+		want=$(find ${SRCDIR} -type f -size +0 | wc -l | tr -d ' ')
+	else
+		want=0
+	fi
+	if [ "$teed" -ne "$want" ]; then
+		cp ${LOG} ${OBJ}/sftp-bundle-failed.log
+		fail "$label: $direction used $teed teed source hashes, wanted $want"
+	fi
+	grep -q "VERIFY FAILED" ${LOG} && \
+	    fail "$label: $direction reported a verify mismatch"
+}
+
 # One pass: put -r then get -r, each followed by a recursive diff
 # against the source and a check of the client's -v log. $2 says what
 # the log must show: bundle, bundle-multi (at least two bundles per
@@ -131,6 +152,10 @@ bundle_round_trip() {
 	server-off) reason="lacks hpn-bundle" ;;
 	*) fail "$label: unknown result '$expect'"; return ;;
 	esac
+	verify=no
+	for arg; do
+		[ "$arg" = -V ] && verify=yes
+	done
 	bclean
 	make_dataset
 
@@ -150,6 +175,7 @@ EOF
 	diff -r ${SRCDIR} ${DSTDIR}/up || \
 	    fail "$label: uploaded tree differs from source"
 	check_log put "hpn-bundle upload: n="
+	[ $verify = yes ] && check_verify put
 
 	verbose "$tid: $label (get -r)"
 	${SFTP} -q -v -S "$SSH" -F $OBJ/ssh_config \
@@ -165,6 +191,7 @@ EOF
 	diff -r ${SRCDIR} ${DSTDIR}/down || \
 	    fail "$label: downloaded tree differs from source"
 	check_log get "hpn-bundle-fetch: n="
+	[ $verify = yes ] && check_verify get
 }
 
 # Pass 1: parallel defaults. HPNUseBundle is yes and the server
@@ -203,7 +230,22 @@ bundle_round_trip "preserve" bundle -j 4 -p
 check_preserve ${DSTDIR}/up
 check_preserve ${DSTDIR}/down
 
-# Pass 8: the server side off. With sshd_config HPNUseBundle=no the
+# Pass 8: -V on the parallel default. The bundle writer tees each
+# member's source hash as it packs it, so the verify phase reads no
+# source file.
+bundle_round_trip "parallel -V" bundle -j 4 -V
+
+# Pass 9: -V with bundling off on the client. The pipelined batch tees
+# each small file from its read buffer.
+bundle_round_trip "HPNUseBundle=no -V" client-off -j 4 -V \
+    -o HPNUseBundle=no
+
+# Pass 10: -V at the 1 MiB target, so the 300 KiB file travels as a
+# single unit whose hash the plain upload tees.
+bundle_round_trip "HPNBundleSize=1M parallel -V" bundle -j 4 -V \
+    -o HPNBundleSize=1M
+
+# Pass 11: the server side off. With sshd_config HPNUseBundle=no the
 # server does not advertise the extension, so a default client takes
 # the per-file path.
 stop_sshd

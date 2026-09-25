@@ -117,9 +117,12 @@ void sftp_hpn_tar_writer_free(struct sftp_hpn_tar_writer *w);
  * Returns 0 on success or -1 on error (path too long, OOM, etc.).
  * On -1 the writer's queue is unchanged.
  */
+/* hash_out, when not NULL, receives the XXH3 of the entry's data once it
+ * has been packed, and *hash_valid_out is then set to 1. NULL for neither. */
 int sftp_hpn_tar_writer_add_file(struct sftp_hpn_tar_writer *w,
     const char *src_path, const char *archive_path,
-    mode_t mode, uint64_t size, time_t mtime);
+    mode_t mode, uint64_t size, time_t mtime,
+    uint64_t *hash_out, int *hash_valid_out);
 
 /*
  * Signal that no more files will be added.  After calling this,

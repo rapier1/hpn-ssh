@@ -797,7 +797,7 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		file_size = (uint64_t)file_stat.st_size;
 		if (sftp_hpn_tar_writer_add_file(state->writer, paths[i],
 		    paths[i], file_stat.st_mode, file_size,
-		    file_stat.st_mtime) < 0) {
+		    file_stat.st_mtime, NULL, NULL) < 0) {
 			error_f("hpn-bundle-fetch: writer rejected \"%s\" "
 			    "(path too long or out of memory)", paths[i]);
 			continue;

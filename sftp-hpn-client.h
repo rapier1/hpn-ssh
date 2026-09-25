@@ -142,6 +142,10 @@ struct sftp_verify_pending_entry {
 	/* Bytes, filled at phase start for the meter. */
 	off_t size;
 	int   local_is_target;		/* 0 = upload, 1 = download */
+	/* Source hash teed while the upload read the file, when the tee
+	 * covered every byte; the phase then skips the local read. */
+	int      have_src_hash;
+	uint64_t src_hash;
 };
 
 /* Adaptive upload pacing state. WRITE acks arrive at the receiver's
@@ -327,11 +331,13 @@ struct sftp_hpn_conn {
 	int      fault_recv_throttling;		/* holds a receive slot */
 #endif
 
-	/* Inline source hash for verify transfer. A whole-file upload hashes
-	 * the source as it reads, so the verify step need not read it again.
-	 * state is the streaming XXH3 handle, void so this header stays free
-	 * of xxhash, NULL when idle. valid is set on a clean finish, failed
-	 * when an update errored, which discards the result. */
+	/* Inline source hash for verify transfer. An upload hashes the source
+	 * as it reads it, and the result is taken into the file's parked
+	 * verify entry or range slot, so the verify step need not read the
+	 * source again. state is the streaming XXH3 handle, void so this
+	 * header stays free of xxhash, NULL when idle. valid is set on a
+	 * clean finish, failed when an update errored, which discards the
+	 * result. */
 	void     *verify_src_state;
 	uint64_t  verify_src_bytes;
 	uint64_t  verify_src_hash;

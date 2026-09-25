@@ -76,6 +76,9 @@
 #include "sshbuf.h"		/* POKE/PEEK big-endian field macros */
 #include "sftp-hpn-tar.h"
 
+#define XXH_INLINE_ALL		/* xxhash is header-only; inline the XXH3 API */
+#include "xxhash.h"
+
 /* ── Record layout ───────────────────────────────────────────────────────── */
 
 #define HPN_REC_END	0u	/* lone type byte that ends the stream */
@@ -108,6 +111,9 @@ struct writer_file {
 	mode_t   mode;
 	uint64_t size;
 	time_t   mtime;
+	/* Where to deliver the entry's source hash, NULL when not wanted. */
+	uint64_t *hash_out;
+	int      *hash_valid_out;
 	struct writer_file *next;
 };
 
@@ -121,6 +127,10 @@ struct sftp_hpn_tar_writer {
 	struct writer_file *cur;	/* the entry currently being emitted */
 	int      cur_fd;		/* open() result for cur->src_path */
 	uint64_t cur_data_emitted;	/* bytes of data written into out so far */
+	/* Streaming XXH3 of cur's data, kept across entries and reset for
+	 * each one that asked for its hash; NULL until first needed. */
+	XXH3_state_t *hash_state;
+	int      hash_active;		/* cur's data is being hashed */
 	u_char   hdr_buf[SFTP_HPN_TAR_HDR_MAX];	/* fixed prefix + path */
 	size_t   hdr_total;		/* full header size (prefix + path) */
 	size_t   hdr_pos;		/* bytes of hdr_buf already emitted */
@@ -174,6 +184,8 @@ sftp_hpn_tar_writer_free(struct sftp_hpn_tar_writer *w)
 		free(f->archive_path);
 		free(f);
 	}
+	if (w->hash_state != NULL)
+		XXH3_freeState(w->hash_state);
 	free(w->err);
 	free(w);
 }
@@ -181,7 +193,8 @@ sftp_hpn_tar_writer_free(struct sftp_hpn_tar_writer *w)
 int
 sftp_hpn_tar_writer_add_file(struct sftp_hpn_tar_writer *w,
     const char *src_path, const char *archive_path,
-    mode_t mode, uint64_t size, time_t mtime)
+    mode_t mode, uint64_t size, time_t mtime,
+    uint64_t *hash_out, int *hash_valid_out)
 {
 	struct writer_file *f;
 
@@ -206,6 +219,10 @@ sftp_hpn_tar_writer_add_file(struct sftp_hpn_tar_writer *w,
 	f->mode  = mode;
 	f->size  = size;
 	f->mtime = mtime;
+	f->hash_out = hash_out;
+	f->hash_valid_out = hash_valid_out;
+	if (hash_valid_out != NULL)
+		*hash_valid_out = 0;
 	if (w->q_tail == NULL)
 		w->q_head = f;
 	else
@@ -270,6 +287,16 @@ writer_advance_idle(struct sftp_hpn_tar_writer *w)
 	f->next = NULL;
 	w->cur  = f;
 	w->cur_data_emitted = 0;
+	/* Start the entry's hash if the caller asked for one. A state that
+	 * cannot be had just leaves the hash unreported. */
+	w->hash_active = 0;
+	if (f->hash_out != NULL) {
+		if (w->hash_state == NULL)
+			w->hash_state = XXH3_createState();
+		if (w->hash_state != NULL &&
+		    XXH3_64bits_reset(w->hash_state) == XXH_OK)
+			w->hash_active = 1;
+	}
 	if (writer_build_header(w) < 0) {
 		writer_set_error(w, "header build failed for \"%s\"",
 		    f->archive_path);
@@ -278,10 +305,17 @@ writer_advance_idle(struct sftp_hpn_tar_writer *w)
 	w->state = WS_HEADER;
 }
 
-/* Free the current entry and return to WS_IDLE. */
+/* Deliver the entry's hash when one was kept, free the entry and return
+ * to WS_IDLE. */
 static void
 writer_finish_entry(struct sftp_hpn_tar_writer *w)
 {
+	if (w->hash_active) {
+		*w->cur->hash_out = (uint64_t)XXH3_64bits_digest(w->hash_state);
+		if (w->cur->hash_valid_out != NULL)
+			*w->cur->hash_valid_out = 1;
+		w->hash_active = 0;
+	}
 	free(w->cur->src_path);
 	free(w->cur->archive_path);
 	free(w->cur);
@@ -368,6 +402,10 @@ sftp_hpn_tar_writer_pack_next(struct sftp_hpn_tar_writer *w,
 				    (unsigned long long)w->cur->size);
 				return -1;
 			}
+			if (w->hash_active &&
+			    XXH3_64bits_update(w->hash_state, out + written,
+			    (size_t)n) == XXH_ERROR)
+				w->hash_active = 0;
 			written             += (size_t)n;
 			w->cur_data_emitted += (uint64_t)n;
 			continue;

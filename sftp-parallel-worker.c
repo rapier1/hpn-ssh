@@ -137,17 +137,17 @@ worker_record_completion(struct sftp_worker *worker, off_t bytes, int success)
  */
 static void
 parallel_verify_one(struct sftp_worker *worker, const char *local_path,
-    const char *remote_path, int local_is_target)
+    const char *remote_path, int local_is_target, int have_src_hash,
+    uint64_t src_hash)
 {
 	struct sftp_parallel *fleet = worker->parent;
-	/* Whole-file mode: len 0 makes the engine verify span [0, size). No
-	 * teed hash is passed, because the decoupled verify may run on a
-	 * different worker than the one that uploaded the file, and the
-	 * size-keyed accumulator could hold another same-size file's hash. */
+	/* Whole-file mode: len 0 makes the engine verify span [0, size). An
+	 * upload's teed source hash, carried in the parked item, spares the
+	 * local read. */
 	int repaired = 0;
 	int verify_rc = sftp_hpn_verify_repair(worker->conn, local_path, remote_path,
 	    local_is_target, /*off=*/0, /*len=*/0,
-	    /*have_local_hash=*/0, /*local_hash=*/0,
+	    have_src_hash, src_hash,
 	    fleet->verify_repair_enabled, fleet->verify_repair_attempts, &repaired);
 
 	/* TransferLog: under -V the transfer line was deferred to this,
@@ -384,7 +384,8 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 			    item->remote_prefix, rrel);
 
 			parallel_verify_one(worker, local, remote,
-			    item->local_is_target);
+			    item->local_is_target, item->have_src_hash,
+			    item->src_hash);
 			free(local);
 			free(remote);
 			free(item);	/* single block: header + both rels */
@@ -428,9 +429,16 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 		rc = sftp_upload(worker->conn, unit->src_path, unit->dst_path,
 		    fleet->cfg.preserve_flag, unit->resume, /*verify=*/unit->verify,
 		    fleet->cfg.fsync_flag, fleet->cfg.inplace_flag);
-		if (rc == 0 && fleet->cfg.verify_transfer)
+		if (rc == 0 && fleet->cfg.verify_transfer) {
+			/* sftp_upload leaves its teed source hash for the worker,
+			 * since its own park skips worker conns. */
+			unit->have_src_hash = sftp_hpn_src_take(
+			    sftp_conn_hpn(worker->conn), (uint64_t)unit->size,
+			    &unit->src_hash) == 0;
 			parallel_verify_park_whole_file(fleet, unit->src_path,
-			    unit->dst_path, /*local_is_target=*/0);  /* local = source */
+			    unit->dst_path, /*local_is_target=*/0,
+			    unit->have_src_hash, unit->src_hash);
+		}
 		if (rc == 1 || rc == 2) {
 			unit->skipped = 1;	/* TransferLog: final at completion */
 			rc = 0;	/* identical / target-larger: complete */
@@ -514,7 +522,7 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 		    fleet->cfg.inplace_flag, /*verify=*/unit->verify);
 		if (rc == 0 && fleet->cfg.verify_transfer)
 			parallel_verify_park_whole_file(fleet, unit->dst_path,
-			    unit->src_path, /*local_is_target=*/1);  /* local = downloaded */
+			    unit->src_path, /*local_is_target=*/1, 0, 0);  /* local = downloaded */
 		if (rc == 1 || rc == 2) {
 			unit->skipped = 1;	/* TransferLog: final at completion */
 			rc = 0;	/* identical / target-larger: complete */
@@ -800,10 +808,11 @@ worker_finalize_one_entry(struct sftp_parallel *fleet, struct sftp_worker *worke
 			    (long long)unit->size, unit->dst_path);
 		else if (unit->op == SFTP_OP_UPLOAD)
 			parallel_verify_park_whole_file(fleet, unit->src_path,
-			    unit->dst_path, /*local_is_target=*/0);
+			    unit->dst_path, /*local_is_target=*/0,
+			    unit->have_src_hash, unit->src_hash);
 		else if (unit->op == SFTP_OP_DOWNLOAD)
 			parallel_verify_park_whole_file(fleet, unit->dst_path,
-			    unit->src_path, /*local_is_target=*/1);
+			    unit->src_path, /*local_is_target=*/1, 0, 0);
 		parallel_unit_pending_dec(fleet);
 		parallel_unit_free(unit);
 		return;
@@ -832,10 +841,16 @@ worker_finalize_prev_batch(struct sftp_worker *worker)
 
 	if (worker->batch_prev_units == NULL)
 		return;
-	for (int i = 0; i < worker->batch_prev_n; i++)
-		worker_finalize_one_entry(fleet, worker,
-		    worker->batch_prev_units[i],
-		    worker->batch_prev_entries[i].result);
+	for (int i = 0; i < worker->batch_prev_n; i++) {
+		struct sftp_work_unit *unit = worker->batch_prev_units[i];
+		struct sftp_upload_batch_entry *entry =
+		    &worker->batch_prev_entries[i];
+
+		/* Carry the teed source hash to the verify park. */
+		unit->have_src_hash = entry->have_src_hash;
+		unit->src_hash = entry->src_hash;
+		worker_finalize_one_entry(fleet, worker, unit, entry->result);
+	}
 	free(worker->batch_prev_units);
 	free(worker->batch_prev_entries);
 	worker->batch_prev_units   = NULL;
@@ -1080,11 +1095,15 @@ worker_run_bundle(struct sftp_worker *worker,
 	    &opts);
 	t_end_ms = monotime_ms();
 
-	for (i = 0; i < batch_n; i++)
+	for (i = 0; i < batch_n; i++) {
 		results[i] = entries[i].result;
-	
+		/* Carry each member's teed source hash to the verify park. */
+		batch[i]->have_src_hash = entries[i].have_src_hash;
+		batch[i]->src_hash = entries[i].src_hash;
+	}
+
 	worker_finish_bundle(fleet, worker, batch, batch_n, bundle_rc, results,
-            total_bytes, t_start_ms, t_end_ms, "BUNDLE");
+	    total_bytes, t_start_ms, t_end_ms, "BUNDLE");
 
 	free(entries);
 	free(results);

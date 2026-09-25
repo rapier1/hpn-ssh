@@ -288,6 +288,9 @@ struct sftp_upload_batch_entry {
 	const char *local_path;
 	const char *remote_path;
 	int         result;
+	/* Source hash teed during the send, for the verify phase. */
+	int         have_src_hash;
+	uint64_t    src_hash;
 };
 
 /* ── BEGIN Phase 4 gap 1: pipelined batch send/finish ──────────────────────
@@ -351,6 +354,9 @@ struct sftp_hpn_bundle_upload_entry {
 	const char *local_path;
 	const char *remote_path;   /* relative path inside the bundle dest */
 	int         result;        /* 0 = ok; -1 = failed (set by function) */
+	/* Source hash of the packed data, for the verify phase. */
+	int         have_src_hash;
+	uint64_t    src_hash;
 };
 
 /*

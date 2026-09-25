@@ -197,14 +197,19 @@ int  sftp_conn_verify_transfer_enabled(struct sftp_conn *conn);
 void sftp_conn_set_verify_repair(struct sftp_conn *conn, int enabled,
 	int attempts);
 
-/*
- * Park a transferred file for the classic post-transfer verify phase, called
- * at the end of sftp_upload (local_is_target=0) and sftp_download
- * (local_is_target=1).  No-op unless verify_transfer_enabled and skipped on
- * worker conns; the compare runs later in sftp_conn_verify_run_phase.
- */
+/* Park a transferred file for the classic post-transfer verify phase,
+ * called at the end of sftp_upload (local_is_target 0) and sftp_download
+ * (1). size is the byte count an upload's inline source hash must cover
+ * to be taken along. No-op unless verify_transfer_enabled and skipped on
+ * worker conns; the compare runs later in sftp_conn_verify_run_phase. */
 void sftp_conn_verify_park(struct sftp_conn *conn,
-	const char *local_path, const char *remote_path, int local_is_target);
+	const char *local_path, const char *remote_path, int local_is_target,
+	off_t size);
+/* The serial bundle flush's form: an uploaded member's source hash comes
+ * from the bundle writer, so it is passed in rather than taken. */
+void sftp_conn_verify_park_hashed(struct sftp_conn *conn,
+	const char *local_path, const char *remote_path, int have_src_hash,
+	uint64_t src_hash);
 
 /*
  * Set / query the HPNLustreStripeCount resolved-from-ssh_config value
