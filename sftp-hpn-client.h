@@ -16,417 +16,467 @@
  *
  */
 
-/* sftp-hpn-client.h - HPN-SSH extensions to the SFTP client connection.
+/* sftp-hpn-client.h - HPN-SSH extensions to the SFTP client.
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- * All HPN-specific per-connection state is isolated here so that
- * sftp-client.c carries a minimal diff against upstream.
- *
- * Upstream merge note: struct sftp_conn gains exactly ONE HPN line -
- *   struct sftp_hpn_conn *hpn;
- * All HPN per-connection state (dead flag, live counter, verify/hash/rdahead/
- * watchdog state, last_status, saw_perm/policy_denied, worker cap) lives on
- * struct sftp_hpn_conn and is reached via conn->hpn->... or the sftp_conn_hpn()
- * bridge.  sftp-client.c also gains the include, sftp_hpn_conn_init/free calls
- * in sftp_init/sftp_free, and send_msg/get_msg/get_handle un-static'd.
- */
+ * This file is part of HPN-SSH, not of upstream OpenSSH. It declares the
+ * client-side HPN state and interfaces that sftp-client.c would otherwise
+ * carry: the extension bits the server advertises, the per-connection
+ * state (struct sftp_hpn_conn, reached from struct sftp_conn through one
+ * pointer, its only HPN member), the serial bundle accumulator, the
+ * deferred directory attributes, the sink and driver interfaces of the
+ * shared upload and download walks, and the read-ahead tuning constants.
+ * The implementations are in sftp-hpn-client.c, except the inline source
+ * hash, which is in sftp-hpn-verify.c. */
 
-#ifndef _SFTP_CLIENT_HPN_H
-#define _SFTP_CLIENT_HPN_H
+#ifndef _SFTP_HPN_CLIENT_H
+#define _SFTP_HPN_CLIENT_H
 
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <stdint.h>
 
-/*
- * HPN's SFTP extension bits (server-advertised in SSH2_FXP_VERSION), split out
- * of the SFTP_EXT_* block in sftp-client.c so struct sftp_conn's upstream
- * define block carries only stock OpenSSH extensions.  sftp-client.c (the
- * `exts |=` setters) and sftp-hpn-client.c (the has_*() predicates) both see
- * these through this header.
- */
+#include "sftp-common.h"
+
+struct bwlimit;		/* misc.h; kept opaque here */
+struct sftp_conn;
+struct stat;
+
+/* HPN's SFTP extension bits (server-advertised in SSH2_FXP_VERSION), split
+ * out of the SFTP_EXT_* block in sftp-client.c so struct sftp_conn's upstream
+ * define block carries only stock OpenSSH extensions. sftp-client.c sets
+ * them and sftp-hpn-client.c tests them, both through this header. */
 #define SFTP_EXT_HPN_CHECK_FILE		0x00000400
 #define SFTP_EXT_HPN_FS_INFO		0x00000800
 #define SFTP_EXT_HPN_BUNDLE		0x00001000
 #define SFTP_EXT_HPN_BUNDLE_FETCH	0x00002000
 #define SFTP_EXT_HASH_RANGE		0x00004000
 #define SFTP_EXT_HPN_FILE_LAYOUT	0x00008000
-#define SFTP_EXT_HPN_DTREE_OPEN		0x00020000
-#define SFTP_EXT_HPN_DTREE_READ		0x00040000
-
-/*
- * Uncomment to enable fault injection (SFTP_FAULT_INJECT / SFTP_FAULT_PROTOCOL
- * environment variables).  Leave commented out for production builds.
- */
-/* #define HPN_FAULT_INJECTION */
-
-/*
- * Adaptive SFTP read-ahead controller (HPN).
- *
- * The stock client keeps a fixed pipeline of num_requests (-R, default 1024)
- * outstanding 128 KB requests - ~128 MB in flight per connection.  The
- * receive side must buffer all of it, so on a fat pipe with N parallel
- * workers process RSS and the kernel SO_RCVBUF balloon into the GB range,
- * far past what throughput actually needs.
- *
- * This controller instead probes for the SMALLEST depth that saturates the
- * path.  Over a sliding window of one depth's worth of completed requests it
- * measures app-layer throughput, then multiplicatively grows the depth (x2)
- * while throughput keeps rising (an RTT-bound ramp - growing by 1 would take
- * thousands of RTTs to fill a fat pipe), and settles at the last depth that
- * still gained once throughput plateaus (the BDP knee); a deeper pipe that
- * reduces throughput (overshoot) likewise falls back to that last-good depth.
- * -R stays a hard ceiling.  Per-connection, so each parallel worker tunes
- * itself.  App-layer only - no TCP_INFO dependency, portable across every OS
- * we support.
- */
-struct sftp_rdahead {
-	uint32_t cur;         /* current target depth (requests in flight) */
-	uint32_t floor;       /* never probe below this */
-	uint32_t cap;         /* never exceed this (= num_requests / -R) */
-	uint32_t last_rising; /* largest depth that still improved throughput */
-	uint32_t win_reqs;    /* completed requests in the current window */
-	uint64_t win_bytes;   /* bytes accumulated in the current window */
-	double   win_start;   /* monotime_double() at window open */
-	double   last_rate;   /* smoothed throughput of previous window (bytes/s) */
-	int      settled;     /* 1 once the knee is found - stop probing */
-
-	/* Part D - persistent-degradation tracking.  Backpressure events
-	 * occurring while already at floor accumulate here.  When the
-	 * controller can't keep cur above floor for an extended period,
-	 * the connection is marked dead so the orchestrator's existing
-	 * respawn machinery can replace it with a fresh TCP session.
-	 * Reset when cur grows above floor again (either via normal
-	 * window completion or the Part C time-probe). */
-	uint32_t consecutive_bp_at_floor; /* backpressure events while cur==floor */
-	double   time_first_at_floor;     /* monotime_double() when cur first hit
-	                                   * floor in the current degradation run;
-	                                   * 0 if cur > floor */
-};
-
-/* One file parked for the classic post-transfer verify phase. */
-struct sftp_verify_pending_entry {
-	char *local_path;
-	char *remote_path;
-	off_t size;			/* bytes; sized at phase start for the meter */
-	int   local_is_target;		/* 0 = upload, 1 = download */
-};
-
-struct bwlimit;		/* misc.h; kept opaque here */
+#define SFTP_EXT_HPN_DTREE_OPEN		0x00010000
+#define SFTP_EXT_HPN_DTREE_READ		0x00020000
 
 /* Length of the pacing rate ring, the estimator's memory in seconds.
  * sftp-hpn-client.c indexes the ring with it. */
 #define PACE_RING	10
 
-/*
- * HPN per-connection state.  Embedded in struct sftp_conn as a single
- * pointer so the upstream struct definition gains exactly one line.
- */
+/* Wedge detection threshold in seconds. A STATUS read that blocks longer
+ * than this is evidence the path is wedged: the caller signals
+ * sftp_conn_rdahead_backpressure_signal and the controller halves the
+ * depth, as TCP halves cwnd on a timeout. 10 s is above the 3 to 8 s
+ * STATUS latencies Lustre OST contention produces and well below the
+ * wedges observed in testing, which all blocked for over 90 s. Without
+ * the signal the grow-only controller settles high and never recovers
+ * when conditions degrade mid-transfer.
+ *
+ * This layer is application-level congestion control on top of TCP's,
+ * because the client cannot see the transport socket's TCP_INFO across
+ * the hpnssh subprocess boundary. */
+#define RDAHEAD_BP_THRESHOLD_SEC  10.0
+
+/* Persistent degradation thresholds. When repeated backpressure events
+ * have forced the controller to its floor and it is not recovering, the
+ * connection is marked dead so the orchestrator replaces it with a fresh
+ * TCP session. Either threshold suffices: BP_COUNT consecutive
+ * backpressure events while at the floor, or FLOOR_SEC of wall time at
+ * the floor in this run. The values are conservative, to give a broken
+ * connection a way out without thrashing on transient slowdowns. Five
+ * backpressure events at the floor is well past what a healthy path
+ * produces, and 60 s there without recovery means the floor-doubling time
+ * probe found no headroom either. The reap feeds the orchestrator's
+ * existing respawn machinery, with its cooldowns and budgets. It adds a
+ * trigger, not a respawn path. See parallel_respawn_dispatch in
+ * sftp-parallel-respawn.c for why that gate is session-wide. */
+#define RDAHEAD_REAP_BP_COUNT   5
+#define RDAHEAD_REAP_FLOOR_SEC  60.0
+
+/* Adaptive SFTP read-ahead controller.
+ *
+ * The stock client keeps a fixed pipeline of num_requests (-R, default
+ * 1024) outstanding 128 KB requests, about 128 MB in flight per
+ * connection. The receive side must buffer all of it, so on a fat pipe
+ * with N parallel workers the process RSS and the kernel SO_RCVBUF grow
+ * into the gigabytes, far past what throughput needs.
+ *
+ * This controller instead probes for the smallest depth that saturates
+ * the path. Over a sliding window of one depth's worth of completed
+ * requests it measures application-layer throughput, doubles the depth
+ * while throughput keeps rising (growing by one would take thousands of
+ * RTTs to fill a fat pipe), and settles at the last depth that still
+ * gained once throughput plateaus, the BDP knee. A deeper pipe that
+ * reduces throughput falls back to that last good depth the same way.
+ * -R stays a hard ceiling. The state is per connection, so each parallel
+ * worker tunes itself, and application-layer only: no TCP_INFO
+ * dependency, so it is portable to every OS we support. */
+struct sftp_rdahead {
+	uint32_t cur;         /* current target depth, requests in flight */
+	uint32_t floor;       /* never probe below this */
+	uint32_t cap;         /* never exceed this, the -R value */
+	/* The depth to fall back to, the last one that still gained. */
+	uint32_t last_rising;
+	uint32_t win_reqs;    /* completed requests in the current window */
+	uint64_t win_bytes;   /* bytes accumulated in the current window */
+	double   win_start;   /* monotime_double() at window open */
+	/* Smoothed rate of the last window in bytes/s. 0 means no baseline. */
+	double   last_rate;
+	/* Set at the knee or at the -R ceiling. Stops the probing. */
+	int      settled;
+
+	/* Persistent degradation tracking. Backpressure events that arrive
+	 * while cur is already at the floor accumulate here, and when the
+	 * controller cannot lift cur above the floor for long enough, the
+	 * connection is marked dead so the orchestrator's respawn machinery
+	 * replaces it with a fresh TCP session (RDAHEAD_REAP_*). Both reset
+	 * when cur grows above the floor again, from a window completion or
+	 * from the floor time probe. */
+	int      consecutive_bp_at_floor;
+	/* monotime_double() of the first backpressure signal in the current
+	 * run at the floor, or 0 while there is no such run. */
+	double   time_first_at_floor;
+};
+
+/* One file parked for the classic post-transfer verify phase.
+ * sftp_conn_verify_park adds one per transferred file and
+ * sftp_conn_verify_run_phase verifies them all. Both paths are owned. */
+struct sftp_verify_pending_entry {
+	char *local_path;
+	char *remote_path;
+	/* Bytes, filled at phase start for the meter. */
+	off_t size;
+	int   local_is_target;		/* 0 = upload, 1 = download */
+};
+
+/* Adaptive upload pacing state. WRITE acks arrive at the receiver's
+ * sustained drain rate, about one RTT late. Sending at slightly above that
+ * rate keeps the destination's page cache below its dirty limit, which
+ * otherwise turns a single-stream high-RTT upload into a stall and
+ * recover cycle. sftp_conn_pace_ack holds the control law. One per
+ * connection, so each parallel worker paces itself. */
+struct sftp_hpn_pace {
+	int      enabled;		/* on unless -X Pacing=no */
+	int      active;		/* grace passed, limiter engaged */
+	uint64_t acks;			/* WRITE acks seen, for the grace */
+	uint64_t first_ack_ms;		/* monotime_ms of the first ack */
+	uint64_t bucket_bytes;		/* acked bytes in the current bucket */
+	uint64_t bucket_start_ms;	/* monotime_ms the bucket opened */
+	/* Per-second delivered rates in bytes. The ceiling is 125% of their
+	 * mean, so stalled seconds pull it toward the sink's sustained rate.
+	 * Slow-start samples are left out. */
+	uint64_t rate_ring[PACE_RING];
+	u_int    ring_idx;
+	uint64_t last_arm_ms;		/* monotime_ms of the last arm */
+	uint64_t bw_rate_bits;		/* rate programmed into bw, bits/s */
+	/* The last ceiling armed while rising, reclaimed after a famine. */
+	uint64_t reclaim_bytes;
+	struct bwlimit *bw;		/* -l token bucket, NULL until active */
+};
+
+/* Serial-path bundling settings, from HPNUseBundle, HPNBundleSize and
+ * HPNWriterPool in ssh_config through sftp_conn_set_bundle_config. They
+ * mirror the parallel planner's, so both modes obey the same knobs. */
+struct sftp_hpn_bundle_cfg {
+	int      use;			/* HPNUseBundle, default on */
+	int      writer_pool;		/* HPNWriterPool, default on */
+	uint64_t size;			/* HPNBundleSize bytes, 0 = default */
+	/* Set after the server refused a bundle. The session then sends
+	 * files individually. */
+	int      server_cant;
+};
+
+/* HPN per-connection state, reached from struct sftp_conn through one
+ * pointer, its only HPN member. */
 struct sftp_hpn_conn {
-	/* Set when an unrecoverable I/O error occurs; prevents further
-	 * send/recv on this connection. */
+	/* Set on an unrecoverable I/O error. send and receive refuse to run.
+	 * A plain int, touched only by the thread that owns the connection. */
 	int              dead;
 
-	/* Non-zero while a multi-message reply is streaming in on this
-	 * connection (a dtree-read batch).  A reply is matched to its request
-	 * by reading the next message in wire order, so a second request sent
-	 * inside that window has its reply interleaved with the remaining
-	 * chunks: one reader consumes a message meant for the other and both
-	 * desynchronise, which is the "reply id mismatch" class of failure.
-	 * send_msg refuses to send while this is set, so a violation fails
-	 * immediately at the offending call site instead of surfacing later as
-	 * timing-dependent corruption.
-	 *
-	 * The scope is one connection.  A crossload walk legitimately sends on
-	 * the destination connection while the source connection streams, and
-	 * a pipelined helper that tracks its own request ids (mkdir/setstat,
-	 * bundle-fetch) manages its own window and does not set this. */
+	/* Set while a dtree-read batch is arriving. A reply is matched to
+	 * its request by wire order, so a second request sent inside that
+	 * window would interleave the two replies and desynchronise both
+	 * readers, the "reply id mismatch" failure. send_msg refuses to send
+	 * while this is set, so the mistake fails at once at the call site.
+	 * Per connection: a crossload walk may send on the destination while
+	 * the source connection is busy, and the pipelined helpers that track
+	 * their own request ids (mkdir, setstat, bundle-fetch) do not set
+	 * it. */
 	int              reply_stream_active;
 
-	/* Set when a protocol-level violation is detected (ID mismatch,
-	 * unexpected packet type). Distinct from dead: this indicates
-	 * possible MITM attack or serious server corruption, not a simple
-	 * connection drop.  In parallel mode the orchestrator aborts the
-	 * entire transfer rather than retrying. */
+	/* Set on a protocol violation, such as a reply id mismatch or an
+	 * unexpected packet type. Unlike dead, this means a possible attack
+	 * or a corrupt server, so the parallel orchestrator aborts the whole
+	 * transfer instead of retrying. */
 	int              protocol_violation;
 
-	/* HPN: sticky "server refused with PERMISSION_DENIED" signal, set by
-	 * get_status/get_handle and read by the parallel worker's retry
-	 * deciders to set u->no_retry (a refusal is permanent).  Survives the
-	 * post-failure CLOSE; reset at each unit/batch status-read boundary.
-	 * Migrated here from struct sftp_conn. */
+	/* Sticky: the server answered PERMISSION_DENIED. Set by get_status
+	 * and get_handle, read by the parallel worker's retry decision, since
+	 * a refusal is permanent. Survives the CLOSE that follows a failure
+	 * and is cleared at each unit or batch status read. */
 	int              saw_perm_denied;
 
-	/* HPN: the refusal above was tagged by the server as a -P/-p
-	 * request-policy denial (HPN_POLICY_DENIED_TAG), not a filesystem
-	 * error, letting the bundle path abort the whole transfer.  Reset at
-	 * each bundle attempt.  Migrated here from struct sftp_conn. */
+	/* The refusal above carried the server's request-policy tag
+	 * (HPN_POLICY_DENIED_TAG), so it was a -P or -p denial rather than a
+	 * filesystem error, and the bundle path aborts the whole transfer.
+	 * Cleared at each bundle attempt. */
 	int              saw_policy_denied;
 
-	/* HPN: most recent SSH2_FXP_STATUS code seen by get_status/get_handle;
-	 * lets callers classify permanent failures.  Migrated from
-	 * struct sftp_conn. */
+	/* The last SSH2_FXP_STATUS code from get_status or get_handle, for
+	 * classifying permanent failures. */
 	u_int            last_status;
 
-	/* HPN: operator's per-user parallel-worker cap advertised by the server
-	 * in SSH2_FXP_VERSION (hpn-max-workers@hpnssh.org).  -1 = not advertised
-	 * (stock/non-HPN server); 0 = advertised with no cap; N>0 = the cap.
-	 * Migrated from struct sftp_conn. */
+	/* The server's per-user worker cap from hpn-max-workers@hpnssh.org:
+	 * -1 not advertised (a stock server), 0 advertised with no cap, else
+	 * the cap. */
 	int              hpn_max_workers_cap;
 
-	/* Incremental progress hook for the parallel orchestrator.
-	 * Updated atomically per chunk during transfer; NULL in normal
-	 * (non-parallel) mode. */
+	/* Progress hook for the parallel orchestrator, added to atomically per
+	 * completed request. NULL until installed, by the orchestrator for
+	 * its workers or by the verify repair for its meter. */
 	volatile uint64_t *live_counter;
 
-	/* Cooperative-yield hook for the parallel orchestrator's tail
-	 * redistribution (phase C).  When the detector confirms this
-	 * worker is the lagging endgame holder, the reporter sets the
-	 * flag; the range transfer loops stop issuing NEW requests/writes,
-	 * drain what is already in flight, and return with acked_out at
-	 * the yield line so the caller requeues only the untouched
-	 * remainder.  Voluntary wind-down only - never a kill; NULL in
-	 * normal (non-parallel) mode. */
+	/* Yield hook for the orchestrator's tail redistribution. When the
+	 * reporter finds this worker holding the last of the work, it sets
+	 * the flag. The range loops then stop issuing requests, drain what is
+	 * in flight and return with what was acked, so the caller requeues
+	 * only the untouched remainder. A voluntary wind-down, never a kill.
+	 * NULL outside parallel mode. */
 	volatile int *yield_flag;
 
-	/* Watchdog pause: monotonic-ms deadline before which the parallel
-	 * orchestrator's inactivity-based heuristics (born-dead, silence,
-	 * isolation, throughput-outlier, born-slow) suppress for this
-	 * worker.  The SSH-child-gone check still fires regardless.  Set by
-	 * sftp_conn_watchdog_pause() before a long non-byte-transfer
-	 * operation (verify-hash, fsync after large write, bundle
-	 * accumulate/extract, etc.), cleared by sftp_conn_watchdog_resume()
-	 * or auto-expires.  Atomic load/store; safe from any thread. */
+	/* Monotonic-ms deadline before which the watchdog's inactivity
+	 * heuristics leave this worker alone; the SSH-child-gone check still
+	 * fires. sftp_conn_watchdog_pause sets it before a long operation
+	 * that moves no bytes (a verify hash, an fsync, a bundle extract),
+	 * sftp_conn_watchdog_resume or expiry clears it. Atomic load and
+	 * store: written by the owning thread, read by the watchdog. */
 	volatile uint64_t watchdog_pause_until_ms;
 
-	/* Verify transfer state, latched from the -V flag at sftp_init
-	 * time.  Gates the inline source-hash tee (so the post-transfer verify
-	 * has a source hash) and the post-transfer integrity check itself. */
+	/* -V, latched at sftp_init. Turns on the inline source hash and the
+	 * post-transfer verify. */
 	int              verify_transfer_enabled;
 
-	/* Auto-repair (#6) settings for the single-conn (classic) verify phase,
-	 * resolved once in sftp.c from the -X VerifyRepair token (attempt cap
-	 * fixed at 3) - the conn-side analogue of the orchestrator's
-	 * p->verify_repair_{enabled,attempts}.  The shared core
-	 * (sftp_hpn_verify_repair) reads these on this path. */
+	/* Auto-repair for the single-connection verify phase, from the
+	 * -X VerifyRepair token with attempts capped at 3. The parallel
+	 * fleet keeps its own copy. sftp_hpn_verify_repair reads these. */
 	int              verify_repair_enabled;
 	int              verify_repair_attempts;
 
-	/* Classic post-transfer verify phase: the single-conn analogue of the
-	 * -j orchestrator's verify phase.  sftp_upload/sftp_download PARK each
-	 * transferred file (verify_pending); after the command's transfers
-	 * finish, sftp_conn_verify_run_phase() verifies them all and appends any
-	 * mismatch's remote path to verify_failed_paths, which
-	 * sftp_conn_drain_verify_failures() then hands to sftp.c for the run
-	 * summary + exit code.  Plain arrays (main conn is single-threaded, no
-	 * mutex) - deliberately not hpn_strlist, which lives in the parallel
-	 * module that scp does not link.  Both empty on worker conns: the
-	 * orchestrator phase verifies those. */
+	/* The single-connection verify phase. sftp_upload and sftp_download
+	 * park each transferred file here, sftp_conn_verify_run_phase
+	 * verifies them all once the command's transfers finish, and
+	 * sftp_conn_drain_verify_failures hands the mismatched remote paths
+	 * to the caller for the summary and exit code. Plain arrays, since
+	 * this connection is single threaded. Empty on worker connections,
+	 * whose files the orchestrator verifies. */
 	struct sftp_verify_pending_entry *verify_pending;
 	int              verify_pending_count;
 	int              verify_pending_cap;
 	char           **verify_failed_paths;
 	int              verify_failed_count;
 
-	/* Cumulative SFTP payload bytes that actually crossed the wire on
-	 * this connection: incremented after each successful SSH2_FXP_WRITE
-	 * send (uploads) and SSH2_FXP_DATA payload receive (downloads).
-	 * Excludes SSH framing and cipher overhead and is uncorrelated with
-	 * the worker's "work units completed" byte count, which counts the
-	 * full unit size even when chunked-resume verified the data already
-	 * matched on the remote (zero wire bytes).  Read by the parallel
-	 * orchestrator at session end to report "X resolved, Y wired" so the
-	 * throughput line reflects what actually moved, not what was visited.
-	 * Atomic add; safe from any thread. */
+	/* SFTP payload bytes that crossed the wire on this connection: WRITE
+	 * payload sent and DATA payload received, without SSH framing. A
+	 * unit's byte count can exceed it, since chunked resume skips data
+	 * the remote already has. The orchestrator reports both at the end
+	 * as resolved versus wired. Atomic add, any thread. */
 	volatile uint64_t bytes_wired_payload;
 
-	/*
-	 * Unified hash-work accounting (HPN; project_hash_work_meter_design).
-	 * Every hash phase - -Z resume check, -V verify, auto-repair - meters
-	 * in WORK-BYTES: checking one byte of overlap costs 2 (one local, one
-	 * remote), so a two-leg op's total is 2x its span and BOTH legs feed
-	 * the same monotone counter (done = leg_base + leg progress).  The
-	 * stamp is refreshed by every progress write: the watchdog's kill
-	 * classifiers treat a fresh stamp as "provably hashing", and the
-	 * reporter treats a stale one (~3s) as op-gone - engines do NOT need
-	 * exit-point discipline; the explicit end lives at unit-completion
-	 * sites.  Atomic; any thread.
-	 */
+	/* Hash work accounting for the -Z resume check, -V verify and
+	 * auto-repair, in work bytes: checking one byte costs two, one per
+	 * side, and both sides feed one monotone counter, done = leg_base +
+	 * leg progress. Every progress write refreshes the stamp. The
+	 * watchdog takes a fresh stamp as proof of hashing, and the reporter
+	 * takes one older than HASH_WORK_STALE_MS as an op that is gone, so
+	 * an engine need not mark its exit; the unit-completion sites do.
+	 * Atomic, any thread. */
 	volatile uint64_t hash_work_done;
 	volatile uint64_t hash_work_total;
 	volatile uint64_t hash_work_leg_base;
 	volatile uint64_t hash_work_stamp_ms;
 
-	/* Serial meter bridge: when registered, every progress write also
-	 * lands meter_base + done at this location, so a meter counter
-	 * advances while the single thread is blocked in an engine.
-	 * meter_base carries completed prior ops (multi-file serial verify).
-	 * Registered/cleared only by serial call sites (parallel workers run
-	 * with showprogress off and never set it). */
+	/* Serial meter bridge. When set, every progress write also stores
+	 * meter_base + done here, so a meter advances while the single thread
+	 * is inside an engine. meter_base carries the completed prior ops of
+	 * a multi-file verify. Only serial call sites set it. */
 	volatile off_t  *hash_meter_ctr;
 	volatile uint64_t hash_meter_base;
 
-	/* HPNLustreStripeCount resolved from ssh_config at sftp_init time.
-	 *   -1  : auto (use -j N as the desired count when destination is
-	 *         on Lustre and currently has stripe_count < N)
-	 *    0  : feature disabled - never call hpn-file-layout
-	 *   >0  : explicit override; ask for this stripe count when the
-	 *         destination is Lustre and currently has stripe_count <
-	 *         this value
-	 * Read by the dir-layout decision site once per transfer (top-level
-	 * destination dir). */
+	/* HPNLustreStripeCount from ssh_config: -1 auto (the -j count, when
+	 * the destination is Lustre with fewer stripes), 0 off (never call
+	 * hpn-file-layout), else the stripe count to ask for under the same
+	 * condition. Read for each directory the walk creates, until
+	 * layout_set_declined ends the calls. */
 	int              lustre_stripe_count;
 
-	/* Latched after the first non-success reply to hpn-file-layout on
-	 * this connection.  Subsequent dir-layout calls skip the wire round
-	 * trip entirely so a single declined / unsupported reply doesn't
-	 * generate per-directory log spam.  Resets when a new conn is built
-	 * (a new sftp invocation). */
+	/* Set after the first non-success reply to hpn-file-layout, so later
+	 * directories skip the round trip and the log gets one line, not one
+	 * per directory. Lives as long as the connection. */
 	int              layout_set_declined;
 
-	/* Adaptive read-ahead controller - sizes the in-flight request
-	 * window to the path BDP instead of a flat num_requests. */
+	/* Read-ahead controller. Sizes the in-flight window to the path's
+	 * BDP instead of a flat num_requests. */
 	struct sftp_rdahead rd;
 
 #ifdef HPN_FAULT_INJECTION
-	/* SFTP_FAULT_INJECT=bytes[:max_kills]   - simulates connection death.
-	 * SFTP_FAULT_PROTOCOL=bytes[:max_kills] - simulates protocol violation. */
-	/* FAULT-INJ: test-scaffolding state (sftp-fault-inject.c); inert
-	 * in normal builds. */
-	uint64_t fault_after_bytes;    /* die after N bytes sent (0=off) */
-	uint64_t fault_pv_after_bytes; /* protocol violation after N bytes (0=off) */
-	uint64_t fault_bytes_sent;     /* bytes sent so far on this connection */
-	uint64_t fault_throttle_after_bytes; /* throttle after N bytes (0=off) */
-	int      fault_throttling;     /* this conn holds a throttle slot */
-	uint64_t fault_recv_throttle_after_bytes; /* recv-throttle after N
-						    * bytes received (0=off) */
-	uint64_t fault_bytes_recvd;    /* bytes received so far on this conn */
-	int      fault_recv_throttling; /* this conn holds a recv-throttle slot */
+	/* Test scaffolding for sftp-fault-inject.c, armed from the
+	 * SFTP_FAULT_* variables its header documents. Thresholds are byte
+	 * counts, 0 for off. */
+	uint64_t fault_after_bytes;		/* die after this many sent */
+	uint64_t fault_pv_after_bytes;		/* protocol violation after */
+	uint64_t fault_bytes_sent;		/* sent so far */
+	uint64_t fault_throttle_after_bytes;	/* throttle sends after */
+	int      fault_throttling;		/* holds a throttle slot */
+	uint64_t fault_recv_throttle_after_bytes; /* throttle receives after */
+	uint64_t fault_bytes_recvd;		/* received so far */
+	int      fault_recv_throttling;		/* holds a receive slot */
 #endif
 
-	/* Verify transfer (1b): inline source-hash accumulator.  When the
-	 * upload computes the source XXH3 as it reads (post-transfer verify
-	 * enabled, whole-file upload), the result lands here so the verify
-	 * step consumes it instead of re-reading the source.  state is the
-	 * streaming XXH3 handle (void* to keep this header xxhash-free; NULL
-	 * when inactive); valid is set once finished cleanly. */
+	/* Inline source hash for verify transfer. A whole-file upload hashes
+	 * the source as it reads, so the verify step need not read it again.
+	 * state is the streaming XXH3 handle, void so this header stays free
+	 * of xxhash, NULL when idle. valid is set on a clean finish, failed
+	 * when an update errored, which discards the result. */
 	void     *verify_src_state;
 	uint64_t  verify_src_bytes;
 	uint64_t  verify_src_hash;
 	int       verify_src_valid;
 	int       verify_src_failed;
 
-	/* Adaptive upload pacing: ack-rate-driven issue ceiling.  WRITE
-	 * status returns arrive at the receiver's true sustained drain rate
-	 * (~1 RTT delayed); pacing sends to slightly above that rate keeps
-	 * the destination's page cache out of the dirty-limit cliff that
-	 * otherwise collapses single-stream high-RTT uploads into a
-	 * stall/recover duty cycle.  See sftp_conn_pace_ack() for the
-	 * control law; state is per-connection (per-worker in parallel
-	 * mode).  bw is the reused -l token bucket (struct bwlimit),
-	 * allocated on first activation. */
-	struct {
-		int      enabled;      /* -X Pacing=no clears (default on) */
-		int      active;       /* grace passed; limiter engaged */
-		uint64_t acks;         /* WRITE acks seen (startup grace) */
-		uint64_t first_ack_ms; /* monotime_ms of first ack */
-		uint64_t bucket_bytes; /* acked bytes in current bucket */
-		uint64_t bucket_start_ms; /* monotime_ms the bucket opened */
-		/* Sliding window of per-second delivered rates (bytes/sec);
-		 * the ceiling is 125% of the mean of these, so stall
-		 * seconds pull the estimate toward the sink's sustained
-		 * rate.  Samples during slow-start are excised. */
-		uint64_t rate_ring[PACE_RING];
-		u_int    ring_idx;
-		uint64_t last_arm_ms;  /* monotime_ms of last actuator arm */
-		uint64_t bw_rate_bits; /* programmed actuator rate, bits/s */
-		uint64_t reclaim_bytes; /* last ceiling armed while rising;
-		                         * post-famine reclaim target */
-		struct bwlimit *bw;    /* actuator; NULL until activated */
-	} pace;
-
-	/* Serial-path bundling configuration (HPNUseBundle, HPNBundleSize,
-	 * HPNWriterPool - resolved from ssh_config by the client program
-	 * via sftp_conn_set_bundle_config).  Mirrors the parallel
-	 * planner's pcfg fields so both modes obey the same knobs.
-	 * server_cant latches after a SERVER_CANT bundle result: the
-	 * session stops offering bundles and drives files individually. */
-	struct {
-		int      use;         /* HPNUseBundle; default 1 */
-		int      writer_pool; /* HPNWriterPool; default 1 */
-		uint64_t size;        /* HPNBundleSize bytes; 0 = default */
-		int      server_cant; /* latched: server refused a bundle */
-	} bundle_cfg;
+	struct sftp_hpn_pace pace;		/* adaptive upload pacing */
+	struct sftp_hpn_bundle_cfg bundle_cfg;	/* serial bundling settings */
 };
 
-/*
- * Serial-path bundle accumulator: the recursive upload walk in
- * sftp-client.c collects bundle-eligible small files here and ships
- * each batch as one hpn-bundle stream on the session connection.
- * Implementation in sftp-hpn-client.c; eligibility policy shared with
- * the parallel planner via sftp-hpn-bundle.h.
- */
+/* Serial-path bundle accumulator. The serial walks collect bundle-eligible
+ * small files here and ship each batch on the session connection, as one
+ * hpn-bundle stream for an upload or one hpn-bundle-fetch request for a
+ * download. Implemented in sftp-hpn-client.c, with the eligibility policy
+ * shared with the parallel planner through sftp-hpn-bundle.h. */
 struct sftp_hpn_bundle_acc {
 	char **src_paths;	/* upload: local; download: remote */
 	char **dst_paths;	/* upload: remote; download: local */
-	off_t *sizes;		/* per-member bytes, for TransferLog */
+	/* Per-member file bytes, for the log and the meter. */
+	off_t *sizes;
 	int nmembers;
 	int members_alloc;
-	uint64_t bytes;		/* accumulated FRAMED bytes (header+path+
-				 * payload per member, matching the
-				 * parallel producer's accounting) */
+	/* Framed bytes so far: header, path and payload per member, the
+	 * same accounting as the parallel producer. */
+	uint64_t bytes;
 	uint64_t path_bytes;	/* download only: fetch-request path cost */
 	uint64_t target;	/* flush threshold (HPNBundleSize) */
-	int is_download;
+	int is_download;	/* selects the fetch request over the stream */
+	/* 0 when this walk cannot bundle: bundling is off, the server refused
+	 * a bundle earlier, the walk is a resume, or the server lacks the
+	 * direction's extension. Every file then goes individually. */
 	int enabled;
 };
 
-/*
- * Shared directory handling for the recursive transfer walks (serial
- * AND parallel-producer; one implementation - the hand-copied versions
- * measurably diverged).  ensure_* creates the destination directory
- * (remote for uploads, local for downloads).
+/* Deferred directory attributes for the recursive transfer walks, one
+ * implementation for serial and parallel. A directory is created with the
+ * owner write and execute bits forced on and its final attrs are queued
+ * here, then applied only after all file content has landed: at the end
+ * of sftp_upload_dir, sftp_download_dir and sftp_crossload_dir for serial,
+ * and of sftp_parallel_wait for parallel. Stock OpenSSH sets a
+ * directory's final mode after its files are written; bundling delivers a
+ * directory's files at a later flush, and bundles span directories, so
+ * the end of the transfer is the first point every directory is known to
+ * be complete. sftp_hpn_dirattrs_apply orders the list deepest first.
  *
- * Directory ATTRIBUTE application (setstat / utimes+chmod) is DEFERRED
- * to restore stock OpenSSH's perms-AFTER-data ordering, which small-file
- * bundling broke.  Stock applies a directory's final mode after its
- * files are uploaded, so a restrictive mode (e.g. 0555) is set only
- * once the directory no longer needs writing into.  Bundling accumulates
- * files and writes them LATER at bundle flush, so an inline setstat ran
- * perms-BEFORE-data and could lose files under -p into a read-only
- * directory.  The walk records each directory here and the owner applies
- * the list only after all file content has landed:
- *   serial:   end of sftp_upload_dir / sftp_download_dir.
- *   parallel: end of sftp_parallel_wait, after every unit has drained.
- *
- * Applied at END OF TRANSFER, not per-directory: bundles span directory
- * boundaries, so a directory's files are not guaranteed written when the
- * walk leaves it - only after the final flush.  Tradeoffs (accepted,
- * bounded, never data-loss): the list costs one entry per directory for
- * the whole transfer (memory on pathological million-dir trees), and an
- * interrupted transfer leaves directories with the temporary writable
- * perms until a re-run completes.  Files need no such deferral - they
- * are written through an open fd and fchmod'd last, so the parent-dir
- * write check at create time is the only ordering hazard.  See
- * hpn-serial-bundling-design.md section 9 for the full rationale and the
- * per-bundle-completion mitigation if the tradeoffs ever bite.
- */
+ * The accepted costs: one entry per directory for the whole transfer, and
+ * an interrupted transfer leaves directories with the widened mode until
+ * a re-run completes. Files need no deferral, since they are written
+ * through an open fd and fchmod'd last. */
 struct sftp_hpn_dirattr {
 	char   *path;
-	Attrib  attrs;      /* desired final attrs (remote) */
-	mode_t  mode;       /* desired final mode (local) */
-	int     is_local;   /* 0: remote setstat; 1: local utimes+chmod */
-	int     set_times;  /* local: dirattrib had ACMODTIME */
-	int64_t atime, mtime;
+	Attrib  attrs;		/* remote: the final attrs for setstat */
+	mode_t  mode;		/* local: final mode, (mode_t)-1 for no chmod */
+	int     is_local;	/* 0 remote setstat, 1 local chmod and utimes */
+	int     set_times;	/* local: the source sent ACMODTIME */
+	time_t  atime, mtime;	/* local: the times to set when set_times */
 };
 
+/* The deferred entries of one transfer, applied and freed by the owner. */
 struct sftp_hpn_dirattr_list {
 	struct sftp_hpn_dirattr *entries;
 	int nentries;
 	int entries_alloc;
 };
 
-struct sftp_conn;
-/* Normalise a local stat into the attrs a directory should be created with:
- * no size, no owner, mode bits only, timestamps under -p alone. */
+/* Per-mode callbacks for the download walks, sftp_tree_download_consume
+ * and sftp_readdir_download_consume. The pattern, and how a callback
+ * recovers its context, is described on struct sftp_upload_sink below.
+ * Downloads create local directories one at a time, so make_dir both
+ * creates and defers attrs, and they add two optional callbacks and the
+ * streams_files flag. */
+struct sftp_tree_dl_sink {
+	/* Create local directory dst for a directory entry and defer its
+	 * attrs. src, the remote path, is for messages. 0, or -1 after
+	 * recording the failure. */
+	int  (*make_dir)(struct sftp_tree_dl_sink *sink, const char *src,
+	         const char *dst, const Attrib *attrs);
+	/* Transfer regular file src to dst. 0 or -1. */
+	int  (*xfer_file)(struct sftp_tree_dl_sink *sink, const char *src,
+	         const char *dst, Attrib *attrs);
+	/* Record a per-entry failure. reason is a static string. */
+	void (*fail)(struct sftp_tree_dl_sink *sink, const char *path,
+	         const char *reason);
+	/* True when the walk should stop: interrupt or fleet abort. */
+	int  (*aborting)(struct sftp_tree_dl_sink *sink);
+	/* Optional. Print a one-line notice: a batch of the file list is
+	 * being fetched, or an interrupt is waiting for one to drain. Serial
+	 * prints above the meter. NULL keeps a sink's output unchanged. */
+	void (*notice)(struct sftp_tree_dl_sink *sink, const char *text);
+	/* Optional. Take the total bytes and file count once the walk ends,
+	 * so an aggregate meter can show a percentage and ETA. Only the
+	 * parallel sink has one. The readdir fallback never calls it. */
+	void (*set_total)(struct sftp_tree_dl_sink *sink, off_t total_bytes,
+	    size_t nfiles);
+	/* Set when xfer_file may run while a batch is still arriving, so
+	 * transfer overlaps discovery and the driver keeps no queue. Legal
+	 * only when xfer_file sends nothing on the connection carrying the
+	 * reply; reply_stream_active makes a violation fatal at once. Only
+	 * parallel qualifies, since submitting just enqueues work. Serial
+	 * and crossload transfer on that connection and keep the per-batch
+	 * queue. */
+	int streams_files;
+};
+
+/* Per-mode callbacks for the shared upload driver, sftp_upload_walk_consume.
+ * The driver does what serial and parallel uploads share: walk the local
+ * directory, batch-create the subdirectories on the control connection,
+ * recurse. What differs by mode goes through these callbacks: how a file
+ * is transferred (serial bundles it or calls sftp_upload, parallel submits
+ * it to the fleet) and the per-directory bookkeeping (progress, Lustre
+ * layout, worker phases, the deferred-attrs list, failures, aborts). A mode
+ * flag would not do, because the two implementations live in different
+ * files and call file-local functions the driver cannot see.
+ *
+ * Each mode embeds this struct as the first member of its own context
+ * (serial_ul_sink, parallel_ul_sink), which also holds its connection,
+ * accumulator or fleet, and flags. The driver holds only the base pointer;
+ * a callback casts it back to the full context, which is safe because the
+ * two share an address. struct sftp_tree_dl_sink is the download twin. */
+struct sftp_upload_sink {
+	/* Once per directory, after its attrs are known and before it is
+	 * enumerated. Serial prints "Entering src"; parallel applies the
+	 * Lustre layout to dst and enters the enumerate phase. */
+	void (*enter_dir)(struct sftp_upload_sink *sink, const char *src,
+	         const char *dst);
+	/* Transfer regular local file src to dst. src_sb is its stat. 0 or
+	 * -1. */
+	int  (*xfer_file)(struct sftp_upload_sink *sink, const char *src,
+	         const char *dst, const struct stat *src_sb);
+	/* Before the pipelined mkdir batch. Parallel enters the mkdir phase. */
+	void (*before_mkdir)(struct sftp_upload_sink *sink);
+	/* Defer this directory's final remote attrs. The driver applies the
+	 * created-or-preserve gate, so a call here means they are wanted. */
+	void (*defer_dir)(struct sftp_upload_sink *sink, const char *dst,
+	         const Attrib *attrs);
+	/* Record a per-entry failure. reason is a short message the sink
+	 * must use at once, since it may be strerror's buffer. */
+	void (*fail)(struct sftp_upload_sink *sink, const char *path,
+	         const char *reason);
+	/* True when the walk should stop: interrupt or fleet abort. */
+	int  (*aborting)(struct sftp_upload_sink *sink);
+};
+
+/* Directory handling shared by the serial and parallel walks. The
+ * definitions in sftp-hpn-client.c carry the detail. */
 void sftp_hpn_dir_attrs_from_stat(const struct stat *sb, int preserve_flag,
     Attrib *out);
 int  sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
@@ -441,273 +491,53 @@ void sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
     struct sftp_hpn_dirattr_list *dl);
 void sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl);
 
-/*
- * struct sftp_tree_dl_sink is the per-mode callback set for the download walk.
- * It uses the same callback-table pattern documented on struct
- * sftp_upload_sink below. That comment explains why the driver cannot branch
- * on a mode flag and how a callback recovers its context. The download
- * differences are:
- *
- *   - It drives downloads. Both sftp_tree_download_consume (the chunked
- *     tree walk) and sftp_readdir_download_consume (the recursive readdir
- *     fallback) use it.
- *   - Local directories are created one at a time with a cheap mkdir, so a
- *     single make_dir callback both creates the directory and defers its
- *     attrs. There is no batch-create or before_mkdir step like upload has.
- *   - The plug-in points are make_dir, xfer_file (download or bundle-fetch
- *     versus submit to the fleet), fail, aborting and the optional notice.
- */
-struct sftp_tree_dl_sink {
-	/* Create the local directory dst for a dir entry (remote path src,
-	 * attrs) and defer its attributes; src is for progress output only.
-	 * Returns 0, or -1 (having recorded failure). */
-	int  (*make_dir)(struct sftp_tree_dl_sink *sink, const char *src,
-	         const char *dst, Attrib *attrs);
-	/* Transfer regular file src -> dst (attrs).  Returns 0 or -1. */
-	int  (*xfer_file)(struct sftp_tree_dl_sink *sink, const char *src,
-	         const char *dst, Attrib *attrs);
-	/* Record a per-entry failure (reason is a short static string). */
-	void (*fail)(struct sftp_tree_dl_sink *sink, const char *path,
-	         const char *reason);
-	/* True when the walk should stop (interrupt / fleet abort). */
-	int  (*aborting)(struct sftp_tree_dl_sink *sink);
-	/* Optional. Show the user a one-line notice about the walk: that a
-	 * batch of the file list is being fetched, during which the transfer
-	 * pauses, or that an interrupt is waiting for the current batch to
-	 * drain. The serial sink prints it above the meter. NULL for sinks
-	 * whose output should not change (parallel, crossload). */
-	void (*notice)(struct sftp_tree_dl_sink *sink, const char *text);
-	/* Optional.  Once the walk has reached END, report the enumerated
-	 * total bytes and file count so an aggregate meter can
-	 * switch from rate-only to a real percentage and ETA (and rewrite a
-	 * deferred-count label).  NULL for sinks with no such meter (serial
-	 * per-file, crossload); the readdir fallback has no complete total
-	 * and never calls it. */
-	void (*set_total)(struct sftp_tree_dl_sink *sink, off_t total_bytes,
-	    size_t nfiles);
-	/* Set when xfer_file may be called during a read rather than after
-	 * the batch, so discovery and transfer overlap. The driver keeps no
-	 * files[] queue, and the parallel fleet holds only its bounded window
-	 * of pending work (sftp_parallel_await_capacity). This is only legal
-	 * when xfer_file sends nothing on the connection carrying the reply.
-	 * reply_stream_active turns a violation into an immediate failure.
-	 *
-	 * The parallel download sink qualifies because it only enqueues work
-	 * for the fleet. Serial does not, because it downloads on this very
-	 * connection. Neither does crossload, which reads from the source
-	 * connection, the one carrying the reply. Both leave this clear and
-	 * keep the per-batch queue. */
-	int streams_files;
-};
-
-/* Walk the remote subtree at src through the chunked tree walk and replay
- * each entry through sink as it arrives. dst and every listed directory
- * are created inline. Regular files go to the sink as they arrive if it
- * streams, and otherwise are queued and transferred once the batch ends,
- * because a transfer issued mid-batch would collide with the dtree-read
- * reply on the control connection. Symlinks and other non-regular entries
- * are skipped and ERROR records are reported. dirattrib is the root's
- * attrs, or NULL to stat it. Returns 0, or -1 if any entry failed. */
+/* The shared walk drivers. Each replays a tree through the sink it is
+ * given and returns 0, or -1 if any entry failed. The download drivers
+ * take the root's attrs in dirattrib, or NULL to stat it; the readdir
+ * fallback serves servers without the tree walk. The upload driver
+ * expects dst to exist and recurses with each child's created flag. */
 int  sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, Attrib *dirattrib, int follow_link_flag,
     struct sftp_tree_dl_sink *sink);
-
-/* Fallback recursive readdir download driver, used when the server lacks
- * the tree walk. Enumerates src one directory at a time via sftp_readdir
- * and replays each entry through the same sink as sftp_tree_download_consume.
- * Recursive (calls itself per subdirectory); max_depth caps the recursion and
- * follow_link_flag is the caller's, which scp sets. Returns 0, or -1 if any
- * entry failed. */
 int  sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
     const char *dst, int depth, int max_depth, Attrib *dirattrib,
     int follow_link_flag, struct sftp_tree_dl_sink *sink);
-
-struct stat;
-
-/*
- * struct sftp_upload_sink is the small set of per-mode callbacks the shared
- * upload driver calls out to.
- *
- * sftp_upload_walk_consume() below does everything the serial and parallel
- * uploads do the same way. It walks the local directory, collects
- * subdirectories, batch-creates them on the control connection, and recurses.
- * A few steps differ by mode. A file is transferred differently (serial
- * bundles it or calls sftp_upload, parallel submits it to the worker fleet),
- * and the per-directory bookkeeping differs (progress print, Lustre layout,
- * worker phases, which deferred-attrs list to use, how to record a failure,
- * how to detect an abort).
- *
- * The driver cannot just branch on a mode flag. The serial and parallel
- * implementations live in different files and call file-local functions the
- * driver cannot see. So each mode hands those steps to the driver as the
- * callbacks in this struct.
- *
- * A mode embeds this struct as the first member of its own context struct
- * (serial_ul_sink or parallel_ul_sink). That context also carries the mode's
- * data, such as the connection, bundle accumulator, worker set, and flags.
- * The driver only ever holds a struct sftp_upload_sink pointer. Each callback
- * casts that pointer back to the full context struct to reach its own data.
- * The cast is safe because base is the first member, so the two share an
- * address. sftp_tree_dl_sink is the download twin.
- */
-struct sftp_upload_sink {
-	/* Once per directory, after its attrs are known and before its
-	 * contents are enumerated: serial prints "Entering src"; parallel
-	 * applies the Lustre layout to dst and enters the enumerate phase. */
-	void (*enter_dir)(struct sftp_upload_sink *sink, const char *src,
-	         const char *dst);
-	/* Transfer a regular local file src -> dst (src_sb is src's local
-	 * stat).  0 or -1. */
-	int  (*xfer_file)(struct sftp_upload_sink *sink, const char *src,
-	         const char *dst, const struct stat *src_sb);
-	/* Before the pipelined mkdir batch (parallel enters the mkdir phase). */
-	void (*before_mkdir)(struct sftp_upload_sink *sink);
-	/* Defer this directory's final remote attrs. The driver applies the
-	 * created-or-preserve gate, so a call here means they are wanted. */
-	void (*defer_dir)(struct sftp_upload_sink *sink, const char *dst,
-	         const Attrib *attrs);
-	/* Record a per-entry failure (reason a short static string). */
-	void (*fail)(struct sftp_upload_sink *sink, const char *path,
-	         const char *reason);
-	/* True when the walk should stop (interrupt / fleet abort). */
-	int  (*aborting)(struct sftp_upload_sink *sink);
-};
-
-/*
- * Enumerate the local subtree at src, hand files to sink, batch-create the
- * discovered subdirectories on the control connection, and recurse (each
- * child gets its mkdir "created" flag).  dst must already exist (the caller
- * creates the root; each level creates its children).  Returns 0, or -1 if
- * any entry failed.
- */
 int  sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
     const char *dst, int depth, int max_depth, int created, int preserve_flag,
     int follow_link_flag, struct sftp_upload_sink *sink);
 
+/* Serial bundle accumulator, see struct sftp_hpn_bundle_acc. */
 void sftp_hpn_bundle_acc_init(struct sftp_hpn_bundle_acc *acc,
     struct sftp_conn *conn, int resume, int is_download);
-int sftp_hpn_bundle_acc_eligible(const struct sftp_hpn_bundle_acc *acc,
+int  sftp_hpn_bundle_acc_eligible(const struct sftp_hpn_bundle_acc *acc,
     uint64_t size);
-int sftp_hpn_bundle_acc_add(struct sftp_hpn_bundle_acc *acc,
+int  sftp_hpn_bundle_acc_add(struct sftp_hpn_bundle_acc *acc,
     const char *src, const char *dst, off_t size);
-int sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
+int  sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
     struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
     int verify, int fsync_flag, int inplace_flag);
 void sftp_hpn_bundle_acc_free(struct sftp_hpn_bundle_acc *acc);
 
-/*
- * Verify transfer (1b) inline source-hash accumulator (sftp-hpn-verify.c).
- * arm:     begin a streaming XXH3 over the source bytes.
- * feed:    add bytes as the source is read so the hash reflects the
- *          on-disk source.
- * finish:  digest + mark valid; frees the streaming state.
- * dispose: abort with no result (partial/failed transfer); frees the state.
- * take:    consume the result iff it covers expect_bytes; 0 + *hash_out on
- *          success, -1 otherwise (caller re-reads the source).
- * All are no-ops when not armed / hpn==NULL.
- */
-void sftp_hpn_src_arm(struct sftp_hpn_conn *hpn);
-void sftp_hpn_src_feed(struct sftp_hpn_conn *hpn, const u_char *buf, size_t len);
-void sftp_hpn_src_finish(struct sftp_hpn_conn *hpn);
-void sftp_hpn_src_dispose(struct sftp_hpn_conn *hpn);
-int  sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
-	uint64_t *hash_out);
-
-/* Allocate and initialise a zeroed sftp_hpn_conn. Never returns NULL. */
+/* Allocate a zeroed sftp_hpn_conn with its option defaults set. Dies
+ * rather than return NULL. */
 struct sftp_hpn_conn *sftp_hpn_conn_init(void);
 
-/* Free an sftp_hpn_conn.  Safe to call with NULL. */
+/* Free an sftp_hpn_conn. NULL is fine. */
 void sftp_hpn_conn_free(struct sftp_hpn_conn *);
 
-/* Adaptive upload pacing master switch, the -X Pacing= option, consulted
- * at conn init. The per-connection entry points are declared in
- * sftp-client-internal.h. */
+/* The -X Pacing= switch, applied to each new connection. The
+ * per-connection pacing entry points are in sftp-client-internal.h. */
 void sftp_hpn_pace_set_enabled(int on);
 
-/*
- * Wedge-detection threshold (seconds).  A STATUS read that blocks longer
- * than this is treated as evidence the path is wedged: the caller invokes
- * sftp_conn_rdahead_backpressure_signal() and the controller multiplicatively
- * decreases `cur` (analogous to TCP cwnd /= 2 on RTO).
- *
- * 10 s catches every wedge the 2026-05-30 campaign captured (all blocked
- * > 90 s) while being above the 3–8 s STATUS latencies legitimately
- * produced by Lustre OST contention.  Without this signal the grow-only
- * controller settles high and never recovers when conditions degrade
- * mid-transfer; see [[bundle-inflight-backpressure]] in project memory.
- *
- * NB: this whole layer is application-level congestion control on top of
- * TCP's, because the SFTP client can't see the SSH transport socket's
- * TCP_INFO from across the hpnssh-subprocess boundary.  See
- * [[hpn-code-organization-vision]] and [[post-18-10-tcp-info-self-monitor]]
- * for the architectural direction (TCP_INFO integration) that would
- * eventually subsume this.
- *
- * Used by: do_upload_body, sftp_upload_range, bundle_drain_n.
- */
-#define RDAHEAD_BP_THRESHOLD_SEC  10.0
-
-/*
- * Part D - persistent-degradation reap thresholds.  When the controller
- * has been forced to floor by repeated backpressure events (TCP wedge,
- * sustained server slowdown, etc.) and isn't recovering, mark the
- * connection dead so the orchestrator can replace it with a fresh TCP
- * session.  Either threshold suffices:
- *
- *   _BP_COUNT      consecutive backpressure events while cur==floor
- *   _SEC           total wallclock time spent at floor in this run
- *
- * Chosen values are deliberately conservative - the goal is to give a
- * truly-broken connection a way out without thrashing legitimate
- * transient slowdowns.  5 events of Part B firing at floor is well past
- * what any healthy path produces; 60 s at floor without recovery means
- * the floor-doubling probes (Part C) haven't found any headroom either.
- *
- * The reap signal itself feeds the existing orchestrator respawn
- * machinery (cooldowns, total_respawns, BORN_SLOW budgets) - Part D
- * adds a trigger, not a parallel respawn path.  See the design
- * discussion at reporter_dispatch_respawns in sftp-parallel.c for why
- * thrash protection stays session-wide for now.
- */
-#define RDAHEAD_REAP_BP_COUNT   5
-#define RDAHEAD_REAP_FLOOR_SEC  60.0
-
-
-
-/* ── hpn-file-layout@hpnssh.org client helper (EXPERIMENTAL) ─────────────
- *
- * Ask the server to set a Lustre stripe count on `path` (must be an
- * existing directory).  Subsequent file creations in that directory
- * inherit the layout - including files unpacked from a bundle stream.
- *
- * Returns one of HPN_FILE_LAYOUT_OK / _NOT_FS / _PERM / _FAIL.  The caller
- * is responsible for:
- *   - gating on sftp_conn_has_file_layout(conn) before calling
- *   - gating on sftp_conn_layout_set_declined(conn) - a previous
- *     non-success reply latches that flag and subsequent calls should
- *     skip the wire round trip
- *   - latching the flag via sftp_conn_set_layout_set_declined(conn, 1)
- *     on any non-OK reply so future calls short-circuit
- *
- * `*applied_out`, if non-NULL, is set to the stripe count the server
- * reported applying (may be silently clamped by Lustre below the
- * requested value if the filesystem has fewer OSTs).
- */
-int sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
+/* Ask the server to set a Lustre layout on the directory at path:
+ * stripe_count stripes, with files below small_threshold kept on one.
+ * Returns HPN_FILE_LAYOUT_OK, _NOT_FS, _PERM or _FAIL and reports what was
+ * applied through applied_out and layout_kind_out. The caller,
+ * sftp-lustre-client.c, gates on sftp_conn_has_file_layout and
+ * sftp_conn_layout_set_declined and latches the latter after a refusal.
+ * Experimental, and shaped so other parallel filesystems could use it. */
+int  sftp_hpn_set_file_layout(struct sftp_conn *conn, const char *path,
     uint32_t stripe_count, uint32_t small_threshold, uint32_t *applied_out,
     uint32_t *layout_kind_out);
 
-/*
- * Compute XXH3_64bits over bytes [offset, offset+length) of the open fd.
- * Seeks before reading; the fd's position after return is undefined (the
- * caller is expected to lseek again before any subsequent read/write).
- * Returns 0 on success and writes the hash to *hash_out; -1 on any I/O
- * or hash-state error.
- */
-
-
-
-
-#include "sftp-hpn-verify.h"
-
-#endif /* _SFTP_CLIENT_HPN_H */
+#endif /* _SFTP_HPN_CLIENT_H */

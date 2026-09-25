@@ -241,7 +241,7 @@ sftp_parallel_upload_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
  * the transfer. */
 static int
 parallel_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
-    const char *dst, Attrib *attrs)
+    const char *dst, const Attrib *attrs)
 {
 	struct parallel_dl_sink	*ctx = (struct parallel_dl_sink *)sink;
 	mode_t			 mode, tmpmode;

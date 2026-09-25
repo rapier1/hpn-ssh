@@ -18,7 +18,6 @@
 
 /*
  * sftp-hpn-verify.h - client-side verification / verified-resume API.
- * Chained from sftp-hpn-client.h so existing consumers see no change.
  */
 
 #ifndef SFTP_HPN_VERIFY_H
@@ -43,6 +42,7 @@ struct sftp_hash_range {
 };
 
 struct sftp_conn;
+struct sftp_hpn_conn;
 
 /*
  * Ask the server to XXH3 each (off, len) range of `path` and write the N
@@ -184,5 +184,18 @@ int sftp_hpn_verify_repair(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, int local_is_target, off_t off, off_t len,
     int have_local_hash, uint64_t local_hash,
     int repair_enabled, int max_attempts, int *repaired_out);
+
+/* Inline source hash for verify transfer, on the verify_src_* state of
+ * struct sftp_hpn_conn. arm starts a streaming XXH3, feed adds bytes as
+ * the source is read, finish digests, dispose abandons a partial result,
+ * and take returns the hash if it covers expect_bytes. All are no-ops
+ * when not armed or hpn is NULL. */
+void sftp_hpn_src_arm(struct sftp_hpn_conn *hpn);
+void sftp_hpn_src_feed(struct sftp_hpn_conn *hpn, const u_char *buf,
+    size_t len);
+void sftp_hpn_src_finish(struct sftp_hpn_conn *hpn);
+void sftp_hpn_src_dispose(struct sftp_hpn_conn *hpn);
+int  sftp_hpn_src_take(struct sftp_hpn_conn *hpn, uint64_t expect_bytes,
+    uint64_t *hash_out);
 
 #endif /* SFTP_HPN_VERIFY_H */

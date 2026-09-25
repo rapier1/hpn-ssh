@@ -25,6 +25,9 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifndef SFTP_COMMON_H
+#define SFTP_COMMON_H
+
 /* Maximum packet that we are willing to send/accept */
 #define SFTP_MAX_MSG_LENGTH	(256 * 1024)
 
@@ -51,3 +54,5 @@ char	*ls_file(const char *, const struct stat *, int, int,
     const char *, const char *);
 
 const char *fx2txt(int);
+
+#endif /* SFTP_COMMON_H */

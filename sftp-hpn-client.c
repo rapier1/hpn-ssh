@@ -57,6 +57,7 @@
 /* hpn-file-layout wire format and status codes */
 #include "sftp-hpn-server.h"
 #include "sftp-hpn-client.h"
+#include "sftp-hpn-verify.h"	/* sftp_hpn_src_dispose */
 #include "sftp-hpn-tree.h"	/* tree walk and record codec */
 #include "hpn-meter.h"	/* progress meter core */
 #include "sftp-hpn-bundle.h"  /* bundle flags and eligibility policy */
@@ -476,7 +477,7 @@ sftp_conn_rdahead_backpressure_signal(struct sftp_conn *conn)
 		if (rd->consecutive_bp_at_floor >= RDAHEAD_REAP_BP_COUNT ||
 		    (now - rd->time_first_at_floor) > RDAHEAD_REAP_FLOOR_SEC) {
 			debug_f("rdahead: connection persistently degraded "
-			    "(bp_at_floor=%u floor_for=%.1fs); marking dead "
+			    "(bp_at_floor=%d floor_for=%.1fs); marking dead "
 			    "for orchestrator respawn",
 			    rd->consecutive_bp_at_floor,
 			    now - rd->time_first_at_floor);
@@ -1712,7 +1713,9 @@ sftp_hpn_dirattrs_defer_remote(struct sftp_hpn_dirattr_list *dl,
  * those files updates the directory's modification time, overwriting
  * any time set earlier. Because bundles can deliver a directory's files
  * after the walk has moved past it, the end of the transfer is the first
- * point at which every directory is known to be complete.
+ * point at which every directory is known to be complete. The list, its
+ * apply points and its costs are described at struct sftp_hpn_dirattr in
+ * sftp-hpn-client.h.
  *
  * The mode is stored only when it differs from the mode the directory
  * was created with. (mode_t)-1 means no chmod is needed. */

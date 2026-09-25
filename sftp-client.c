@@ -54,6 +54,7 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-hpn-client.h" /* HPN */
+#include "sftp-hpn-verify.h" /* chunked resume and verify helpers */
 #include "sftp-hpn-server.h" /* hpn-check-file + heartbeat protocol constants */
 #include "sftp-hpn-tree.h"	/* tree walk extension names */
 #include "hpn-meter.h"	/* progress meter core */
@@ -2628,7 +2629,7 @@ struct serial_dl_sink {
 
 static int
 serial_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
-    const char *dst, Attrib *attrs)
+    const char *dst, const Attrib *attrs)
 {
 	struct serial_dl_sink	*ctx = (struct serial_dl_sink *)sink;
 	mode_t			 mode, tmpmode;
@@ -5136,7 +5137,7 @@ struct crossload_sink {
 
 static int
 crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
-    Attrib *attrs)
+    const Attrib *attrs)
 {
 	struct crossload_sink	*ctx = (struct crossload_sink *)sink;
 	Attrib		 curdir = *attrs;
