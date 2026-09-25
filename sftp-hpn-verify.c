@@ -16,18 +16,12 @@
  *
  */
 
-/*
- * sftp-hpn-verify.c - client-side verification and verified resume for
+/* sftp-hpn-verify.c - client-side verification and verified resume for
  * HPN-SSH: local XXH3 hashing (whole-file and per-range), the remote
  * hash extensions (hpn-check-file, sftp-hash-range) with their
- * heartbeat/progress stall detection, post-transfer verification, and
- * the chunked verified-resume orchestration for reput/reget.
- *
- * This file is the landing zone for future verify work: parallel hole
- * refill (feed missing-chunk runs to the range machinery), chunk-
- * parallel server hashing, and streaming verify.  See the project
- * notes for the cost taxonomy (avoid / parallelize / overlap).
- */
+ * heartbeat and progress stall detection, post-transfer verification
+ * with auto-repair, and the chunked verified resume behind reput and
+ * reget. */
 
 #include "includes.h"
 
@@ -36,7 +30,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,11 +49,7 @@
 #include "sftp-hpn-verify.h"
 #include "sftp-hpn-verify-hash.h"	/* fsync+O_DIRECT on-disk read-back hashing */
 #include "sftp-hpn-server.h"	/* heartbeat protocol + wire-name macros */
-/* verify_run_phase (moved from sftp-client.c) drives the progress meter,
- * status frames, and the transfer log: */
-#include "progressmeter.h"
-#include "hpn-meter.h"	/* progress meter core */
-#include "hpn-status-frame.h"
+#include "hpn-meter.h"		/* the verify phase's progress meter */
 #include "sftp-hpn-transferlog.h"
 
 #define XXH_INLINE_ALL
@@ -95,9 +84,6 @@ static int sftp_hpn_hash_remote_ranges(struct sftp_conn *conn,
     u_int64_t *hashes_out);
 
 #define HASH_RANGE_READ_BUF_LEN	65536U
-
-#include "sftp.h"
-#include "sftp-client-internal.h"
 
 /*
  * Tunables for chunked resume.  Defaults chosen per the locked design
