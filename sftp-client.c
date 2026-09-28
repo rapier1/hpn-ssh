@@ -2144,9 +2144,6 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					goto resume_fail;
 				}
 
-				uint64_t local_hash, remote_hash;
-				int lret, rret;
-
 				/*
 				 * Option A: equal size does NOT imply equal
 				 * content.  A range-split download pre-creates
@@ -2157,25 +2154,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * and re-download.  Closes the crash-resume
 				 * sparse-hole corruption gap.
 				 */
-				/*
-				 * Always strict: hash both ends off the platter
-				 * and compare; equal size never implies equal
-				 * content.  STRICT is always sent so a pre-Phase-1
-				 * server still hashes instead of returning the
-				 * (removed) fully-allocated sentinel.
-				 */
-				sftp_conn_watchdog_pause(conn,
-				    HPN_HEARTBEAT_REFRESH_SEC);
-				/* hash-work op: remote leg first here */
-				sftp_conn_hash_op_begin(conn, 2 * size);
-				rret = sftp_hpn_hash_remote_file(conn,
-				    remote_path, size, &remote_hash);
-				sftp_conn_hash_op_leg(conn, size);
-				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
-				    size, &local_hash);
-				sftp_conn_watchdog_resume(conn);
-				if (lret == 0 && rret == 0 &&
-				    local_hash == remote_hash) {
+				int match = sftp_hpn_prefix_match(conn,
+				    local_fd, remote_path, size);
+
+				if (match == 1) {
 					debug("verified transfer: "
 					    "full-file hash match, "
 					    "\"%s\" already complete",
@@ -2184,8 +2166,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					goto resume_fail;
 				}
 				debug("verified transfer: same size "
-				    "but hash mismatch for \"%s\"; "
+				    "but hash %s for \"%s\"; "
 				    "re-downloading from scratch",
+				    match == 0 ? "mismatch" : "failed",
 				    local_path);
 				if (ftruncate(local_fd, 0) == -1) {
 					error("truncate \"%s\": %s",
@@ -2221,9 +2204,6 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					goto resume_fail;
 				}
 
-				uint64_t local_hash, remote_hash;
-				int lret, rret;
-
 				/*
 				 * Partial local file: hash the overlapping
 				 * prefix to decide resume (continue) vs
@@ -2232,21 +2212,11 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				 * (no trust shortcut), so the comparison below
 				 * is exact.
 				 */
-				sftp_conn_watchdog_pause(conn,
-				    HPN_HEARTBEAT_REFRESH_SEC);
-				/* hash-work op: local leg first here */
-				sftp_conn_hash_op_begin(conn,
-				    2 * (uint64_t)st.st_size);
-				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
-				    (uint64_t)st.st_size, &local_hash);
-				sftp_conn_hash_op_leg(conn,
+				int match = sftp_hpn_prefix_match(conn,
+				    local_fd, remote_path,
 				    (uint64_t)st.st_size);
-				rret = sftp_hpn_hash_remote_file(conn,
-				    remote_path, (uint64_t)st.st_size,
-				    &remote_hash);
-				sftp_conn_watchdog_resume(conn);
-				if (lret == 0 && rret == 0 &&
-				    local_hash == remote_hash) {
+
+				if (match == 1) {
 					debug("verified resume: prefix "
 					    "hash match, resuming at "
 					    "offset %llu",
@@ -2256,8 +2226,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					    st.st_size;
 				} else {
 					debug("verified resume: prefix "
-					    "hash mismatch or error; "
-					    "restarting download");
+					    "hash %s; restarting download",
+					    match == 0 ? "mismatch" :
+					    "failed");
 					if (ftruncate(local_fd, 0) == -1) {
 						error("truncate \"%s\": %s",
 						    local_path,
@@ -3108,37 +3079,11 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * otherwise re-upload from scratch.  Closes the
 				 * crash-resume sparse-hole corruption gap.
 				 */
-				uint64_t local_hash, remote_hash;
-				int lret, rret;
-
-				/* Hashing on both ends is legitimate
-				 * non-byte-transfer work; pause the
-				 * orchestrator watchdog for the duration so
-				 * its born-dead / silence heuristics don't
-				 * kill the worker mid-hash.  Auto-expires;
-				 * resume() called explicitly on the success
-				 * paths below for promptness. */
-				sftp_conn_watchdog_pause(conn,
-				    HPN_HEARTBEAT_REFRESH_SEC);
-				/*
-				 * Always strict: hash both ends off the platter
-				 * and compare; equal size never implies equal
-				 * content.  STRICT is always sent so a pre-Phase-1
-				 * server still hashes instead of returning the
-				 * (removed) fully-allocated sentinel.
-				 * Hash-work op: remote leg first here.
-				 */
-				sftp_conn_hash_op_begin(conn,
-				    2 * (uint64_t)sb.st_size);
-				rret = sftp_hpn_hash_remote_file(conn, remote_path,
-				    sb.st_size, &remote_hash);
-				sftp_conn_hash_op_leg(conn,
+				int match = sftp_hpn_prefix_match(conn,
+				    local_fd, remote_path,
 				    (uint64_t)sb.st_size);
-				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
-				    sb.st_size, &local_hash);
-				sftp_conn_watchdog_resume(conn);
-				if (lret == 0 && rret == 0 &&
-				    local_hash == remote_hash) {
+
+				if (match == 1) {
 					debug("verified transfer: full-file hash "
 					    "match, \"%s\" already complete",
 					    local_path);
@@ -3148,8 +3093,9 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 					return 1; /* identical */
 				}
 				debug("verified transfer: same size but hash "
-				    "mismatch for \"%s\"; re-uploading from "
-				    "scratch", local_path);
+				    "%s for \"%s\"; re-uploading from "
+				    "scratch", match == 0 ? "mismatch" :
+				    "failed", local_path);
 				resume = 0;           /* fresh upload */
 				effective_inplace = 0; /* force TRUNC */
 			} else if ((off_t)c.size > sb.st_size) {
@@ -3189,38 +3135,18 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				 * Hash the overlapping prefix to decide whether
 				 * we can safely resume (append) or must restart.
 				 */
-				uint64_t local_hash, remote_hash;
-				int lret, rret;
+				int match = sftp_hpn_prefix_match(conn,
+				    local_fd, remote_path, c.size);
 
-				sftp_conn_watchdog_pause(conn,
-				    HPN_HEARTBEAT_REFRESH_SEC);
-				/* hash-work op: local leg first here */
-				sftp_conn_hash_op_begin(conn, 2 * c.size);
-				lret = sftp_hpn_xxhash_local_fd(conn, local_fd,
-				    c.size, &local_hash);
-				sftp_conn_hash_op_leg(conn, c.size);
-				/* Prefix-resume: the server always returns the
-				 * real XXH3 of the requested prefix off the
-				 * platter, so the compare below is exact. */
-				rret = sftp_hpn_hash_remote_file(conn, remote_path,
-				    c.size, &remote_hash);
-				sftp_conn_watchdog_resume(conn);
-				debug3_f("lret=%d rret=%d local_hash=%016llx "
-				    "remote_hash=%016llx match=%d",
-				    lret, rret,
-				    (unsigned long long)local_hash,
-				    (unsigned long long)remote_hash,
-				    (lret == 0 && rret == 0 &&
-				    local_hash == remote_hash));
-				if (lret == 0 && rret == 0 &&
-				    local_hash == remote_hash) {
+				if (match == 1) {
 					debug("verified resume: prefix hash "
 					    "match, resuming at offset %llu",
 					    (unsigned long long)c.size);
 					resume = 1;
 				} else {
 					debug("verified resume: prefix hash "
-					    "mismatch or error; restarting upload");
+					    "%s; restarting upload",
+					    match == 0 ? "mismatch" : "failed");
 					resume = 0;           /* force fresh upload */
 					effective_inplace = 0; /* force TRUNC */
 				}

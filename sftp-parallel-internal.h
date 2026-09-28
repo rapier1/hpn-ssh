@@ -408,9 +408,9 @@ struct verify_whole_item {
 struct hpn_strlist {
 	pthread_mutex_t  mu;
 	char           **items;     /* xstrdup'd entries; NULL until init */
-	size_t           used;      /* entries actually held */
-	size_t           cap;       /* array capacity */
-	uint64_t         total;     /* total appends seen (may exceed cap) */
+	int              used;      /* entries actually held */
+	int              cap;       /* array capacity */
+	int              total;     /* total appends seen (may exceed cap) */
 };
 
 /* What one spawn thread is handed. auth_mu, auth_cv, auth_in_flight and
@@ -1048,10 +1048,10 @@ void	*parallel_reporter_thread(void *);
 void	 parallel_stats_snapshot(struct sftp_parallel *, uint64_t *);
 
 /* hpn_strlist - small string-list utility (lives in sftp-parallel.c) */
-void	 hpn_strlist_init(struct hpn_strlist *, size_t);
+void	 hpn_strlist_init(struct hpn_strlist *, int);
 void	 hpn_strlist_free(struct hpn_strlist *);
 void	 hpn_strlist_append(struct hpn_strlist *, const char *);
-uint64_t hpn_strlist_drain(struct hpn_strlist *, char ***, size_t *);
+int	 hpn_strlist_drain(struct hpn_strlist *, char ***, int *);
 
 /* sftp-parallel-unit.c - work units, trackers, pending, submission */
 void	 parallel_unit_free(struct sftp_work_unit *);

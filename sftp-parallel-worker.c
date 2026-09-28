@@ -145,9 +145,8 @@ parallel_verify_one(struct sftp_worker *worker, const char *local_path,
 	 * upload's teed source hash, carried in the parked item, spares the
 	 * local read. */
 	int repaired = 0;
-	int verify_rc = sftp_hpn_verify_repair(worker->conn, local_path, remote_path,
-	    local_is_target, /*off=*/0, /*len=*/0,
-	    have_src_hash, src_hash,
+	int verify_rc = sftp_hpn_verify_repair_file(worker->conn, local_path,
+	    remote_path, local_is_target, have_src_hash, src_hash,
 	    fleet->verify_repair_enabled, fleet->verify_repair_attempts, &repaired);
 
 	/* TransferLog: under -V the transfer line was deferred to this,
@@ -290,8 +289,8 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 			 */
 			int repaired = 0;
 
-			verify_rc = sftp_hpn_verify_repair(worker->conn, job->local_path,
-			    job->remote_path, job->local_is_target,
+			verify_rc = sftp_hpn_verify_repair_range(worker->conn,
+			    job->local_path, job->remote_path, job->local_is_target,
 			    job->offs[idx], job->lens[idx],
 			    have_teed, have_teed ? job->hashes[idx] : 0,
 			    fleet->verify_repair_enabled, fleet->verify_repair_attempts,
@@ -502,7 +501,7 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 		int local_is_target = (unit->range_tracker != NULL &&
 		    unit->range_tracker->target == SFTP_RANGE_TARGET_LOCAL);
 
-		rc = sftp_hpn_verify_repair(worker->conn,
+		rc = sftp_hpn_verify_repair_range(worker->conn,
 		    local_is_target ? unit->dst_path : unit->src_path,
 		    local_is_target ? unit->src_path : unit->dst_path,
 		    local_is_target, unit->range_offset, unit->range_length,

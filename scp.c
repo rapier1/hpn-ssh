@@ -1606,7 +1606,7 @@ static void
 scp_parallel_finish(struct sftp_conn *conn)
 {
 	char **paths = NULL;
-	size_t i, used = 0;
+	int i, used = 0;
 
 	if (parallel_orch != NULL) {
 		struct sftp_parallel_stats pstats;

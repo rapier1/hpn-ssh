@@ -174,7 +174,7 @@ sftp_parallel_set_walker_phase(struct sftp_parallel *fleet, int phase)
 
 /* Bounded thread-safe string list - see comment on struct hpn_strlist. */
 void
-hpn_strlist_init(struct hpn_strlist *list, size_t cap)
+hpn_strlist_init(struct hpn_strlist *list, int cap)
 {
 	pthread_mutex_init(&list->mu, NULL);
 	list->cap   = cap;
@@ -191,7 +191,7 @@ void
 hpn_strlist_free(struct hpn_strlist *list)
 {
 	if (list->items != NULL) {
-		for (size_t i = 0; i < list->used; i++)
+		for (int i = 0; i < list->used; i++)
 			free(list->items[i]);
 		free(list->items);
 		list->items = NULL;
@@ -224,17 +224,17 @@ hpn_strlist_append(struct hpn_strlist *list, const char *entry)
  *
  * The list is reset to empty and stays usable, and that reset includes the
  * total, so a second drain reports only what arrived after the first. */
-uint64_t
-hpn_strlist_drain(struct hpn_strlist *list, char ***out, size_t *out_used)
+int
+hpn_strlist_drain(struct hpn_strlist *list, char ***out, int *out_used)
 {
-	uint64_t total;
+	int total;
 	pthread_mutex_lock(&list->mu);
 	total = list->total;
 	if (out != NULL && out_used != NULL) {
 		*out_used = list->used;
 		if (list->used > 0) {
 			*out = xcalloc(list->used, sizeof(**out));
-			for (size_t i = 0; i < list->used; i++)
+			for (int i = 0; i < list->used; i++)
 				(*out)[i] = list->items[i];   /* transfer ownership */
 		} else {
 			*out = NULL;
@@ -242,7 +242,7 @@ hpn_strlist_drain(struct hpn_strlist *list, char ***out, size_t *out_used)
 	} else {
 		/* Nobody is taking the strings, so free them here rather
 		 * than losing them in the reset below. */
-		for (size_t i = 0; i < list->used; i++)
+		for (int i = 0; i < list->used; i++)
 			free(list->items[i]);
 	}
 	/* Reset the list so subsequent appends start fresh. */
@@ -1294,12 +1294,12 @@ sftp_parallel_get_stats(struct sftp_parallel *fleet,
 }
 
 /* Drain the failed-path list the walkers and workers appended to:
- * returns the total failure count seen andntransfers ownership of the
+ * returns the total failure count seen and transfers ownership of the
  * path strings to the caller. The list is reset, so failures recorded
  * after this call start fresh. */
-uint64_t
+int
 sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
-    char ***out_paths, size_t *out_used)
+    char ***out_paths, int *out_used)
 {
 	if (fleet == NULL) {
 		if (out_paths != NULL)
@@ -1315,9 +1315,9 @@ sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
  * as sftp_parallel_drain_failed_paths above: returns the total mismatch count
  * and transfers ownership of the path strings to the caller.
  * A non-zero return means hpnsftp should exit SFTP_EX_VERIFY_FAILED. */
-uint64_t
+int
 sftp_parallel_drain_verify_failures(struct sftp_parallel *fleet,
-    char ***out_paths, size_t *out_used)
+    char ***out_paths, int *out_used)
 {
 	if (fleet == NULL) {
 		if (out_paths != NULL)

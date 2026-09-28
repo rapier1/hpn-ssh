@@ -537,15 +537,15 @@ void sftp_parallel_get_stats(struct sftp_parallel *fleet,
  *
  * The list is reset by this call so subsequent failures start fresh.
  */
-uint64_t sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
-    char ***out_paths, size_t *out_used);
+int sftp_parallel_drain_failed_paths(struct sftp_parallel *fleet,
+    char ***out_paths, int *out_used);
 
 /*
  * Drain the verify transfer post-transfer hash-mismatch list (transfers
  * ownership of the path strings to the caller). Non-zero return => some
  * file failed end-to-end verification => exit SFTP_EX_VERIFY_FAILED.
  */
-uint64_t sftp_parallel_drain_verify_failures(struct sftp_parallel *fleet,
-    char ***out_paths, size_t *out_used);
+int sftp_parallel_drain_verify_failures(struct sftp_parallel *fleet,
+    char ***out_paths, int *out_used);
 
 #endif /* _SFTP_PARALLEL_H */

@@ -162,7 +162,7 @@ int global_fflag = 0;
 static int hpn_verify_transfer = 0;	/* session-global -V (program switch) */
 static int verify_flag_user = 0;	/* -V program switch -> hpn_verify_transfer */
 static char **verify_fail_list = NULL;
-static u_int verify_fail_count = 0;
+static int verify_fail_count = 0;
 
 /* SIGINT received during command processing.  _Atomic (lock-free): set by the
  * signal handler and the main loop, read by parallel worker/reporter threads;
@@ -950,22 +950,20 @@ parallel_flush(struct sftp_conn *conn, int final)
 	 * (it owns the memory); printed at debug after a user interrupt. */
 	{
 		char  **paths     = NULL;
-		size_t  paths_used = 0;
-		uint64_t total = sftp_parallel_drain_failed_paths(
+		int     paths_used = 0;
+		int     total = sftp_parallel_drain_failed_paths(
 		    parallel_orch, &paths, &paths_used);
 		if (total > 0) {
 			if (user_int) {
-				debug("  Incomplete paths (%llu total):",
-				    (unsigned long long)total);
+				debug("  Incomplete paths (%d total):", total);
 			} else if (paths_used >= total) {
-				error("  Failed paths (%llu total):",
-				    (unsigned long long)total);
+				error("  Failed paths (%d total):", total);
 			} else {
-				error("  Failed paths (showing first %zu; "
-				    "list exceeds current limit of %zu files):",
+				error("  Failed paths (showing first %d; "
+				    "list exceeds current limit of %d files):",
 				    paths_used, paths_used);
 			}
-			for (size_t i = 0; i < paths_used; i++) {
+			for (int i = 0; i < paths_used; i++) {
 				if (user_int)
 					debug("    %s", paths[i]);
 				else
@@ -985,14 +983,14 @@ parallel_flush(struct sftp_conn *conn, int final)
  * Print the verify-failure summary at exit.  Returns the number of files
  * that failed verification (0 = all clean / verify off).
  */
-static u_int
+static int
 verify_print_summary(void)
 {
-	u_int i;
+	int i;
 
 	if (verify_fail_count == 0)
 		return 0;
-	mprintf("\nVerification FAILED for %u file(s) after transfer:\n",
+	mprintf("\nVerification FAILED for %d file(s) after transfer:\n",
 	    verify_fail_count);
 	for (i = 0; i < verify_fail_count; i++)
 		mprintf("    %s\n", verify_fail_list[i]);
@@ -4057,7 +4055,7 @@ main(int argc, char **argv)
 	 */
 	{
 		char  **cvpaths = NULL;
-		size_t  cvused = 0, i;
+		int     cvused = 0, i;
 
 		(void)sftp_conn_drain_verify_failures(conn, &cvpaths, &cvused);
 		for (i = 0; i < cvused; i++) {
@@ -4085,7 +4083,7 @@ main(int argc, char **argv)
 	 */
 	if (parallel_orch != NULL) {
 		char  **vpaths = NULL;
-		size_t  vused = 0, i;
+		int     vused = 0, i;
 
 		(void)sftp_parallel_drain_verify_failures(parallel_orch,
 		    &vpaths, &vused);

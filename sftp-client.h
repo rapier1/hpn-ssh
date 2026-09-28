@@ -455,8 +455,8 @@ int sftp_conn_verify_pending_count(struct sftp_conn *conn);
  * sftp_parallel_drain_verify_failures so the end-of-run summary + exit code
  * cover classic and parallel transfers uniformly.  Returns the count.
  */
-size_t sftp_conn_drain_verify_failures(struct sftp_conn *conn,
-    char ***out_paths, size_t *out_used);
+int sftp_conn_drain_verify_failures(struct sftp_conn *conn,
+    char ***out_paths, int *out_used);
 
 /*
  * True iff the server advertised sftp-hash-range@hpnssh.org, i.e. it can
