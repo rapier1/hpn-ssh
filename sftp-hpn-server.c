@@ -1,31 +1,7 @@
 /*
- * sftp-hpn-server.c - HPN-SSH server-side SFTP extensions.
+ * Copyright (c) 2024-2026 The Board of Trustees of Carnegie Mellon University.
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- * Isolating HPN-specific extension handlers here keeps sftp-server.c's
- * diff against upstream small.
- *
- * hpn-fs-info@hpnssh.org
- * -----------------------
- * Returns filesystem type and stripe geometry for a given path so that
- * the parallel client (sftp-parallel.c) can align byte-range transfers to
- * Lustre/GPFS stripe boundaries.
- *
- * Detection layers (each falls back to the next):
- *   1. statfs() f_type magic number → filesystem type string
- *   2. Lustre: read the "lustre.lov" extended attribute via getxattr()
- *      (lustre_get_stripe -> read_lov_layout, sftp-lustre.c) - a plain
- *      syscall, no fork/exec or subprocess
- *   3. GPFS:   type detected via magic; block_size from statvfs()
- *   4. Fallback: block_size from statvfs(), zeros for stripe fields
- *
- * Wire format (SSH_FXP_EXTENDED_REPLY):
- *   fs_type      string   "lustre"|"gpfs"|"xfs"|"ext4"|"nfs"|"unknown"|...
- *   stripe_size  uint64   bytes per stripe; 0 if not applicable
- *   stripe_count uint32   number of stripes/OSTs; 0 if not applicable
- *   block_size   uint64   optimal I/O block size (always present)
- *
- * Copyright (c) 2024-2026 Pittsburgh Supercomputing Center / HPN-SSH project.
+ *  Author: Chris Rapier <rapier@psc.edu>
  *
  * This library or code is free software; you can redistribute it and/or
  * modify it under the terms of the BSD 2 Clause License.
@@ -39,6 +15,15 @@
  * code, if not, see https://opensource.org/license/bsd-2-clause.
  *
  */
+
+/* sftp-hpn-server.c - the server side of the HPN SFTP extensions, kept
+ * here so sftp-server.c carries only the dispatch and close calls.
+ * fs-info reports a path's filesystem type and stripe geometry,
+ * hpn-check-file and sftp-hash-range hash a file prefix or a set of
+ * ranges read from disk, with heartbeats during a long hash, and
+ * file-layout sets a Lustre stripe layout on a directory. Bundle and
+ * tree walk requests are routed to their own modules. Wire formats are
+ * in sftp-hpn-server.h. */
 
 #include "includes.h"
 
@@ -75,11 +60,9 @@
 #include "sftp-hpn-server.h"
 #include "sftp-hpn-tree.h"		/* tree walk record codec + constants */
 #include "sftp-hpn-tree-server.h"	/* chunked tree walk handlers */
-#include "sftp-hpn-verify-hash.h"		/* sftp_hpn_hash_file_ondisk */
+#include "sftp-hpn-verify-hash.h"	/* the on-disk hash reader */
 #include "sftp-hpn-bundle-server.h"	/* process_hpn_bundle_open / _fetch */
 #include "sftp-lustre.h"		/* lustre_set_stripe_fd / _tiered_layout_fd / _get_stripe */
-#define XXH_INLINE_ALL
-#include "xxhash.h"
 
 /* Linux filesystem type magic numbers. */
 #ifndef EXT4_SUPER_MAGIC
@@ -188,47 +171,14 @@ send_status_oqueue(struct sshbuf *oqueue, u_int id, u_int status)
 }
 
 
-/* ── BEGIN sftp-hash-range: chunked-resume ranged XXH3 hashing ─────────────
- *
- * Multi-range variant of hpn-check-file: client supplies N (offset, length)
- * tuples in one request, server returns N XXH3_64bits hashes in one reply.
- * Used by chunked resume to identify exactly which chunks of a same-size
- * destination differ from the source, so only those chunks get re-transferred
- * instead of the whole file (closes the cost half of the sparse-hole gate).
- *
- * Wire format:
- *   request:  string path | uint32 num_ranges
- *             | num_ranges * (uint64 off, uint64 len)
- *   reply:    uint32 num_hashes (== num_ranges)
- *             | num_hashes * uint64 hash
- *
- * Error model: all-or-nothing.  Any range that fails to hash (I/O error,
- * resource cap, file vanished mid-request) rejects the entire request with
- * a single SSH2_FXP_STATUS reply -- no partial hashes.  The client falls
- * back to hpn-check-file whole-file hash on this failure, then to full
- * re-transfer if that also fails.
- *
- * EOF clamping: offset+length > file_size is clamped to [offset, file_size);
- * offset >= file_size hashes zero bytes (well-defined XXH3 constant).  The
- * client sees a mismatch against its local "full chunk" hash and correctly
- * flags the chunk as incomplete.
- */
-struct hash_range {
-	u_int64_t	off;
-	u_int64_t	len;
-};
-
-/*
- * Drain oqueue synchronously to STDOUT_FILENO via atomicio().  Used by the
- * heartbeat path so the bytes actually reach the SSH transport mid-handler
- * instead of sitting in oqueue until the handler returns (sftp-server's
- * main poll loop does not iterate during a handler call).  Order is
- * preserved: pre-handler pending bytes leave first, the heartbeat after.
- */
+/* Drain oqueue to STDOUT_FILENO now, blocking. A heartbeat must reach
+ * the client while the handler is still running, and sftp-server's poll
+ * loop does not turn during a handler. Bytes already queued leave first,
+ * so the order holds. */
 void
 flush_oqueue_blocking(struct sshbuf *oqueue)
 {
-	size_t	len, wrote;
+	size_t len, wrote;
 
 	len = sshbuf_len(oqueue);
 	if (len == 0)
@@ -239,73 +189,96 @@ flush_oqueue_blocking(struct sshbuf *oqueue)
 		(void)sshbuf_consume(oqueue, wrote);
 }
 
-/*
- * Emit an sftp-hash-range heartbeat into oqueue, then synchronously
- * drain.  Wire shape matches the final reply prefix
- * (type | id | num_hashes) but with the reserved sentinel
- * HPN_NUM_HASHES_HEARTBEAT in num_hashes, followed by a u64
- * bytes-hashed-so-far figure so the client can distinguish a slow
- * backend from a stalled one.  Called from the inner read
- * loop every HPN_HEARTBEAT_EMIT_INTERVAL_SEC seconds; lets the client
- * refresh its watchdog-pause window so the parallel orchestrator doesn't
- * kill the worker mid-hash on a slow / contended disk.
- */
+/* One heartbeat stream for a long hash. The client's watchdog would take
+ * a silent minute of hashing for a dead worker, so the handler sends a
+ * reply-shaped heartbeat every HPN_HASH_HEARTBEAT_INTERVAL_SEC: the
+ * reply's first field holds a sentinel of that field's width, 4 bytes
+ * for sftp-hash-range's count and 8 for hpn-check-file's hash, and the
+ * bytes hashed so far follow. base is the bytes of earlier ranges, so the
+ * figure stays monotone across a many-range request. */
+struct hash_heartbeat {
+	const char	*name;		/* the extension, for messages */
+	u_int		 id;
+	struct sshbuf	*oqueue;
+	int		 sentinel_width;
+	uint64_t	 sentinel;
+	uint64_t	 base;
+	time_t		 last_sec;
+};
+
 static void
-send_hpn_hash_range_heartbeat(u_int id, struct sshbuf *oqueue,
-    u_int64_t progress)
+hash_heartbeat_send(struct hash_heartbeat *hb, uint64_t progress)
 {
-	struct sshbuf	*msg;
-	int		 r;
+	struct sshbuf *msg;
+	int r;
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u32(msg,
-	        (u_int32_t)HPN_NUM_HASHES_HEARTBEAT)) != 0 ||
+	    (r = sshbuf_put_u32(msg, hb->id)) != 0 ||
+	    (r = hb->sentinel_width == 4 ?
+	    sshbuf_put_u32(msg, (uint32_t)hb->sentinel) :
+	    sshbuf_put_u64(msg, hb->sentinel)) != 0 ||
 	    (r = sshbuf_put_u64(msg, progress)) != 0)
 		fatal_fr(r, "compose heartbeat");
-	debug3("sftp-hash-range: heartbeat id=%u", id);
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
+	debug3("%s: heartbeat id=%u", hb->name, hb->id);
+	if ((r = sshbuf_put_stringb(hb->oqueue, msg)) != 0)
 		fatal_fr(r, "enqueue heartbeat");
 	sshbuf_free(msg);
-	flush_oqueue_blocking(oqueue);
+	flush_oqueue_blocking(hb->oqueue);
 }
 
+/* Progress callback for the hash reader: send a heartbeat when one is
+ * due. */
+static void
+hash_heartbeat_progress(void *arg, uint64_t done)
+{
+	struct hash_heartbeat *hb = arg;
+	time_t now = monotime();
+
+	if (now != 0 && hb->last_sec != 0 &&
+	    now - hb->last_sec >= (time_t)HPN_HASH_HEARTBEAT_INTERVAL_SEC) {
+		hash_heartbeat_send(hb, hb->base + done);
+		hb->last_sec = now;
+	}
+}
+
+/* One (offset, length) range of a hash-range request. */
+struct hash_range {
+	uint64_t	off;
+	uint64_t	len;
+};
+
+/* sftp-hash-range: hash each of up to SFTP_HASH_RANGE_MAX_RANGES ranges of
+ * a file in one request, so chunked verified resume and the per-range
+ * verify learn which chunks differ without a round trip per chunk. The
+ * bytes come from the platter, not the page cache, since an upload
+ * verify must check what landed on disk. A range past EOF is clamped to
+ * it, and one wholly past EOF hashes no bytes; the client's full-length
+ * hash then mismatches, which is the right answer for a short file. All
+ * or nothing: any failure is one STATUS reply and no hashes. Wire format
+ * in sftp-hpn-server.h. */
 static void
 process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
-	char			*path = NULL;
-	u_int32_t		 num_ranges = 0;
-	struct hash_range	*ranges = NULL;
-	u_int64_t		*hashes = NULL;
-	XXH3_state_t		*state = NULL;
-	struct sshbuf		*msg = NULL;
-	struct stat		 st;
-	/*
-	 * Read-back buffer: 4 MiB page-aligned for O_DIRECT (matches the
-	 * client's HPN_READBACK_BUFSZ - the measured large-FS sweet spot,
-	 * 64 KiB ~43 MB/s vs 4 MiB ~340 MB/s on Lustre).  Heap-allocated.
-	 */
-	const size_t		 bufsz = 4 * 1024 * 1024;
-	u_char			*buf = NULL;
-	int			 direct = 0;
-	u_int64_t		 fsize = 0;
-	u_int64_t		 hashed_total = 0;
-	time_t			 last_hb_sec;
-	u_int32_t		 i;
-	int			 fd = -1;
-	int			 r;
+	char *path = NULL;
+	uint32_t num_ranges = 0, i;
+	struct hash_range *ranges = NULL;
+	uint64_t *hashes = NULL;
+	struct sftp_hpn_hash_reader *reader = NULL;
+	struct hash_heartbeat hb;
+	struct sshbuf *msg = NULL;
+	uint64_t fsize, cap, total = 0;
+	off_t size;
+	int r;
 
 	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &num_ranges)) != 0) {
 		error_f("parse: %s", ssh_err(r));
 		goto fail_status;
 	}
-
 	debug3("request %u: sftp-hash-range \"%s\" num_ranges=%u",
 	    id, path, num_ranges);
-
 	if (num_ranges == 0) {
 		error_f("rejecting sftp-hash-range with num_ranges=0 "
 		    "for \"%s\"", path);
@@ -318,7 +291,6 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		    path);
 		goto fail_status;
 	}
-
 	if ((ranges = calloc(num_ranges, sizeof(*ranges))) == NULL ||
 	    (hashes = calloc(num_ranges, sizeof(*hashes))) == NULL) {
 		error_f("calloc for %u ranges failed", num_ranges);
@@ -331,177 +303,46 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 			goto fail_status;
 		}
 	}
+	debug("sftp-hash-range \"%s\" num_ranges=%u", path, num_ranges);
 
-	logit("sftp-hash-range \"%s\" num_ranges=%u", path, num_ranges);
-
-	if ((fd = open(path, O_RDONLY)) == -1) {
-		send_status_oqueue(oqueue, id,
-		    errno_to_sftp_status(errno));
+	if ((reader = sftp_hpn_hash_reader_open(path, 1, &size)) == NULL) {
+		send_status_oqueue(oqueue, id, errno_to_sftp_status(errno));
 		goto out;
 	}
-	if (fstat(fd, &st) == -1) {
-		send_status_oqueue(oqueue, id,
-		    errno_to_sftp_status(errno));
-		goto out;
-	}
-	fsize = (u_int64_t)st.st_size;
+	fsize = (uint64_t)size;
 
-	/*
-	 * Total-work guard against crafted requests.  A legitimate request
-	 * (range-split upload verify, chunked verified resume) tiles [0, fsize)
-	 * exactly, so the bytes it asks us to hash sum to the file size.  A
-	 * single over-large len is already harmless - it EOF-clamps to one
-	 * end-of-file read.  The real attack is many overlapping / redundant
-	 * ranges (up to SFTP_HASH_RANGE_MAX_RANGES of them) crafted to make the
-	 * server re-hash the file many times over.  EOF-clamp each range and
-	 * reject if the clamped total runs past 2x the file size: that can only
-	 * be such a request.  This bounds our work to reading the file at most
-	 * twice per request, regardless of file size, while never rejecting a
-	 * legitimate tiling.  Overflow-safe: the running total never passes cap.
-	 */
-	{
-		u_int64_t cap = fsize > UINT64_MAX / 2 ? UINT64_MAX : fsize * 2;
-		u_int64_t total = 0, clamped;
-
-		for (i = 0; i < num_ranges; i++) {
-			clamped = ranges[i].off >= fsize ? 0 :
-			    MINIMUM(ranges[i].len, fsize - ranges[i].off);
-			if (clamped > cap - total) {
-				error_f("sftp-hash-range \"%s\": clamped range "
-				    "total exceeds 2x file size (%llu) - "
-				    "rejecting crafted request", path,
-				    (unsigned long long)fsize);
-				goto fail_status;
-			}
-			total += clamped;
-		}
-	}
-
-	if ((state = XXH3_createState()) == NULL) {
-		error_f("XXH3_createState failed");
-		goto fail_status;
-	}
-
-	if (posix_memalign((void **)&buf, 4096, bufsz) != 0) {
-		buf = NULL;
-		error_f("posix_memalign(%zu) failed", bufsz);
-		goto fail_status;
-	}
-
-	/*
-	 * Read the bytes from the platter, not the page cache: an upload
-	 * verify must check what actually landed on the server's disk, not
-	 * the copy still warm in cache from the just-finished write.  Mirrors
-	 * the client's read-back (sftp_hpn_hash_range_ondisk).  O_DIRECT (with
-	 * the EINVAL fallback below) where the fs supports it, buffered
-	 * otherwise.
-	 */
-	direct = sftp_hpn_fd_set_ondisk(fd, path);
-	debug_f("range-hash read-back of \"%s\" via %s", path,
-	    direct ? "O_DIRECT" : "buffered");
-
-	/*
-	 * For each range, lseek to the offset and hash bytes
-	 * [offset, min(offset+length, file_size)).  EOF clamping handled by
-	 * starting `remaining` at the clamped length (zero if offset >= fsize).
-	 * All-or-nothing: any read or hash failure bails out with a single
-	 * SSH2_FXP_STATUS reply.
-	 *
-	 * Heartbeats: every HPN_HEARTBEAT_EMIT_INTERVAL_SEC of elapsed wall
-	 * time inside this loop we enqueue a tiny "still working" reply on
-	 * oqueue.  Lets the client's parallel orchestrator's watchdog see
-	 * proof of life so it doesn't kill the worker mid-hash on slow /
-	 * contended storage.  See sftp-hpn-server.h for the wire format.
-	 */
-	last_hb_sec = monotime();
+	/* Clamp each range to EOF, and guard the total work. A legitimate
+	 * request tiles [0, fsize), so its clamped lengths sum to the file
+	 * size; only a crafted one of many overlapping ranges can pass twice
+	 * the size, and it would make us re-read the file over and over.
+	 * The running total never passes cap, so it cannot overflow. */
+	cap = fsize > UINT64_MAX / 2 ? UINT64_MAX : fsize * 2;
 	for (i = 0; i < num_ranges; i++) {
-		u_int64_t	 off = ranges[i].off;
-		u_int64_t	 want = ranges[i].len;
-		u_int64_t	 remaining;
-		ssize_t		 nread;
-
-		if (XXH3_64bits_reset(state) == XXH_ERROR) {
-			error_f("XXH3_64bits_reset failed at range %u", i);
+		ranges[i].len = ranges[i].off >= fsize ? 0 :
+		    MINIMUM(ranges[i].len, fsize - ranges[i].off);
+		if (ranges[i].len > cap - total) {
+			error_f("sftp-hash-range \"%s\": clamped range "
+			    "total exceeds 2x file size (%llu) - "
+			    "rejecting crafted request", path,
+			    (unsigned long long)fsize);
 			goto fail_status;
 		}
-
-		if (off >= fsize) {
-			remaining = 0;
-		} else {
-			u_int64_t avail = fsize - off;
-			remaining = want < avail ? want : avail;
-		}
-
-		if (remaining > 0) {
-			if (lseek(fd, (off_t)off, SEEK_SET) == (off_t)-1) {
-				send_status_oqueue(oqueue, id,
-				    errno_to_sftp_status(errno));
-				goto out;
-			}
-			while (remaining > 0) {
-				/*
-				 * O_DIRECT requires block-aligned request
-				 * lengths, so in direct mode always read a full
-				 * (aligned) buffer and clamp the hashed byte
-				 * count to what remains; a short read at EOF is
-				 * fine.  Buffered mode clamps the request.
-				 */
-				size_t toread = direct ? bufsz :
-				    (size_t)MINIMUM((u_int64_t)bufsz, remaining);
-				size_t hbytes;
-
-				nread = read(fd, buf, toread);
-#ifdef O_DIRECT
-				if (nread < 0 && direct && errno == EINVAL) {
-					/* O_DIRECT rejected at read time on
-					 * this fs; drop it and retry the same
-					 * offset buffered. */
-					int fl = fcntl(fd, F_GETFL);
-					if (fl != -1)
-						(void)fcntl(fd, F_SETFL,
-						    fl & ~O_DIRECT);
-					direct = 0;
-					continue;
-				}
-#endif
-				if (nread == 0)
-					break;	/* EOF before length bytes -
-						 * hash what we have */
-				if (nread < 0) {
-					send_status_oqueue(oqueue, id,
-					    errno_to_sftp_status(errno));
-					goto out;
-				}
-				/* never hash past the requested length */
-				hbytes = (u_int64_t)nread > remaining ?
-				    (size_t)remaining : (size_t)nread;
-				if (XXH3_64bits_update(state, buf,
-				    hbytes) == XXH_ERROR) {
-					error_f("XXH3_64bits_update failed "
-					    "at range %u", i);
-					goto fail_status;
-				}
-				remaining -= (u_int64_t)hbytes;
-				hashed_total += (u_int64_t)hbytes;
-
-				/* Time-keyed heartbeat (see comment above). */
-				{
-					time_t now =
-					    monotime();
-					if (now != 0 && last_hb_sec != 0 &&
-					    (now - last_hb_sec) >=
-					    (time_t)
-					    HPN_HASH_HEARTBEAT_INTERVAL_SEC) {
-						send_hpn_hash_range_heartbeat(
-						    id, oqueue, hashed_total);
-						last_hb_sec = now;
-					}
-				}
-			}
-		}
-		hashes[i] = (u_int64_t)XXH3_64bits_digest(state);
+		total += ranges[i].len;
 	}
 
+	hb = (struct hash_heartbeat){ .name = "sftp-hash-range", .id = id,
+	    .oqueue = oqueue, .sentinel_width = 4,
+	    .sentinel = HPN_NUM_HASHES_HEARTBEAT, .last_sec = monotime() };
+	for (i = 0; i < num_ranges; i++) {
+		if (sftp_hpn_hash_reader_range(reader, ranges[i].off,
+		    ranges[i].len, &hashes[i], hash_heartbeat_progress,
+		    &hb) != 0) {
+			send_status_oqueue(oqueue, id,
+			    errno_to_sftp_status(errno));
+			goto out;
+		}
+		hb.base += ranges[i].len;
+	}
 	debug3("sftp-hash-range: computed %u hashes for \"%s\"",
 	    num_ranges, path);
 
@@ -521,135 +362,51 @@ process_hpn_hash_range(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		fatal_fr(r, "enqueue reply");
 	goto out;
 
-fail_status:
+ fail_status:
 	send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
-out:
-	if (msg != NULL)
-		sshbuf_free(msg);
-	if (state != NULL)
-		XXH3_freeState(state);
-	if (fd != -1)
-		close(fd);
-	free(buf);
+ out:
+	sshbuf_free(msg);
+	sftp_hpn_hash_reader_close(reader);
 	free(ranges);
 	free(hashes);
 	free(path);
 }
 
-/* ── END sftp-hash-range ───────────────────────────────────────────────── */
-
-/*
- * Emit an hpn-check-file heartbeat reply (EXTENDED_REPLY with the reserved
- * HPN_HASH_CHECK_FILE_HEARTBEAT sentinel in the hash field).  Called from
- * the inner read+hash loop every HPN_HEARTBEAT_EMIT_INTERVAL_SEC seconds;
- * lets the client refresh its watchdog-pause window so the parallel
- * orchestrator doesn't kill the worker mid-hash on a slow / contended
- * disk.  Wire shape matches the final reply; only the hash value differs.
- *
- * Append to oqueue then synchronously drain so the bytes actually leave
- * the process during the handler (the main poll loop is blocked here).
- * Lives in sftp-hpn-server.c so sftp-server.c keeps a minimal upstream
- * diff; oqueue is threaded through from the dispatch.
- */
+/* hpn-check-file: hash the first length bytes of a file, the whole-file
+ * and prefix gates of verified resume. The bytes come from the platter
+ * so the answer reflects the disk, and every check is a full hash: size
+ * and allocation are never taken as content. length is clamped to the
+ * file's size, so a request for UINT64_MAX bytes cannot drive unbounded
+ * I/O. Wire format in sftp-hpn-server.h. */
 static void
-send_hpn_check_file_heartbeat(uint32_t id, uint64_t progress,
-    struct sshbuf *oqueue)
-{
-	struct sshbuf *msg;
-	int r;
-
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u64(msg,
-	        (uint64_t)HPN_HASH_CHECK_FILE_HEARTBEAT)) != 0 ||
-	    (r = sshbuf_put_u64(msg, progress)) != 0)
-		fatal_fr(r, "compose heartbeat");
-	debug3("hpn-check-file: heartbeat id=%u", id);
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue heartbeat");
-	sshbuf_free(msg);
-	flush_oqueue_blocking(oqueue);
-}
-
-/*
- * Heartbeat context for the hpn-check-file read-back hash.  The shared
- * read-back helper invokes this per chunk; we throttle the actual heartbeat
- * emission to HPN_HEARTBEAT_EMIT_INTERVAL_SEC so the client's watchdog-pause
- * stays refreshed during a long hash.
- */
-struct hpn_check_file_hb {
-	u_int          id;
-	struct sshbuf *oqueue;
-	time_t         last_hb_sec;
-};
-
-static void
-hpn_check_file_hb_progress(void *arg, uint64_t done)
-{
-	struct hpn_check_file_hb *c = arg;
-	time_t now = monotime();
-
-	if (now != 0 && c->last_hb_sec != 0 &&
-	    (now - c->last_hb_sec) >= (time_t)HPN_HASH_HEARTBEAT_INTERVAL_SEC) {
-		send_hpn_check_file_heartbeat(c->id, done, c->oqueue);
-		c->last_hb_sec = now;
-	}
-}
-
-void
 process_hpn_check_file(u_int id, struct sshbuf *iqueue,
     struct sshbuf *oqueue)
 {
 	char *path = NULL;
-	uint64_t length;
-	int r;
-	int fd = -1;
-	uint64_t hash = 0;
-	struct hpn_check_file_hb hb;
+	uint64_t length, hash = 0;
+	struct sftp_hpn_hash_reader *reader = NULL;
+	struct hash_heartbeat hb;
 	struct sshbuf *msg;
-	struct stat st;
+	off_t size;
+	int r;
 
 	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0 ||
 	    (r = sshbuf_get_u64(iqueue, &length)) != 0)
 		fatal_fr(r, "parse");
-
-	debug3("request %u: hpn-check-file \"%s\" length %llu",
-	    id, path, (unsigned long long)length);
-	logit("hpn-check-file \"%s\" length %llu", path,
+	debug("hpn-check-file \"%s\" length %llu", path,
 	    (unsigned long long)length);
 
-	if ((fd = open(path, O_RDONLY)) == -1) {
+	if ((reader = sftp_hpn_hash_reader_open(path, 1, &size)) == NULL) {
 		send_status_oqueue(oqueue, id, errno_to_sftp_status(errno));
 		goto out;
 	}
-
-	if (fstat(fd, &st) == -1) {
-		send_status_oqueue(oqueue, id, errno_to_sftp_status(errno));
-		goto out;
-	}
-	/* Clamp to actual file size to prevent a malicious client from
-	 * requesting a hash of UINT64_MAX bytes and causing unbounded I/O. */
-	if (length > (uint64_t)st.st_size)
-		length = (uint64_t)st.st_size;
-
-	/*
-	 * Hash the file via the shared on-disk read-back helper, ALWAYS with
-	 * fsync + O_DIRECT so the hash reflects the platter, not the page cache.
-	 * Size/allocation is never trusted as a content signal (the old
-	 * sparse-skip sentinel short-circuit was removed) - every check is a full
-	 * strict hash.  The helper opens its own fd, so release ours first; the
-	 * heartbeat callback keeps the client's watchdog-pause refreshed during a
-	 * long hash.
-	 */
-	close(fd);
-	fd = -1;
-	hb.id = id;
-	hb.oqueue = oqueue;
-	hb.last_hb_sec = monotime();
-	if (sftp_hpn_hash_file_ondisk(path, length, /*ondisk=*/1, &hash,
-	    hpn_check_file_hb_progress, &hb) != 0) {
+	if (length > (uint64_t)size)
+		length = (uint64_t)size;
+	hb = (struct hash_heartbeat){ .name = "hpn-check-file", .id = id,
+	    .oqueue = oqueue, .sentinel_width = 8,
+	    .sentinel = HPN_HASH_CHECK_FILE_HEARTBEAT, .last_sec = monotime() };
+	if (sftp_hpn_hash_reader_range(reader, 0, length, &hash,
+	    hash_heartbeat_progress, &hb) != 0) {
 		send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
 		goto out;
 	}
@@ -660,16 +417,13 @@ process_hpn_check_file(u_int id, struct sshbuf *iqueue,
 		fatal_f("sshbuf_new failed");
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED_REPLY)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u64(msg, (uint64_t)hash)) != 0)
+	    (r = sshbuf_put_u64(msg, hash)) != 0)
 		fatal_fr(r, "compose");
-	debug3("hpn-check-file: sending EXTENDED_REPLY id=%u hash=%016llx",
-	    id, (unsigned long long)hash);
 	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
 		fatal_fr(r, "enqueue reply");
 	sshbuf_free(msg);
-out:
-	if (fd != -1)
-		close(fd);
+ out:
+	sftp_hpn_hash_reader_close(reader);
 	free(path);
 }
 
@@ -693,11 +447,11 @@ static void
 process_hpn_file_layout(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
 	char		*path = NULL;
-	u_int32_t	 requested = 0;
-	u_int32_t	 small_threshold = 0;
-	u_int32_t	 applied = 0;
-	u_int32_t	 layout_kind = 0;   /* 0 = plain stripe, 1 = tiered composite */
-	u_int32_t	 status = HPN_FILE_LAYOUT_FAIL;
+	uint32_t	 requested = 0;
+	uint32_t	 small_threshold = 0;
+	uint32_t	 applied = 0;
+	uint32_t	 layout_kind = 0;   /* 0 = plain stripe, 1 = tiered composite */
+	uint32_t	 status = HPN_FILE_LAYOUT_FAIL;
 	int		 fd = -1;
 	int		 r;
 	struct sshbuf	*msg = NULL;
@@ -819,120 +573,69 @@ sftp_hpn_server_close_handle(int handle, int *status)
 	return 0;
 }
 
-void
-sftp_hpn_server_dispatch(u_int id, const char *name,
-    struct sshbuf *iqueue, struct sshbuf *oqueue)
+/* hpn-fs-info: report a path's filesystem type and stripe geometry, so
+ * the parallel client can align its byte ranges to Lustre or GPFS stripe
+ * boundaries. The type comes from the statfs() magic number and the
+ * block size from statvfs(). On Lustre the stripe size and count come
+ * from the lustre.lov extended attribute through lustre_get_stripe, a
+ * plain syscall; elsewhere they are zero. The path is usually an upload
+ * target that does not exist yet, so the first existing ancestor
+ * answers; stripe layout inherits per directory, so its answer is the
+ * same. Wire format in sftp-hpn-server.h. */
+static void
+process_hpn_fs_info(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 {
-	char *path = NULL;
+	char *path = NULL, *effective_path, *slash;
 	const char *fs_type = "unknown";
 	uint64_t stripe_size = 0, block_size = 4096;
 	uint32_t stripe_count = 0;
 	struct sshbuf *msg;
+	struct statvfs svfs;
+	struct stat st;
+#ifdef HAVE_STATFS
+	struct statfs sfs;
+#endif
 	int r;
-
-	/* Phase 5: bundle-open / bundle-fetch dispatch to their own handlers. */
-	if (strcmp(name, HPN_EXT_BUNDLE_OPEN) == 0) {
-		process_hpn_bundle_open(id, iqueue, oqueue);
-		return;
-	}
-	if (strcmp(name, HPN_EXT_BUNDLE_FETCH) == 0) {
-		process_hpn_bundle_fetch(id, iqueue, oqueue);
-		return;
-	}
-
-	/* Chunked-resume ranged hashing - see process_hpn_hash_range above. */
-	if (strcmp(name, HPN_EXT_CHECK_FILE) == 0) {
-		process_hpn_check_file(id, iqueue, oqueue);
-		return;
-	}
-	if (strcmp(name, HPN_EXT_HASH_RANGE) == 0) {
-		process_hpn_hash_range(id, iqueue, oqueue);
-		return;
-	}
-
-	/* Lustre / future-fs layout - see process_hpn_file_layout above. */
-	if (strcmp(name, HPN_EXT_FILE_LAYOUT) == 0) {
-		process_hpn_file_layout(id, iqueue, oqueue);
-		return;
-	}
-
-	/* Chunked tree walk, in sftp-hpn-tree-server.c. */
-	if (strcmp(name, HPN_EXT_DTREE_OPEN) == 0) {
-		sftp_hpn_tree_open(id, iqueue, oqueue);
-		return;
-	}
-	if (strcmp(name, HPN_EXT_DTREE_READ) == 0) {
-		sftp_hpn_tree_read(id, iqueue, oqueue);
-		return;
-	}
-
-	if (strcmp(name, HPN_EXT_FS_INFO) != 0)
-		goto unsupported;
 
 	if ((r = sshbuf_get_cstring(iqueue, &path, NULL)) != 0) {
 		error_f("parse path: %s", ssh_err(r));
-		goto unsupported;
+		send_status_oqueue(oqueue, id, SSH2_FX_BAD_MESSAGE);
+		return;
 	}
 	debug3("request %u: hpn-fs-info \"%s\"", id, path);
 
-	/*
-	 * The client typically asks about the destination file BEFORE it
-	 * exists (path is the upload target, not yet created).  statfs /
-	 * statvfs / lfs getstripe all need an existing path, so walk up
-	 * the path's ancestors until we find one that exists.  Lustre /
-	 * GPFS stripe geometry inherits per-directory, so the first
-	 * existing ancestor gives the same answer.
-	 *
-	 * effective_path is a writable copy we whittle down with dirname()
-	 * style component stripping; freed before return.
-	 */
-	char *effective_path = strdup(path);
-	if (effective_path == NULL)
-		fatal_f("strdup failed");
-	{
-		struct stat st;
-		while (stat(effective_path, &st) != 0) {
-			char *slash = strrchr(effective_path, '/');
-			if (slash == NULL) {
-				/* Ran out of slashes - bail.  Server returns
-				 * "unknown" / zeros; client falls back. */
-				debug3("hpn-fs-info: no existing ancestor "
-				    "for \"%s\"", path);
-				break;
-			}
-			if (slash == effective_path) {
-				/* Reached "/" itself. */
-				effective_path[1] = '\0';
-				if (stat(effective_path, &st) != 0) {
-					debug3("hpn-fs-info: even / does "
-					    "not stat for \"%s\"", path);
-				}
-				break;
-			}
-			*slash = '\0';
+	/* walk up to the first existing ancestor, stopping at "/" */
+	effective_path = xstrdup(path);
+	while (stat(effective_path, &st) != 0) {
+		if ((slash = strrchr(effective_path, '/')) == NULL) {
+			/* a relative path with no existing ancestor: answer
+			 * "unknown" and zeros, and the client falls back */
+			debug3("hpn-fs-info: no existing ancestor "
+			    "for \"%s\"", path);
+			break;
 		}
-		if (strcmp(effective_path, path) != 0)
-			debug3("hpn-fs-info: walked \"%s\" -> existing "
-			    "ancestor \"%s\"", path, effective_path);
+		if (slash == effective_path) {
+			effective_path[1] = '\0';
+			if (stat(effective_path, &st) != 0)
+				debug3("hpn-fs-info: even / does "
+				    "not stat for \"%s\"", path);
+			break;
+		}
+		*slash = '\0';
 	}
+	if (strcmp(effective_path, path) != 0)
+		debug3("hpn-fs-info: walked \"%s\" -> existing "
+		    "ancestor \"%s\"", path, effective_path);
 
 #ifdef HAVE_STATFS
-	{
-		struct statfs sfs;
-		if (statfs(effective_path, &sfs) == 0)
-			fs_type = fstype_from_magic(
-			    (unsigned long)sfs.f_type);
-		else
-			debug3("hpn-fs-info: statfs \"%s\": %s",
-			    effective_path, strerror(errno));
-	}
+	if (statfs(effective_path, &sfs) == 0)
+		fs_type = fstype_from_magic((unsigned long)sfs.f_type);
+	else
+		debug3("hpn-fs-info: statfs \"%s\": %s",
+		    effective_path, strerror(errno));
 #endif
-
-	{
-		struct statvfs svfs;
-		if (statvfs(effective_path, &svfs) == 0 && svfs.f_bsize > 0)
-			block_size = (uint64_t)svfs.f_bsize;
-	}
+	if (statvfs(effective_path, &svfs) == 0 && svfs.f_bsize > 0)
+		block_size = (uint64_t)svfs.f_bsize;
 
 	if (strcmp(fs_type, "lustre") == 0) {
 		if (lustre_get_stripe(effective_path, &stripe_size,
@@ -947,7 +650,6 @@ sftp_hpn_server_dispatch(u_int id, const char *name,
 			    effective_path);
 		}
 	}
-
 	free(effective_path);
 
 	if ((msg = sshbuf_new()) == NULL)
@@ -963,9 +665,36 @@ sftp_hpn_server_dispatch(u_int id, const char *name,
 		fatal_fr(r, "enqueue");
 	sshbuf_free(msg);
 	free(path);
-	return;
+}
 
- unsupported:
-	free(path);
+/* The HPN extensions by wire name, in the shape of sftp-server.c's own
+ * handler table. */
+static const struct hpn_ext_handler {
+	const char *name;
+	void (*handler)(u_int, struct sshbuf *, struct sshbuf *);
+} hpn_ext_handlers[] = {
+	{ HPN_EXT_FS_INFO,	process_hpn_fs_info },
+	{ HPN_EXT_CHECK_FILE,	process_hpn_check_file },
+	{ HPN_EXT_HASH_RANGE,	process_hpn_hash_range },
+	{ HPN_EXT_FILE_LAYOUT,	process_hpn_file_layout },
+	{ HPN_EXT_BUNDLE_OPEN,	process_hpn_bundle_open },
+	{ HPN_EXT_BUNDLE_FETCH,	process_hpn_bundle_fetch },
+	{ HPN_EXT_DTREE_OPEN,	sftp_hpn_tree_open },
+	{ HPN_EXT_DTREE_READ,	sftp_hpn_tree_read },
+	{ NULL, NULL }
+};
+
+void
+sftp_hpn_server_dispatch(u_int id, const char *name,
+    struct sshbuf *iqueue, struct sshbuf *oqueue)
+{
+	int i;
+
+	for (i = 0; hpn_ext_handlers[i].name != NULL; i++) {
+		if (strcmp(name, hpn_ext_handlers[i].name) == 0) {
+			hpn_ext_handlers[i].handler(id, iqueue, oqueue);
+			return;
+		}
+	}
 	send_status_oqueue(oqueue, id, SSH2_FX_OP_UNSUPPORTED);
 }

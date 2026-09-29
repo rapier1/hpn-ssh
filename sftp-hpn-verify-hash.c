@@ -2,11 +2,12 @@
  * sftp-hpn-verify-hash.c - shared verify hashing primitives for
  * Verify transfer, linked into both the client and the server.
  *
- * The primitive that lives here:
- *   - sftp_hpn_hash_file_ondisk: fsync + posix_fadvise(DONTNEED) + O_DIRECT
- *     read-back of a file, so a verified transfer's guarantee is about bytes
- *     on the platter rather than bytes in the page cache (buffered fallback
- *     where O_DIRECT is unavailable).  The TARGET side of the check.
+ * The primitive that lives here is the hash reader and its one-range
+ * wrapper, sftp_hpn_hash_range_ondisk: an fsync + posix_fadvise(DONTNEED)
+ * + O_DIRECT read-back of a file, so a verified transfer's guarantee is
+ * about bytes on the platter rather than bytes in the page cache
+ * (buffered fallback where O_DIRECT is unavailable).  The TARGET side of
+ * the check.
  *
  * Self-contained (libc + xxhash + log) so it links into both binaries.
  *
@@ -29,6 +30,8 @@
 #include "includes.h"
 
 #include <sys/types.h>
+#include <sys/stat.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -88,43 +91,76 @@ sftp_hpn_fd_set_ondisk(int fd, const char *path)
 	return direct;
 }
 
-int
-sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset, uint64_t length,
-    int ondisk, uint64_t *hash_out, sftp_hpn_readback_progress cb, void *cb_arg)
-{
-	int fd = -1, direct = 0, rc = -1;
-	XXH3_state_t *state = NULL;
-	u_char *buf = NULL;
-	size_t bufsz = HPN_READBACK_BUFSZ;
-	uint64_t remaining, done = 0;
-	ssize_t nread;
+/* The reader behind every hash in this module; see the header. */
+struct sftp_hpn_hash_reader {
+	int		 fd;
+	int		 direct;	/* O_DIRECT in effect */
+	char		*path;		/* for messages */
+	u_char		*buf;		/* HPN_READBACK_BUFSZ, aligned */
+	XXH3_state_t	*state;
+};
 
-	if ((fd = open(path, O_RDONLY | O_NOFOLLOW)) == -1) {
-		error_f("open \"%s\": %s", path, strerror(errno));
+struct sftp_hpn_hash_reader *
+sftp_hpn_hash_reader_open(const char *path, int ondisk, off_t *size_out)
+{
+	struct sftp_hpn_hash_reader *reader;
+	struct stat st;
+	int saved_errno;
+
+	reader = xcalloc(1, sizeof(*reader));
+	reader->path = xstrdup(path);
+	if ((reader->fd = open(path, O_RDONLY)) == -1 ||
+	    fstat(reader->fd, &st) == -1)
+		goto fail;
+	if (posix_memalign((void **)&reader->buf, HPN_READBACK_ALIGN,
+	    HPN_READBACK_BUFSZ) != 0) {
+		reader->buf = NULL;
+		errno = ENOMEM;
+		goto fail;
+	}
+	if ((reader->state = XXH3_createState()) == NULL) {
+		errno = ENOMEM;
+		goto fail;
+	}
+	if (ondisk) {
+		reader->direct = sftp_hpn_fd_set_ondisk(reader->fd, path);
+		debug_f("read-back of \"%s\" via %s", path,
+		    reader->direct ? "O_DIRECT" : "buffered");
+	}
+	if (size_out != NULL)
+		*size_out = st.st_size;
+	return reader;
+ fail:
+	saved_errno = errno;
+	sftp_hpn_hash_reader_close(reader);
+	errno = saved_errno;
+	return NULL;
+}
+
+int
+sftp_hpn_hash_reader_range(struct sftp_hpn_hash_reader *reader,
+    uint64_t offset, uint64_t length, uint64_t *hash_out,
+    sftp_hpn_readback_progress cb, void *cb_arg)
+{
+	uint64_t remaining = length, done = 0;
+	ssize_t nread;
+	int saved_errno;
+
+	if (XXH3_64bits_reset(reader->state) == XXH_ERROR) {
+		error_f("XXH3 reset failed");
+		errno = EIO;
 		return -1;
 	}
-	if (posix_memalign((void **)&buf, HPN_READBACK_ALIGN, bufsz) != 0) {
-		buf = NULL;
-		error_f("posix_memalign failed");
-		goto out;
-	}
-	if (ondisk)
-		direct = sftp_hpn_fd_set_ondisk(fd, path);
-	if ((state = XXH3_createState()) == NULL ||
-	    XXH3_64bits_reset(state) == XXH_ERROR) {
-		error_f("XXH3 state init failed");
-		goto out;
-	}
-
-	/* Range start.  Callers pass O_DIRECT-aligned offsets (verify chunks are
-	 * >=256 MiB, so always block-aligned); offset 0 is the whole-file case. */
-	if (offset != 0 && lseek(fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
-		error_f("lseek \"%s\" to %llu: %s", path,
+	/* nothing to read for an empty range, which hashes to the XXH3 of
+	 * no bytes */
+	if (length > 0 &&
+	    lseek(reader->fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
+		saved_errno = errno;
+		error_f("lseek \"%s\" to %llu: %s", reader->path,
 		    (unsigned long long)offset, strerror(errno));
-		goto out;
+		errno = saved_errno;
+		return -1;
 	}
-
-	remaining = length;
 	while (remaining > 0) {
 		/*
 		 * O_DIRECT requires block-aligned request lengths, so in direct
@@ -132,57 +168,81 @@ sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset, uint64_t length,
 		 * byte count to what remains; a short read at EOF is fine.
 		 * Buffered mode clamps the request itself.
 		 */
-		size_t toread = direct ? bufsz :
-		    (size_t)MINIMUM((uint64_t)bufsz, remaining);
+		size_t toread = reader->direct ? HPN_READBACK_BUFSZ :
+		    (size_t)MINIMUM((uint64_t)HPN_READBACK_BUFSZ, remaining);
 		size_t hbytes;
 
-		nread = read(fd, buf, toread);
+		nread = read(reader->fd, reader->buf, toread);
 #ifdef O_DIRECT
-		if (nread < 0 && direct && errno == EINVAL) {
-			/* O_DIRECT rejected at read time on this fs; drop it
-			 * and retry the same offset with a buffered read. */
-			int fl = fcntl(fd, F_GETFL);
-			if (fl != -1)
-				(void)fcntl(fd, F_SETFL, fl & ~O_DIRECT);
-			direct = 0;
+		if (nread < 0 && reader->direct && errno == EINVAL) {
+			/* O_DIRECT refused at read time, an unaligned offset
+			 * or a filesystem without it; drop it and retry the
+			 * same offset buffered */
+			int flags = fcntl(reader->fd, F_GETFL);
+
+			if (flags != -1)
+				(void)fcntl(reader->fd, F_SETFL,
+				    flags & ~O_DIRECT);
+			reader->direct = 0;
 			continue;
 		}
 #endif
+		/* EOF before length bytes: hash what was read */
 		if (nread == 0)
-			break;	/* EOF before length bytes - hash what we have */
+			break;
 		if (nread < 0) {
-			error_f("read \"%s\": %s", path, strerror(errno));
-			goto out;
+			saved_errno = errno;
+			error_f("read \"%s\": %s", reader->path,
+			    strerror(errno));
+			errno = saved_errno;
+			return -1;
 		}
-		/* never hash past the requested length (length may be < size) */
+		/* never hash past the requested length */
 		hbytes = (uint64_t)nread > remaining ?
 		    (size_t)remaining : (size_t)nread;
-		if (XXH3_64bits_update(state, buf, hbytes) == XXH_ERROR) {
+		if (XXH3_64bits_update(reader->state, reader->buf,
+		    hbytes) == XXH_ERROR) {
 			error_f("XXH3 update failed");
-			goto out;
+			errno = EIO;
+			return -1;
 		}
 		remaining -= (uint64_t)hbytes;
 		done += (uint64_t)hbytes;
 		if (cb != NULL)
 			cb(cb_arg, done);
 	}
-	*hash_out = (uint64_t)XXH3_64bits_digest(state);
-	rc = 0;
- out:
-	if (state != NULL)
-		XXH3_freeState(state);
-	if (fd != -1)
-		close(fd);
-	free(buf);
+	*hash_out = (uint64_t)XXH3_64bits_digest(reader->state);
+	return 0;
+}
+
+void
+sftp_hpn_hash_reader_close(struct sftp_hpn_hash_reader *reader)
+{
+	if (reader == NULL)
+		return;
+	if (reader->state != NULL)
+		XXH3_freeState(reader->state);
+	if (reader->fd != -1)
+		close(reader->fd);
+	free(reader->buf);
+	free(reader->path);
+	free(reader);
+}
+
+/* One range through a reader of its own. */
+int
+sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset, uint64_t length,
+    int ondisk, uint64_t *hash_out, sftp_hpn_readback_progress cb, void *cb_arg)
+{
+	struct sftp_hpn_hash_reader *reader;
+	int rc;
+
+	if ((reader = sftp_hpn_hash_reader_open(path, ondisk, NULL)) == NULL) {
+		error_f("open \"%s\": %s", path, strerror(errno));
+		return -1;
+	}
+	rc = sftp_hpn_hash_reader_range(reader, offset, length, hash_out,
+	    cb, cb_arg);
+	sftp_hpn_hash_reader_close(reader);
 	return rc;
 }
-
-/* Whole-file convenience wrapper: hash [0, length). */
-int
-sftp_hpn_hash_file_ondisk(const char *path, uint64_t length, int ondisk,
-    uint64_t *hash_out, sftp_hpn_readback_progress cb, void *cb_arg)
-{
-	return sftp_hpn_hash_range_ondisk(path, 0, length, ondisk, hash_out,
-	    cb, cb_arg);
-}
-

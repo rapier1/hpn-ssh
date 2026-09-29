@@ -347,16 +347,12 @@ sftp_hpn_hash_remote_file(struct sftp_conn *conn, const char *path,
 	return rc;
 }
 
-/* The whole-file and prefix gates of verified resume: hash the first
- * length bytes of the remote file at remote_path and of the local file
- * behind local_fd, and compare them. One hash-work op of two legs
- * covers the pair; it stays up for the caller's meter bridge and a
- * worker retires it at unit end. The remote leg goes first because a
- * server without hpn-check-file fails it at once, which spares the
- * local hash. Each leg pauses the watchdog for itself; the resume here
- * ends the last one promptly. Returns 1 when the hashes match, 0 when
- * they differ, or -1 when either leg failed, which that leg has
- * already reported. */
+/* One hash-work op of two legs covers the pair; it stays up for the
+ * caller's meter bridge and a worker retires it at unit end. The remote
+ * leg goes first because a server without hpn-check-file fails it at
+ * once, which spares the local hash. Each leg pauses the watchdog for
+ * itself; the resume here ends the last one promptly. A failed leg has
+ * already reported itself. */
 int
 sftp_hpn_prefix_match(struct sftp_conn *conn, int local_fd,
     const char *remote_path, uint64_t length)
@@ -944,9 +940,8 @@ sftp_hpn_try_chunked_resume_download(struct sftp_conn *conn, int local_fd,
 	    0, file_size, dest_size, /*local_is_target=*/1, "verified resume");
 }
 
-/* Resolve the auto-repair settings for a connection or a fleet from the
- * one control, the -X VerifyRepair=no token, so the serial and parallel
- * paths cannot drift. */
+/* Repair is on unless the token turned it off, and the attempt cap is
+ * the fixed VERIFY_REPAIR_ATTEMPTS. */
 void
 sftp_hpn_verify_repair_resolve(int no_verify_repair_cli, int *enabled_out,
     int *attempts_out)
@@ -1000,16 +995,12 @@ verify_repair_one_pass(struct sftp_conn *conn, const char *local_path,
 	return rc;
 }
 
-/* Verify the range [off, off + len) of local_path against remote_path
- * and, on a mismatch with repair enabled, repair and re-verify up to
- * max_attempts times. The first verify may use the caller's teed source
- * hash; every re-verify reads the destination back from disk. Two
- * identical failed destination hashes in a row mean the repair keeps
- * writing the same bad bytes, so the loop stops early; so does a SIGINT
- * between attempts, leaving the range as the last attempt wrote it.
- * Returns 0 when verified, with *repaired_out set when a repair ran, 1
- * when mismatched and not repaired, or -1 when the range could not be
- * verified at all. */
+/* Verify, then repair and re-verify up to max_attempts times. The first
+ * verify may use the caller's teed source hash; every re-verify reads
+ * the destination back from disk. Two identical failed destination
+ * hashes in a row mean the repair keeps writing the same bad bytes, so
+ * the loop stops early; so does a SIGINT between attempts, leaving the
+ * range as the last attempt wrote it. */
 int
 sftp_hpn_verify_repair_range(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, int local_is_target, off_t off, off_t len,
@@ -1096,11 +1087,9 @@ sftp_hpn_verify_repair_range(struct sftp_conn *conn, const char *local_path,
 	return 1;
 }
 
-/* The whole-file form: stat both ends and compare the sizes before any
- * hashing, since each side would hash [0, len) from one size and a
- * shorter or longer destination would otherwise pass. A size difference
- * is a mismatch that is reported, not repaired; the range repair handles
- * corruption inside a same-size copy. An empty pair matches. Otherwise
+/* Stat both ends and compare the sizes before any hashing: each side
+ * would hash [0, len) from one size, so a shorter or longer destination
+ * would otherwise pass. An empty pair matches without hashing. Otherwise
  * the whole file goes to the range form. */
 int
 sftp_hpn_verify_repair_file(struct sftp_conn *conn, const char *local_path,
