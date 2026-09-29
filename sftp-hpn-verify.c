@@ -204,7 +204,7 @@ hash_reply_wait(struct sftp_conn *conn, const char *name, const char *path,
 		}
 		if (type != SSH2_FXP_EXTENDED_REPLY) {
 			sftp_conn_die(conn, "%s \"%s\": expected "
-			    "SSH2_FXP_EXTENDED_REPLY(%u), got %u",
+			    "SSH2_FXP_EXTENDED_REPLY(%u), got %d",
 			    name, path, SSH2_FXP_EXTENDED_REPLY, type);
 			return -1;
 		}
@@ -240,7 +240,7 @@ hash_reply_wait(struct sftp_conn *conn, const char *name, const char *path,
 			 * late reply would desync it, so the connection is
 			 * failed instead. */
 			sftp_conn_die(conn, "%s \"%s\": server hash made no "
-			    "progress for %u seconds", name, path,
+			    "progress for %d seconds", name, path,
 			    HPN_VERIFY_PROGRESS_STALL_SEC);
 			return -1;
 		}

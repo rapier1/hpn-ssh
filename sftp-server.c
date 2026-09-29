@@ -205,7 +205,7 @@ static const struct sftp_handler extended_handlers[] = {
 	    process_extended_home_directory, 0 },
 	{ "users-groups-by-id", "users-groups-by-id@openssh.com", 0,
 	    process_extended_get_users_groups_by_id, 0 },
-	{ "hpn-check-file", "hpn-check-file@hpnssh.org", 0,
+	{ "hpn-check-file", HPN_EXT_CHECK_FILE, 0,
 	    process_hpn_check_file, 0 },
 	{ "sftp-hash-range", HPN_EXT_HASH_RANGE, 0,
 	    process_hpn_hash_range, 0 },
@@ -911,7 +911,7 @@ process_init(void)
 	compose_extension(msg, "copy-data", "1");
 	compose_extension(msg, "home-directory", "1");
 	compose_extension(msg, "users-groups-by-id@openssh.com", "1");
-	compose_extension(msg, "hpn-check-file@hpnssh.org", "1");
+	compose_extension(msg, HPN_EXT_CHECK_FILE, "1");
 	compose_extension(msg, HPN_EXT_HASH_RANGE, "1");
 	compose_extension(msg, HPN_EXT_FS_INFO, "1");
 	/* The read-only tree walk, advertised unconditionally like fs-info.

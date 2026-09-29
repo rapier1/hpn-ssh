@@ -709,7 +709,7 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_GETUSERSGROUPS_BY_ID;
 			known = 1;
-		} else if (strcmp(name, "hpn-check-file@hpnssh.org") == 0 &&
+		} else if (strcmp(name, HPN_EXT_CHECK_FILE) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_HPN_CHECK_FILE;
 			known = 1;
