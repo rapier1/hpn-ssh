@@ -61,7 +61,9 @@ int sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset,
  * reader holds the open file, its on-disk mode, one aligned read buffer and
  * one XXH3 state, so a many-range request opens and allocates once.  open
  * returns NULL with errno set, and gives the file's size in *size_out when
- * that is non-NULL.  range hashes [offset, offset+length) with the same
+ * that is non-NULL.  attach wraps an fd the caller already has, reads it
+ * buffered, and leaves it open at close; `path` is for messages.  range
+ * hashes [offset, offset+length) with the same
  * rules as sftp_hpn_hash_range_ondisk; cb, when set, gets the bytes hashed
  * so far in this range; it returns 0 with *hash_out set or -1 with errno
  * set.  close takes NULL.
@@ -69,6 +71,8 @@ int sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset,
 struct sftp_hpn_hash_reader;
 struct sftp_hpn_hash_reader *sftp_hpn_hash_reader_open(const char *path,
     int ondisk, off_t *size_out);
+struct sftp_hpn_hash_reader *sftp_hpn_hash_reader_attach(int fd,
+    const char *path);
 int sftp_hpn_hash_reader_range(struct sftp_hpn_hash_reader *reader,
     uint64_t offset, uint64_t length, uint64_t *hash_out,
     sftp_hpn_readback_progress cb, void *cb_arg);

@@ -87,6 +87,7 @@ LTESTS= 	connect \
 		sftp-hpn-config \
 		sftp-worker-log-dir \
 		sftp-verify \
+		sftp-chunked-resume \
 		reconfigure \
 		dynamic-forward \
 		forwarding \
@@ -149,14 +150,15 @@ SFTP_TESTS=	sftp sftp-chroot sftp-cmds sftp-badcmds sftp-batch \
 		sftp-glob sftp-perm sftp-resume sftp-verified-resume sftp-uri \
 		sftp-parallel sftp-parallel-resume sftp-parallel-respawn \
 		sftp-parallel-tput sftp-bundle sftp-range-split sftp-hpn-config \
-		sftp-worker-log-dir sftp-verify
+		sftp-worker-log-dir sftp-verify sftp-chunked-resume
 SCP_TESTS=	scp scp3 scp-uri scp-resume
 HPN_TESTS=	connect-mptcp connect-happy-eyeballs connect-memlimit \
 		connect-fallback connect-metrics connect-none-cipher \
 		connect-tcprcvbufpoll transfer-mt-ciphers scp-resume \
 		sftp-verified-resume sftp-parallel sftp-parallel-resume \
 		sftp-parallel-respawn sftp-parallel-tput sftp-bundle \
-		sftp-range-split sftp-hpn-config sftp-worker-log-dir sftp-verify
+		sftp-range-split sftp-hpn-config sftp-worker-log-dir sftp-verify \
+		sftp-chunked-resume
 TRANSPORT_TESTS=	connect connect-mptcp connect-happy-eyeballs \
 		connect-memlimit connect-fallback connect-metrics \
 		connect-none-cipher connect-tcprcvbufpoll transfer \
@@ -164,7 +166,7 @@ TRANSPORT_TESTS=	connect connect-mptcp connect-happy-eyeballs \
 		proto-version proto-mismatch stderr-data stderr-after-eof \
 		broken-pipe yes-head
 RESUME_TESTS=	sftp-resume sftp-verified-resume scp-resume \
-		sftp-parallel-resume sftp-verify
+		sftp-parallel-resume sftp-verify sftp-chunked-resume
 PARALLEL_TESTS=	sftp-parallel sftp-parallel-resume sftp-parallel-respawn \
 		sftp-parallel-tput sftp-range-split sftp-worker-log-dir \
 		sftp-bundle

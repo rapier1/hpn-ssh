@@ -49,8 +49,10 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-hpn-server.h"
+#include "sftp-server-internal.h"	/* the helpers exported to HPN */
 #include "sftp-hpn-bundle-server.h"	/* HPN_EXT_BUNDLE_* + bundle dispatch */
 #include "sftp-hpn-tree.h"		/* tree walk extension names */
+#include "sftp-hpn-tree-server.h"	/* tree walk handlers */
 
 
 char *sftp_realpath(const char *, char *); /* sftp-realpath.c */
@@ -152,15 +154,7 @@ static void process_extended_expand(uint32_t id);
 static void process_extended_copy_data(uint32_t id);
 static void process_extended_home_directory(uint32_t id);
 static void process_extended_get_users_groups_by_id(uint32_t id);
-static void process_extended_hpn_check_file(uint32_t id);
-static void process_extended_sftp_hash_range(uint32_t id);
-static void process_extended_hpn_fs_info(uint32_t id);
-static void process_extended_hpn_bundle_open(uint32_t id);
 static void process_extended_hpn_bundle_cap(uint32_t id);
-static void process_extended_hpn_bundle_fetch(uint32_t id);
-static void process_extended_hpn_file_layout(uint32_t id);
-static void process_extended_hpn_dtree_open(uint32_t id);
-static void process_extended_hpn_dtree_read(uint32_t id);
 static void process_extended(uint32_t id);
 
 struct sftp_handler {
@@ -212,23 +206,23 @@ static const struct sftp_handler extended_handlers[] = {
 	{ "users-groups-by-id", "users-groups-by-id@openssh.com", 0,
 	    process_extended_get_users_groups_by_id, 0 },
 	{ "hpn-check-file", "hpn-check-file@hpnssh.org", 0,
-	    process_extended_hpn_check_file, 0 },
+	    process_hpn_check_file, 0 },
 	{ "sftp-hash-range", HPN_EXT_HASH_RANGE, 0,
-	    process_extended_sftp_hash_range, 0 },
+	    process_hpn_hash_range, 0 },
 	{ "hpn-fs-info", HPN_EXT_FS_INFO, 0,
-	    process_extended_hpn_fs_info, 0 },
+	    process_hpn_fs_info, 0 },
 	{ "hpn-bundle", HPN_EXT_BUNDLE, 0,
 	    process_extended_hpn_bundle_cap, 1 },
 	{ "hpn-bundle-open", HPN_EXT_BUNDLE_OPEN, 0,
-	    process_extended_hpn_bundle_open, 1 },
+	    process_hpn_bundle_open, 1 },
 	{ "hpn-bundle-fetch", HPN_EXT_BUNDLE_FETCH, 0,
-	    process_extended_hpn_bundle_fetch, 0 },
+	    process_hpn_bundle_fetch, 0 },
 	{ "hpn-file-layout", HPN_EXT_FILE_LAYOUT, 0,
-	    process_extended_hpn_file_layout, 1 },
+	    process_hpn_file_layout, 1 },
 	{ "hpn-dtree-open", HPN_EXT_DTREE_OPEN, 0,
-	    process_extended_hpn_dtree_open, 0 },
+	    sftp_hpn_tree_open, 0 },
 	{ "hpn-dtree-read", HPN_EXT_DTREE_READ, 0,
-	    process_extended_hpn_dtree_read, 0 },
+	    sftp_hpn_tree_read, 0 },
 	{ NULL, NULL, 0, NULL, 0 }
 };
 
@@ -310,7 +304,7 @@ request_permitted(const struct sftp_handler *h)
 	return 1;
 }
 
-static int
+int
 errno_to_portable(int unixerrno)
 {
 	int ret = 0;
@@ -701,7 +695,7 @@ get_handle(struct sshbuf *queue, int *hp)
 
 /* send replies */
 
-static void
+void
 send_msg(struct sshbuf *m)
 {
 	int r;
@@ -755,7 +749,7 @@ send_status_errmsg(uint32_t id, uint32_t status, const char *errmsg)
 	sshbuf_free(msg);
 }
 
-static void
+void
 send_status(uint32_t id, uint32_t status)
 {
 	send_status_errmsg(id, status, NULL);
@@ -784,7 +778,7 @@ send_data(uint32_t id, const u_char *data, int dlen)
 	send_data_or_handle(SSH2_FXP_DATA, id, data, dlen);
 }
 
-static void
+void
 send_handle(uint32_t id, int handle)
 {
 	u_char *string;
@@ -930,7 +924,7 @@ process_init(void)
 	 * extensions don't show up in SSH_FXP_VERSION at all - clients
 	 * see no advertisement and use the per-file path.  Dispatchers
 	 * also refuse the ops defensively in case a client somehow tries. */
-	if (sftp_hpn_server_bundle_enabled()) {
+	if (sftp_server_hpn_use_bundle()) {
 		compose_extension(msg, HPN_EXT_BUNDLE, "1");
 		compose_extension(msg, HPN_EXT_BUNDLE_FETCH, "1");
 	}
@@ -1041,10 +1035,9 @@ process_read(uint32_t id)
 	debug("request %u: read \"%s\" (handle %d) off %llu len %u",
 	    id, handle_to_name(handle), handle, (unsigned long long)off, len);
 
-	/* Phase 5 (download bundling): READs on a fetch-mode bundle handle
-	 * return bytes from the pre-packed tar accumulator rather than
-	 * reading from an OS file descriptor. */
-	if (sftp_hpn_server_is_bundle_handle(handle)) {
+	/* READs on a fetch-mode bundle handle return bytes from the
+	 * pre-packed tar accumulator rather than an OS file descriptor. */
+	if (handle_is_bundle(handle)) {
 		size_t got = 0;
 		if (len > SFTP_MAX_READ_LENGTH)
 			len = SFTP_MAX_READ_LENGTH;
@@ -1119,7 +1112,7 @@ process_write(uint32_t id)
 
 	/* Bundle handles feed the WRITE payload to the bundle parser, which
 	 * extracts the entries as they arrive. */
-	if (sftp_hpn_server_is_bundle_handle(handle)) {
+	if (handle_is_bundle(handle)) {
 		status = sftp_hpn_server_bundle_write(handle, off, data, len);
 		send_status(id, status);
 		free(data);
@@ -2062,57 +2055,7 @@ process_extended_get_users_groups_by_id(uint32_t id)
 	sshbuf_free(msg);
 }
 
-/*
- * hpn-check-file@hpnssh.org dispatch wrapper.  The real implementation
- * lives in sftp-hpn-server.c so sftp-server.c carries a minimal diff
- * against upstream OpenSSH.
- */
-static void
-process_extended_hpn_check_file(uint32_t id)
-{
-	sftp_hpn_server_dispatch(id, HPN_EXT_CHECK_FILE, iqueue, oqueue);
-}
-
-/*
- * sftp-hash-range@hpnssh.org dispatch wrapper.  The real implementation
- * lives in sftp-hpn-server.c so sftp-server.c carries a minimal diff
- * against upstream OpenSSH.
- */
-static void
-process_extended_sftp_hash_range(uint32_t id)
-{
-	sftp_hpn_server_dispatch(id, HPN_EXT_HASH_RANGE, iqueue, oqueue);
-}
-
-static void
-process_extended_hpn_fs_info(uint32_t id)
-{
-	sftp_hpn_server_dispatch(id, HPN_EXT_FS_INFO, iqueue, oqueue);
-}
-
-/* Chunked tree walk dispatch wrappers. The handlers live in
- * sftp-hpn-tree-server.c. */
-static void
-process_extended_hpn_dtree_open(uint32_t id)
-{
-	sftp_hpn_server_dispatch(id, HPN_EXT_DTREE_OPEN, iqueue, oqueue);
-}
-
-static void
-process_extended_hpn_dtree_read(uint32_t id)
-{
-	sftp_hpn_server_dispatch(id, HPN_EXT_DTREE_READ, iqueue, oqueue);
-}
-
-/* Phase 5: hpn-bundle-open@hpnssh.org dispatch wrapper.  The real
- * implementation lives in sftp-hpn-server.c. */
-static void
-process_extended_hpn_bundle_open(uint32_t id)
-{
-	sftp_hpn_server_dispatch(id, HPN_EXT_BUNDLE_OPEN, iqueue, oqueue);
-}
-
-/* Phase 5: capability-only advertisement.  Clients never send a request
+/* Capability-only advertisement.  Clients never send a request
  * named hpn-bundle@hpnssh.org - they send hpn-bundle-open instead.  This
  * stub exists so compose_extension's handler-lookup-or-fatal can find a
  * registration when advertising the capability in process_init(). */
@@ -2122,26 +2065,6 @@ process_extended_hpn_bundle_cap(uint32_t id)
 	error("hpn-bundle@hpnssh.org received as a request; clients should "
 	    "send hpn-bundle-open@hpnssh.org");
 	send_status(id, SSH2_FX_OP_UNSUPPORTED);
-}
-
-/* Phase 5 (download side): hpn-bundle-fetch@hpnssh.org dispatch wrapper.
- * Client supplies a list of remote paths + base_dir; server reads them,
- * packs into a tar buffer via libarchive write, allocates a bundle handle
- * holding the buffer, replies with SSH_FXP_HANDLE.  Client then drains via
- * SSH_FXP_READ (process_read routes bundle-handle reads to
- * sftp_hpn_server_bundle_read) and closes the handle when done. */
-static void
-process_extended_hpn_bundle_fetch(uint32_t id)
-{
-	sftp_hpn_server_dispatch(id, HPN_EXT_BUNDLE_FETCH, iqueue, oqueue);
-}
-
-/* hpn-file-layout@hpnssh.org dispatch wrapper.  The real implementation
- * lives in sftp-hpn-server.c (process_hpn_file_layout). */
-static void
-process_extended_hpn_file_layout(uint32_t id)
-{
-	sftp_hpn_server_dispatch(id, HPN_EXT_FILE_LAYOUT, iqueue, oqueue);
 }
 
 static void

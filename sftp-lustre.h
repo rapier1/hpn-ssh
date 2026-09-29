@@ -29,24 +29,29 @@
 #include <stdint.h>
 
 /*
- * Apply a simple RAID0 stripe to an open directory or freshly-created file FD.
- * Returns HPN_FILE_LAYOUT_OK/_NOT_FS/_PERM/_FAIL; on OK *applied_count is set to
- * the requested count (Lustre clamps silently to the OST count).
+ * The layout status for the errno of a failed layout call: a filesystem
+ * that cannot take the layout, not Lustre or without composite support,
+ * answers HPN_FILE_LAYOUT_NOT_FS, a site that forbids it _PERM, and
+ * anything else _FAIL.  The setters here and the server's directory open
+ * share it, so every failure maps the same way.
  */
-uint32_t lustre_set_stripe_fd(int fd, uint32_t requested_count,
-    uint32_t *applied_count);
+uint32_t lustre_layout_status(int err);
 
 /*
- * Apply a composite TIERED layout to an open directory FD (the no-MDT
- * replacement for Data-on-MDT): [0, small_threshold) on a single OST
- * (stripe_count=1), [small_threshold, EOF) striped RAID0 across overflow_count
- * OSTs.  Small files land wholly in the stripe-1 component (one OST, no
- * over-striping, no MDT data); large files stripe wide.  Written via
- * fsetxattr("lustre.lov") (LL_IOC_LOV_SETSTRIPE rejects composite layouts).
- * Returns HPN_FILE_LAYOUT_OK/_NOT_FS/_PERM/_FAIL.
+ * Set the layout a directory should get, the one policy for both ends of a
+ * transfer: a tiered composite when small_threshold is above zero and the
+ * filesystem takes it - [0, small_threshold) on one OST, the rest striped
+ * across stripe_count - otherwise, or when the composite is refused, a
+ * plain stripe_count-wide RAID0 stripe.  The _fd form works on an open
+ * directory, the server's case; the _path form opens it, for the client's
+ * local destination (download parity).  Returns HPN_FILE_LAYOUT_OK/_NOT_FS/
+ * _PERM/_FAIL and reports the count applied and the HPN_FILE_LAYOUT_KIND_*
+ * set.  Off Linux both answer NOT_FS.
  */
-uint32_t lustre_set_tiered_layout_fd(int fd, uint32_t small_threshold,
-    uint32_t overflow_count);
+uint32_t lustre_set_layout_fd(int fd, uint32_t stripe_count,
+    uint32_t small_threshold, uint32_t *applied_out, uint32_t *kind_out);
+uint32_t lustre_set_layout_path(const char *dir, uint32_t stripe_count,
+    uint32_t small_threshold, uint32_t *applied_out, uint32_t *kind_out);
 
 /*
  * Read a directory's default OST stripe geometry (count + size) via
@@ -56,18 +61,5 @@ uint32_t lustre_set_tiered_layout_fd(int fd, uint32_t small_threshold,
  */
 int lustre_get_stripe(const char *path, uint64_t *stripe_size,
     uint32_t *stripe_count);
-
-/*
- * Path conveniences over the fd variants above, for the CLIENT side
- * (download parity): the orchestrator writes the local destination itself,
- * so it applies layout directly to a just-created local directory instead of
- * asking a server over the wire.  Open the directory read-only, delegate to
- * the fd variant, close.  Return the fd variant's HPN_FILE_LAYOUT_* code;
- * an unopenable path maps to HPN_FILE_LAYOUT_FAIL.
- */
-uint32_t lustre_set_stripe_path(const char *dir, uint32_t requested_count,
-    uint32_t *applied_count);
-uint32_t lustre_set_tiered_layout_path(const char *dir,
-    uint32_t small_threshold, uint32_t overflow_count);
 
 #endif /* _SFTP_LUSTRE_H */

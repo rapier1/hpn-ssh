@@ -40,6 +40,26 @@
 #include "sftp-hpn-server.h"	/* HPN_FILE_LAYOUT_* */
 #include "sftp-lustre.h"
 
+/* The layout status for the errno of a failed layout call. */
+uint32_t
+lustre_layout_status(int err)
+{
+	switch (err) {
+	case ENOTTY:
+#ifdef ENODATA
+	case ENODATA:
+#endif
+	case EINVAL:
+	case EOPNOTSUPP:   /* == ENOTSUP: non-Lustre, or composite/PFL unsupported */
+		return HPN_FILE_LAYOUT_NOT_FS;
+	case EPERM:
+	case EACCES:
+		return HPN_FILE_LAYOUT_PERM;
+	default:
+		return HPN_FILE_LAYOUT_FAIL;
+	}
+}
+
 /*
  * Lustre is a Linux-only filesystem: the layout ABI uses Linux ioctls and the
  * Linux xattr API (fsetxattr/getxattr).  Build the real implementation only on
@@ -145,7 +165,7 @@ struct hpn_lov_comp_md_v1 {
  * value, since the actual landed-on-disk count is what subsequent file
  * creates will inherit).
  */
-uint32_t
+static uint32_t
 lustre_set_stripe_fd(int fd, uint32_t requested_count,
     uint32_t *applied_count)
 {
@@ -165,17 +185,7 @@ lustre_set_stripe_fd(int fd, uint32_t requested_count,
 	}
 	if (applied_count != NULL)
 		*applied_count = 0;
-	switch (errno) {
-	case ENOTTY:
-	case EINVAL:
-	case EOPNOTSUPP:
-		return HPN_FILE_LAYOUT_NOT_FS;
-	case EPERM:
-	case EACCES:
-		return HPN_FILE_LAYOUT_PERM;
-	default:
-		return HPN_FILE_LAYOUT_FAIL;
-	}
+	return lustre_layout_status(errno);
 }
 
 /*
@@ -205,7 +215,7 @@ lustre_set_stripe_fd(int fd, uint32_t requested_count,
  * + two 32B lov_user_md_v1 sub-layouts = 192B.  Returns HPN_FILE_LAYOUT_OK /
  * _NOT_FS (composite/PFL unsupported, or not Lustre) / _PERM / _FAIL.
  */
-uint32_t
+static uint32_t
 lustre_set_tiered_layout_fd(int fd, uint32_t small_threshold,
     uint32_t overflow_count)
 {
@@ -258,18 +268,7 @@ lustre_set_tiered_layout_fd(int fd, uint32_t small_threshold,
 
 	if (fsetxattr(fd, "lustre.lov", buf, sizeof(buf), 0) == 0)
 		return HPN_FILE_LAYOUT_OK;
-	switch (errno) {
-	case ENOTTY:
-	case ENODATA:
-	case EINVAL:
-	case EOPNOTSUPP:   /* == ENOTSUP: non-Lustre, or composite/PFL unsupported */
-		return HPN_FILE_LAYOUT_NOT_FS;
-	case EPERM:
-	case EACCES:
-		return HPN_FILE_LAYOUT_PERM;
-	default:
-		return HPN_FILE_LAYOUT_FAIL;
-	}
+	return lustre_layout_status(errno);
 }
 
 /*
@@ -371,44 +370,9 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size, uint32_t *stripe_coun
 	return 0;
 }
 
-/*
- * Path wrappers over the fd setters, for the CLIENT side (download parity).
- * The download orchestrator writes the local destination itself, so it
- * applies layout directly to the just-created local directory - no wire
- * extension involved.  O_DIRECTORY makes a non-directory path fail at open
- * rather than inside the xattr call.
- */
-uint32_t
-lustre_set_stripe_path(const char *dir, uint32_t requested_count,
-    uint32_t *applied_count)
-{
-	uint32_t rc;
-	int fd = open(dir, O_RDONLY | O_DIRECTORY);
-
-	if (fd == -1)
-		return HPN_FILE_LAYOUT_FAIL;
-	rc = lustre_set_stripe_fd(fd, requested_count, applied_count);
-	close(fd);
-	return rc;
-}
-
-uint32_t
-lustre_set_tiered_layout_path(const char *dir, uint32_t small_threshold,
-    uint32_t overflow_count)
-{
-	uint32_t rc;
-	int fd = open(dir, O_RDONLY | O_DIRECTORY);
-
-	if (fd == -1)
-		return HPN_FILE_LAYOUT_FAIL;
-	rc = lustre_set_tiered_layout_fd(fd, small_threshold, overflow_count);
-	close(fd);
-	return rc;
-}
-
 #else /* !__linux__ -- no Lustre off Linux; stub the API so the build links */
 
-uint32_t
+static uint32_t
 lustre_set_stripe_fd(int fd, uint32_t requested_count, uint32_t *applied_count)
 {
 	(void)fd; (void)requested_count;
@@ -417,7 +381,7 @@ lustre_set_stripe_fd(int fd, uint32_t requested_count, uint32_t *applied_count)
 	return HPN_FILE_LAYOUT_NOT_FS;
 }
 
-uint32_t
+static uint32_t
 lustre_set_tiered_layout_fd(int fd, uint32_t small_threshold,
     uint32_t overflow_count)
 {
@@ -433,22 +397,40 @@ lustre_get_stripe(const char *path, uint64_t *stripe_size,
 	return 0;
 }
 
-uint32_t
-lustre_set_stripe_path(const char *dir, uint32_t requested_count,
-    uint32_t *applied_count)
-{
-	(void)dir; (void)requested_count;
-	if (applied_count != NULL)
-		*applied_count = 0;
-	return HPN_FILE_LAYOUT_NOT_FS;
-}
-
-uint32_t
-lustre_set_tiered_layout_path(const char *dir, uint32_t small_threshold,
-    uint32_t overflow_count)
-{
-	(void)dir; (void)small_threshold; (void)overflow_count;
-	return HPN_FILE_LAYOUT_NOT_FS;
-}
-
 #endif /* __linux__ */
+
+uint32_t
+lustre_set_layout_fd(int fd, uint32_t stripe_count, uint32_t small_threshold,
+    uint32_t *applied_out, uint32_t *kind_out)
+{
+	*kind_out = HPN_FILE_LAYOUT_KIND_STRIPE;
+	*applied_out = 0;
+	/* a tiered composite when asked for and the filesystem takes it */
+	if (small_threshold > 0 && lustre_set_tiered_layout_fd(fd,
+	    small_threshold, stripe_count) == HPN_FILE_LAYOUT_OK) {
+		*kind_out = HPN_FILE_LAYOUT_KIND_TIERED;
+		*applied_out = stripe_count;
+		return HPN_FILE_LAYOUT_OK;
+	}
+	/* otherwise, or when the composite is refused, a plain stripe */
+	return lustre_set_stripe_fd(fd, stripe_count, applied_out);
+}
+
+uint32_t
+lustre_set_layout_path(const char *dir, uint32_t stripe_count,
+    uint32_t small_threshold, uint32_t *applied_out, uint32_t *kind_out)
+{
+	uint32_t rc;
+	int fd;
+
+	/* O_DIRECTORY fails a non-directory at the open, not in the call */
+	if ((fd = open(dir, O_RDONLY | O_DIRECTORY)) == -1) {
+		*kind_out = HPN_FILE_LAYOUT_KIND_STRIPE;
+		*applied_out = 0;
+		return lustre_layout_status(errno);
+	}
+	rc = lustre_set_layout_fd(fd, stripe_count, small_threshold,
+	    applied_out, kind_out);
+	close(fd);
+	return rc;
+}

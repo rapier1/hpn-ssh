@@ -94,11 +94,36 @@ sftp_hpn_fd_set_ondisk(int fd, const char *path)
 /* The reader behind every hash in this module; see the header. */
 struct sftp_hpn_hash_reader {
 	int		 fd;
+	int		 owns_fd;	/* opened here, so closed here */
 	int		 direct;	/* O_DIRECT in effect */
 	char		*path;		/* for messages */
 	u_char		*buf;		/* HPN_READBACK_BUFSZ, aligned */
 	XXH3_state_t	*state;
 };
+
+/* The buffer and hash state every reader needs, on an fd it does not
+ * yet have. Returns NULL with errno ENOMEM. */
+static struct sftp_hpn_hash_reader *
+hash_reader_new(const char *path)
+{
+	struct sftp_hpn_hash_reader *reader;
+
+	reader = xcalloc(1, sizeof(*reader));
+	reader->fd = -1;
+	reader->path = xstrdup(path);
+	if (posix_memalign((void **)&reader->buf, HPN_READBACK_ALIGN,
+	    HPN_READBACK_BUFSZ) != 0) {
+		reader->buf = NULL;
+		goto fail;
+	}
+	if ((reader->state = XXH3_createState()) == NULL)
+		goto fail;
+	return reader;
+ fail:
+	sftp_hpn_hash_reader_close(reader);
+	errno = ENOMEM;
+	return NULL;
+}
 
 struct sftp_hpn_hash_reader *
 sftp_hpn_hash_reader_open(const char *path, int ondisk, off_t *size_out)
@@ -107,20 +132,15 @@ sftp_hpn_hash_reader_open(const char *path, int ondisk, off_t *size_out)
 	struct stat st;
 	int saved_errno;
 
-	reader = xcalloc(1, sizeof(*reader));
-	reader->path = xstrdup(path);
+	if ((reader = hash_reader_new(path)) == NULL)
+		return NULL;
+	reader->owns_fd = 1;
 	if ((reader->fd = open(path, O_RDONLY)) == -1 ||
-	    fstat(reader->fd, &st) == -1)
-		goto fail;
-	if (posix_memalign((void **)&reader->buf, HPN_READBACK_ALIGN,
-	    HPN_READBACK_BUFSZ) != 0) {
-		reader->buf = NULL;
-		errno = ENOMEM;
-		goto fail;
-	}
-	if ((reader->state = XXH3_createState()) == NULL) {
-		errno = ENOMEM;
-		goto fail;
+	    fstat(reader->fd, &st) == -1) {
+		saved_errno = errno;
+		sftp_hpn_hash_reader_close(reader);
+		errno = saved_errno;
+		return NULL;
 	}
 	if (ondisk) {
 		reader->direct = sftp_hpn_fd_set_ondisk(reader->fd, path);
@@ -130,11 +150,17 @@ sftp_hpn_hash_reader_open(const char *path, int ondisk, off_t *size_out)
 	if (size_out != NULL)
 		*size_out = st.st_size;
 	return reader;
- fail:
-	saved_errno = errno;
-	sftp_hpn_hash_reader_close(reader);
-	errno = saved_errno;
-	return NULL;
+}
+
+struct sftp_hpn_hash_reader *
+sftp_hpn_hash_reader_attach(int fd, const char *path)
+{
+	struct sftp_hpn_hash_reader *reader;
+
+	if ((reader = hash_reader_new(path)) == NULL)
+		return NULL;
+	reader->fd = fd;
+	return reader;
 }
 
 int
@@ -173,6 +199,8 @@ sftp_hpn_hash_reader_range(struct sftp_hpn_hash_reader *reader,
 		size_t hbytes;
 
 		nread = read(reader->fd, reader->buf, toread);
+		if (nread < 0 && errno == EINTR)
+			continue;
 #ifdef O_DIRECT
 		if (nread < 0 && reader->direct && errno == EINVAL) {
 			/* O_DIRECT refused at read time, an unaligned offset
@@ -222,7 +250,7 @@ sftp_hpn_hash_reader_close(struct sftp_hpn_hash_reader *reader)
 		return;
 	if (reader->state != NULL)
 		XXH3_freeState(reader->state);
-	if (reader->fd != -1)
+	if (reader->owns_fd && reader->fd != -1)
 		close(reader->fd);
 	free(reader->buf);
 	free(reader->path);

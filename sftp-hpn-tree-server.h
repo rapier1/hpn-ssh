@@ -32,11 +32,6 @@
 
 struct sshbuf;
 
-/* Tree handles live in sftp-server.c's handle table as HANDLE_TREE. The
- * close hook in sftp-hpn-server.c tests for one with the predicate and
- * calls the close below instead of the fd path. */
-int sftp_hpn_tree_is_handle(int handle);
-
 /* Free a tree handle and its open directories. Returns the SSH2_FX_*
  * status for the caller to send. */
 int sftp_hpn_tree_close(int handle);
@@ -45,9 +40,7 @@ int sftp_hpn_tree_close(int handle);
  * SSH2_FXP_HANDLE, or SSH2_FXP_STATUS on failure. dtree-read replies with
  * one or more SSH2_FXP_EXTENDED_REPLY messages, or SSH2_FXP_STATUS for a
  * bad handle. */
-void sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue,
-    struct sshbuf *oqueue);
-void sftp_hpn_tree_read(u_int id, struct sshbuf *iqueue,
-    struct sshbuf *oqueue);
+void sftp_hpn_tree_open(uint32_t id);
+void sftp_hpn_tree_read(uint32_t id);
 
 #endif /* _SFTP_HPN_TREE_SERVER_H */

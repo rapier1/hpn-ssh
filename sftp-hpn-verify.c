@@ -55,11 +55,6 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
-/* Read buffer for local hashing, and the bytes hashed between watchdog
- * refreshes and progress reports. */
-#define HASH_RANGE_READ_BUF_LEN	65536
-#define HASH_REFRESH_BYTES	((uint64_t)64 * 1024 * 1024)
-
 /* Chunked resume tunables. CHUNK_SIZE is the re-transfer granularity: at
  * 64 MiB the per-chunk protocol cost, 16 bytes of request and 8 of reply,
  * is negligible next to a missed chunk's transfer. Below MIN_FILE_SIZE
@@ -91,88 +86,49 @@ struct sftp_hash_range {
 	uint64_t	len;
 };
 
-/* Hash [offset, offset + length) of an open fd with streaming XXH3. A
- * short read hashes what was read: a caller comparing against the peer's
- * hash of the full range then sees a mismatch, which is the right answer
- * for a truncated file. The watchdog is paused for the hash and the
- * pause refreshed every HASH_REFRESH_BYTES, along with a report of
- * progress_base plus the bytes hashed so far to the hash-work op, whose
- * leg base the caller sets. Returns 0 with the hash in *hash_out, or -1
- * on a seek, read or hash-state error. Leaves the fd positioned after
- * the last byte read. */
+/* Progress for a local hash: each buffer the reader hashes renews the
+ * watchdog pause and reports base plus the bytes so far to the hash-work
+ * op, whose leg base the caller sets. */
+struct local_hash_progress {
+	struct sftp_conn	*conn;
+	uint64_t		 base;
+};
+
+static void
+local_hash_progress(void *arg, uint64_t done)
+{
+	struct local_hash_progress *p = arg;
+
+	sftp_conn_watchdog_pause(p->conn, HPN_HEARTBEAT_REFRESH_SEC);
+	sftp_conn_hash_op_progress(p->conn, p->base + done);
+}
+
+/* Hash [offset, offset + length) of an open fd, buffered, through the
+ * shared hash reader. A short read hashes what was read: a caller
+ * comparing against the peer's hash of the full range then sees a
+ * mismatch, which is the right answer for a truncated file. Hashing a
+ * large file can be minutes of wire silence, so the watchdog is paused
+ * here and the pause renewed as the bytes go by; a single window set
+ * before the call would expire mid-hash. progress_base plus the bytes
+ * hashed so far goes to the hash-work op. Returns 0 with the hash in
+ * *hash_out, or -1 on a seek, read or hash-state error. Leaves the fd
+ * positioned after the last byte read. */
 static int
 sftp_hpn_xxhash_local_range(struct sftp_conn *conn, int fd, uint64_t offset,
     uint64_t length, uint64_t progress_base, uint64_t *hash_out)
 {
-	XXH3_state_t *state;
-	u_char buf[HASH_RANGE_READ_BUF_LEN];
-	uint64_t remaining = length;
-	uint64_t since_refresh = 0;
-	ssize_t nread;
-	int rc = -1;
+	struct sftp_hpn_hash_reader *reader;
+	struct local_hash_progress progress = { conn, progress_base };
+	int rc;
 
-	/* error checking */
-	if (hash_out == NULL || fd < 0) {
-		errno = EINVAL;
+	if ((reader = sftp_hpn_hash_reader_attach(fd, "local file")) == NULL) {
+		error_f("hash reader: %s", strerror(errno));
 		return -1;
 	}
-	if ((state = XXH3_createState()) == NULL) {
-		error_f("XXH3_createState failed");
-		return -1;
-	}
-	if (XXH3_64bits_reset(state) == XXH_ERROR) {
-		error_f("XXH3_64bits_reset failed");
-		goto out;
-	}
-	if (lseek(fd, (off_t)offset, SEEK_SET) == (off_t)-1) {
-		error_f("lseek to %llu: %s",
-		    (unsigned long long)offset, strerror(errno));
-		goto out;
-	}
-
-	/* Hashing a large file can be minutes of wire silence. Declare the
-	 * pause here and refresh it as the bytes go by: a single window set
-	 * before the call would expire mid-hash and the watchdog would kill
-	 * a worker that is working. */
 	sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-
-	/* read the fd in BUF_LEN chunks */
-	while (remaining > 0) {
-		size_t toread = (size_t)MINIMUM((uint64_t)sizeof(buf),
-		    remaining);
-
-		nread = read(fd, buf, toread);
-		if (nread == 0)
-			break;	/* short read, hash what we got */
-		if (nread < 0) {
-			if (errno == EINTR)
-				continue;
-			error_f("read at offset %llu: %s",
-			    (unsigned long long)(offset + length - remaining),
-			    strerror(errno));
-			goto out;
-		}
-		if (XXH3_64bits_update(state, buf, (size_t)nread)
-		    == XXH_ERROR) {
-			error_f("XXH3_64bits_update failed");
-			goto out;
-		}
-		remaining -= (uint64_t)nread;
-		since_refresh += (uint64_t)nread;
-		/* Renew the pause declared above and report progress. */
-		if (since_refresh >= HASH_REFRESH_BYTES) {
-			sftp_conn_watchdog_pause(conn,
-			    HPN_HEARTBEAT_REFRESH_SEC);
-			sftp_conn_hash_op_progress(conn,
-			    progress_base + (length - remaining));
-			since_refresh = 0;
-		}
-	}
-
-	*hash_out = (uint64_t)XXH3_64bits_digest(state);
-	rc = 0;
- out:
-	XXH3_freeState(state);
+	rc = sftp_hpn_hash_reader_range(reader, offset, length, hash_out,
+	    local_hash_progress, &progress);
+	sftp_hpn_hash_reader_close(reader);
 	return rc;
 }
 

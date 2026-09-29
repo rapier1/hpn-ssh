@@ -58,6 +58,7 @@
 #include "sftp.h"
 #include "sftp-hpn-bundle.h"	/* HPN_BUNDLE_FLAG_* */
 #include "sftp-hpn-bundle-server.h"
+#include "sftp-server-internal.h"	/* send_status, send_handle */
 #include "sftp-hpn-tar.h"
 #include "sftp-hpn-bundle-pool.h"	/* shared writer pool (extract overlap) */
 
@@ -105,17 +106,6 @@ struct hpn_bundle_state {
 	uint64_t fetch_total_size;  /* sum of declared file sizes (logged) */
 };
 
-/* HPN operator toggles parsed from argv (-B and -O) in sftp-server.c. */
-extern int    sftp_server_hpn_use_bundle(void);
-extern int    sftp_server_hpn_writer_pool(void);
-
-/* Bundle slots of the handle table, implemented in sftp-server.c so this
- * file needs nothing of the table internals. */
-extern int    handle_new_bundle(void *opaque);
-extern void  *handle_get_bundle(int handle);
-extern void   handle_free_bundle(int handle);
-extern int    handle_is_bundle(int handle);
-
 /* Parser callbacks, the path-safety check and the state destructor,
  * defined below. */
 static int bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
@@ -130,50 +120,6 @@ static const struct sftp_hpn_tar_callbacks bundle_upload_callbacks = {
 	.data_cb      = bundle_upload_data_cb,
 	.entry_end_cb = bundle_upload_entry_end_cb,
 };
-
-/* Compose and enqueue an SSH_FXP_STATUS failure reply on oqueue. Shared
- * by the fail labels of both extended-request handlers, which differ
- * only in the tag used for the fatal log line. */
-static void
-bundle_send_status_failure(struct sshbuf *oqueue, u_int id, int status,
-    const char *tag)
-{
-	struct sshbuf *msg;
-	int r;
-
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_STATUS)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_u32(msg, (u_int)status)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "")) != 0)
-		fatal_fr(r, "compose %s", tag);
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue %s", tag);
-	sshbuf_free(msg);
-}
-
-/* Compose and enqueue the SSH_FXP_HANDLE reply both extended-request
- * handlers send on success. */
-static void
-bundle_send_handle_reply(struct sshbuf *oqueue, u_int id, int handle)
-{
-	struct sshbuf *msg;
-	u_char hbuf[sizeof(uint32_t)];
-	int r;
-
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	put_u32(hbuf, (uint32_t)handle);
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_HANDLE)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_string(msg, hbuf, sizeof(hbuf))) != 0)
-		fatal_fr(r, "compose handle reply");
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue handle reply");
-	sshbuf_free(msg);
-}
 
 /* Allocate the state for an upload handle: the parser and, when the
  * operator allows it and the client did not opt out, the writer pool.
@@ -258,20 +204,6 @@ bundle_state_free(struct hpn_bundle_state *state)
 	sftp_hpn_tar_writer_free(state->writer);
 	free(state->dest_dir);
 	free(state);
-}
-
-/* Is this handle a bundle? */
-int
-sftp_hpn_server_is_bundle_handle(int handle)
-{
-	return handle_is_bundle(handle);
-}
-
-/* Did the operator leave bundles on (HPNUseBundle)? */
-int
-sftp_hpn_server_bundle_enabled(void)
-{
-	return sftp_server_hpn_use_bundle();
 }
 
 /* Join dest_dir and an entry path into a malloc'd destination path. An
@@ -666,7 +598,7 @@ sftp_hpn_server_bundle_close(int handle)
  * upload handle and replies with SSH_FXP_HANDLE, or with SSH_FXP_STATUS
  * on failure. */
 void
-process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
+process_hpn_bundle_open(uint32_t id)
 {
 	char *dest_dir = NULL;
 	uint32_t flags = 0;
@@ -676,7 +608,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 
 	/* Refuse when HPNUseBundle is off. The extension is not advertised
 	 * then, but a client may still try. */
-	if (!sftp_hpn_server_bundle_enabled()) {
+	if (!sftp_server_hpn_use_bundle()) {
 		debug_f("hpn-bundle-open: refused, HPNUseBundle=no");
 		status = SSH2_FX_OP_UNSUPPORTED;
 		goto fail;
@@ -695,10 +627,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		saved_errno = errno;
 		error_f("hpn-bundle-open: mkdir_p \"%s\": %s",
 		    dest_dir, strerror(saved_errno));
-		if (saved_errno == ENOENT)
-			status = SSH2_FX_NO_SUCH_FILE;
-		else if (saved_errno == EACCES)
-			status = SSH2_FX_PERMISSION_DENIED;
+		status = errno_to_portable(saved_errno);
 		goto fail;
 	}
 	if ((state = bundle_state_new(dest_dir, flags)) == NULL) {
@@ -710,12 +639,12 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		bundle_state_free(state);
 		goto fail;
 	}
-	bundle_send_handle_reply(oqueue, id, handle);
+	send_handle(id, handle);
 	free(dest_dir);
 	return;
 
  fail:
-	bundle_send_status_failure(oqueue, id, status, "bundle open failure");
+	send_status(id, status);
 	free(dest_dir);
 }
 
@@ -728,7 +657,7 @@ process_hpn_bundle_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
  * sees the missing record and fetches that file on its own. A file that
  * fails while being packed fails the bundle in bundle_read. */
 void
-process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
+process_hpn_bundle_fetch(uint32_t id)
 {
 	uint32_t flags = 0, n_paths = 0, n_queued = 0, i;
 	char **paths = NULL;
@@ -739,7 +668,7 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	int r, status = SSH2_FX_FAILURE;
 
 	/* Refuse when HPNUseBundle is off, as in bundle-open. */
-	if (!sftp_hpn_server_bundle_enabled()) {
+	if (!sftp_server_hpn_use_bundle()) {
 		debug_f("hpn-bundle-fetch: refused, HPNUseBundle=no");
 		status = SSH2_FX_OP_UNSUPPORTED;
 		goto fail;
@@ -815,7 +744,7 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	debug_f("hpn-bundle-fetch: handle=%d queued=%u of %u total_size=%llu",
 	    handle, n_queued, n_paths,
 	    (unsigned long long)state->fetch_total_size);
-	bundle_send_handle_reply(oqueue, id, handle);
+	send_handle(id, handle);
 	for (i = 0; i < n_paths; i++)
 		free(paths[i]);
 	free(paths);
@@ -828,5 +757,5 @@ process_hpn_bundle_fetch(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 			free(paths[i]);
 	}
 	free(paths);
-	bundle_send_status_failure(oqueue, id, status, "bundle-fetch failure");
+	send_status(id, status);
 }

@@ -22,16 +22,10 @@
  * Server-side HPN extension handlers are isolated here so that
  * sftp-server.c carries a minimal diff against upstream.
  *
- * Current extensions (Phase 3):
- *   hpn-fs-info@hpnssh.org - returns filesystem type and stripe geometry
- *     for a given path, allowing the client to align byte-range parallel
- *     transfers to Lustre/GPFS stripe boundaries.
- *
- * Upstream merge note: sftp-server.c gains only:
- *   #include "sftp-hpn-server.h"
- *   sftp_hpn_server_dispatch() calls in the SSH2_FXP_EXTENDED dispatch
- *   block (extensions are registered in the extended_handlers[] table
- *   at the top of sftp-server.c, which routes by name to dispatch).
+ * Upstream merge note: sftp-server.c's extended_handlers[] table names
+ * the HPN handlers declared here and in the bundle and tree headers
+ * directly; they have upstream's handler shape, so no wrapper sits
+ * between the table and them.
  */
 
 #ifndef _SFTP_SERVER_HPN_H
@@ -53,27 +47,39 @@
 #define SFTP_HASH_RANGE_MAX_RANGES	65536
 
 /*
- * hpn-file-layout@hpnssh.org wire format (revision 1):
+ * hpn-fs-info@hpnssh.org wire format:
+ *
+ *   request:  string path
+ *
+ *   reply:    string fs_type       "lustre", "gpfs", "xfs", "ext4", "nfs",
+ *                                  "tmpfs", "btrfs" or "unknown"
+ *             uint64 stripe_size   bytes per stripe; 0 off Lustre
+ *             uint32 stripe_count  stripes (OSTs); 0 off Lustre
+ *             uint64 block_size    optimal I/O block size, always set
+ *
+ * A path that does not exist yet is answered for its first existing
+ * ancestor.  A malformed request gets SSH2_FX_BAD_MESSAGE.
+ */
+
+/*
+ * hpn-file-layout@hpnssh.org wire format:
  *
  *   request:  string path
  *             uint32 stripe_count   (0 = "use all available" per Lustre lfs -c 0)
- *             uint32 small_threshold (rev 2; 0 = plain stripe.  >0 requests a
+ *             uint32 small_threshold (0 = plain stripe.  >0 requests a
  *                                    tiered composite layout: [0,small_threshold)
  *                                    on a single OST (stripe_count=1),
  *                                    [small_threshold,EOF) striped across
- *                                    stripe_count OSTs.  A rev-1 client omits
- *                                    this; the server defaults it to 0.  Before
- *                                    19.0 this field was the Data-on-MDT
- *                                    component size; same wire u32.)
+ *                                    stripe_count OSTs.)
  *
  *   reply:    uint32 status         (0 = applied, non-zero = error code; see below)
  *             uint32 applied_count  (what the server actually set; may be
  *                                    clamped below the requested value if the
  *                                    filesystem has fewer OSTs than requested,
  *                                    zero on any error)
- *             uint32 layout_kind    (rev 2; 0 = plain stripe, 1 = tiered
- *                                    composite.  Absent from a rev-1 server;
- *                                    client treats a missing field as 0.)
+ *             uint32 layout_kind    (HPN_FILE_LAYOUT_KIND_STRIPE or
+ *                                    HPN_FILE_LAYOUT_KIND_TIERED: the layout
+ *                                    actually set)
  *
  * Status values:
  *   0                          - applied successfully; applied_count valid
@@ -99,6 +105,10 @@
 #define HPN_FILE_LAYOUT_PERM      2u
 #define HPN_FILE_LAYOUT_FAIL      3u
 
+/* The layout_kind values of an hpn-file-layout reply. */
+#define HPN_FILE_LAYOUT_KIND_STRIPE	0u	/* plain RAID0 stripe */
+#define HPN_FILE_LAYOUT_KIND_TIERED	1u	/* tiered composite */
+
 /*
  * hpn-check-file@hpnssh.org wire format (19.0):
  *
@@ -118,10 +128,10 @@
 /*
  * Heartbeat protocol for long-running HPN hash extensions (19.0):
  *
- * Server-side hash loops (process_extended_hpn_check_file in sftp-server.c
- * and process_hpn_hash_range in this file) emit a tiny "still working"
- * reply on the SFTP out-queue every HPN_HEARTBEAT_EMIT_INTERVAL_SEC seconds
- * of elapsed wall time inside the inner read+hash loop.  The client treats
+ * The server's hash handlers, process_hpn_check_file and
+ * process_hpn_hash_range in sftp-hpn-server.c, emit a tiny "still working"
+ * reply on the SFTP out-queue every HPN_HASH_HEARTBEAT_INTERVAL_SEC seconds
+ * of elapsed wall time while they hash.  The client treats
  * each heartbeat as proof of life and refreshes the orchestrator's
  * watchdog-pause window to HPN_HEARTBEAT_REFRESH_SEC from now.
  *
@@ -178,36 +188,23 @@
 
 struct sshbuf;
 
-/* Helpers shared with the other HPN server modules. */
-u_int errno_to_sftp_status(int e);
-void send_status_oqueue(struct sshbuf *oqueue, u_int id, u_int status);
-void flush_oqueue_blocking(struct sshbuf *oqueue);
+/* Send what is queued on sftp-server.c's oqueue now, during a handler;
+ * shared with the tree walk. The other reply helpers are upstream's,
+ * through sftp-server-internal.h. */
+void flush_oqueue_blocking(void);
+
+/* The extension handlers, in the shape of sftp-server.c's own: each reads
+ * its request from iqueue and replies through send_msg or send_status.
+ * Wire formats above. */
+void process_hpn_fs_info(uint32_t id);
+void process_hpn_check_file(uint32_t id);
+void process_hpn_hash_range(uint32_t id);
+void process_hpn_file_layout(uint32_t id);
 
 /* Close hook for the handles the HPN modules own, bundle and tree.
  * Returns 1 and sets *status when handle was one of them, so
  * sftp-server.c's CLOSE sends that status instead of taking its fd
  * path. Returns 0 for a FILE or DIR handle. */
 int sftp_hpn_server_close_handle(int handle, int *status);
-
-/*
- * Dispatch an HPN extension request from sftp-server.c's
- * SSH2_FXP_EXTENDED handler.  The caller has already routed by
- * extension name (via the extended_handlers[] table in sftp-server.c),
- * so this entry point switches on `name` to call the right HPN-side
- * handler.
- *
- *   id      - SFTP request ID from the client
- *   name    - extension name string (one of HPN_EXT_*)
- *   iqueue  - input buffer (positioned after the extension name)
- *   oqueue  - output buffer for the reply
- */
-void sftp_hpn_server_dispatch(u_int id, const char *name,
-    struct sshbuf *iqueue, struct sshbuf *oqueue);
-
-/* Bundle handle dispatch (sftp_hpn_server_bundle_*, _is_bundle_handle,
- * _enabled) moved to sftp-hpn-bundle-server.h on 2026-05-31 alongside the
- * bundle code itself.  sftp-server.c now includes both this header (for the
- * dispatcher + hash-range / file-layout decls) and
- * sftp-hpn-bundle-server.h (for the bundle ones). */
 
 #endif /* _SFTP_SERVER_HPN_H */

@@ -57,15 +57,9 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-hpn-server.h"
+#include "sftp-server-internal.h"	/* send_msg, send_status, send_handle */
 #include "sftp-hpn-tree.h"
 #include "sftp-hpn-tree-server.h"
-
-/* Tree slots of the handle table, implemented in sftp-server.c so this
- * file needs nothing of the table internals. */
-extern int    handle_new_tree(void *opaque);
-extern void  *handle_get_tree(int handle);
-extern void   handle_free_tree(int handle);
-extern int    handle_is_tree(int handle);
 
 /* Records buffered per reply message before it is written out. */
 #define DTREE_MSG_RECORDS	256
@@ -104,7 +98,6 @@ struct hpn_tree_state {
  * request, against the limit the client asked for. */
 struct tree_emit {
 	u_int		 id;
-	struct sshbuf	*oqueue;
 	struct sshbuf	*recbuf;
 	uint32_t	 count;
 	uint32_t	 sent;
@@ -132,10 +125,9 @@ tree_flush(struct tree_emit *emit, u_char kind)
 	    (r = sshbuf_put_u32(msg, emit->count)) != 0 ||
 	    (r = sshbuf_putb(msg, emit->recbuf)) != 0)
 		fatal_fr(r, "compose tree message");
-	if ((r = sshbuf_put_stringb(emit->oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue tree message");
+	send_msg(msg);
 	sshbuf_free(msg);
-	flush_oqueue_blocking(emit->oqueue);
+	flush_oqueue_blocking();
 	sshbuf_reset(emit->recbuf);
 	emit->count = 0;
 }
@@ -286,7 +278,7 @@ tree_entry(struct hpn_tree_state *state, struct tree_emit *emit,
 
 	if (lstat(child_abs, &st) != 0) {
 		tree_add(emit, child_rel, HPN_DTREE_REC_ERROR, NULL,
-		    errno_to_sftp_status(errno));
+		    errno_to_portable(errno));
 		goto done;
 	}
 	if (S_ISLNK(st.st_mode) && !state->follow) {
@@ -296,7 +288,7 @@ tree_entry(struct hpn_tree_state *state, struct tree_emit *emit,
 	}
 	if (S_ISLNK(st.st_mode) && !tree_resolve_link(child_abs, &st)) {
 		tree_add(emit, child_rel, HPN_DTREE_REC_ERROR, NULL,
-		    errno_to_sftp_status(errno));
+		    errno_to_portable(errno));
 		goto done;
 	}
 	stat_to_attrib(&st, &attrs);
@@ -320,7 +312,7 @@ tree_entry(struct hpn_tree_state *state, struct tree_emit *emit,
 			return;
 		} else {
 			tree_add(emit, child_rel, HPN_DTREE_REC_ERROR, NULL,
-			    errno_to_sftp_status(errno));
+			    errno_to_portable(errno));
 		}
 	} else if (S_ISREG(st.st_mode)) {
 		tree_add(emit, child_rel, HPN_DTREE_REC_REG, &attrs, 0);
@@ -352,7 +344,7 @@ tree_walk_batch(struct hpn_tree_state *state, struct tree_emit *emit)
 				    strerror(errno));
 				tree_add(emit, level->relpath,
 				    HPN_DTREE_REC_ERROR, NULL,
-				    errno_to_sftp_status(errno));
+				    errno_to_portable(errno));
 			}
 			tree_pop(state);
 			continue;
@@ -368,34 +360,6 @@ tree_state_free(struct hpn_tree_state *state)
 	while (state->depth >= 0)
 		tree_pop(state);
 	free(state);
-}
-
-/* Compose and enqueue the SSH2_FXP_HANDLE reply for a new tree. */
-static void
-tree_send_handle(struct sshbuf *oqueue, u_int id, int handle)
-{
-	struct sshbuf	*msg;
-	u_char		 hbuf[sizeof(uint32_t)];
-	int		 r;
-
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
-	put_u32(hbuf, (uint32_t)handle);
-	if ((r = sshbuf_put_u8(msg, SSH2_FXP_HANDLE)) != 0 ||
-	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_string(msg, hbuf, sizeof(hbuf))) != 0)
-		fatal_fr(r, "compose handle reply");
-	if ((r = sshbuf_put_stringb(oqueue, msg)) != 0)
-		fatal_fr(r, "enqueue handle reply");
-	sshbuf_free(msg);
-}
-
-/* True when handle is an open tree walk. The close hook uses it to route
- * CLOSE here instead of the fd path. */
-int
-sftp_hpn_tree_is_handle(int handle)
-{
-	return handle_is_tree(handle);
 }
 
 /* Close a tree handle: shut every directory still open on the walk's
@@ -419,7 +383,7 @@ sftp_hpn_tree_close(int handle)
  * root fails the request with a status rather than starting a walk
  * that emits one error. */
 void
-sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
+sftp_hpn_tree_open(uint32_t id)
 {
 	struct hpn_tree_state	*state;
 	struct stat		 st;
@@ -431,7 +395,7 @@ sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	if ((r = sshbuf_get_cstring(iqueue, &root, NULL)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &flags)) != 0) {
 		error_f("parse hpn-dtree-open request: %s", ssh_err(r));
-		send_status_oqueue(oqueue, id, SSH2_FX_BAD_MESSAGE);
+		send_status(id, SSH2_FX_BAD_MESSAGE);
 		free(root);
 		return;
 	}
@@ -443,7 +407,7 @@ sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 	if (stat(root, &st) != 0) {
-		status = errno_to_sftp_status(errno);
+		status = errno_to_portable(errno);
 		goto fail;
 	}
 	if (!S_ISDIR(st.st_mode)) {
@@ -456,7 +420,7 @@ sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	state->depth = -1;
 	relpath = xstrdup("");
 	if (tree_push(state, root, relpath) != 0) {
-		status = errno_to_sftp_status(errno);
+		status = errno_to_portable(errno);
 		free(state);
 		free(relpath);
 		goto fail;
@@ -469,11 +433,11 @@ sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 		goto fail;
 	}
 	tree_handle = handle;
-	tree_send_handle(oqueue, id, handle);
+	send_handle(id, handle);
 	return;
 
  fail:
-	send_status_oqueue(oqueue, id, status);
+	send_status(id, status);
 	free(root);
 }
 
@@ -483,7 +447,7 @@ sftp_hpn_tree_open(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
  * replies END again. Zero, or more than HPN_DTREE_MAX_BATCH, means the
  * maximum. */
 void
-sftp_hpn_tree_read(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
+sftp_hpn_tree_read(uint32_t id)
 {
 	struct hpn_tree_state	*state;
 	struct tree_emit	 emit;
@@ -495,13 +459,13 @@ sftp_hpn_tree_read(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	if ((r = sshbuf_get_string(iqueue, &hbuf, &hlen)) != 0 ||
 	    (r = sshbuf_get_u32(iqueue, &max_records)) != 0) {
 		error_f("parse hpn-dtree-read request: %s", ssh_err(r));
-		send_status_oqueue(oqueue, id, SSH2_FX_BAD_MESSAGE);
+		send_status(id, SSH2_FX_BAD_MESSAGE);
 		free(hbuf);
 		return;
 	}
 	if (hlen != sizeof(uint32_t)) {
 		error_f("hpn-dtree-read: bad handle length %zu", hlen);
-		send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
+		send_status(id, SSH2_FX_FAILURE);
 		free(hbuf);
 		return;
 	}
@@ -509,7 +473,7 @@ sftp_hpn_tree_read(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	free(hbuf);
 	if ((state = handle_get_tree(handle)) == NULL) {
 		error_f("hpn-dtree-read: handle %d is not an open tree", handle);
-		send_status_oqueue(oqueue, id, SSH2_FX_FAILURE);
+		send_status(id, SSH2_FX_FAILURE);
 		return;
 	}
 	if (max_records == 0 || max_records > HPN_DTREE_MAX_BATCH)
@@ -518,7 +482,6 @@ sftp_hpn_tree_read(u_int id, struct sshbuf *iqueue, struct sshbuf *oqueue)
 	    max_records);
 
 	emit.id = id;
-	emit.oqueue = oqueue;
 	emit.count = 0;
 	emit.sent = 0;
 	emit.limit = max_records;

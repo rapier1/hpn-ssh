@@ -171,7 +171,8 @@ maybe_apply_lustre_layout(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		 * auto-tuning); -v recovers it.  PERM/FAIL below stay loud. */
 		debug("Lustre auto-stripe: \"%s\" -> %s "
 		    "(stripe_count %u)", dst,
-		    layout_kind ? "tiered composite" : "plain stripe", applied);
+		    layout_kind == HPN_FILE_LAYOUT_KIND_TIERED ?
+		    "tiered composite" : "plain stripe", applied);
 		break;
 	case HPN_FILE_LAYOUT_NOT_FS:
 		debug_f("Lustre auto-stripe: \"%s\" reports not on a "
@@ -197,7 +198,7 @@ maybe_apply_lustre_layout(struct sftp_parallel *fleet, struct sftp_conn *conn,
 /*
  * Local twin of maybe_apply_lustre_layout for DOWNLOADS.  The destination
  * directory is on a LOCAL filesystem and this process is the writer, so the
- * layout is applied directly (sftp-lustre.c path wrappers) instead of via
+ * layout is applied directly (lustre_set_layout_path) instead of via
  * the hpn-file-layout wire extension.  The policy block mirrors the upload
  * side exactly: HPNLustreStripeCount 0=disabled, unset(<0)=tiered composite
  * sized to n_workers, explicit N=plain N-stripe with the exact-match skip
@@ -220,6 +221,7 @@ maybe_apply_lustre_layout_local(struct sftp_parallel *fleet,
 	uint32_t l_scount = 0;
 	uint32_t small_threshold;
 	uint32_t applied = 0;
+	uint32_t layout_kind = HPN_FILE_LAYOUT_KIND_STRIPE;
 	uint32_t rc;
 	int configured;
 	int n_workers;
@@ -252,18 +254,16 @@ maybe_apply_lustre_layout_local(struct sftp_parallel *fleet,
 	    ? stripe_to_small_threshold(l_ssize)
 	    : 0;
 
-	rc = use_tiered
-	    ? lustre_set_tiered_layout_path(dst, small_threshold,
-	        (uint32_t)desired)
-	    : lustre_set_stripe_path(dst, (uint32_t)desired, &applied);
+	rc = lustre_set_layout_path(dst, (uint32_t)desired, small_threshold,
+	    &applied, &layout_kind);
 	switch (rc) {
 	case HPN_FILE_LAYOUT_OK:
 		/* Success is silent at default verbosity, mirroring the wire
 		 * variant above; PERM stays loud. */
 		debug("Lustre auto-stripe (experimental): local \"%s\" -> %s "
 		    "(stripe_count %u)", dst,
-		    use_tiered ? "tiered composite" : "plain stripe",
-		    use_tiered ? (uint32_t)desired : applied);
+		    layout_kind == HPN_FILE_LAYOUT_KIND_TIERED ?
+		    "tiered composite" : "plain stripe", applied);
 		break;
 	case HPN_FILE_LAYOUT_NOT_FS:
 		debug_f("Lustre auto-stripe (local): \"%s\" not on a "
