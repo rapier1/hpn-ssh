@@ -681,15 +681,10 @@ chunked_reconcile_span(struct sftp_conn *conn, int local_fd,
 
 	n_chunks = (u_int)((slen + CHUNK_HASH_CHUNK_SIZE - 1) /
 	    CHUNK_HASH_CHUNK_SIZE);
-	ranges = calloc(n_chunks, sizeof(*ranges));
-	local_hashes = calloc(n_chunks, sizeof(*local_hashes));
-	remote_hashes = calloc(n_chunks, sizeof(*remote_hashes));
-	differs = calloc(n_chunks, sizeof(*differs));
-	if (ranges == NULL || local_hashes == NULL || remote_hashes == NULL ||
-	    differs == NULL) {
-		error_f("calloc for %u chunks failed", n_chunks);
-		goto out;
-	}
+	ranges = xcalloc(n_chunks, sizeof(*ranges));
+	local_hashes = xcalloc(n_chunks, sizeof(*local_hashes));
+	remote_hashes = xcalloc(n_chunks, sizeof(*remote_hashes));
+	differs = xcalloc(n_chunks, sizeof(*differs));
 
 	/* Lay the chunks over the span. The last one clamps to the span end,
 	 * as the server clamps its hash, so the two line up. */

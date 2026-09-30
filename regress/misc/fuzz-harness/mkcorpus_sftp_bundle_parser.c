@@ -1,10 +1,10 @@
 /*
- * mkcorpus_sftp_tar_parser.c - generate seed corpus for
- * sftp_tar_parser_fuzz by driving the in-tree bundle-codec *writer*
- * (sftp-hpn-tar.c) to emit valid streams.
+ * mkcorpus_sftp_bundle_parser.c - generate seed corpus for
+ * sftp_bundle_parser_fuzz by driving the in-tree bundle-codec *writer*
+ * (sftp-hpn-bundle-codec.c) to emit valid streams.
  *
  * The codec is a length-prefixed binary record stream, not tar (see
- * sftp-hpn-tar.c).  Parser and writer are a matched pair, so a stream
+ * sftp-hpn-bundle-codec.c).  Parser and writer are a matched pair, so a stream
  * the writer produces is exactly the shape the parser expects - the
  * ideal starting point from which the fuzzer mutates.  Building the
  * corpus this way also smoke-exercises the writer end-to-end with a
@@ -15,10 +15,10 @@
  *
  * The writer opens and reads real files, so we stage temp files under a
  * scratch dir, pack them, capture the produced bytes, and drop each
- * stream as a seed in ./sftp_tar_parser_corpus/.
+ * stream as a seed in ./sftp_bundle_parser_corpus/.
  *
  * Built with plain CFLAGS (no sanitizer/fuzzer) and links
- * ../../../sftp-hpn-tar.o.  Invoked by the Makefile `corpus` target and
+ * ../../../sftp-hpn-bundle-codec.o.  Invoked by the Makefile `corpus` target and
  * by oss-fuzz's build.sh.
  */
 
@@ -34,9 +34,9 @@
 #include <err.h>
 #include <time.h>
 
-#include "sftp-hpn-tar.h"
+#include "sftp-hpn-bundle-codec.h"
 
-#define CORPUS_DIR "sftp_tar_parser_corpus"
+#define CORPUS_DIR "sftp_bundle_parser_corpus"
 #define SCRATCH    CORPUS_DIR "/.scratch"
 
 struct file_spec {
@@ -66,30 +66,30 @@ stage_file(int idx, size_t sz, char *out, size_t outlen)
 	close(fd);
 }
 
-/* Pack the given specs into one tar stream and write it as a seed. */
+/* Pack the given specs into one bundle stream and write it as a seed. */
 static void
 write_seed(const char *seed, const struct file_spec *specs, int n)
 {
-	struct sftp_hpn_tar_writer *w = sftp_hpn_tar_writer_new();
+	struct sftp_hpn_bundle_writer *w = sftp_hpn_bundle_writer_new();
 	if (w == NULL)
 		errx(1, "writer_new");
 
 	char disk[512];
 	for (int i = 0; i < n; i++) {
 		stage_file(i, specs[i].size, disk, sizeof(disk));
-		if (sftp_hpn_tar_writer_add_file(w, disk, specs[i].name,
-		    specs[i].mode, (uint64_t)specs[i].size, (time_t)1000000000)
-		    < 0) {
+		if (sftp_hpn_bundle_writer_add_file(w, disk, specs[i].name,
+		    specs[i].mode, (uint64_t)specs[i].size, (time_t)1000000000,
+		    NULL, NULL) < 0) {
 			/* A spec the writer legitimately rejects (e.g. an
 			 * over-long name) is not seed-worthy; skip the whole
 			 * seed rather than emit a truncated stream. */
 			fprintf(stderr, "  %s: writer rejected \"%s\", skipping seed\n",
 			    seed, specs[i].name);
-			sftp_hpn_tar_writer_free(w);
+			sftp_hpn_bundle_writer_free(w);
 			return;
 		}
 	}
-	sftp_hpn_tar_writer_finish(w);
+	sftp_hpn_bundle_writer_finish(w);
 
 	char path[512];
 	snprintf(path, sizeof(path), "%s/%s", CORPUS_DIR, seed);
@@ -99,17 +99,17 @@ write_seed(const char *seed, const struct file_spec *specs, int n)
 
 	u_char buf[8192];
 	for (;;) {
-		ssize_t got = sftp_hpn_tar_writer_pack_next(w, buf, sizeof(buf));
+		ssize_t got = sftp_hpn_bundle_writer_pack_next(w, buf, sizeof(buf));
 		if (got < 0)
 			errx(1, "pack_next: %s",
-			    sftp_hpn_tar_writer_error(w));
+			    sftp_hpn_bundle_writer_error(w));
 		if (got == 0)
 			break;   /* EOA + trailing zero blocks emitted */
 		if (fwrite(buf, (size_t)got, 1, f) != 1)
 			err(1, "fwrite %s", path);
 	}
 	fclose(f);
-	sftp_hpn_tar_writer_free(w);
+	sftp_hpn_bundle_writer_free(w);
 }
 
 int

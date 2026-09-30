@@ -3568,15 +3568,11 @@ if test "x$enable_sk" = "xyes" -a "x$enable_sk_internal" != "xno" ; then
 	fi
 fi
 
-# ── Phase 5: bundle codec ─────────────────────────────────────────────────
-# 2026-05-31: libarchive removed in favour of the in-tree USTAR codec
-# (sftp-hpn-tar.{c,h}).  The codec is pure C99 with no external library
-# dependencies - no configure check needed.  See
-# project_libarchive_removal.md for rationale (streaming impedance
-# mismatch fixed; security surface reduced; we used ~5% of libarchive).
+# The bundle codec (sftp-hpn-bundle-codec.{c,h}) replaced libarchive. It is
+# plain C99 with no external dependency, so there is nothing to check for;
+# LIBARCHIVE stays empty for the link lines that still name it.
 LIBARCHIVE=""
 AC_SUBST([LIBARCHIVE])
-# ── END Phase 5 ──────────────────────────────────────────────────────────
 
 # Check for standalone SecurityKeyProvider
 AC_MSG_CHECKING([whether to build standalone sk-libfido2])

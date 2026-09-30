@@ -737,14 +737,13 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 			known = 1;
 		} else if (strcmp(name, "hpn-bundle@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
-			/* Phase 5: server can accept tar-format bundles via
-			 * the hpn-bundle-open@hpnssh.org extension. */
+			/* the server accepts bundle uploads through
+			 * hpn-bundle-open@hpnssh.org */
 			ret->exts |= SFTP_EXT_HPN_BUNDLE;
 			known = 1;
 		} else if (strcmp(name, "hpn-bundle-fetch@hpnssh.org") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
-			/* Phase 5: server can produce tar-format bundles from
-			 * a list of paths via hpn-bundle-fetch@hpnssh.org. */
+			/* the server packs a bundle from a list of paths */
 			ret->exts |= SFTP_EXT_HPN_BUNDLE_FETCH;
 			known = 1;
 		} else if (strcmp(name, "hpn-file-layout@hpnssh.org") == 0 &&

@@ -20,7 +20,7 @@
  *
  * Upload, hpn-bundle-open@hpnssh.org: process_hpn_bundle_open creates
  * the handle, sftp_hpn_server_bundle_write feeds each WRITE payload to
- * the sftp-hpn-tar.h parser, and the parser callbacks (entry_cb,
+ * the sftp-hpn-bundle-codec.h parser, and the parser callbacks (entry_cb,
  * data_cb, entry_end_cb) extract the entries. With the writer pool
  * active, the default, each file is buffered whole and handed to a
  * pool thread. With it off the callbacks open, write and close inline.
@@ -28,7 +28,7 @@
  * joins the pool and releases the state.
  *
  * Download, hpn-bundle-fetch@hpnssh.org: process_hpn_bundle_fetch
- * checks each requested file, queues it into the sftp-hpn-tar.h writer
+ * checks each requested file, queues it into the sftp-hpn-bundle-codec.h writer
  * and installs the handle. sftp_hpn_server_bundle_read packs archive
  * bytes on demand for each READ. Close only releases the state.
  *
@@ -59,7 +59,7 @@
 #include "sftp-hpn-bundle.h"	/* HPN_BUNDLE_FLAG_* */
 #include "sftp-hpn-bundle-server.h"
 #include "sftp-server-internal.h"	/* send_status, send_handle */
-#include "sftp-hpn-tar.h"
+#include "sftp-hpn-bundle-codec.h"
 #include "sftp-hpn-bundle-pool.h"	/* shared writer pool (extract overlap) */
 
 /* Bundle handle mode. An upload handle extracts entries as the WRITEs
@@ -83,7 +83,7 @@ struct hpn_bundle_state {
 	uint32_t flags;             /* HPN_BUNDLE_FLAG_*, see sftp-hpn-bundle.h */
 
 	/* UPLOAD-mode fields. */
-	struct sftp_hpn_tar_parser *parser;
+	struct sftp_hpn_bundle_parser *parser;
 	uint64_t bytes_received;    /* file data bytes the parser delivered */
 	uint64_t next_write_offset; /* expected SSH_FXP_WRITE offset */
 	int      end_seen;          /* the parser saw the end marker */
@@ -101,7 +101,7 @@ struct hpn_bundle_state {
 	size_t   cur_job_filled;    /* pool: bytes accumulated so far */
 
 	/* FETCH-mode fields. */
-	struct sftp_hpn_tar_writer *writer;
+	struct sftp_hpn_bundle_writer *writer;
 	uint64_t bytes_produced;    /* cumulative pack_next bytes returned */
 	uint64_t fetch_total_size;  /* sum of declared file sizes (logged) */
 };
@@ -115,7 +115,7 @@ static int bundle_upload_entry_end_cb(void *ctx);
 static int bundle_path_is_safe(const char *path, const char *dest_dir);
 static void bundle_state_free(struct hpn_bundle_state *state);
 
-static const struct sftp_hpn_tar_callbacks bundle_upload_callbacks = {
+static const struct sftp_hpn_bundle_callbacks bundle_upload_callbacks = {
 	.entry_cb     = bundle_upload_entry_cb,
 	.data_cb      = bundle_upload_data_cb,
 	.entry_end_cb = bundle_upload_entry_end_cb,
@@ -139,7 +139,7 @@ bundle_state_new(const char *dest_dir, uint32_t flags)
 	state->cur_fd = -1;
 	state->dest_dir = strdup(dest_dir);
 	if (state->dest_dir != NULL)
-		state->parser = sftp_hpn_tar_parser_new(
+		state->parser = sftp_hpn_bundle_parser_new(
 		    &bundle_upload_callbacks, state);
 	if (state->dest_dir == NULL || state->parser == NULL) {
 		bundle_state_free(state);
@@ -179,10 +179,7 @@ bundle_state_new_fetch(void)
 		return NULL;
 	state->mode   = HPN_BUNDLE_MODE_FETCH;
 	state->cur_fd = -1;	/* so bundle_state_free never closes fd 0 */
-	if ((state->writer = sftp_hpn_tar_writer_new()) == NULL) {
-		bundle_state_free(state);
-		return NULL;
-	}
+	state->writer = sftp_hpn_bundle_writer_new();
 	return state;
 }
 
@@ -200,8 +197,8 @@ bundle_state_free(struct hpn_bundle_state *state)
 		(void)close(state->cur_fd);
 	free(state->cur_full_path);
 	free(state->last_mkdir_dir);
-	sftp_hpn_tar_parser_free(state->parser);
-	sftp_hpn_tar_writer_free(state->writer);
+	sftp_hpn_bundle_parser_free(state->parser);
+	sftp_hpn_bundle_writer_free(state->writer);
 	free(state->dest_dir);
 	free(state);
 }
@@ -451,10 +448,10 @@ sftp_hpn_server_bundle_write(int handle, uint64_t off,
 		    (unsigned long long)state->next_write_offset);
 		return SSH2_FX_FAILURE;
 	}
-	rc = sftp_hpn_tar_parser_feed(state->parser, data, len);
+	rc = sftp_hpn_bundle_parser_feed(state->parser, data, len);
 	if (rc < 0) {
 		error_f("hpn-bundle: parser error: %s",
-		    sftp_hpn_tar_parser_error(state->parser));
+		    sftp_hpn_bundle_parser_error(state->parser));
 		return SSH2_FX_FAILURE;
 	}
 	if (rc == 1)		/* parser_feed returns 1 at the end marker */
@@ -498,11 +495,11 @@ sftp_hpn_server_bundle_read(int handle, uint64_t off, u_char *out_buf,
 	}
 	/* pack_next returns 0 only at the end of the archive. */
 	while (produced < len) {
-		packed = sftp_hpn_tar_writer_pack_next(state->writer,
+		packed = sftp_hpn_bundle_writer_pack_next(state->writer,
 		    out_buf + produced, len - produced);
 		if (packed < 0) {
 			error_f("hpn-bundle: READ writer error: %s",
-			    sftp_hpn_tar_writer_error(state->writer));
+			    sftp_hpn_bundle_writer_error(state->writer));
 			return SSH2_FX_FAILURE;
 		}
 		if (packed == 0)
@@ -571,7 +568,7 @@ sftp_hpn_server_bundle_close(int handle)
 		debug_f("hpn-bundle: close upload handle=%d dest=\"%s\" "
 		    "received=%llu flags=0x%x", handle, state->dest_dir,
 		    (unsigned long long)state->bytes_received, state->flags);
-		parser_error = sftp_hpn_tar_parser_error(state->parser);
+		parser_error = sftp_hpn_bundle_parser_error(state->parser);
 		if (parser_error != NULL) {
 			error_f("hpn-bundle: close with parser error: %s",
 			    parser_error);
@@ -724,18 +721,18 @@ process_hpn_bundle_fetch(uint32_t id)
 			continue;
 		}
 		file_size = (uint64_t)file_stat.st_size;
-		if (sftp_hpn_tar_writer_add_file(state->writer, paths[i],
+		if (sftp_hpn_bundle_writer_add_file(state->writer, paths[i],
 		    paths[i], file_stat.st_mode, file_size,
 		    file_stat.st_mtime, NULL, NULL) < 0) {
 			error_f("hpn-bundle-fetch: writer rejected \"%s\" "
-			    "(path too long or out of memory)", paths[i]);
+			    "(path too long)", paths[i]);
 			continue;
 		}
 		state->fetch_total_size += file_size;
 		n_queued++;
 	}
 	/* Queue the end marker. Nothing can be added after this. */
-	sftp_hpn_tar_writer_finish(state->writer);
+	sftp_hpn_bundle_writer_finish(state->writer);
 
 	if ((handle = handle_new_bundle(state)) < 0) {
 		error_f("hpn-bundle-fetch: handle table full");

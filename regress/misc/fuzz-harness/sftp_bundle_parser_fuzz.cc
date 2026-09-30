@@ -1,12 +1,11 @@
 /*
- * sftp_tar_parser_fuzz.cc - libFuzzer harness for the HPN-SSH bundle
- * codec parser (sftp_hpn_tar_parser_feed, sftp-hpn-tar.c).
+ * sftp_bundle_parser_fuzz.cc - libFuzzer harness for the HPN-SSH bundle
+ * codec parser (sftp_hpn_bundle_parser_feed, sftp-hpn-bundle-codec.c).
  *
  * The codec is NOT tar: it is a minimal length-prefixed binary record
  * stream (u8 type, u32 mode, u64 mtime, u64 size, u16 path_len, path;
  * a lone HPN_REC_END byte terminates).  No 512-byte blocks, no octal,
- * no magic - see sftp-hpn-tar.c.  ("tar" survives only in the file name
- * and API prefix.)
+ * no magic - see sftp-hpn-bundle-codec.c.
  *
  * This is the single highest-value memory-safety target in the bundle
  * path.  The parser consumes an ENTIRELY adversary-controlled byte
@@ -42,7 +41,7 @@
  * stays fast.
  *
  * Build target lives in regress/misc/fuzz-harness/Makefile.  Run with
- *   ./sftp_tar_parser_fuzz <corpus_dir>
+ *   ./sftp_bundle_parser_fuzz <corpus_dir>
  */
 
 #include <sys/types.h>
@@ -57,7 +56,7 @@
 extern "C" {
 
 #include "log.h"
-#include "sftp-hpn-tar.h"
+#include "sftp-hpn-bundle-codec.h"
 
 /* --- KEEP IN SYNC WITH sftp-hpn-server.c:bundle_path_is_safe --------- */
 static int
@@ -142,17 +141,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
 	static int log_inited = 0;
 	if (!log_inited) {
-		log_init("sftp_tar_parser_fuzz",
+		log_init("sftp_bundle_parser_fuzz",
 		    SYSLOG_LEVEL_QUIET, SYSLOG_FACILITY_USER, 1);
 		log_inited = 1;
 	}
 
-	static const struct sftp_hpn_tar_callbacks cb = {
+	static const struct sftp_hpn_bundle_callbacks cb = {
 		h_entry_cb, h_data_cb, h_entry_end_cb
 	};
 	struct cb_ctx ctx = { 0, 0 };
 
-	struct sftp_hpn_tar_parser *p = sftp_hpn_tar_parser_new(&cb, &ctx);
+	struct sftp_hpn_bundle_parser *p = sftp_hpn_bundle_parser_new(&cb, &ctx);
 	if (p == NULL)
 		return 0;
 
@@ -173,19 +172,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
 	while (remaining > 0) {
 		size_t n = remaining < chunk ? remaining : chunk;
-		int r = sftp_hpn_tar_parser_feed(p, cur, n);
+		int r = sftp_hpn_bundle_parser_feed(p, cur, n);
 		if (r != 0) {
 			/* r == 1 (clean EOA) or r == -1 (parse error): both
 			 * mean stop.  Further feeds after either are a caller
 			 * error, not a parser bug. */
-			(void)sftp_hpn_tar_parser_error(p);
+			(void)sftp_hpn_bundle_parser_error(p);
 			break;
 		}
 		cur += n;
 		remaining -= n;
 	}
 
-	sftp_hpn_tar_parser_free(p);
+	sftp_hpn_bundle_parser_free(p);
 	return 0;
 }
 

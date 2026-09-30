@@ -56,7 +56,7 @@
 #include "sftp-client-internal.h"
 #include "sftp-hpn-client.h"	/* struct sftp_hpn_conn + adaptive rdahead API */
 #include "sftp-hpn-bundle.h"
-#include "sftp-hpn-tar.h"
+#include "sftp-hpn-bundle-codec.h"
 #include "sftp-hpn-bundle-pool.h"	/* shared writer pool (extract overlap) */
 
 /* Per-READ chunk size. 128 KiB matches the default SFTP_MAX_READ_LENGTH
@@ -107,7 +107,7 @@ struct bundle_dl_stream {
 	uint64_t fire_off;
 
 	/* Caller-supplied download-entry list, used by entry_cb to map
-	 * tar pathnames back to local destinations. */
+	 * record pathnames back to local destinations. */
 	struct sftp_hpn_bundle_download_entry *entries;
 	int      n_entries;
 	int      preserve_flag;
@@ -119,7 +119,7 @@ struct bundle_dl_stream {
 
 	/* Per-entry state set by entry_cb. */
 
-	/* Index into entries[], or -1 when the tar path is not in the
+	/* Index into entries[], or -1 when the record path is not in the
 	 * requested set. */
 	int         cur_idx;
 	int         cur_fd;	/* open output fd, or -1 */
@@ -139,7 +139,7 @@ struct bundle_dl_stream {
 	 * job; the writer threads do the open/write/close. */
 	struct bundle_write_pool *pool;	/* writer pool, or NULL (serial path) */
 	u_char  *cur_buf;	/* pool: current file's data buffer (owns) */
-	uint64_t cur_size;	/* pool: declared size from the tar header */
+	uint64_t cur_size;	/* pool: declared size from the record header */
 
 	/* Most recently created parent dir, so repeats can be skipped. */
 	char    *last_mkdir_dir;
@@ -149,7 +149,7 @@ struct bundle_dl_stream {
 	off_t   *progress;
 };
 
-/* Context for the tar codec's write path. WRITEs are pipelined: the
+/* Context for the bundle codec's write path. WRITEs are pipelined: the
  * pack loop in sftp_hpn_bundle_upload sends each SSH_FXP_WRITE without
  * waiting for its STATUS. Replies are drained cap/2 at a time whenever
  * the in-flight count reaches the read-ahead depth, and fully before
@@ -203,8 +203,8 @@ static int bundle_dl_data_cb(void *ctx, const u_char *data, size_t len);
 static int bundle_dl_entry_end_cb(void *ctx);
 
 /* Parser callback table for the download side, handed to
- * sftp_hpn_tar_parser_new with a struct bundle_dl_stream as ctx. */
-static const struct sftp_hpn_tar_callbacks bundle_dl_callbacks = {
+ * sftp_hpn_bundle_parser_new with a struct bundle_dl_stream as ctx. */
+static const struct sftp_hpn_bundle_callbacks bundle_dl_callbacks = {
 	.entry_cb     = bundle_dl_entry_cb,
 	.data_cb      = bundle_dl_data_cb,
 	.entry_end_cb = bundle_dl_entry_end_cb,
@@ -212,19 +212,19 @@ static const struct sftp_hpn_tar_callbacks bundle_dl_callbacks = {
 
 /* ------ Parser callbacks ------ */
 
-/* Match a tar record pathname back to an entries[] slot. The server
+/* Match a record pathname back to an entries[] slot. The server
  * sets the pathname to the original remote_path verbatim, so this is
  * an exact string match. Linear scan. bundles are 32-256 entries. */
 static int
 bundle_dl_lookup_entry(struct sftp_hpn_bundle_download_entry *entries, int n_entries,
-    const char *tar_path)
+    const char *rec_path)
 {
 	int i;
 	for (i = 0; i < n_entries; i++) {
 		/* A NULL remote_path is legal because the unit constructor
 		 * allows a NULL source, so skip the slot instead of comparing. */
 		if (entries[i].remote_path != NULL &&
-		    strcmp(entries[i].remote_path, tar_path) == 0)
+		    strcmp(entries[i].remote_path, rec_path) == 0)
 			return i;
 	}
 	return -1;
@@ -245,13 +245,13 @@ bundle_dl_entry_cb(void *ctx, const char *path, uint64_t size,
 	mode_t perm;
 
 	if (path == NULL || *path == '\0') {
-		error_f("hpn-bundle-fetch: empty pathname in tar record");
+		error_f("hpn-bundle-fetch: empty pathname in bundle record");
 		return -1;
 	}
 	idx = bundle_dl_lookup_entry(stream->entries, stream->n_entries, path);
 	stream->cur_idx = idx;
 	if (idx < 0) {
-		debug_f("hpn-bundle-fetch: tar record \"%s\" not in "
+		debug_f("hpn-bundle-fetch: bundle record \"%s\" not in "
 		    "entries[]; skipping", path);
 		stream->cur_fd    = -1;
 		stream->cur_local = NULL;
@@ -520,7 +520,7 @@ bundle_dl_stream_fire_one(struct bundle_dl_stream *stream)
  *   -1  - error. */
 static int
 bundle_dl_stream_drain_one(struct bundle_dl_stream *stream,
-    struct sftp_hpn_tar_parser *parser)
+    struct sftp_hpn_bundle_parser *parser)
 {
 	struct sshbuf *msg = NULL;
 	u_int recv_id, status, expected_id;
@@ -574,15 +574,15 @@ bundle_dl_stream_drain_one(struct bundle_dl_stream *stream,
 			return -1;
 		}
 		sftp_conn_rdahead_account(stream->conn, dlen);
-		/* Live-byte counter for the watchdog: received tar-stream
+		/* Live-byte counter for the watchdog: received bundle-stream
 		 * bytes are the download twin of the upload send-side bump
 		 * in bundle_ul_send_write. */
 		sftp_conn_live_account(stream->conn, dlen);
-		feed_rc = sftp_hpn_tar_parser_feed(parser, data, dlen);
+		feed_rc = sftp_hpn_bundle_parser_feed(parser, data, dlen);
 		sshbuf_free(msg);
 		if (feed_rc < 0) {
 			error_f("hpn-bundle-fetch parser: %s",
-			    sftp_hpn_tar_parser_error(parser));
+			    sftp_hpn_bundle_parser_error(parser));
 			return -1;
 		}
 		if (feed_rc == 1)
@@ -677,7 +677,7 @@ bundle_dl_stream_drain_inflight(struct bundle_dl_stream *stream)
 
 /* Fetch a bundle of small files in one streamed transaction: open the
  * bundle handle, keep READs in flight up to the read-ahead cap, feed
- * each DATA reply to the tar parser whose callbacks write the files,
+ * each DATA reply to the bundle parser whose callbacks write the files,
  * then drain, join the writer pool and CLOSE. Failure classification
  * for the caller happens after cleanup, from the connection state. */
 int
@@ -693,7 +693,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	size_t  handle_len = 0;
 	u_int   open_id, flags;
 	struct  bundle_dl_stream stream;
-	struct  sftp_hpn_tar_parser *parser = NULL;
+	struct  sftp_hpn_bundle_parser *parser = NULL;
 	int     i, r, rc = -1;
 	int     done = 0;
 
@@ -772,9 +772,9 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 			    bundle_writer_threads());
 	}
 
-	parser = sftp_hpn_tar_parser_new(&bundle_dl_callbacks, &stream);
+	parser = sftp_hpn_bundle_parser_new(&bundle_dl_callbacks, &stream);
 	if (parser == NULL) {
-		error_f("sftp_hpn_tar_parser_new failed");
+		error_f("sftp_hpn_bundle_parser_new failed");
 		goto cleanup;
 	}
 
@@ -836,7 +836,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 		(void)bundle_write_pool_finish(stream.pool);
 	free(stream.cur_buf);		/* a file buffered but not yet enqueued */
 	if (parser != NULL)
-		sftp_hpn_tar_parser_free(parser);
+		sftp_hpn_bundle_parser_free(parser);
 	if (stream.cur_fd >= 0) {
 		/* Aborted mid-entry (a completed entry closes its fd in
 		 * entry_end_cb). Truncate to the bytes actually written:
@@ -1197,13 +1197,14 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	const int preserve_flag = opts->preserve;
 	const int fsync_flag = opts->fsync;
 	const int writer_pool = opts->writer_pool;
+	const int verify = sftp_conn_verify_transfer_enabled(conn);
 	struct sshbuf *msg = NULL;
 	u_char *handle = NULL;
 	size_t handle_len = 0;
 	u_int open_id, close_id, status, reply_rid;
 	u_int flags;
 	u_char type;
-	struct sftp_hpn_tar_writer *writer = NULL;
+	struct sftp_hpn_bundle_writer *writer = NULL;
 	struct bundle_write_ctx ctx = { 0 };
 	u_char  outbuf[HPN_BUNDLE_BLOCK_BYTES];  /* per-WRITE payload buf */
 	int i, r;
@@ -1278,16 +1279,12 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	}
 	t_open_done = monotime_double();
 
-	/* ------ Build the tar writer ------ */
+	/* ------ Build the bundle writer ------ */
 	ctx.conn       = conn;
 	ctx.handle     = handle;
 	ctx.handle_len = handle_len;
 
-	writer = sftp_hpn_tar_writer_new();
-	if (writer == NULL) {
-		error_f("sftp_hpn_tar_writer_new failed");
-		goto cleanup;
-	}
+	writer = sftp_hpn_bundle_writer_new();
 
 	/* Queue every requested entry. Per-entry stat() failures are logged
 	 * and skipped. The writer pulls bytes lazily from disk when pack_next
@@ -1302,7 +1299,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		    entries[i].remote_path == NULL)
 			continue;
 		/* Deliberate re-stat: cheap (attr cache is warm from the
-		 * walk) and keeps the tar header's size/mtime fresh. */
+		 * walk) and keeps the record header's size/mtime fresh. */
 		if (stat(entries[i].local_path, &sb) < 0) {
 			error("hpn-bundle: stat local \"%s\": %s",
 			    entries[i].local_path, strerror(errno));
@@ -1322,10 +1319,11 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		}
 
 		/* add a file to the bundle */
-		if (sftp_hpn_tar_writer_add_file(writer,
+		if (sftp_hpn_bundle_writer_add_file(writer,
 		    entries[i].local_path, entries[i].remote_path,
 		    perm, (uint64_t)sb.st_size, mtime,
-		    &entries[i].src_hash, &entries[i].have_src_hash) < 0) {
+		    verify ? &entries[i].src_hash : NULL,
+		    verify ? &entries[i].have_src_hash : NULL) < 0) {
 			error_f("hpn-bundle: writer_add_file \"%s\" "
 			    "rejected (path too long?)",
 			    entries[i].remote_path);
@@ -1336,16 +1334,16 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		entries[i].result = 0;
 		files_queued++;
 	}
-	sftp_hpn_tar_writer_finish(writer);
+	sftp_hpn_bundle_writer_finish(writer);
 
 	/* ------ Pack/send loop ------ */
 	t_send_start = monotime_double();
 	for (;;) {
-		ssize_t produced = sftp_hpn_tar_writer_pack_next(writer,
+		ssize_t produced = sftp_hpn_bundle_writer_pack_next(writer,
 		    outbuf, sizeof(outbuf));
 		if (produced < 0) {
 			error_f("hpn-bundle: pack: %s",
-			    sftp_hpn_tar_writer_error(writer));
+			    sftp_hpn_bundle_writer_error(writer));
 			goto cleanup;
 		}
 		if (produced == 0)
@@ -1447,7 +1445,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		for (i = 0; i < n_entries; i++)
 			entries[i].result = -1;
 	}
-	sftp_hpn_tar_writer_free(writer);
+	sftp_hpn_bundle_writer_free(writer);
 	free(handle);
 	free(ctx.wsizes);
 	sshbuf_free(msg);

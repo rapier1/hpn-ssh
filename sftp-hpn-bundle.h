@@ -32,6 +32,8 @@
 #ifndef _SFTP_HPN_BUNDLE_H
 #define _SFTP_HPN_BUNDLE_H
 
+#include "sftp-hpn-bundle-codec.h"
+
 /*
  * Bundle flags carried in the SSH_FXP_EXTENDED open / fetch request:
  *
@@ -52,9 +54,9 @@
 #define HPN_BUNDLE_FLAG_NO_POOL    0x00000004U
 
 /*
- * Tar codec output block size.  Each block becomes one SSH_FXP_WRITE
+ * Bundle codec output block size.  Each block becomes one SSH_FXP_WRITE
  * message on the upload path; on the download path it's the chunk
- * size for reading the packed tar buffer.  128 KiB matches
+ * size for reading the packed bundle buffer.  128 KiB matches
  * DEFAULT_TRANSFER_BUFLEN.  Both ends use the same value so block
  * alignment is consistent across pack/unpack.
  */
@@ -76,14 +78,13 @@
  * first for any file >= ~1 KiB. */
 #define BUNDLE_BATCH_MAX_FILES  8192
 
-/* Wire cost of one file in a bundle: the fixed record header (type +
- * mode + mtime + size + path_len = 23 bytes, see sftp-hpn-tar.h) plus
+/* Wire cost of one file in a bundle: the fixed record header plus
  * the archive path plus the file data, with no padding.  Accumulators
  * size bundles by this framed cost rather than raw payload, so a
  * bundle's wire size stays near the byte cap even when tiny-file
  * headers/paths dominate. */
 #define BUNDLE_REC_FRAME_BYTES(plen, sz) \
-    (23ULL + (uint64_t)(plen) + (uint64_t)(sz))
+    (SFTP_HPN_BUNDLE_FIXED_HDR + (uint64_t)(plen) + (uint64_t)(sz))
 
 /*
  * Shared accumulation decisions - one source of truth used by BOTH the
@@ -110,7 +111,7 @@ hpn_bundle_should_flush(uint64_t framed_bytes, int members,
  * before that path list overflows SFTP_MAX_MSG_LENGTH; the cap
  * reserves one PATH_MAX overshoot + the ~44-byte request header.
  * Expanded at use sites, which have SFTP_MAX_MSG_LENGTH and PATH_MAX.
- * Upload streams paths inside the tar and is immune. */
+ * Upload streams paths inside the bundle and is immune. */
 #define BUNDLE_DL_FETCH_REQ_MAX \
     ((uint64_t)SFTP_MAX_MSG_LENGTH - PATH_MAX - 1024)
 

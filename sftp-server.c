@@ -1036,7 +1036,7 @@ process_read(uint32_t id)
 	    id, handle_to_name(handle), handle, (unsigned long long)off, len);
 
 	/* READs on a fetch-mode bundle handle return bytes from the
-	 * pre-packed tar accumulator rather than an OS file descriptor. */
+	 * pre-packed bundle stream rather than an OS file descriptor. */
 	if (handle_is_bundle(handle)) {
 		size_t got = 0;
 		if (len > SFTP_MAX_READ_LENGTH)
