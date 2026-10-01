@@ -50,7 +50,7 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"
-#include "sftp-workqueue.h"
+#include "sftp-hpn-workqueue.h"
 #include "sftp-parallel.h"
 #include "sftp-parallel-internal.h"
 #include "hpn-exit-codes.h"
@@ -769,7 +769,7 @@ tail_detector_tick(struct sftp_parallel *fleet, uint64_t bytes_now)
 	 * matters once the walker is done and the queue is empty. */
 	walker_done = (__atomic_load_n(&fleet->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE); /*boolean*/
-	if (walker_done && sftp_workqueue_depth(fleet->q) == 0)
+	if (walker_done && sftp_hpn_workqueue_depth(fleet->q) == 0)
 		would_arm = tail_arm_check(fleet, now);
 
 	/* Condition holds. tail_arm_check has already done whatever this
@@ -819,7 +819,7 @@ reporter_emit_fleetsample(struct sftp_parallel *fleet)
 
 	off = (size_t)snprintf(line, sizeof(line),
 	    "HPN FLEETSAMPLE t=%.3f qdepth=%zu walker=%s",
-	    monotime_double(), sftp_workqueue_depth(fleet->q),
+	    monotime_double(), sftp_hpn_workqueue_depth(fleet->q),
 	    walker_phase_name(__atomic_load_n(&fleet->walker_phase,
 	        __ATOMIC_RELAXED)));
 

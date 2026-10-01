@@ -3,7 +3,7 @@
 # driver provides its own main().
 
 PROG=test_sftp_workqueue
-SRCS=tests.c sftp-workqueue.c
+SRCS=tests.c sftp-hpn-workqueue.c
 
 LDADD+=-lpthread
 DPADD+=

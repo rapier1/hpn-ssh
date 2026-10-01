@@ -36,12 +36,12 @@
 #include "sftp-hpn-bundle.h"	/* shared bundle-eligibility policy */
 #include "hpn-meter.h"	        /* fleet display meter object */
 
-/* Forward declarations. sftp_conn and sftp_workqueue stay opaque here and
+/* Forward declarations. sftp_conn and sftp_hpn_workqueue stay opaque here and
  * sftp_hpn_dirattr_list is defined in sftp-hpn-client.h. sftp_parallel is
  * defined below; it is named here so the structs that only hold a pointer
  * to it do not depend on that order. */
 struct sftp_conn;
-struct sftp_workqueue;
+struct sftp_hpn_workqueue;
 struct sftp_parallel;
 struct sftp_hpn_dirattr_list;	/* deferred dir attrs */
 
@@ -338,7 +338,7 @@ enum worker_doom_reason {
  * every worker stands at the instant a transfer freezes. */
 enum worker_phase {
 	WPH_INIT = 0,
-	WPH_POP_WAIT,    /* blocked in sftp_workqueue_pop (queue empty) */
+	WPH_POP_WAIT,    /* blocked in sftp_hpn_workqueue_pop (queue empty) */
 	WPH_ASSEMBLE,    /* collecting a batch via non-blocking trypop */
 	WPH_RUN,         /* inside a bundle / single-file transfer */
 	WPH_FINALIZE,    /* finalizing entries / draining deferred batch */
@@ -681,7 +681,7 @@ struct sftp_parallel {
 
 	struct sftp_parallel_config cfg;
 	char                        cfg_port_buf[16]; /* owns cfg.port string */
-	struct sftp_workqueue      *q;
+	struct sftp_hpn_workqueue      *q;
 
 	/* Workers held as an array of pointers so add/remove can mutate
 	 * the array without invalidating pointers held by worker threads

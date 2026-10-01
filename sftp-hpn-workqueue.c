@@ -23,9 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "sftp-workqueue.h"
+#include "sftp-hpn-workqueue.h"
 
-struct sftp_workqueue {
+struct sftp_hpn_workqueue {
 	void           **ring;        /* circular buffer of capacity slots */
 	size_t           capacity;
 	size_t           head;        /* next slot to pop */
@@ -36,7 +36,7 @@ struct sftp_workqueue {
 	pthread_mutex_t  mu;
 	pthread_cond_t   not_empty;
 	pthread_cond_t   not_full;
-	/* Activity kick channel (sftp_workqueue_kick/wait_activity): wakes
+	/* Activity kick channel (sftp_hpn_workqueue_kick/wait_activity): wakes
 	 * workers whose only available work is externally gated (writer-cap
 	 * slots) without the queue ever going empty.  kick_seq orders kicks
 	 * so a waiter never sleeps through one that fired just before it
@@ -45,10 +45,10 @@ struct sftp_workqueue {
 	uint64_t         kick_seq;
 };
 
-struct sftp_workqueue *
-sftp_workqueue_new(size_t capacity)
+struct sftp_hpn_workqueue *
+sftp_hpn_workqueue_new(size_t capacity)
 {
-	struct sftp_workqueue *q;
+	struct sftp_hpn_workqueue *q;
 
 	if (capacity == 0)
 		return NULL;
@@ -82,7 +82,7 @@ sftp_workqueue_new(size_t capacity)
 }
 
 void
-sftp_workqueue_free(struct sftp_workqueue *q)
+sftp_hpn_workqueue_free(struct sftp_hpn_workqueue *q)
 {
 	if (q == NULL)
 		return;
@@ -95,7 +95,7 @@ sftp_workqueue_free(struct sftp_workqueue *q)
 }
 
 int
-sftp_workqueue_push(struct sftp_workqueue *q, void *item)
+sftp_hpn_workqueue_push(struct sftp_hpn_workqueue *q, void *item)
 {
 	pthread_mutex_lock(&q->mu);
 	while (q->count == q->capacity && !q->shutdown)
@@ -120,7 +120,7 @@ sftp_workqueue_push(struct sftp_workqueue *q, void *item)
  * full queue it is itself the consumer of (self-deadlock; fatal at -j1).
  */
 int
-sftp_workqueue_trypush(struct sftp_workqueue *q, void *item)
+sftp_hpn_workqueue_trypush(struct sftp_hpn_workqueue *q, void *item)
 {
 	pthread_mutex_lock(&q->mu);
 	if (q->shutdown) {
@@ -143,7 +143,7 @@ sftp_workqueue_trypush(struct sftp_workqueue *q, void *item)
 
 /* Non-blocking push_front (head).  Same return contract as trypush. */
 int
-sftp_workqueue_trypush_front(struct sftp_workqueue *q, void *item)
+sftp_hpn_workqueue_trypush_front(struct sftp_hpn_workqueue *q, void *item)
 {
 	pthread_mutex_lock(&q->mu);
 	if (q->shutdown) {
@@ -165,7 +165,7 @@ sftp_workqueue_trypush_front(struct sftp_workqueue *q, void *item)
 }
 
 int
-sftp_workqueue_pop(struct sftp_workqueue *q, void **itemp)
+sftp_hpn_workqueue_pop(struct sftp_hpn_workqueue *q, void **itemp)
 {
 	pthread_mutex_lock(&q->mu);
 	while (q->count == 0 && !q->shutdown)
@@ -185,7 +185,7 @@ sftp_workqueue_pop(struct sftp_workqueue *q, void **itemp)
 }
 
 int
-sftp_workqueue_trypop(struct sftp_workqueue *q, void **itemp)
+sftp_hpn_workqueue_trypop(struct sftp_hpn_workqueue *q, void **itemp)
 {
 	pthread_mutex_lock(&q->mu);
 	if (q->count == 0 || q->shutdown) {
@@ -208,7 +208,7 @@ sftp_workqueue_trypop(struct sftp_workqueue *q, void **itemp)
  * shutdown is set) and would otherwise leak with their payloads.
  */
 int
-sftp_workqueue_drain(struct sftp_workqueue *q, void **itemp)
+sftp_hpn_workqueue_drain(struct sftp_hpn_workqueue *q, void **itemp)
 {
 	pthread_mutex_lock(&q->mu);
 	if (q->count == 0) {
@@ -224,7 +224,7 @@ sftp_workqueue_drain(struct sftp_workqueue *q, void **itemp)
 }
 
 void
-sftp_workqueue_shutdown(struct sftp_workqueue *q)
+sftp_hpn_workqueue_shutdown(struct sftp_hpn_workqueue *q)
 {
 	pthread_mutex_lock(&q->mu);
 	q->shutdown = 1;
@@ -236,7 +236,7 @@ sftp_workqueue_shutdown(struct sftp_workqueue *q)
 }
 
 void
-sftp_workqueue_kick(struct sftp_workqueue *q)
+sftp_hpn_workqueue_kick(struct sftp_hpn_workqueue *q)
 {
 	pthread_mutex_lock(&q->mu);
 	q->kick_seq++;
@@ -245,7 +245,7 @@ sftp_workqueue_kick(struct sftp_workqueue *q)
 }
 
 void
-sftp_workqueue_wait_activity(struct sftp_workqueue *q, int timeout_ms)
+sftp_hpn_workqueue_wait_activity(struct sftp_hpn_workqueue *q, int timeout_ms)
 {
 	struct timespec deadline;
 	uint64_t seen;
@@ -268,7 +268,7 @@ sftp_workqueue_wait_activity(struct sftp_workqueue *q, int timeout_ms)
 }
 
 size_t
-sftp_workqueue_depth(struct sftp_workqueue *q)
+sftp_hpn_workqueue_depth(struct sftp_hpn_workqueue *q)
 {
 	size_t n;
 	pthread_mutex_lock(&q->mu);
@@ -278,7 +278,7 @@ sftp_workqueue_depth(struct sftp_workqueue *q)
 }
 
 size_t
-sftp_workqueue_high_watermark(struct sftp_workqueue *q)
+sftp_hpn_workqueue_high_watermark(struct sftp_hpn_workqueue *q)
 {
 	size_t n;
 	pthread_mutex_lock(&q->mu);

@@ -52,7 +52,7 @@
 #include "sftp-client.h"
 #include "sftp-client-internal.h"	/* sftp_conn_watchdog_pause_until_ms */
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair[_resolve] */
-#include "sftp-workqueue.h"
+#include "sftp-hpn-workqueue.h"
 #include "sftp-parallel.h"
 #include "sftp-hpn-client.h"	/* deferred dir attrs */
 #include "sftp-parallel-internal.h"
@@ -357,7 +357,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 	/* Workqueue, sized for cfg->num_streams. Respawned workers reuse the
 	 * same queue, so capacity is set once at startup. */
 	fleet->outstanding_cap = (uint64_t)outstanding_file_cap(cfg);
-	fleet->q = sftp_workqueue_new(work_queue_depth(cfg));
+	fleet->q = sftp_hpn_workqueue_new(work_queue_depth(cfg));
 	if (fleet->q == NULL) {
 		error_f("workqueue allocation failed");
 		goto fail;
@@ -636,7 +636,7 @@ sftp_parallel_abort(struct sftp_parallel *fleet)
 	 * further redraw is a stale frame with a garbage rate. */
 	sftp_parallel_progress_stop(fleet);
 	if (fleet->q)
-		sftp_workqueue_shutdown(fleet->q);
+		sftp_hpn_workqueue_shutdown(fleet->q);
 
 	/* Set each fd to -1 after closing so parallel_respawn_teardown_ssh,
 	 * which runs later from sftp_parallel_stop, skips these slots rather
@@ -733,7 +733,7 @@ sftp_parallel_stop(struct sftp_parallel *fleet)
 	fleet->stopped = 1;
 
 	if (fleet->q)
-		sftp_workqueue_shutdown(fleet->q);
+		sftp_hpn_workqueue_shutdown(fleet->q);
 
 	/* Join the reporter BEFORE touching the workers. Otherwise
 	 * we might end up having a worker getting freed out of sync leading to
@@ -793,7 +793,7 @@ sftp_parallel_stop(struct sftp_parallel *fleet)
 	 * pending count is never read again. */
 	if (fleet->q) {
 		void *item;
-		while (sftp_workqueue_drain(fleet->q, &item) == 0) {
+		while (sftp_hpn_workqueue_drain(fleet->q, &item) == 0) {
 			struct sftp_work_unit *work_unit = item;
 			(void)parallel_unit_tracker_finalize(work_unit->range_tracker, 1, NULL);
 			parallel_unit_free(work_unit);
@@ -820,7 +820,7 @@ sftp_parallel_stop(struct sftp_parallel *fleet)
 	}
 
 	if (fleet->q) {
-		sftp_workqueue_free(fleet->q);
+		sftp_hpn_workqueue_free(fleet->q);
 		fleet->q = NULL;
 	}
 

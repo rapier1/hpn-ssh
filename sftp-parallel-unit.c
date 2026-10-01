@@ -53,7 +53,7 @@
 #include "sftp-common.h"
 #include "sftp-client.h"
 #include "sftp-client-internal.h"
-#include "sftp-workqueue.h"
+#include "sftp-hpn-workqueue.h"
 #include "sftp-parallel.h"
 #include "sftp-hpn-transferlog.h"
 #include "sftp-parallel-internal.h"
@@ -974,7 +974,7 @@ parallel_bundle_flush(struct sftp_parallel *fleet)
 
 	if (n == 1) {
 		struct sftp_work_unit *u = fleet->bundle_pending[0];
-		if (sftp_workqueue_push(fleet->q, u) != 0)
+		if (sftp_hpn_workqueue_push(fleet->q, u) != 0)
 			parallel_bundle_member_pushfail(fleet, u);
 		return;
 	}
@@ -989,7 +989,7 @@ parallel_bundle_flush(struct sftp_parallel *fleet)
 		if (fleet->bundle_pending[i]->size > 0)
 			c->size += fleet->bundle_pending[i]->size;
 	}
-	if (sftp_workqueue_push(fleet->q, c) != 0) {
+	if (sftp_hpn_workqueue_push(fleet->q, c) != 0) {
 		for (i = 0; i < n; i++)
 			parallel_bundle_member_pushfail(fleet, c->members[i]);
 		free(c->members);
@@ -1042,7 +1042,7 @@ parallel_bundle_add(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 	    hpn_bundle_should_flush(fleet->bundle_pending_framed,
 	    fleet->bundle_pending_n, target)))
 		parallel_bundle_flush(fleet);
-	sftp_workqueue_kick(fleet->q);
+	sftp_hpn_workqueue_kick(fleet->q);
 	return 0;
 }
 
@@ -1054,7 +1054,7 @@ parallel_bundle_flush_pending(struct sftp_parallel *fleet)
 	if (fleet == NULL)
 		return;
 	parallel_bundle_flush(fleet);
-	sftp_workqueue_kick(fleet->q);
+	sftp_hpn_workqueue_kick(fleet->q);
 }
 
 /*
@@ -1097,7 +1097,7 @@ parallel_unit_submit(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 	pthread_mutex_lock(&fleet->pending_mu);
 	fleet->pending++;
 	pthread_mutex_unlock(&fleet->pending_mu);
-	if (sftp_workqueue_push(fleet->q, u) != 0) {
+	if (sftp_hpn_workqueue_push(fleet->q, u) != 0) {
 		pthread_mutex_lock(&fleet->pending_mu);
 		pending_dec_locked(fleet);
 		pthread_mutex_unlock(&fleet->pending_mu);
@@ -1109,7 +1109,7 @@ parallel_unit_submit(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 	 * the cap-gate's own requeue pushes there, and kicking from push
 	 * created a wake->pass->requeue->kick feedback storm (measured:
 	 * denials 6M -> 109M, four cores burned). */
-	sftp_workqueue_kick(fleet->q);
+	sftp_hpn_workqueue_kick(fleet->q);
 	return 0;
 }
 
@@ -1126,8 +1126,8 @@ int
 parallel_worker_requeue(struct sftp_parallel *fleet, struct sftp_work_unit *u,
     int front)
 {
-	int rc = front ? sftp_workqueue_trypush_front(fleet->q, u)
-	               : sftp_workqueue_trypush(fleet->q, u);
+	int rc = front ? sftp_hpn_workqueue_trypush_front(fleet->q, u)
+	               : sftp_hpn_workqueue_trypush(fleet->q, u);
 	if (rc == 0)
 		return 0;	/* placed on the queue */
 	if (rc < 0)
@@ -1175,8 +1175,8 @@ parallel_retry_overflow_drain(struct sftp_parallel *fleet)
 		int front = u->overflow_front;
 		u->overflow_next = NULL;
 		u->overflow_front = 0;
-		int rc = front ? sftp_workqueue_trypush_front(fleet->q, u)
-		               : sftp_workqueue_trypush(fleet->q, u);
+		int rc = front ? sftp_hpn_workqueue_trypush_front(fleet->q, u)
+		               : sftp_hpn_workqueue_trypush(fleet->q, u);
 		if (rc == 0)
 			continue;	/* placed; try the next parked unit */
 

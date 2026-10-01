@@ -65,7 +65,7 @@
 #include "sftp-client-internal.h"
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair, _chunk */
 #include "sftp-hpn-transferlog.h"
-#include "sftp-workqueue.h"
+#include "sftp-hpn-workqueue.h"
 #include "sftp-parallel.h"
 #include "sftp-parallel-internal.h"
 
@@ -643,7 +643,7 @@ worker_retry_or_give_up(struct sftp_parallel *fleet, struct sftp_worker *worker,
 		if (parallel_worker_requeue(fleet, unit, transient || yielded) != 0)
 			worker_give_up_pushfail(fleet, worker, unit);
 		else if (yielded)
-			sftp_workqueue_kick(fleet->q);
+			sftp_hpn_workqueue_kick(fleet->q);
 		return;
 	}
 	worker_give_up_unit(fleet, worker, unit, log_prefix);
@@ -690,7 +690,7 @@ worker_process_result(struct sftp_worker *worker, struct sftp_work_unit *unit, i
 	 * instead of on the timeout. */
 	if (unit->range_tracker != NULL) {
 		parallel_unit_writer_release(unit->range_tracker);
-		sftp_workqueue_kick(fleet->q);
+		sftp_hpn_workqueue_kick(fleet->q);
 	}
 
 	if (rc == 0) {
@@ -1024,7 +1024,7 @@ worker_finish_bundle(struct sftp_parallel *fleet, struct sftp_worker *worker,
 			    "this class of transfer");
 		fleet->abort_flag = 1;
 		if (fleet->q != NULL)
-			sftp_workqueue_shutdown(fleet->q);
+			sftp_hpn_workqueue_shutdown(fleet->q);
 	} else if (bundle_rc == SFTP_HPN_BUNDLE_SERVER_CANT) {
 		for (i = 0; i < batch_n; i++)
 			batch[i]->bundle_ineligible = 1;
@@ -1361,7 +1361,7 @@ worker_collect_batch(struct sftp_worker *worker, struct sftp_work_unit *first,
 	    (batch_op != SFTP_OP_DOWNLOAD ||
 	        batch_path_bytes < BUNDLE_DL_FETCH_REQ_MAX)) {
 		void *next_item = NULL;
-		if (sftp_workqueue_trypop(fleet->q, &next_item) != 0)
+		if (sftp_hpn_workqueue_trypop(fleet->q, &next_item) != 0)
 			break;	/* queue empty or shutdown */
 		struct sftp_work_unit *next_unit = next_item;
 		/* Even with the strict gate a unit can overshoot on its own,
@@ -1518,7 +1518,7 @@ parallel_worker_thread(void *arg)
 		 * batch (which reads the pending STATUSes and frees them)
 		 * before falling back to a blocking pop. */
 		if (worker->batch_prev_pending != NULL) {
-			if (sftp_workqueue_trypop(fleet->q, &item) != 0) {
+			if (sftp_hpn_workqueue_trypop(fleet->q, &item) != 0) {
 				/* queue empty - drain before blocking */
 				__atomic_store_n(&worker->phase,
 				    WPH_FINALIZE, __ATOMIC_RELAXED);
@@ -1532,7 +1532,7 @@ parallel_worker_thread(void *arg)
 		 * idle, healthy, ready for work (see enum worker_avail). */
 		__atomic_store_n(&worker->avail, WORKER_AVAIL_READY,
 		    __ATOMIC_RELAXED);
-		if (item == NULL && sftp_workqueue_pop(fleet->q, &item) != 0)
+		if (item == NULL && sftp_hpn_workqueue_pop(fleet->q, &item) != 0)
 			break;	/* shutdown && empty */
 		uint64_t t_work_start = monotime_ms();
 		/* Mark when this worker took possession of a unit so the
@@ -1567,8 +1567,8 @@ parallel_worker_thread(void *arg)
 			}
 			__atomic_store_n(&worker->unit_start_ms, 0,
 			    __ATOMIC_RELEASE);
-			sftp_workqueue_kick(fleet->q);
-			sftp_workqueue_wait_activity(fleet->q, 250);
+			sftp_hpn_workqueue_kick(fleet->q);
+			sftp_hpn_workqueue_wait_activity(fleet->q, 250);
 			continue;
 		}
 		if (unit->yield_from != 0) {
@@ -1613,8 +1613,8 @@ parallel_worker_thread(void *arg)
 			__atomic_store_n(&worker->avail, WORKER_AVAIL_CAPPED,
 			    __ATOMIC_RELAXED);
 			if (++capped_passes >=
-			    (int)sftp_workqueue_depth(fleet->q) + 1) {
-				sftp_workqueue_wait_activity(fleet->q, 250);
+			    (int)sftp_hpn_workqueue_depth(fleet->q) + 1) {
+				sftp_hpn_workqueue_wait_activity(fleet->q, 250);
 				capped_passes = 0;
 			}
 			continue;

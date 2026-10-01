@@ -87,7 +87,7 @@
 #include "sftp-common.h"		/* Attrib, needed by sftp-client.h */
 #include "sftp-client.h"
 #include "sftp-client-internal.h"	/* sftp_conn_watchdog_pause_until_ms */
-#include "sftp-workqueue.h"
+#include "sftp-hpn-workqueue.h"
 #include "sftp-parallel.h"
 #include "sftp-parallel-internal.h"
 
@@ -1049,7 +1049,7 @@ void
 parallel_watchdog_check(struct sftp_parallel *fleet)
 {
 	uint64_t now = monotime_ms();
-	int queue_has_work = (sftp_workqueue_depth(fleet->q) > 0);
+	int queue_has_work = (sftp_hpn_workqueue_depth(fleet->q) > 0);
 
 	/* Per-tick scratch: the count of slow workers accepted this pass,
 	 * with born-slow gated off. reporter_flare reads it after the
