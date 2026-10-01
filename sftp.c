@@ -3458,11 +3458,11 @@ main(int argc, char **argv)
 	int lustre_stripe_count = -1;	/* HPNLustreStripeCount: -1 = auto */
 	long long llv, limit_kbps = 0;
 
-	/* Pass-through state for the parallel-streams ControlMaster.
-	 * Captured during getopt and forwarded into sftp_parallel_config so
-	 * the master and worker connections honor the same connection options
-	 * the user gave the main connection.  The forwarded -o list lives at
-	 * file scope (parallel_extra_o*, appended via parallel_extra_o_add). */
+	/* Pass-through state for the parallel worker connections. Captured
+	 * during getopt and forwarded into sftp_parallel_config, so the
+	 * workers honor the connection options the user gave the main
+	 * connection. The forwarded -o list lives at file scope
+	 * (parallel_extra_o, appended to by parallel_extra_o_add()). */
 	const char *parallel_identity = NULL;
 	const char *parallel_config_file = NULL;
 	int zstd_level = 0;			/* -z: zstd@hpnssh.org level */
