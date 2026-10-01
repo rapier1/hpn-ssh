@@ -318,8 +318,8 @@ struct sftp_hpn_conn {
 	struct sftp_rdahead rd;
 
 #ifdef HPN_FAULT_INJECTION
-	/* Test scaffolding for sftp-fault-inject.c, armed from the
-	 * SFTP_FAULT_* variables its header documents. Thresholds are byte
+	/* Test scaffolding for hpn-fault-inject.c, armed from the
+	 * HPN_FAULT_* variables its header documents. Thresholds are byte
 	 * counts, 0 for off. */
 	uint64_t fault_after_bytes;		/* die after this many sent */
 	uint64_t fault_pv_after_bytes;		/* protocol violation after */
