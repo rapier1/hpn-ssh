@@ -78,7 +78,7 @@
 #include "ssherr.h"
 #include "metrics.h"
 #include "cipher-switch.h"
-#include "sftp-hpn-congestion.h"
+#include "hpn-congestion-monitor.h"
 #include "hpn-exit-codes.h"
 
 extern ServerOptions options;
@@ -96,7 +96,7 @@ static int no_more_sessions = 0; /* Disallow further sessions. */
  * connection on a confirmed wedge -- the download-direction counterpart of
  * the client's monitor.  Polled off a ppoll deadline, traffic-independent.
  */
-static struct sftp_hpn_tcp_health_ctx srv_tcp_health;
+static struct hpn_cong_ctx srv_tcp_health;
 static int srv_tcp_health_armed;
 static time_t srv_tcp_health_check_time;
 #define HPN_SRV_TCP_HEALTH_INTERVAL 1	/* seconds between health polls */
@@ -873,8 +873,8 @@ server_arm_parallel_worker(struct ssh *ssh)
 		return 1;
 	}
 	sock_in = ssh_packet_get_connection_in(ssh);
-	sftp_hpn_tcp_health_ctx_init(&srv_tcp_health, sock_in);
-	srv_tcp_health_armed = (srv_tcp_health.avail != TCP_HEALTH_UNSUPPORTED);
+	hpn_cong_init(&srv_tcp_health, sock_in);
+	srv_tcp_health_armed = (srv_tcp_health.avail != HPN_CONG_UNSUPPORTED);
 	srv_tcp_health_check_time = monotime() + HPN_SRV_TCP_HEALTH_INTERVAL;
 	debug_f("HPN: server TCP health monitor %s on fd %d (avail=%d)",
 	    srv_tcp_health_armed ? "armed" : "unavailable",
@@ -946,13 +946,13 @@ srv_terminate_worker(struct ssh *ssh, int code, const char *reason)
 static void
 srv_tcp_health_tick(struct ssh *ssh)
 {
-	struct sftp_hpn_tcp_health h;
+	struct hpn_cong_sample h;
 	char reason[256];
 	static int srv_ps_waiting = 0;	/* edge-trigger the peer-stall wait log */
 
 	if (!srv_tcp_health_armed)
 		return;
-	if (sftp_hpn_tcp_health_poll(&srv_tcp_health, &h) != 0) {
+	if (hpn_cong_poll(&srv_tcp_health, &h) != 0) {
 		srv_tcp_health_armed = 0;
 		debug_f("HPN: server TCP health monitor disabled (unsupported)");
 		return;
@@ -962,8 +962,8 @@ srv_tcp_health_tick(struct ssh *ssh)
 	    (int)h.availability, h.raw.snd_cwnd, h.raw.rtt, h.raw.rcv_space,
 	    (unsigned long long)h.raw.total_retrans, h.raw.notsent_bytes,
 	    (unsigned long long)h.raw.delivery_rate, h.raw.total_rto_time);
-	switch (sftp_hpn_classify(&srv_tcp_health, &h)) {
-	case SFTP_HPN_WEDGE_TCP_WEDGE:
+	switch (hpn_cong_classify(&srv_tcp_health, &h)) {
+	case HPN_WEDGE_TCP_WEDGE:
 		snprintf(reason, sizeof(reason),
 		    "parallel worker TCP wedge from %s: cwnd=%u, rtt=%.1fms, "
 		    "%.1f MB unsent, stalled %.1fs, %llu retransmits",
@@ -973,7 +973,7 @@ srv_tcp_health_tick(struct ssh *ssh)
 		    (unsigned long long)h.raw.total_retrans);
 		srv_terminate_worker(ssh, HPN_EXIT_TCP_WEDGE, reason);
 		return;
-	case SFTP_HPN_WEDGE_PEER_STALL:
+	case HPN_WEDGE_PEER_STALL:
 		/*
 		 * Peer-stall = the client's receive window is pinned (it can't
 		 * drain to local storage right now) while our cwnd is healthy -
@@ -991,7 +991,7 @@ srv_tcp_health_tick(struct ssh *ssh)
 			srv_ps_waiting = 1;
 		}
 		break;
-	case SFTP_HPN_WEDGE_PEER_STALL_BRAKE:
+	case HPN_WEDGE_PEER_STALL_BRAKE:
 		/*
 		 * Emergency brake: the client has pinned our send window for
 		 * over 5 minutes straight (PEER_STALL_BRAKE_SECS).  No longer a
@@ -1005,13 +1005,13 @@ srv_tcp_health_tick(struct ssh *ssh)
 		    h.raw.notsent_bytes / 1000000.0);
 		srv_terminate_worker(ssh, HPN_EXIT_TCP_PEER_STALL, reason);
 		return;
-	case SFTP_HPN_WEDGE_PATH_DEGRADED:
+	case HPN_WEDGE_PATH_DEGRADED:
 		logit("HPN: parallel worker path degraded from %s: sustained "
 		    "retransmits, cwnd=%u, rtt=%.1fms, %llu retransmits",
 		    ssh_remote_ipaddr(ssh), h.raw.snd_cwnd, h.raw.rtt / 1000.0,
 		    (unsigned long long)h.raw.total_retrans);
 		break;
-	case SFTP_HPN_WEDGE_NONE:
+	case HPN_WEDGE_NONE:
 		srv_ps_waiting = 0;	/* recovered; re-log a later episode */
 		break;
 	}

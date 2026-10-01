@@ -1,9 +1,9 @@
-# TCP_INFO health-monitor unit tests (tcpi-portable + sftp-hpn-congestion).
+# TCP_INFO health-monitor unit tests (tcpi-portable + hpn-congestion-monitor).
 # Self-contained: the driver provides its own main() and does not link
 # against test_helper.
 
 PROG=test_tcp_health
-SRCS=tests.c sftp-hpn-congestion.c tcpi-portable.c
+SRCS=tests.c hpn-congestion-monitor.c tcpi-portable.c
 
 REGRESS_TARGETS=run-regress-${PROG}
 

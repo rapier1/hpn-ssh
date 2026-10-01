@@ -16,13 +16,11 @@
  *
  */
 
-/*
- * hpn-fault-inject.c - fault-injection test scaffolding for HPN-SSH.
+/* hpn-fault-inject.c - fault-injection test scaffolding for HPN-SSH.
  * TEST/DEBUG ONLY: built only with -DHPN_FAULT_INJECTION, and compiled out
  * otherwise. The environment variables and the API are documented in
  * hpn-fault-inject.h. No hook sites live in the tree: each test campaign
- * adds the fault_inj_ calls it needs and removes them afterward.
- */
+ * adds the fault_inj_ calls it needs and removes them afterward. */
 
 #include "includes.h"
 
@@ -60,8 +58,8 @@ static const char *corrupt_mode_names[] = {
 /* A fault that ends connections: HPN_FAULT_INJECT marks them dead and
  * HPN_FAULT_PROTOCOL reports a protocol violation. */
 struct fault_inj_kill {
-	uint64_t       threshold;  /* bytes before it fires; 0 = disabled */
-	int            kills_left; /* connections left to hit; INT_MAX = no cap */
+	uint64_t       threshold;  /* bytes before it fires, 0 = disabled */
+	int            kills_left; /* connections left to hit, INT_MAX = no cap */
 	pthread_once_t once;
 };
 
@@ -93,7 +91,7 @@ static struct fault_inj_throttle fault_inj_rthrottle_state = {
 };
 
 /* Corruption state for HPN_FAULT_CORRUPT. The mode decides which fields
- * apply; hpn-fault-inject.h describes the modes and what each one tests. */
+ * apply. hpn-fault-inject.h describes the modes and what each one tests. */
 static struct {
 	uint64_t       offset;     /* ONCE, PERSIST, VARY: the offset */
 	uint64_t       offsets[FAULT_CORRUPT_MAX_OFFSETS]; /* MULTI: offset list */
@@ -136,7 +134,7 @@ fault_inj_cap(const char *name, const char *str)
 }
 
 /* Parse <bytes>[:<max_kills>] from env into a kill fault and announce
- * it once. Unset, or a zero byte count, leaves it disabled; no cap means
+ * it once. Unset, or a zero byte count, leaves it disabled. No cap means
  * every connection. what says what the fault does, e.g. "die". */
 static void
 fault_inj_kill_parse(struct fault_inj_kill *kill, const char *name,
@@ -171,7 +169,7 @@ fault_inj_kill_parse(struct fault_inj_kill *kill, const char *name,
 
 /* Parse <bytes>:<delay_ms>[:<max_conns>] from env into a throttle fault
  * and announce it once. Unset, or a zero byte count or delay, leaves it
- * disabled; no cap means one connection. dir is "send" or "recv". */
+ * disabled. No cap means one connection. dir is "send" or "recv". */
 static void
 fault_inj_throttle_parse(struct fault_inj_throttle *throttle,
     const char *name, const char *dir)
@@ -258,7 +256,7 @@ fault_inj_sleep_ms(uint64_t ms)
 }
 
 /* Arm a new connection with whichever kill and throttle faults are set.
- * Each connection gets the thresholds; the shared budgets decide which
+ * Each connection gets the thresholds. The shared budgets decide which
  * of them actually fault. */
 void
 fault_inj_arm_conn(struct sftp_hpn_conn *hpn)
@@ -279,7 +277,7 @@ fault_inj_arm_conn(struct sftp_hpn_conn *hpn)
 }
 
 /* Count bytes sent on a connection and fire whichever faults it has
- * crossed. Throttling sleeps and continues; a protocol violation or a
+ * crossed. Throttling sleeps and continues. A protocol violation or a
  * death marks the connection and returns -1, as a failed send would.
  * Returns 0 otherwise. */
 int
@@ -416,8 +414,8 @@ fault_inj_corrupt_state_init(void)
 	fault_inj_corrupt_state.n_offsets = count;
 	fault_inj_corrupt_state.offset = fault_inj_corrupt_state.offsets[0];
 
-	/* Optional mode suffix. A single offset with no suffix is ONCE;
-	 * :persist and :vary take one offset; :multi[:N], or a bare list of
+	/* Optional mode suffix. A single offset with no suffix is ONCE.
+	 * :persist and :vary take one offset. :multi[:N], or a bare list of
 	 * offsets, is MULTI. */
 	if (*end == ':') {
 		if (strcmp(end + 1, "persist") == 0)
@@ -462,8 +460,8 @@ fault_inj_corrupt_state_init(void)
 }
 
 /* Corrupt the outgoing write of len bytes at file offset chunk_off, in
- * place, if it covers an armed offset. The source file is never touched;
- * only the bytes on their way out change. */
+ * place, if it covers an armed offset. The source file is never touched.
+ * Only the bytes on their way out change. */
 void
 fault_inj_corrupt(off_t chunk_off, u_char *buf, size_t len)
 {
@@ -521,8 +519,8 @@ fault_inj_corrupt(off_t chunk_off, u_char *buf, size_t len)
 	}
 
 	/* PERSIST and VARY corrupt every write that covers the offset, repairs
-	 * included. PERSIST uses a fixed mask, so the target hash repeats; VARY
-	 * uses a counter, so the hash changes on every attempt. */
+	 * included. PERSIST uses a fixed mask, so the target hash repeats.
+	 * VARY uses a counter, so the hash changes on every attempt. */
 	if (fault_inj_corrupt_state.mode == CORRUPT_VARY) {
 		uint64_t seq = __atomic_add_fetch(&fault_inj_corrupt_state.seq, 1,
 		    __ATOMIC_SEQ_CST);

@@ -33,9 +33,9 @@
  *   parser  - used by the server upload extract path and the client
  *             download extract path. The caller pushes wire bytes with
  *             parser_feed(), and the parser calls back as it reaches each
- *             entry's header, data and end.
+ *             entry's header, data, and end.
  *
- * Format (HPN-internal; read only by HPN-SSH at the other end of the same
+ * Format (HPN-internal, read only by HPN-SSH at the other end of the same
  * connection, so it carries no tar/archive compatibility baggage):
  *
  *   A minimal length-prefixed binary record per file:
@@ -44,13 +44,13 @@
  *     u64  mtime      seconds since the epoch
  *     u64  size       file data length
  *     u16  path_len   archive-path length (PATH_MAX < 64 KiB)
- *     u8[path_len]    archive path (length-prefixed; no NUL)
+ *     u8[path_len]    archive path (length-prefixed, no NUL)
  *     u8[size]        file data
  *   The next record follows with no padding, and a lone type 0 byte ends
  *   the stream. All integers are big-endian, since the stream can cross
  *   architectures. There are no 512-byte blocks, octal fields, checksums,
- *   magic or uid/gid. Every entry is a regular file: no symlinks,
- *   directories or special files.
+ *   magic, or uid/gid. Every entry is a regular file: no symlinks,
+ *   directories, or special files.
  *
  * Error model: a bundle is all-or-nothing. Any failure while packing or
  * unpacking puts the codec in an error state. The caller abandons the
@@ -59,8 +59,7 @@
  *
  * Threading: the codec keeps no shared state and takes no locks. Each
  * writer or parser belongs to one thread, the worker or transfer that
- * created it.
- */
+ * created it. */
 
 #ifndef _SFTP_HPN_BUNDLE_CODEC_H
 #define _SFTP_HPN_BUNDLE_CODEC_H
@@ -86,19 +85,17 @@
 struct sftp_hpn_bundle_writer;
 struct sftp_hpn_bundle_parser;
 
-/*
- * Callbacks the parser makes as it reaches each entry. ctx is the value
+/* Callbacks the parser makes as it reaches each entry. ctx is the value
  * given to parser_new(), passed back unchanged. A non-zero return from
  * any callback fails the parser, and the caller abandons the bundle.
  *
  * For each entry, in order:
  *   entry_cb      - the header is complete. The caller may open the
- *                   output file, check the path and preallocate.
+ *                   output file, check the path, and preallocate.
  *   data_cb       - file bytes, in one or more calls that total the
  *                   declared size. Not called for an empty file.
  *   entry_end_cb  - all of the entry's bytes have arrived. The caller
- *                   closes the file and applies its mode and mtime.
- */
+ *                   closes the file and applies its mode and mtime. */
 struct sftp_hpn_bundle_callbacks {
 	int (*entry_cb)(void *ctx, const char *, uint64_t, mode_t, time_t);
 	int (*data_cb)(void *ctx, const u_char *, size_t);
@@ -109,17 +106,16 @@ struct sftp_hpn_bundle_callbacks {
  * sftp_hpn_bundle_writer_free(). */
 struct sftp_hpn_bundle_writer *sftp_hpn_bundle_writer_new(void);
 
-/* Free a writer, its queue and the entry in flight, closing any open
+/* Free a writer, its queue, and the entry in flight, closing any open
  * source file. Safe on NULL. */
 void sftp_hpn_bundle_writer_free(struct sftp_hpn_bundle_writer *);
 
-/*
- * Queue a file for inclusion in the bundle stream.
+/* Queue a file for inclusion in the bundle stream.
  *
  *   src_path       - local path the writer opens and reads. Required.
  *   archive_path   - path as it appears in the record header, at most
  *                    SFTP_HPN_BUNDLE_MAX_PATH bytes.
- *   mode           - permission bits; only the low 12 are sent.
+ *   mode           - permission bits, of which only the low 12 are sent.
  *   size           - bytes to pack. The header commits to it, so a file
  *                    that shrinks before it is packed fails the bundle.
  *   mtime          - modification time in seconds since the epoch.
@@ -129,8 +125,7 @@ void sftp_hpn_bundle_writer_free(struct sftp_hpn_bundle_writer *);
  *
  * Returns 0 on success or -1 on an empty or too-long path, or when only
  * one of the hash pointers is given.
- * On -1 the writer's queue is unchanged.
- */
+ * On -1 the writer's queue is unchanged. */
 int sftp_hpn_bundle_writer_add_file(struct sftp_hpn_bundle_writer *,
     const char *src_path, const char *archive_path,
     mode_t mode, uint64_t size, time_t mtime,
@@ -142,22 +137,20 @@ int sftp_hpn_bundle_writer_add_file(struct sftp_hpn_bundle_writer *,
  * the end of the stream. Calling finish() again has no effect. */
 void sftp_hpn_bundle_writer_finish(struct sftp_hpn_bundle_writer *);
 
-/*
- * Pack the next part of the stream into out.
+/* Pack the next part of the stream into out.
  *
  * Returns:
  *    > 0  - bytes written into out, at most max_bytes.
  *    0    - nothing more to produce: the end of the stream after
  *           finish(), or an empty queue before it.
- *   -1    - codec error; sftp_hpn_bundle_writer_error() says why. The
- *           stream on the wire is now invalid, so the caller must
- *           abandon the bundle.
- */
+ *   -1    - codec error, and sftp_hpn_bundle_writer_error() says why.
+ *           The stream on the wire is now invalid, so the caller must
+ *           abandon the bundle. */
 ssize_t sftp_hpn_bundle_writer_pack_next(struct sftp_hpn_bundle_writer *,
     u_char *out, size_t max_bytes);
 
 /* Why pack_next() failed, or NULL if it has not. The string belongs to
- * the writer; do not free it. */
+ * the writer. Do not free it. */
 const char *sftp_hpn_bundle_writer_error(struct sftp_hpn_bundle_writer *);
 
 /* Construct a parser. cb and ctx must stay valid for the parser's
@@ -168,22 +161,20 @@ struct sftp_hpn_bundle_parser *sftp_hpn_bundle_parser_new(
 /* Free the parser. Safe on NULL. */
 void sftp_hpn_bundle_parser_free(struct sftp_hpn_bundle_parser *);
 
-/*
- * Feed bytes from the wire into the parser. All of them are consumed
+/* Feed bytes from the wire into the parser. All of them are consumed
  * before it returns, and the callbacks run during the call.
  *
  * Returns:
- *    0  - all bytes consumed; feed more.
- *    1  - the end byte was the last byte given; the stream is complete.
+ *    0  - all bytes consumed, so feed more.
+ *    1  - the end byte was the last byte given, so the stream is complete.
  *         Any bytes after it, now or in a later call, are an error.
- *   -1  - parse error; sftp_hpn_bundle_parser_error() says why. The
- *         caller must abandon the bundle.
- */
+ *   -1  - parse error, and sftp_hpn_bundle_parser_error() says why. The
+ *         caller must abandon the bundle. */
 int sftp_hpn_bundle_parser_feed(struct sftp_hpn_bundle_parser *,
     const u_char *, size_t);
 
 /* Why feed() failed, or NULL if it has not. The string belongs to the
- * parser; do not free it. */
+ * parser. Do not free it. */
 const char *sftp_hpn_bundle_parser_error(struct sftp_hpn_bundle_parser *);
 
 #endif /* _SFTP_HPN_BUNDLE_CODEC_H */

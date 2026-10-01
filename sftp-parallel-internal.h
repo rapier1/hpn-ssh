@@ -133,7 +133,7 @@ struct sftp_hpn_dirattr_list;	/* deferred dir attrs */
 
 /* Watchdog thresholds. STALL: warn (status only, NO kill) if a worker has
  * had work available but made no bytes-level progress for this long.
- * The kill lanes live with the transport classifier in sftp-hpn-congestion.c
+ * The kill lanes live with the transport classifier in hpn-congestion-monitor.c
  * and the watchdog. */
 #define STALL_THRESHOLD_SEC          60  /* STALLED warn status (no kill) */
 /* reap a still-connected, byte-silent worker only after this - above the

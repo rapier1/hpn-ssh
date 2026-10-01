@@ -16,11 +16,10 @@
  *
  */
 
-/*
- * hpn-fault-inject.h - fault-injection test scaffolding for HPN-SSH.
+/* hpn-fault-inject.h - fault-injection test scaffolding for HPN-SSH.
  *
- * TEST/DEBUG ONLY. Everything here is built only with -DHPN_FAULT_INJECTION;
- * in normal builds the hooks below compile to nothing. All functions are
+ * TEST/DEBUG ONLY. Everything here is built only with -DHPN_FAULT_INJECTION.
+ * In normal builds the hooks below compile to nothing. All functions are
  * prefixed fault_inj_. No hook sites live in the tree: a test campaign adds
  * the calls it needs and removes them afterward. Typically that means
  * fault_inj_arm_conn() at connection setup, fault_inj_check_send() and
@@ -34,7 +33,7 @@
  *   ENV-VAR HPN_FAULT_INJECT=<bytes>[:<max_kills>]
  *       After <bytes> sent, the connection is marked dead, just like a
  *       real EPIPE (no descriptors are closed here). At most <max_kills>
- *       connections die; the default is all of them. Tests worker death
+ *       connections die, all of them by default. Tests worker death
  *       and recovery: the respawn and the requeue of the unfinished work.
  *
  *   ENV-VAR HPN_FAULT_PROTOCOL=<bytes>[:<max_kills>]
@@ -75,8 +74,7 @@
  *                  The first send spends the slots, so the repairs run
  *                  clean and must all succeed. Use one offset with N set
  *                  to the file count for many files, or a list for many
- *                  points in one file.
- */
+ *                  points in one file. */
 
 #ifndef HPN_FAULT_INJECT_H
 #define HPN_FAULT_INJECT_H
@@ -84,8 +82,8 @@
 struct sftp_hpn_conn;
 
 #ifdef HPN_FAULT_INJECTION
-/* Arm a new connection with the faults that are set; call at connection
- * setup. */
+/* Arm a new connection with the faults that are set. Call it at
+ * connection setup. */
 void	fault_inj_arm_conn(struct sftp_hpn_conn *);
 /* Send hook: count the bytes and fire any fault they cross. Returns -1
  * when the send should fail because the connection is now dead or has

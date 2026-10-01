@@ -19,7 +19,7 @@
 /* sftp-hpn-bundle-codec.c - the bundle codec: a streaming writer that
  * packs files into the bundle record stream and a streaming parser that
  * unpacks it, used by both ends in both directions. The record format and
- * the API are in sftp-hpn-bundle-codec.h; the integers are big-endian
+ * the API are in sftp-hpn-bundle-codec.h. The integers are big-endian
  * through the tree's POKE and PEEK macros. This is a "tar like" protocol
  * but is not tar. We originally tried this using libarchive but it was far too
  * heavy for what we are doing.
@@ -28,7 +28,7 @@
  * file data: the writer reads source bytes straight into the output
  * buffer, and the parser hands file bytes to data_cb straight from the
  * input. Each keeps one record header, the fixed prefix and its path, as
- * scratch; any larger buffering is the caller's. An empty file skips the
+ * scratch. Any larger buffering is the caller's. An empty file skips the
  * data state. When asked, the writer also hashes each entry's data with
  * XXH3 as it reads it, so a verified upload needs no second read of the
  * source.
@@ -181,7 +181,7 @@ writer_file_free(struct writer_file *file)
 	free(file);
 }
 
-/* Free the writer, its queue and the entry in flight, closing an open
+/* Free the writer, its queue, and the entry in flight, closing an open
  * source file. Safe on NULL. */
 void
 sftp_hpn_bundle_writer_free(struct sftp_hpn_bundle_writer *writer)
@@ -205,7 +205,7 @@ sftp_hpn_bundle_writer_free(struct sftp_hpn_bundle_writer *writer)
 }
 
 /* Queue a file after those already queued. Only its paths and header
- * fields are kept; the file is opened when pack_next() reaches it. */
+ * fields are kept. The file is opened when pack_next() reaches it. */
 int
 sftp_hpn_bundle_writer_add_file(struct sftp_hpn_bundle_writer *writer,
     const char *src_path, const char *archive_path,
@@ -534,7 +534,7 @@ parser_handle_header(struct sftp_hpn_bundle_parser *parser)
 		}
 		parser->state = PS_HEADER;
 	} else {
-		/* data follows; feed() finishes the entry when it has all of it */
+		/* data follows, and feed() finishes the entry when it is all in */
 		parser->state = PS_DATA;
 	}
 	return 0;
@@ -549,7 +549,7 @@ sftp_hpn_bundle_parser_feed(struct sftp_hpn_bundle_parser *parser,
 {
 	if (parser == NULL || data == NULL)
 		return -1;
-	/* a failed parser stays failed; a finished one takes no more input */
+	/* a failed parser stays failed, and a finished one takes no more input */
 	if (parser->state == PS_ERROR)
 		return -1;
 	if (parser->state == PS_DONE) {

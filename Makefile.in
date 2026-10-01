@@ -116,7 +116,7 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
 	kexsntrup761x25519.o kexmlkem768x25519.o sntrup761.o kexgen.o \
 	sftp-realpath.o platform-pledge.o platform-tracing.o platform-misc.o \
 	sshbuf-io.o misc-agent.o ssherr-libcrypto.o \
-	metrics.o tcpi-portable.o sftp-hpn-congestion.o binn.o happyeyeballs.o \
+	metrics.o tcpi-portable.o hpn-congestion-monitor.o binn.o happyeyeballs.o \
 	hpn-compress.o \
 	cipher-ctr-mt-provider.o \
 	cipher-ctr-mt-functions.o ossl3-provider-err.o num.o
@@ -848,11 +848,11 @@ regress/unittests/sftp_workqueue/test_sftp_workqueue$(EXEEXT): \
 	$(LD) -o $@ $(LDFLAGS) $(UNITTESTS_TEST_SFTP_WORKQUEUE_OBJS) \
 	    -lpthread $(TESTLIBS)
 
-# TCP_INFO health monitor (tcpi-portable + sftp-hpn-congestion). Own main(),
+# TCP_INFO health monitor (tcpi-portable + hpn-congestion-monitor). Own main(),
 # no test_helper. Links the two modules directly against a localhost socket.
 UNITTESTS_TEST_TCP_HEALTH_OBJS=\
 	regress/unittests/tcp_health/tests.o \
-	sftp-hpn-congestion.o \
+	hpn-congestion-monitor.o \
 	tcpi-portable.o
 
 regress/unittests/tcp_health/test_tcp_health$(EXEEXT): \

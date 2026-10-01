@@ -101,7 +101,7 @@
 #include "ssherr.h"
 #include "hostfile.h"
 #include "metrics.h"
-#include "sftp-hpn-congestion.h"
+#include "hpn-congestion-monitor.h"
 #include "hpn-exit-codes.h"
 
 /* Permitted RSA signature algorithms for UpdateHostkeys proofs */
@@ -167,7 +167,7 @@ static int connection_out;	/* Connection to server (output). */
  * HPN_PARALLEL_WORKER environment variable); ordinary ssh sessions leave
  * it untouched.  The periodic poll + wedge decision land in a later change.
  */
-static struct sftp_hpn_tcp_health_ctx tcp_health;
+static struct hpn_cong_ctx tcp_health;
 static int tcp_health_armed;	/* nonzero once tcp_health is initialised */
 static time_t tcp_health_check_time;	/* monotime deadline for next poll */
 static time_t metrics_check_time;	/* monotime deadline for next metrics poll */
@@ -181,7 +181,7 @@ static time_t metrics_check_time;	/* monotime deadline for next metrics poll */
  * it tells whether a worker that vanished was wedged (cwnd collapsed) or
  * peer-stalled (receive window pinned) at the moment it died.
  */
-static struct sftp_hpn_tcp_health hpn_last_health;
+static struct hpn_cong_sample hpn_last_health;
 static int hpn_have_last_health;
 static time_t hpn_last_health_s;
 static int need_rekeying;	/* Set to non-zero if rekeying is requested. */
@@ -549,11 +549,11 @@ schedule_tcp_health_check(void)
 static void
 tcp_health_tick(void)
 {
-	struct sftp_hpn_tcp_health h;
+	struct hpn_cong_sample h;
 
 	if (!tcp_health_armed)
 		return;
-	if (sftp_hpn_tcp_health_poll(&tcp_health, &h) != 0) {
+	if (hpn_cong_poll(&tcp_health, &h) != 0) {
 		/* Settled UNSUPPORTED - stop polling this connection. */
 		tcp_health_armed = 0;
 		debug_f("HPN: TCP health monitor disabled (unsupported)");
@@ -593,8 +593,8 @@ tcp_health_tick(void)
 	}
 
 	static int ps_waiting = 0;
-	switch (sftp_hpn_classify(&tcp_health, &h)) {
-	case SFTP_HPN_WEDGE_TCP_WEDGE:
+	switch (hpn_cong_classify(&tcp_health, &h)) {
+	case HPN_WEDGE_TCP_WEDGE:
 		/* The orchestrator announces this event in plain language
 		 * ("worker N: connection wedged, reconnecting"), so the
 		 * transport-side stats line is developer telemetry - debug
@@ -613,7 +613,7 @@ tcp_health_tick(void)
 			    (unsigned long long)h.raw.total_retrans);
 		cleanup_exit(HPN_EXIT_TCP_WEDGE);
 		break;
-	case SFTP_HPN_WEDGE_PEER_STALL:
+	case HPN_WEDGE_PEER_STALL:
 		/*
 		 * Peer-stall = the remote isn't draining right now (receive
 		 * window pinned, cwnd healthy) - a transient backend stall
@@ -634,7 +634,7 @@ tcp_health_tick(void)
 			ps_waiting = 1;
 		}
 		break;
-	case SFTP_HPN_WEDGE_PEER_STALL_BRAKE:
+	case HPN_WEDGE_PEER_STALL_BRAKE:
 		/*
 		 * Emergency brake: the peer has pinned our send window for over
 		 * 5 minutes straight.  That is no longer a transient backend
@@ -645,12 +645,12 @@ tcp_health_tick(void)
 		    "(receive window pinned) - self-terminating");
 		cleanup_exit(HPN_EXIT_TCP_PEER_STALL);
 		break;
-	case SFTP_HPN_WEDGE_PATH_DEGRADED:
+	case HPN_WEDGE_PATH_DEGRADED:
 		/* Monitored only -- no self-termination yet. */
 		logit("HPN: worker path degraded, sustained retransmits "
 		    "(cwnd=%u rtt=%uus)", h.raw.snd_cwnd, h.raw.rtt);
 		break;
-	case SFTP_HPN_WEDGE_NONE:
+	case HPN_WEDGE_NONE:
 		ps_waiting = 0;	/* recovered; let a later stall episode re-log */
 		break;
 	}
@@ -1691,9 +1691,9 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	 * so only orchestrator-spawned workers run it.  No poll/decision yet.
 	 */
 	if (getenv("HPN_PARALLEL_WORKER") != NULL) {
-		sftp_hpn_tcp_health_ctx_init(&tcp_health, connection_in);
+		hpn_cong_init(&tcp_health, connection_in);
 		tcp_health_armed =
-		    (tcp_health.avail != TCP_HEALTH_UNSUPPORTED);
+		    (tcp_health.avail != HPN_CONG_UNSUPPORTED);
 		debug_f("HPN: parallel-worker TCP health monitor %s on "
 		    "fd %d (avail=%d)",
 		    tcp_health_armed ? "armed" : "unavailable",
