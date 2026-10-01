@@ -67,13 +67,13 @@ volatile sig_atomic_t parallel_user_abort_flag;
  * fed. With bundling a single queued object can carry thousands of files, so
  * counting files would either starve the workers or let the queue grow without
  * bound; the depth is derived from how many files fit in a bundle instead. */
-static size_t
+static int
 work_queue_depth(const struct sftp_parallel_config *cfg)
 {
-	size_t base, per_bundle, depth;
+	int base, per_bundle, depth;
 	uint64_t target;
 
-	base = (size_t)cfg->num_streams * UPLOAD_BATCH_SIZE * 4 +
+	base = cfg->num_streams * UPLOAD_BATCH_SIZE * 4 +
 	    UPLOAD_BATCH_SIZE;
 	if (!cfg->use_bundle)
 		return base;
@@ -82,13 +82,13 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
 	target = cfg->bundle_size;
 
 	/* per bundle = estimate of number of files in a bundle */
-	per_bundle = (size_t)(target / BUNDLE_QUEUE_FILE_HINT);
+	per_bundle = (int)(target / BUNDLE_QUEUE_FILE_HINT);
 	if (per_bundle < UPLOAD_BATCH_SIZE)
 		per_bundle = UPLOAD_BATCH_SIZE;
 
 	/* Two rounds of full bundles per worker, so the walker can stay a round
 	 * ahead while every worker is assembling, plus one batch of slack. */
-	depth = (size_t)cfg->num_streams * per_bundle * 2 +
+	depth = cfg->num_streams * per_bundle * 2 +
 	    UPLOAD_BATCH_SIZE;
 	if (depth < base)
 		depth = base;

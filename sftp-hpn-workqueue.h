@@ -16,106 +16,77 @@
  *
  */
 
-/*
- * Bounded multi-producer, multi-consumer work queue for the parallel-streams
- * sftp client. Carries opaque void* items; the caller owns the memory the
- * pointers refer to.
+/* sftp-hpn-workqueue.h - a bounded multi-producer, multi-consumer work
+ * queue for parallel hpnsftp. It carries opaque void * items, and the
+ * caller owns the memory they point to.
  *
- * Used by sftp-parallel.c: one producer pushes work units; N workers pop and
- * execute them. The queue is intentionally typeless so it can be compiled
- * and tested in isolation from the rest of the sftp client.
- */
+ * The parallel orchestrator (sftp-parallel*.c) pushes work units, and its
+ * worker threads pop and run them. The queue knows nothing about the
+ * items, so it can be built and unit-tested apart from the rest of the
+ * sftp client. */
 
 #ifndef _SFTP_HPN_WORKQUEUE_H
 #define _SFTP_HPN_WORKQUEUE_H
 
-#include <stddef.h>
-
 struct sftp_hpn_workqueue;
 
-/*
- * Create a bounded queue with the given capacity (must be > 0). Returns
- * NULL on allocation failure.
- */
-struct sftp_hpn_workqueue *sftp_hpn_workqueue_new(size_t capacity);
+/* Create a queue that holds up to the given number of items, which must be
+ * positive. Returns NULL on failure. */
+struct sftp_hpn_workqueue *sftp_hpn_workqueue_new(int);
 
-/*
- * Free the queue. The caller must have drained it; items still inside are
- * not freed by this function (the queue does not own item memory).
- */
-void sftp_hpn_workqueue_free(struct sftp_hpn_workqueue *q);
+/* Free the queue. Items still in it are not freed, because the queue does
+ * not own them, so the caller drains it first. */
+void sftp_hpn_workqueue_free(struct sftp_hpn_workqueue *);
 
-/*
- * Push an item. Blocks if the queue is full. Returns 0 on success, -1 if
- * shutdown was signaled before the push could complete.
- */
-int sftp_hpn_workqueue_push(struct sftp_hpn_workqueue *q, void *item);
+/* Push an item, blocking while the queue is full. Returns 0, or -1 if the
+ * queue is shut down first. */
+int sftp_hpn_workqueue_push(struct sftp_hpn_workqueue *, void *);
 
-/*
- * Non-blocking pushes: trypush inserts at the tail; trypush_front at the
- * HEAD (LIFO - the item is the next one popped), used for transient unit
- * re-queues so a failed byte-range jumps ahead of fresh work and its file
- * completes promptly.  Never wait on a full queue.  Return 0 if the item
- * was queued, 1 if the queue is full (item NOT queued), -1 if the queue is
- * shut down.  A worker re-queueing units onto the same queue it also drains
- * must use these: a blocking push there can self-deadlock (the blocked
- * worker stops consuming, so nothing ever drains the queue) - fatal at -j1,
- * where that worker is the only consumer.
- */
-int sftp_hpn_workqueue_trypush(struct sftp_hpn_workqueue *q, void *item);
-int sftp_hpn_workqueue_trypush_front(struct sftp_hpn_workqueue *q, void *item);
+/* Pushes that never wait. trypush adds at the tail. trypush_front adds at
+ * the head, so the item is popped next. Re-queued units use it, so a
+ * failed byte range runs ahead of fresh work and its file finishes
+ * promptly. Both return 0 if queued, 1 if the queue is full and the item
+ * was not queued, or -1 if it is shut down. A worker re-queueing onto the
+ * queue it also drains must use these. A blocking push there would stop
+ * that worker consuming, so nothing would drain the queue, and at -j1
+ * that worker is the only consumer. */
+int sftp_hpn_workqueue_trypush(struct sftp_hpn_workqueue *, void *);
+int sftp_hpn_workqueue_trypush_front(struct sftp_hpn_workqueue *, void *);
 
-/*
- * Pop an item. Blocks if the queue is empty. On success sets *itemp and
- * returns 0. Returns -1 if shutdown was signaled and the queue is empty
- * (drains residual items before returning -1).
- */
-int sftp_hpn_workqueue_pop(struct sftp_hpn_workqueue *q, void **itemp);
+/* Pop an item through the pointer given, blocking while the queue is
+ * empty. Returns 0, or -1 once the queue is shut down and empty. Items
+ * left at shutdown are still handed out first. */
+int sftp_hpn_workqueue_pop(struct sftp_hpn_workqueue *, void **);
 
-/*
- * Non-blocking pop. On success sets *itemp and returns 0. Returns -1
- * immediately if the queue is empty or shutdown (does not drain).
- * Used by workers to collect a batch of items without blocking.
- */
-int sftp_hpn_workqueue_trypop(struct sftp_hpn_workqueue *q, void **itemp);
+/* Pop an item through the pointer given, without waiting. Returns 0, or -1
+ * if the queue is empty or shut down. Workers use it to gather a batch. */
+int sftp_hpn_workqueue_trypop(struct sftp_hpn_workqueue *, void **);
 
-/*
- * Pop remaining items from a SHUT-DOWN queue (trypop refuses once shutdown
- * is set).  Owner's final drain so undispatched items don't leak; returns
- * -1 only when the queue is empty.
- */
-int sftp_hpn_workqueue_drain(struct sftp_hpn_workqueue *q, void **itemp);
+/* Pop an item through the pointer given, even from a shut-down queue,
+ * which trypop refuses. Returns -1 only when empty. The owner's final
+ * drain uses it, so undispatched items do not leak. */
+int sftp_hpn_workqueue_drain(struct sftp_hpn_workqueue *, void **);
 
-/*
- * Signal shutdown. Wakes every thread currently blocked in push or pop.
- * Subsequent push calls fail immediately; pop calls drain remaining items
- * then fail. Idempotent.
- */
-void sftp_hpn_workqueue_shutdown(struct sftp_hpn_workqueue *q);
+/* Shut the queue down and wake every thread blocked in it. Later pushes
+ * fail, and pop hands out what is left and then fails. Calling it again is
+ * harmless. */
+void sftp_hpn_workqueue_shutdown(struct sftp_hpn_workqueue *);
 
-/*
- * Activity kick: wake threads parked in sftp_hpn_workqueue_wait_activity.
- * Called when external state that gates queued work changes (a per-file
- * writer-cap slot freeing) - the queue itself may be non-empty the whole
- * time, so the not-empty condition cannot serve as the wait point.
- * Cheap: bump a sequence number and broadcast.
- */
-void sftp_hpn_workqueue_kick(struct sftp_hpn_workqueue *q);
+/* Wake the threads waiting in sftp_hpn_workqueue_wait_activity(). Called
+ * when something outside the queue that gates queued work changes, such
+ * as a per-file writer-cap slot freeing. The queue may stay non-empty the
+ * whole time, so the not-empty condition cannot be the wait point. */
+void sftp_hpn_workqueue_kick(struct sftp_hpn_workqueue *);
 
-/*
- * Park until the next activity kick, a push, shutdown, or timeout_ms -
- * whichever comes first.  Used by workers whose only available work is
- * gated (all queued units capped): replaces a pop/requeue spin with an
- * exact wakeup on slot release plus a bounded-staleness backstop.
- */
-void sftp_hpn_workqueue_wait_activity(struct sftp_hpn_workqueue *q, int timeout_ms);
+/* Wait for the next kick, a shutdown, or the given timeout in milliseconds,
+ * whichever comes first. A push does not end the wait. Workers whose queued
+ * work is all capped use it in place of a pop and re-queue spin: the kick
+ * wakes them when a slot frees, and the timeout bounds how stale they can
+ * get. */
+void sftp_hpn_workqueue_wait_activity(struct sftp_hpn_workqueue *, int);
 
-/* Current number of items in the queue. Snapshot - may be stale by the
- * time the caller reads it, which is fine for telemetry. */
-size_t sftp_hpn_workqueue_depth(struct sftp_hpn_workqueue *q);
-
-/* Largest depth the queue has held since creation. Used by adaptive
- * tuning to detect "queue saturated" conditions. */
-size_t sftp_hpn_workqueue_high_watermark(struct sftp_hpn_workqueue *q);
+/* The number of items queued. It can be stale by the time the caller
+ * reads it, which is fine for the telemetry and the gating that use it. */
+int sftp_hpn_workqueue_depth(struct sftp_hpn_workqueue *);
 
 #endif /* _SFTP_HPN_WORKQUEUE_H */

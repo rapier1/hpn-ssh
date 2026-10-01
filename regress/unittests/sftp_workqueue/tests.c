@@ -39,7 +39,7 @@ test_basic_fifo(void)
 	for (intptr_t i = 1; i <= 8; i++)
 		if (sftp_hpn_workqueue_push(q, (void *)i) != 0)
 			FAIL("push %td", i);
-	if (sftp_hpn_workqueue_depth(q) != 8) FAIL("depth %zu", sftp_hpn_workqueue_depth(q));
+	if (sftp_hpn_workqueue_depth(q) != 8) FAIL("depth %d", sftp_hpn_workqueue_depth(q));
 	for (intptr_t i = 1; i <= 8; i++) {
 		void *p = NULL;
 		if (sftp_hpn_workqueue_pop(q, &p) != 0)
@@ -219,33 +219,11 @@ test_mpmc_stress(void)
 		FAIL("sum: got %lu want %lu (items lost or duplicated)",
 		    (unsigned long)actual_sum, (unsigned long)expected_sum);
 
-	if (sftp_hpn_workqueue_high_watermark(q) > 64)
-		FAIL("high watermark exceeded capacity");
-
 	sftp_hpn_workqueue_free(q);
 	OK("mpmc_stress");
 }
 
-/* --- 6. high watermark tracks correctly --- */
-static void
-test_high_watermark(void)
-{
-	struct sftp_hpn_workqueue *q = sftp_hpn_workqueue_new(8);
-	if (sftp_hpn_workqueue_high_watermark(q) != 0) FAIL("hw not 0");
-	for (intptr_t i = 1; i <= 5; i++) sftp_hpn_workqueue_push(q, (void *)i);
-	if (sftp_hpn_workqueue_high_watermark(q) != 5) FAIL("hw not 5");
-	void *p;
-	for (int i = 0; i < 3; i++) sftp_hpn_workqueue_pop(q, &p);
-	if (sftp_hpn_workqueue_high_watermark(q) != 5) FAIL("hw should not decrease");
-	for (intptr_t i = 1; i <= 6; i++) sftp_hpn_workqueue_push(q, (void *)i);
-	if (sftp_hpn_workqueue_high_watermark(q) != 8) FAIL("hw not 8");
-	sftp_hpn_workqueue_shutdown(q);
-	while (sftp_hpn_workqueue_pop(q, &p) == 0) ;
-	sftp_hpn_workqueue_free(q);
-	OK("high_watermark");
-}
-
-/* --- 7. invalid args --- */
+/* --- 6. invalid args --- */
 static void
 test_invalid(void)
 {
@@ -260,7 +238,6 @@ main(void)
 	test_shutdown_drains();
 	test_shutdown_wakes_waiters();
 	test_capacity_blocks_push();
-	test_high_watermark();
 	test_mpmc_stress();
 	test_invalid();
 	printf("\nall workqueue tests passed\n");

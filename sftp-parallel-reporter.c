@@ -818,7 +818,7 @@ reporter_emit_fleetsample(struct sftp_parallel *fleet)
 		return;
 
 	off = (size_t)snprintf(line, sizeof(line),
-	    "HPN FLEETSAMPLE t=%.3f qdepth=%zu walker=%s",
+	    "HPN FLEETSAMPLE t=%.3f qdepth=%d walker=%s",
 	    monotime_double(), sftp_hpn_workqueue_depth(fleet->q),
 	    walker_phase_name(__atomic_load_n(&fleet->walker_phase,
 	        __ATOMIC_RELAXED)));

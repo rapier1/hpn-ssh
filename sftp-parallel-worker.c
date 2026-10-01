@@ -1613,7 +1613,7 @@ parallel_worker_thread(void *arg)
 			__atomic_store_n(&worker->avail, WORKER_AVAIL_CAPPED,
 			    __ATOMIC_RELAXED);
 			if (++capped_passes >=
-			    (int)sftp_hpn_workqueue_depth(fleet->q) + 1) {
+			    sftp_hpn_workqueue_depth(fleet->q) + 1) {
 				sftp_hpn_workqueue_wait_activity(fleet->q, 250);
 				capped_passes = 0;
 			}
