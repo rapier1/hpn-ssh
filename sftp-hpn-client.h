@@ -531,10 +531,6 @@ struct sftp_hpn_conn *sftp_hpn_conn_init(void);
 /* Free an sftp_hpn_conn. NULL is fine. */
 void sftp_hpn_conn_free(struct sftp_hpn_conn *);
 
-/* The -X Pacing= switch, applied to each new connection. The
- * per-connection pacing entry points are in sftp-client-internal.h. */
-void sftp_hpn_pace_set_enabled(int on);
-
 /* Ask the server to set a Lustre layout on the directory at path:
  * stripe_count stripes, with files below small_threshold kept on one.
  * Returns HPN_FILE_LAYOUT_OK, _NOT_FS, _PERM or _FAIL and reports what was

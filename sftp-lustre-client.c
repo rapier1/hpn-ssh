@@ -40,7 +40,7 @@
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
-#include "sftp-client-internal.h"  /* sftp_conn_{lustre_stripe_count,layout_set_declined} */
+#include "sftp-client-internal.h"  /* sftp_conn_lustre_stripe_count */
 #include "sftp-hpn-client.h"        /* sftp_hpn_set_file_layout */
 #include "sftp-hpn-server.h"        /* HPN_FILE_LAYOUT_* */
 #include "sftp-lustre.h"            /* local layout apply (download parity) */
@@ -73,6 +73,27 @@ stripe_to_small_threshold(uint64_t stripe_size)
 	if (stripe_size > UINT32_MAX)
 		return UINT32_MAX;
 	return (uint32_t)stripe_size;
+}
+
+/* Query and set the latch that records the server declining
+ * hpn-file-layout on this connection. maybe_apply_lustre_layout() sets it
+ * after the first refusal, so later calls skip the round trip. Safe when
+ * conn or conn->hpn is NULL. */
+static int
+sftp_conn_layout_set_declined(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	return h != NULL && h->layout_set_declined;
+}
+
+static void
+sftp_conn_set_layout_set_declined(struct sftp_conn *conn, int v)
+{
+	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+
+	if (h != NULL)
+		h->layout_set_declined = v ? 1 : 0;
 }
 
 /*
@@ -305,21 +326,4 @@ sftp_conn_lustre_stripe_count(struct sftp_conn *conn)
 	if (h == NULL)
 		return 0;
 	return h->lustre_stripe_count;
-}
-
-int
-sftp_conn_layout_set_declined(struct sftp_conn *conn)
-{
-	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
-
-	return h != NULL && h->layout_set_declined;
-}
-
-void
-sftp_conn_set_layout_set_declined(struct sftp_conn *conn, int v)
-{
-	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
-
-	if (h != NULL)
-		h->layout_set_declined = v ? 1 : 0;
 }

@@ -2402,9 +2402,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					reordered = 1;
 			}
 			progress_counter += len;
-			if (conn->hpn->live_counter != NULL) /* HPN */
-				__atomic_fetch_add(conn->hpn->live_counter, len,
-				    __ATOMIC_RELAXED);
+			sftp_conn_live_account(conn, len); /* HPN */
 			free(data);
 
 			if (len == req->len) {
@@ -2908,9 +2906,7 @@ do_upload_body(struct sftp_conn *conn,
 			    ack->id, ack->len, (unsigned long long)ack->offset);
 			++ackid;
 			progress_counter += ack->len;
-			if (conn->hpn->live_counter != NULL) /* HPN */
-				__atomic_fetch_add(conn->hpn->live_counter, ack->len,
-				    __ATOMIC_RELAXED);
+			sftp_conn_live_account(conn, ack->len); /* HPN */
 			/* HPN adaptive read-ahead: feed acked bytes. */
 			sftp_conn_rdahead_account(conn, ack->len);
 			/* HPN adaptive upload pacing: feed the ack-rate
@@ -3727,14 +3723,10 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			 * estimator (see sftp_conn_pace_ack). */
 			sftp_conn_pace_ack(conn, ack->len,
 			    conn->num_requests);
-			if (conn->hpn->live_counter != NULL) {
-				/* Report incremental progress so the
-				 * orchestrator's bps window sees a steady
-				 * stream rather than a step at range
-				 * completion. */
-				__atomic_fetch_add(conn->hpn->live_counter,
-				    (uint64_t)ack->len, __ATOMIC_RELAXED);
-			}
+			/* Report incremental progress so the orchestrator's
+			 * bps window sees a steady stream rather than a step
+			 * at range completion. */
+			sftp_conn_live_account(conn, ack->len);
 		}
 		TAILQ_REMOVE(&acks, ack, tq);
 		free(ack);
@@ -4005,10 +3997,8 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				if (contig_hw < 0 ||
 				    (off_t)req->offset < contig_hw)
 					contig_hw = (off_t)req->offset;
-			} else if (conn->hpn->live_counter != NULL) {
-				__atomic_fetch_add(conn->hpn->live_counter,
-				    (uint64_t)len, __ATOMIC_RELAXED);
-			}
+			} else
+				sftp_conn_live_account(conn, len);
 			free(data);
 			if (len == req->len) {
 				TAILQ_REMOVE(&requests, req, tq);
@@ -4524,9 +4514,7 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 				sshbuf_free(msg);
 				goto send_failed;
 			}
-			if (conn->hpn->live_counter != NULL) /* HPN */
-				__atomic_fetch_add(conn->hpn->live_counter,
-				    (uint64_t)bs[i].sb.st_size, __ATOMIC_RELAXED);
+			sftp_conn_live_account(conn, bs[i].sb.st_size); /* HPN */
 			if (status != SSH2_FX_OK) {
 				error("write remote \"%s\": %s",
 				    entries[i].remote_path, fx2txt(status));

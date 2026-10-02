@@ -981,7 +981,7 @@ worker_finish_bundle(struct sftp_parallel *fleet, struct sftp_worker *worker,
 			ok_count++;
 			wired_data += batch[i]->size;
 		}
-	/* Count member data, not the tar-framed wire stream, for the run
+	/* Count member data, not the bundle-framed wire stream, for the run
 	 * summary, so it reflects what the user moved. Only the ok
 	 * members; failed ones re-transfer and are counted on that path. */
 	sftp_conn_bytes_wired_add(worker->conn, (uint64_t)wired_data);
