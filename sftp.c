@@ -1346,31 +1346,11 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			    verify, fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
-			/*
-			 * Download parity for HPNLustreStripeCount: mirror of
-			 * the upload-side parent-dir hook below (process_put),
-			 * but the destination is LOCAL, so the layout is
-			 * applied directly instead of via the wire extension.
-			 * A single-file -j N get into an un-striped local
-			 * Lustre directory then fans out across OSTs too.
-			 */
-			{
-				const char *slash = strrchr(abs_dst, '/');
-				char *parent;
-				if (slash == NULL) {
-					parent = xstrdup(".");
-				} else if (slash == abs_dst) {
-					parent = xstrdup("/");
-				} else {
-					size_t plen = (size_t)(slash - abs_dst);
-					parent = xmalloc(plen + 1);
-					memcpy(parent, abs_dst, plen);
-					parent[plen] = '\0';
-				}
-				maybe_apply_lustre_layout_local(parallel_orch,
-				    conn, parent);
-				free(parent);
-			}
+			/* HPNLustreStripeCount: stripe the local destination
+			 * directory, so a single-file -j get fans out across
+			 * OSTs too. */
+			maybe_apply_lustre_layout_parent(parallel_orch, conn,
+			    abs_dst, 1);
 			/*
 			 * Recover size and mode from the glob attrib cache so
 			 * maybe_submit_download can decide whether to range-
@@ -1577,32 +1557,11 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
-			/*
-			 * HPNLustreStripeCount: same-thread analogue of the
-			 * walker hook.  Apply the layout to the parent
-			 * directory of `abs_dst` (the file's destination
-			 * directory) so a single-file -j N upload to an
-			 * un-striped Lustre directory also fans out across
-			 * OSTs.  Idempotent; the declined-latch on conn
-			 * prevents log spam after the first failure.
-			 */
-			{
-				const char *slash = strrchr(abs_dst, '/');
-				char *parent;
-				if (slash == NULL) {
-					parent = xstrdup(".");
-				} else if (slash == abs_dst) {
-					parent = xstrdup("/");
-				} else {
-					size_t plen = (size_t)(slash - abs_dst);
-					parent = xmalloc(plen + 1);
-					memcpy(parent, abs_dst, plen);
-					parent[plen] = '\0';
-				}
-				maybe_apply_lustre_layout(parallel_orch, conn,
-				    parent);
-				free(parent);
-			}
+			/* HPNLustreStripeCount: stripe the remote destination
+			 * directory, so a single-file -j put fans out across
+			 * OSTs too. */
+			maybe_apply_lustre_layout_parent(parallel_orch, conn,
+			    abs_dst, 0);
 			/* Glob / direct dispatch bypasses the walker; register
 			 * both sides' directories so whole-file verify factors
 			 * the path (upload: local=src, remote=abs_dst). */

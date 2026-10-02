@@ -189,6 +189,20 @@ keyboard-interactive, or a one-time-password / two-factor challenge
 its own prompt and a one-time password cannot be reused across workers.
 If only interactive authentication is available, run without
 .Fl j .
+.Pp
+On Lustre destinations, parallel streams also widen the destination
+directory's stripe to match
+.Fl j Ar N ,
+so the workers fan out across multiple OSTs instead of piling onto one.
+See
+.Cm HPNLustreStripeCount
+in
+.Xr hpnssh_config 5 ;
+the feature is
+.Sy experimental ,
+on by default for parallel Lustre uploads and downloads, and disabled
+with
+.Cm HPNLustreStripeCount Cm 0 .
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
 .It Fl M Ar range_split_min

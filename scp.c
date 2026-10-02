@@ -126,6 +126,7 @@
 #include "sftp-hpn-transferlog.h"
 #include "hpn-compress.h"		/* HPN: -z zstd level bounds */
 #include "sftp-parallel.h"
+#include "sftp-lustre-client.h"	/* maybe_apply_lustre_layout_parent */
 #include "hpn-exit-codes.h"
 
 extern char *__progname;
@@ -1425,6 +1426,7 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	struct sftp_parallel_config pcfg;
 	char portbuf[16] = "";
 	int eff_streams = 0;	/* per-call effective stream count after the cap */
+	int lustre_stripe_count = -1;	/* HPNLustreStripeCount: -1 = auto */
 
 	/*
 	 * Capture whether progress is wanted BEFORE sftp_parallel_start() zeroes
@@ -1471,10 +1473,15 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 
 		memset(&bcfg, 0, sizeof(bcfg));
 		if (sftp_parallel_apply_ssh_config(&bcfg, host,
-		    parallel_config_file, parallel_extra_o) == 0)
+		    parallel_config_file, parallel_extra_o) == 0) {
 			sftp_conn_set_bundle_config(conn, bcfg.use_bundle,
 			    bcfg.bundle_size, bcfg.writer_pool);
+			lustre_stripe_count = bcfg.lustre_stripe_count;
+		}
 	}
+	/* The layout hooks read HPNLustreStripeCount from the connection,
+	 * for the walker's directories and single files alike. */
+	sftp_conn_set_lustre_stripe_count(conn, lustre_stripe_count);
 
 	if (parallel_num_streams <= 1)
 		return;			/* single-stream: no orchestrator */
@@ -2235,6 +2242,9 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 			errs = 1;
 		}
 	} else if (parallel_orch != NULL) {
+		/* HPNLustreStripeCount: stripe the remote destination
+		 * directory first, as sftp.c does. */
+		maybe_apply_lustre_layout_parent(parallel_orch, conn, abs_dst, 0);
 		if (sftp_parallel_submit_upload(parallel_orch, conn, src,
 		    abs_dst, st.st_size, st.st_mode,
 		    resume_flag, resume_flag) != 0) {
@@ -2555,6 +2565,10 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 				if (ga.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
 					fmode = ga.perm;
 			}
+			/* HPNLustreStripeCount: stripe the local destination
+			 * directory first, as sftp.c does. */
+			maybe_apply_lustre_layout_parent(parallel_orch, conn,
+			    abs_dst, 1);
 			if (sftp_parallel_submit_download(parallel_orch, conn,
 			    g.gl_pathv[i], abs_dst, fsize, fmode,
 			    resume_flag, resume_flag) != 0)

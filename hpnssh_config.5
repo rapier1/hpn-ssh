@@ -1410,16 +1410,19 @@ itself ignores this option. HPNSSH only.
 .Sy EXPERIMENTAL :
 desired Lustre stripe count for destination directories when
 .Xr hpnsftp 1
-is uploading with
+or
+.Xr hpnscp 1
+transfers with
 .Fl j Ar N
-parallel streams.
+parallel streams, in either direction.
 Lustre's default per-directory layout often gives small files a single
 OST, so all parallel workers pile onto one storage server and the
 transfer caps out below the path's actual capacity.
-With this option enabled,
-.Xr hpnsftp 1
-asks the server to apply a wider stripe to the destination directory
-before any files land in it, so new files (whether created by the
+With this option enabled, the client gives the destination directory a
+wider stripe before any files land in it.
+On an upload it asks the server to apply the layout, and on a download,
+where the destination is local, it applies the layout itself.
+New files (whether created by the
 range-split path or extracted from a bundle) automatically inherit the
 wider layout and the workers fan out across multiple OSTs.
 The argument is one of:
@@ -1442,6 +1445,8 @@ The feature engages only when all of the following hold:
 .Bl -bullet -compact -offset indent
 .It
 .Xr hpnsftp 1
+or
+.Xr hpnscp 1
 is running in parallel mode
 .Pq Fl j Ar N No with Ar N No \(>= 2 ;
 .It
@@ -1460,6 +1465,10 @@ the server advertises the
 .Cm hpn-file-layout@hpnssh.org
 extension.
 .El
+.Pp
+The two server-side conditions apply to uploads.
+On a download the client reads and sets the local directory's layout
+directly, so it needs neither extension.
 .Pp
 When the layout is applied, one
 .Sy info
@@ -1480,7 +1489,9 @@ This option modifies persistent state on the destination filesystem:
 Lustre's setstripe operation only affects newly-created files but
 persists across sessions, so subsequent file creations in the same
 directory (by any process, not just
-.Xr hpnsftp 1 )
+.Xr hpnsftp 1
+or
+.Xr hpnscp 1 )
 will inherit the layout we set.
 Operators on shared sites with site-managed Lustre policies may want
 to disable it with
@@ -1489,7 +1500,9 @@ in
 .Pa /etc/hpnssh/ssh_config .
 .Pp
 Consulted only by
-.Xr hpnsftp 1 ;
+.Xr hpnsftp 1
+and
+.Xr hpnscp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
 .It Cm IdentitiesOnly

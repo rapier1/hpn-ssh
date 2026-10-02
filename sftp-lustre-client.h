@@ -33,8 +33,8 @@ struct sftp_conn;
 
 /*
  * HPNLustreStripeCount entry point.  Called by the recursive walker after
- * mkdir of a destination subdirectory, and by sftp.c's single-file upload
- * dispatch on the destination directory.  No-op when the feature is
+ * mkdir of a destination subdirectory, and through
+ * maybe_apply_lustre_layout_parent() for a single-file upload.  No-op when the feature is
  * disabled (HPNLustreStripeCount=0), not in parallel mode, the server
  * does not advertise hpn-file-layout, the destination is not on Lustre,
  * the current stripe count already meets or exceeds the desired count,
@@ -57,5 +57,11 @@ void maybe_apply_lustre_layout(struct sftp_parallel *fleet,
  */
 void maybe_apply_lustre_layout_local(struct sftp_parallel *fleet,
     struct sftp_conn *conn, const char *dst);
+
+/* Apply the layout to the parent directory of a single-file -j transfer's
+ * destination, the case the walker does not cover. sftp.c and scp.c call
+ * it before submitting the file. local selects the download variant. */
+void maybe_apply_lustre_layout_parent(struct sftp_parallel *,
+    struct sftp_conn *, const char *path, int local);
 
 #endif /* SFTP_LUSTRE_CLIENT_H */

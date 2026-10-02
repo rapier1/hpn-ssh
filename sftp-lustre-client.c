@@ -33,9 +33,12 @@
 
 #include <sys/types.h>
 
+#include <libgen.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "xmalloc.h"
 #include "log.h"
 #include "sftp.h"
 #include "sftp-common.h"
@@ -300,6 +303,27 @@ maybe_apply_lustre_layout_local(struct sftp_parallel *fleet,
 		    "failed (status %u)", dst, rc);
 		break;
 	}
+}
+
+/* Apply the layout to the parent directory of path, for a single-file -j
+ * transfer that does not go through the walker. local is 1 when the
+ * destination is local (a download) and 0 when it is remote (an upload). */
+void
+maybe_apply_lustre_layout_parent(struct sftp_parallel *fleet,
+    struct sftp_conn *conn, const char *path, int local)
+{
+	char *copy;
+	char *parent;
+
+	if (path == NULL)
+		return;
+	copy = xstrdup(path);
+	parent = dirname(copy);
+	if (local)
+		maybe_apply_lustre_layout_local(fleet, conn, parent);
+	else
+		maybe_apply_lustre_layout(fleet, conn, parent);
+	free(copy);
 }
 
 /* ==========================================================================
