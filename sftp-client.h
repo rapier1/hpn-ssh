@@ -288,7 +288,7 @@ struct sftp_upload_batch_entry {
 	uint64_t    src_hash;
 };
 
-/* ── BEGIN Phase 4 gap 1: pipelined batch send/finish ──────────────────────
+/* BEGIN HPN: pipelined batch send and finish
  *
  * Upload N files with pipelined SSH_FXP_OPEN/CLOSE (all N opens in one burst,
  * transfer sequentially, all N closes in one burst) so per-file open/close RTT
@@ -324,15 +324,15 @@ struct sftp_upload_batch_pending *sftp_upload_batch_send(
 int sftp_upload_batch_finish(struct sftp_conn *conn,
     struct sftp_upload_batch_pending *pending);
 
-/* ── END Phase 4 gap 1 ───────────────────────────────────────────────────── */
+/* END HPN: pipelined batch send and finish */
 
-/* ── BEGIN Phase 5: hpn-bundle small-file streaming ──────────────────────
+/* BEGIN HPN: hpn-bundle small-file streaming
  *
  * Bundle upload via the `hpn-bundle-open@hpnssh.org` SFTP extension.
- * Many small files are packed into a single tar-format byte stream and
- * delivered through one OPEN / WRITE×N / CLOSE sequence - amortising the
+ * Many small files are packed into a single bundle byte stream and
+ * delivered through one OPEN / WRITE x N / CLOSE sequence - amortising the
  * per-file OPEN/CLOSE round-trip cost that limits small-file throughput
- * even after Phase 4 pipelining.
+ * even after the pipelined batch path.
  *
  * Composes with parallel streams: each worker handles its own bundles
  * over its own SSH connection; many concurrent bundles in flight.
@@ -355,11 +355,11 @@ struct sftp_hpn_bundle_upload_entry {
 };
 
 /*
- * Upload N small files as a single tar stream to remote_dest_dir.  The
+ * Upload N small files as a single bundle stream to remote_dest_dir.  The
  * server's hpn-bundle handler extracts each file into remote_dest_dir/
  * preserving the relative path supplied in entries[i].remote_path.
  *
- * preserve_flag: when non-zero, file mode + mtime are carried in the tar
+ * preserve_flag: when non-zero, file mode + mtime are carried in the record
  *   header and applied on extract.  Otherwise extracted files use 0644
  *   mode and current mtime.
  * fsync_flag: when non-zero, request the server fsync each extracted
@@ -472,8 +472,8 @@ int sftp_conn_has_fs_info(struct sftp_conn *conn);
 
 /*
  * Download-side counterpart of sftp_hpn_bundle_upload.  Asks the server to
- * pack the listed `entries[].remote_path` files into a single tar stream,
- * then untars locally into each `entries[].local_path`.  Per-entry result
+ * pack the listed `entries[].remote_path` files into a single bundle stream,
+ * then unpacks locally into each `entries[].local_path`.  Per-entry result
  * codes are written into entries[i].result (0 = ok, -1 = skipped/failed).
  *
  * Returns an enum sftp_hpn_bundle_result: OK when the transaction
@@ -496,7 +496,7 @@ int sftp_hpn_bundle_download(struct sftp_conn *conn,
     struct sftp_hpn_bundle_download_entry *entries, int n,
     const struct sftp_bundle_opts *opts, off_t *progress);
 
-/* ── END Phase 5 ─────────────────────────────────────────────────────────*/
+/* END HPN: hpn-bundle small-file streaming */
 
 /*
  * Recursively upload 'local_directory' to 'remote_directory'. Preserve

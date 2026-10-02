@@ -347,7 +347,7 @@ enum worker_phase {
 
 /* What a work unit tells its worker to do. Three types: whole
  * file, byte range of one large file, and a container whose
- * members[] travel as a single tar stream. Range, resume and verify
+ * members[] travel as a single bundle stream. Range, resume and verify
  * units belong to a per-file tracker; whole-file and container units
  * do not. */
 enum sftp_op {

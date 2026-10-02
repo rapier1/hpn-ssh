@@ -1047,7 +1047,7 @@ worker_finish_bundle(struct sftp_parallel *fleet, struct sftp_worker *worker,
 
 /*
  * Bundle-mode analogue of worker_run_batch_pipelined. The batch of small
- * files is packed into a single tar stream and shipped through one
+ * files is packed into a single bundle stream and shipped through one
  * OPEN/WRITE/CLOSE on a fresh bundle handle, which removes the per-file open
  * and close round trip that limits the pipelined path on high-RTT links.
  *
@@ -1085,7 +1085,7 @@ worker_run_bundle(struct sftp_worker *worker,
 	 * the server-side bundle handler. This avoids computing a common
 	 * prefix across the batch. The server's bundle extractor calls mkdir_p
 	 * on each containing directory anyway. Slight wire-size cost (full
-	 * path repeated in every tar header) but trivial vs the small-file
+	 * path repeated in every record header) but trivial vs the small-file
 	 * payloads. */
 	opts.preserve = fleet->cfg.preserve_flag;
 	opts.fsync = fleet->cfg.fsync_flag;
@@ -1112,7 +1112,7 @@ worker_run_bundle(struct sftp_worker *worker,
  * Download counterpart of worker_run_bundle. Builds the entry array from a
  * batch of download units, with each unit's source path as the remote and
  * its destination as the local, and asks the server to pack those paths into
- * one tar stream. worker_finish_bundle does the accounting, the log line,
+ * one bundle stream. worker_finish_bundle does the accounting, the log line,
  * the failure handling, and the per-member retirement.
  */
 static void
@@ -1320,7 +1320,7 @@ worker_collect_batch(struct sftp_worker *worker, struct sftp_work_unit *first,
 	struct sftp_parallel *fleet = worker->parent;
 	enum sftp_op batch_op = first->op;
 	int batch_n = 0;
-	/* Byte cap: bundle mode uses the smaller per-bundle target so each tar
+	/* Byte cap: bundle mode uses the smaller per-bundle target so each bundle
 	 * stream still composes well with the other parallel streams. The first
 	 * unit is always taken, even when it alone exceeds the cap, so a single
 	 * large file is never orphaned. */
@@ -1329,7 +1329,7 @@ worker_collect_batch(struct sftp_worker *worker, struct sftp_work_unit *first,
 	/* A download bundle lists every member's remote path in one
 	 * hpn-bundle-fetch request, so collection also stops before that list
 	 * overflows SFTP_MAX_MSG_LENGTH. An upload streams its paths inside the
-	 * tar and is immune. Cost per member is a 4-byte length plus the path;
+	 * bundle and is immune. Cost per member is a 4-byte length plus the path;
 	 * the cap leaves room for one PATH_MAX overshoot, since the gate is
 	 * checked after the last add, plus the request header. */
 	uint64_t batch_path_bytes = 0;
@@ -1394,7 +1394,7 @@ worker_collect_batch(struct sftp_worker *worker, struct sftp_work_unit *first,
 /*
  * Collects a batch around `first` and dispatches it: a batch of one takes the
  * single-unit path, a download batch is bundle-fetched, and an upload batch is
- * either bundled into a tar stream or sent through the pipelined batch path,
+ * either bundled into a bundle stream or sent through the pipelined batch path,
  * depending on whether this worker bundles. A leftover from collection runs
  * afterwards.
  */
@@ -1426,7 +1426,7 @@ worker_run_batch(struct sftp_worker *worker, struct sftp_work_unit *first)
 		 * no carry-over state. */
 		worker_run_bundle_download(worker, batch, batch_n);
 	} else if (worker->bundle_enabled) {
-		/* One tar stream through a single open, writes and close.
+		/* One bundle stream through a single open, writes and close.
 		 * Synchronous; the pipelined carry-over state stays NULL. */
 		worker_run_bundle(worker, batch, batch_n);
 	} else {
