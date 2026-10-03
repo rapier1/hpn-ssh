@@ -16,80 +16,76 @@
  *
  */
 
-/*
- * sftp-hpn-transferlog.h - per-file transfer log (-X TransferLog).
+/* sftp-hpn-transferlog.h - per-file transfer log (-X TransferLog).
  *
- * Observability ONLY: one tab-delimited line per file with its final
- * status, ending with a run footer carrying the total time.  Nothing
- * ever reads this file back to decide whether to skip transfer or
- * verification work, so tampering or staleness cannot affect integrity
- * behavior. That is the property that distinguishes it from the
- * rejected resume sidecar.
+ * The log is for observation only. It holds one tab-delimited line per
+ * file with its final status, between a start line and a footer that
+ * gives the file count, byte total, and elapsed time. Nothing ever reads
+ * the file back to decide whether to skip transfer or verification work,
+ * so tampering or staleness cannot affect integrity behavior.
  *
- * Two producers feed one line writer: the local collection sites (the
- * process moving the data), and - on a relay consumer such as hpn3scp
- * or the hpnscp -R launcher - FILEDONE frames from the remote source.
- * A source armed with HPN_ENABLE_REMOTE_PROGRESS=log mirrors every
- * final status as a FILEDONE frame (transferlog_frames).
- */
+ * Two producers feed one line writer. The first is the process moving
+ * the data, which writes a line as each file's status becomes final.
+ * The second is a relay consumer, such as hpn3scp or the hpnscp -R
+ * launcher, which writes a line for each FILEDONE frame from the remote
+ * source. A source armed with HPN_ENABLE_REMOTE_PROGRESS=log mirrors
+ * every final status as a FILEDONE frame (transferlog_frames). */
 
 #ifndef SFTP_HPN_TRANSFERLOG_H
 #define SFTP_HPN_TRANSFERLOG_H
 
 #include <sys/types.h>
 
-/* Per-file final status, most specific wins.  repaired and verified
- * imply the transfer itself succeeded.  Values double as the FILEDONE
- * wire encoding (HPNS_FD_*); transferlog_status_from_wire maps back. */
-enum transferlog_status {
-	TRANSFERLOG_SUCCESS = 0,	/* transferred */
-	TRANSFERLOG_SKIPPED = 1,	/* resume: identical / target larger */
-	TRANSFERLOG_VERIFIED = 2,	/* transferred + post-verify matched */
-	TRANSFERLOG_REPAIRED = 3,	/* verify mismatch spliced good */
-	TRANSFERLOG_FAILED = 4		/* transfer or verification failed */
-};
+#include "hpn-status-frame.h"	/* enum hpns_fd_status */
 
 /* Claim "-X TransferLog[=path]", with the name matched case-insensitively.
- * Without a path the log goes to ./hpnssh-transfer.log. Returns 1 if
- * claimed, so the caller does not forward it, and 0 otherwise. */
+ * Without a path the log goes to ./hpnssh-transfer.log, and an empty path
+ * is fatal. Returns 1 if claimed, so the caller does not forward it, and 0
+ * otherwise. */
 int	transferlog_option(const char *);
 
-/*
- * When the option was given, open the log (append) and write the run
- * header.  fatal()s on an unwritable target - callers invoke this
- * EARLY, before any connection is established, so a bad path fails the
- * run before work starts.  No-op when the option was not given.
- */
+/* If TransferLog was given, open the log for appending and write the
+ * run's start line. An unwritable target is fatal, so callers run this
+ * before any connection is made and a bad path fails the run before any
+ * work starts. Does nothing when the option was not given or the log is
+ * already open. */
 void	transferlog_begin(void);
 
-/* Source side: mirror every final status as a FILEDONE frame (armed
- * when the relay consumer requested the "log" env value). */
-void	transferlog_frames(int on);
+/* Turn the FILEDONE mirror on or off. A source started by a relay
+ * consumer that asked for the "log" value of HPN_ENABLE_REMOTE_PROGRESS
+ * turns it on, and then sends every final status to the consumer as a
+ * FILEDONE frame. */
+void	transferlog_frames(int);
 
-/* Is any sink (file or frames) armed?  Callers may skip status
- * bookkeeping cost (stats) when off. */
+/* Returns 1 if the log file or the FILEDONE mirror is on, and 0
+ * otherwise. Callers use it to skip the work a status line needs, such
+ * as a stat for the size, and a relay launcher uses it to decide whether
+ * to ask its source for FILEDONE frames. */
 int	transferlog_active(void);
 
-/* One file's final line: status TAB size TAB path.  Thread-safe.
- * path is LOCAL text (our own argv/paths), written as-is. */
-void	transferlog_file(enum transferlog_status st, off_t size,
-	    const char *path);
+/* Record one file's final status as a line of status, size, and path,
+ * separated by tabs. The path is local text from our own arguments and
+ * is written as given. A NULL path is written as "(unknown)" and is not
+ * mirrored. When the FILEDONE mirror is on, the status also goes to the
+ * relay consumer. Safe to call from any thread. */
+void	transferlog_file(enum hpns_fd_status, off_t, const char *);
 
-/*
- * Consumer-side variant: path is OPAQUE REMOTE bytes (a FILEDONE
- * payload) and is percent-encoded before it lands in the log - log
- * files get displayed (cat), so remote bytes are neutralized with the
- * same discipline as every other frame consumer.  Never re-emits
- * frames.
- */
-void	transferlog_file_bytes(enum transferlog_status st, off_t size,
-	    const u_char *path, size_t path_len);
+/* The relay consumer's form, for a file a remote source reported in a
+ * FILEDONE frame. The path is opaque remote bytes with a length. It is
+ * percent-encoded before it reaches the log, because log files get
+ * displayed and remote bytes must never reach a terminal raw. This never
+ * sends a frame of its own. */
+void	transferlog_file_bytes(enum hpns_fd_status, off_t, const u_char *,
+	    size_t);
 
-/* Map a FILEDONE wire status byte to the enum (flag bits masked off);
- * unknown values map to TRANSFERLOG_FAILED (fail-closed for display). */
-enum transferlog_status transferlog_status_from_wire(u_char wire);
+/* Map a FILEDONE status byte to its status, flag bits masked off. An
+ * unknown value maps to HPNS_FD_FAILED, so it is never logged as a
+ * success. */
+enum hpns_fd_status transferlog_status_from_wire(u_char);
 
-/* Write the run footer (totals + elapsed seconds) and close. */
+/* Write the run's footer, with the file count, byte total, and elapsed
+ * seconds, and close the log. Does nothing if the log is not open, so a
+ * second call is harmless. */
 void	transferlog_close(void);
 
 #endif /* SFTP_HPN_TRANSFERLOG_H */

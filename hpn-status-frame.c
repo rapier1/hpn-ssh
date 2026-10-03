@@ -360,12 +360,28 @@ hpns_pct_encode(char *out, size_t outlen, const u_char *in, size_t inlen)
 const char *
 hpns_fd_status_word(u_char status)
 {
-	switch (status & HPNS_FD_STATUSMASK) {
+	/* switch on the enum so -Wswitch flags a status without a word */
+	switch ((enum hpns_fd_status)(status & HPNS_FD_STATUSMASK)) {
 	case HPNS_FD_SUCCESS:	return "success";
 	case HPNS_FD_SKIPPED:	return "skipped";
 	case HPNS_FD_VERIFIED:	return "verified";
 	case HPNS_FD_REPAIRED:	return "repaired";
 	case HPNS_FD_FAILED:	return "failed";
+	case HPNS_FD_COUNT:	break;
 	}
 	return "unknown";
+}
+
+/* The final status of a file whose verify phase ran. failed covers a
+ * mismatch that could not be repaired and a file that could not be
+ * verified. repaired means a mismatch was found and fixed. Every verify
+ * site calls this, so the precedence lives only here. */
+enum hpns_fd_status
+hpns_fd_verify_status(int failed, int repaired)
+{
+	if (failed)
+		return HPNS_FD_FAILED;
+	if (repaired)
+		return HPNS_FD_REPAIRED;
+	return HPNS_FD_VERIFIED;
 }

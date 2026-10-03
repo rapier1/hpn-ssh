@@ -380,7 +380,7 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 		}
 		/* TransferLog: the file's final status (interrupt included -
 		 * an aborted file is still not delivered). */
-		transferlog_file(TRANSFERLOG_FAILED,
+		transferlog_file(HPNS_FD_FAILED,
 		    t->file_bytes, t->path);
 	} else if (t->verify && worker != NULL) {
 		/*
@@ -397,7 +397,7 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 	} else {
 		/* TransferLog: clean range/span completion with no verify
 		 * phase to defer to - final here. */
-		transferlog_file(TRANSFERLOG_SUCCESS,
+		transferlog_file(HPNS_FD_SUCCESS,
 		    t->file_bytes, t->path);
 	}
 	pthread_mutex_destroy(&t->mu);

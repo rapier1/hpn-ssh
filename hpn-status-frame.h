@@ -99,13 +99,9 @@
 #define HPNS_FILEDONE_HDR	11	/* status u8 + size u64 + path_len u16 */
 #define HPNS_FILEDONE_MAXPATH	(HPNS_MAX_PAYLOAD - HPNS_FILEDONE_HDR)
 
-/* FILEDONE status byte: value in the low 7 bits, flags in the high bit */
+/* FILEDONE status byte: an enum hpns_fd_status value in the low 7 bits,
+ * flags in the high bit. */
 #define HPNS_FD_STATUSMASK	0x7f
-#define HPNS_FD_SUCCESS		0
-#define HPNS_FD_SKIPPED		1
-#define HPNS_FD_VERIFIED	2
-#define HPNS_FD_REPAIRED	3
-#define HPNS_FD_FAILED		4
 #define HPNS_FD_TRUNCATED	0x80		/* path too long, clipped */
 
 /* HELLO capability bits (advertised by the emitter; all reserved) */
@@ -127,6 +123,19 @@
 						 * ticks and never do. */
 
 #define HPNS_ETA_UNKNOWN	0xffffffffu
+
+/* A file's final status, sent in FILEDONE and written by the transfer
+ * log. Each file gets the most specific status that applies. VERIFIED
+ * and REPAIRED both imply the transfer succeeded. HPNS_FD_COUNT is not a
+ * status. It bounds the valid values. */
+enum hpns_fd_status {
+	HPNS_FD_SUCCESS = 0,	/* transferred, no verify phase */
+	HPNS_FD_SKIPPED = 1,	/* resume: target identical or larger */
+	HPNS_FD_VERIFIED = 2,	/* transferred and verify matched */
+	HPNS_FD_REPAIRED = 3,	/* verify mismatch, repaired */
+	HPNS_FD_FAILED = 4,	/* transfer or verify failed */
+	HPNS_FD_COUNT
+};
 
 /* first frame: version + capabilities + what is known of the totals */
 struct hpns_hello {
@@ -176,8 +185,8 @@ struct hpns_filefail {
 	const u_char	*path;		/* borrowed; copy/encode before reuse */
 };
 
-/* Per-file final status (see the HPNS_FD_* block above); path carries
- * the same opaque-borrowed contract as hpns_filefail. */
+/* Per-file final status (enum hpns_fd_status). path carries the same
+ * opaque-borrowed contract as hpns_filefail. */
 struct hpns_filedone {
 	u_char		status;		/* HPNS_FD_* value | flags */
 	uint64_t	size;		/* file size in bytes */
@@ -238,5 +247,9 @@ void	hpns_pct_encode(char *, size_t, const u_char *, size_t);
 /* The word for a FILEDONE status value, such as "success", with the flag
  * bits ignored. A value with no word returns "unknown". */
 const char *hpns_fd_status_word(u_char);
+
+/* The final status of a file whose verify phase ran: FAILED when it
+ * failed or could not be verified, otherwise REPAIRED or VERIFIED. */
+enum hpns_fd_status hpns_fd_verify_status(int, int);
 
 #endif /* HPN_STATUS_FRAME_H */

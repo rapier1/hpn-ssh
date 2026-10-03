@@ -128,14 +128,14 @@ transferlog_active(void)
  * already made path safe to display. A NULL path is written as
  * "(unknown)". */
 static void
-write_line(enum transferlog_status status, off_t size, const char *path)
+write_line(enum hpns_fd_status status, off_t size, const char *path)
 {
 	if (path == NULL)
 		path = "(unknown)";
 	pthread_mutex_lock(&tl_mu);
 	if (tl_out != NULL) {
 		fprintf(tl_out, "%s\t%lld\t%s\n",
-		    hpns_fd_status_word((u_char)status), (long long)size, path);
+		    hpns_fd_status_word(status), (long long)size, path);
 		tl_files++;
 		if (size > 0)
 			tl_bytes += (uint64_t)size;
@@ -147,20 +147,20 @@ write_line(enum transferlog_status status, off_t size, const char *path)
  * open, and to the relay consumer as a FILEDONE frame if the mirror is
  * on. path is local text and is written as given. */
 void
-transferlog_file(enum transferlog_status status, off_t size, const char *path)
+transferlog_file(enum hpns_fd_status status, off_t size, const char *path)
 {
 	write_line(status, size, path);
 	/* On the source side of a relay armed with "log", mirror the status
 	 * as a FILEDONE frame for the consumer's log or GUI file list. */
 	if (tl_frames && path != NULL)
-		hpn_pm_filedone((u_int)status, size, path, strlen(path));
+		hpn_pm_filedone(status, size, path, strlen(path));
 }
 
 /* Write the log line for a file a remote source reported in a FILEDONE
  * frame. The path is remote bytes, so it is percent-encoded before it
  * reaches the log. */
 void
-transferlog_file_bytes(enum transferlog_status status, off_t size,
+transferlog_file_bytes(enum hpns_fd_status status, off_t size,
     const u_char *path, size_t path_len)
 {
 	char enc[3 * HPNS_FILEDONE_MAXPATH + 1];	/* every byte as %XX */
@@ -169,20 +169,17 @@ transferlog_file_bytes(enum transferlog_status status, off_t size,
 	write_line(status, size, enc);
 }
 
-/* Map a FILEDONE status byte to the log's status, ignoring the flag
- * bits. An unknown value maps to TRANSFERLOG_FAILED, so a status the
- * consumer cannot read is never logged as a success. */
-enum transferlog_status
+/* Map a FILEDONE status byte to its status, ignoring the flag bits. An
+ * unknown value maps to HPNS_FD_FAILED, so a status the consumer cannot
+ * read is never logged as a success. */
+enum hpns_fd_status
 transferlog_status_from_wire(u_char wire)
 {
-	switch (wire & HPNS_FD_STATUSMASK) {
-	case HPNS_FD_SUCCESS:	return TRANSFERLOG_SUCCESS;
-	case HPNS_FD_SKIPPED:	return TRANSFERLOG_SKIPPED;
-	case HPNS_FD_VERIFIED:	return TRANSFERLOG_VERIFIED;
-	case HPNS_FD_REPAIRED:	return TRANSFERLOG_REPAIRED;
-	case HPNS_FD_FAILED:	return TRANSFERLOG_FAILED;
-	}
-	return TRANSFERLOG_FAILED;	/* unknown: fail closed */
+	u_char status = wire & HPNS_FD_STATUSMASK;
+
+	if (status >= HPNS_FD_COUNT)
+		return HPNS_FD_FAILED;	/* unknown: fail closed */
+	return (enum hpns_fd_status)status;
 }
 
 /* Write the run's footer and close the log. Does nothing if the log

@@ -1327,18 +1327,11 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 			}
 			/* the transfer log line was held back for this final
 			 * status. A file that could not be verified failed. */
-			if (transferlog_active()) {
-				enum transferlog_status st;
-
-				if (rc != 0)
-					st = TRANSFERLOG_FAILED;
-				else
-					st = repaired ? TRANSFERLOG_REPAIRED :
-					    TRANSFERLOG_VERIFIED;
-				transferlog_file(st, entry->size,
+			if (transferlog_active())
+				transferlog_file(hpns_fd_verify_status(rc != 0,
+				    repaired), entry->size,
 				    entry->local_is_target ? entry->local_path :
 				    entry->remote_path);
-			}
 			/* a mismatch or a file that could not be verified is
 			 * recorded for the drain at exit */
 			if (rc != 0) {

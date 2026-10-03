@@ -1346,20 +1346,20 @@ sftp_hpn_report_transfer(struct sftp_conn *conn, int rc, const char *src,
 
 	switch (rc) {
 	case -1:
-		transferlog_file(TRANSFERLOG_FAILED, size, dst);
+		transferlog_file(HPNS_FD_FAILED, size, dst);
 		return -1;
 	case 1:
 		fmprintf(out, "File skipped: %s: Identical.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED, size, dst);
+		transferlog_file(HPNS_FD_SKIPPED, size, dst);
 		break;
 	case 2:
 		fmprintf(out, "File skipped: %s: Target is larger than "
 		    "source.\n", src);
-		transferlog_file(TRANSFERLOG_SKIPPED, size, dst);
+		transferlog_file(HPNS_FD_SKIPPED, size, dst);
 		break;
 	default:
 		if (!sftp_conn_verify_transfer_enabled(conn))
-			transferlog_file(TRANSFERLOG_SUCCESS, size, dst);
+			transferlog_file(HPNS_FD_SUCCESS, size, dst);
 		break;
 	}
 	return 0;
