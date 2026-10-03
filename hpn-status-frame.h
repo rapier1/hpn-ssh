@@ -229,4 +229,14 @@ int	hpns_decode_filedone(const u_char *, uint16_t,
 int	hpns_parser_feed(struct hpns_parser *, const u_char *, size_t,
 	    hpns_frame_cb, void *, size_t *);
 
+/* Percent-encode a byte string, which may hold NUL or high-bit bytes,
+ * into a NUL-terminated buffer of the given size. Only A-Z, a-z, 0-9,
+ * and . _ - : / @ + pass through. Every other byte becomes %XX. Output
+ * that does not fit is truncated. */
+void	hpns_pct_encode(char *, size_t, const u_char *, size_t);
+
+/* The word for a FILEDONE status value, such as "success", with the flag
+ * bits ignored. A value with no word returns "unknown". */
+const char *hpns_fd_status_word(u_char);
+
 #endif /* HPN_STATUS_FRAME_H */

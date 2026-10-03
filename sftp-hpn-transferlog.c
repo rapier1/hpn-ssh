@@ -16,22 +16,22 @@
  *
  */
 
-/*
- * sftp-hpn-transferlog.c - per-file transfer log (see the header).
+/* sftp-hpn-transferlog.c - the per-file transfer log. What it is for is in
+ * sftp-hpn-transferlog.h.
  *
- * One writer guarded by a mutex: lines arrive from the main thread
- * (serial paths, frame consumers), worker threads (parallel
- * completions, verify resolutions), and tracker finalize.  Lines are
- * written when a file's status is FINAL - at completion when no verify
- * phase follows, at verify resolution when one does - so each file
- * appears exactly once.
- */
+ * One writer behind a mutex serves every thread that finishes a file: the
+ * main thread on the serial paths and for frame consumers such as hpn3scp,
+ * the parallel workers for completions and verify results, and the
+ * tracker's finalize. A line is written only once a file's status is
+ * final, so each file appears exactly once. That is at completion when no
+ * verify phase follows, and at the verify result when one does. */
 
 #include "includes.h"
 
 #include <sys/types.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,150 +42,136 @@
 #include "misc.h"
 #include "xmalloc.h"
 #include "hpn-status-frame.h"
-#include "progressmeter.h"
+#include "hpn-progressmeter.h"
 #include "sftp-hpn-transferlog.h"
 
-static int tl_want;			/* option given; open at begin() */
+/* The log's state. option(), begin(), and frames() set it up before any
+ * worker starts. tl_mu then serializes the line writes, the footer
+ * counters, and close(). */
+static int tl_want;			/* option given, open at begin() */
 static char *tl_path;			/* NULL = default location */
-static FILE *tl_out;
+static FILE *tl_out;			/* NULL until begin() opens it */
 static int tl_frames;			/* mirror statuses as FILEDONE frames */
 static pthread_mutex_t tl_mu = PTHREAD_MUTEX_INITIALIZER;
-static double tl_start;
-static unsigned long long tl_files, tl_bytes;
+static double tl_start;			/* monotonic start, for the footer */
+static int tl_files;			/* lines written, for the footer */
+static uint64_t tl_bytes;		/* their sizes, for the footer */
 
-static const char *
-status_word(enum transferlog_status st)
-{
-	switch (st) {
-	case TRANSFERLOG_SUCCESS:	return "success";
-	case TRANSFERLOG_SKIPPED:	return "skipped";
-	case TRANSFERLOG_VERIFIED:	return "verified";
-	case TRANSFERLOG_REPAIRED:	return "repaired";
-	case TRANSFERLOG_FAILED:	return "failed";
-	}
-	return "unknown";
-}
-
+/* Claim a -X option if it is TransferLog or TransferLog=path, and
+ * remember it for begin(). Returns 1 if claimed and 0 otherwise. A
+ * claimed option is not forwarded, since the log belongs to this host. */
 int
 transferlog_option(const char *opt)
 {
-	static const char key[] = "transferlog";
-	const size_t klen = sizeof(key) - 1;
+	const char *path = NULL;
 
-	if (strncasecmp(opt, key, klen) != 0)
+	if (strncasecmp(opt, "TransferLog=", 12) == 0) {
+		path = opt + 12;
+		if (*path == '\0')
+			fatal("Missing TransferLog path");
+	} else if (strcasecmp(opt, "TransferLog") != 0)
 		return 0;
-	opt += klen;
-	if (*opt != '\0' && *opt != '=' && *opt != ' ' && *opt != '\t')
-		return 0;	/* a different option with this prefix */
-	while (*opt == '=' || *opt == ' ' || *opt == '\t')
-		opt++;
 	tl_want = 1;
 	free(tl_path);
-	tl_path = *opt != '\0' ? xstrdup(opt) : NULL;
+	tl_path = NULL;
+	if (path != NULL)
+		tl_path = xstrdup(path);
 	return 1;
 }
 
+/* Open the log for appending and write the run's start line, if
+ * TransferLog was given. A failed open is fatal. Calling it again does
+ * nothing. */
 void
 transferlog_begin(void)
 {
 	const char *path;
 	char stamp[64];
-	time_t now;
-	struct tm *tm;
+	int fd;
 
 	if (!tl_want || tl_out != NULL)
 		return;
-	path = tl_path != NULL ? tl_path : "./hpnssh-transfer.log";
-	/* The open IS the early writability check: callers run this before
+	path = "./hpnssh-transfer.log";
+	if (tl_path != NULL)
+		path = tl_path;
+	/* The open is the early writability check. Callers run this before
 	 * any connection is established, so an unwritable target fails the
-	 * run before work starts, per the option's contract. */
-	if ((tl_out = fopen(path, "a")) == NULL)
+	 * run before work starts. */
+	if ((fd = open(path, O_WRONLY|O_CREAT|O_APPEND, 0600)) == -1 ||
+	    (tl_out = fdopen(fd, "a")) == NULL)
 		fatal("TransferLog \"%s\": %s", path, strerror(errno));
 	tl_start = monotime_double();
-	now = time(NULL);
-	if ((tm = localtime(&now)) != NULL &&
-	    strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S%z", tm) > 0)
-		fprintf(tl_out, "# hpnssh transfer log - run started %s\n",
-		    stamp);
+	format_absolute_time(time(NULL), stamp, sizeof(stamp));
+	fprintf(tl_out, "# hpnssh transfer log - run started %s\n", stamp);
 	fflush(tl_out);
 }
 
+/* Turn the FILEDONE mirror on or off. A source started by a relay
+ * consumer turns it on, and then sends every final status as a FILEDONE
+ * frame for the consumer's log. */
 void
 transferlog_frames(int on)
 {
 	tl_frames = on;
 }
 
+/* Returns 1 if either sink is armed, the log file or the FILEDONE
+ * mirror, and 0 otherwise. Callers use it to skip the status work a
+ * line needs when nothing would record it. */
 int
 transferlog_active(void)
 {
 	return tl_out != NULL || tl_frames;
 }
 
-/* shared line writer; caller guarantees path is display-safe */
+/* Write one log line and add it to the footer counts. The caller has
+ * already made path safe to display. A NULL path is written as
+ * "(unknown)". */
 static void
-write_line(enum transferlog_status st, long long size, const char *path)
+write_line(enum transferlog_status status, off_t size, const char *path)
 {
-	if (tl_out == NULL)
-		return;
+	if (path == NULL)
+		path = "(unknown)";
 	pthread_mutex_lock(&tl_mu);
-	fprintf(tl_out, "%s\t%lld\t%s\n", status_word(st), size,
-	    path != NULL ? path : "(unknown)");
-	tl_files++;
-	if (size > 0)
-		tl_bytes += (unsigned long long)size;
+	if (tl_out != NULL) {
+		fprintf(tl_out, "%s\t%lld\t%s\n",
+		    hpns_fd_status_word((u_char)status), (long long)size, path);
+		tl_files++;
+		if (size > 0)
+			tl_bytes += (uint64_t)size;
+	}
 	pthread_mutex_unlock(&tl_mu);
 }
 
+/* Record one file's final status. The line goes to the log if it is
+ * open, and to the relay consumer as a FILEDONE frame if the mirror is
+ * on. path is local text and is written as given. */
 void
-transferlog_file(enum transferlog_status st, long long size, const char *path)
+transferlog_file(enum transferlog_status status, off_t size, const char *path)
 {
-	write_line(st, size, path);
-	/* Source side of a relay armed with "log": mirror the status as a
-	 * FILEDONE frame for the consumer's log / GUI file list. */
+	write_line(status, size, path);
+	/* On the source side of a relay armed with "log", mirror the status
+	 * as a FILEDONE frame for the consumer's log or GUI file list. */
 	if (tl_frames && path != NULL)
-		hpn_pm_filedone((u_int)st, size, path,
-		    strlen(path));
+		hpn_pm_filedone((u_int)status, size, path, strlen(path));
 }
 
-/*
- * Percent-encode helper for remote path bytes, sibling of the encoder in
- * hpn3scp-proto.c: every byte outside a fixed safe printable-ASCII set
- * becomes %XX, so terminal escapes and raw multibyte can never reach a
- * display through the log.
- */
-static int
-pct_safe(u_char c)
-{
-	return ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-	    (c >= '0' && c <= '9') ||
-	    c == '.' || c == '_' || c == '-' || c == ':' ||
-	    c == '/' || c == '@' || c == '+');
-}
-
+/* Write the log line for a file a remote source reported in a FILEDONE
+ * frame. The path is remote bytes, so it is percent-encoded before it
+ * reaches the log. */
 void
-transferlog_file_bytes(enum transferlog_status st, long long size,
+transferlog_file_bytes(enum transferlog_status status, off_t size,
     const u_char *path, size_t path_len)
 {
-	static const char hex[] = "0123456789ABCDEF";
-	char enc[2048];		/* >= 3 * max frame path + 1, all escaped */
-	size_t i, o = 0;
+	char enc[3 * HPNS_FILEDONE_MAXPATH + 1];	/* every byte as %XX */
 
-	for (i = 0; i < path_len && o + 4 < sizeof(enc); i++) {
-		u_char c = path[i];
-
-		if (pct_safe(c))
-			enc[o++] = (char)c;
-		else {
-			enc[o++] = '%';
-			enc[o++] = hex[c >> 4];
-			enc[o++] = hex[c & 0x0f];
-		}
-	}
-	enc[o] = '\0';
-	write_line(st, size, enc);
+	hpns_pct_encode(enc, sizeof(enc), path, path_len);
+	write_line(status, size, enc);
 }
 
+/* Map a FILEDONE status byte to the log's status, ignoring the flag
+ * bits. An unknown value maps to TRANSFERLOG_FAILED, so a status the
+ * consumer cannot read is never logged as a success. */
 enum transferlog_status
 transferlog_status_from_wire(u_char wire)
 {
@@ -199,18 +185,20 @@ transferlog_status_from_wire(u_char wire)
 	return TRANSFERLOG_FAILED;	/* unknown: fail closed */
 }
 
+/* Write the run's footer and close the log. Does nothing if the log
+ * is not open, so a second call is harmless. */
 void
 transferlog_close(void)
 {
 	double elapsed;
 
-	if (tl_out == NULL)
-		return;
-	elapsed = monotime_double() - tl_start;
 	pthread_mutex_lock(&tl_mu);
-	fprintf(tl_out, "total: %llu files, %llu bytes, %.1f seconds\n",
-	    tl_files, tl_bytes, elapsed);
-	fclose(tl_out);
-	tl_out = NULL;
+	if (tl_out != NULL) {
+		elapsed = monotime_double() - tl_start;
+		fprintf(tl_out, "total: %d files, %llu bytes, %.1f seconds\n",
+		    tl_files, (unsigned long long)tl_bytes, elapsed);
+		fclose(tl_out);
+		tl_out = NULL;
+	}
 	pthread_mutex_unlock(&tl_mu);
 }

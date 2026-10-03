@@ -61,55 +61,11 @@ po(void)
 	return proto_out != NULL ? proto_out : stdout;
 }
 
-/*
- * Wire-safe byte set for percent-encoding.  Explicit ASCII test, NOT the
- * locale-sensitive isalnum(): the protocol must read identically under any
- * LC_*.  ':' '/' '@' '+' '.' '_' '-' stay literal so fingerprints, hosts,
- * and paths remain human-readable; space, '=', '%', newline, control, and
- * high-bit bytes are all encoded so no delimiter or multibyte sequence ever
- * appears raw.
- */
-static int
-pct_safe(u_char c)
-{
-	return ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-	    (c >= '0' && c <= '9') ||
-	    c == '.' || c == '_' || c == '-' || c == ':' ||
-	    c == '/' || c == '@' || c == '+');
-}
-
-/* encode exactly inlen bytes (may contain NUL/high-bit); truncates to fit out */
-static void
-pct_encode_n(char *out, size_t outlen, const u_char *in, size_t inlen)
-{
-	static const char hex[] = "0123456789ABCDEF";
-	size_t i, o = 0;
-
-	if (outlen == 0)
-		return;
-	for (i = 0; i < inlen; i++) {
-		u_char c = in[i];
-
-		if (pct_safe(c)) {
-			if (o + 1 >= outlen)
-				break;
-			out[o++] = (char)c;
-		} else {
-			if (o + 3 >= outlen)
-				break;
-			out[o++] = '%';
-			out[o++] = hex[c >> 4];
-			out[o++] = hex[c & 0x0f];
-		}
-	}
-	out[o] = '\0';
-}
-
-/* NUL-terminated convenience wrapper over pct_encode_n */
+/* NUL-terminated convenience wrapper over hpns_pct_encode */
 static void
 pct_encode(char *out, size_t outlen, const char *in)
 {
-	pct_encode_n(out, outlen, (const u_char *)in, strlen(in));
+	hpns_pct_encode(out, outlen, (const u_char *)in, strlen(in));
 }
 
 static int
@@ -260,11 +216,11 @@ proto_emit_error(const char *msg)
 void
 proto_emit_file_fail(const struct hpns_filefail *ff)
 {
-	char enc[2048];		/* >= 3 * max frame path (509) + 1, all escaped */
+	char enc[3 * HPNS_FILEFAIL_MAXPATH + 1];	/* every byte as %XX */
 
 	if (human_mode)
 		return;		/* the source's stderr already shows the detail */
-	pct_encode_n(enc, sizeof(enc), ff->path, ff->path_len);
+	hpns_pct_encode(enc, sizeof(enc), ff->path, ff->path_len);
 	fprintf(po(), "EVENT file_fail kind=%u path=%s\n",
 	    (unsigned)ff->kind, enc);
 	fflush(po());
@@ -273,22 +229,14 @@ proto_emit_file_fail(const struct hpns_filefail *ff)
 void
 proto_emit_file_status(const struct hpns_filedone *fd)
 {
-	char enc[2048];		/* >= 3 * max frame path + 1, all escaped */
-	const char *word;
+	char enc[3 * HPNS_FILEDONE_MAXPATH + 1];	/* every byte as %XX */
 
 	if (human_mode)
 		return;		/* the transfer log / meter covers a human */
-	switch (fd->status & HPNS_FD_STATUSMASK) {
-	case HPNS_FD_SUCCESS:	word = "success"; break;
-	case HPNS_FD_SKIPPED:	word = "skipped"; break;
-	case HPNS_FD_VERIFIED:	word = "verified"; break;
-	case HPNS_FD_REPAIRED:	word = "repaired"; break;
-	case HPNS_FD_FAILED:	word = "failed"; break;
-	default:		word = "unknown"; break;
-	}
-	pct_encode_n(enc, sizeof(enc), fd->path, fd->path_len);
+	hpns_pct_encode(enc, sizeof(enc), fd->path, fd->path_len);
 	fprintf(po(), "EVENT file_status status=%s size=%llu path=%s\n",
-	    word, (unsigned long long)fd->size, enc);
+	    hpns_fd_status_word(fd->status), (unsigned long long)fd->size,
+	    enc);
 	fflush(po());
 }
 

@@ -156,8 +156,8 @@ parallel_verify_one(struct sftp_worker *worker, const char *local_path,
 	 * destination path names the file. */
 	if (transferlog_active()) {
 		struct stat local_st;
-		long long size = (stat(local_path, &local_st) == 0) ?
-		    (long long)local_st.st_size : -1;
+		off_t size = (stat(local_path, &local_st) == 0) ?
+		    local_st.st_size : -1;
 		enum transferlog_status status;
 
 		if (verify_rc > 0)
@@ -341,9 +341,9 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 				 * demotes "verified" to plain success. */
 				if (transferlog_active()) {
 					struct stat local_st;
-					long long size =
+					off_t size =
 					    (stat(job->local_path, &local_st) == 0) ?
-					    (long long)local_st.st_size : -1;
+					    local_st.st_size : -1;
 					enum transferlog_status status;
 
 					if (j_failed)
@@ -559,7 +559,7 @@ worker_retire_failed_unit(struct sftp_parallel *fleet, struct sftp_worker *worke
 	/* TransferLog: a whole-file give-up is the file's final status, while
 	 * range and span give-ups are logged once at tracker finalize. */
 	if (unit->op == SFTP_OP_UPLOAD || unit->op == SFTP_OP_DOWNLOAD)
-		transferlog_file(TRANSFERLOG_FAILED, (long long)unit->size,
+		transferlog_file(TRANSFERLOG_FAILED, unit->size,
 		    unit->dst_path);
 	(void)parallel_unit_tracker_finalize(unit->range_tracker, 1, worker);
 	worker_record_failed_path(fleet, unit, cause);
@@ -702,7 +702,7 @@ worker_process_result(struct sftp_worker *worker, struct sftp_work_unit *unit, i
 		if ((unit->op == SFTP_OP_UPLOAD || unit->op == SFTP_OP_DOWNLOAD) &&
 		    (unit->skipped || !fleet->cfg.verify_transfer))
 			transferlog_file(unit->skipped ? TRANSFERLOG_SKIPPED :
-			    TRANSFERLOG_SUCCESS, (long long)unit->size,
+			    TRANSFERLOG_SUCCESS, unit->size,
 			    unit->dst_path);
 		/*
 		 * Range tracker: this range finished cleanly. Finalize before
@@ -804,7 +804,7 @@ worker_finalize_one_entry(struct sftp_parallel *fleet, struct sftp_worker *worke
 		 * unless the verify phase will resolve it. */
 		if (!fleet->cfg.verify_transfer)
 			transferlog_file(TRANSFERLOG_SUCCESS,
-			    (long long)unit->size, unit->dst_path);
+			    unit->size, unit->dst_path);
 		else if (unit->op == SFTP_OP_UPLOAD)
 			parallel_verify_park_whole_file(fleet, unit->src_path,
 			    unit->dst_path, /*local_is_target=*/0,

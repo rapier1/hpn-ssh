@@ -3587,10 +3587,6 @@ main(int argc, char **argv)
 			break;
 		}
 		case 'o':
-			/* TransferLog is ours, not ssh's: consume it here
-			 * or ssh rejects the unknown keyword. */
-			if (transferlog_option(optarg))
-				break;
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
 			parallel_extra_o_add(optarg);
@@ -3776,6 +3772,8 @@ main(int argc, char **argv)
 			worker_log_dir = optarg;
 			break;
 		case 'X':
+			if (transferlog_option(optarg))
+				break;
 			/* Please keep in sync with scp.c -X */
 			if (strncasecmp(optarg, "buffer=", 7) == 0) {
 				r = scan_scaled(optarg + 7, &llv);
@@ -3843,7 +3841,8 @@ main(int argc, char **argv)
 
 	log_init(argv[0], ll, SYSLOG_FACILITY_USER, 1);
 
-	/* -oTransferLog: open (writability-check) BEFORE any connection */
+	/* -X TransferLog: open the log before any connection. The open is
+	 * the writability check. */
 	transferlog_begin();
 
 	if (sftp_direct == NULL) {

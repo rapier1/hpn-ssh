@@ -384,14 +384,15 @@ scp_meter_degrade(void *ctx)
 	    "display");
 }
 
-/* -R + -oTransferLog: the source mirrors each file's final status as a
- * FILEDONE frame; write it to the launcher-side log.  The path is opaque
- * remote bytes - the module percent-encodes before it hits the log. */
+/* -R + -X TransferLog: the source mirrors each file's final status as a
+ * FILEDONE frame, and this writes it to the launcher-side log. The path
+ * is opaque remote bytes, which the module percent-encodes before they
+ * reach the log. */
 static void
 scp_meter_filedone(const struct hpns_filedone *fd, void *ctx)
 {
 	transferlog_file_bytes(transferlog_status_from_wire(fd->status),
-	    (long long)fd->size, fd->path, fd->path_len);
+	    (off_t)fd->size, fd->path, fd->path_len);
 }
 
 /*
@@ -755,9 +756,6 @@ main(int argc, char **argv)
 			throughlocal = 0;
 			break;
 		case 'o':
-			if (transferlog_option(optarg))
-				break;
-			/* FALLTHROUGH */
 		case 'c':
 		case 'i':
 		case 'F':
@@ -889,6 +887,8 @@ main(int argc, char **argv)
 				    HPN_RANGE_WRITERS_CAP_MAX, optarg, errstr);
 			break;
 		case 'X':
+			if (transferlog_option(optarg))
+				break;
 			/* Please keep in sync with sftp.c -X */
 			if (strncasecmp(optarg, "buffer=", 7) == 0) {
                                 r = scan_scaled(optarg + 7, &llv);
@@ -1010,9 +1010,9 @@ main(int argc, char **argv)
 			showprogress = 0;
 	}
 
-	/* -oTransferLog: open (and thereby writability-check) the log NOW,
-	 * before any connection is established - a bad path must fail the
-	 * run before work starts. */
+	/* -X TransferLog: open the log now, before any connection is
+	 * established. The open is the writability check, so a bad path fails
+	 * the run before work starts. */
 	transferlog_begin();
 
 	if (pflag) {

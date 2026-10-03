@@ -17,14 +17,14 @@
  */
 
 /*
- * sftp-hpn-transferlog.h - per-file transfer log (-oTransferLog).
+ * sftp-hpn-transferlog.h - per-file transfer log (-X TransferLog).
  *
  * Observability ONLY: one tab-delimited line per file with its final
  * status, ending with a run footer carrying the total time.  Nothing
  * ever reads this file back to decide whether to skip transfer or
  * verification work, so tampering or staleness cannot affect integrity
- * behavior (the property that distinguishes it from the rejected
- * resume sidecar - see project_transfer_log).
+ * behavior. That is the property that distinguishes it from the
+ * rejected resume sidecar.
  *
  * Two producers feed one line writer: the local collection sites (the
  * process moving the data), and - on a relay consumer such as hpn3scp
@@ -49,13 +49,10 @@ enum transferlog_status {
 	TRANSFERLOG_FAILED = 4		/* transfer or verification failed */
 };
 
-/*
- * Consume "-o TransferLog[=path]" (key case-insensitive; '=' or blank
- * separated; no value = default ./hpnssh-transfer.log).  Returns 1 when
- * the argument was TransferLog - the caller must NOT forward it to ssh,
- * which would reject the unknown keyword.
- */
-int	transferlog_option(const char *opt);
+/* Claim "-X TransferLog[=path]", with the name matched case-insensitively.
+ * Without a path the log goes to ./hpnssh-transfer.log. Returns 1 if
+ * claimed, so the caller does not forward it, and 0 otherwise. */
+int	transferlog_option(const char *);
 
 /*
  * When the option was given, open the log (append) and write the run
@@ -75,7 +72,7 @@ int	transferlog_active(void);
 
 /* One file's final line: status TAB size TAB path.  Thread-safe.
  * path is LOCAL text (our own argv/paths), written as-is. */
-void	transferlog_file(enum transferlog_status st, long long size,
+void	transferlog_file(enum transferlog_status st, off_t size,
 	    const char *path);
 
 /*
@@ -85,7 +82,7 @@ void	transferlog_file(enum transferlog_status st, long long size,
  * same discipline as every other frame consumer.  Never re-emits
  * frames.
  */
-void	transferlog_file_bytes(enum transferlog_status st, long long size,
+void	transferlog_file_bytes(enum transferlog_status st, off_t size,
 	    const u_char *path, size_t path_len);
 
 /* Map a FILEDONE wire status byte to the enum (flag bits masked off);

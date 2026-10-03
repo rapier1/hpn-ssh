@@ -1288,7 +1288,7 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 				else
 					st = repaired ? TRANSFERLOG_REPAIRED :
 					    TRANSFERLOG_VERIFIED;
-				transferlog_file(st, (long long)entry->size,
+				transferlog_file(st, entry->size,
 				    entry->local_is_target ? entry->local_path :
 				    entry->remote_path);
 			}

@@ -309,3 +309,63 @@ hpns_parser_feed(struct hpns_parser *ps, const u_char *data, size_t len,
 		 */
 	}
 }
+
+/* The bytes hpns_pct_encode() writes as themselves. This is an explicit
+ * ASCII test, not the locale-sensitive isalnum(), so the output reads the
+ * same under any LC_* setting. ':' '/' '@' '+' '.' '_' '-' stay literal
+ * so fingerprints, hosts, and paths remain readable. Space, '=', '%',
+ * newline, control, and high-bit bytes are always encoded, so no
+ * delimiter or multibyte sequence ever appears raw. */
+static int
+pct_safe(u_char byte)
+{
+	return ((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+	    (byte >= '0' && byte <= '9') ||
+	    byte == '.' || byte == '_' || byte == '-' || byte == ':' ||
+	    byte == '/' || byte == '@' || byte == '+');
+}
+
+/* Percent-encode inlen bytes of in into out. A byte that fails
+ * pct_safe() becomes %XX. Output that does not fit stops at a whole
+ * input byte, never partway through an escape. */
+void
+hpns_pct_encode(char *out, size_t outlen, const u_char *in, size_t inlen)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	size_t i, used = 0;
+
+	if (outlen == 0)
+		return;
+	for (i = 0; i < inlen; i++) {
+		u_char byte = in[i];
+
+		if (pct_safe(byte)) {
+			if (used + 1 >= outlen)
+				break;
+			out[used++] = (char)byte;
+		} else {
+			if (used + 3 >= outlen)
+				break;
+			out[used++] = '%';
+			out[used++] = hex[byte >> 4];
+			out[used++] = hex[byte & 0x0f];
+		}
+	}
+	out[used] = '\0';
+}
+
+/* The word for a FILEDONE status, with the flag bits ignored. These are
+ * also the transfer log's words, so the log and the EVENT stream read
+ * the same. A value with no word reads "unknown". */
+const char *
+hpns_fd_status_word(u_char status)
+{
+	switch (status & HPNS_FD_STATUSMASK) {
+	case HPNS_FD_SUCCESS:	return "success";
+	case HPNS_FD_SKIPPED:	return "skipped";
+	case HPNS_FD_VERIFIED:	return "verified";
+	case HPNS_FD_REPAIRED:	return "repaired";
+	case HPNS_FD_FAILED:	return "failed";
+	}
+	return "unknown";
+}

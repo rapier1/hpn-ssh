@@ -381,7 +381,7 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 		/* TransferLog: the file's final status (interrupt included -
 		 * an aborted file is still not delivered). */
 		transferlog_file(TRANSFERLOG_FAILED,
-		    (long long)t->file_bytes, t->path);
+		    t->file_bytes, t->path);
 	} else if (t->verify && worker != NULL) {
 		/*
 		 * Verify transfer: the file's last range just finished
@@ -398,7 +398,7 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 		/* TransferLog: clean range/span completion with no verify
 		 * phase to defer to - final here. */
 		transferlog_file(TRANSFERLOG_SUCCESS,
-		    (long long)t->file_bytes, t->path);
+		    t->file_bytes, t->path);
 	}
 	pthread_mutex_destroy(&t->mu);
 	free(t->vslots);
@@ -1253,8 +1253,8 @@ submit_resume_whole_file(struct sftp_parallel *fleet, struct sftp_conn *conn,
 }
 
 /*
- * Parallel verified-resume split (project_verify_refill_parallel): an
- * existing partial destination divides the file at its EOF. Everything
+ * Parallel verified-resume split: an existing partial destination
+ * divides the file at its EOF. Everything
  * past dest EOF is KNOWN missing - the pwrite highwater guarantees no
  * data exists there, the same fact the serial gate's dest-EOF clamp
  * relies on - so the tail [dest_size, src_size) submits as ordinary

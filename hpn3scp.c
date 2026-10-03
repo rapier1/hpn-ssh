@@ -304,7 +304,7 @@ ev_filedone(const struct hpns_filedone *fd, void *ctx)
 	 * additionally emits the EVENT (no-op for a human - the log and the
 	 * meter cover that case). */
 	transferlog_file_bytes(transferlog_status_from_wire(fd->status),
-	    (long long)fd->size, fd->path, fd->path_len);
+	    (off_t)fd->size, fd->path, fd->path_len);
 	proto_emit_file_status(fd);
 }
 
@@ -724,15 +724,14 @@ main(int argc, char **argv)
 			addargs(&hpnscp_extra, "%s", optarg);
 			break;
 		case 'o':
-			/* TransferLog is consumed here (the log lives on
-			 * THIS host); everything else forwards to the
-			 * source hpnscp. */
-			if (transferlog_option(optarg))
-				break;
 			addargs(&hpnscp_extra, "-o");
 			addargs(&hpnscp_extra, "%s", optarg);
 			break;
 		case 'X':
+			/* The transfer log is written on this host, so
+			 * TransferLog is not forwarded to the source. */
+			if (transferlog_option(optarg))
+				break;
 			addargs(&hpnscp_extra, "-X");
 			addargs(&hpnscp_extra, "%s", optarg);
 			break;
@@ -762,7 +761,8 @@ main(int argc, char **argv)
 	/* a terminal gets the human rendering; a pipe gets the EVENT protocol */
 	if (isatty(STDOUT_FILENO))
 		proto_set_human(1);
-	/* -oTransferLog: open (writability-check) BEFORE any connection */
+	/* -X TransferLog: open the log before any connection. The open is
+	 * the writability check. */
 	transferlog_begin();
 	i = run_session(&s);
 	transferlog_close();
