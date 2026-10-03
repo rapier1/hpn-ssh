@@ -51,7 +51,6 @@
 #include "xmalloc.h"
 
 #include "sftp.h"
-#include "sftp-common.h"		/* Attrib, which sftp-hpn-tree.h uses */
 #include "sftp-hpn-server.h"
 #include "sftp-server-internal.h"	/* upstream reply helpers, queues */
 #include "sftp-hpn-bundle-server.h"	/* bundle handlers and handles */

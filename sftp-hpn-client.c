@@ -2036,7 +2036,7 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 
 			memset(&ent, 0, sizeof(ent));
 			if ((r = sftp_tree_get_record(msg, &ent.relpath,
-			    &ent.rectype, &ent.a, &ent.status)) != 0) {
+			    &ent.rectype, &ent.attrs, &ent.status)) != 0) {
 				free(ent.relpath);
 				sftp_conn_die(conn, "hpn-dtree-read: parse "
 				    "record: %s", ssh_err(r));
@@ -2107,7 +2107,7 @@ static int
 tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 {
 	struct tree_dl_ctx	*ctx = vctx;
-	Attrib			*attrs = &ent->a;
+	Attrib			*attrs = &ent->attrs;
 	char			*new_src, *new_dst;
 
 	/* On abort, tell the read to stop decoding. It still reads the batch

@@ -64,7 +64,8 @@ sftp_tree_put_record(struct sshbuf *msg, const char *relpath, u_char rectype,
 /*
  * Parse one record from m.  Allocates *relpath (caller frees).  *status is
  * set only for ERROR records; *a is filled for all other types.  Returns 0
- * or an SSH_ERR_* code; on error *relpath is NULL.
+ * or an SSH_ERR_* code. *relpath stays allocated if a later field fails,
+ * so the caller frees it on error too.
  */
 int
 sftp_tree_get_record(struct sshbuf *msg, char **relpath, u_char *rectype,
