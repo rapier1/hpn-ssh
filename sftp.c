@@ -175,13 +175,35 @@ _Atomic sig_atomic_t interrupted = 0;
  * orchestrator.  put/get/-V/getv/putv set it on; the resume verbs set it off
  * (they use the chunked-resume verify path instead).  Forward declaration of
  * parallel_orch is above; the accessors no-op on NULL.
+ * Turning it on against a server that cannot verify prints
+ * VERIFY_INCOMPAT_MSG and returns -1, so the caller fails only that
+ * command and the session stays up. Returns 0 otherwise.
  */
-static void
+static int
 verify_set_for_command(struct sftp_conn *conn, int on)
 {
+	if (on && !sftp_conn_verify_transfer_supported(conn)) {
+		error("%s", VERIFY_INCOMPAT_MSG);
+		return -1;
+	}
 	sftp_conn_set_verify_transfer(conn, on);
 	if (parallel_orch != NULL)
 		sftp_parallel_set_verify_transfer(parallel_orch, on);
+	return 0;
+}
+
+/* Check before a resume verb that its -V can be honored. Verified resume
+ * hashes the existing partial through hpn-check-file, so without that
+ * extension this prints RESUME_INCOMPAT_MSG and returns -1, and the
+ * caller fails only that command. Returns 0 otherwise. */
+static int
+resume_verify_check(struct sftp_conn *conn, int verify)
+{
+	if (verify && !sftp_conn_has_hpn_check_file(conn)) {
+		error("%s", RESUME_INCOMPAT_MSG);
+		return -1;
+	}
+	return 0;
 }
 
 /* I wish qsort() took a separate ctx for the comparison function...*/
@@ -2400,11 +2422,15 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		vflag = 1;
 		/* FALLTHROUGH */
 	case I_REGET:
-		/* Resume download.  -V here is the RESUME verify: the chunked
-		 * sftp-hash-range path (verifies what it resumed), not the
-		 * post-transfer phase. */
+		/* Resume download. -V here is the resume verify, which hashes
+		 * what it resumes, not the post-transfer phase. */
 		aflag = 1;
 		verify_set_for_command(conn, 0);
+		if (resume_verify_check(conn,
+		    vflag || hpn_verify_transfer) == -1) {
+			err = -1;
+			break;
+		}
 		err = process_get(conn, path1, path2, *pwd, pflag,
 		    rflag, aflag, fflag, vflag || hpn_verify_transfer);
 		break;
@@ -2415,7 +2441,11 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		/* Fresh download.  -V (or the session-global -V) runs the
 		 * post-transfer whole-file verify phase for this command; the
 		 * chunked-resume verify arg stays 0 (nothing to resume). */
-		verify_set_for_command(conn, vflag || hpn_verify_transfer);
+		if (verify_set_for_command(conn,
+		    vflag || hpn_verify_transfer) == -1) {
+			err = -1;
+			break;
+		}
 		err = process_get(conn, path1, path2, *pwd, pflag,
 		    rflag, aflag, fflag, 0 /* not chunked-resume verify */);
 		break;
@@ -2425,6 +2455,11 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 	case I_REPUT:
 		aflag = 1;
 		verify_set_for_command(conn, 0);
+		if (resume_verify_check(conn,
+		    vflag || hpn_verify_transfer) == -1) {
+			err = -1;
+			break;
+		}
 		err = process_put(conn, path1, path2, *pwd, pflag,
 		    rflag, aflag, fflag, vflag || hpn_verify_transfer);
 		break;
@@ -2432,7 +2467,11 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		vflag = 1;
 		/* FALLTHROUGH */
 	case I_PUT:
-		verify_set_for_command(conn, vflag || hpn_verify_transfer);
+		if (verify_set_for_command(conn,
+		    vflag || hpn_verify_transfer) == -1) {
+			err = -1;
+			break;
+		}
 		err = process_put(conn, path1, path2, *pwd, pflag,
 		    rflag, aflag, fflag, 0 /* not chunked-resume verify */);
 		break;

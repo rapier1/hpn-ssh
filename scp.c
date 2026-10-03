@@ -1441,6 +1441,9 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	 * below so parallel workers verify too.
 	 */
 	hpn_verify_transfer = verify_flag;
+	/* -V that cannot be honored stops the run before any data moves. */
+	if (hpn_verify_transfer && !sftp_conn_verify_transfer_supported(conn))
+		fatal("%s", VERIFY_INCOMPAT_MSG);
 	sftp_conn_set_verify_transfer(conn, hpn_verify_transfer);
 
 	/*

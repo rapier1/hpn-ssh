@@ -426,8 +426,16 @@ Verify the integrity of every transferred file
 .Pq HPNSSH extension .
 After each file is transferred its local and remote copies are hashed with
 XXH3 and compared via the
-.Cm hpn-check-file@hpnssh.org
-extension; a mismatch is logged and reported and
+.Cm sftp-hash-range@hpnssh.org
+extension.
+If the server does not advertise that extension,
+.Nm
+exits before anything is transferred.
+A file that cannot be verified, for example because of a read error, is
+tried up to three times and then counts as a verification failure.
+With parallel streams, a file whose stream fails during verification is
+verified again on another stream.
+A mismatch, or a file that could not be verified, is logged and reported and
 .Nm
 exits with code 57
 .Pq Dv SFTP_EX_VERIFY_FAILED ,
@@ -525,6 +533,10 @@ Statuses are
 and
 .Cm failed ;
 verified and repaired imply a successful transfer.
+Under
+.Fl V ,
+a file that could not be verified is logged as
+.Cm failed .
 The log target must be writable or
 .Nm
 exits before any connection is made.

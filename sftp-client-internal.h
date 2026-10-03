@@ -159,6 +159,14 @@ void sftp_conn_set_yield_flag(struct sftp_conn *, volatile int *);
 void sftp_conn_set_verify_transfer(struct sftp_conn *, int);
 int  sftp_conn_verify_transfer_enabled(struct sftp_conn *);
 
+/* Whether a connection can honor -V. The verify engine compares range
+ * hashes from both ends, so the server must advertise sftp-hash-range.
+ * Callers refuse -V with VERIFY_INCOMPAT_MSG when it cannot. */
+int  sftp_conn_verify_transfer_supported(struct sftp_conn *);
+#define VERIFY_INCOMPAT_MSG \
+	"The remote cannot verify transfers. Please upgrade the remote " \
+	"to at least HPN-SSH 19.0.0"
+
 /* Set a single connection's verify auto-repair. attempts is at least 1.
  * sftp.c and scp.c resolve both from -X VerifyRepair, with the cap fixed
  * at 3. It is the per-connection form of fleet->verify_repair_enabled and

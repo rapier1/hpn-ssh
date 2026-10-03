@@ -90,7 +90,7 @@ void sftp_hpn_verify_repair_resolve(int no_verify_repair_cli,
  * source hash already computed, which skips the local read. Both return
  * 0 when verified, after a repair if one ran and *repaired_out is then
  * set (NULL is fine), 1 when unrepairable, or -1 when nothing could be
- * verified, which callers treat as skipped. */
+ * verified. */
 int sftp_hpn_verify_repair_file(struct sftp_conn *conn,
     const char *local_path, const char *remote_path, int local_is_target,
     int have_local_hash, uint64_t local_hash,
@@ -99,5 +99,13 @@ int sftp_hpn_verify_repair_range(struct sftp_conn *conn,
     const char *local_path, const char *remote_path, int local_is_target,
     off_t off, off_t len, int have_local_hash, uint64_t local_hash,
     int repair_enabled, int max_attempts, int *repaired_out);
+
+/* Verify transfer's entry to the engine. len 0 verifies the whole file,
+ * otherwise the range [off, off + len). An unverifiable result on a live
+ * connection is retried, and one that never resolves is a failure for
+ * the caller to record. A dead connection returns -1 at once so the
+ * caller can requeue the work. */
+int sftp_hpn_verify_transfer(struct sftp_conn *, const char *,
+    const char *, int, off_t, off_t, int, uint64_t, int, int, int *);
 
 #endif /* SFTP_HPN_VERIFY_H */

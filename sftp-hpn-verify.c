@@ -69,6 +69,8 @@
 /* Auto-repair attempts per mismatched range before sftp_hpn_verify_repair
  * gives up and reports the destination as still corrupt. */
 #define VERIFY_REPAIR_ATTEMPTS		3
+/* Tries for a verify that reaches no verdict on a live connection. */
+#define VERIFY_UNVERIFIABLE_TRIES	3
 
 /* SIGINT flag, defined by both binaries that link this file, sftp.c and
  * scp.c, and set by their handlers. The auto-repair loop polls it so a
@@ -1082,6 +1084,38 @@ sftp_hpn_verify_repair_file(struct sftp_conn *conn, const char *local_path,
 	    repair_enabled, max_attempts, repaired_out);
 }
 
+/* Run one verify for -V, retrying an unverifiable result while the
+ * connection stays up. Returns what the last attempt returned: 0 good or
+ * repaired, 1 failed, -1 unverifiable. */
+int
+sftp_hpn_verify_transfer(struct sftp_conn *conn, const char *local_path,
+    const char *remote_path, int local_is_target, off_t off, off_t len,
+    int have_local_hash, uint64_t local_hash, int repair_enabled,
+    int max_attempts, int *repaired_out)
+{
+	int attempt, rc;
+
+	for (attempt = 1;; attempt++) {
+		if (len == 0)
+			rc = sftp_hpn_verify_repair_file(conn, local_path,
+			    remote_path, local_is_target, have_local_hash,
+			    local_hash, repair_enabled, max_attempts,
+			    repaired_out);
+		else
+			rc = sftp_hpn_verify_repair_range(conn, local_path,
+			    remote_path, local_is_target, off, len,
+			    have_local_hash, local_hash, repair_enabled,
+			    max_attempts, repaired_out);
+		if (rc >= 0 || sftp_conn_is_dead(conn) ||
+		    attempt == VERIFY_UNVERIFIABLE_TRIES)
+			return rc;
+		logit("verify \"%s\": could not be verified, trying again "
+		    "(try %d of %d)",
+		    local_is_target ? local_path : remote_path,
+		    attempt + 1, VERIFY_UNVERIFIABLE_TRIES);
+	}
+}
+
 /* Per-connection verify state, declared in sftp-client-internal.h. The
  * upstream files and the parallel code reach it only through these. Each
  * no-ops on a NULL connection, like every accessor in sftp-hpn-client.c. */
@@ -1106,6 +1140,14 @@ sftp_conn_verify_transfer_enabled(struct sftp_conn *conn)
 	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 
 	return hpn != NULL && hpn->verify_transfer_enabled;
+}
+
+/* Whether a connection can honor -V. The engine hashes ranges on both
+ * ends, so the server must advertise sftp-hash-range. */
+int
+sftp_conn_verify_transfer_supported(struct sftp_conn *conn)
+{
+	return sftp_conn_has_hash_range(conn);
 }
 
 /* Set the auto-repair settings for the single-connection verify phase,
@@ -1227,16 +1269,17 @@ sftp_conn_drain_verify_failures(struct sftp_conn *conn, char ***out_paths,
  * the list. The fleet has its own phase on the same engine. An upload's
  * teed source hash rides in its entry, so only files without one are
  * read locally. Each file's outcome goes to the transfer log, and a
- * mismatch is recorded on the connection for the run summary and the
- * SFTP_EX_VERIFY_FAILED exit; it does not fail the transfer. A SIGINT
- * stops the verifying but not the walk, so the list is freed either
- * way. No-op when nothing was parked. */
+ * mismatch, or a file that could not be verified, is recorded on the
+ * connection for the run summary and the SFTP_EX_VERIFY_FAILED exit. It
+ * does not fail the transfer. A SIGINT or a lost connection stops the
+ * verifying without a record, but not the walk, so the list is freed
+ * either way. No-op when nothing was parked. */
 void
 sftp_conn_verify_run_phase(struct sftp_conn *conn)
 {
 	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	off_t total = 0, counter = 0;
-	int i, meter_on = 0;
+	int i, meter_on = 0, conn_lost = 0;
 	struct stat sb;
 
 	debug_f("verify phase: %d file(s) parked",
@@ -1267,24 +1310,28 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 		struct sftp_verify_pending_entry *entry =
 		    &hpn->verify_pending[i];
 
-		if (!interrupted) {
+		if (!interrupted && !conn_lost) {
 			int repaired = 0;
 			/* the whole-file form compares the sizes first */
-			int rc = sftp_hpn_verify_repair_file(conn,
+			int rc = sftp_hpn_verify_transfer(conn,
 			    entry->local_path, entry->remote_path,
-			    entry->local_is_target, entry->have_src_hash,
+			    entry->local_is_target, 0, 0, entry->have_src_hash,
 			    entry->src_hash, hpn->verify_repair_enabled,
 			    hpn->verify_repair_attempts, &repaired);
 
+			/* a lost connection ends the phase with no verdict,
+			 * like an interrupt, so nothing is recorded */
+			if (rc < 0 && sftp_conn_is_dead(conn)) {
+				conn_lost = 1;
+				goto next;
+			}
 			/* the transfer log line was held back for this final
-			 * status; unverifiable still transferred fine */
+			 * status. A file that could not be verified failed. */
 			if (transferlog_active()) {
 				enum transferlog_status st;
 
-				if (rc == 1)
+				if (rc != 0)
 					st = TRANSFERLOG_FAILED;
-				else if (rc < 0)
-					st = TRANSFERLOG_SUCCESS;
 				else
 					st = repaired ? TRANSFERLOG_REPAIRED :
 					    TRANSFERLOG_VERIFIED;
@@ -1292,12 +1339,19 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 				    entry->local_is_target ? entry->local_path :
 				    entry->remote_path);
 			}
-			/* a mismatch is recorded for the drain at exit */
-			if (rc == 1) {
-				error("VERIFY FAILED: \"%s\" (post-transfer "
-				    "hash mismatch - the transferred file does "
-				    "NOT match the source)",
-				    entry->remote_path);
+			/* a mismatch or a file that could not be verified is
+			 * recorded for the drain at exit */
+			if (rc != 0) {
+				if (rc == 1)
+					error("VERIFY FAILED: \"%s\" "
+					    "(post-transfer hash mismatch - "
+					    "the transferred file does NOT "
+					    "match the source)",
+					    entry->remote_path);
+				else
+					error("VERIFY FAILED: \"%s\" (the "
+					    "transferred file could not be "
+					    "verified)", entry->remote_path);
 				hpn->verify_failed_paths = xreallocarray(
 				    hpn->verify_failed_paths,
 				    hpn->verify_failed_count + 1,
@@ -1305,17 +1359,13 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 				hpn->verify_failed_paths[
 				    hpn->verify_failed_count++] =
 				    xstrdup(entry->remote_path);
-			} else if (rc < 0) {
-				logit("VERIFY SKIPPED: \"%s\": could not "
-				    "verify (no hpn-check-file@hpnssh.org on "
-				    "the server, or a read error)",
-				    entry->remote_path);
 			}
 			/* fold this file's work into the meter base so the
 			 * next file's progress continues from it */
 			sftp_conn_hash_meter_base_add(conn,
 			    2 * (uint64_t)entry->size);
 		}
+ next:
 		free(entry->local_path);
 		free(entry->remote_path);
 	}

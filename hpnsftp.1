@@ -803,17 +803,20 @@ If the
 flag is specified, the integrity of the transferred file is verified after
 the download completes: the local and remote files are hashed with XXH3 and
 compared using the
-.Cm hpn-check-file@hpnssh.org
+.Cm sftp-hash-range@hpnssh.org
 extension
 .Pq capital Fl V ; lowercase Fl v No is verbose .
-A mismatch is logged, recorded, and reported in a summary when the session
-ends, after which
+A mismatch, or a file that still cannot be verified after three tries, is
+logged, recorded, and reported in a summary when the session ends, after
+which
 .Nm
 exits with code 57
 .Pq Dv SFTP_EX_VERIFY_FAILED ;
 the transfer itself is not aborted.
 This requires the remote server to advertise
-.Cm hpn-check-file@hpnssh.org .
+.Cm sftp-hash-range@hpnssh.org .
+If it does not, the command fails before anything is transferred and the
+session continues.
 The
 .Ic getv
 command is a shorthand for
@@ -988,17 +991,20 @@ If the
 flag is specified, the integrity of the transferred file is verified after
 the upload completes: the local and remote files are hashed with XXH3 and
 compared using the
-.Cm hpn-check-file@hpnssh.org
+.Cm sftp-hash-range@hpnssh.org
 extension
 .Pq capital Fl V ; lowercase Fl v No is verbose .
-A mismatch is logged, recorded, and reported in a summary when the session
-ends, after which
+A mismatch, or a file that still cannot be verified after three tries, is
+logged, recorded, and reported in a summary when the session ends, after
+which
 .Nm
 exits with code 57
 .Pq Dv SFTP_EX_VERIFY_FAILED ;
 the transfer itself is not aborted.
 This requires the remote server to advertise
-.Cm hpn-check-file@hpnssh.org .
+.Cm sftp-hash-range@hpnssh.org .
+If it does not, the command fails before anything is transferred and the
+session continues.
 The
 .Ic putv
 command is a shorthand for
@@ -1181,14 +1187,14 @@ exits 0 on success and >0 if an error occurs.
 .Pp
 As an HPNSSH extension, when integrity verification is requested
 .Pq Fl V , Ic getv , or Ic putv
-and one or more files fail the post-transfer XXH3 integrity check, the
-transfer is completed but
+and one or more files fail the post-transfer XXH3 integrity check or cannot
+be verified, the transfer is completed but
 .Nm
 exits with code 57
 .Pq Dv SFTP_EX_VERIFY_FAILED
-and prints a summary of the files that did not match their source. This
-distinct code lets automation detect a silent-corruption event separately
-from an ordinary transfer error.
+and prints a summary of the files that failed verification.
+This distinct code lets automation detect a silent-corruption event
+separately from an ordinary transfer error.
 .Sh SEE ALSO
 .Xr ftp 1 ,
 .Xr ls 1 ,

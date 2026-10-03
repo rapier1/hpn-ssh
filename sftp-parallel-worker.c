@@ -129,13 +129,13 @@ worker_record_completion(struct sftp_worker *worker, off_t bytes, int success)
 	pthread_mutex_unlock(&worker->mu);
 }
 
-/*
- * Verify transfer (parallel): verify one just-transferred whole file
- * end-to-end on the worker's connection and record a mismatch in the
- * orchestrator's verify_failed_paths list. Never fails the unit.
- * A mismatch is surfaced in the summary + exit code, not retried.
- */
-static void
+/* Verify transfer (parallel): verify one just-transferred whole file
+ * end-to-end on the worker's connection. A mismatch, or a file that
+ * could not be verified, goes in the orchestrator's verify_failed_paths
+ * list for the summary and exit code. Returns -1 with nothing recorded
+ * when the connection died first, so the caller requeues the file, and
+ * 0 otherwise. */
+static int
 parallel_verify_one(struct sftp_worker *worker, const char *local_path,
     const char *remote_path, int local_is_target, int have_src_hash,
     uint64_t src_hash)
@@ -145,13 +145,14 @@ parallel_verify_one(struct sftp_worker *worker, const char *local_path,
 	 * upload's teed source hash, carried in the parked item, spares the
 	 * local read. */
 	int repaired = 0;
-	int verify_rc = sftp_hpn_verify_repair_file(worker->conn, local_path,
-	    remote_path, local_is_target, have_src_hash, src_hash,
+	int verify_rc = sftp_hpn_verify_transfer(worker->conn, local_path,
+	    remote_path, local_is_target, 0, 0, have_src_hash, src_hash,
 	    fleet->verify_repair_enabled, fleet->verify_repair_attempts, &repaired);
 
-	/* TransferLog: under -V the transfer line was deferred to this,
-	 * the file's final status. Unverifiable (verify_rc < 0) transferred fine
-	 * but cannot claim "verified" - log it as plain success. Size
+	if (verify_rc < 0 && sftp_conn_is_dead(worker->conn))
+		return -1;
+	/* TransferLog: under -V the transfer line was deferred to this, the
+	 * file's final status. A file that could not be verified failed. Size
 	 * from the local side, which exists in both directions. The
 	 * destination path names the file. */
 	if (transferlog_active()) {
@@ -160,10 +161,8 @@ parallel_verify_one(struct sftp_worker *worker, const char *local_path,
 		    local_st.st_size : -1;
 		enum transferlog_status status;
 
-		if (verify_rc > 0)
+		if (verify_rc != 0)
 			status = TRANSFERLOG_FAILED;
-		else if (verify_rc < 0)
-			status = TRANSFERLOG_SUCCESS;
 		else
 			status = repaired ? TRANSFERLOG_REPAIRED :
 			    TRANSFERLOG_VERIFIED;
@@ -171,22 +170,16 @@ parallel_verify_one(struct sftp_worker *worker, const char *local_path,
 		    local_is_target ? local_path : remote_path);
 	}
 	if (verify_rc == 0)
-		return;	/* verified good (possibly after repair) */
-	if (verify_rc < 0) {
-		logit("VERIFY SKIPPED: \"%s\": server lacks "
-		    "hpn-check-file@hpnssh.org or read error",
-		    remote_path);
-		return;
-	}
-	/*
-	 * Unrepairable (converged, hit the cap, or repair disabled): the core
-	 * already logged the specific cause; record the failure for the run
-	 * summary + exit code.
-	 */
-	error_f("worker %d VERIFY FAILED: %s file \"%s\" does NOT match source",
-	    worker->id, local_is_target ? "local" : "remote",
-	    local_is_target ? local_path : remote_path);
+		return 0;	/* verified good (possibly after repair) */
+	/* Unrepairable (converged, hit the cap, or repair disabled) or still
+	 * unverifiable after the retries. The core logs the specific cause
+	 * when it has one, so this records the failure. */
+	error_f("worker %d VERIFY FAILED: %s file \"%s\" %s", worker->id,
+	    local_is_target ? "local" : "remote",
+	    local_is_target ? local_path : remote_path,
+	    verify_rc < 0 ? "could not be verified" : "does NOT match source");
 	parallel_verify_fail_record(fleet, local_is_target, local_path, remote_path);
+	return 0;
 }
 
 /* Close and clear the worker's warm remote handle (held open across same-
@@ -261,9 +254,10 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 	/* Post-transfer verify: the parked file is verified on this worker's own
 	 * conn and its carrier (verify_job for a range chunk, verify_whole for a
 	 * whole file) freed by the handler, which NULLs it so parallel_unit_free
-	 * won't double-free. Verify never fails the unit - a mismatch goes to
-	 * verify_failed_paths, not a retry - so it always returns 0 and
-	 * worker_process_result just dec-pendings and frees it. */
+	 * won't double-free. A mismatch goes to verify_failed_paths, not a
+	 * retry, so this returns 0 and worker_process_result dec-pendings and
+	 * frees the unit. It returns -1 only when the connection died before
+	 * a verdict. The carrier is then kept and the unit is requeued. */
 	if (unit->op == SFTP_OP_VERIFY) {
 		/*
 		 * Range-granular: one transfer-range chunk of a large file. Many
@@ -279,22 +273,25 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 			int have_teed = (!job->local_is_target && job->valid[idx]);
 			int verify_rc;
 
-			/*
-			 * Verify this chunk on the worker's own conn, splicing the
+			/* Verify this chunk on the worker's own conn, splicing the
 			 * bad 64 MiB sub-chunks in place on a mismatch. Each worker
 			 * repairs only its own index, with no cross-worker
 			 * coordination. Returns 0 for good or repaired, 1 for
-			 * unrepairable, and -1 for unverifiable, which warns rather
-			 * than counting as a content failure.
-			 */
+			 * unrepairable, and -1 for unverifiable after the retries.
+			 * Either failure fails the whole file. A dead connection
+			 * requeues the chunk for another worker instead. */
 			int repaired = 0;
 
-			verify_rc = sftp_hpn_verify_repair_range(worker->conn,
+			verify_rc = sftp_hpn_verify_transfer(worker->conn,
 			    job->local_path, job->remote_path, job->local_is_target,
 			    job->offs[idx], job->lens[idx],
 			    have_teed, have_teed ? job->hashes[idx] : 0,
 			    fleet->verify_repair_enabled, fleet->verify_repair_attempts,
 			    &repaired);
+			if (verify_rc < 0 && sftp_conn_is_dead(worker->conn)) {
+				sftp_conn_hash_op_end(worker->conn);
+				return -1;
+			}
 			if (verify_rc == 1)	/* unrepairable mismatch */
 				__atomic_store_n(&job->failed, 1, __ATOMIC_RELAXED);
 			else if (verify_rc < 0)	/* couldn't verify this chunk */
@@ -314,31 +311,34 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 			__atomic_fetch_add(&fleet->verify_done_bytes,
 			    2 * (uint64_t)job->lens[idx], __ATOMIC_RELAXED);
 
-			/*
-			 * Last chunk to finish (the ACQ_REL barrier makes every
-			 * worker's job->failed store visible here): record the file
-			 * as failed if any chunk was unrepairable, then free the
-			 * job. No separate repair phase - the repair already ran
-			 * inline above.
-			 */
+			/* Last chunk to finish. The ACQ_REL barrier makes every
+			 * worker's job->failed and job->any_unverified stores
+			 * visible here. Record the file as failed if any chunk
+			 * was unrepairable or unverifiable, then free the job.
+			 * There is no separate repair phase, because the repair
+			 * already ran inline above. */
 			if (__atomic_sub_fetch(&job->ranges_left, 1,
 			    __ATOMIC_ACQ_REL) == 0) {
 				int j_failed = __atomic_load_n(&job->failed,
 				    __ATOMIC_RELAXED);
+				int j_unverified = __atomic_load_n(
+				    &job->any_unverified, __ATOMIC_RELAXED);
 
-				if (j_failed) {
+				if (j_failed || j_unverified) {
 					error_f("worker %d VERIFY FAILED: %s file "
-					    "\"%s\" does NOT match source", worker->id,
+					    "\"%s\" %s", worker->id,
 					    job->local_is_target ? "local" : "remote",
 					    job->local_is_target ? job->local_path
-					    : job->remote_path);
+					    : job->remote_path, j_failed ?
+					    "does NOT match source" :
+					    "could not be verified");
 					parallel_verify_fail_record(fleet,
 					    job->local_is_target, job->local_path,
 					    job->remote_path);
 				}
-				/* TransferLog: FINAL status for a range-split
-				 * file under -V. Any unverifiable chunk
-				 * demotes "verified" to plain success. */
+				/* TransferLog: the final status for a
+				 * range-split file under -V. Any chunk that
+				 * could not be verified fails the file. */
 				if (transferlog_active()) {
 					struct stat local_st;
 					off_t size =
@@ -346,14 +346,11 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 					    local_st.st_size : -1;
 					enum transferlog_status status;
 
-					if (j_failed)
+					if (j_failed || j_unverified)
 						status = TRANSFERLOG_FAILED;
 					else if (__atomic_load_n(
 					    &job->any_repaired, __ATOMIC_RELAXED))
 						status = TRANSFERLOG_REPAIRED;
-					else if (__atomic_load_n(
-					    &job->any_unverified, __ATOMIC_RELAXED))
-						status = TRANSFERLOG_SUCCESS;
 					else
 						status = TRANSFERLOG_VERIFIED;
 					transferlog_file(status, size,
@@ -382,11 +379,16 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 			char *remote = parallel_verify_prefix_join(fleet,
 			    item->remote_prefix, rrel);
 
-			parallel_verify_one(worker, local, remote,
+			int lost = parallel_verify_one(worker, local, remote,
 			    item->local_is_target, item->have_src_hash,
 			    item->src_hash);
+
 			free(local);
 			free(remote);
+			if (lost == -1) {
+				sftp_conn_hash_op_end(worker->conn);
+				return -1;	/* requeued with the item */
+			}
 			free(item);	/* single block: header + both rels */
 			unit->verify_whole = NULL;
 		} else {
@@ -614,6 +616,13 @@ static void
 worker_give_up_pushfail(struct sftp_parallel *fleet, struct sftp_worker *worker,
     struct sftp_work_unit *unit)
 {
+	/* A verify unit the fleet can no longer run is dropped without a
+	 * record, since the user stopped the run or the fleet died. */
+	if (unit->op == SFTP_OP_VERIFY) {
+		parallel_unit_pending_dec(fleet);
+		parallel_unit_free(unit);
+		return;
+	}
 	worker_retire_failed_unit(fleet, worker, unit, "queue shutdown");
 }
 

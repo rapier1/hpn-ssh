@@ -127,7 +127,9 @@ May be repeated for more detail; passed through to the underlying
 programs.
 .It Fl V
 Verify the integrity of every transferred file
-.Pq an HPN-SSH extension, effective only against an HPN-SSH 19.0 or later target .
+.Pq an HPN-SSH extension .
+The target must be HPN-SSH 19.0 or later, or the transfer stops before
+any data is copied.
 After each file is copied, its source and target copies are hashed with XXH3
 and compared.
 On a terminal

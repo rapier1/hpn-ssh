@@ -58,7 +58,6 @@
 #include "sftp-hpn-server.h" /* hpn-check-file + heartbeat protocol constants */
 #include "sftp-hpn-tree.h"	/* tree walk extension names */
 #include "hpn-meter.h"	/* progress meter core */
-#include "sftp-hpn-transferlog.h"
 #include "sftp-client-internal.h" /* sftp_conn_verify_transfer_enabled */
 
 #define XXH_INLINE_ALL
