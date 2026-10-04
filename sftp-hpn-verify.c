@@ -580,7 +580,7 @@ sftp_hpn_verify_chunk(struct sftp_conn *conn, const char *local_path,
 	if (!have_local_hash) {
 		/* pause the watchdog so a long hash doesn't trip it */
 		sftp_conn_watchdog_pause(conn, HPN_HEARTBEAT_REFRESH_SEC);
-		if (sftp_hpn_hash_range_ondisk(local_path, (uint64_t)off,
+		if (sftp_hpn_hash_range(local_path, (uint64_t)off,
 		    (uint64_t)len, /*ondisk=*/local_is_target, &local_hash,
 		    verify_readback_progress, conn) != 0) {
 			error_f("verify: local range hash failed at %llu+%llu "

@@ -2299,6 +2299,10 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[
 
 AC_CHECK_DECLS([bzero, memmem])
 
+dnl HPN: the verify read-back flushes with fdatasync where it can. macOS
+dnl has the symbol but does not declare it, so test the declaration.
+AC_CHECK_DECLS([fdatasync], , , [#include <unistd.h>])
+
 dnl Wide character support.
 AC_CHECK_FUNCS([mblen mbtowc nl_langinfo wcwidth])
 

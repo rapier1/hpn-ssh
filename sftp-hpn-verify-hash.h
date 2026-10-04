@@ -16,76 +16,53 @@
  *
  */
 
-/*
- * sftp-hpn-verify-hash.h - shared verify hashing primitives for
- * Verify transfer, linked into both the client and the server.
+/* sftp-hpn-verify-hash.h - the hash reader every verify path shares.
  *
- * The hash reader and sftp_hpn_hash_range_ondisk hash what actually
- * landed on the platter (fsync + O_DIRECT), not the page cache.
- *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- */
+ * Hashes byte ranges of a file with XXH3. With ondisk set, the read
+ * reflects the device rather than the page cache. sftp-hpn-verify-hash.c
+ * describes how, and who links it. */
+
 #ifndef SFTP_HPN_VERIFY_HASH_H
 #define SFTP_HPN_VERIFY_HASH_H
 
 #include <sys/types.h>
 #include <stdint.h>
 
-/*
- * Periodic progress callback, invoked once per read chunk during a long
- * read-back hash so the caller can keep a heartbeat / watchdog alive.
- * `bytes` is the cumulative count hashed so far.  May be NULL.
- */
-typedef void (*sftp_hpn_readback_progress)(void *arg, uint64_t bytes);
+/* Progress callback, called after each read with the bytes of the range
+ * hashed so far, so a caller can keep its heartbeat, watchdog, or meter
+ * moving through a long hash. The first argument is the caller's context.
+ * Callers that do not need it pass NULL. */
+typedef void (*sftp_hpn_readback_progress)(void *, uint64_t);
 
-/*
- * Hash [offset, offset+length) of `path` with XXH3_64bits.
- *
- * When `ondisk` is nonzero the read reflects the platter: fsync flushes any
- * dirty pages, posix_fadvise drops the clean cached copy (best-effort), and
- * the data is read back via O_DIRECT through a large page-aligned buffer -
- * falling back to a buffered read where O_DIRECT is unavailable or the
- * filesystem refuses it, such as at an unaligned offset.  When `ondisk` is
- * zero it is a plain buffered read.  The file is opened O_RDONLY and a
- * symlink is followed, as SFTP's own open does.  A file shorter than the
- * range hashes what it has.
- *
- * Returns 0 and writes *hash_out on success, -1 on error.
- */
-int sftp_hpn_hash_range_ondisk(const char *path, uint64_t offset,
-    uint64_t length, int ondisk, uint64_t *hash_out,
-    sftp_hpn_readback_progress cb, void *cb_arg);
-
-/*
- * The same hashing for a caller that hashes many ranges of one file: the
- * reader holds the open file, its on-disk mode, one aligned read buffer and
- * one XXH3 state, so a many-range request opens and allocates once.  open
- * returns NULL with errno set, and gives the file's size in *size_out when
- * that is non-NULL.  attach wraps an fd the caller already has, reads it
- * buffered, and leaves it open at close; `path` is for messages.  range
- * hashes [offset, offset+length) with the same
- * rules as sftp_hpn_hash_range_ondisk; cb, when set, gets the bytes hashed
- * so far in this range; it returns 0 with *hash_out set or -1 with errno
- * set.  close takes NULL.
- */
+/* Opaque. sftp-hpn-verify-hash.c defines it. */
 struct sftp_hpn_hash_reader;
-struct sftp_hpn_hash_reader *sftp_hpn_hash_reader_open(const char *path,
-    int ondisk, off_t *size_out);
-struct sftp_hpn_hash_reader *sftp_hpn_hash_reader_attach(int fd,
-    const char *path);
-int sftp_hpn_hash_reader_range(struct sftp_hpn_hash_reader *reader,
-    uint64_t offset, uint64_t length, uint64_t *hash_out,
-    sftp_hpn_readback_progress cb, void *cb_arg);
-void sftp_hpn_hash_reader_close(struct sftp_hpn_hash_reader *reader);
 
-/*
- * Switch an already-open fd to read from the platter rather than the page
- * cache: flush dirty DATA (fdatasync; fsync fallback), drop the now-clean
- * cached pages (best-effort), and set O_DIRECT.  Returns 1 if O_DIRECT
- * engaged, 0 if it could not be set (caller must read buffered).  Shared so
- * the client read-back and the server's range-hash reply mean the same thing
- * by "on-disk".  `path` is used only for log messages.
- */
-int sftp_hpn_fd_set_ondisk(int fd, const char *path);
+/* Hash a range of a file, given by an offset and then a length, with XXH3,
+ * opening and closing the file for the one call. With ondisk set, the read
+ * reflects the device rather than the page cache, falling back to buffered
+ * where O_DIRECT is unavailable or refused. Without it, the read is
+ * buffered. The file is opened read-only and a symlink is followed, as
+ * SFTP's own open does. A file shorter than the range hashes what it has.
+ * The progress callback may be NULL. Returns 0 with the hash set, or -1
+ * after logging the cause. */
+int sftp_hpn_hash_range(const char *, uint64_t, uint64_t, int, uint64_t *,
+    sftp_hpn_readback_progress, void *);
+
+/* The same hashing for a caller that hashes many ranges of one file. The
+ * reader holds the open file, its on-disk mode, one aligned read buffer,
+ * and one XXH3 state, so a many-range request opens and allocates once.
+ * open gives the file's size through its last argument when that is
+ * non-NULL, and returns NULL with errno set. attach wraps an fd the caller
+ * already has, reads it buffered, and leaves it open at close. Its path is
+ * used only in messages. range hashes a range given by an offset and then
+ * a length, with the same rules as sftp_hpn_hash_range, and the progress
+ * callback, when set, gets the bytes hashed so far in that range. It
+ * returns 0 with the hash set, or -1 with errno set. close takes NULL. */
+struct sftp_hpn_hash_reader *sftp_hpn_hash_reader_open(const char *, int,
+    off_t *);
+struct sftp_hpn_hash_reader *sftp_hpn_hash_reader_attach(int, const char *);
+int sftp_hpn_hash_reader_range(struct sftp_hpn_hash_reader *, uint64_t,
+    uint64_t, uint64_t *, sftp_hpn_readback_progress, void *);
+void sftp_hpn_hash_reader_close(struct sftp_hpn_hash_reader *);
 
 #endif /* SFTP_HPN_VERIFY_HASH_H */
