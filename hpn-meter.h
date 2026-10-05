@@ -145,7 +145,7 @@ void	hpn_meter_bind_display(struct hpn_meter *m, const void *owner,
  */
 void	hpn_meter_relay_start(const char *label);
 void	hpn_meter_relay_sample(const struct hpns_progress *p);
-void	hpn_meter_relay_end(u_int64_t bytes_done);
+void	hpn_meter_relay_end(uint64_t bytes_done);
 void	hpn_meter_relay_stop(void);
 
 /* Display routing used by progressmeter.c: is a core meter current, and
