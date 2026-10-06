@@ -1,4 +1,4 @@
-/* $OpenBSD: servconf.c,v 1.452 2026/07/11 11:16:47 naddy Exp $ */
+/* $OpenBSD: servconf.c,v 1.458 2026/10/03 00:46:58 djm Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -160,6 +160,9 @@ initialize_server_options(ServerOptions *options)
 	options->subsystem_name = NULL; \
 	options->subsystem_command = NULL; \
 	options->subsystem_args = NULL;
+#define init_pubkey_auth_options(options) \
+	options->pubkey_auth_options = -1; \
+	options->max_pubkey_ok = -1;
 #define init_timingsecret(options) \
 	options->timing_secret = 0;
 
@@ -270,6 +273,18 @@ void
 fill_default_server_options(ServerOptions *options)
 {
 	u_int i;
+
+	/* Portable-specific overrides */
+#ifdef SKIP_PRIVDROP
+	if (options->allow_streamlocal_forwarding != -1 &&
+	    options->allow_streamlocal_forwarding != FORWARD_DENY)
+		logit("StreamlocalForwarding is not supported on this system");
+	options->allow_streamlocal_forwarding = 0;
+	if (options->fwd_opts.gateway_ports != -1 &&
+	    options->fwd_opts.gateway_ports == 0)
+		logit("GatewayPorts is not supported on this system");
+	options->fwd_opts.gateway_ports = 0;
+#endif
 
 #define SSHCONF_INT(var, conf, flags, ms, def, cp) \
 	if (options->var == -1) \
@@ -408,6 +423,12 @@ fill_default_server_options(ServerOptions *options)
 		options->sshd_session_path = xstrdup(_PATH_SSHD_SESSION);
 	if (options->sshd_auth_path == NULL)
 		options->sshd_auth_path = xstrdup(_PATH_SSHD_AUTH);
+	if (options->pubkey_auth_options == -1) {
+		options->pubkey_auth_options = 0;
+		options->max_pubkey_ok = DEFAULT_AUTH_FAIL_MAX;
+	}
+	if (options->agent_socket_path == NULL)
+		options->agent_socket_path = xstrdup(_PATH_SSH_AGENT_SOCKET_DIR);
 	/* HPN: NoneMacEnabled has no effect without NoneEnabled
 	 * note this placement of this stanza matters. It has to come after
 	 * the macros are run so we have these items in the struct */
@@ -415,7 +436,6 @@ fill_default_server_options(ServerOptions *options)
 		logit("NoneMacEnabled ignored: requires NoneEnabled");
 		options->nonemac_enabled = 0;
 	}
-	
 	assemble_algorithms(options);
 
 #define CLEAR_ON_NONE(v) \
@@ -446,6 +466,7 @@ fill_default_server_options(ServerOptions *options)
 	CLEAR_ON_NONE(options->routing_domain);
 	CLEAR_ON_NONE(options->host_key_agent);
 	CLEAR_ON_NONE(options->per_source_penalty_exempt);
+	CLEAR_ON_NONE(options->agent_socket_path);
 
 	for (i = 0; i < options->num_host_key_files; i++)
 		CLEAR_ON_NONE(options->host_key_files[i]);
@@ -1099,6 +1120,22 @@ static const struct multistate multistate_tcpfwd[] = {
 	{ "local",			FORWARD_LOCAL },
 	{ NULL, -1 }
 };
+static const struct multistate multistate_keepalives[] = {
+	{ "true",			SSH_KEEPALIVES_TRANSPORT },
+	{ "false",			SSH_KEEPALIVES_OFF },
+	{ "yes",			SSH_KEEPALIVES_TRANSPORT },
+	{ "no",				SSH_KEEPALIVES_OFF },
+	{ "transport",			SSH_KEEPALIVES_TRANSPORT },
+	{ "all",			SSH_KEEPALIVES_ALL },
+};
+static const struct multistate multistate_warnweakcrypto[] = {
+	{ "true",			1 },
+	{ "false",			0 },
+	{ "yes",			1 },
+	{ "no",				0 },
+	{ "no-pq-kex",			0 },
+	{ NULL, -1 }
+};
 
 static int
 process_server_config_line_depth(ServerOptions *options, char *line,
@@ -1428,6 +1465,7 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 	case sPubkeyAuthOptions:
 		intptr = &options->pubkey_auth_options;
 		value = 0;
+		value2 = -1;
 		while ((arg = argv_next(&ac, &av)) != NULL) {
 			if (strcasecmp(arg, "none") == 0)
 				continue;
@@ -1435,14 +1473,24 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 				value |= PUBKEYAUTH_TOUCH_REQUIRED;
 			else if (strcasecmp(arg, "verify-required") == 0)
 				value |= PUBKEYAUTH_VERIFY_REQUIRED;
-			else {
+			else if (strncasecmp(arg, "max-pk-ok:", 10) == 0) {
+				value2 = strtonum(arg + 10, 0, 255, &errstr);
+				if (errstr != NULL) {
+					error("%s line %d: bad %s max-pk-ok "
+					    "value: %s", filename, linenum,
+					keyword, errstr);
+					goto out;
+				}
+			} else {
 				error("%s line %d: unsupported %s option %s",
 				    filename, linenum, keyword, arg);
 				goto out;
 			}
 		}
-		if (*activep && *intptr == -1)
-			*intptr = value;
+		if (*activep && options->pubkey_auth_options == -1) {
+			options->pubkey_auth_options = value;
+			options->max_pubkey_ok = value2;
+		}
 		break;
 
 #ifdef KRB5
@@ -1537,7 +1585,8 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 
 	case sTCPKeepAlive:
 		intptr = &options->tcp_keep_alive;
-		goto parse_flag;
+		multistate_ptr = multistate_keepalives;
+		goto parse_multistate;
 
 	case sPermitEmptyPasswords:
 		intptr = &options->permit_empty_passwd;
@@ -1678,6 +1727,29 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 	case sAllowAgentForwarding:
 		intptr = &options->allow_agent_forwarding;
 		goto parse_flag;
+
+	case sAgentSocketPath:
+		charptr = &options->agent_socket_path;
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0')
+			fatal("%s line %d: missing path.", filename, linenum);
+		if (strncmp(arg, "shared:", 7) == 0) {
+			/* Shared paths must be absolute */
+			if (arg[7] != '/') {
+				fatal("%s line %d: invalid shared path.",
+				    filename, linenum);
+			}
+		} else if (strncmp(arg, "user:", 5) == 0) {
+			/* User paths must not be empty */
+			if (arg[5] == '\0') {
+				fatal("%s line %d: invalid user path.",
+				    filename, linenum);
+			}
+		} else if (strcmp(arg, "none") != 0)
+			fatal("%s line %d: invalid path.", filename, linenum);
+		if (*activep && *charptr == NULL)
+			*charptr = xstrdup(arg);
+		break;
 
 	case sDisableForwarding:
 		intptr = &options->disable_forwarding;
@@ -2485,7 +2557,8 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		if (arg == p || value < 0 || value > 0777)
 			fatal("%s line %d: Invalid %s.",
 			    filename, linenum, keyword);
-		if (*activep)
+		if (*activep &&
+		    options->fwd_opts.streamlocal_bind_mask == (mode_t)-1)
 			options->fwd_opts.streamlocal_bind_mask = (mode_t)value;
 		break;
 
@@ -2584,6 +2657,11 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 	case sRefuseConnection:
 		intptr = &options->refuse_connection;
 		multistate_ptr = multistate_flag;
+		goto parse_multistate;
+
+	case sWarnWeakCrypto:
+		intptr = &options->warn_weak_crypto;
+		multistate_ptr = multistate_warnweakcrypto;
 		goto parse_multistate;
 
 	case sDeprecated:
@@ -3080,6 +3158,19 @@ serialise_subsystem(const ServerOptions *options, struct sshbuf *buf)
 			error_fr(r, "serialise member");
 			return r;
 		}
+	}
+	return 0;
+}
+
+static int
+serialise_pubkey_auth_options(const ServerOptions *options, struct sshbuf *buf)
+{
+	int r;
+
+	if ((r = serialise_s32(buf, options->pubkey_auth_options)) != 0 ||
+	    (r = serialise_s32(buf, options->max_pubkey_ok)) != 0) {
+		error_fr(r, "serialise");
+		return r;
 	}
 	return 0;
 }
@@ -3619,6 +3710,19 @@ deserialise_subsystem(ServerOptions *options, struct sshbuf *buf)
 }
 
 static int
+deserialise_pubkey_auth_options(ServerOptions *options, struct sshbuf *buf)
+{
+	int r;
+
+	if ((r = deserialise_s32(buf, &options->pubkey_auth_options)) != 0 ||
+	    (r = deserialise_s32(buf, &options->max_pubkey_ok)) != 0) {
+		error_fr(r, "deserialise");
+		return r;
+	}
+	return 0;
+}
+
+static int
 deserialise_timingsecret(ServerOptions *options, struct sshbuf *buf)
 {
 	int r;
@@ -3792,6 +3896,7 @@ free_server_options(ServerOptions *options)
 #define free_persourcenetblocksize(options)
 #define free_persourcepenalties(options)
 #define free_rekeylimit(options)
+#define free_pubkey_auth_options(options)
 #define free_timingsecret(options)
 
 	SSHD_CONFIG_ENTRIES
@@ -3924,6 +4029,15 @@ copy_subsystem(ServerOptions *dst, const ServerOptions *src)
 	dst->num_subsystems = src->num_subsystems;
 }
 
+static void
+copy_pubkey_auth_options(ServerOptions *dst, const ServerOptions *src)
+{
+	if (src->pubkey_auth_options != -1) {
+		dst->pubkey_auth_options = src->pubkey_auth_options;
+		dst->max_pubkey_ok = src->max_pubkey_ok;
+	}
+}
+
 /*
  * Copy any supported values that are set.
  *
@@ -3984,6 +4098,22 @@ copy_set_server_options(ServerOptions *dst, ServerOptions *src, int preauth)
 	assemble_algorithms(dst);
 
 	/*
+	 * These options may be "none" to clear a global setting.  They are
+	 * consulted before authentication, so they must be cleared here
+	 * rather than in the post-auth section below.
+	 */
+#define CLEAR_ON_NONE(v) \
+	do { \
+		if (option_clear_or_none(v)) { \
+			free(v); \
+			v = NULL; \
+		} \
+	} while(0)
+	CLEAR_ON_NONE(dst->authorized_principals_file);
+	CLEAR_ON_NONE(dst->trusted_user_ca_keys);
+	CLEAR_ON_NONE(dst->banner);
+
+	/*
 	 * The only things that should be below this point are string options
 	 * which are only used after authentication.
 	 */
@@ -3993,16 +4123,11 @@ copy_set_server_options(ServerOptions *dst, ServerOptions *src, int preauth)
 	/* These options may be "none" to clear a global setting */
 	copy_server_option_string(&dst->adm_forced_command,
 	    src->adm_forced_command);
-	if (option_clear_or_none(dst->adm_forced_command)) {
-		free(dst->adm_forced_command);
-		dst->adm_forced_command = NULL;
-	}
 	copy_server_option_string(&dst->chroot_directory,
 	    src->chroot_directory);
-	if (option_clear_or_none(dst->chroot_directory)) {
-		free(dst->chroot_directory);
-		dst->chroot_directory = NULL;
-	}
+	CLEAR_ON_NONE(dst->chroot_directory);
+	CLEAR_ON_NONE(dst->adm_forced_command);
+#undef CLEAR_ON_NONE
 
 	/* Subsystems require merging. */
 	servconf_merge_subsystems(dst, src);
@@ -4082,6 +4207,10 @@ fmt_intarg(ServerOpCodes code, int val)
 		return fmt_multistate_int(val, multistate_tcpfwd);
 	case sIgnoreRhosts:
 		return fmt_multistate_int(val, multistate_ignore_rhosts);
+	case sTCPKeepAlive:
+		return fmt_multistate_int(val, multistate_keepalives);
+	case sWarnWeakCrypto:
+		return fmt_multistate_int(val, multistate_warnweakcrypto);
 	case sFingerprintHash:
 		return ssh_digest_alg_name(val);
 	default:
@@ -4281,6 +4410,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sNoneEnabled, o->none_enabled);
 	dump_cfg_fmtint(sNoneMacEnabled, o->nonemac_enabled);
 	dump_cfg_fmtint(sUseMPTCP, o->use_mptcp);
+	dump_cfg_fmtint(sWarnWeakCrypto, o->warn_weak_crypto);
 	dump_cfg_fmtint(sRefuseConnection, o->refuse_connection);
 
 	/* string arguments */
@@ -4314,6 +4444,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_string(sSshdSessionPath, o->sshd_session_path);
 	dump_cfg_string(sSshdAuthPath, o->sshd_auth_path);
 	dump_cfg_string(sPerSourcePenaltyExemptList, o->per_source_penalty_exempt);
+	dump_cfg_string(sAgentSocketPath, o->agent_socket_path);
 
 	/* string arguments requiring a lookup */
 	dump_cfg_string(sLogLevel, log_level_name(o->log_level));
@@ -4401,6 +4532,8 @@ dump_config(ServerOptions *o)
 		printf(" touch-required");
 	if (o->pubkey_auth_options & PUBKEYAUTH_VERIFY_REQUIRED)
 		printf(" verify-required");
+	if (o->max_pubkey_ok != -1)
+		printf(" max-pk-ok:%d", o->max_pubkey_ok);
 	printf("\n");
 
 	if (o->per_source_penalty.enabled) {
