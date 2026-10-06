@@ -154,7 +154,6 @@ meter_init(struct hpn_meter *meter, const void *owner,
 	strlcpy(meter->label, label != NULL ? label : "transfer",
 	    sizeof(meter->label));
 	meter->kind = kind;
-	meter->domain = domain;
 	meter->owner = owner;
 	meter->total = total;
 	meter->ctr = ctr;
