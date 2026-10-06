@@ -39,7 +39,6 @@
 
 #include <pthread.h>
 
-struct meter_view;
 struct hpns_progress;
 
 /* What a meter measures, declared at start and fixed for its life. The
@@ -65,6 +64,33 @@ enum hpn_meter_domain {
 
 /* The longest label a meter keeps, including the NUL. */
 #define HPN_METER_LABEL_MAX	128
+
+/* One meter's freshly computed numbers, the currency between the meter
+ * and its sinks. A fill produces it, from the local rate math or from the
+ * relay's frame ingest. The TTY renderer paints a line from it, and the
+ * frame sink projects it onto the wire, dropping the label and adding the
+ * cross-file total. It is per meter and never aggregated, so it carries no
+ * frame state and no label reaches the wire. */
+struct meter_view {
+	const char	*label;		/* painted on the TTY, dropped on the wire */
+	off_t		 cur;		/* this meter's position */
+	off_t		 total;		/* this meter's target, 0 if unknown */
+	long long	 rate;		/* smoothed bytes/sec */
+	/* the instantaneous figure for display, where each fill picks its own
+	 * peak scheme */
+	long long	 inst;
+	/* raw bytes since the last sample, from which the frame sink derives a
+	 * per-second rate distinct from inst */
+	off_t		 delta;
+	double		 elapsed;	/* raw seconds since the last sample */
+	uint32_t	 eta_sec;	/* HPNS_ETA_UNKNOWN if not derivable */
+	int		 stalled;	/* no progress for STALL_TIME */
+	int		 done;		/* this meter is complete */
+	/* 0 to 100, computed by the fill, because what a zero total means
+	 * depends on the source */
+	int		 percent;
+	long		 elapsed_sec;	/* wall-clock, for the DONE line */
+};
 
 /* One meter: what it measures, the counter it samples, and the sample
  * state its fill keeps between start and stop. */

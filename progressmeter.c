@@ -517,7 +517,7 @@ pm_display_end(off_t painted, off_t cur, off_t total, double rate)
 	pthread_mutex_unlock(&meter_mu);
 
 	if (hpn_pm_active()) {
-		hpn_pm_meter_done(cur, total, rate);
+		hpn_pm_meter_done(cur, total, (long long)rate);
 		return;
 	}
 
