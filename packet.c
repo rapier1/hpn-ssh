@@ -938,7 +938,7 @@ uncompress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 			if ((r = sshbuf_put(out, buf, sizeof(buf) -
 			    ssh->state->compression_in_stream.avail_out)) != 0)
 				return r;
-			if (sshbuf_len(out) >= PACKET_MAX_SIZE)
+			if (sshbuf_len(out) >= packet_max_size)
 				return SSH_ERR_INVALID_FORMAT;
 			break;
 		case Z_BUF_ERROR:
