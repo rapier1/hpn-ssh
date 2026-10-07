@@ -128,7 +128,7 @@ hpn3scp_fetch_target_keys(struct launch_session *s, struct target_keyset *set)
 
 	memset(set, 0, sizeof(*set));
 
-	/* have the source keyscan the target: ssh A "ssh-keyscan -T 10 [-p P] C" */
+	/* the source keyscans the target: ssh-keyscan -T 10 [-p P] -- C */
 	ssh_base_args(s, &a, 0, 0);
 	addargs(&a, "ssh-keyscan");
 	if (s->addr_family == 4)		/* the A->C keyscan hop */
@@ -141,6 +141,8 @@ hpn3scp_fetch_target_keys(struct launch_session *s, struct target_keyset *set)
 		addargs(&a, "-p");
 		addargs(&a, "%d", s->dst.port);
 	}
+	/* -- so a host starting with '-' is never read as an option */
+	addargs(&a, "--");
 	addargs(&a, "%s", s->dst.host);
 	rc = hpn_run_capture(&a, buf, sizeof(buf), 20000);
 	freeargs(&a);
@@ -207,8 +209,10 @@ hpn3scp_source_knows_target(struct launch_session *s)
 	ssh_base_args(s, &a, 0, 0);
 	addargs(&a, "ssh-keygen");
 	addargs(&a, "-F");
-	addargs(&a, "'%s'", spec);	/* quote: [host]:port brackets are
-					 * glob metacharacters to the remote shell */
+	/* Quote the spec, because the brackets of [host]:port are glob
+	 * characters to the source's shell. The quotes cannot be broken out
+	 * of, because resolve_endpoint() accepts no host containing one. */
+	addargs(&a, "'%s'", spec);
 	rc = hpn_run_capture(&a, buf, sizeof(buf), 15000);
 	freeargs(&a);
 	/* ssh-keygen -F exits 0 only when a matching host entry is found */

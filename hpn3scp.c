@@ -16,21 +16,23 @@
  *
  */
 
-/*
- * hpn3scp.c - third-party transfer launcher (B side), engine entry point.
+/* hpn3scp.c - the third-party transfer launcher.
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.  Stage 0
- * skeleton: argument intake, session setup, the phase-name table, and a
- * dispatcher that walks the phase machine over the real control protocol.
- * Only RESOLVE is wired; the remaining phase handlers arrive in later stages
- * (see hpn-launcher-design.md).  Progress/decision output all flows through
- * hpn3scp-proto so the CLI and a future GUI share one engine.
- */
+ * hpn3scp runs on the launcher and copies files directly from a source
+ * host to a target host, without the data passing through the launcher.
+ * It works through a fixed sequence of phases. It resolves the endpoints,
+ * brokers the target's host key into the source's known_hosts when the
+ * source does not already trust it, checks that the source can
+ * authenticate to the target, then launches hpnscp on the source and
+ * relays its progress. All progress and decisions go through hpn3scp-proto,
+ * so the command line and the GUI drive the same engine. */
 
 #include "includes.h"
 
 #include <sys/types.h>
+#include <netinet/in.h>
 
+#include <arpa/inet.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +43,8 @@
 #include "log.h"
 #include "misc.h"
 #include "pathnames.h"
+#include "ssh.h"		/* SSH_MAX_* sizes readconf.h needs */
+#include "readconf.h"	/* ssh_valid_ruser */
 #include "progressmeter.h"
 #include "hpn-meter.h"	/* relay meter source */
 #include "xmalloc.h"
@@ -50,10 +54,33 @@
 #include "sftp-hpn-transferlog.h"
 #include "hpn3scp-run.h"
 
-const char *
-phase_name(enum launch_phase p)
+/* The local relay meter in human mode: its label and whether it has
+ * started. */
+static struct {
+	char	 label[HPN_METER_LABEL_MAX];	/* "source => target" */
+	int	 on;
+} meter;
+
+/* per-transfer failure tally, for the completion summary */
+static struct {
+	u_int	verify;
+	u_int	transfer;
+} failtally;
+
+/* the END frame's authoritative counts, for the completion summary */
+static struct {
+	uint32_t	files_done;
+	/* END's ok byte. 0 means the source reported failure, even when no
+	 * FILEFAIL arrived, because serial transfer errors send none. */
+	int		ok;
+	int		got;	/* an END frame arrived */
+} endinfo;
+
+/* The name of a phase as the GUI sees it, the value of a PHASE event. */
+static const char *
+phase_name(enum launch_phase phase)
 {
-	switch (p) {
+	switch (phase) {
 	case LP_RESOLVE:		return "RESOLVE";
 	case LP_REACH_SOURCE:		return "REACH_SOURCE";
 	case LP_FETCH_TARGET_KEY:	return "FETCH_TARGET_KEY";
@@ -72,42 +99,63 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: hpn3scp [-46AVZrv] [-j streams] [-o ssh_option] [-X sftp_option] [-z level]\n"
-	    "               [-Y \"hpnscp switches\"] source target\n");
+	    "usage: hpn3scp [-46AVZrv] [-j streams] [-o ssh_option]\n"
+	    "               [-X sftp_option] [-Y switches] [-z level]\n"
+	    "               source target\n");
 	exit(1);
 }
 
-/*
- * Drive the phase machine.  Stage 0: emit the opening phases over the
- * protocol, then report that the trust-broker/launch phases are not yet
- * built.  Returns the process exit status.
- */
-/*
- * Reject usernames carrying shell-hazard characters before they are embedded
- * in the remote command line - same intent as scp.c's okname(), written with
- * explicit ASCII tests so it is locale-independent like the rest of hpn3scp.
- */
+/* Reject a username that is unsafe in the source's command line. Two
+ * upstream rules apply. ssh_valid_ruser() rejects a leading '-', control
+ * characters, and the shell operators. scp.c's okname() rule, written
+ * here with explicit ASCII tests, rejects spaces, quotes, '#', and
+ * high-bit bytes. */
 static int
-valid_user(const char *u)
+valid_user(const char *user)
 {
-	const u_char *p = (const u_char *)u;
+	const u_char *cursor = (const u_char *)user;
 
-	if (*p == '\0')
+	if (*cursor == '\0' || !ssh_valid_ruser(user))
 		return 0;
-	for (; *p != '\0'; p++) {
-		if (*p & 0x80)
+	for (; *cursor != '\0'; cursor++) {
+		if (*cursor & 0x80)
 			return 0;			/* no high-bit bytes */
-		if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
-		    (*p >= '0' && *p <= '9'))
+		if ((*cursor >= 'A' && *cursor <= 'Z') ||
+		    (*cursor >= 'a' && *cursor <= 'z') ||
+		    (*cursor >= '0' && *cursor <= '9'))
 			continue;			/* alphanumeric ok */
-		switch (*p) {
-		case '\'': case '"': case '`': case ' ': case '#':
+		switch (*cursor) {
+		case '\'':
+		case '"':
+		case '`':
+		case ' ':
+		case '#':
 			return 0;			/* shell hazards */
 		default:
 			break;				/* other punctuation ok */
 		}
 	}
 	return 1;
+}
+
+/* Accept a host that is safe to embed in the source's command line: a
+ * domain name or IPv4 address, as upstream's valid_domain() checks, or an
+ * IPv6 literal. Anything else, including a leading '-', control
+ * characters, and shell metacharacters, is rejected. */
+static int
+valid_host(const char *host)
+{
+	struct in6_addr addr6;
+	char *copy;
+	int ok;
+
+	/* valid_domain() may strip a trailing dot, so it checks a copy */
+	copy = xstrdup(host);
+	ok = valid_domain(copy, 0, NULL);
+	free(copy);
+	if (!ok && strchr(host, ':') != NULL)
+		ok = inet_pton(AF_INET6, host, &addr6) == 1;
+	return ok;
 }
 
 /*
@@ -142,6 +190,13 @@ resolve_endpoint(const char *arg, struct endpoint *ep, const char **why)
 		*why = "endpoint has no host (a third-party copy needs two "
 		    "remote hosts)";
 		free(user);
+		free(path);
+		return -1;
+	}
+	if (!valid_host(host)) {
+		*why = "invalid host name";
+		free(user);
+		free(host);
 		free(path);
 		return -1;
 	}
@@ -209,31 +264,10 @@ ssh_base_args(struct launch_session *s, arglist *a, int with_n, int with_agent)
 	addargs(a, "%s", s->src.host);
 }
 
-/*
- * Decoded frames -> output.  Protocol mode relays them as EVENT lines;
- * human mode (stdout is a terminal) drives a local progress meter rendered
- * entirely from the frames (pm_relay_*), exactly as hpnscp's
- * -R consumer does - no rate/ETA is re-derived from frame arrival times.
- */
-static struct {
-	char	 label[1100];	/* "srchost => dsthost", local argv data only */
-	int	 on;
-} meter;
-
-/* per-transfer failure tally, for the completion summary */
-static struct {
-	unsigned int	verify;
-	unsigned int	transfer;
-} failtally;
-
-/* the END frame's authoritative counts, for the completion summary */
-static struct {
-	uint32_t	files_done;
-	int		ok;	/* END's ok byte: 0 = the source reported
-				 * failure, even if no FILEFAIL arrived
-				 * (serial transfer errors emit none) */
-	int		got;
-} endinfo;
+/* The decoded-frame callbacks. Protocol mode relays each frame as an EVENT
+ * line. Human mode, when stdout is a terminal, drives a local meter
+ * rendered entirely from the frames through hpn_meter_relay_*, as hpnscp's
+ * -R consumer does, so no rate or ETA is re-derived from arrival times. */
 
 static void
 ev_hello(const struct hpns_hello *hl, void *ctx)
@@ -411,6 +445,8 @@ do_launch(struct launch_session *s)
 		addargs(&a, "-P");
 		addargs(&a, "%d", s->dst.port);
 	}
+	/* -- so a source path starting with '-' is never read as an option */
+	addargs(&a, "--");
 	addargs(&a, "%s", s->src.path != NULL ? s->src.path : ".");
 	addargs(&a, "%s%s%s:%s",
 	    s->dst.user != NULL ? s->dst.user : "",
@@ -517,6 +553,8 @@ auth_preflight(struct launch_session *s)
 	snprintf(target, sizeof(target), "%s%s%s",
 	    s->dst.user != NULL ? s->dst.user : "",
 	    s->dst.user != NULL ? "@" : "", s->dst.host);
+	/* -- so a target starting with '-' is never read as an option */
+	addargs(&a, "--");
 	addargs(&a, "%s", target);
 	addargs(&a, "true");
 	addargs(&a, "2>&1");

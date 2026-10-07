@@ -86,8 +86,6 @@ struct launch_session {
 	pid_t		 child;		/* launch ssh pid, or -1 */
 };
 
-const char	*phase_name(enum launch_phase p);
-
 /* build the ssh command that reaches the source A (defined in hpn3scp.c);
  * with_n adds -n, with_agent adds -A.  Shared with the host-key broker. */
 void		 ssh_base_args(struct launch_session *s, struct arglist *a,
