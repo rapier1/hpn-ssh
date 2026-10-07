@@ -16,35 +16,30 @@
  *
  */
 
-/*
- * hpn-status-frame.h - HPN status-relay frames.
- *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- * See hpn-status-relay-design.md for the full design.
+/* hpn-status-frame.h - the status-relay frame format.
  *
  * A transfer client whose stdout is a pipe emits these small binary
- * frames instead of ANSI progress-meter text when armed via the
- * HPN_ENABLE_REMOTE_PROGRESS environment variable.  The launching
- * hpnscp (scp -R "third party" transfers) parses them from the launch
- * ssh's stdout and renders a local meter.  Numbers only, by design: no
- * strings ever cross this channel, so the consumer never renders
- * remote-controlled text (terminal-escape injection is structurally
- * excluded).  The stream is telemetry, never control: consumers must
- * treat any protocol error as "stop parsing, fall back to passthrough"
- * and take transfer success/failure from the transport exit status.
+ * frames instead of ANSI meter text when HPN_ENABLE_REMOTE_PROGRESS is
+ * set. The launcher of a third-party transfer, hpnscp -R or hpn3scp,
+ * parses them from the remote side's stdout and paints a local meter.
  *
- * Wire format, all integers network byte order.  8-byte header:
- *     u32 magic  0x48504E53 ("HPNS")
- *     u8  ver    1
- *     u8  type   HPNS_T_*
- *     u16 payload_len   (hard cap HPNS_MAX_PAYLOAD)
- * Payloads are fixed-size per type, except FILEFAIL, which carries a
- * variable-length opaque path; unknown types with a sane header must be
- * skipped by consumers (forward compatibility).
+ * The stream is telemetry, never control. A consumer treats any protocol
+ * error as the end of parsing, passes the remaining bytes through as is,
+ * and takes success or failure from the transport's exit status. The
+ * only text that crosses the channel is the file paths in FILEFAIL and
+ * FILEDONE. They are opaque bytes that the parser never interprets, and a
+ * consumer percent-encodes them before display, so remote text never
+ * reaches a terminal raw.
  *
- * Implementation is in hpn-status-frame.c, which deliberately depends
- * on libc only so the fuzz harness can link the parser directly.
- */
+ * Wire format, with all integers in network byte order. The 8-byte
+ * header is
+ *     u32 magic        0x48504E53, "HPNS", which marks a frame
+ *     u8  version      1
+ *     u8  type         HPNS_T_*
+ *     u16 payload_len  at most HPNS_MAX_PAYLOAD
+ * Each type has a fixed payload size, except FILEFAIL and FILEDONE, which
+ * end in a variable-length path. A consumer skips a frame of an unknown
+ * type when its header is valid, so new types do not break old readers. */
 
 #ifndef HPN_STATUS_FRAME_H
 #define HPN_STATUS_FRAME_H
@@ -67,16 +62,11 @@
 /* fixed payload sizes */
 #define HPNS_HELLO_LEN		21
 #define HPNS_PROGRESS_LEN	52
-#define HPNS_PROGRESS_LEN_V0	44	/* legacy, before rate_inst_bps: the
-					 * decoder still accepts it so a new
-					 * consumer meters an older HPN source */
 #define HPNS_END_LEN		17
 
-/*
- * FILEFAIL is variable-length: a 3-byte fixed head (kind + path_len)
- * plus up to HPNS_FILEFAIL_MAXPATH opaque path bytes.  One frame per
- * failed file.
- */
+/* FILEFAIL is one frame per failed file. Its payload is a 3-byte fixed
+ * part, the kind and the path length, followed by up to
+ * HPNS_FILEFAIL_MAXPATH opaque path bytes. */
 #define HPNS_FILEFAIL_HDR	3
 #define HPNS_FILEFAIL_MAXPATH	(HPNS_MAX_PAYLOAD - HPNS_FILEFAIL_HDR)
 
@@ -86,16 +76,12 @@
 #define HPNS_FF_VERIFY		1	/* transferred but failed verification */
 #define HPNS_FF_TRUNCATED	0x80		/* path too long, clipped */
 
-/*
- * FILEDONE: one frame per file with its FINAL transfer-log status,
- * emitted only when the relay was armed with the "log" value
- * (HPN_ENABLE_REMOTE_PROGRESS=log) - the per-file event stream the
- * consumer's transfer log and a GUI's file list are built from.  Same
- * shape and discipline as FILEFAIL: an 11-byte fixed head plus opaque
- * path bytes the parser never interprets; the consumer neutralizes
- * (percent-encodes) before the path lands anywhere displayable,
- * including a log file.  Status values mirror the transfer-log words.
- */
+/* FILEDONE is one frame per file with its final transfer-log status, sent
+ * only when HPN_ENABLE_REMOTE_PROGRESS is "log". The consumer builds its
+ * transfer log, or a GUI its file list, from these. It has the same shape
+ * as FILEFAIL, an 11-byte fixed part followed by opaque path bytes, and
+ * the consumer percent-encodes the path before writing it anywhere,
+ * including a log file. */
 #define HPNS_FILEDONE_HDR	11	/* status u8 + size u64 + path_len u16 */
 #define HPNS_FILEDONE_MAXPATH	(HPNS_MAX_PAYLOAD - HPNS_FILEDONE_HDR)
 
@@ -104,24 +90,26 @@
 #define HPNS_FD_STATUSMASK	0x7f
 #define HPNS_FD_TRUNCATED	0x80		/* path too long, clipped */
 
-/* HELLO capability bits (advertised by the emitter; all reserved) */
-#define HPNS_CAP_PULL		0x00000001u	/* future request/response */
+/* HELLO capability bits, advertised by the emitter. None is set yet.
+ *
+ * PULL reserves the request mode planned for the GUI launcher. Today the
+ * stream runs one way, from the source to the launcher. In pull mode the
+ * launcher could also send requests to the source on its stdin, but only
+ * after HELLO advertises this bit, so a source that never sets it never
+ * reads remote input. */
+#define HPNS_CAP_PULL		0x00000001u
 
-/* PROGRESS flag bits */
+/* PROGRESS flag bits. Consumers ignore unknown bits, so a new bit does
+ * not break old readers. */
 #define HPNS_F_VERIFY		0x0001		/* verify phase in progress */
-#define HPNS_F_RESUME		0x0002		/* resume check (hashing the
-						 * existing partial).  New bits
-						 * are NOT a wire break -
-						 * consumers ignore unknown
-						 * bits. */
-#define HPNS_F_BOUNDARY		0x0004		/* this frame is a serial file
-						 * boundary: bytes_done is the
-						 * finished file's exact end
-						 * state.  Only per-file meters
-						 * mark it; a fleet's external
-						 * file counts rise on ordinary
-						 * ticks and never do. */
+#define HPNS_F_RESUME		0x0002		/* resume check, hashing the
+						 * existing partial file */
+/* This frame is a serial file boundary, and bytes_done is the finished
+ * file's exact end state. Only per-file meters set it. A fleet's file
+ * counts rise on ordinary ticks and never do. */
+#define HPNS_F_BOUNDARY		0x0004
 
+/* eta_sec when no ETA can be given */
 #define HPNS_ETA_UNKNOWN	0xffffffffu
 
 /* A file's final status, sent in FILEDONE and written by the transfer
@@ -137,33 +125,36 @@ enum hpns_fd_status {
 	HPNS_FD_COUNT
 };
 
-/* first frame: version + capabilities + what is known of the totals */
+/* The first frame: the protocol version, the capabilities, and what is
+ * known of the totals. */
 struct hpns_hello {
-	u_char		proto_ver;
-	uint32_t	caps;
+	u_char		proto_ver;	/* HPNS_VERSION */
+	uint32_t	caps;		/* HPNS_CAP_* */
 	uint64_t	total_bytes;	/* 0 = not yet known */
 	uint32_t	total_files;	/* 0 = not yet known */
-	uint32_t	streams;	/* effective -j; 1 = serial */
+	uint32_t	streams;	/* effective -j, 1 for serial */
 };
 
-/* periodic (~1 Hz) aggregate snapshot; counts are authoritative */
+/* A snapshot of the whole transfer, sent about once a second. Its counts
+ * are authoritative. */
 struct hpns_progress {
 	uint64_t	bytes_done;
-	uint64_t	bytes_total;	/* may grow; 0 = unknown */
+	uint64_t	bytes_total;	/* may grow, 0 if unknown */
 	uint64_t	rate_bps;	/* smoothed */
-	uint64_t	rate_inst_bps;	/* last-interval rate, unsmoothed.
-					 * Measured at the source against its
-					 * own clock; a consumer cannot derive
-					 * it from frame arrival times. */
-	uint32_t	eta_sec;	/* HPNS_ETA_UNKNOWN = unknown */
+	/* The last interval's rate, unsmoothed. The source measures it against
+	 * its own clock, which a consumer cannot recover from frame arrival
+	 * times. */
+	uint64_t	rate_inst_bps;
+	uint32_t	eta_sec;	/* or HPNS_ETA_UNKNOWN */
 	uint32_t	files_done;
-	uint32_t	files_total;	/* 0 = unknown */
+	uint32_t	files_total;	/* 0 if unknown */
 	uint16_t	workers_active;
 	uint16_t	workers_stalled;
 	uint16_t	flags;		/* HPNS_F_* */
 };
 
-/* final frame; advisory only - exit status comes from the transport */
+/* The last frame. It is advisory, because the transport's exit status
+ * decides success. */
 struct hpns_end {
 	uint64_t	bytes_done;
 	uint32_t	files_done;
@@ -171,55 +162,53 @@ struct hpns_end {
 	u_char		ok;
 };
 
-/*
- * Per-file failure detail: one frame per failed file, emitted before END
- * when the relay is armed.  Variable length.  path is carried as OPAQUE
- * bytes - the parser never interprets or renders them; the consumer must
- * neutralize (percent-encode) before the path is ever displayed.  On
- * decode, path borrows into the parser's frame buffer: not owned, not
- * NUL-terminated, valid only for the duration of the frame callback.
- */
+/* One failed file, sent before END. path is opaque bytes, which the
+ * parser never interprets and a consumer percent-encodes before display.
+ * On decode, path points into the parser's frame buffer. It is not owned
+ * or NUL-terminated, and it is valid only during the frame callback. */
 struct hpns_filefail {
-	u_char		kind;		/* HPNS_FF_* reason | flags */
-	uint16_t	path_len;	/* opaque bytes at path (<= MAXPATH) */
-	const u_char	*path;		/* borrowed; copy/encode before reuse */
+	u_char		kind;		/* HPNS_FF_* reason and flags */
+	uint16_t	path_len;	/* at most HPNS_FILEFAIL_MAXPATH */
+	const u_char	*path;		/* borrowed, copy before keeping */
 };
 
-/* Per-file final status (enum hpns_fd_status). path carries the same
- * opaque-borrowed contract as hpns_filefail. */
+/* One file's final status, an enum hpns_fd_status value. path follows
+ * the same rules as in hpns_filefail. */
 struct hpns_filedone {
-	u_char		status;		/* HPNS_FD_* value | flags */
+	u_char		status;		/* HPNS_FD_* value and flags */
 	uint64_t	size;		/* file size in bytes */
-	uint16_t	path_len;	/* opaque bytes at path (<= MAXPATH) */
-	const u_char	*path;		/* borrowed; copy/encode before reuse */
+	uint16_t	path_len;	/* at most HPNS_FILEDONE_MAXPATH */
+	const u_char	*path;		/* borrowed, copy before keeping */
 };
 
-/*
- * Incremental frame parser (the consumer side; this is the one piece of
- * code that faces remote input, so it is deliberately tiny and is the
- * fuzz target).  Holds at most one frame of buffered bytes.  On any
- * header validation failure it latches `failed`; the caller must switch
- * to passthrough, flushing parser->buf[0..have) plus whatever input it
- * reports unconsumed.  Frames with valid headers but unknown types are
- * delivered to the callback, which should ignore types it doesn't know.
- */
+/* The consumer's incremental frame parser. It is the one piece of this
+ * code that faces remote input, so it is kept small and is the fuzz
+ * target. It buffers at most one frame. When a header fails validation it
+ * sets failed, and the caller must switch to passthrough, flushing
+ * parser->buf[0..have) and whatever input the parser reports unconsumed.
+ * A frame of an unknown type with a valid header still reaches the
+ * callback, which ignores types it does not know. */
 struct hpns_parser {
 	u_char	buf[HPNS_HDR_LEN + HPNS_MAX_PAYLOAD];
-	size_t	have;
-	int	failed;
+	size_t	have;		/* bytes held in buf */
+	int	failed;		/* set on a bad header, never cleared */
 };
 
-typedef void (*hpns_frame_cb)(u_char type, const u_char *payload,
-    uint16_t plen, void *ctx);
+/* Called once for each complete frame, with its type, its payload and
+ * payload length, and the caller's context. */
+typedef void (*hpns_frame_cb)(u_char, const u_char *, uint16_t, void *);
 
-/* encoders: fill buf (>= HPNS_HDR_LEN + payload), return frame length */
+/* The encoders. Each writes one frame into the buffer and returns its
+ * total length. A buffer of HPNS_HDR_LEN + HPNS_MAX_PAYLOAD bytes always
+ * suffices. */
 size_t	hpns_encode_hello(u_char *, const struct hpns_hello *);
 size_t	hpns_encode_progress(u_char *, const struct hpns_progress *);
 size_t	hpns_encode_end(u_char *, const struct hpns_end *);
 size_t	hpns_encode_filefail(u_char *, const struct hpns_filefail *);
 size_t	hpns_encode_filedone(u_char *, const struct hpns_filedone *);
 
-/* strict decoders: payload length must match exactly; -1 on mismatch */
+/* The decoders. Each returns 0, or -1 if the payload length does not
+ * match its type's layout exactly. */
 int	hpns_decode_hello(const u_char *, uint16_t, struct hpns_hello *);
 int	hpns_decode_progress(const u_char *, uint16_t,
 	    struct hpns_progress *);
@@ -229,12 +218,11 @@ int	hpns_decode_filefail(const u_char *, uint16_t,
 int	hpns_decode_filedone(const u_char *, uint16_t,
 	    struct hpns_filedone *);
 
-/*
- * Feed input bytes.  Returns 0 and consumes all input on success (any
- * complete frames are delivered via the callback); returns -1 on
- * protocol failure with *unconsumed = count of trailing input bytes
- * never buffered (the buffered prefix is in parser->buf[0..have)).
- */
+/* Feed input bytes to the parser, delivering each complete frame to the
+ * callback. Returns 0 once all input is consumed. On a protocol failure
+ * it returns -1, and so does every later call. The last argument then
+ * holds the count of trailing input bytes never buffered, and the
+ * buffered prefix stays in parser->buf[0..have). */
 int	hpns_parser_feed(struct hpns_parser *, const u_char *, size_t,
 	    hpns_frame_cb, void *, size_t *);
 
