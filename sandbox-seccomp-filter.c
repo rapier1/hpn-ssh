@@ -370,7 +370,7 @@ static const struct sock_filter preauth_insns[] = {
 	SC_ALLOW_ARG_MASK(__NR_mprotect, 2, PROT_READ|PROT_WRITE|PROT_NONE),
 #endif
 #ifdef __NR_mremap
-	SC_ALLOW(__NR_mremap),
+	SC_ALLOW_ARG_MASK(__NR_mremap, 3, MREMAP_MAYMOVE),
 #endif
 #ifdef __NR_munmap
 	SC_ALLOW(__NR_munmap),
