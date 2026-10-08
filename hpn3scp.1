@@ -5,7 +5,7 @@
 .\"
 .\" Redistribution and use in source and binary forms, with or without
 .\" modification, are permitted provided that the conditions of the
-.\" BSD 2-Clause License are met.  See https://opensource.org/license/bsd-2-clause.
+.\" BSD 2-Clause License are met. See https://opensource.org/license/bsd-2-clause.
 .\"
 .Dd $Mdocdate: July 8 2026 $
 .Dt HPN3SCP 1
@@ -180,6 +180,16 @@ See the
 entry in
 .Xr hpnscp 1
 for the format.
+.Pp
+The
+.Cm StrictArgs
+option is also consumed by
+.Nm
+itself.
+It refuses a source that cannot read its arguments from standard input,
+as described under
+.Sx SOURCE ARGUMENTS ,
+and exits with status 58 before anything is copied.
 .It Fl Y Ar switches
 Forward a quoted string of raw
 .Xr hpnscp 1
@@ -243,6 +253,30 @@ Verification is fail-closed: the key is accepted only if it is
 authenticated by a DNSSEC-signed SSHFP record, or if you confirm its
 fingerprint at an interactive prompt.
 There is no blind-accept mode.
+.Sh SOURCE ARGUMENTS
+.Nm
+sends the arguments for the source's
+.Xr hpnscp 1
+over the session's standard input rather than on its command line, so the
+source's shell never parses file names.
+The source's
+.Xr hpnscp 1
+expands wildcards and
+.Ql ~
+itself.
+A source whose
+.Xr hpnscp 1
+is too old to read its arguments this way is sent them on its command line
+instead, after a warning that names the host.
+In that mode the source's shell parses the arguments, so an argument
+containing a character the shell acts on as a command, such as
+.Ql \&;
+or
+.Ql $ ,
+is refused.
+The retry is a second connection, so you may be asked to log in again.
+.Fl X Cm StrictArgs
+refuses that mode instead.
 .Sh OUTPUT
 When standard output is a terminal,
 .Nm
@@ -252,8 +286,26 @@ When standard output is redirected or piped,
 .Nm
 instead emits a line-structured event protocol on standard output,
 intended for a driving front end.
+The protocol is experimental and may change as the needs of a graphical
+front end require.
+The final
+.Ql done
+event carries the
+.Ql files ,
+.Ql verify_failed ,
+and
+.Ql transfer_failed
+counts only when they are known.
+They are absent when the source ran but reported no counts, as an older
+source does.
 .Sh EXIT STATUS
 .Ex -std
+.Pp
+With
+.Fl X Cm StrictArgs ,
+.Nm
+exits with code 58 when the source cannot read its arguments safely,
+before anything is copied.
 .Sh EXAMPLES
 Copy a file directly from one remote host to another, using four streams:
 .Bd -literal -offset indent

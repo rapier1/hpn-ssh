@@ -94,16 +94,19 @@ run_frame(u_char type, const u_char *payload, uint16_t plen, void *ctx)
 }
 
 int
-hpn_run_status(struct arglist *a, pid_t *pidp, const struct hpn_run_hooks *h)
+hpn_run_status(struct arglist *a, pid_t *pidp, const struct hpn_run_hooks *h,
+    struct hpn_run_result *res)
 {
 	struct hpns_parser ps;
 	struct run_dispatch d;
-	struct pollfd pfd;
+	struct pollfd pfd[2];
 	u_char rb[4096];
 	double t0;
-	size_t left;
+	size_t left, sent = 0;
 	ssize_t n;
-	int pfds[2], status, passthrough = 0;
+	int pfds[2], stdin_pfds[2] = { -1, -1 };
+	int status, passthrough = 0, npfd, ready, sigpipe_saved = 0;
+	sshsig_t old_sigpipe;
 	pid_t pid;
 
 	if (a->num == 0)
@@ -111,16 +114,24 @@ hpn_run_status(struct arglist *a, pid_t *pidp, const struct hpn_run_hooks *h)
 
 	if (pipe(pfds) == -1)
 		fatal_f("pipe: %s", strerror(errno));
+	if (h->stdin_data != NULL && pipe(stdin_pfds) == -1)
+		fatal_f("pipe: %s", strerror(errno));
 	if ((pid = fork()) == -1)
 		fatal_f("fork: %s", strerror(errno));
 
 	if (pid == 0) {
-		if (dup2(pfds[1], STDOUT_FILENO) == -1) {
+		if (dup2(pfds[1], STDOUT_FILENO) == -1 ||
+		    (stdin_pfds[0] != -1 &&
+		    dup2(stdin_pfds[0], STDIN_FILENO) == -1)) {
 			perror("dup2");
 			exit(1);
 		}
 		close(pfds[0]);
 		close(pfds[1]);
+		if (stdin_pfds[0] != -1) {
+			close(stdin_pfds[0]);
+			close(stdin_pfds[1]);
+		}
 		execvp(a->list[0], a->list);
 		perror(a->list[0]);
 		exit(1);
@@ -128,6 +139,20 @@ hpn_run_status(struct arglist *a, pid_t *pidp, const struct hpn_run_hooks *h)
 	close(pfds[1]);
 	if (pidp != NULL)
 		*pidp = pid;
+	if (stdin_pfds[0] != -1) {
+		close(stdin_pfds[0]);
+		/* The payload is written as the child reads it, alongside its
+		 * output, so neither pipe can fill and stall the other. A
+		 * child that exits without reading must not kill us with
+		 * SIGPIPE, and scp's own SIGPIPE handler would. */
+		set_nonblock(stdin_pfds[1]);
+		old_sigpipe = ssh_signal(SIGPIPE, SIG_IGN);
+		sigpipe_saved = 1;
+		if (h->stdin_len == 0) {
+			close(stdin_pfds[1]);
+			stdin_pfds[1] = -1;
+		}
+	}
 
 	memset(&ps, 0, sizeof(ps));
 	memset(&d, 0, sizeof(d));
@@ -135,9 +160,15 @@ hpn_run_status(struct arglist *a, pid_t *pidp, const struct hpn_run_hooks *h)
 	t0 = monotime_double();
 
 	for (;;) {
-		pfd.fd = pfds[0];
-		pfd.events = POLLIN;
-		if (poll(&pfd, 1, 1000) == -1) {
+		pfd[0].fd = pfds[0];
+		pfd[0].events = POLLIN;
+		npfd = 1;
+		if (stdin_pfds[1] != -1) {
+			pfd[1].fd = stdin_pfds[1];
+			pfd[1].events = POLLOUT;
+			npfd = 2;
+		}
+		if ((ready = poll(pfd, npfd, 1000)) == -1) {
 			if (errno == EINTR) {
 				/* signal wake (e.g. meter SIGALRM): let the
 				 * caller repaint if it wants */
@@ -147,7 +178,21 @@ hpn_run_status(struct arglist *a, pid_t *pidp, const struct hpn_run_hooks *h)
 			}
 			fatal_f("poll: %s", strerror(errno));
 		}
-		if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+		/* feed the payload, closing stdin once it is all sent or the
+		 * child stops reading */
+		if (npfd == 2 && pfd[1].revents != 0) {
+			n = write(stdin_pfds[1], h->stdin_data + sent,
+			    h->stdin_len - sent);
+			if (n > 0)
+				sent += (size_t)n;
+			if ((n == -1 && errno != EAGAIN && errno != EINTR) ||
+			    sent == h->stdin_len) {
+				close(stdin_pfds[1]);
+				stdin_pfds[1] = -1;
+			}
+		}
+		/* only a quiet poll counts toward the degrade timer */
+		if (ready == 0) {
 			/* quiet second: if the peer never spoke frames, give
 			 * up on status and pass its output through as-is */
 			if (!passthrough && !d.got_hello &&
@@ -160,6 +205,8 @@ hpn_run_status(struct arglist *a, pid_t *pidp, const struct hpn_run_hooks *h)
 				h->on_tick(h->ctx);
 			continue;
 		}
+		if (!(pfd[0].revents & (POLLIN | POLLHUP | POLLERR)))
+			continue;
 		n = read(pfds[0], rb, sizeof(rb));
 		if (n == -1) {
 			if (errno == EINTR || errno == EAGAIN)
@@ -196,12 +243,26 @@ hpn_run_status(struct arglist *a, pid_t *pidp, const struct hpn_run_hooks *h)
 		}
 	}
 	close(pfds[0]);
+	if (stdin_pfds[1] != -1)
+		close(stdin_pfds[1]);
+	/* SIG_DFL is a null pointer, so a flag, not the handler, records the
+	 * save */
+	if (sigpipe_saved)
+		ssh_signal(SIGPIPE, old_sigpipe);
 
 	while (waitpid(pid, &status, 0) == -1)
 		if (errno != EINTR)
 			fatal_f("waitpid: %s", strerror(errno));
 	if (pidp != NULL)
 		*pidp = -1;
+	if (res != NULL) {
+		memset(res, 0, sizeof(*res));
+		res->got_hello = d.got_hello;
+		if (WIFEXITED(status)) {
+			res->exited = 1;
+			res->exit_status = WEXITSTATUS(status);
+		}
+	}
 
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		return (-1);

@@ -222,17 +222,21 @@ hpn_pm_meter_done(off_t cur_pos, off_t end_pos, long long bytes_per_second)
 	pthread_mutex_unlock(&frames_mu);
 }
 
-/* Arm status-relay frame mode on the source side. scp calls it once at
- * startup when HPN_ENABLE_REMOTE_PROGRESS is set and stdout is not a TTY.
- * It emits the HELLO frame, carrying the version and capabilities with the
- * totals still unknown, so the consumer can tell a peer that speaks frames
- * from an old peer's silence. */
+/* Arm status-relay frame mode on the source side. scp calls it at startup
+ * when HPN_ENABLE_REMOTE_PROGRESS is set and stdout is not a TTY, and in
+ * stdin mode hpn-launch-args calls it earlier, before option parsing. Only
+ * the first call acts. It emits the HELLO frame, carrying the version and
+ * capabilities with the totals still unknown, so the consumer can tell a
+ * peer that speaks frames from an old peer's silence. */
 void
 hpn_pm_frame_mode(u_int streams)
 {
 	struct hpns_hello hello;
 	u_char fbuf[HPNS_HDR_LEN + HPNS_HELLO_LEN];
 
+	/* stdin mode arms before option parsing, and its HELLO stands */
+	if (frame_mode)
+		return;
 	frame_mode = 1;
 
 	memset(&hello, 0, sizeof(hello));
@@ -240,10 +244,8 @@ hpn_pm_frame_mode(u_int streams)
 	hello.caps = 0;			/* no pull support in v1 */
 	hello.total_bytes = 0;
 	hello.total_files = 0;
-	/* the effective -j, where a serial transfer is one stream */
-	hello.streams = 1;
-	if (streams > 0)
-		hello.streams = (uint32_t)streams;
+	/* the effective -j, or 0 when armed before the options were read */
+	hello.streams = (uint32_t)streams;
 	frames_write(fbuf, hpns_encode_hello(fbuf, &hello));
 }
 

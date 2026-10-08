@@ -132,7 +132,7 @@ struct hpns_hello {
 	uint32_t	caps;		/* HPNS_CAP_* */
 	uint64_t	total_bytes;	/* 0 = not yet known */
 	uint32_t	total_files;	/* 0 = not yet known */
-	uint32_t	streams;	/* effective -j, 1 for serial */
+	uint32_t	streams;	/* effective -j, 0 if not yet known */
 };
 
 /* A snapshot of the whole transfer, sent about once a second. Its counts

@@ -113,6 +113,7 @@
 #include "log.h"
 #include "hpn-status-frame.h"
 #include "hpn3scp-run.h"
+#include "hpn-launch-args.h"
 #include "misc.h"
 #include "progressmeter.h"
 #include "hpn-meter.h"	/* progress meter core */
@@ -320,129 +321,6 @@ do_local_cmd(arglist *a)
 		return (-1);
 
 	return (0);
-}
-
-/*
- * HPN status relay, consumer side (hpn-status-relay-design.md).  scp drives
- * a local ANSI progress meter rendered entirely from the frames the shared
- * runner decodes (pm_relay_*): every displayed value comes from
- * the source's own measurements, never re-derived from frame arrival times.
- * The meter starts on the first PROGRESS (only if showprogress).
- */
-struct scp_meter {
-	const char *label;	/* built from local argv only, never remote bytes */
-	int meter_on;
-};
-
-static void
-scp_meter_hello(const struct hpns_hello *h, void *ctx)
-{
-	/* totals arrive in PROGRESS frames; nothing to seed yet */
-}
-
-static void
-scp_meter_progress(const struct hpns_progress *p, void *ctx)
-{
-	struct scp_meter *m = ctx;
-
-	if (!m->meter_on && showprogress) {
-		hpn_meter_relay_start(m->label);
-		m->meter_on = 1;
-	}
-	if (m->meter_on)
-		hpn_meter_relay_sample(p);
-}
-
-static void
-scp_meter_end(const struct hpns_end *e, void *ctx)
-{
-	struct scp_meter *m = ctx;
-
-	if (m->meter_on)
-		hpn_meter_relay_end(e->bytes_done);
-}
-
-static void
-scp_meter_tick(void *ctx)
-{
-	struct scp_meter *m = ctx;
-
-	if (m->meter_on)
-		refresh_progress_meter(0);
-}
-
-static void
-scp_meter_degrade(void *ctx)
-{
-	struct scp_meter *m = ctx;
-
-	if (m->meter_on) {
-		hpn_meter_relay_stop();
-		m->meter_on = 0;
-	}
-	error("remote status stream garbled; continuing without progress "
-	    "display");
-}
-
-/* -R + -X TransferLog: the source mirrors each file's final status as a
- * FILEDONE frame, and this writes it to the launcher-side log. The path
- * is opaque remote bytes, which the module percent-encodes before they
- * reach the log. */
-static void
-scp_meter_filedone(const struct hpns_filedone *fd, void *ctx)
-{
-	transferlog_file_bytes(transferlog_status_from_wire(fd->status),
-	    (off_t)fd->size, fd->path, fd->path_len);
-}
-
-/*
- * Variant of do_local_cmd() for -R transfers with the status relay armed:
- * launch the ssh with a piped stdout via the shared runner, which parses
- * HPNS frames and drives the meter through the hooks above; raw output from
- * a source that does not speak frames passes through to our stdout.  Return
- * value is the child exit status, exactly as do_local_cmd().
- */
-static int
-do_local_cmd_status(arglist *a, const char *label)
-{
-	struct scp_meter m;
-	struct hpn_run_hooks h;
-	char *cp;
-	int r;
-
-	if (a->num == 0)
-		fatal("do_local_cmd_status: no arguments");
-
-	if (verbose_mode) {
-		cp = argv_assemble(a->num, a->list);
-		fmprintf(stderr, "Executing: %s\n", cp);
-		free(cp);
-	}
-
-	/* the runner sets/clears do_cmd_pid; our killchild handler reads it */
-	ssh_signal(SIGTERM, killchild);
-	ssh_signal(SIGINT, killchild);
-	ssh_signal(SIGHUP, killchild);
-
-	memset(&m, 0, sizeof(m));
-	m.label = label;
-	memset(&h, 0, sizeof(h));
-	h.on_hello = scp_meter_hello;
-	h.on_progress = scp_meter_progress;
-	h.on_end = scp_meter_end;
-	h.on_filedone = scp_meter_filedone;
-	h.on_tick = scp_meter_tick;
-	h.on_degrade = scp_meter_degrade;
-	h.passthrough_fd = STDOUT_FILENO;
-	h.ctx = &m;
-
-	r = hpn_run_status(a, &do_cmd_pid, &h);
-
-	if (m.meter_on) {
-		refresh_progress_meter(1);
-		hpn_meter_relay_stop();
-	}
-	return (r);
 }
 
 /*
@@ -675,6 +553,9 @@ main(int argc, char **argv)
 
 	log_init(argv0, log_level, SYSLOG_FACILITY_USER, 2);
 
+	/* HPN: a third-party launcher may send the arguments on stdin */
+	hpn_launch_args_stdin(&argc, &argv);
+
 	memset(&args, '\0', sizeof(args));
 	memset(&remote_remote_args, '\0', sizeof(remote_remote_args));
 	args.list = remote_remote_args.list = NULL;
@@ -889,6 +770,9 @@ main(int argc, char **argv)
 		case 'X':
 			if (transferlog_option(optarg))
 				break;
+			/* StrictArgs governs a -R launch, not the transfer */
+			if (hpn_launch_args_option(optarg))
+				break;
 			/* Please keep in sync with sftp.c -X */
 			if (strncasecmp(optarg, "buffer=", 7) == 0) {
                                 r = scan_scaled(optarg + 7, &llv);
@@ -1039,6 +923,8 @@ main(int argc, char **argv)
 		sink(argc, argv, NULL);
 		exit(errs != 0);
 	}
+	/* HPN: expand the operands no shell saw, before they are counted */
+	hpn_launch_args_glob(&argc, &argv);
 	if (argc < 2)
 		usage();
 	if (argc > 2)
@@ -1689,16 +1575,12 @@ void
 toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 {
 	char *suser = NULL, *host = NULL, *src = NULL;
-	char *bp, *tuser, *thost, *targ, *mlabel;
-	int sport = -1, tport = -1, relay;
+	char *bp, *tuser, *thost, *targ;
+	int sport = -1, tport = -1;
 	struct sftp_conn *conn = NULL, *conn2 = NULL;
-	arglist alist;
+	struct hpn_scp_remote remote;
 	int i, r, status;
 	struct stat sb;
-	u_int j;
-
-	memset(&alist, '\0', sizeof(alist));
-	alist.list = NULL;
 
 	/* Parse target */
 	r = parse_scp_uri(argv[argc - 1], &tuser, &thost, &tport, &targ);
@@ -1830,96 +1712,41 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 				continue;
 			}
 
-			freeargs(&alist);
-			addargs(&alist, "%s", ssh_program);
-			addargs(&alist, "-x");
-			addargs(&alist, "-oClearAllForwardings=yes");
-			addargs(&alist, "-n");
-			for (j = 0; j < remote_remote_args.num; j++) {
-				addargs(&alist, "%s",
-				    remote_remote_args.list[j]);
-			}
-
-			if (sport != -1) {
-				addargs(&alist, "-p");
-				addargs(&alist, "%d", sport);
-			}
-			if (suser) {
-				addargs(&alist, "-l");
-				addargs(&alist, "%s", suser);
-			}
-			addargs(&alist, "--");
-			addargs(&alist, "%s", host);
-			/*
-			 * HPN status relay (hpn-status-relay-design.md): when
-			 * this side would have shown a meter, subscribe to
-			 * progress frames from the source by prefixing the
-			 * remote command with an environment variable.  An
-			 * env prefix (not a flag) so old/stock sources ignore
-			 * the request instead of choking on an unknown
-			 * option; env(1) rather than a VAR=val shell prefix
-			 * so csh-family login shells work.  Our own hpnssh
-			 * rewrites the scp token behind the prefix to hpnscp
-			 * (clientloop.c).
-			 */
-			/* Arm the relay for the meter, for the transfer log,
-			 * or both.  The "log" value additionally asks the
-			 * source for per-file FILEDONE frames; old sources
-			 * treat any value as plain arming (frames without
-			 * the per-file stream - the log degrades to header
-			 * + failures + footer). */
-			relay = showprogress != 0 || transferlog_active();
-			if (relay) {
-				addargs(&alist, "env");
-				addargs(&alist, transferlog_active() ?
-				    "HPN_ENABLE_REMOTE_PROGRESS=log" :
-				    "HPN_ENABLE_REMOTE_PROGRESS=1");
-			}
-			addargs(&alist, "%s", cmd);
-			/*
-			 * HPN: make -R a parallel, direct source->target transfer --
-			 * forward -j (parallel streams) and a non-default target port
-			 * into the source's scp.  The source connects to the target,
-			 * so its -P is the target port (tport).
-			 */
-			if (parallel_num_streams > 1) {
-				addargs(&alist, "-j");
-				addargs(&alist, "%d", parallel_num_streams);
-			}
-			if (tport != -1 && tport != SSH_DEFAULT_PORT) {
-				addargs(&alist, "-P");
-				addargs(&alist, "%d", tport);
-			}
-			/*
-			 * The source runs the actual source->target transfer,
-			 * so its address family and verify/resume requests must
-			 * travel with it: remote_remote_args above only
-			 * decorates the ssh hop to the source, and cmd carries
-			 * none of these flags.
-			 */
-			if (family_flag)
-				addargs(&alist, "-%d", family_flag);
-			if (compress_flag)
-				addargs(&alist, "-C");
-			if (zstd_level > 0)
-				addargs(&alist, "-z%d", zstd_level);
-			if (verify_flag)
-				addargs(&alist, "-V");
-			if (resume_flag)
-				addargs(&alist, "-Z");
-			addargs(&alist, "%s", src);
-			addargs(&alist, "%s%s%s:%s",
-			    tuser ? tuser : "", tuser ? "@" : "",
-			    thost, targ);
-			if (relay) {
-				/* label is local argv data only, never
-				 * remote-supplied strings */
-				xasprintf(&mlabel, "%s => %s", host, thost);
-				r = do_local_cmd_status(&alist, mlabel);
-				free(mlabel);
-				if (r != 0)
-					errs = 1;
-			} else if (do_local_cmd(&alist) != 0)
+			/* HPN: the launch keeps the arguments off the source's
+			 * shell; hpn-launch-args.c builds and runs it */
+			memset(&remote, 0, sizeof(remote));
+			remote.ssh_program = ssh_program;
+			remote.ssh_args = &remote_remote_args;
+			remote.host = host;
+			remote.user = suser;
+			remote.port = sport;
+			remote.src = src;
+			remote.target_user = tuser;
+			remote.target_host = thost;
+			remote.target_port = tport;
+			remote.target_path = targ;
+			remote.verbose = verbose_mode;
+			remote.recursive = iamrecursive;
+			remote.preserve = pflag;
+			remote.target_is_dir = targetshouldbedirectory;
+			remote.streams = parallel_num_streams;
+			remote.family = family_flag;
+			remote.compress = compress_flag;
+			remote.zstd_level = zstd_level;
+			remote.verify = verify_flag;
+			remote.resume = resume_flag;
+			remote.show_meter = showprogress;
+			remote.pidp = &do_cmd_pid;
+			/* the runner sets/clears do_cmd_pid; our killchild
+			 * handler reads it */
+			ssh_signal(SIGTERM, killchild);
+			ssh_signal(SIGINT, killchild);
+			ssh_signal(SIGHUP, killchild);
+			r = hpn_launch_args_scp_remote(&remote);
+			/* a refused legacy source stops the whole copy */
+			if (r == HPN_EXIT_STRICT_ARGS)
+				exit(HPN_EXIT_STRICT_ARGS);
+			if (r != 0)
 				errs = 1;
 		} else {	/* local to remote */
 			if (mode == MODE_SFTP) {
@@ -2003,7 +1830,6 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 	}
 	scp_parallel_finish(conn);
 out:
-	freeargs(&alist);
 	free(tuser);
 	free(thost);
 	free(targ);

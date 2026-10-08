@@ -367,7 +367,34 @@ This requires that
 running on the origin host can authenticate to the destination host without
 requiring a password.
 .Pp
-A non-default destination port may be given by writing the destination
+The arguments for the origin host's
+.Nm
+travel over the session's standard input rather than on its command line,
+so the origin host's shell never parses file names.
+.Nm
+on the origin host expands wildcards and
+.Ql ~
+itself.
+An origin host whose
+.Nm
+cannot read its arguments this way, an older HPN-SSH or a stock
+.Xr scp 1 ,
+is sent them on its command line instead, after a warning that names the
+host.
+In that mode the origin host's shell parses the arguments, so an argument
+containing a character the shell acts on as a command, such as
+.Ql \&;
+or
+.Ql $ ,
+is refused.
+The retry is a second connection, so you may be asked to log in again.
+The
+.Cm StrictArgs
+option to
+.Fl X
+refuses that mode instead.
+.Pp
+A destination port may be given by writing the destination
 as an
 .Ar scp://
 URI; it is forwarded to the origin host's
@@ -542,7 +569,35 @@ The log target must be writable or
 exits before any connection is made.
 The path is used as given.
 The log is purely informational: nothing ever reads it back.
+.It Cm StrictArgs
+With
+.Fl R ,
+refuses an origin host that cannot read its arguments from standard input,
+instead of falling back to its command line, and exits with status 58
+before anything is copied.
+Use it when file names may come from other people, for example on a
+shared file system.
 .El
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev HPN_ARGS_STDIN
+Set to
+.Ql 1
+by a third-party launcher
+.Pq Fl R No or Xr hpn3scp 1
+in the environment of the
+.Nm
+it starts on the origin host.
+.Nm
+then reads its arguments from standard input instead of its command line.
+It does so only when started with no arguments at all, so the variable
+never overrides arguments given on the command line, for example by a
+wrapper or by a forced command in
+.Pa authorized_keys .
+Started with no arguments, it refuses to run if standard input or
+standard output is a terminal.
+The variable is not meant to be set by hand.
 .El
 .Sh EXIT STATUS
 .Ex -std scp
@@ -557,6 +612,14 @@ exits with code 57
 and prints a summary of the files that did not match their source. This
 distinct code lets automation detect a silent-corruption event separately
 from an ordinary transfer error.
+.Pp
+With
+.Fl R
+and
+.Fl X Cm StrictArgs ,
+.Nm
+exits with code 58 when the origin host cannot read its arguments
+safely, before anything is copied.
 .Sh SEE ALSO
 .Xr hpn3scp 1 ,
 .Xr hpnsftp 1 ,

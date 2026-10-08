@@ -241,11 +241,19 @@ proto_emit_file_status(const struct hpns_filedone *fd)
 }
 
 void
-proto_emit_done(int ok, int exit_status, unsigned files,
-    unsigned verify_failed, unsigned transfer_failed)
+proto_emit_done(int ok, int exit_status, int counts_known, u_int files,
+    u_int verify_failed, u_int transfer_failed)
 {
 	if (human_mode)
 		return;		/* the exit status says it for a human */
+	/* Without the source's END frame the counts are not known, and a 0
+	 * would read as "none". Leave the keys out instead. */
+	if (!counts_known) {
+		fprintf(po(), "EVENT done ok=%d exit=%d\n", ok ? 1 : 0,
+		    exit_status);
+		fflush(po());
+		return;
+	}
 	fprintf(po(), "EVENT done ok=%d exit=%d files=%u verify_failed=%u "
 	    "transfer_failed=%u\n", ok ? 1 : 0, exit_status, files,
 	    verify_failed, transfer_failed);

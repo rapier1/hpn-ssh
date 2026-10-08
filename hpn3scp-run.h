@@ -64,17 +64,30 @@ struct hpn_run_hooks {
 	void (*on_tick)(void *ctx);
 	void (*on_degrade)(void *ctx);
 	int  passthrough_fd;	/* raw bytes after degrade go here; <0 = discard */
+	/* Bytes written to the child's stdin, which is then closed. NULL
+	 * leaves stdin as the child inherits it. */
+	const u_char *stdin_data;
+	size_t	stdin_len;
 	void *ctx;
 };
 
-/*
- * Fork+exec a->list[0] with a piped stdout, dispatch its HPNS frames to
- * `h`.  If pidp != NULL it receives the child pid after fork and -1 after
- * reap, so the caller's own signal handler can kill the child.  Returns 0
- * if the child exited 0, -1 otherwise.
- */
+/* What a status run saw, so a launcher can tell a source that read its
+ * argument list from one that did not. */
+struct hpn_run_result {
+	int	got_hello;	/* a HELLO or PROGRESS frame arrived */
+	int	exited;		/* the child exited rather than died */
+	int	exit_status;	/* its exit status, when exited */
+};
+
+/* Fork and exec a->list[0] with a piped stdout, and dispatch its HPNS
+ * frames to h. When h->stdin_data is set, it is written to the child's
+ * stdin, which is then closed. If pidp is not NULL it receives the child
+ * pid after fork and -1 after reap, so the caller's own signal handler can
+ * kill the child. If res is not NULL it reports whether a HELLO arrived and
+ * how the child ended. Returns 0 if the child exited 0, and -1
+ * otherwise. */
 int	hpn_run_status(struct arglist *a, pid_t *pidp,
-	    const struct hpn_run_hooks *h);
+	    const struct hpn_run_hooks *h, struct hpn_run_result *res);
 
 /*
  * Fork+exec a->list[0] with a piped stdout, capture up to buflen-1 bytes of

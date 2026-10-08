@@ -32,6 +32,7 @@
  *   0        success
  *   1        general error (sftp.c)
  *   57       SFTP_EX_VERIFY_FAILED (sftp-client.h)
+ *   58       HPN_EXIT_STRICT_ARGS (hpn-launch-args.h)
  *   64-78    BSD sysexits (EX_*)
  *   127      execvp-failed sentinel (spawn_worker_ssh)
  *   255      ssh transport-level error (cleanup_exit)

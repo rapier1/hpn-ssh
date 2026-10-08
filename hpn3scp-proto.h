@@ -29,12 +29,15 @@
  * EVENT contract (binding on every front-end): fields are key=value
  * tokens.  Parse by key - ignore unrecognized keys, do not depend on key
  * order, and expect new keys to appear in any event as the protocol
- * grows.  Existing keys are never renamed or repurposed.  A positional
- * parser WILL break on the next field addition.
+ * grows.  The protocol is experimental, so keys may still be renamed or
+ * dropped as the needs of the GUI require.  A positional parser WILL
+ * break on the next field addition.
  */
 
 #ifndef HPN3SCP_PROTO_H
 #define HPN3SCP_PROTO_H
+
+#include <sys/types.h>
 
 #include <stdio.h>
 
@@ -83,8 +86,12 @@ void	proto_emit_file_fail(const struct hpns_filefail *ff);
  * handling as file_fail.
  */
 void	proto_emit_file_status(const struct hpns_filedone *fd);
-void	proto_emit_done(int ok, int exit_status, unsigned files,
-	    unsigned verify_failed, unsigned transfer_failed);
+/* The last event. ok and exit give the result. The files, verify_failed,
+ * and transfer_failed counts appear only when counts_known is set, which
+ * means the source sent its END frame. A source that sends no frames
+ * leaves them unknown, and their keys are absent. */
+void	proto_emit_done(int ok, int exit_status, int counts_known, u_int files,
+	    u_int verify_failed, u_int transfer_failed);
 
 /* --- decisions in (front-end -> engine) --- */
 enum proto_decision_kind {

@@ -53,6 +53,7 @@
 #include "hpn3scp-proto.h"
 #include "sftp-hpn-transferlog.h"
 #include "hpn3scp-run.h"
+#include "hpn-launch-args.h"
 
 /* The local relay meter in human mode: its label and whether it has
  * started. */
@@ -397,87 +398,111 @@ emit_completion_summary(struct launch_session *s)
 	}
 }
 
-/*
- * Launch the source's hpnscp (a bare word, resolved by the source's PATH
- * exactly as stock scp resolves its remote command) to push directly to
- * the target, and relay its status frames as events.  Mirrors scp.c's
- * proven -R command build: env-armed frames, -j / -P forwarded into the
- * source's hpnscp, target as user@host:path.  Raw bytes from a source that
- * does not speak frames are discarded (passthrough_fd = -1), never written
- * to our protocol stdout.  Returns the child exit status.
- */
-static int
-do_launch(struct launch_session *s)
+/* Build the source hpnscp's own arguments: everything after the word
+ * hpnscp, ending in -- and the two operands. Both launch modes send the
+ * same list, on stdin or on the command line. */
+static void
+launch_hpnscp_args(struct launch_session *s, arglist *args)
 {
-	arglist a;
-	struct hpn_run_hooks h;
-	char *cp;
-	int r, i;
+	int i;
 
-	/* source-key-only default: no agent is forwarded and the source
-	 * authenticates to the target with its own key.  -A opts into
-	 * forwarding the user's ambient agent instead. */
-	ssh_base_args(s, &a, 1, s->use_ambient);
-	addargs(&a, "env");
-	/* "log" additionally asks the source for per-file FILEDONE frames
-	 * (the transfer log / GUI file list); old sources treat any value
-	 * as plain arming and the log degrades to header + footer. */
-	addargs(&a, transferlog_active() ?
-	    "HPN_ENABLE_REMOTE_PROGRESS=log" : "HPN_ENABLE_REMOTE_PROGRESS=1");
-	addargs(&a, "hpnscp");
+	memset(args, 0, sizeof(*args));
 	/* the target key is trusted by now (broker or pre-existing), so hold
 	 * the workers to strict checking; a user -o after this can override */
-	addargs(&a, "-o");
-	addargs(&a, "StrictHostKeyChecking=yes");
+	addargs(args, "-o");
+	addargs(args, "StrictHostKeyChecking=yes");
 	for (i = 0; i < s->verbosity; i++)	/* -v propagates to the source hpnscp */
-		addargs(&a, "-v");
+		addargs(args, "-v");
 	if (s->addr_family == 4)		/* the A->C transfer hop */
-		addargs(&a, "-4");
+		addargs(args, "-4");
 	else if (s->addr_family == 6)
-		addargs(&a, "-6");
+		addargs(args, "-6");
 	for (i = 0; i < (int)s->hpnscp_extra->num; i++)	/* -r/-V/-Z/-o/-X/-Y */
-		addargs(&a, "%s", s->hpnscp_extra->list[i]);
+		addargs(args, "%s", s->hpnscp_extra->list[i]);
 	if (s->streams > 1) {
-		addargs(&a, "-j");
-		addargs(&a, "%d", s->streams);
+		addargs(args, "-j");
+		addargs(args, "%d", s->streams);
 	}
 	if (s->dst.port != -1) {
-		addargs(&a, "-P");
-		addargs(&a, "%d", s->dst.port);
+		addargs(args, "-P");
+		addargs(args, "%d", s->dst.port);
 	}
 	/* -- so a source path starting with '-' is never read as an option */
-	addargs(&a, "--");
-	addargs(&a, "%s", s->src.path != NULL ? s->src.path : ".");
-	addargs(&a, "%s%s%s:%s",
+	addargs(args, "--");
+	addargs(args, "%s", s->src.path != NULL ? s->src.path : ".");
+	addargs(args, "%s%s%s:%s",
 	    s->dst.user != NULL ? s->dst.user : "",
 	    s->dst.user != NULL ? "@" : "",
 	    s->dst.host, s->dst.path != NULL ? s->dst.path : "");
+}
 
-	cp = argv_assemble(a.num, a.list);
-	debug("launch: %s", cp);		/* visible under -v */
-	free(cp);
+/* Start the source's hpnscp (a bare word, resolved by the source's PATH
+ * exactly as stock scp resolves its remote command) to push directly to
+ * the target, and relay its status as events. hpn_launch_args_run() keeps
+ * the arguments off the source's shell and handles a legacy source. Raw
+ * bytes from a source that does not speak frames are discarded
+ * (passthrough_fd = -1), never written to our protocol stdout. Returns 0,
+ * HPN_EXIT_STRICT_ARGS for a refused legacy source, HPN_LAUNCH_REFUSED when
+ * the copy was refused before it ran, or -1. */
+static int
+do_launch(struct launch_session *s)
+{
+	struct hpn_launch launch;
+	struct hpn_run_hooks hooks;
+	arglist args, ssh_stdin, ssh_legacy;
+	int r;
 
 	snprintf(meter.label, sizeof(meter.label), "%s => %s",
 	    s->src.host, s->dst.host);
 
-	memset(&h, 0, sizeof(h));
-	h.on_hello = ev_hello;
-	h.on_progress = ev_progress;
-	h.on_end = ev_end;
-	h.on_file_fail = ev_file_fail;
-	h.on_filedone = ev_filedone;
-	h.on_tick = ev_tick;
-	h.on_degrade = ev_degrade;
-	h.passthrough_fd = -1;
-	h.ctx = s;
+	launch_hpnscp_args(s, &args);
+	/* Source-key-only default: no agent is forwarded and the source
+	 * authenticates to the target with its own key. -A opts into
+	 * forwarding the user's ambient agent instead. Stdin mode needs
+	 * stdin, so only the legacy prefix has -n. */
+	ssh_base_args(s, &ssh_stdin, 0, s->use_ambient);
+	ssh_base_args(s, &ssh_legacy, 1, s->use_ambient);
 
-	r = hpn_run_status(&a, &s->child, &h);
-	freeargs(&a);
+	memset(&hooks, 0, sizeof(hooks));
+	hooks.on_hello = ev_hello;
+	hooks.on_progress = ev_progress;
+	hooks.on_end = ev_end;
+	hooks.on_file_fail = ev_file_fail;
+	hooks.on_filedone = ev_filedone;
+	hooks.on_tick = ev_tick;
+	hooks.on_degrade = ev_degrade;
+	hooks.passthrough_fd = -1;
+	hooks.ctx = s;
+
+	memset(&launch, 0, sizeof(launch));
+	launch.ssh_stdin = &ssh_stdin;
+	launch.ssh_legacy = &ssh_legacy;
+	launch.program = "hpnscp";
+	/* "log" additionally asks the source for per-file FILEDONE frames
+	 * (the transfer log / GUI file list); old sources treat any value
+	 * as plain arming and the log degrades to header + footer. */
+	launch.relay = "HPN_ENABLE_REMOTE_PROGRESS=1";
+	if (transferlog_active())
+		launch.relay = "HPN_ENABLE_REMOTE_PROGRESS=log";
+	/* hpn3scp always relays, so both modes use the same hooks */
+	launch.legacy_relay = 1;
+	launch.args = &args;
+	launch.source_host = s->src.host;
+	launch.hooks = &hooks;
+	launch.plain_hooks = &hooks;
+	launch.pidp = &s->child;
+	launch.warn = proto_emit_warning;
+	launch.fail = proto_emit_error;
+
+	r = hpn_launch_args_run(&launch);
 	if (meter.on) {
 		refresh_progress_meter(1);
 		hpn_meter_relay_stop();
 		meter.on = 0;
 	}
+	freeargs(&args);
+	freeargs(&ssh_stdin);
+	freeargs(&ssh_legacy);
 	return r;
 }
 
@@ -604,7 +629,7 @@ run_session(struct launch_session *s)
 	const char *why = NULL;
 	char sd[512], dd[512], *m;
 	struct target_keyset set;
-	int r, ret = 1, knows;
+	int r, ret = 1, knows, counts_known;
 
 	memset(&set, 0, sizeof(set));
 
@@ -680,15 +705,26 @@ run_session(struct launch_session *s)
 	r = do_launch(s);
 	emit_completion_summary(s);
 
+	/* a refused legacy source keeps its own exit status */
+	ret = 0;
+	if (r == HPN_EXIT_STRICT_ARGS)
+		ret = HPN_EXIT_STRICT_ARGS;
+	else if (r != 0)
+		ret = 1;
+	/* The counts are known when the source sent its END frame, or when
+	 * the launch was refused before anything ran and so moved nothing,
+	 * as for a failure before the launch. */
+	counts_known = endinfo.got || r == HPN_EXIT_STRICT_ARGS ||
+	    r == HPN_LAUNCH_REFUSED;
 	s->phase = LP_COMPLETE;
 	proto_emit_phase(phase_name(s->phase));
-	proto_emit_done(r == 0, r == 0 ? 0 : 1, endinfo.files_done,
+	proto_emit_done(r == 0, ret, counts_known, endinfo.files_done,
 	    failtally.verify, failtally.transfer);
-	ret = (r == 0) ? 0 : 1;
 	goto out;
 
  fail:
-	proto_emit_done(0, 1, 0, 0, 0);
+	/* nothing was launched, so the zero counts are known */
+	proto_emit_done(0, 1, 1, 0, 0, 0);
 	ret = 1;
  out:
 	hpn3scp_free_keyset(&set);
@@ -769,6 +805,9 @@ main(int argc, char **argv)
 			/* The transfer log is written on this host, so
 			 * TransferLog is not forwarded to the source. */
 			if (transferlog_option(optarg))
+				break;
+			/* StrictArgs governs this launch, not the source */
+			if (hpn_launch_args_option(optarg))
 				break;
 			addargs(&hpnscp_extra, "-X");
 			addargs(&hpnscp_extra, "%s", optarg);
