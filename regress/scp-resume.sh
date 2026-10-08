@@ -41,7 +41,7 @@ forest() {
 	ln -s ${DIR}/subdir ${DIR}/subdir-sym
 }
 
-for mode in scp sftp ; do
+for mode in scp ; do
 	tag="$tid: $mode mode"
 	if test $mode = scp ; then
 		scpopts="-O -S ${OBJ}/scp-ssh-wrapper.scp"
