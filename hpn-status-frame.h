@@ -108,6 +108,10 @@
  * file's exact end state. Only per-file meters set it. A fleet's file
  * counts rise on ordinary ticks and never do. */
 #define HPNS_F_BOUNDARY		0x0004
+/* bytes_total and files_total are real values, even when 0. Without the
+ * flag the field is not known yet, whatever it holds. */
+#define HPNS_F_TOTAL_KNOWN	0x0008
+#define HPNS_F_FILES_KNOWN	0x0010
 
 /* eta_sec when no ETA can be given */
 #define HPNS_ETA_UNKNOWN	0xffffffffu
@@ -139,7 +143,7 @@ struct hpns_hello {
  * are authoritative. */
 struct hpns_progress {
 	uint64_t	bytes_done;
-	uint64_t	bytes_total;	/* may grow, 0 if unknown */
+	uint64_t	bytes_total;	/* may grow, HPNS_F_TOTAL_KNOWN */
 	uint64_t	rate_bps;	/* smoothed */
 	/* The last interval's rate, unsmoothed. The source measures it against
 	 * its own clock, which a consumer cannot recover from frame arrival
@@ -147,7 +151,7 @@ struct hpns_progress {
 	uint64_t	rate_inst_bps;
 	uint32_t	eta_sec;	/* or HPNS_ETA_UNKNOWN */
 	uint32_t	files_done;
-	uint32_t	files_total;	/* 0 if unknown */
+	uint32_t	files_total;	/* see HPNS_F_FILES_KNOWN */
 	uint16_t	workers_active;
 	uint16_t	workers_stalled;
 	uint16_t	flags;		/* HPNS_F_* */
@@ -235,6 +239,10 @@ void	hpns_pct_encode(char *, size_t, const u_char *, size_t);
 /* The word for a FILEDONE status value, such as "success", with the flag
  * bits ignored. A value with no word returns "unknown". */
 const char *hpns_fd_status_word(u_char);
+
+/* The word for a FILEFAIL reason, "transfer" or "verify", with the flag
+ * bit ignored. A reason with no word returns "unknown". */
+const char *hpns_ff_kind_word(u_char);
 
 /* The final status of a file whose verify phase ran: FAILED when it
  * failed or could not be verified, otherwise REPAIRED or VERIFIED. */

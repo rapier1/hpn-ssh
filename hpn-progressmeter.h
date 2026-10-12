@@ -37,7 +37,7 @@ struct meter_view;
 void	hpn_pm_frame_mode(u_int);
 int	hpn_pm_active(void);
 void	hpn_pm_set_workers(u_int, u_int);
-void	hpn_pm_set_files(u_int, u_int);
+void	hpn_pm_set_files(u_int, u_int, int);
 void	hpn_pm_count_file(void);
 void	hpn_pm_set_phase(u_int, int);
 void	hpn_pm_filefail(u_int, const char *, size_t);

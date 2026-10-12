@@ -22,10 +22,9 @@
  * host to a target host, without the data passing through the launcher.
  * It works through a fixed sequence of phases. It resolves the endpoints,
  * brokers the target's host key into the source's known_hosts when the
- * source does not already trust it, checks that the source can
- * authenticate to the target, then launches hpnscp on the source and
- * relays its progress. All progress and decisions go through hpn3scp-proto,
- * so the command line and the GUI drive the same engine. */
+ * source does not already trust it, then launches hpnscp on the source
+ * and relays its progress. All progress goes through hpn3scp-proto, so the
+ * command line and the GUI drive the same engine. */
 
 #include "includes.h"
 
@@ -45,8 +44,10 @@
 #include "pathnames.h"
 #include "ssh.h"		/* SSH_MAX_* sizes readconf.h needs */
 #include "readconf.h"	/* ssh_valid_ruser */
-#include "progressmeter.h"
+#include "ssherr.h"
 #include "hpn-meter.h"	/* relay meter source */
+#include "hpn-compress.h"	/* HPN_ZSTD_LEVEL_MIN, HPN_ZSTD_LEVEL_MAX */
+#include "sftp-parallel.h"	/* SFTP_PARALLEL_MAX_WORKERS */
 #include "xmalloc.h"
 #include "hpn3scp.h"
 #include "hpn3scp-hostkey.h"
@@ -55,12 +56,8 @@
 #include "hpn3scp-run.h"
 #include "hpn-launch-args.h"
 
-/* The local relay meter in human mode: its label and whether it has
- * started. */
-static struct {
-	char	 label[HPN_METER_LABEL_MAX];	/* "source => target" */
-	int	 on;
-} meter;
+/* The local relay meter's label in human mode, "source => target" */
+static char meter_label[HPN_METER_LABEL_MAX];
 
 /* per-transfer failure tally, for the completion summary */
 static struct {
@@ -83,15 +80,12 @@ phase_name(enum launch_phase phase)
 {
 	switch (phase) {
 	case LP_RESOLVE:		return "RESOLVE";
-	case LP_REACH_SOURCE:		return "REACH_SOURCE";
 	case LP_FETCH_TARGET_KEY:	return "FETCH_TARGET_KEY";
 	case LP_CONFIRM_KEY:		return "CONFIRM_KEY";
 	case LP_PROVISION:		return "PROVISION";
-	case LP_AUTH_PREFLIGHT:		return "AUTH_PREFLIGHT";
 	case LP_LAUNCH:			return "LAUNCH";
 	case LP_MONITOR:		return "MONITOR";
 	case LP_COMPLETE:		return "COMPLETE";
-	case LP_FAILED:			return "FAILED";
 	}
 	return "UNKNOWN";
 }
@@ -131,9 +125,9 @@ valid_user(const char *user)
 		case '`':
 		case ' ':
 		case '#':
-			return 0;			/* shell hazards */
+			return 0;	/* shell hazards */
 		default:
-			break;				/* other punctuation ok */
+			break;		/* other punctuation ok */
 		}
 	}
 	return 1;
@@ -159,110 +153,103 @@ valid_host(const char *host)
 	return ok;
 }
 
-/*
- * Parse one endpoint argument - an scp:// URI or a plain [user@]host:path -
- * into ep.  Returns 0 for a valid REMOTE endpoint; -1 otherwise with *why set
- * to a short reason.  The scp:// path rule (one slash after the port = home-
- * relative, two = absolute) is inherited from parse_uri().
- */
+/* Parse one endpoint argument, an scp:// URI or a plain [user@]host:path,
+ * into endpoint. Returns 0 for a valid remote endpoint, or -1 with *why
+ * set to a short reason. The host and user are checked here, because they
+ * reach the source's command line in the keyscan, the host-key check, and
+ * a legacy launch. The scp:// path rule, one slash after the port for a
+ * home-relative path and two for an absolute one, comes from parse_uri(). */
 static int
-resolve_endpoint(const char *arg, struct endpoint *ep, const char **why)
+resolve_endpoint(const char *arg, struct endpoint *endpoint, const char **why)
 {
 	char *user = NULL, *host = NULL, *path = NULL;
 	int port = -1, r;
 
-	memset(ep, 0, sizeof(*ep));
-	ep->port = -1;
+	memset(endpoint, 0, sizeof(*endpoint));
+	endpoint->port = -1;
 
 	r = parse_uri("scp", arg, &user, &host, &port, &path);
 	if (r == -1) {
 		*why = "invalid scp:// uri";
 		return -1;
 	}
-	if (r == 1) {
-		/* not a URI: [user@]host:path */
-		if (parse_user_host_path(arg, &user, &host, &path) == -1) {
-			*why = "not a valid [user@]host:path";
-			return -1;
-		}
-		port = -1;
+	/* not a URI, so it must be [user@]host:path */
+	if (r == 1 && parse_user_host_path(arg, &user, &host, &path) == -1) {
+		*why = "not a valid [user@]host:path";
+		return -1;
 	}
 	if (host == NULL) {
 		*why = "endpoint has no host (a third-party copy needs two "
 		    "remote hosts)";
-		free(user);
-		free(path);
-		return -1;
+		goto fail;
 	}
 	if (!valid_host(host)) {
 		*why = "invalid host name";
-		free(user);
-		free(host);
-		free(path);
-		return -1;
+		goto fail;
 	}
 	if (user != NULL && !valid_user(user)) {
 		*why = "invalid username";
-		free(user);
-		free(host);
-		free(path);
-		return -1;
+		goto fail;
 	}
-	ep->user = user;
-	ep->host = host;
-	ep->port = port;
-	ep->path = path;
+	endpoint->user = user;
+	endpoint->host = host;
+	endpoint->port = port;
+	endpoint->path = path;
 	return 0;
+
+ fail:
+	free(user);
+	free(host);
+	free(path);
+	return -1;
 }
 
-/* [user@]host[:port]:path for display only (never fed back to a shell) */
-static void
-endpoint_desc(const struct endpoint *ep, char *buf, size_t len)
-{
-	char portbuf[16] = "";
-
-	if (ep->port != -1)
-		snprintf(portbuf, sizeof(portbuf), ":%d", ep->port);
-	snprintf(buf, len, "%s%s%s%s:%s",
-	    ep->user != NULL ? ep->user : "", ep->user != NULL ? "@" : "",
-	    ep->host, portbuf, ep->path != NULL ? ep->path : "");
-}
-
-/*
- * Build the ssh command used to reach the source A, up to and including the
- * host - the caller appends the remote command.  with_n adds -n (no stdin,
- * for the launch); with_agent adds -A (opt-in forwarding, section 0).
- */
+/* Add -4 or -6 when the user chose an address family. ssh, hpnscp, and
+ * ssh-keyscan all take the same flag, so one helper serves every hop. */
 void
-ssh_base_args(struct launch_session *s, arglist *a, int with_n, int with_agent)
+add_addr_family_arg(const struct launch_session *session, arglist *args)
+{
+	if (session->addr_family == 4)
+		addargs(args, "-4");
+	else if (session->addr_family == 6)
+		addargs(args, "-6");
+}
+
+/* Build the ssh command that reaches the source, up to and including the
+ * host. The caller appends the remote command. with_n adds -n for the
+ * legacy launch, which sends nothing on stdin. with_agent adds -A for the
+ * user's opt-in agent forwarding. */
+void
+ssh_base_args(const struct launch_session *session, arglist *args,
+    int with_n, int with_agent)
 {
 	int i;
 
-	memset(a, 0, sizeof(*a));
-	a->list = NULL;
-	addargs(a, "%s", _PATH_SSH_PROGRAM);
-	addargs(a, "-x");
-	addargs(a, "-oClearAllForwardings=yes");
+	memset(args, 0, sizeof(*args));
+	args->list = NULL;
+	addargs(args, "%s", _PATH_SSH_PROGRAM);
+	/* no X11 or port forwarding reaches the source */
+	addargs(args, "-x");
+	addargs(args, "-oClearAllForwardings=yes");
 	if (with_n)
-		addargs(a, "-n");
+		addargs(args, "-n");
 	if (with_agent)
-		addargs(a, "-A");
-	for (i = 0; i < s->verbosity; i++)	/* -v propagates to the launch ssh */
-		addargs(a, "-v");
-	if (s->addr_family == 4)		/* -4/-6 applies to every hop */
-		addargs(a, "-4");
-	else if (s->addr_family == 6)
-		addargs(a, "-6");
-	if (s->src.port != -1) {
-		addargs(a, "-p");
-		addargs(a, "%d", s->src.port);
+		addargs(args, "-A");
+	/* the user's -v reaches the ssh to the source */
+	for (i = 0; i < session->verbosity; i++)
+		addargs(args, "-v");
+	add_addr_family_arg(session, args);
+	if (session->src.port != -1) {
+		addargs(args, "-p");
+		addargs(args, "%d", session->src.port);
 	}
-	if (s->src.user != NULL) {
-		addargs(a, "-l");
-		addargs(a, "%s", s->src.user);
+	if (session->src.user != NULL) {
+		addargs(args, "-l");
+		addargs(args, "%s", session->src.user);
 	}
-	addargs(a, "--");
-	addargs(a, "%s", s->src.host);
+	/* the host was checked by valid_host(), and -- keeps it an operand */
+	addargs(args, "--");
+	addargs(args, "%s", session->src.host);
 }
 
 /* The decoded-frame callbacks. Protocol mode relays each frame as an EVENT
@@ -270,131 +257,114 @@ ssh_base_args(struct launch_session *s, arglist *a, int with_n, int with_agent)
  * rendered entirely from the frames through hpn_meter_relay_*, as hpnscp's
  * -R consumer does, so no rate or ETA is re-derived from arrival times. */
 
+/* Feed a PROGRESS frame to the local meter in human mode, starting the
+ * meter on the first one, or emit it as a progress event. */
 static void
-ev_hello(const struct hpns_hello *hl, void *ctx)
-{
-	(void)ctx;
-	(void)hl;	/* totals arrive in PROGRESS frames */
-}
-
-static void
-ev_progress(const struct hpns_progress *p, void *ctx)
+ev_progress(const struct hpns_progress *progress, void *ctx)
 {
 	(void)ctx;
 	if (proto_human()) {
-		if (!meter.on) {
-			hpn_meter_relay_start(meter.label);
-			meter.on = 1;
-		}
-		hpn_meter_relay_sample(p);
+		hpn_meter_relay_sample(meter_label, progress);
 		return;
 	}
-	proto_emit_progress(p);
+	proto_emit_progress(progress);
 }
 
+/* Keep the END frame's counts for the done event and the summary. Then
+ * close the meter in human mode, or emit a final progress event. */
 static void
-ev_end(const struct hpns_end *e, void *ctx)
+ev_end(const struct hpns_end *end, void *ctx)
 {
 	struct hpns_progress last;
 
 	(void)ctx;
-	endinfo.files_done = e->files_done;
-	endinfo.ok = e->ok;
+	endinfo.files_done = end->files_done;
+	endinfo.ok = end->ok;
 	endinfo.got = 1;
 	if (proto_human()) {
-		if (meter.on)
-			hpn_meter_relay_end(e->bytes_done);
+		hpn_meter_relay_end(end->bytes_done);
 		return;
 	}
-	/* synthesize the final 100% snapshot; phases are over by END and
-	 * rates are unknowable, so flags, rates, and eta stay zero */
+	/* A synthesized final snapshot at 100%. Both totals are known by END.
+	 * The phases are over and the rates are unknown, so the phase flags,
+	 * rates, and ETA stay 0. */
 	memset(&last, 0, sizeof(last));
-	last.bytes_done = e->bytes_done;
-	last.bytes_total = e->bytes_done;
-	last.files_done = e->files_done;
-	last.files_total = e->files_done + e->files_failed;
+	last.bytes_done = end->bytes_done;
+	last.bytes_total = end->bytes_done;
+	last.files_done = end->files_done;
+	last.files_total = end->files_done + end->files_failed;
+	last.flags = HPNS_F_TOTAL_KNOWN | HPNS_F_FILES_KNOWN;
 	proto_emit_progress(&last);
 }
 
+/* Count a FILEFAIL frame as a verify or a transfer failure and emit a
+ * file_fail event. Human mode emits nothing, because the source's stderr
+ * already shows the detail. */
 static void
-ev_file_fail(const struct hpns_filefail *ff, void *ctx)
+ev_file_fail(const struct hpns_filefail *filefail, void *ctx)
 {
 	(void)ctx;
-	if ((ff->kind & HPNS_FF_KINDMASK) == HPNS_FF_VERIFY)
+	if ((filefail->kind & HPNS_FF_KINDMASK) == HPNS_FF_VERIFY)
 		failtally.verify++;
 	else
 		failtally.transfer++;
-	/* structured emit; the borrowed path is consumed now (percent-encoded)
-	 * and not retained.  Human mode is a no-op here - the source's stderr
-	 * already carries the per-file detail. */
-	proto_emit_file_fail(ff);
+	/* the path is borrowed from the frame, so it is encoded now */
+	proto_emit_file_fail(filefail);
 }
 
+/* Write a FILEDONE frame to the launcher-side transfer log and emit a
+ * file_status event. Human mode emits nothing, because the log and the
+ * meter cover it. */
 static void
-ev_filedone(const struct hpns_filedone *fd, void *ctx)
+ev_filedone(const struct hpns_filedone *filedone, void *ctx)
 {
 	(void)ctx;
-	/* Launcher-side transfer log: the path is opaque remote bytes; the
-	 * module percent-encodes before it lands in the log.  Protocol mode
-	 * additionally emits the EVENT (no-op for a human - the log and the
-	 * meter cover that case). */
-	transferlog_file_bytes(transferlog_status_from_wire(fd->status),
-	    (off_t)fd->size, fd->path, fd->path_len);
-	proto_emit_file_status(fd);
+	/* the path is opaque remote bytes, which the log percent-encodes */
+	transferlog_file_bytes(transferlog_status_from_wire(filedone->status),
+	    (off_t)filedone->size, filedone->path, filedone->path_len);
+	proto_emit_file_status(filedone);
 }
 
-static void
-ev_tick(void *ctx)
-{
-	(void)ctx;
-	if (meter.on)
-		refresh_progress_meter(0);
-}
-
+/* Drop the meter and warn when the source stops sending frames. The copy
+ * itself carries on. */
 static void
 ev_degrade(void *ctx)
 {
 	(void)ctx;
-	if (meter.on) {
-		hpn_meter_relay_stop();
-		meter.on = 0;
-	}
+	hpn_meter_relay_stop();
 	proto_emit_warning("source is not sending status; the transfer "
 	    "continues without progress");
 }
 
-/*
- * Human-mode completion summary (walk-away confidence): only when -V/-Z was
- * requested.  A clean run confirms verification; a verify failure points at
- * the per-file detail the source already printed above.  No-op in protocol
- * mode - the front end builds its own summary from the file_fail + done events.
- */
+/* Print the human-mode completion summary when -V or -Z was given, so the
+ * user can walk away and trust the result. A clean run reports the files
+ * that came through, and a verify failure points at the per-file detail
+ * the source printed above. Protocol mode prints nothing, because the
+ * front end builds its own summary from the file_fail and done events. */
 static void
-emit_completion_summary(struct launch_session *s)
+emit_completion_summary(const struct launch_session *session)
 {
-	if (!proto_human() || !s->verify_requested)
+	u_int files_ok;
+
+	if (!proto_human() || !session->verify_requested)
 		return;
 	if (failtally.verify > 0)
 		fprintf(stderr, "hpn3scp: WARNING: %u file%s failed "
 		    "verification (see above)\n", failtally.verify,
 		    failtally.verify == 1 ? "" : "s");
 	else if (endinfo.got && !endinfo.ok) {
-		/* The source reported failure without per-file FILEFAIL
-		 * detail (serial transfer errors emit none): never claim
-		 * anything was verified OK. */
+		/* The source reported failure without FILEFAIL detail, as a
+		 * serial transfer error does, so claim no file as verified. */
 		fprintf(stderr, "hpn3scp: WARNING: the source reported the "
 		    "transfer incomplete (see errors above)\n");
 	} else if (endinfo.got) {
-		/* OK = files sent minus those that failed to transfer */
-		u_int ok = endinfo.files_done > failtally.transfer ?
-		    endinfo.files_done - failtally.transfer : 0;
-
-		if (s->verify_full)
-			fprintf(stderr, "hpn3scp: verified: %u file%s OK\n",
-			    ok, ok == 1 ? "" : "s");
-		else
-			fprintf(stderr, "hpn3scp: %u file%s OK\n",
-			    ok, ok == 1 ? "" : "s");
+		/* the files sent, less those that failed to transfer */
+		files_ok = 0;
+		if (endinfo.files_done > failtally.transfer)
+			files_ok = endinfo.files_done - failtally.transfer;
+		fprintf(stderr, "hpn3scp: %s%u file%s OK\n",
+		    session->verify_full ? "verified: " : "",
+		    files_ok, files_ok == 1 ? "" : "s");
 	}
 }
 
@@ -402,308 +372,255 @@ emit_completion_summary(struct launch_session *s)
  * hpnscp, ending in -- and the two operands. Both launch modes send the
  * same list, on stdin or on the command line. */
 static void
-launch_hpnscp_args(struct launch_session *s, arglist *args)
+launch_hpnscp_args(const struct launch_session *session, arglist *args)
 {
+	const char *lbracket = "", *rbracket = "";
 	int i;
 
 	memset(args, 0, sizeof(*args));
-	/* the target key is trusted by now (broker or pre-existing), so hold
-	 * the workers to strict checking; a user -o after this can override */
+	/* The target key is trusted by now, from the broker or from before,
+	 * so the workers are held to strict checking. A user -o after this
+	 * can override it. */
 	addargs(args, "-o");
 	addargs(args, "StrictHostKeyChecking=yes");
-	for (i = 0; i < s->verbosity; i++)	/* -v propagates to the source hpnscp */
+	/* the user's -v reaches the source hpnscp */
+	for (i = 0; i < session->verbosity; i++)
 		addargs(args, "-v");
-	if (s->addr_family == 4)		/* the A->C transfer hop */
-		addargs(args, "-4");
-	else if (s->addr_family == 6)
-		addargs(args, "-6");
-	for (i = 0; i < (int)s->hpnscp_extra->num; i++)	/* -r/-V/-Z/-o/-X/-Y */
-		addargs(args, "%s", s->hpnscp_extra->list[i]);
-	if (s->streams > 1) {
+	/* the source to target transfer hop */
+	add_addr_family_arg(session, args);
+	/* the user's -r, -V, -Z, -z, -o, -X, and -Y */
+	for (i = 0; i < (int)session->hpnscp_extra->num; i++)
+		addargs(args, "%s", session->hpnscp_extra->list[i]);
+	if (session->streams > 1) {
 		addargs(args, "-j");
-		addargs(args, "%d", s->streams);
+		addargs(args, "%d", session->streams);
 	}
-	if (s->dst.port != -1) {
+	if (session->dst.port != -1) {
 		addargs(args, "-P");
-		addargs(args, "%d", s->dst.port);
+		addargs(args, "%d", session->dst.port);
 	}
 	/* -- so a source path starting with '-' is never read as an option */
 	addargs(args, "--");
-	addargs(args, "%s", s->src.path != NULL ? s->src.path : ".");
-	addargs(args, "%s%s%s:%s",
-	    s->dst.user != NULL ? s->dst.user : "",
-	    s->dst.user != NULL ? "@" : "",
-	    s->dst.host, s->dst.path != NULL ? s->dst.path : "");
+	addargs(args, "%s",
+	    session->src.path != NULL ? session->src.path : ".");
+	/* Brackets keep an IPv6 target's colons apart from the path. Without
+	 * them hpnscp reads ::1:path as a local file name. */
+	if (strchr(session->dst.host, ':') != NULL) {
+		lbracket = "[";
+		rbracket = "]";
+	}
+	addargs(args, "%s%s%s%s%s:%s",
+	    session->dst.user != NULL ? session->dst.user : "",
+	    session->dst.user != NULL ? "@" : "",
+	    lbracket, session->dst.host, rbracket,
+	    session->dst.path != NULL ? session->dst.path : "");
 }
 
-/* Start the source's hpnscp (a bare word, resolved by the source's PATH
- * exactly as stock scp resolves its remote command) to push directly to
- * the target, and relay its status as events. hpn_launch_args_run() keeps
+/* Start the source's hpnscp to push directly to the target, and relay its
+ * status as events. hpnscp is a bare word that the source's PATH resolves,
+ * as stock scp resolves its remote command. hpn_launch_args_run() keeps
  * the arguments off the source's shell and handles a legacy source. Raw
- * bytes from a source that does not speak frames are discarded
- * (passthrough_fd = -1), never written to our protocol stdout. Returns 0,
- * HPN_EXIT_STRICT_ARGS for a refused legacy source, HPN_LAUNCH_REFUSED when
- * the copy was refused before it ran, or -1. */
+ * bytes from a source that does not send frames are discarded, so they
+ * never reach our protocol stdout. Returns 0, HPN_EXIT_STRICT_ARGS for a
+ * refused legacy source, HPN_LAUNCH_REFUSED when the copy was refused
+ * before it ran, or -1. */
 static int
-do_launch(struct launch_session *s)
+do_launch(struct launch_session *session)
 {
 	struct hpn_launch launch;
 	struct hpn_run_hooks hooks;
 	arglist args, ssh_stdin, ssh_legacy;
 	int r;
 
-	snprintf(meter.label, sizeof(meter.label), "%s => %s",
-	    s->src.host, s->dst.host);
+	/* the human-mode meter's label, from local arguments only */
+	snprintf(meter_label, sizeof(meter_label), "%s => %s",
+	    session->src.host, session->dst.host);
 
-	launch_hpnscp_args(s, &args);
+	/* the source hpnscp's own arguments, one list for both modes */
+	launch_hpnscp_args(session, &args);
 	/* Source-key-only default: no agent is forwarded and the source
 	 * authenticates to the target with its own key. -A opts into
 	 * forwarding the user's ambient agent instead. Stdin mode needs
 	 * stdin, so only the legacy prefix has -n. */
-	ssh_base_args(s, &ssh_stdin, 0, s->use_ambient);
-	ssh_base_args(s, &ssh_legacy, 1, s->use_ambient);
+	ssh_base_args(session, &ssh_stdin, 0, session->use_ambient);
+	ssh_base_args(session, &ssh_legacy, 1, session->use_ambient);
 
+	/* Each decoded frame becomes an event, or feeds the meter in human
+	 * mode. */
 	memset(&hooks, 0, sizeof(hooks));
-	hooks.on_hello = ev_hello;
 	hooks.on_progress = ev_progress;
 	hooks.on_end = ev_end;
 	hooks.on_file_fail = ev_file_fail;
 	hooks.on_filedone = ev_filedone;
-	hooks.on_tick = ev_tick;
+	hooks.on_tick = hpn_meter_relay_tick;
 	hooks.on_degrade = ev_degrade;
+	/* discard raw bytes from a source that does not send frames */
 	hooks.passthrough_fd = -1;
-	hooks.ctx = s;
+	hooks.ctx = session;
 
+	/* Describe the launch for the shared policy. */
 	memset(&launch, 0, sizeof(launch));
 	launch.ssh_stdin = &ssh_stdin;
 	launch.ssh_legacy = &ssh_legacy;
 	launch.program = "hpnscp";
-	/* "log" additionally asks the source for per-file FILEDONE frames
-	 * (the transfer log / GUI file list); old sources treat any value
-	 * as plain arming and the log degrades to header + footer. */
-	launch.relay = "HPN_ENABLE_REMOTE_PROGRESS=1";
-	if (transferlog_active())
-		launch.relay = "HPN_ENABLE_REMOTE_PROGRESS=log";
 	/* hpn3scp always relays, so both modes use the same hooks */
 	launch.legacy_relay = 1;
 	launch.args = &args;
-	launch.source_host = s->src.host;
+	launch.source_host = session->src.host;
 	launch.hooks = &hooks;
 	launch.plain_hooks = &hooks;
-	launch.pidp = &s->child;
+	launch.pidp = &session->child;
+	/* warnings and refusals go out as events, or as text in human mode */
 	launch.warn = proto_emit_warning;
 	launch.fail = proto_emit_error;
 
+	/* stdin mode first, and the legacy command line only for a source
+	 * that cannot read the list */
 	r = hpn_launch_args_run(&launch);
-	if (meter.on) {
-		refresh_progress_meter(1);
-		hpn_meter_relay_stop();
-		meter.on = 0;
-	}
+	hpn_meter_relay_finish();
 	freeargs(&args);
 	freeargs(&ssh_stdin);
 	freeargs(&ssh_legacy);
 	return r;
 }
 
-/*
- * -A path: confirm the user's ambient agent is present and non-empty (we
- * cannot see per-key constraints, only presence/count).  0 ok, -1 with a
- * specific error emitted.
- */
+/* Check the ambient agent before -A forwards it. The ambient agent is the
+ * ssh-agent already running in the user's login session, found through
+ * SSH_AUTH_SOCK. hpn3scp neither starts nor manages it. Only whether it
+ * answers and holds keys can be checked here, because a client cannot see
+ * per-key constraints such as ssh-add -h destination rules. Returns 0, or
+ * -1 with an error emitted. */
 static int
 check_ambient_agent(void)
 {
-	struct ssh_identitylist *idl = NULL;
-	int fd, r, nkeys = 0;
+	struct ssh_identitylist *identities = NULL;
+	char *msg;
+	int agent_sock, r;
 
-	if (getenv("SSH_AUTH_SOCK") == NULL) {
+	/* the agent is not present when SSH_AUTH_SOCK is unset or empty */
+	r = ssh_get_authentication_socket(&agent_sock);
+	if (r == SSH_ERR_AGENT_NOT_PRESENT) {
 		proto_emit_error("-A given but no ssh-agent is running "
 		    "(SSH_AUTH_SOCK unset); start one (hpnssh-agent) and load "
 		    "your key (hpnssh-add)");
 		return -1;
 	}
-	if (ssh_get_authentication_socket(&fd) != 0) {
+	if (r != 0) {
 		proto_emit_error("-A given but the agent at SSH_AUTH_SOCK is "
 		    "unreachable (stale socket?)");
 		return -1;
 	}
-	r = ssh_fetch_identitylist(fd, &idl);
-	ssh_close_authentication_socket(fd);
-	if (r == 0 && idl != NULL)
-		nkeys = (int)idl->nkeys;
-	if (idl != NULL)
-		ssh_free_identitylist(idl);
-	if (nkeys == 0) {
+	r = ssh_fetch_identitylist(agent_sock, &identities);
+	ssh_close_authentication_socket(agent_sock);
+	ssh_free_identitylist(identities);
+	/* the agent reports an empty key list as an error code */
+	if (r == SSH_ERR_AGENT_NO_IDENTITIES) {
 		proto_emit_error("-A given but your agent holds no keys; "
 		    "hpnssh-add the key that opens the target");
+		return -1;
+	}
+	if (r != 0) {
+		xasprintf(&msg, "-A given but the agent did not list its keys: "
+		    "%s", ssh_err(r));
+		proto_emit_error(msg);
+		free(msg);
 		return -1;
 	}
 	return 0;
 }
 
-/*
- * Preflight the A->C hop before any workers spawn: run
- * `ssh [-A] A "ssh -o BatchMode=yes ... C true"`.  Default (source-key-only)
- * omits -A so the test is whether the source can reach the target with its
- * OWN key; with -A the user's ambient agent is forwarded and tested instead.
- * 0 if the source can authenticate; -1 with a classified error emitted
- * (auth / host key / unreachable), naming the hosts and the fix.
- */
+/* Run one third-party copy from start to finish and report it as events:
+ * resolve the two endpoints, make sure the source trusts the target's host
+ * key, check the agent for -A, then launch the source's hpnscp and relay
+ * its status. Every path ends with exactly one done event. Returns the
+ * exit status for main(). */
 static int
-auth_preflight(struct launch_session *s)
-{
-	arglist a;
-	char buf[8192], target[600], *m;
-	int rc;
-
-	/* 2>&1 brings the inner ssh's diagnostics back on stdout so we can
-	 * classify the failure */
-	ssh_base_args(s, &a, 0, s->use_ambient);
-	addargs(&a, "ssh");
-	addargs(&a, "-o");
-	addargs(&a, "BatchMode=yes");
-	addargs(&a, "-o");
-	addargs(&a, "ConnectTimeout=10");
-	addargs(&a, "-o");
-	addargs(&a, "StrictHostKeyChecking=yes");
-	if (s->addr_family == 4)
-		addargs(&a, "-4");
-	else if (s->addr_family == 6)
-		addargs(&a, "-6");
-	if (s->dst.port != -1) {
-		addargs(&a, "-p");
-		addargs(&a, "%d", s->dst.port);
-	}
-	snprintf(target, sizeof(target), "%s%s%s",
-	    s->dst.user != NULL ? s->dst.user : "",
-	    s->dst.user != NULL ? "@" : "", s->dst.host);
-	/* -- so a target starting with '-' is never read as an option */
-	addargs(&a, "--");
-	addargs(&a, "%s", target);
-	addargs(&a, "true");
-	addargs(&a, "2>&1");
-	rc = hpn_run_capture(&a, buf, sizeof(buf), 30000);
-	freeargs(&a);
-
-	if (rc == 0)
-		return 0;			/* A can authenticate to C */
-
-	if (strstr(buf, "Permission denied") != NULL ||
-	    strstr(buf, "Too many authentication") != NULL) {
-		if (s->use_ambient) {
-			xasprintf(&m, "%s cannot authenticate to %s: your "
-			    "forwarded agent holds no key %s accepts - "
-			    "hpnssh-add the right key", s->src.host,
-			    s->dst.host, s->dst.host);
-		} else {
-			char portopt[16] = "";
-
-			/* a copy-pasteable fix: ssh-copy-id run on the source */
-			if (s->dst.port != -1)
-				snprintf(portopt, sizeof(portopt), "-p %d ",
-				    s->dst.port);
-			xasprintf(&m, "%s cannot authenticate to %s with its "
-			    "own key - run \"ssh-copy-id %s%s%s%s\" on %s, or "
-			    "re-run with -A to forward your agent",
-			    s->src.host, s->dst.host, portopt,
-			    s->dst.user != NULL ? s->dst.user : "",
-			    s->dst.user != NULL ? "@" : "", s->dst.host,
-			    s->src.host);
-		}
-	} else if (strstr(buf, "Host key verification failed") != NULL) {
-		xasprintf(&m, "%s could not verify %s's host key during "
-		    "preflight", s->src.host, s->dst.host);
-	} else {
-		xasprintf(&m, "%s could not reach %s for a preflight check "
-		    "(unreachable or timed out)", s->src.host, s->dst.host);
-	}
-	proto_emit_error(m);
-	free(m);
-	return -1;
-}
-
-static int
-run_session(struct launch_session *s)
+run_session(struct launch_session *session)
 {
 	const char *why = NULL;
-	char sd[512], dd[512], *m;
-	struct target_keyset set;
+	char *msg;
+	struct target_keyset keyset;
 	int r, ret = 1, knows, counts_known;
 
-	memset(&set, 0, sizeof(set));
+	memset(&keyset, 0, sizeof(keyset));
 
-	s->phase = LP_RESOLVE;
-	proto_emit_phase(phase_name(s->phase));
-	if (resolve_endpoint(s->src_arg, &s->src, &why) != 0 ||
-	    resolve_endpoint(s->dst_arg, &s->dst, &why) != 0) {
+	/* parse and check both endpoints before anything connects */
+	session->phase = LP_RESOLVE;
+	proto_emit_phase(phase_name(session->phase));
+	if (resolve_endpoint(session->src_arg, &session->src, &why) != 0 ||
+	    resolve_endpoint(session->dst_arg, &session->dst, &why) != 0) {
 		proto_emit_error(why);
 		goto fail;
 	}
-	endpoint_desc(&s->src, sd, sizeof(sd));
-	endpoint_desc(&s->dst, dd, sizeof(dd));
-	proto_emit_resolved(sd, dd, s->streams);
+	proto_emit_resolved(&session->src, &session->dst, session->streams);
 
-	/*
-	 * Stage 2 - host-key trust broker: only if the source does not already
-	 * trust the target.  Fetch the target's keys via the source, verify
-	 * (SSHFP or ssh-style prompt), and add them to the source's
-	 * known_hosts for the strict launch.
-	 */
-	knows = hpn3scp_source_knows_target(s);
+	/* The host-key broker runs only when the source does not already
+	 * trust the target. It fetches the target's keys through the source,
+	 * verifies them by SSHFP or an ssh-style prompt, and adds them to the
+	 * source's known_hosts, so the copy can check the key strictly. */
+	knows = hpn3scp_source_knows_target(session);
 	if (knows != 1) {
-		s->phase = LP_FETCH_TARGET_KEY;
-		proto_emit_phase(phase_name(s->phase));
-		if (hpn3scp_fetch_target_keys(s, &set) != 0) {
-			xasprintf(&m, "could not retrieve %s's host key via "
-			    "%s", s->dst.host, s->src.host);
-			proto_emit_error(m);
-			free(m);
+		session->phase = LP_FETCH_TARGET_KEY;
+		proto_emit_phase(phase_name(session->phase));
+		if (hpn3scp_fetch_target_keys(session, &keyset) != 0) {
+			xasprintf(&msg, "could not retrieve %s's host key via "
+			    "%s", session->dst.host, session->src.host);
+			proto_emit_error(msg);
+			free(msg);
 			goto fail;
 		}
-		s->phase = LP_CONFIRM_KEY;
-		proto_emit_phase(phase_name(s->phase));
-		if (hpn3scp_confirm_target(s, &set) != 0)
+		/* the user or SSHFP accepts the key, or the run stops here */
+		session->phase = LP_CONFIRM_KEY;
+		proto_emit_phase(phase_name(session->phase));
+		if (hpn3scp_confirm_target(session, &keyset) != 0)
 			goto fail;
-		s->phase = LP_PROVISION;
-		proto_emit_phase(phase_name(s->phase));
-		if (hpn3scp_provision_target(s, &set) != 0) {
-			xasprintf(&m, "could not add %s's host key to %s's "
-			    "known_hosts", s->dst.host, s->src.host);
-			proto_emit_error(m);
-			free(m);
+		/* write the accepted key into the source's known_hosts */
+		session->phase = LP_PROVISION;
+		proto_emit_phase(phase_name(session->phase));
+		if (hpn3scp_provision_target(session, &keyset) != 0) {
+			xasprintf(&msg, "could not add %s's host key to %s's "
+			    "known_hosts", session->dst.host,
+			    session->src.host);
+			proto_emit_error(msg);
+			free(msg);
 			goto fail;
 		}
 	} else {
 		debug("source already trusts %s; skipping host-key brokering",
-		    s->dst.host);
+		    session->dst.host);
 	}
 
-	/*
-	 * Stage 3 - credential.  SOURCE-KEY-ONLY by default: the source
-	 * authenticates to the target with its own key, so the user's key
-	 * never leaves B and no agent is ever forwarded.  -A opts into
-	 * forwarding the user's ambient agent (unconstrained - the agent
-	 * design forbids an intermediate host signing with a forwarded
-	 * constrained key; see hpn-launcher-design.md sec 15) for sources
-	 * that have no key of their own on the target.
-	 */
-	if (s->use_ambient && check_ambient_agent() != 0)
+	/* The credential. By default the source authenticates to the target
+	 * with its own key, so the user's key never leaves the launcher and
+	 * no agent is forwarded. -A forwards the ambient agent instead, for a
+	 * source with no key of its own on the target. The user can limit
+	 * the forwarded key to that one hop by loading it with ssh-add -h
+	 * SOURCE -h "SOURCE>TARGET", which OpenSSH 8.9 and later honour. */
+	if (session->use_ambient && check_ambient_agent() != 0)
 		goto fail;
 
-	/* preflight the A->C hop before any workers spawn */
-	s->phase = LP_AUTH_PREFLIGHT;
-	proto_emit_phase(phase_name(s->phase));
-	if (auth_preflight(s) != 0)
-		goto fail;			/* error emitted in preflight */
+	/* Start the copy on the source and relay its frames until it ends.
+	 * LAUNCH and MONITOR are emitted together for now. LAUNCH is kept so
+	 * a front end can later show the time from starting the source to
+	 * its first frame, which covers the source's login to the target. */
+	session->phase = LP_LAUNCH;
+	proto_emit_phase(phase_name(session->phase));
 
-	s->phase = LP_LAUNCH;
-	proto_emit_phase(phase_name(s->phase));
-
-	s->phase = LP_MONITOR;
-	proto_emit_phase(phase_name(s->phase));
-	r = do_launch(s);
-	emit_completion_summary(s);
+	session->phase = LP_MONITOR;
+	proto_emit_phase(phase_name(session->phase));
+	r = do_launch(session);
+	/* A run that ended without the source's END frame failed before it
+	 * reported a result, for example when the source could not log in to
+	 * the target. The source's own messages are on stderr, so the event
+	 * names only where it failed. A refused launch has reported already. */
+	if (r != 0 && !endinfo.got && r != HPN_EXIT_STRICT_ARGS &&
+	    r != HPN_LAUNCH_REFUSED) {
+		xasprintf(&msg, "the copy on %s failed before it reported a "
+		    "result (see its messages on stderr)", session->src.host);
+		proto_emit_error(msg);
+		free(msg);
+	}
+	emit_completion_summary(session);
 
 	/* a refused legacy source keeps its own exit status */
 	ret = 0;
@@ -716,8 +633,8 @@ run_session(struct launch_session *s)
 	 * as for a failure before the launch. */
 	counts_known = endinfo.got || r == HPN_EXIT_STRICT_ARGS ||
 	    r == HPN_LAUNCH_REFUSED;
-	s->phase = LP_COMPLETE;
-	proto_emit_phase(phase_name(s->phase));
+	session->phase = LP_COMPLETE;
+	proto_emit_phase(phase_name(session->phase));
 	proto_emit_done(r == 0, ret, counts_known, endinfo.files_done,
 	    failtally.verify, failtally.transfer);
 	goto out;
@@ -727,73 +644,90 @@ run_session(struct launch_session *s)
 	proto_emit_done(0, 1, 1, 0, 0, 0);
 	ret = 1;
  out:
-	hpn3scp_free_keyset(&set);
+	hpn3scp_free_keyset(&keyset);
 	return ret;
 }
 
+/* Parse the options and the two endpoints, choose the human or protocol
+ * rendering, and run the copy. Options the source's hpnscp needs are
+ * collected into hpnscp_extra and forwarded unchanged. */
 int
 main(int argc, char **argv)
 {
-	struct launch_session s;
+	struct launch_session session;
 	arglist hpnscp_extra;
-	char **av;
-	int ch, ac, i;
+	const char *errstr = NULL;
+	char **split_argv;
+	int ch, split_argc, i, ret;
 
-	/* logs to stderr; stdout is reserved for the control protocol */
+	/* logs go to stderr, because stdout carries the control protocol */
 	log_init(argv[0], SYSLOG_LEVEL_INFO, SYSLOG_FACILITY_USER, 1);
-	signal(SIGPIPE, SIG_IGN);	/* we write to child stdins (provision) */
+	/* we write to child stdins, so a child that exits must not kill us */
+	signal(SIGPIPE, SIG_IGN);
 
-	memset(&s, 0, sizeof(s));
-	s.streams = 1;
-	s.policy = DP_PROMPT;
-	s.child = -1;
+	memset(&session, 0, sizeof(session));
+	session.streams = 1;
+	session.policy = DP_PROMPT;
+	session.child = -1;
 	memset(&hpnscp_extra, 0, sizeof(hpnscp_extra));
-	s.hpnscp_extra = &hpnscp_extra;
+	session.hpnscp_extra = &hpnscp_extra;
 
-	/*
-	 * -o / -X / -Y / -r all just accumulate flags for the source hpnscp:
-	 * -o and -X forward one-for-one to hpnscp's own -o (ssh options) and
-	 * -X (sftp options); -r forwards -r (recursive); -Y is the escape
-	 * hatch for hpnscp's native switches - one quoted string, split with
-	 * quote/escape handling so dashes travel intact.
-	 */
+	/* Most options are forwarded to the source's hpnscp. -o, -X, -r, -V,
+	 * -Z, and -z become the same hpnscp options. -Y is the escape hatch
+	 * for any other hpnscp switch: one quoted string, split with quote
+	 * and escape handling so the dashes travel intact. */
 	while ((ch = getopt(argc, argv, "j:Arvo:X:Y:46VZz:")) != -1) {
 		switch (ch) {
 		case 'j':
-			s.streams = (int)strtol(optarg, NULL, 10);
-			if (s.streams < 1)
-				usage();
+			/* the same limit the source's hpnscp enforces */
+			session.streams = (int)strtonum(optarg, 1,
+			    SFTP_PARALLEL_MAX_WORKERS, &errstr);
+			if (errstr != NULL)
+				fatal("Number of parallel streams %s: %s",
+				    optarg, errstr);
 			break;
 		case '4':
-			s.addr_family = 4;
+			session.addr_family = 4;
 			break;
 		case '6':
-			s.addr_family = 6;
+			session.addr_family = 6;
 			break;
 		case 'A':
-			s.use_ambient = 1;
+			session.use_ambient = 1;
 			break;
 		case 'v':
-			s.verbosity++;
-			log_change_level(s.verbosity == 1 ? SYSLOG_LEVEL_DEBUG1 :
-			    s.verbosity == 2 ? SYSLOG_LEVEL_DEBUG2 :
-			    SYSLOG_LEVEL_DEBUG3);
+			/* each -v raises our own log level, up to DEBUG3 */
+			session.verbosity++;
+			if (session.verbosity == 1)
+				log_change_level(SYSLOG_LEVEL_DEBUG1);
+			else if (session.verbosity == 2)
+				log_change_level(SYSLOG_LEVEL_DEBUG2);
+			else
+				log_change_level(SYSLOG_LEVEL_DEBUG3);
 			break;
 		case 'r':
 			addargs(&hpnscp_extra, "-r");
 			break;
 		case 'V':
 			addargs(&hpnscp_extra, "-V");
-			s.verify_requested = 1;
-			s.verify_full = 1;
+			session.verify_requested = 1;
+			session.verify_full = 1;
 			break;
 		case 'Z':
 			addargs(&hpnscp_extra, "-Z");
-			s.verify_requested = 1;	/* resume implies verification */
+			/* resume implies verification */
+			session.verify_requested = 1;
 			break;
 		case 'z':
-			/* HPN: zstd on the source->target transfer; forward
-			 * the level to the source hpnscp verbatim. */
+			/* zstd on the source to target transfer. The level is
+			 * checked here, so a bad one fails before connecting,
+			 * and forwarded to the source's hpnscp. */
+			(void)strtonum(optarg, HPN_ZSTD_LEVEL_MIN,
+			    HPN_ZSTD_LEVEL_MAX, &errstr);
+			if (errstr != NULL)
+				fatal("Invalid -z zstd level \"%s\": %s "
+				    "(range %d-%d)", optarg, errstr,
+				    HPN_ZSTD_LEVEL_MIN, HPN_ZSTD_LEVEL_MAX);
 			addargs(&hpnscp_extra, "-z");
 			addargs(&hpnscp_extra, "%s", optarg);
 			break;
@@ -813,14 +747,15 @@ main(int argc, char **argv)
 			addargs(&hpnscp_extra, "%s", optarg);
 			break;
 		case 'Y':
-			if (argv_split(optarg, &ac, &av, 0) != 0) {
+			if (argv_split(optarg, &split_argc, &split_argv,
+			    0) != 0) {
 				fprintf(stderr, "hpn3scp: bad -Y value: %s\n",
 				    optarg);
 				exit(1);
 			}
-			for (i = 0; i < ac; i++)
-				addargs(&hpnscp_extra, "%s", av[i]);
-			argv_free(av, ac);
+			for (i = 0; i < split_argc; i++)
+				addargs(&hpnscp_extra, "%s", split_argv[i]);
+			argv_free(split_argv, split_argc);
 			break;
 		default:
 			usage();
@@ -831,17 +766,18 @@ main(int argc, char **argv)
 	if (argc != 2)
 		usage();
 
-	s.src_arg = argv[0];
-	s.dst_arg = argv[1];
+	session.src_arg = argv[0];
+	session.dst_arg = argv[1];
 
 	proto_init(stdout);
-	/* a terminal gets the human rendering; a pipe gets the EVENT protocol */
+	/* A terminal gets the human rendering, and a pipe gets the EVENT
+	 * protocol. */
 	if (isatty(STDOUT_FILENO))
 		proto_set_human(1);
 	/* -X TransferLog: open the log before any connection. The open is
 	 * the writability check. */
 	transferlog_begin();
-	i = run_session(&s);
+	ret = run_session(&session);
 	transferlog_close();
-	return i;
+	return ret;
 }

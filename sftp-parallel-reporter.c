@@ -1018,7 +1018,8 @@ reporter_publish_relay(struct sftp_parallel *fleet)
 	    (u_int)__atomic_load_n(&fleet->files_submitted,
 	        __ATOMIC_RELAXED),
 	    (u_int)__atomic_load_n(&fleet->files_total,
-	        __ATOMIC_RELAXED));
+	        __ATOMIC_RELAXED),
+	    __atomic_load_n(&fleet->files_total_known, __ATOMIC_RELAXED));
 }
 
 void *

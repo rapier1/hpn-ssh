@@ -71,7 +71,6 @@ struct scp_remote_meter {
 	/* built from local argv only, never remote bytes */
 	const char	*label;
 	int		 show;		/* scp would show a meter */
-	int		 meter_on;	/* the meter has started */
 };
 
 /* set once the argument list came from stdin, so the operands are
@@ -322,6 +321,19 @@ launch_args_debug(const char *label, arglist *cmd)
 	free(cmdline);
 }
 
+/* The variable that arms the source's status frames. The "log" value also
+ * asks the source for per-file FILEDONE frames, for the launcher's transfer
+ * log. An old source treats any value as plain arming and sends frames
+ * without the per-file stream, so the log degrades to header, failures,
+ * and footer. */
+static const char *
+launch_args_relay(void)
+{
+	if (transferlog_active())
+		return "HPN_ENABLE_REMOTE_PROGRESS=log";
+	return "HPN_ENABLE_REMOTE_PROGRESS=1";
+}
+
 /* Try stdin mode: only fixed text on the source's command line, and the
  * packed list on the session's stdin. Returns the run's status and fills
  * res, or returns HPN_LAUNCH_REFUSED when the list cannot be packed, in
@@ -357,7 +369,7 @@ launch_args_try_stdin(const struct hpn_launch *launch,
 	memset(&cmd, 0, sizeof(cmd));
 	launch_args_append(&cmd, launch->ssh_stdin);
 	addargs(&cmd, "env");
-	addargs(&cmd, "%s", launch->relay);
+	addargs(&cmd, "%s", launch_args_relay());
 	addargs(&cmd, "%s=1", HPN_ARGS_STDIN_ENV);
 	addargs(&cmd, "%s", launch->program);
 	launch_args_debug("stdin", &cmd);
@@ -426,7 +438,7 @@ launch_args_legacy(const struct hpn_launch *launch, int warn)
 	launch_args_append(&cmd, launch->ssh_legacy);
 	if (launch->legacy_relay) {
 		addargs(&cmd, "env");
-		addargs(&cmd, "%s", launch->relay);
+		addargs(&cmd, "%s", launch_args_relay());
 	}
 	addargs(&cmd, "%s", launch->program);
 	launch_args_append(&cmd, launch->args);
@@ -475,50 +487,31 @@ hpn_launch_args_run(const struct hpn_launch *launch)
  * frame arrival times. The meter starts on the first PROGRESS, and only
  * when scp would show one. */
 
-/* Start the meter on the first PROGRESS, then feed it every one. */
+/* Feed every PROGRESS frame to the meter when scp would show one. The
+ * first frame starts it. */
 static void
 scp_remote_progress(const struct hpns_progress *progress, void *ctx)
 {
 	struct scp_remote_meter *meter = ctx;
 
-	if (!meter->meter_on && meter->show) {
-		hpn_meter_relay_start(meter->label);
-		meter->meter_on = 1;
-	}
-	if (meter->meter_on)
-		hpn_meter_relay_sample(progress);
+	if (meter->show)
+		hpn_meter_relay_sample(meter->label, progress);
 }
 
 /* Close the meter on the source's final byte count. */
 static void
 scp_remote_end(const struct hpns_end *end, void *ctx)
 {
-	struct scp_remote_meter *meter = ctx;
-
-	if (meter->meter_on)
-		hpn_meter_relay_end(end->bytes_done);
-}
-
-/* Repaint the meter through a quiet spell. */
-static void
-scp_remote_tick(void *ctx)
-{
-	struct scp_remote_meter *meter = ctx;
-
-	if (meter->meter_on)
-		refresh_progress_meter(0);
+	(void)ctx;
+	hpn_meter_relay_end(end->bytes_done);
 }
 
 /* Drop the meter when the frame stream is abandoned. */
 static void
 scp_remote_degrade(void *ctx)
 {
-	struct scp_remote_meter *meter = ctx;
-
-	if (meter->meter_on) {
-		hpn_meter_relay_stop();
-		meter->meter_on = 0;
-	}
+	(void)ctx;
+	hpn_meter_relay_stop();
 	error("source is not sending status; the transfer continues without "
 	    "progress");
 }
@@ -657,7 +650,7 @@ hpn_launch_args_scp_remote(const struct hpn_scp_remote *remote)
 	hooks.on_progress = scp_remote_progress;
 	hooks.on_end = scp_remote_end;
 	hooks.on_filedone = scp_remote_filedone;
-	hooks.on_tick = scp_remote_tick;
+	hooks.on_tick = hpn_meter_relay_tick;
 	hooks.on_degrade = scp_remote_degrade;
 	hooks.passthrough_fd = STDOUT_FILENO;
 	hooks.ctx = &meter;
@@ -672,13 +665,6 @@ hpn_launch_args_scp_remote(const struct hpn_scp_remote *remote)
 	/* Our own hpnssh rewrites the scp word behind the env prefix to
 	 * hpnscp (clientloop.c). */
 	launch.program = "scp";
-	/* The "log" value additionally asks the source for per-file FILEDONE
-	 * frames. Old sources treat any value as plain arming, frames without
-	 * the per-file stream, and the log degrades to header, failures, and
-	 * footer. */
-	launch.relay = "HPN_ENABLE_REMOTE_PROGRESS=1";
-	if (transferlog_active())
-		launch.relay = "HPN_ENABLE_REMOTE_PROGRESS=log";
 	/* A legacy source keeps the relay only when this side wants a meter
 	 * or a log. Stdin mode always arms it, because its HELLO tells a new
 	 * source from a legacy one. env(1), not a VAR=val prefix, so
@@ -696,12 +682,8 @@ hpn_launch_args_scp_remote(const struct hpn_scp_remote *remote)
 	/* stdin mode first, and the legacy line only for a source that
 	 * cannot read the list */
 	r = hpn_launch_args_run(&launch);
-	/* Repaint the meter at its final state, which the last tick may have
-	 * missed, then close it so the next operand's meter starts clean. */
-	if (meter.meter_on) {
-		refresh_progress_meter(1);
-		hpn_meter_relay_stop();
-	}
+	/* close the meter so the next operand's meter starts clean */
+	hpn_meter_relay_finish();
 	free(label);
 	freeargs(&ssh_stdin);
 	freeargs(&ssh_legacy);

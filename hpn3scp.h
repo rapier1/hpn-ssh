@@ -21,8 +21,8 @@
  *
  * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.  hpn3scp
  * is the B-side orchestrator for direct A->C ("third party") transfers: it
- * drives the shipped hpnscp -R transport, brokers the target host key, runs
- * an A->C auth preflight, and relays live status.  See hpn-launcher-design.md
+ * drives the shipped hpnscp -R transport, brokers the target host key, and
+ * relays live status.  See hpn-launcher-design.md
  * for the full design (this is the Stage 0 skeleton: phase enum + session
  * state + the control protocol; the phase handlers land in later stages).
  */
@@ -37,15 +37,12 @@ struct arglist;			/* misc.h; only pointers needed here */
 /* Phase state machine (hpn-launcher-design.md sec 7). */
 enum launch_phase {
 	LP_RESOLVE,		/* parse the endpoint specs */
-	LP_REACH_SOURCE,	/* open the B->A control link */
 	LP_FETCH_TARGET_KEY,	/* keyscan C from A */
 	LP_CONFIRM_KEY,		/* present fingerprint; accept/verify */
 	LP_PROVISION,		/* write transfer-scoped known_hosts on A */
-	LP_AUTH_PREFLIGHT,	/* arrange + test the A->C credential */
 	LP_LAUNCH,		/* spawn hpnscp -R via the shared runner */
 	LP_MONITOR,		/* consume status frames -> progress events */
-	LP_COMPLETE,		/* reap, clean up, report */
-	LP_FAILED
+	LP_COMPLETE		/* reap, clean up, report */
 };
 
 /*
@@ -60,8 +57,8 @@ enum decision_policy {
 
 /* One transfer endpoint, parsed from an scp:// URI or host:path (Stage 1). */
 struct endpoint {
-	char	*user;		/* validated (okname) */
-	char	*host;		/* validated (valid_domain) */
+	char	*user;		/* checked by valid_user() */
+	char	*host;		/* checked by valid_host() */
 	int	 port;		/* -1 = default */
 	char	*path;		/* home-relative vs absolute preserved */
 };
@@ -88,7 +85,10 @@ struct launch_session {
 
 /* build the ssh command that reaches the source A (defined in hpn3scp.c);
  * with_n adds -n, with_agent adds -A.  Shared with the host-key broker. */
-void		 ssh_base_args(struct launch_session *s, struct arglist *a,
-		    int with_n, int with_agent);
+void		 ssh_base_args(const struct launch_session *session,
+		    struct arglist *args, int with_n, int with_agent);
+/* Add -4 or -6 for the user's address family. Shared with the broker. */
+void		 add_addr_family_arg(const struct launch_session *session,
+		    struct arglist *args);
 
 #endif /* HPN3SCP_H */

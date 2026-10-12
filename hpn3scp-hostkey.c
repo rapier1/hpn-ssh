@@ -131,10 +131,8 @@ hpn3scp_fetch_target_keys(struct launch_session *s, struct target_keyset *set)
 	/* the source keyscans the target: ssh-keyscan -T 10 [-p P] -- C */
 	ssh_base_args(s, &a, 0, 0);
 	addargs(&a, "ssh-keyscan");
-	if (s->addr_family == 4)		/* the A->C keyscan hop */
-		addargs(&a, "-4");
-	else if (s->addr_family == 6)
-		addargs(&a, "-6");
+	/* the source to target keyscan hop */
+	add_addr_family_arg(s, &a);
 	addargs(&a, "-T");
 	addargs(&a, "10");
 	if (s->dst.port != -1) {

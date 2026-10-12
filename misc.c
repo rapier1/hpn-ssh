@@ -1179,6 +1179,7 @@ parse_uri(const char *scheme, const char *uri, char **userp, char **hostp,
 	char *user = NULL, *host = NULL, *path = NULL;
 	int port = -1, ret = -1;
 	size_t len;
+	struct in6_addr addr6;
 
 	len = strlen(scheme);
 	if (strncmp(uri, scheme, len) != 0 || strncmp(uri + len, "://", 3) != 0)
@@ -1219,7 +1220,9 @@ parse_uri(const char *scheme, const char *uri, char **userp, char **hostp,
 	if ((cp = hpdelim2(&tmp, &ch)) == NULL || *cp == '\0')
 		goto out;
 	host = xstrdup(cleanhostname(cp));
-	if (!valid_domain(host, 0, NULL))
+	/* HPN: RFC 3986 also allows an IPv6 address in brackets */
+	if (!valid_domain(host, 0, NULL) &&
+	    (*cp != '[' || inet_pton(AF_INET6, host, &addr6) != 1))
 		goto out;
 
 	if (tmp != NULL && *tmp != '\0') {

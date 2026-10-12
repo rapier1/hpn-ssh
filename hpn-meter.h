@@ -74,7 +74,8 @@ enum hpn_meter_domain {
 struct meter_view {
 	const char	*label;		/* painted on the TTY, dropped on the wire */
 	off_t		 cur;		/* this meter's position */
-	off_t		 total;		/* this meter's target, 0 if unknown */
+	off_t		 total;		/* this meter's target */
+	int		 total_known;	/* total is real, even when 0 */
 	long long	 rate;		/* smoothed bytes/sec */
 	/* the instantaneous figure for display, where each fill picks its own
 	 * peak scheme */
@@ -151,13 +152,19 @@ void	hpn_meter_bind_display(struct hpn_meter *, const void *, pthread_t);
 /* The relay source: a meter over hpns_progress frames from a remote
  * transfer, which scp -R and hpn3scp consume. No local counter exists. The
  * rate and ETA ride in the frames, because deriving them from frames that
- * arrive about once a second aliases against the local clock. Start arms
- * the display without an initial paint, since nothing has arrived to paint.
- * End paints the completion line, and stop closes the display session. */
-void	hpn_meter_relay_start(const char *);
-void	hpn_meter_relay_sample(const struct hpns_progress *);
+ * arrive about once a second aliases against the local clock. The first
+ * sample starts the meter under its label, without an initial paint, since
+ * nothing has arrived to paint before it. End paints the completion line,
+ * tick repaints through a quiet spell, and stop closes the display
+ * session. Finish repaints the final state and then stops. Apart from the
+ * first sample, which starts the meter, each call does nothing while the
+ * relay meter is not current, so a consumer keeps no meter state of its
+ * own. */
+void	hpn_meter_relay_sample(const char *, const struct hpns_progress *);
 void	hpn_meter_relay_end(uint64_t);
+void	hpn_meter_relay_tick(void *);
 void	hpn_meter_relay_stop(void);
+void	hpn_meter_relay_finish(void);
 
 /* Display routing used by progressmeter.c: whether a meter is current,
  * whether this thread may fill it, and the fill-and-dispatch on the shared

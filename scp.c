@@ -1519,7 +1519,8 @@ scp_parallel_finish(struct sftp_conn *conn)
 		 * walker's tally directly before the meter (and END) are read. */
 		hpn_pm_set_files(
 		    sftp_parallel_files_submitted(parallel_orch),
-		    sftp_parallel_files_total(parallel_orch));
+		    sftp_parallel_files_total(parallel_orch),
+		    sftp_parallel_files_total_known(parallel_orch));
 		sftp_parallel_progress_stop(parallel_orch);
 		sftp_parallel_get_stats(parallel_orch, &pstats);
 		if (showprogress && pstats.bytes_wired_aggregate > 0) {

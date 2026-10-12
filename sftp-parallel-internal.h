@@ -777,6 +777,8 @@ struct sftp_parallel {
 	 * read by the reporter. */
 	uint64_t                    files_submitted;
 	uint64_t                    files_total;
+	/* files_total was set by a scan, so even 0 is real */
+	int                         files_total_known;
 
 	/* enum sftp_walker_phase; relaxed atomic, set by the walker via
 	 * sftp_parallel_set_walker_phase, read by the reporter FLEETSAMPLE. */

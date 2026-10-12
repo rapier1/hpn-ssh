@@ -56,7 +56,8 @@ static pthread_mutex_t frames_mu = PTHREAD_MUTEX_INITIALIZER;
 static double frame_last_emit;		/* rate limiter timestamp */
 static off_t frames_acc_bytes;		/* bytes from completed meters */
 static uint32_t frames_files_done;	/* from meters, or set externally */
-static uint32_t frames_files_total;	/* external, 0 = unknown */
+static uint32_t frames_files_total;	/* external, see the flag below */
+static int frames_files_known;		/* frames_files_total is real */
 static int frames_files_ext;		/* setter overrides meter counts */
 /* How many files the current meter represents: 1 for a file, N for a
  * bundle, and 0 for a meter that is not a file (verify, resume check). */
@@ -136,7 +137,9 @@ emit_progress(off_t cur_pos, off_t end_pos, long long bytes_per_second,
 	if (flags & (HPNS_F_VERIFY | HPNS_F_RESUME))
 		acc = 0;
 	progress.bytes_done = (uint64_t)(acc + cur_pos);
-	if (end_pos > 0)
+	/* the caller says whether end_pos is real, so an empty file's 0 is
+	 * sent as a known total */
+	if (extra_flags & HPNS_F_TOTAL_KNOWN)
 		progress.bytes_total = (uint64_t)(acc + end_pos);
 	if (bytes_per_second > 0)
 		progress.rate_bps = (uint64_t)bytes_per_second;
@@ -150,6 +153,8 @@ emit_progress(off_t cur_pos, off_t end_pos, long long bytes_per_second,
 		progress.eta_sec = (uint32_t)(bytes_left / bytes_per_second);
 	progress.files_done = frames_files_done;
 	progress.files_total = frames_files_total;
+	if (frames_files_known)
+		flags |= HPNS_F_FILES_KNOWN;
 	progress.workers_active = frames_workers_active;
 	progress.workers_stalled = frames_workers_stalled;
 	progress.flags = flags | extra_flags;
@@ -173,7 +178,8 @@ hpn_pm_emit_view(const struct meter_view *view, int force)
 	frames_rate_inst = 0;
 	if (!view->done && view->elapsed >= 0.001)
 		frames_rate_inst = (long long)(view->delta / view->elapsed);
-	emit_progress(view->cur, view->total, view->rate, force, 0);
+	emit_progress(view->cur, view->total, view->rate, force,
+	    view->total_known ? HPNS_F_TOTAL_KNOWN : 0);
 	pthread_mutex_unlock(&frames_mu);
 }
 
@@ -214,7 +220,9 @@ hpn_pm_meter_done(off_t cur_pos, off_t end_pos, long long bytes_per_second)
 		if (frames_meter_files > 0)
 			boundary = HPNS_F_BOUNDARY;
 	}
-	emit_progress(cur_pos, end_pos, bytes_per_second, 1, boundary);
+	/* a finished meter's end position is its real total */
+	emit_progress(cur_pos, end_pos, bytes_per_second, 1,
+	    boundary | HPNS_F_TOTAL_KNOWN);
 	/* Only transfer meters feed the running total. Verify and resume-check
 	 * bytes are hash bytes and must not inflate it or the END frame. */
 	if (!(frames_flags & (HPNS_F_VERIFY | HPNS_F_RESUME)))
@@ -333,14 +341,16 @@ hpn_pm_set_phase(u_int flag, int on)
 
 /* Store external file counts, which override the serial count of one
  * file per meter. The parallel reporter pushes them every tick, and scp
- * pushes the final tally once more before the END frame. */
+ * pushes the final tally once more before the END frame. total_known says
+ * whether total is real, because a scan that found no files gives 0 too. */
 void
-hpn_pm_set_files(u_int done, u_int total)
+hpn_pm_set_files(u_int done, u_int total, int total_known)
 {
 	pthread_mutex_lock(&frames_mu);
 	frames_files_ext = 1;
 	frames_files_done = (uint32_t)done;
 	frames_files_total = (uint32_t)total;
+	frames_files_known = total_known;
 	pthread_mutex_unlock(&frames_mu);
 }
 

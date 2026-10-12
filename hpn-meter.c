@@ -61,7 +61,8 @@ static struct hpn_meter serial_meter;
  * and hpn3scp) use this state, so local meters are unaffected. */
 static struct {
 	uint64_t bytes_done;	/* cumulative, from the last frame */
-	uint64_t bytes_total;	/* 0 until the source knows it */
+	uint64_t bytes_total;	/* valid once total_known is set */
+	int	 total_known;	/* a frame carried HPNS_F_TOTAL_KNOWN */
 	uint64_t rate;		/* source-smoothed */
 	uint64_t rate_inst;	/* source last-interval */
 	uint64_t rate_inst_max;	/* peak inst within the current phase */
@@ -97,6 +98,9 @@ static struct {
 /* The core requires a counter, but the relay fill never reads it. */
 static off_t relay_ctr;
 static struct hpn_meter relay_meter;	/* core-owned, like serial_meter */
+/* A relay start was tried since the last stop. A start that fails, because
+ * another meter is current, is then not retried on every frame. */
+static int relay_start_tried;
 
 /* The serial meter's storage, owned here so it can never dangle into a
  * caller's stack frame. See hpn-meter.h. */
@@ -380,6 +384,7 @@ hpn_meter_refresh_current(int force_update)
 	view.label = meter->label;
 	view.cur = meter->cur_pos;
 	view.total = meter->total;
+	view.total_known = !total_unknown;
 	if (total_unknown)
 		view.percent = 0;
 	/* if meter->total is 0 then we risk a div by 0 and it's also a
@@ -476,9 +481,11 @@ relay_fill(struct hpn_meter *meter, struct meter_view *view)
 		total = relay.bytes_total - base;
 	view->cur = (off_t)cur;
 	view->total = (off_t)total;
-	/* an unknown (0) total reads 0%, so the relay never claims 100%
-	 * before the source has reported a size */
-	if (relay.done || (total > 0 && cur >= total))
+	view->total_known = relay.total_known || relay.done;
+	/* An unknown total reads 0%, so the relay never claims 100% before
+	 * the source has reported a size. A known total of 0 is an empty
+	 * copy, complete at once. */
+	if (relay.done || (relay.total_known && cur >= total))
 		view->percent = 100;
 	else if (total > 0)
 		view->percent = (int)(cur * 100 / total);
@@ -512,8 +519,8 @@ relay_fill(struct hpn_meter *meter, struct meter_view *view)
  * First, there is no initial paint, because nothing has arrived to paint
  * until the first frame. Second, its counter is a placeholder that exists
  * only because the core requires one. */
-void
-hpn_meter_relay_start(const char *label)
+static void
+relay_start(const char *label)
 {
 	relay_ctr = 0;
 	/* AGGREGATE, because the relay stands for the whole remote run rather
@@ -542,17 +549,22 @@ relay_phase_reset(double now)
 }
 
 /* Take one PROGRESS frame from the remote source. The frame consumers
- * (scp -R and hpn3scp) call this for every frame, and it does nothing
- * unless the relay meter is current. First, it follows the source's phase
- * flags, restarting the per-file tracking when the resume check ends or
- * verify begins. Second, it stores the frame's telemetry for the fill.
- * Third, at a file boundary it paints and keeps a completed-file row.
- * It then asks for an ordinary repaint, which the alarm gates. */
+ * (scp -R and hpn3scp) call this for every frame. The first frame starts
+ * the meter under label. Otherwise it does nothing while the relay meter
+ * is not current. First, it follows the source's phase flags, restarting the
+ * per-file tracking when the resume check ends or verify begins. Second,
+ * it stores the frame's telemetry for the fill. Third, at a file boundary
+ * it paints and keeps a completed-file row. It then asks for an ordinary
+ * repaint, which the alarm gates. */
 void
-hpn_meter_relay_sample(const struct hpns_progress *frame)
+hpn_meter_relay_sample(const char *label, const struct hpns_progress *frame)
 {
 	double now, span;
 
+	if (!relay_start_tried) {
+		relay_start_tried = 1;
+		relay_start(label);
+	}
 	if (current_meter != &relay_meter)
 		return;
 	now = monotime_double();
@@ -573,8 +585,11 @@ hpn_meter_relay_sample(const struct hpns_progress *frame)
 		relay_phase_reset(now);
 	}
 	relay.bytes_done = frame->bytes_done;
-	if (frame->bytes_total > 0)
+	/* the flag, not a nonzero value, says the source knows the total */
+	if (frame->flags & HPNS_F_TOTAL_KNOWN) {
 		relay.bytes_total = frame->bytes_total;
+		relay.total_known = 1;
+	}
 	relay.rate = frame->rate_bps;
 	relay.rate_inst = frame->rate_inst_bps;
 	if (frame->rate_inst_bps > relay.rate_inst_max)
@@ -647,15 +662,37 @@ hpn_meter_relay_end(uint64_t bytes_done)
 	refresh_progress_meter(1);
 }
 
+/* Repaint the relay meter through a quiet spell. It has the frame
+ * runner's tick hook signature, so a consumer installs it directly. */
+void
+hpn_meter_relay_tick(void *ctx)
+{
+	(void)ctx;
+	if (current_meter == &relay_meter)
+		refresh_progress_meter(0);
+}
+
 /* Close the relay meter. Any completion line was painted by
  * hpn_meter_relay_end. A close without an end, from a garbled stream,
- * paints nothing, so a broken source never shows a fake completion. */
+ * paints nothing, so a broken source never shows a fake completion. The
+ * next frame after a close starts a fresh meter. */
 void
 hpn_meter_relay_stop(void)
 {
+	relay_start_tried = 0;
 	if (current_meter != &relay_meter)
 		return;
 	pm_display_end_relay();
 	current_meter = NULL;
 	relay_meter.active = 0;
+}
+
+/* Repaint the relay meter at its final state, which the last tick may
+ * have missed, then close it. A consumer calls this when its run ends. */
+void
+hpn_meter_relay_finish(void)
+{
+	if (current_meter == &relay_meter)
+		refresh_progress_meter(1);
+	hpn_meter_relay_stop();
 }

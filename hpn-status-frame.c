@@ -370,6 +370,19 @@ hpns_fd_status_word(u_char status)
 	return "unknown";
 }
 
+/* The word for a FILEFAIL reason, with the flag bit ignored, so the EVENT
+ * stream never shows the frame's bit layout. A reason with no word reads
+ * "unknown". */
+const char *
+hpns_ff_kind_word(u_char kind)
+{
+	switch (kind & HPNS_FF_KINDMASK) {
+	case HPNS_FF_TRANSFER:	return "transfer";
+	case HPNS_FF_VERIFY:	return "verify";
+	}
+	return "unknown";
+}
+
 /* The final status of a file whose verify phase ran. failed covers a
  * mismatch that could not be repaired and a file that could not be
  * verified. repaired means a mismatch was found and fixed. Every verify

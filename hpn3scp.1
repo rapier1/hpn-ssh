@@ -95,8 +95,7 @@ The options are as follows:
 Use IPv4 addresses only.
 The address family applies to every connection
 .Nm
-makes: the target host-key scan, the authentication preflight, and the
-transfer itself.
+makes: the target host-key scan and the transfer itself.
 .It Fl 6
 Use IPv6 addresses only.
 .It Fl A
@@ -213,13 +212,11 @@ The source authenticates to the target with a key of its
 .Pa authorized_keys .
 Your launcher key never leaves the launcher, and no agent is forwarded.
 This is the most contained arrangement and requires no extra flags.
-Before any data streams start,
-.Nm
-runs a preflight check of the source-to-target login; if it fails,
-.Nm
-stops immediately and prints the fix \(en typically a single
+If the source cannot log in to the target, the transfer stops before any
+data moves, and the source's own error explains why.
+The usual fix is a single
 .Xr ssh-copy-id 1
-run on the source \(en rather than letting the workers fail one by one.
+run on the source.
 .It agent forwarding Pq Fl A
 If the source has no key of its own on the target, but you can reach the
 target yourself,
@@ -232,6 +229,23 @@ This is convenient but less contained: while the transfer runs, a
 compromised source could use the forwarded keys to authenticate as you
 to any host that accepts them.
 It is therefore an explicit opt-in, never the default.
+.Pp
+To limit that exposure, load the key with destination constraints
+before the transfer, so the forwarded key can be used only from the
+source to the target:
+.Bd -literal -offset indent
+$ hpnssh-add -h source -h 'source>target' ~/.ssh/id_ed25519
+.Ed
+.Pp
+The agent then refuses any other use of the key on the source.
+This needs OpenSSH 8.9 or later, or an HPN-SSH release based on it, for
+the agent on the launcher, the client on the source, and the server on
+the target.
+Both hosts' keys must already be in your
+.Pa known_hosts ,
+because the constraints name hosts by their host keys.
+See
+.Xr hpnssh-add 1 .
 .El
 .Pp
 In both cases the launcher authenticates to the source using your normal
@@ -288,16 +302,26 @@ instead emits a line-structured event protocol on standard output,
 intended for a driving front end.
 The protocol is experimental and may change as the needs of a graphical
 front end require.
+A value the engine reports but does not know yet is the word
+.Ql unknown
+in place of a number, for example
+.Ql eta=unknown .
+A key that is missing is one this version of
+.Nm
+does not report.
+A setting the user did not give, such as a port, is the word
+.Ql default ,
+meaning ssh's own default applies.
 The final
 .Ql done
-event carries the
+event's
 .Ql files ,
 .Ql verify_failed ,
 and
 .Ql transfer_failed
-counts only when they are known.
-They are absent when the source ran but reported no counts, as an older
-source does.
+counts are
+.Ql unknown
+when the source ran but reported no counts, as an older source does.
 .Sh EXIT STATUS
 .Ex -std
 .Pp

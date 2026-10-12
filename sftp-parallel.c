@@ -939,6 +939,7 @@ sftp_parallel_set_file_total(struct sftp_parallel *fleet, uint64_t total)
 	if (fleet == NULL)
 		return;
 	__atomic_store_n(&fleet->files_total, total, __ATOMIC_RELAXED);
+	__atomic_store_n(&fleet->files_total_known, 1, __ATOMIC_RELAXED);
 }
 
 /* How many files the walker has submitted so far, for the END frame the
@@ -969,6 +970,15 @@ sftp_parallel_files_total(struct sftp_parallel *fleet)
 		return 0;
 	return (u_int)__atomic_load_n(&fleet->files_total,
 	    __ATOMIC_RELAXED);
+}
+
+/* Whether a scan set the file total, which tells a real 0 from no count */
+int
+sftp_parallel_files_total_known(struct sftp_parallel *fleet)
+{
+	if (fleet == NULL)
+		return 0;
+	return __atomic_load_n(&fleet->files_total_known, __ATOMIC_RELAXED);
 }
 
 /* Was the run aborted (user interrupt, control-session loss, fatal

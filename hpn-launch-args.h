@@ -58,7 +58,6 @@ struct hpn_launch {
 	struct arglist	*ssh_stdin;	/* for stdin mode, without -n */
 	struct arglist	*ssh_legacy;	/* for legacy mode, with -n */
 	const char	*program;	/* the remote program word */
-	const char	*relay;		/* HPN_ENABLE_REMOTE_PROGRESS=VALUE */
 	int		 legacy_relay;	/* arm the relay in legacy mode too */
 	const struct arglist *args;	/* the program's arguments */
 	const char	*source_host;	/* named in messages */

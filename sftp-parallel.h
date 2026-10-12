@@ -504,6 +504,7 @@ void sftp_parallel_set_file_total(struct sftp_parallel *fleet, uint64_t total);
 /* Walker-authoritative per-file counts (for a final END-frame publish). */
 u_int sftp_parallel_files_submitted(struct sftp_parallel *fleet);
 u_int sftp_parallel_files_total(struct sftp_parallel *fleet);
+int sftp_parallel_files_total_known(struct sftp_parallel *fleet);
 
 /* Non-zero after wait if the run was aborted (interrupt / control-session
  * loss / fatal error) - callers must not report success. */
