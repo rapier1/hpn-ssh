@@ -16,90 +16,95 @@
  *
  */
 
-/*
- * hpn3scp-hostkey.h - target host-key trust broker (Stage 2).
+/* hpn3scp-hostkey.h - making sure the source host trusts the target's
+ * host key before hpn3scp launches the copy.
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.  The
- * source (A) is asked to ssh-keyscan the target (C); every byte it returns
- * is untrusted input, so the line parser here is strict and is the fuzz
- * target (hpn-launcher-design.md sec 9/12).  Fingerprints are computed by
- * us from the parsed key, never taken from the source's text; SSHFP is the
- * independent DNS channel that turns blind TOFU into verification.
+ * This is server verification, the check ssh makes that a server is the
+ * host it claims to be. It is not host-based authentication, and nothing
+ * here logs a user in. The copy always runs with StrictHostKeyChecking=yes,
+ * so the source host's hpnssh makes the final check, and these functions
+ * only add a verified key to its known_hosts.
  *
- * Stage 2 status: fetch + parse + fingerprint + SSHFP classification are
- * built here.  The accept decision (ssh-style prompt), provisioning into the
- * source's ~/.ssh/known_hosts, and gating the launch are wired separately.
- */
+ * The source host scans the target, and everything that scan returns is
+ * untrusted. The parser is strict and fuzzed, fingerprints are computed
+ * here, and no line from the source host is ever written back. A key is
+ * accepted only on evidence from another path: a DNSSEC-signed SSHFP
+ * record, the launcher's own known_hosts, or the user's confirmation of
+ * the one key the copy would negotiate. Evidence that contradicts a key
+ * stops the run. */
 
 #ifndef HPN3SCP_HOSTKEY_H
 #define HPN3SCP_HOSTKEY_H
 
-#include <sys/types.h>
-
+/* Defined in sshkey.h and hpn3scp.h. Only pointers are needed here. */
 struct sshkey;
 struct launch_session;
 
-/* SSHFP classification of a fetched key against C's DNS records */
+/* What the target's SSHFP records in DNS say about a fetched key */
 enum sshfp_status {
-	SSHFP_ABSENT,		/* no usable SSHFP records / lookup failed */
-	SSHFP_MATCH,		/* matched, but NOT DNSSEC-authenticated */
-	SSHFP_SECURE,		/* matched AND DNSSEC-authenticated */
-	SSHFP_MISMATCH		/* records exist and disagree - treat hostile */
+	SSHFP_ABSENT,		/* no records, or the lookup failed */
+	SSHFP_MATCH,		/* matched, without DNSSEC */
+	SSHFP_SECURE,		/* matched, with DNSSEC */
+	SSHFP_MISMATCH		/* records exist and disagree: hostile */
 };
 
-/* one target host key plus what we independently determined about it */
+/* One of the target's host keys, with what hpn3scp found out about it */
 struct target_key {
-	struct sshkey	*key;		/* parsed, validated (owned) */
-	char		*fingerprint;	/* our SHA256:... (owned) */
-	enum sshfp_status sshfp;
+	struct sshkey	*key;		/* parsed and checked, owned */
+	char		*fingerprint;	/* computed here, owned */
+	enum sshfp_status sshfp;	/* its SSHFP result */
+	int		 accepted;	/* verified or confirmed */
 };
 
+/* Every key a keyscan returned for the target */
 struct target_keyset {
 	struct target_key *keys;
-	size_t		 nkeys;
+	int		 nkeys;
 };
 
-/*
- * Parse one ssh-keyscan output line into *keyp.  Returns 0 on a valid host
- * key (caller owns *keyp), 1 to skip the line (blank or comment), -1 to
- * reject it (a known_hosts marker such as @cert-authority, or a malformed
- * key - either is an abort signal).  Pure text -> sshkey: the remote-facing
- * parser and the fuzz target.
- */
-int	hpn3scp_parse_keyscan_line(const char *line, struct sshkey **keyp);
+/* Parse one keyscan output line into *keyp. Returns 0 for a plain host
+ * key, which the caller then owns, 1 to skip a blank or comment line, or
+ * -1 to reject the line: a known_hosts marker, a certificate, or a
+ * malformed key. A rejected line should fail the whole scan. This parses
+ * the source host's untrusted text and is the fuzz target. */
+int	hpn3scp_parse_keyscan_line(const char *, struct sshkey **);
 
-/* our own SHA256 fingerprint string for key (caller frees) */
-char	*hpn3scp_key_fp(const struct sshkey *key);
+/* hpn3scp's own SHA256 fingerprint of a key, which the caller frees */
+char	*hpn3scp_key_fp(const struct sshkey *);
 
-/* classify key against host's DNS SSHFP records */
-enum sshfp_status hpn3scp_sshfp_check(const char *host,
-	    const struct sshkey *key);
-const char *hpn3scp_sshfp_str(enum sshfp_status s);
+/* What the host's SSHFP records in DNS, looked up from the launcher, say
+ * about a key */
+enum sshfp_status hpn3scp_sshfp_check(const char *, const struct sshkey *);
 
-/*
- * Ask the source to ssh-keyscan the target, then parse + fingerprint +
- * SSHFP-classify every key into *set.  Returns 0 with >=1 key on success;
- * -1 on keyscan failure, a rejected line, or no keys.  Caller frees with
- * hpn3scp_free_keyset().
- */
-int	hpn3scp_fetch_target_keys(struct launch_session *s,
-	    struct target_keyset *set);
-void	hpn3scp_free_keyset(struct target_keyset *set);
+/* Ask the source host to keyscan the target's port, then parse,
+ * fingerprint, and SSHFP-check every key into *keyset. Returns 0 with at
+ * least one key, 1 when nothing on the port responded, so the caller may
+ * try another, or -1 when the output had a rejected line. The caller
+ * frees the set with hpn3scp_free_keyset(). */
+int	hpn3scp_fetch_target_keys(const struct launch_session *,
+	    struct target_keyset *);
 
-/* Does the source already trust the target (in its known_hosts)?  1 = yes. */
-int	hpn3scp_source_knows_target(struct launch_session *s);
+/* Free a key set and leave it empty, so freeing it again is harmless */
+void	hpn3scp_free_keyset(struct target_keyset *);
 
-/*
- * Verification ladder for a freshly fetched keyset: a DNSSEC-secure SSHFP
- * match auto-accepts; a SSHFP MISMATCH aborts; otherwise an ssh-style
- * interactive prompt (yes/no/[fingerprint]) on a terminal, or fail-closed
- * when non-interactive.  Returns 0 to accept, -1 to reject/abort.
- */
-int	hpn3scp_confirm_target(struct launch_session *s,
-	    struct target_keyset *set);
+/* Whether a known_hosts file the source host's hpnssh uses already holds a
+ * key for the target on its current port: 1 if so, else 0, which only
+ * means the key is fetched and confirmed again. */
+int	hpn3scp_source_knows_target(const struct launch_session *);
 
-/* Append the accepted keys to the source's ~/.ssh/known_hosts.  0 on success. */
-int	hpn3scp_provision_target(struct launch_session *s,
-	    struct target_keyset *set);
+/* Decide which fetched keys the source host may trust. An SSHFP mismatch,
+ * or a different or revoked key in the launcher's known_hosts, aborts.
+ * Keys that a DNSSEC-signed SSHFP record or the launcher's known_hosts
+ * vouch for are accepted. Otherwise the user confirms the one key the copy
+ * would negotiate on a terminal, and with no terminal the run stops.
+ * Returns 0 with the accepted keys marked, or -1 with an error emitted. */
+int	hpn3scp_confirm_target(const struct launch_session *,
+	    struct target_keyset *);
+
+/* Append the accepted keys to the first known_hosts file the source
+ * host's hpnssh uses, formatted and hashed as hpnssh would write them.
+ * Returns 0, or -1. */
+int	hpn3scp_provision_target(const struct launch_session *,
+	    struct target_keyset *);
 
 #endif /* HPN3SCP_HOSTKEY_H */

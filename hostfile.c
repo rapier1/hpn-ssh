@@ -55,6 +55,7 @@
 #include "match.h"
 #include "sshkey.h"
 #include "hostfile.h"
+#include "hostfile-internal.h"
 #include "log.h"
 #include "misc.h"
 #include "pathnames.h"
@@ -433,7 +434,7 @@ lookup_marker_in_hostkeys(struct hostkeys *hostkeys, int want_marker)
 	return 0;
 }
 
-static int
+int
 format_host_entry(struct sshbuf *entry, const char *host, const char *ip,
     const struct sshkey *key, int store_hash)
 {

@@ -529,6 +529,56 @@ check_ambient_agent(void)
 	return 0;
 }
 
+/* Make sure the source trusts the target's host key on session->dst.port.
+ * Either it already does, or the key is fetched, confirmed by SSHFP or the
+ * user, and added to the source's known_hosts. Returns 0, 1 when nothing
+ * on the port responded and may_fall_back allows another port, or -1 with
+ * an error emitted. */
+static int
+trust_target_port(struct launch_session *session,
+    struct target_keyset *keyset, int may_fall_back)
+{
+	char *msg;
+	int r;
+
+	/* the source host already trusts the key, so nothing is needed */
+	if (hpn3scp_source_knows_target(session) == 1) {
+		debug("source already trusts %s port %d; skipping host-key "
+		    "brokering", session->dst.host, session->dst.port);
+		return 0;
+	}
+	/* fetch the target's keys through the source host */
+	session->phase = LP_FETCH_TARGET_KEY;
+	proto_emit_phase(phase_name(session->phase));
+	r = hpn3scp_fetch_target_keys(session, keyset);
+	/* nothing responded, so the caller may try the other port */
+	if (r == 1 && may_fall_back)
+		return 1;
+	if (r != 0) {
+		xasprintf(&msg, "could not retrieve %s's host key via %s",
+		    session->dst.host, session->src.host);
+		proto_emit_error(msg);
+		free(msg);
+		return -1;
+	}
+	/* the user or SSHFP accepts the key, or the run stops here */
+	session->phase = LP_CONFIRM_KEY;
+	proto_emit_phase(phase_name(session->phase));
+	if (hpn3scp_confirm_target(session, keyset) != 0)
+		return -1;
+	/* write the accepted key into the source's known_hosts */
+	session->phase = LP_PROVISION;
+	proto_emit_phase(phase_name(session->phase));
+	if (hpn3scp_provision_target(session, keyset) != 0) {
+		xasprintf(&msg, "could not add %s's host key to %s's "
+		    "known_hosts", session->dst.host, session->src.host);
+		proto_emit_error(msg);
+		free(msg);
+		return -1;
+	}
+	return 0;
+}
+
 /* Run one third-party copy from start to finish and report it as events:
  * resolve the two endpoints, make sure the source trusts the target's host
  * key, check the agent for -A, then launch the source's hpnscp and relay
@@ -540,7 +590,7 @@ run_session(struct launch_session *session)
 	const char *why = NULL;
 	char *msg;
 	struct target_keyset keyset;
-	int r, ret = 1, knows, counts_known;
+	int r, ret = 1, counts_known;
 
 	memset(&keyset, 0, sizeof(keyset));
 
@@ -554,40 +604,25 @@ run_session(struct launch_session *session)
 	}
 	proto_emit_resolved(&session->src, &session->dst, session->streams);
 
-	/* The host-key broker runs only when the source does not already
-	 * trust the target. It fetches the target's keys through the source,
-	 * verifies them by SSHFP or an ssh-style prompt, and adds them to the
-	 * source's known_hosts, so the copy can check the key strictly. */
-	knows = hpn3scp_source_knows_target(session);
-	if (knows != 1) {
-		session->phase = LP_FETCH_TARGET_KEY;
-		proto_emit_phase(phase_name(session->phase));
-		if (hpn3scp_fetch_target_keys(session, &keyset) != 0) {
-			xasprintf(&msg, "could not retrieve %s's host key via "
-			    "%s", session->dst.host, session->src.host);
-			proto_emit_error(msg);
-			free(msg);
+	/* Make sure the source trusts the target's host key on the port the
+	 * copy will use. A port the user gave is the only one tried. Without
+	 * one, HPN's port 2222 comes first, as hpnssh tries it, and 22 is the
+	 * fallback when nothing responds there. The port chosen stays set, so
+	 * the launch uses it too and the copy cannot pick another. */
+	if (session->dst.port != -1) {
+		if (trust_target_port(session, &keyset, 0) != 0)
 			goto fail;
-		}
-		/* the user or SSHFP accepts the key, or the run stops here */
-		session->phase = LP_CONFIRM_KEY;
-		proto_emit_phase(phase_name(session->phase));
-		if (hpn3scp_confirm_target(session, &keyset) != 0)
-			goto fail;
-		/* write the accepted key into the source's known_hosts */
-		session->phase = LP_PROVISION;
-		proto_emit_phase(phase_name(session->phase));
-		if (hpn3scp_provision_target(session, &keyset) != 0) {
-			xasprintf(&msg, "could not add %s's host key to %s's "
-			    "known_hosts", session->dst.host,
-			    session->src.host);
-			proto_emit_error(msg);
-			free(msg);
-			goto fail;
-		}
 	} else {
-		debug("source already trusts %s; skipping host-key brokering",
-		    session->dst.host);
+		session->dst.port = HPNSSH_DEFAULT_PORT;
+		r = trust_target_port(session, &keyset, 1);
+		if (r == 1) {
+			debug("No response on port %d, trying port %d",
+			    HPNSSH_DEFAULT_PORT, SSH_DEFAULT_PORT);
+			session->dst.port = SSH_DEFAULT_PORT;
+			r = trust_target_port(session, &keyset, 0);
+		}
+		if (r != 0)
+			goto fail;
 	}
 
 	/* The credential. By default the source authenticates to the target
