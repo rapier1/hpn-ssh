@@ -28,7 +28,7 @@ extern "C" {
  * linked here).  The parser path never calls it; abort if anything does.
  */
 void
-ssh_base_args(struct launch_session *s, struct arglist *a, int with_n,
+ssh_base_args(struct run_state *s, struct arglist *a, int with_n,
     int with_agent)
 {
 	(void)s; (void)a; (void)with_n; (void)with_agent;

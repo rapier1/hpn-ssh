@@ -38,7 +38,7 @@
 
 /* Defined in sshkey.h and hpn3scp.h. Only pointers are needed here. */
 struct sshkey;
-struct launch_session;
+struct run_state;
 
 /* What the target's SSHFP records in DNS say about a fetched key */
 enum sshfp_status {
@@ -81,7 +81,7 @@ enum sshfp_status hpn3scp_sshfp_check(const char *, const struct sshkey *);
  * least one key, 1 when nothing on the port responded, so the caller may
  * try another, or -1 when the output had a rejected line. The caller
  * frees the set with hpn3scp_free_keyset(). */
-int	hpn3scp_fetch_target_keys(const struct launch_session *,
+int	hpn3scp_fetch_target_keys(const struct run_state *,
 	    struct target_keyset *);
 
 /* Free a key set and leave it empty, so freeing it again is harmless */
@@ -90,7 +90,7 @@ void	hpn3scp_free_keyset(struct target_keyset *);
 /* Whether a known_hosts file the source host's hpnssh uses already holds a
  * key for the target on its current port: 1 if so, else 0, which only
  * means the key is fetched and confirmed again. */
-int	hpn3scp_source_knows_target(const struct launch_session *);
+int	hpn3scp_source_knows_target(const struct run_state *);
 
 /* Decide which fetched keys the source host may trust. An SSHFP mismatch,
  * or a different or revoked key in the launcher's known_hosts, aborts.
@@ -98,13 +98,13 @@ int	hpn3scp_source_knows_target(const struct launch_session *);
  * vouch for are accepted. Otherwise the user confirms the one key the copy
  * would negotiate on a terminal, and with no terminal the run stops.
  * Returns 0 with the accepted keys marked, or -1 with an error emitted. */
-int	hpn3scp_confirm_target(const struct launch_session *,
+int	hpn3scp_confirm_target(const struct run_state *,
 	    struct target_keyset *);
 
 /* Append the accepted keys to the first known_hosts file the source
  * host's hpnssh uses, formatted and hashed as hpnssh would write them.
  * Returns 0, or -1. */
-int	hpn3scp_provision_target(const struct launch_session *,
+int	hpn3scp_provision_target(const struct run_state *,
 	    struct target_keyset *);
 
 #endif /* HPN3SCP_HOSTKEY_H */

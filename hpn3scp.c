@@ -76,16 +76,16 @@ static struct {
 
 /* The name of a phase as the GUI sees it, the value of a PHASE event. */
 static const char *
-phase_name(enum launch_phase phase)
+phase_name(enum run_phase phase)
 {
 	switch (phase) {
-	case LP_RESOLVE:		return "RESOLVE";
-	case LP_FETCH_TARGET_KEY:	return "FETCH_TARGET_KEY";
-	case LP_CONFIRM_KEY:		return "CONFIRM_KEY";
-	case LP_PROVISION:		return "PROVISION";
-	case LP_LAUNCH:			return "LAUNCH";
-	case LP_MONITOR:		return "MONITOR";
-	case LP_COMPLETE:		return "COMPLETE";
+	case RUN_RESOLVE:		return "RESOLVE";
+	case RUN_FETCH_TARGET_KEY:	return "FETCH_TARGET_KEY";
+	case RUN_CONFIRM_KEY:		return "CONFIRM_KEY";
+	case RUN_PROVISION:		return "PROVISION";
+	case RUN_LAUNCH:		return "LAUNCH";
+	case RUN_MONITOR:		return "MONITOR";
+	case RUN_COMPLETE:		return "COMPLETE";
 	}
 	return "UNKNOWN";
 }
@@ -207,7 +207,7 @@ resolve_endpoint(const char *arg, struct endpoint *endpoint, const char **why)
 /* Add -4 or -6 when the user chose an address family. ssh, hpnscp, and
  * ssh-keyscan all take the same flag, so one helper serves every hop. */
 void
-add_addr_family_arg(const struct launch_session *session, arglist *args)
+add_addr_family_arg(const struct run_state *session, arglist *args)
 {
 	if (session->addr_family == 4)
 		addargs(args, "-4");
@@ -220,7 +220,7 @@ add_addr_family_arg(const struct launch_session *session, arglist *args)
  * legacy launch, which sends nothing on stdin. with_agent adds -A for the
  * user's opt-in agent forwarding. */
 void
-ssh_base_args(const struct launch_session *session, arglist *args,
+ssh_base_args(const struct run_state *session, arglist *args,
     int with_n, int with_agent)
 {
 	int i;
@@ -342,7 +342,7 @@ ev_degrade(void *ctx)
  * the source printed above. Protocol mode prints nothing, because the
  * front end builds its own summary from the file_fail and done events. */
 static void
-emit_completion_summary(const struct launch_session *session)
+emit_completion_summary(const struct run_state *session)
 {
 	u_int files_ok;
 
@@ -372,7 +372,7 @@ emit_completion_summary(const struct launch_session *session)
  * hpnscp, ending in -- and the two operands. Both launch modes send the
  * same list, on stdin or on the command line. */
 static void
-launch_hpnscp_args(const struct launch_session *session, arglist *args)
+launch_hpnscp_args(const struct run_state *session, arglist *args)
 {
 	const char *lbracket = "", *rbracket = "";
 	int i;
@@ -425,7 +425,7 @@ launch_hpnscp_args(const struct launch_session *session, arglist *args)
  * refused legacy source, HPN_LAUNCH_REFUSED when the copy was refused
  * before it ran, or -1. */
 static int
-do_launch(struct launch_session *session)
+do_launch(struct run_state *session)
 {
 	struct hpn_launch launch;
 	struct hpn_run_hooks hooks;
@@ -535,7 +535,7 @@ check_ambient_agent(void)
  * on the port responded and may_fall_back allows another port, or -1 with
  * an error emitted. */
 static int
-trust_target_port(struct launch_session *session,
+trust_target_port(struct run_state *session,
     struct target_keyset *keyset, int may_fall_back)
 {
 	char *msg;
@@ -548,8 +548,7 @@ trust_target_port(struct launch_session *session,
 		return 0;
 	}
 	/* fetch the target's keys through the source host */
-	session->phase = LP_FETCH_TARGET_KEY;
-	proto_emit_phase(phase_name(session->phase));
+	proto_emit_phase(phase_name(RUN_FETCH_TARGET_KEY));
 	r = hpn3scp_fetch_target_keys(session, keyset);
 	/* nothing responded, so the caller may try the other port */
 	if (r == 1 && may_fall_back)
@@ -562,13 +561,11 @@ trust_target_port(struct launch_session *session,
 		return -1;
 	}
 	/* the user or SSHFP accepts the key, or the run stops here */
-	session->phase = LP_CONFIRM_KEY;
-	proto_emit_phase(phase_name(session->phase));
+	proto_emit_phase(phase_name(RUN_CONFIRM_KEY));
 	if (hpn3scp_confirm_target(session, keyset) != 0)
 		return -1;
 	/* write the accepted key into the source's known_hosts */
-	session->phase = LP_PROVISION;
-	proto_emit_phase(phase_name(session->phase));
+	proto_emit_phase(phase_name(RUN_PROVISION));
 	if (hpn3scp_provision_target(session, keyset) != 0) {
 		xasprintf(&msg, "could not add %s's host key to %s's "
 		    "known_hosts", session->dst.host, session->src.host);
@@ -585,7 +582,7 @@ trust_target_port(struct launch_session *session,
  * its status. Every path ends with exactly one done event. Returns the
  * exit status for main(). */
 static int
-run_session(struct launch_session *session)
+run_session(struct run_state *session)
 {
 	const char *why = NULL;
 	char *msg;
@@ -595,8 +592,7 @@ run_session(struct launch_session *session)
 	memset(&keyset, 0, sizeof(keyset));
 
 	/* parse and check both endpoints before anything connects */
-	session->phase = LP_RESOLVE;
-	proto_emit_phase(phase_name(session->phase));
+	proto_emit_phase(phase_name(RUN_RESOLVE));
 	if (resolve_endpoint(session->src_arg, &session->src, &why) != 0 ||
 	    resolve_endpoint(session->dst_arg, &session->dst, &why) != 0) {
 		proto_emit_error(why);
@@ -638,11 +634,9 @@ run_session(struct launch_session *session)
 	 * LAUNCH and MONITOR are emitted together for now. LAUNCH is kept so
 	 * a front end can later show the time from starting the source to
 	 * its first frame, which covers the source's login to the target. */
-	session->phase = LP_LAUNCH;
-	proto_emit_phase(phase_name(session->phase));
+	proto_emit_phase(phase_name(RUN_LAUNCH));
 
-	session->phase = LP_MONITOR;
-	proto_emit_phase(phase_name(session->phase));
+	proto_emit_phase(phase_name(RUN_MONITOR));
 	r = do_launch(session);
 	/* A run that ended without the source's END frame failed before it
 	 * reported a result, for example when the source could not log in to
@@ -652,6 +646,17 @@ run_session(struct launch_session *session)
 	    r != HPN_LAUNCH_REFUSED) {
 		xasprintf(&msg, "the copy on %s failed before it reported a "
 		    "result (see its messages on stderr)", session->src.host);
+		proto_emit_error(msg);
+		free(msg);
+	}
+	/* A source that reported failure without a FILEFAIL frame, as a
+	 * serial transfer error does, leaves the front end no file_fail
+	 * event, so the failure gets an error event here. */
+	if (endinfo.got && !endinfo.ok &&
+	    failtally.verify == 0 && failtally.transfer == 0) {
+		xasprintf(&msg, "the copy on %s reported a failure without "
+		    "naming a file (see its messages on stderr)",
+		    session->src.host);
 		proto_emit_error(msg);
 		free(msg);
 	}
@@ -668,13 +673,14 @@ run_session(struct launch_session *session)
 	 * as for a failure before the launch. */
 	counts_known = endinfo.got || r == HPN_EXIT_STRICT_ARGS ||
 	    r == HPN_LAUNCH_REFUSED;
-	session->phase = LP_COMPLETE;
-	proto_emit_phase(phase_name(session->phase));
+	proto_emit_phase(phase_name(RUN_COMPLETE));
 	proto_emit_done(r == 0, ret, counts_known, endinfo.files_done,
 	    failtally.verify, failtally.transfer);
 	goto out;
 
  fail:
+	/* a failed run still ends with COMPLETE before its done event */
+	proto_emit_phase(phase_name(RUN_COMPLETE));
 	/* nothing was launched, so the zero counts are known */
 	proto_emit_done(0, 1, 1, 0, 0, 0);
 	ret = 1;
@@ -689,7 +695,7 @@ run_session(struct launch_session *session)
 int
 main(int argc, char **argv)
 {
-	struct launch_session session;
+	struct run_state session;
 	arglist hpnscp_extra;
 	const char *errstr = NULL;
 	char **split_argv;
@@ -702,7 +708,6 @@ main(int argc, char **argv)
 
 	memset(&session, 0, sizeof(session));
 	session.streams = 1;
-	session.policy = DP_PROMPT;
 	session.child = -1;
 	memset(&hpnscp_extra, 0, sizeof(hpnscp_extra));
 	session.hpnscp_extra = &hpnscp_extra;

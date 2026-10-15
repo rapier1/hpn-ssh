@@ -160,7 +160,7 @@ hpn3scp_sshfp_check(const char *host, const struct sshkey *key)
  * output is untrusted and a partial set could hide a substituted key.
  * No response on the port returns 1, so the caller can try another. */
 int
-hpn3scp_fetch_target_keys(const struct launch_session *session,
+hpn3scp_fetch_target_keys(const struct run_state *session,
     struct target_keyset *keyset)
 {
 	arglist args;
@@ -301,7 +301,7 @@ add_hostfile_paths(char *list, char ***filesp, int *countp)
  * Returns 0, or -1 when the lookup failed or gave no user file, and the
  * callers then use the defaults. */
 static int
-source_hostfiles(const struct launch_session *session)
+source_hostfiles(const struct run_state *session)
 {
 	arglist args;
 	char output[16384], *line, *save;
@@ -373,7 +373,7 @@ source_hostfiles(const struct launch_session *session)
 /* The target's name in known_hosts: [host]:port, or the plain host for
  * port 22, as ssh records it. */
 static void
-target_hostspec(const struct launch_session *session, char *out, size_t len)
+target_hostspec(const struct run_state *session, char *out, size_t len)
 {
 	if (session->dst.port != -1 && session->dst.port != SSH_DEFAULT_PORT)
 		snprintf(out, len, "[%s]:%d", session->dst.host,
@@ -407,7 +407,7 @@ add_keygen_lookup(arglist *args, const char *spec, const char *file,
  * a file holds a key, or 0 if none does or the check could not run, which
  * only means the key is fetched and confirmed again. */
 int
-hpn3scp_source_knows_target(const struct launch_session *session)
+hpn3scp_source_knows_target(const struct run_state *session)
 {
 	arglist args;
 	char output[4096], spec[512];
@@ -515,7 +515,7 @@ prompt_confirm(const char *prompt, struct target_key *key)
  * asked. Returns the number of keys accepted, or -1 with an error
  * emitted. */
 static int
-check_launcher_known_hosts(const struct launch_session *session,
+check_launcher_known_hosts(const struct run_state *session,
     struct target_keyset *keyset)
 {
 	static const char *files[] = {
@@ -573,7 +573,7 @@ check_launcher_known_hosts(const struct launch_session *session,
  * key cannot carry an unverified one in with it. Returns 0, or -1 with an
  * error emitted. */
 int
-hpn3scp_confirm_target(const struct launch_session *session,
+hpn3scp_confirm_target(const struct run_state *session,
     struct target_keyset *keyset)
 {
 	struct target_key *key;
@@ -643,7 +643,7 @@ hpn3scp_confirm_target(const struct launch_session *session,
  * come from the parsed keys, never from the source host's text. Returns
  * 0, or -1. */
 int
-hpn3scp_provision_target(const struct launch_session *session,
+hpn3scp_provision_target(const struct run_state *session,
     struct target_keyset *keyset)
 {
 	arglist args;
