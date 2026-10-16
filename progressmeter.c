@@ -125,10 +125,11 @@ format_size(off_t bytes)
 
 /* tail of the meter line, after the two rate columns */
 enum meter_tail {
-	METER_TAIL_STALLED,	/* "- stalled -" */
+	METER_TAIL_STALLED,	/* " - stalled -" */
 	METER_TAIL_UNKNOWN,	/* "  --:-- ETA" */
 	METER_TAIL_ETA,		/* time remaining + " ETA" */
-	METER_TAIL_DONE		/* time elapsed, no suffix */
+	METER_TAIL_DONE,	/* time elapsed, no suffix */
+	METER_TAIL_ELAPSED	/* time elapsed while progress is unknown */
 };
 
 /*
@@ -140,7 +141,8 @@ enum meter_tail {
  */
 static void
 render_meter_line(const char *label, int percent, off_t bytes_shown,
-    long long rate, off_t inst_rate, enum meter_tail tail, long tail_seconds)
+    long long rate, off_t inst_rate, int blind, enum meter_tail tail,
+    long tail_seconds)
 {
 	char *buf = NULL, *obuf = NULL;
 	int hours, minutes, seconds;
@@ -150,8 +152,9 @@ render_meter_line(const char *label, int percent, off_t bytes_shown,
 	if (win_size < 4)
 		return;
 
-	/* filename / label */
-	file_len = cols = win_size - 45;
+	/* filename / label. HPN: the 46 columns reserved hold the figures and
+	 * the widest tail, " - stalled -". */
+	file_len = cols = win_size - 46;
 	if (file_len > 0) {
 		asmprintf(&buf, INT_MAX, &cols, "%-*s", file_len, label);
 		/* If we used fewer columns than expected then pad */
@@ -159,22 +162,30 @@ render_meter_line(const char *label, int percent, off_t bytes_shown,
 			xextendf(&buf, NULL, "%*s", file_len - cols, "");
 	}
 
-	/* percent / amount transferred / bandwidth usage */
-	xextendf(&buf, NULL, " %3d%% %s %s/s ", percent,
-	    format_size(bytes_shown), format_rate((off_t)rate));
+	/* HPN: a blind relay has no figures, so dashes hold the columns */
+	if (blind)
+		xextendf(&buf, NULL, " %3s%% %6s %7s/s %7s/s", "--", "--",
+		    "--", "--");
+	else {
+		/* percent / amount transferred / bandwidth usage */
+		xextendf(&buf, NULL, " %3d%% %s %s/s ", percent,
+		    format_size(bytes_shown), format_rate((off_t)rate));
 
-	/* instantaneous rate */
-	xextendf(&buf, NULL, "%s/s", format_rate(inst_rate));
+		/* instantaneous rate */
+		xextendf(&buf, NULL, "%s/s", format_rate(inst_rate));
+	}
 
 	switch (tail) {
 	case METER_TAIL_STALLED:
-		xextendf(&buf, NULL, "- stalled -");
+		/* HPN: the space keeps it off the inst column */
+		xextendf(&buf, NULL, " - stalled -");
 		break;
 	case METER_TAIL_UNKNOWN:
 		xextendf(&buf, NULL, "  --:-- ETA");
 		break;
 	case METER_TAIL_ETA:
 	case METER_TAIL_DONE:
+	case METER_TAIL_ELAPSED:
 		seconds = (int)tail_seconds;
 		hours = seconds / 3600;
 		seconds -= hours * 3600;
@@ -227,7 +238,11 @@ render_from_view(const struct meter_view *v)
 	 */
 	if (v->stalled)
 		tail = METER_TAIL_STALLED;
-	else if (v->done) {
+	else if (v->blind) {
+		/* HPN: with no progress, the running time stands in */
+		tail = METER_TAIL_ELAPSED;
+		tsec = v->elapsed_sec;
+	} else if (v->done) {
 		tail = METER_TAIL_DONE;
 		tsec = v->elapsed_sec;
 	} else if (v->rate == 0 || v->eta_sec == HPNS_ETA_UNKNOWN)
@@ -238,7 +253,7 @@ render_from_view(const struct meter_view *v)
 	}
 
 	render_meter_line(v->label, v->percent, v->cur, v->rate, v->inst,
-	    tail, tsec);
+	    v->blind, tail, tsec);
 }
 
 /*
@@ -274,11 +289,11 @@ pm_debug_view(const struct meter_view *v)
 		return;
 	fprintf(pm_debug_fp,
 	    "pm label=%s cur=%llu total=%llu pct=%d rate=%lld inst=%llu "
-	    "stalled=%d eta=%u elapsed=%ld\n",
+	    "stalled=%d blind=%d eta=%u elapsed=%ld\n",
 	    v->label != NULL ? v->label : "",
 	    (unsigned long long)v->cur, (unsigned long long)v->total,
 	    v->percent, (long long)v->rate, (unsigned long long)v->inst,
-	    v->stalled ? 1 : 0, v->eta_sec, v->elapsed_sec);
+	    v->stalled ? 1 : 0, v->blind ? 1 : 0, v->eta_sec, v->elapsed_sec);
 	fflush(pm_debug_fp);
 }
 
@@ -368,18 +383,42 @@ pm_meter_line_break(void)
  * the guard so buffered stdio cannot land after the next repaint, and let
  * the meter's next tick repaint below.
  */
+static int
+guarded_vfmprintf(FILE *stream, const char *fmt, va_list ap)
+{
+	int ret;
+
+	meter_log_enter();
+	ret = vfmprintf(stream, fmt, ap);
+	fflush(stream);
+	meter_log_exit();
+	return ret;
+}
+
+/* The guarded print to stdout */
 int
 pm_mprintf(const char *fmt, ...)
 {
 	va_list ap;
 	int ret;
 
-	meter_log_enter();
 	va_start(ap, fmt);
-	ret = vfmprintf(stdout, fmt, ap);
+	ret = guarded_vfmprintf(stdout, fmt, ap);
 	va_end(ap);
-	fflush(stdout);
-	meter_log_exit();
+	return ret;
+}
+
+/* The guarded print to stderr, for messages such as hpn3scp's human-mode
+ * warnings that can land while a relay meter is live */
+int
+pm_eprintf(const char *fmt, ...)
+{
+	va_list ap;
+	int ret;
+
+	va_start(ap, fmt);
+	ret = guarded_vfmprintf(stderr, fmt, ap);
+	va_end(ap);
 	return ret;
 }
 

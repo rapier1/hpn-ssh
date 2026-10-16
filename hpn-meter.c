@@ -78,6 +78,10 @@ static struct {
 	double	 last_break;	/* monotime of the last row break, one per second */
 	double	 last_frame;	/* monotime of the last sample (stall aging) */
 	double	 started;	/* monotime the relay started */
+	/* Liveness mode: frames arrive but PROGRESS cannot be decoded, so the
+	 * line shows only that the copy is running. */
+	int	 blind;
+	double	 last_heard;	/* monotime of the last frame of any kind */
 
 	/* Per-file state. Frames carry cumulative bytes (the running total
 	 * plus the current meter), while their rate and ETA are already per
@@ -323,6 +327,8 @@ hpn_meter_refresh_current(int force_update)
 		pm_dispatch_view(&view, force_update);
 		return;
 	}
+	/* the builtin fill sets the fields it uses, and zero covers the rest */
+	memset(&view, 0, sizeof(view));
 
 	/* cur_pos is 0 until the first sample, which measures from the
 	 * starting position instead */
@@ -434,7 +440,7 @@ relay_fill(struct hpn_meter *meter, struct meter_view *view)
 	memset(view, 0, sizeof(*view));
 
 	/* Prefix the phase tag, because the label field is cut at the right
-	 * edge (win_size - 45) and a suffix would vanish on a narrow terminal.
+	 * edge (win_size - 46) and a suffix would vanish on a narrow terminal.
 	 * The resume check comes before the transfer and verify after it, so
 	 * the two do not overlap. */
 	view->label = meter->label;
@@ -445,6 +451,19 @@ relay_fill(struct hpn_meter *meter, struct meter_view *view)
 	} else if (relay.verifying) {
 		snprintf(vlabel, sizeof(vlabel), "verify: %s", meter->label);
 		view->label = vlabel;
+	}
+
+	/* Liveness mode: the source is sending but its progress cannot be
+	 * read, so show only the running time, or a stall once nothing has
+	 * arrived. The END line, if one decodes, is still the normal one. */
+	if (relay.blind && !relay.done) {
+		snprintf(vlabel, sizeof(vlabel), "no progress: %s",
+		    meter->label);
+		view->label = vlabel;
+		view->blind = 1;
+		view->stalled = now - relay.last_heard >= HPN_METER_STALL_SEC;
+		view->elapsed_sec = (long)(now - relay.started);
+		return;
 	}
 
 	/* A completed-file row: one preserved line per source-side file
@@ -548,6 +567,17 @@ relay_phase_reset(double now)
 	relay.file_start = now;
 }
 
+/* Start the relay meter under label, once. A later call does nothing,
+ * and a failed start leaves the relay meter not current. */
+static void
+relay_start_once(const char *label)
+{
+	if (!relay_start_tried) {
+		relay_start_tried = 1;
+		relay_start(label);
+	}
+}
+
 /* Take one PROGRESS frame from the remote source. The frame consumers
  * (scp -R and hpn3scp) call this for every frame. The first frame starts
  * the meter under label. Otherwise it does nothing while the relay meter
@@ -561,13 +591,12 @@ hpn_meter_relay_sample(const char *label, const struct hpns_progress *frame)
 {
 	double now, span;
 
-	if (!relay_start_tried) {
-		relay_start_tried = 1;
-		relay_start(label);
-	}
+	relay_start_once(label);
 	if (current_meter != &relay_meter)
 		return;
 	now = monotime_double();
+	/* a frame that decodes ends liveness mode */
+	relay.blind = 0;
 
 	if ((frame->flags & HPNS_F_RESUME) && !relay.resuming)
 		relay.resuming = 1;
@@ -670,6 +699,29 @@ hpn_meter_relay_tick(void *ctx)
 	(void)ctx;
 	if (current_meter == &relay_meter)
 		refresh_progress_meter(0);
+}
+
+/* Switch the relay meter to liveness mode, starting it under label if no
+ * frame has. The next PROGRESS frame that decodes switches it back. */
+void
+hpn_meter_relay_blind(const char *label)
+{
+	relay_start_once(label);
+	if (current_meter != &relay_meter)
+		return;
+	relay.blind = 1;
+	relay.last_heard = monotime_double();
+	refresh_progress_meter(0);
+}
+
+/* Note that a frame arrived, readable or not, for the liveness line. It
+ * has the frame runner's hook signature, so a consumer installs it
+ * directly as on_frame. */
+void
+hpn_meter_relay_heard(void *ctx)
+{
+	(void)ctx;
+	relay.last_heard = monotime_double();
 }
 
 /* Close the relay meter. Any completion line was painted by

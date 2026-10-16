@@ -89,6 +89,12 @@ void	proto_emit_resolved(const struct endpoint *,
  * source reports them. */
 void	proto_emit_progress(const struct hpns_progress *);
 
+/* The source is still sending, though its progress cannot be read. Sent
+ * at most once a second after the mismatch warning, in place of the
+ * progress events. Human mode emits nothing, because the local meter
+ * shows it. */
+void	proto_emit_alive(void);
+
 /* A warning or an error, as msg=. In human mode they go to stderr as
  * plain text instead. */
 void	proto_emit_warning(const char *);

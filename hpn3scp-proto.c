@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include "log.h"
+#include "progressmeter.h"	/* pm_eprintf */
 #include "xmalloc.h"
 #include "hpn-status-frame.h"
 #include "hpn3scp.h"
@@ -233,12 +234,24 @@ proto_emit_progress(const struct hpns_progress *progress)
 	fflush(event_stream());
 }
 
+/* Emit an alive event. Human mode emits nothing, because the local meter
+ * shows the copy is running. */
+void
+proto_emit_alive(void)
+{
+	if (human_mode)
+		return;
+	fprintf(event_stream(), "EVENT alive\n");
+	fflush(event_stream());
+}
+
 /* Emit a warning event, or print the warning on stderr in human mode. */
 void
 proto_emit_warning(const char *msg)
 {
 	if (human_mode) {
-		fprintf(stderr, "hpn3scp: warning: %s\n", msg);
+		/* the guard clears a live meter line first */
+		pm_eprintf("hpn3scp: warning: %s\n", msg);
 		return;
 	}
 	emit_single_value("warning", "msg", msg);
@@ -249,7 +262,7 @@ void
 proto_emit_error(const char *msg)
 {
 	if (human_mode) {
-		fprintf(stderr, "hpn3scp: %s\n", msg);
+		pm_eprintf("hpn3scp: %s\n", msg);
 		return;
 	}
 	emit_single_value("error", "msg", msg);

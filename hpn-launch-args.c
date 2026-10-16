@@ -70,7 +70,9 @@ enum launch_args_mode {
 struct scp_remote_meter {
 	/* built from local argv only, never remote bytes */
 	const char	*label;
+	const char	*source_host;	/* for the mismatch warning */
 	int		 show;		/* scp would show a meter */
+	int		 warned;	/* the mismatch warning was printed */
 };
 
 /* set once the argument list came from stdin, so the operands are
@@ -421,13 +423,16 @@ launch_args_legacy(const struct hpn_launch *launch, int warn)
 		}
 	}
 	if (warn) {
-		/* The retry is a second connection, so a password or MFA
-		 * user is prompted again. Say so before they are. */
 		xasprintf(&msg, "%s does not support safe argument passing. "
 		    "This is a potential security hazard. Upgrade it to "
 		    "HPN-SSH 19 or later to resolve. Continuing in unsafe "
-		    "mode. You may be asked to log in to %s again.",
-		    launch->source_host, launch->source_host);
+		    "mode.", launch->source_host);
+		/* Without a shared login the retry is a second connection,
+		 * so a password or MFA user is prompted again. Say so before
+		 * they are. */
+		if (!launch->shared_login)
+			xextendf(&msg, NULL, " You may be asked to log in to "
+			    "%s again.", launch->source_host);
 		launch->warn(msg);
 		free(msg);
 	}
@@ -514,6 +519,23 @@ scp_remote_degrade(void *ctx)
 	hpn_meter_relay_stop();
 	error("source is not sending status; the transfer continues without "
 	    "progress");
+}
+
+/* The source's PROGRESS frames cannot be decoded. When scp shows a meter,
+ * warn once and switch it to show only that the copy is running. */
+static void
+scp_remote_mismatch(void *ctx)
+{
+	struct scp_remote_meter *meter = ctx;
+
+	if (!meter->show)
+		return;
+	if (!meter->warned) {
+		meter->warned = 1;
+		error("Progress data from %s can't be parsed. The meter will "
+		    "only show that the copy is running.", meter->source_host);
+	}
+	hpn_meter_relay_blind(meter->label);
 }
 
 /* -R with -X TransferLog: the source mirrors each file's final status as a
@@ -642,6 +664,7 @@ hpn_launch_args_scp_remote(const struct hpn_scp_remote *remote)
 	/* the meter starts unseen and shows only when scp would show one */
 	memset(&meter, 0, sizeof(meter));
 	meter.label = label;
+	meter.source_host = remote->host;
 	meter.show = remote->show_meter;
 	/* A relayed run drives the meter and the transfer log from the
 	 * source's frames. Anything else it prints goes to our stdout. */
@@ -652,6 +675,8 @@ hpn_launch_args_scp_remote(const struct hpn_scp_remote *remote)
 	hooks.on_filedone = scp_remote_filedone;
 	hooks.on_tick = hpn_meter_relay_tick;
 	hooks.on_degrade = scp_remote_degrade;
+	hooks.on_frame = hpn_meter_relay_heard;
+	hooks.on_mismatch = scp_remote_mismatch;
 	hooks.passthrough_fd = STDOUT_FILENO;
 	hooks.ctx = &meter;
 	/* a legacy run without the relay just passes its output through */

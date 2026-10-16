@@ -61,6 +61,7 @@ struct hpn_launch {
 	int		 legacy_relay;	/* arm the relay in legacy mode too */
 	const struct arglist *args;	/* the program's arguments */
 	const char	*source_host;	/* named in messages */
+	int		 shared_login;	/* a retry joins a login already made */
 	/* the hooks for a relayed run, and for a legacy run without the
 	 * relay */
 	const struct hpn_run_hooks *hooks;

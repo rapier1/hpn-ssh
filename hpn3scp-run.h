@@ -63,6 +63,13 @@ struct hpn_run_hooks {
 	void (*on_filedone)(const struct hpns_filedone *, void *ctx);
 	void (*on_tick)(void *ctx);
 	void (*on_degrade)(void *ctx);
+	/* on_frame fires for every complete frame, decoded or not, as a sign
+	 * that the source is still sending. */
+	void (*on_frame)(void *ctx);
+	/* on_mismatch fires when about five seconds of PROGRESS frames in a
+	 * row fail to decode, so the consumer can warn that progress cannot
+	 * be read. A decoded PROGRESS restarts the count. */
+	void (*on_mismatch)(void *ctx);
 	int  passthrough_fd;	/* raw bytes after degrade go here; <0 = discard */
 	/* Bytes written to the child's stdin, which is then closed. NULL
 	 * leaves stdin as the child inherits it. */
@@ -92,12 +99,14 @@ int	hpn_run_status(struct arglist *a, pid_t *pidp,
 /*
  * Fork+exec a->list[0] with a piped stdout, capture up to buflen-1 bytes of
  * its output into buf (always NUL-terminated), enforce a wall-clock timeout,
- * and reap.  Returns 0 if the child exited 0 within the timeout, -1 otherwise
- * (timeout, nonzero exit, or spawn failure).  For short one-shot probes (the
- * source-binary discovery), not streaming transfers.
+ * and reap.  With with_stderr set, its stderr is captured too, merged with
+ * stdout.  Output past that is read and dropped, and sets *truncated when
+ * it is not NULL.  Returns 0 if the child exited 0 within the timeout, -1
+ * otherwise (timeout, nonzero exit, or spawn failure).  For short one-shot
+ * probes (the source-binary discovery), not streaming transfers.
  */
 int	hpn_run_capture(struct arglist *a, char *buf, size_t buflen,
-	    int timeout_ms);
+	    int timeout_ms, int *truncated, int with_stderr);
 
 /*
  * Fork+exec a->list[0] feeding `input` to its stdin, then reap.  Returns 0

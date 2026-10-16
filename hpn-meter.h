@@ -87,6 +87,7 @@ struct meter_view {
 	uint32_t	 eta_sec;	/* HPNS_ETA_UNKNOWN if not derivable */
 	int		 stalled;	/* no progress for STALL_TIME */
 	int		 done;		/* this meter is complete */
+	int		 blind;		/* progress unreadable, show liveness */
 	/* 0 to 100, computed by the fill, because what a zero total means
 	 * depends on the source */
 	int		 percent;
@@ -165,6 +166,15 @@ void	hpn_meter_relay_end(uint64_t);
 void	hpn_meter_relay_tick(void *);
 void	hpn_meter_relay_stop(void);
 void	hpn_meter_relay_finish(void);
+
+/* Liveness mode for a source whose frames arrive but whose PROGRESS cannot
+ * be decoded. Blind starts the meter under its label if no frame has, and
+ * switches it to a line that shows only the elapsed time, or a stall once
+ * nothing has arrived for a while. Heard has the frame runner's hook
+ * signature, so a consumer installs it as on_frame to note each frame. A
+ * PROGRESS frame that decodes ends the mode. */
+void	hpn_meter_relay_blind(const char *);
+void	hpn_meter_relay_heard(void *);
 
 /* Display routing used by progressmeter.c: whether a meter is current,
  * whether this thread may fill it, and the fill-and-dispatch on the shared

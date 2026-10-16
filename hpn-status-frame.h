@@ -39,7 +39,10 @@
  *     u16 payload_len  at most HPNS_MAX_PAYLOAD
  * Each type has a fixed payload size, except FILEFAIL and FILEDONE, which
  * end in a variable-length path. A consumer skips a frame of an unknown
- * type when its header is valid, so new types do not break old readers. */
+ * type when its header is valid, so new types do not break old readers.
+ * A layout only grows at the end, and a decoder ignores the bytes past
+ * the fields it knows, so new fields do not break old readers either.
+ * Inserting, moving, or removing a field needs a new HPNS_VERSION. */
 
 #ifndef HPN_STATUS_FRAME_H
 #define HPN_STATUS_FRAME_H
@@ -211,8 +214,9 @@ size_t	hpns_encode_end(u_char *, const struct hpns_end *);
 size_t	hpns_encode_filefail(u_char *, const struct hpns_filefail *);
 size_t	hpns_encode_filedone(u_char *, const struct hpns_filedone *);
 
-/* The decoders. Each returns 0, or -1 if the payload length does not
- * match its type's layout exactly. */
+/* The decoders. Each returns 0, or -1 if the payload is shorter than its
+ * type's layout. Bytes past the layout, from a newer source, are
+ * ignored. */
 int	hpns_decode_hello(const u_char *, uint16_t, struct hpns_hello *);
 int	hpns_decode_progress(const u_char *, uint16_t,
 	    struct hpns_progress *);

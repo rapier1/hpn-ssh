@@ -167,7 +167,7 @@ hpn3scp_fetch_target_keys(const struct run_state *session,
 	char output[16384], *line, *save;
 	struct sshkey *key;
 	struct target_key *entry;
-	int rc, r;
+	int rc, r, truncated;
 
 	memset(keyset, 0, sizeof(*keyset));
 
@@ -184,13 +184,19 @@ hpn3scp_fetch_target_keys(const struct run_state *session,
 	/* -- so a host starting with '-' is never read as an option */
 	addargs(&args, "--");
 	addargs(&args, "%s", session->dst.host);
-	/* Output that overflows the buffer makes the keyscan fail when its
-	 * pipe closes, so a cut-off list is never parsed as complete. */
-	rc = hpn_run_capture(&args, output, sizeof(output), 20000);
+	rc = hpn_run_capture(&args, output, sizeof(output), 20000,
+	    &truncated, 0);
 	freeargs(&args);
 	/* keyscan exits 1 when nothing on the port responded */
 	if (rc != 0)
 		return 1;
+	/* A cut-off list fails the set. A cut at a line break would parse
+	 * as complete while missing keys, possibly the negotiated one. */
+	if (truncated) {
+		debug("hpnssh-keyscan output on %s overflowed %zu bytes",
+		    session->src.host, sizeof(output));
+		return -1;
+	}
 
 	/* The output is keyscan's known_hosts-format text, held only in this
 	 * buffer. Split it into lines, parse each one, and record each valid
@@ -305,7 +311,7 @@ source_hostfiles(const struct run_state *session)
 {
 	arglist args;
 	char output[16384], *line, *save;
-	int rc;
+	int rc, truncated;
 
 	/* a lookup for this port already ran, so reuse its result */
 	if (hostfiles.looked_up && hostfiles.port == session->dst.port) {
@@ -330,10 +336,11 @@ source_hostfiles(const struct run_state *session)
 	/* -- so a host starting with '-' is never read as an option */
 	addargs(&args, "--");
 	addargs(&args, "%s", session->dst.host);
-	rc = hpn_run_capture(&args, output, sizeof(output), 15000);
+	rc = hpn_run_capture(&args, output, sizeof(output), 15000,
+	    &truncated, 0);
 	freeargs(&args);
-	/* a full buffer may end in a cut-off line, so it is not used */
-	if (rc != 0 || strlen(output) >= sizeof(output) - 1)
+	/* a truncated dump may end in a cut-off line, so it is not used */
+	if (rc != 0 || truncated)
 		goto fail;
 
 	/* Only four lines matter, and each is "keyword value...". The
@@ -428,7 +435,7 @@ hpn3scp_source_knows_target(const struct run_state *session)
 	} else
 		add_keygen_lookup(&args, spec, NULL, 1);
 	/* only the exit status matters, so the output is read and dropped */
-	rc = hpn_run_capture(&args, output, sizeof(output), 15000);
+	rc = hpn_run_capture(&args, output, sizeof(output), 15000, NULL, 0);
 	freeargs(&args);
 	/* hpnssh-keygen -F exits 0 only when it finds a matching entry */
 	return rc == 0;

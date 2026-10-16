@@ -48,8 +48,13 @@ void	pm_display_end(off_t, off_t, off_t, double);
 void	pm_display_begin_relay(void);
 void	pm_display_end_relay(void);
 
-/* mprintf that clears a live meter line first; for transfer-path prints
- * that would otherwise land glued onto the meter's in-place repaint. */
+/* Keep the painted meter line and start a fresh row below it */
 void	pm_meter_line_break(void);
+
+/* mprintf that clears a live meter line first, for prints that would
+ * otherwise land glued onto the meter's in-place repaint. pm_eprintf
+ * writes to stderr. */
 int	pm_mprintf(const char *, ...)
+	    __attribute__((format(printf, 1, 2)));
+int	pm_eprintf(const char *, ...)
 	    __attribute__((format(printf, 1, 2)));

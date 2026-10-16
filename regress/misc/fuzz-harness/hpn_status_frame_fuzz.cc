@@ -39,7 +39,7 @@ frame_cb(u_char type, const u_char *payload, uint16_t plen, void *ctx)
 	if (plen > HPNS_MAX_PAYLOAD)
 		abort();
 
-	/* exercise the strict decoders exactly as the consumer does;
+	/* exercise the decoders exactly as the consumer does;
 	 * touch every field so ASan sees any over-read */
 	switch (type) {
 	case HPNS_T_HELLO:

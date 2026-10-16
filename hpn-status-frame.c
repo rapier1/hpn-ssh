@@ -144,13 +144,13 @@ hpns_encode_filedone(u_char *buf, const struct hpns_filedone *filedone)
 	return hdr_len + HPNS_FILEDONE_HDR + path_len;
 }
 
-/* Decode a HELLO payload. Returns 0, or -1 if plen is not exactly
- * HPNS_HELLO_LEN. */
+/* Decode a HELLO payload. Returns 0, or -1 if plen is shorter than
+ * HPNS_HELLO_LEN. Bytes past the known fields are ignored. */
 int
 hpns_decode_hello(const u_char *payload, uint16_t plen,
     struct hpns_hello *hello)
 {
-	if (plen != HPNS_HELLO_LEN)
+	if (plen < HPNS_HELLO_LEN)
 		return -1;
 	hello->proto_ver = payload[0];
 	hello->caps = PEEK_U32(payload + 1);
@@ -160,13 +160,13 @@ hpns_decode_hello(const u_char *payload, uint16_t plen,
 	return 0;
 }
 
-/* Decode a PROGRESS payload. Returns 0, or -1 if plen is not exactly
- * HPNS_PROGRESS_LEN. */
+/* Decode a PROGRESS payload. Returns 0, or -1 if plen is shorter than
+ * HPNS_PROGRESS_LEN. Bytes past the known fields are ignored. */
 int
 hpns_decode_progress(const u_char *payload, uint16_t plen,
     struct hpns_progress *progress)
 {
-	if (plen != HPNS_PROGRESS_LEN)
+	if (plen < HPNS_PROGRESS_LEN)
 		return -1;
 	progress->bytes_done = PEEK_U64(payload);
 	progress->bytes_total = PEEK_U64(payload + 8);
@@ -181,12 +181,12 @@ hpns_decode_progress(const u_char *payload, uint16_t plen,
 	return 0;
 }
 
-/* Decode an END payload. Returns 0, or -1 if plen is not exactly
- * HPNS_END_LEN. */
+/* Decode an END payload. Returns 0, or -1 if plen is shorter than
+ * HPNS_END_LEN. Bytes past the known fields are ignored. */
 int
 hpns_decode_end(const u_char *payload, uint16_t plen, struct hpns_end *end)
 {
-	if (plen != HPNS_END_LEN)
+	if (plen < HPNS_END_LEN)
 		return -1;
 	end->bytes_done = PEEK_U64(payload);
 	end->files_done = PEEK_U32(payload + 8);
@@ -195,9 +195,10 @@ hpns_decode_end(const u_char *payload, uint16_t plen, struct hpns_end *end)
 	return 0;
 }
 
-/* Decode a FILEFAIL payload. Returns 0, or -1 unless plen is exactly
- * HPNS_FILEFAIL_HDR plus the declared path_len. path points into the
- * caller's payload as opaque bytes and is never interpreted here. */
+/* Decode a FILEFAIL payload. Returns 0, or -1 if plen is shorter than
+ * HPNS_FILEFAIL_HDR plus the declared path_len. Bytes past the path are
+ * ignored. path points into the caller's payload as opaque bytes and is
+ * never interpreted here. */
 int
 hpns_decode_filefail(const u_char *payload, uint16_t plen,
     struct hpns_filefail *filefail)
@@ -207,7 +208,7 @@ hpns_decode_filefail(const u_char *payload, uint16_t plen,
 	if (plen < HPNS_FILEFAIL_HDR)
 		return -1;
 	path_len = PEEK_U16(payload + 1);
-	if ((size_t)plen != (size_t)HPNS_FILEFAIL_HDR + path_len)
+	if ((size_t)plen < (size_t)HPNS_FILEFAIL_HDR + path_len)
 		return -1;
 	filefail->kind = payload[0];
 	filefail->path_len = path_len;
@@ -228,7 +229,7 @@ hpns_decode_filedone(const u_char *payload, uint16_t plen,
 	if (plen < HPNS_FILEDONE_HDR)
 		return -1;
 	path_len = PEEK_U16(payload + 9);
-	if ((size_t)plen != (size_t)HPNS_FILEDONE_HDR + path_len)
+	if ((size_t)plen < (size_t)HPNS_FILEDONE_HDR + path_len)
 		return -1;
 	filedone->status = payload[0];
 	filedone->size = PEEK_U64(payload + 1);

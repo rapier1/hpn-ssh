@@ -112,7 +112,6 @@
 #include "pathnames.h"
 #include "log.h"
 #include "hpn-status-frame.h"
-#include "hpn3scp-run.h"
 #include "hpn-launch-args.h"
 #include "misc.h"
 #include "progressmeter.h"

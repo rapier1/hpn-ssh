@@ -32,6 +32,8 @@
 #include <netinet/in.h>
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,6 +75,30 @@ static struct {
 	int		ok;
 	int		got;	/* an END frame arrived */
 } endinfo;
+
+/* Liveness after the source's PROGRESS frames stop decoding */
+static struct {
+	int	warned;		/* the mismatch warning went out */
+	int	blind;		/* PROGRESS cannot be read right now */
+	double	last_alive;	/* monotime of the last alive event */
+} liveness;
+
+/* An idle shared login outlives a killed hpn3scp by at most this long.
+ * It must also outlast the user reading the host-key prompt, when no ssh
+ * to the source is open. */
+#define MUX_PERSIST_SEC		300
+/* short, because a socket path is limited to about 104 bytes */
+#define MUX_DIR_TEMPLATE	"/tmp/hpn3scp.XXXXXXXXXX"
+
+/* The run's shared login to the source host. Every ssh to the source
+ * joins this master through its socket, so a password or MFA user logs
+ * in once. The fields are read by a signal handler. */
+static struct {
+	char	*dir;		/* private directory, or NULL when closed */
+	char	 path[64];	/* the master's ControlPath socket */
+	pid_t	 pid;		/* the master, or -1 when not known */
+	int	 ready;		/* later runs join the master */
+} mux = { NULL, "", -1, 0 };
 
 /* The name of a phase as the GUI sees it, the value of a PHASE event. */
 static const char *
@@ -215,12 +241,12 @@ add_addr_family_arg(const struct run_state *session, arglist *args)
 		addargs(args, "-6");
 }
 
-/* Build the ssh command that reaches the source, up to and including the
- * host. The caller appends the remote command. with_n adds -n for the
- * legacy launch, which sends nothing on stdin. with_agent adds -A for the
- * user's opt-in agent forwarding. */
-void
-ssh_base_args(const struct run_state *session, arglist *args,
+/* The options of every ssh to the source, without the -- and the host,
+ * so the shared login's own runs can add theirs first. with_n adds -n
+ * for the legacy launch, which sends nothing on stdin. with_agent adds -A
+ * for the user's opt-in agent forwarding. */
+static void
+ssh_source_options(const struct run_state *session, arglist *args,
     int with_n, int with_agent)
 {
 	int i;
@@ -247,9 +273,167 @@ ssh_base_args(const struct run_state *session, arglist *args,
 		addargs(args, "-l");
 		addargs(args, "%s", session->src.user);
 	}
+}
+
+/* Build the ssh command that reaches the source, up to and including the
+ * host, joining the run's shared login once it is open. The caller
+ * appends the remote command. with_n and with_agent are as for
+ * ssh_source_options(). */
+void
+ssh_base_args(const struct run_state *session, arglist *args,
+    int with_n, int with_agent)
+{
+	ssh_source_options(session, args, with_n, with_agent);
+	/* join the master, and never become one */
+	if (mux.ready) {
+		addargs(args, "-oControlPath=%s", mux.path);
+		addargs(args, "-oControlMaster=no");
+	}
 	/* the host was checked by valid_host(), and -- keeps it an operand */
 	addargs(args, "--");
 	addargs(args, "%s", session->src.host);
+}
+
+/* Stop the master by pid and remove its socket and directory. Only
+ * async-signal-safe calls are made, so the signal handler and
+ * cleanup_exit() can use it. */
+static void
+mux_kill(void)
+{
+	if (mux.pid > 0)
+		kill(mux.pid, SIGTERM);
+	if (mux.dir != NULL) {
+		unlink(mux.path);
+		rmdir(mux.dir);
+	}
+}
+
+/* SIGINT, SIGTERM, or SIGHUP: stop the shared login, then die of the
+ * signal. A GUI cancel should instead set a flag that run_session()
+ * checks between phases, and tear down through mux_close(). */
+static void
+mux_signal(int signo)
+{
+	mux_kill();
+	ssh_signal(signo, SIG_DFL);
+	kill(getpid(), signo);
+}
+
+/* fatal() ends here, so the shared login does not outlive us */
+void
+cleanup_exit(int i)
+{
+	mux_kill();
+	_exit(i);
+}
+
+/* Close the run's shared login: ask the master to exit, then remove its
+ * directory. A master that does not answer is stopped by pid. */
+static void
+mux_close(const struct run_state *session)
+{
+	arglist args;
+	char output[1024];
+
+	if (mux.dir == NULL)
+		return;
+	if (mux.ready) {
+		ssh_source_options(session, &args, 0, 0);
+		addargs(&args, "-oControlPath=%s", mux.path);
+		addargs(&args, "-O");
+		addargs(&args, "exit");
+		addargs(&args, "--");
+		addargs(&args, "%s", session->src.host);
+		/* Capturing stderr keeps "Exit request sent." off the
+		 * terminal. An answered exit drops the pid, since the system
+		 * may reuse it. */
+		if (hpn_run_capture(&args, output, sizeof(output), 5000, NULL,
+		    1) == 0)
+			mux.pid = -1;
+		freeargs(&args);
+	}
+	mux_kill();
+	ssh_signal(SIGINT, SIG_DFL);
+	ssh_signal(SIGTERM, SIG_DFL);
+	ssh_signal(SIGHUP, SIG_DFL);
+	free(mux.dir);
+	mux.dir = NULL;
+	mux.ready = 0;
+	mux.pid = -1;
+}
+
+/* Open the run's shared login to the source host: a background master
+ * that every later ssh joins. The opener has no deadline, because a
+ * person may be typing a password. The master's pid, from -O check, lets
+ * a signal stop it. Returns 0, or -1 with an error emitted. */
+static int
+mux_open(const struct run_state *session)
+{
+	arglist args;
+	char *dir, *msg, *cp, output[1024];
+	const char *errstr;
+	long long pid;
+	int rc;
+
+	dir = xstrdup(MUX_DIR_TEMPLATE);
+	if (mkdtemp(dir) == NULL) {
+		xasprintf(&msg, "could not create a directory for the login "
+		    "to %s: %s", session->src.host, strerror(errno));
+		proto_emit_error(msg);
+		free(msg);
+		free(dir);
+		return -1;
+	}
+	mux.dir = dir;
+	snprintf(mux.path, sizeof(mux.path), "%s/m", mux.dir);
+	/* from here a signal removes the directory */
+	ssh_signal(SIGINT, mux_signal);
+	ssh_signal(SIGTERM, mux_signal);
+	ssh_signal(SIGHUP, mux_signal);
+
+	/* -f goes to the background once logged in, with its stdio on
+	 * /dev/null, so it never holds our output open */
+	ssh_source_options(session, &args, 0, 0);
+	addargs(&args, "-f");
+	addargs(&args, "-N");
+	addargs(&args, "-oControlMaster=yes");
+	addargs(&args, "-oControlPath=%s", mux.path);
+	addargs(&args, "-oControlPersist=%d", MUX_PERSIST_SEC);
+	addargs(&args, "--");
+	addargs(&args, "%s", session->src.host);
+	/* an empty payload: run it and wait, however long the login takes */
+	rc = hpn_run_feed(&args, "");
+	freeargs(&args);
+	if (rc != 0) {
+		xasprintf(&msg, "could not log in to %s", session->src.host);
+		proto_emit_error(msg);
+		free(msg);
+		mux_close(session);
+		return -1;
+	}
+	mux.ready = 1;
+
+	/* -O check reports "Master running (pid=N)" on stderr */
+	ssh_source_options(session, &args, 0, 0);
+	addargs(&args, "-oControlPath=%s", mux.path);
+	addargs(&args, "-O");
+	addargs(&args, "check");
+	addargs(&args, "--");
+	addargs(&args, "%s", session->src.host);
+	rc = hpn_run_capture(&args, output, sizeof(output), 5000, NULL, 1);
+	freeargs(&args);
+	if (rc == 0 && (cp = strstr(output, "(pid=")) != NULL) {
+		cp += strlen("(pid=");
+		cp[strcspn(cp, ")")] = '\0';
+		pid = strtonum(cp, 2, INT_MAX, &errstr);
+		if (errstr == NULL)
+			mux.pid = (pid_t)pid;
+	}
+	if (mux.pid == -1)
+		debug("no pid for the login to %s, so a signal leaves it to "
+		    "end after %d idle seconds", session->src.host,
+		    MUX_PERSIST_SEC);
+	return 0;
 }
 
 /* The decoded-frame callbacks. Protocol mode relays each frame as an EVENT
@@ -263,11 +447,58 @@ static void
 ev_progress(const struct hpns_progress *progress, void *ctx)
 {
 	(void)ctx;
+	/* a frame that decodes ends liveness mode */
+	liveness.blind = 0;
 	if (proto_human()) {
 		hpn_meter_relay_sample(meter_label, progress);
 		return;
 	}
 	proto_emit_progress(progress);
+}
+
+/* A frame arrived, readable or not. Human mode notes it for the local
+ * meter. In protocol mode, while progress cannot be read, an alive event
+ * goes out at most once a second, so the front end can show that the copy
+ * is running. */
+static void
+ev_frame(void *ctx)
+{
+	double now;
+
+	(void)ctx;
+	if (proto_human()) {
+		hpn_meter_relay_heard(NULL);
+		return;
+	}
+	if (!liveness.blind)
+		return;
+	now = monotime_double();
+	if (now - liveness.last_alive >= 1.0) {
+		liveness.last_alive = now;
+		proto_emit_alive();
+	}
+}
+
+/* The source's PROGRESS frames cannot be decoded. Warn once, then show
+ * only that the copy is running: the local meter in human mode, and alive
+ * events for the front end otherwise. */
+static void
+ev_mismatch(void *ctx)
+{
+	struct run_state *session = ctx;
+	char *msg;
+
+	if (!liveness.warned) {
+		liveness.warned = 1;
+		xasprintf(&msg, "Progress data from %s can't be parsed. The "
+		    "meter will only show that the copy is running.",
+		    session->src.host);
+		proto_emit_warning(msg);
+		free(msg);
+	}
+	liveness.blind = 1;
+	if (proto_human())
+		hpn_meter_relay_blind(meter_label);
 }
 
 /* Keep the END frame's counts for the done event and the summary. Then
@@ -281,6 +512,8 @@ ev_end(const struct hpns_end *end, void *ctx)
 	endinfo.files_done = end->files_done;
 	endinfo.ok = end->ok;
 	endinfo.got = 1;
+	/* the run is over, so no alive event follows */
+	liveness.blind = 0;
 	if (proto_human()) {
 		hpn_meter_relay_end(end->bytes_done);
 		return;
@@ -454,6 +687,8 @@ do_launch(struct run_state *session)
 	hooks.on_filedone = ev_filedone;
 	hooks.on_tick = hpn_meter_relay_tick;
 	hooks.on_degrade = ev_degrade;
+	hooks.on_frame = ev_frame;
+	hooks.on_mismatch = ev_mismatch;
 	/* discard raw bytes from a source that does not send frames */
 	hooks.passthrough_fd = -1;
 	hooks.ctx = session;
@@ -467,6 +702,8 @@ do_launch(struct run_state *session)
 	launch.legacy_relay = 1;
 	launch.args = &args;
 	launch.source_host = session->src.host;
+	/* a legacy retry joins the shared login, so it asks for nothing */
+	launch.shared_login = mux.ready;
 	launch.hooks = &hooks;
 	launch.plain_hooks = &hooks;
 	launch.pidp = &session->child;
@@ -600,6 +837,11 @@ run_session(struct run_state *session)
 	}
 	proto_emit_resolved(&session->src, &session->dst, session->streams);
 
+	/* One login to the source for the whole run, so a password or MFA
+	 * user is asked once. Every later ssh to the source joins it. */
+	if (mux_open(session) != 0)
+		goto fail;
+
 	/* Make sure the source trusts the target's host key on the port the
 	 * copy will use. A port the user gave is the only one tried. Without
 	 * one, HPN's port 2222 comes first, as hpnssh tries it, and 22 is the
@@ -685,6 +927,7 @@ run_session(struct run_state *session)
 	proto_emit_done(0, 1, 1, 0, 0, 0);
 	ret = 1;
  out:
+	mux_close(session);
 	hpn3scp_free_keyset(&keyset);
 	return ret;
 }
