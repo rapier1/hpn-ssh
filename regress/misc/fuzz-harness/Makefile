@@ -130,7 +130,8 @@ mkcorpus_hpn_status_frame: mkcorpus_hpn_status_frame.c ../../../hpn-status-frame
 # (the SOURCE host controls every byte of the keyscan capture).  Links the
 # real hostkey/proto/run objects; sshkey parsing comes from libssh, so build
 # the tree with the same sanitizer opts (see the top-of-file NB).
-# ssh_base_args is stubbed in the .cc (its home, hpn3scp.c, has main()).
+# ssh_base_args and add_addr_family_arg (from hpn3scp.c, which has main())
+# and pm_eprintf (from progressmeter.c) are stubbed in the .cc.
 hpn3scp_keyscan_fuzz: hpn3scp_keyscan_fuzz.o $(SK_NULL_OBJS) ../../../hpn3scp-hostkey.o ../../../hpn3scp-proto.o ../../../hpn3scp-run.o ../../../hpn-status-frame.o $(COMMON_DEPS)
 	$(CXX) -o $@ hpn3scp_keyscan_fuzz.o $(SK_NULL_OBJS) ../../../hpn3scp-hostkey.o ../../../hpn3scp-proto.o ../../../hpn3scp-run.o ../../../hpn-status-frame.o $(LDFLAGS) $(FUZZ_FLAGS) $(LIBS)
 

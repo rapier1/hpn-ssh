@@ -327,6 +327,8 @@ source_hostfiles(const struct run_state *session)
 	/* hpnssh -G prints the config it would use for the target */
 	ssh_base_args(session, &args, 0, 0);
 	addargs(&args, "hpnssh");
+	/* -T, or a -G dump with no terminal still remarks on the pty */
+	addargs(&args, "-T");
 	addargs(&args, "-G");
 	add_addr_family_arg(session, &args);
 	if (session->dst.port != -1) {

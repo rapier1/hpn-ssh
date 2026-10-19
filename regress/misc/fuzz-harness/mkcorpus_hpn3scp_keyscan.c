@@ -1,8 +1,26 @@
 /*
+ * Copyright (c) 2026 The Board of Trustees of Carnegie Mellon University.
+ *
+ *  Author: Chris Rapier <rapier@psc.edu>
+ *
+ * This library or code is free software; you can redistribute it and/or
+ * modify it under the terms of the BSD 2 Clause License.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+ * for more details.
+ *
+ * You should have received a copy of the BSD 2-Clause License along with this
+ * code, if not, see https://opensource.org/license/bsd-2-clause.
+ *
+ */
+
+/*
  * Seed-corpus generator for hpn3scp_keyscan_fuzz.  Emits realistic
- * ssh-keyscan output lines (valid keys in several hostspec forms), the
- * adversarial cases the parser must reject (known_hosts markers, garbage,
- * truncated base64), and the skip cases (comments, blanks) into
+ * hpnssh-keyscan output lines (valid keys in several hostspec forms), the
+ * adversarial cases the parser must reject (known_hosts markers,
+ * certificates, garbage, truncated base64), and the skip cases (comments, blanks) into
  * ./hpn3scp_keyscan_corpus/.  Run once before the fuzzer.
  */
 
@@ -58,6 +76,8 @@ main(void)
 	    "@cert-authority *.example.org " PUB_ED25519 "\n");
 	emit("seed-marker-revoked",
 	    "@revoked target.example.org " PUB_ED25519 "\n");
+	/* a scan never asks for certificates, so one means tampering */
+	emit("seed-cert", "target.example.org " CERT_ED25519 "\n");
 	emit("seed-garbage", "this is not a keyscan line at all\n");
 	emit("seed-bad-b64",
 	    "target.example.org ssh-ed25519 NOT!VALID!BASE64!\n");
