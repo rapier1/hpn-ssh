@@ -3,11 +3,18 @@
 .\"
 .\"  Author: Chris Rapier <rapier@psc.edu>
 .\"
-.\" Redistribution and use in source and binary forms, with or without
-.\" modification, are permitted provided that the conditions of the
-.\" BSD 2-Clause License are met. See https://opensource.org/license/bsd-2-clause.
+.\" This library or code is free software; you can redistribute it and/or
+.\" modify it under the terms of the BSD 2 Clause License.
 .\"
-.Dd $Mdocdate: July 8 2026 $
+.\" This code is distributed in the hope that it will be useful, but WITHOUT
+.\" ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+.\" FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+.\" for more details.
+.\"
+.\" You should have received a copy of the BSD 2-Clause License along with this
+.\" code, if not, see https://opensource.org/license/bsd-2-clause.
+.\"
+.Dd $Mdocdate: October 19 2026 $
 .Dt HPN3SCP 1
 .Os
 .Sh NAME
@@ -15,7 +22,7 @@
 .Nd guided third-party (direct source-to-target) file copy for HPN-SSH
 .Sh SYNOPSIS
 .Nm hpn3scp
-.Op Fl 46AVZrv
+.Op Fl 46ArVvZ
 .Op Fl j Ar streams
 .Op Fl o Ar ssh_option
 .Op Fl X Ar sftp_option
@@ -25,18 +32,15 @@
 .Ar target
 .Sh DESCRIPTION
 .Nm
-copies files directly between two remote hosts \(en the
+copies files directly from the
 .Ar source
-and the
+host to the
 .Ar target
-\(en without the data passing through the local machine.
-It is a front end for the
+host, without the data passing through the local machine.
+It logs in to the source once, makes sure the source trusts the
+target's host key, then runs
 .Xr hpnscp 1
-.Fl R
-third-party transport: it arranges the pieces that a direct
-remote-to-remote transfer needs \(en target host-key trust, a
-source-to-target authentication check, and live progress \(en then
-launches the transfer and relays its status.
+on the source to copy the files to the target, and relays its progress.
 .Pp
 Three hosts take part:
 .Bl -tag -width Ds
@@ -79,23 +83,31 @@ or as an
 URI
 .Po
 .Sm off
-.No scp:// Oo Ar user No @ Oc Ar host Op : Ar port Oo / Ar path Oc
+.No scp:// Oo Ar user No @ Oc Ar host Oo : Ar port Oc Oo / Ar path Oc
 .Sm on
 .Pc .
+In a URI, the slash after the host or port only separates it from the
+path, so
+.Pa scp://host/dir
+is relative to the login directory and
+.Pa scp://host//dir
+is absolute.
 A missing
 .Ar path
-means the remote login directory; a missing
+means the remote login directory.
+A missing
 .Ar port
-uses the default from
-.Xr hpnssh_config 5 .
+uses the
+.Xr hpnssh_config 5
+default for the source.
+For the target it is 2222, with 22 tried when nothing answers there.
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
 .It Fl 4
 Use IPv4 addresses only.
-The address family applies to every connection
-.Nm
-makes: the target host-key scan and the transfer itself.
+It applies to every hop, from the login to the source to the transfer
+itself.
 .It Fl 6
 Use IPv6 addresses only.
 .It Fl A
@@ -103,13 +115,14 @@ Forward the local
 .Xr hpnssh-agent 1
 to the source so it can authenticate to the target with your keys.
 This is an explicit opt-in for the case where the source has no key of
-its own on the target; see
+its own on the target.
+See
 .Sx AUTHENTICATION
 for the trade-off it carries.
 .It Fl j Ar streams
 Use
 .Ar streams
-parallel data streams for the transfer
+parallel data streams for the transfer, from 1 to 24
 .Pq default 1 .
 Larger values raise throughput on high-bandwidth, high-latency paths.
 .It Fl o Ar ssh_option
@@ -121,10 +134,6 @@ to the source-to-target connection.
 May be repeated.
 .It Fl r
 Copy directories recursively.
-.It Fl v
-Raise the verbosity.
-May be repeated for more detail; passed through to the underlying
-programs.
 .It Fl V
 Verify the integrity of every transferred file
 .Pq an HPN-SSH extension .
@@ -134,7 +143,7 @@ After each file is copied, its source and target copies are hashed with XXH3
 and compared.
 On a terminal
 .Nm
-prints a one-line completion summary when the transfer finishes \(en
+prints a one-line completion summary when the transfer finishes,
 .Dq verified: N files OK ,
 or a warning naming how many files failed (the per-file paths are reported as
 they occur).
@@ -143,23 +152,13 @@ transfer.
 Note the capital letter:
 .Fl v
 is verbose.
-.It Fl Z
-Resume an interrupted transfer with integrity verification: only the byte
-ranges that differ between the source and target copies are re-sent, and the
-repaired file is re-verified.
-Implies
-.Fl V .
-.It Fl z Ar level
-HPN: use zstd transport compression
-.Pq Cm zstd@hpnssh.org
-at the given
-.Ar level
-.Pq 1 No to No 19
-on the source-to-target transfer.
-Forwarded to the source
-.Xr hpnscp 1 ;
-a peer without zstd support fails the transfer rather than silently
-falling back.
+.It Fl v
+Raise the verbosity.
+May be repeated for more detail.
+Each
+.Fl v
+is also passed to the login to the source and to the source's
+.Xr hpnscp 1 .
 .It Fl X Ar sftp_option
 Pass an SFTP-level option
 .Pq for example Cm bundle=yes
@@ -195,6 +194,27 @@ Forward a quoted string of raw
 switches to the transfer on the source, for options that
 .Nm
 does not expose directly.
+.It Fl Z
+Resume an interrupted transfer with integrity verification: only the byte
+ranges that differ between the source and target copies are re-sent, and the
+repaired file is re-verified.
+A file that already matches is skipped.
+Only the files it resumes are verified.
+Add
+.Fl V
+to verify every file.
+.It Fl z Ar level
+Use zstd transport compression
+.Pq Cm zstd@hpnssh.org
+at the given
+.Ar level
+.Pq 1 No to No 19
+on the source-to-target transfer
+.Pq an HPN-SSH extension .
+It is forwarded to the source's
+.Xr hpnscp 1 .
+A peer without zstd support fails the transfer rather than silently
+falling back.
 .El
 .Sh AUTHENTICATION
 .Nm
@@ -207,15 +227,15 @@ does this without ever placing your private key on the source:
 .Bl -tag -width Ds
 .It source-key-only (default)
 The source authenticates to the target with a key of its
-.Em own
-\(en a key held on the source whose public half is in the target's
+.Em own ,
+held on the source, whose public half is in the target's
 .Pa authorized_keys .
 Your launcher key never leaves the launcher, and no agent is forwarded.
 This is the most contained arrangement and requires no extra flags.
 If the source cannot log in to the target, the transfer stops before any
 data moves, and the source's own error explains why.
 The usual fix is a single
-.Xr ssh-copy-id 1
+.Xr hpnssh-copy-id 1
 run on the source.
 .It agent forwarding Pq Fl A
 If the source has no key of its own on the target, but you can reach the
@@ -248,25 +268,41 @@ See
 .Xr hpnssh-add 1 .
 .El
 .Pp
-In both cases the launcher authenticates to the source using your normal
+In both cases the launcher logs in to the source once, with your normal
 .Xr hpnssh 1
-credentials.
-Authentication must be non-interactive (public key or a forwarded agent);
-.Nm
-does not prompt for passwords on the source-to-target hop.
+credentials, and every step of the run shares that login.
+It may ask for a password or another factor.
+The source's own login to the target cannot prompt, so it must use a key
+or a forwarded agent.
 .Sh HOST KEY TRUST
 For the source to connect to the target under strict host-key checking,
 the source must already trust the target's host key.
 When it does not,
 .Nm
-brokers that trust before launching:
-it has the source scan the target's host key, verifies it, and \(en only
-on success \(en records it in the source's
-.Pa known_hosts .
-Verification is fail-closed: the key is accepted only if it is
-authenticated by a DNSSEC-signed SSHFP record, or if you confirm its
-fingerprint at an interactive prompt.
+brokers that trust before the copy starts.
+The source scans the target's host keys, and
+.Nm
+checks them on the launcher, because the source's output is not trusted.
+A key is accepted only on evidence that does not come from the source:
+a DNSSEC-signed SSHFP record, a matching entry in the launcher's own
+.Pa known_hosts ,
+or your confirmation of its fingerprint at a prompt.
+Only the key the copy would use is offered for confirmation.
+Without a terminal there is no prompt, so the copy stops.
+A key that an SSHFP record or the launcher's
+.Pa known_hosts
+contradicts stops the copy as well.
 There is no blind-accept mode.
+.Pp
+An accepted key is added to the first
+.Pa known_hosts
+file that the source's
+.Xr hpnssh 1
+uses, hashed when that host's
+.Cm HashKnownHosts
+is set, in the form
+.Xr hpnssh 1
+itself writes.
 .Sh SOURCE ARGUMENTS
 .Nm
 sends the arguments for the source's
@@ -288,14 +324,13 @@ containing a character the shell acts on as a command, such as
 or
 .Ql $ ,
 is refused.
-The retry is a second connection, so you may be asked to log in again.
 .Fl X Cm StrictArgs
 refuses that mode instead.
 .Sh OUTPUT
 When standard output is a terminal,
 .Nm
-prints human-readable progress \(en a live meter during the transfer and
-plain-text errors \(en to the terminal.
+prints a live progress meter during the transfer, and its warnings and
+errors as plain text.
 When standard output is redirected or piped,
 .Nm
 instead emits a line-structured event protocol on standard output,
@@ -310,8 +345,7 @@ A key that is missing is one this version of
 .Nm
 does not report.
 A setting the user did not give, such as a port, is the word
-.Ql default ,
-meaning ssh's own default applies.
+.Ql default .
 The final
 .Ql done
 event's
@@ -340,8 +374,8 @@ $ hpn3scp -j4 user@src.example.org:/data/big.tar \e
 Same transfer when the source has no key of its own on the target,
 forwarding your agent instead:
 .Bd -literal -offset indent
-$ hpn3scp -A -j4 scp://user@src.example.org:2222/data/big.tar \e
-    scp://user@dst.example.org:2222/incoming/
+$ hpn3scp -A -j4 scp://user@src.example.org:2222//data/big.tar \e
+    scp://user@dst.example.org:2222//incoming/
 .Ed
 .Sh SEE ALSO
 .Xr hpnscp 1 ,
@@ -349,7 +383,7 @@ $ hpn3scp -A -j4 scp://user@src.example.org:2222/data/big.tar \e
 .Xr hpnssh 1 ,
 .Xr hpnssh-add 1 ,
 .Xr hpnssh-agent 1 ,
-.Xr ssh-copy-id 1 ,
+.Xr hpnssh-copy-id 1 ,
 .Xr hpnssh_config 5
 .Sh HISTORY
 .Nm

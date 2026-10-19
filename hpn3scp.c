@@ -121,7 +121,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: hpn3scp [-46AVZrv] [-j streams] [-o ssh_option]\n"
+	    "usage: hpn3scp [-46ArVvZ] [-j streams] [-o ssh_option]\n"
 	    "               [-X sftp_option] [-Y switches] [-z level]\n"
 	    "               source target\n");
 	exit(1);
@@ -393,8 +393,10 @@ mux_open(const struct run_state *session)
 	ssh_signal(SIGHUP, mux_signal);
 
 	/* -f goes to the background once logged in, with its stdio on
-	 * /dev/null, so it never holds our output open */
-	ssh_source_options(session, &args, 0, 0);
+	 * /dev/null, so it never holds our output open. The master forwards
+	 * the agent for a joining session only when it forwards it itself,
+	 * so -A goes on the master too. */
+	ssh_source_options(session, &args, 0, session->use_ambient);
 	addargs(&args, "-f");
 	addargs(&args, "-N");
 	addargs(&args, "-oControlMaster=yes");
@@ -613,8 +615,8 @@ launch_hpnscp_args(const struct run_state *session, arglist *args)
 
 	memset(args, 0, sizeof(*args));
 	/* The target key is trusted by now, from the broker or from before,
-	 * so the workers are held to strict checking. A user -o after this
-	 * can override it. */
+	 * so the workers are held to strict checking. ssh keeps the first
+	 * value of an option, so a user's -o after this cannot loosen it. */
 	addargs(args, "-o");
 	addargs(args, "StrictHostKeyChecking=yes");
 	/* the user's -v reaches the source hpnscp */
