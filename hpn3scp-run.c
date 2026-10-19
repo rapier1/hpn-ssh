@@ -22,8 +22,8 @@
  * passes the status frames it sends on stdout to the caller's hooks.
  * hpnscp -R and hpn3scp both launch through it, by way of
  * hpn-launch-args.c. hpn_run_capture() and hpn_run_feed() run the short
- * commands of hpn3scp's host-key broker. One reads the output under a
- * timeout, and the other writes a payload to the command's stdin. */
+ * commands of hpn3scp's host-key broker and shared login. One reads the
+ * output under a timeout, and the other writes a payload to its stdin. */
 
 #include "includes.h"
 

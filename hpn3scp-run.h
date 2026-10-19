@@ -16,103 +16,95 @@
  *
  */
 
-/*
- * hpn3scp-run.h - shared status-relay transfer runner.
+/* hpn3scp-run.h - running the commands that hpnscp and hpn3scp start.
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- * Extracted from scp.c's -R status path so hpnscp (local ANSI meter) and
- * hpn3scp (structured event stream) share one launch+parse loop.  See
- * hpn-status-relay-design.md and hpn-launcher-design.md.
- *
- * hpn_run_status() forks a command with a piped stdout, parses HPNS status
- * frames from it, and dispatches decoded frames to the caller's hooks.  A
- * garbled stream degrades to verbatim passthrough (telemetry never control):
- * the caller decides where those raw bytes go via passthrough_fd - STDOUT
- * for hpnscp, a discard (-1) for hpn3scp so raw remote bytes never touch its
- * control protocol.  Return value comes from the child's exit status, the
- * same contract as scp's do_local_cmd().
- */
+ * hpn_run_status() runs the ssh that starts hpnscp on the source host and
+ * passes the status frames it sends to the caller's hooks. hpnscp -R and
+ * hpn3scp both launch through it. hpn_run_capture() and hpn_run_feed()
+ * run the short commands of hpn3scp's host-key broker and shared login. */
 
 #ifndef HPN3SCP_RUN_H
 #define HPN3SCP_RUN_H
 
-#include <sys/types.h>
+#include <sys/types.h>	/* for pid_t, size_t, and u_char */
 
-#include "hpn-status-frame.h"
-
+/* Defined in misc.h and hpn-status-frame.h. Only pointers are needed
+ * here, so callers need not include either. */
 struct arglist;
+struct hpns_hello;
+struct hpns_progress;
+struct hpns_end;
+struct hpns_filefail;
+struct hpns_filedone;
 
-/*
- * Per-transfer hooks.  Any hook may be NULL.  Decoded-frame hooks receive
- * the validated struct; on_tick fires roughly once a second (poll timeout /
- * signal wake) so a live local meter can repaint during quiet spells;
- * on_degrade fires once when the frame stream is abandoned for passthrough.
- * ctx is passed to every hook.
- */
+/* The caller's side of a status run. Any hook may be NULL, and every
+ * hook gets ctx. The decoded-frame hooks get the validated struct. */
 struct hpn_run_hooks {
+	/* Unused today. A launcher that implements HPNS_CAP_PULL needs it,
+	 * to read the source's caps before it sends any request. */
 	void (*on_hello)(const struct hpns_hello *, void *ctx);
 	void (*on_progress)(const struct hpns_progress *, void *ctx);
 	void (*on_end)(const struct hpns_end *, void *ctx);
-	/* on_file_fail fires once per failed file, before on_end.  The path in
-	 * the struct is a borrowed pointer valid only for the duration of the
-	 * call - the hook must copy or encode it before returning. */
+	/* Once per failed file, before on_end. The path is borrowed for the
+	 * call only, so the hook copies or encodes it before returning. */
 	void (*on_file_fail)(const struct hpns_filefail *, void *ctx);
-	/* on_filedone fires once per file with its final transfer-log status
-	 * (source armed with the "log" env value; older sources never emit
-	 * it).  Same borrowed-path contract as on_file_fail. */
+	/* Once per file with its final transfer-log status, from a source
+	 * armed with the "log" value. The path is borrowed as for
+	 * on_file_fail. */
 	void (*on_filedone)(const struct hpns_filedone *, void *ctx);
+	/* About once a second on a quiet poll, and when a signal wakes the
+	 * run, so a live meter can repaint */
 	void (*on_tick)(void *ctx);
+	/* once, when the run gives up on frames and passes output through */
 	void (*on_degrade)(void *ctx);
-	/* on_frame fires for every complete frame, decoded or not, as a sign
-	 * that the source is still sending. */
+	/* For every complete frame, decoded or not, as a sign that the source
+	 * is still sending */
 	void (*on_frame)(void *ctx);
-	/* on_mismatch fires when about five seconds of PROGRESS frames in a
-	 * row fail to decode, so the consumer can warn that progress cannot
-	 * be read. A decoded PROGRESS restarts the count. */
+	/* When about five seconds of PROGRESS frames in a row fail to decode,
+	 * so the consumer can warn that progress cannot be read. A decoded
+	 * PROGRESS restarts the count. */
 	void (*on_mismatch)(void *ctx);
-	int  passthrough_fd;	/* raw bytes after degrade go here; <0 = discard */
+	/* where raw output goes after a degrade, or -1 to drop it */
+	int		 passthrough_fd;
 	/* Bytes written to the child's stdin, which is then closed. NULL
 	 * leaves stdin as the child inherits it. */
-	const u_char *stdin_data;
-	size_t	stdin_len;
-	void *ctx;
+	const u_char	*stdin_data;
+	size_t		 stdin_len;	/* the length of stdin_data */
+	void		*ctx;		/* passed to every hook */
 };
 
 /* What a status run saw, so a launcher can tell a source that read its
  * argument list from one that did not. */
 struct hpn_run_result {
 	int	got_hello;	/* a HELLO or PROGRESS frame arrived */
-	int	exited;		/* the child exited rather than died */
+	int	exited;		/* the child exited, not killed by a signal */
 	int	exit_status;	/* its exit status, when exited */
 };
 
-/* Fork and exec a->list[0] with a piped stdout, and dispatch its HPNS
- * frames to h. When h->stdin_data is set, it is written to the child's
- * stdin, which is then closed. If pidp is not NULL it receives the child
- * pid after fork and -1 after reap, so the caller's own signal handler can
- * kill the child. If res is not NULL it reports whether a HELLO arrived and
- * how the child ended. Returns 0 if the child exited 0, and -1
- * otherwise. */
-int	hpn_run_status(struct arglist *a, pid_t *pidp,
-	    const struct hpn_run_hooks *h, struct hpn_run_result *res);
+/* Fork and exec args->list[0] with a piped stdout, and pass its HPNS frames
+ * to hooks. When hooks->stdin_data is set, it is written to the child's
+ * stdin, which is then closed. A source that sends no frame within five
+ * seconds, or whose stream fails to parse, has its output passed through
+ * instead. If pidp is not NULL, it receives the child's pid after the fork
+ * and -1 after the reap, so the caller's own signal handler can kill the
+ * child. If res is not NULL, it reports whether a HELLO arrived and how
+ * the child ended. Returns 0 if the child exited 0, and -1 otherwise. */
+int	hpn_run_status(struct arglist *args, pid_t *pidp,
+	    const struct hpn_run_hooks *hooks, struct hpn_run_result *res);
 
-/*
- * Fork+exec a->list[0] with a piped stdout, capture up to buflen-1 bytes of
- * its output into buf (always NUL-terminated), enforce a wall-clock timeout,
- * and reap.  With with_stderr set, its stderr is captured too, merged with
- * stdout.  Output past that is read and dropped, and sets *truncated when
- * it is not NULL.  Returns 0 if the child exited 0 within the timeout, -1
- * otherwise (timeout, nonzero exit, or spawn failure).  For short one-shot
- * probes (the source-binary discovery), not streaming transfers.
- */
-int	hpn_run_capture(struct arglist *a, char *buf, size_t buflen,
+/* Fork and exec args->list[0] and collect its stdout, and its stderr too
+ * when with_stderr is set, into buf, NUL-terminated. Output past buflen - 1
+ * bytes is read and dropped, and sets *truncated when it is not NULL.
+ * Returns 0 if the child exited 0 within timeout_ms, and -1 if it did not,
+ * if reading failed, or if the timeout passed, which also sends it SIGTERM.
+ * For short commands, not transfers. */
+int	hpn_run_capture(struct arglist *args, char *buf, size_t buflen,
 	    int timeout_ms, int *truncated, int with_stderr);
 
-/*
- * Fork+exec a->list[0] feeding `input` to its stdin, then reap.  Returns 0
- * if the child exited 0, -1 otherwise.  For pushing a small payload (e.g.
- * known_hosts lines) to a remote command via ssh.
- */
-int	hpn_run_feed(struct arglist *a, const char *input);
+/* Fork and exec args->list[0], write input to its stdin, close it, and
+ * reap the child. Returns 0 if all of input was written and the child
+ * exited 0, and -1 otherwise. There is no timeout, so a person can answer
+ * a login prompt. */
+int	hpn_run_feed(struct arglist *args, const char *input);
 
 #endif /* HPN3SCP_RUN_H */

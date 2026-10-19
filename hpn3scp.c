@@ -48,6 +48,7 @@
 #include "readconf.h"	/* ssh_valid_ruser */
 #include "ssherr.h"
 #include "hpn-meter.h"	/* relay meter source */
+#include "hpn-status-frame.h"	/* the frame structs and flags */
 #include "hpn-compress.h"	/* HPN_ZSTD_LEVEL_MIN, HPN_ZSTD_LEVEL_MAX */
 #include "sftp-parallel.h"	/* SFTP_PARALLEL_MAX_WORKERS */
 #include "xmalloc.h"

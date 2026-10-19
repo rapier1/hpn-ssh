@@ -46,6 +46,7 @@
 #include "xmalloc.h"
 #include "hpn-meter.h"
 #include "hpn-progressmeter.h"
+#include "hpn-status-frame.h"
 #include "hpn3scp-run.h"
 #include "sftp-hpn-transferlog.h"
 #include "hpn-launch-args.h"
