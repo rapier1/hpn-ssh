@@ -475,15 +475,6 @@ stop_progress_meter(void)
 }
 
 /*
- * Display session mechanics for a meter owned by the hpn-meter core:
- * everything start_progress_meter does around the meter state itself. The
- * initial forced paint routes back to the core's fill through the hook in
- * refresh_progress_meter, so the core must be current before this is
- * called. Frame mode skips the TTY arming and the initial paint for the
- * same reasons start_progress_meter does: stdout is the frame channel, and
- * phase flags are set only after start returns.
- */
-/*
  * Display session for the relay source (hpn-meter.c): TTY arming and the
  * alarm, with two deliberate differences from pm_display_begin. No initial
  * forced paint, because nothing has arrived to paint until the first frame,
@@ -519,6 +510,15 @@ pm_display_end_relay(void)
 	atomicio(vwrite, STDOUT_FILENO, "\n", 1);
 }
 
+/*
+ * Display session mechanics for a meter owned by the hpn-meter core:
+ * everything start_progress_meter does around the meter state itself. The
+ * initial forced paint routes back to the core's fill through the hook in
+ * refresh_progress_meter, so the core must be current before this is
+ * called. Frame mode skips the TTY arming, because stdout is the frame
+ * channel. Its initial paint still runs and goes out as a frame, which is
+ * safe because meter_init sets the phase flags before this is called.
+ */
 void
 pm_display_begin(void)
 {
@@ -534,6 +534,10 @@ pm_display_begin(void)
 			meter_tty_arm();
 		if (can_output() || pm_debug_fp != NULL)
 			refresh_progress_meter(1);
+	} else {
+		/* the frame marks the meter's start for the relay, whose
+		 * elapsed time would otherwise run from the first alarm tick */
+		refresh_progress_meter(1);
 	}
 	ssh_signal(SIGALRM, sig_alarm);
 	alarm(UPDATE_INTERVAL);

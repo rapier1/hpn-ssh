@@ -94,9 +94,17 @@ static struct {
 	double	 file_start;	/* monotime of the last preserved row */
 	int	 row_pending;	/* fill paints one completed-file row */
 	uint64_t row_bytes;	/* the completed file's bytes */
-	uint64_t row_avg;	/* its average rate */
+	uint64_t row_rate;	/* its rate, as the source measured it */
 	uint64_t row_peak;	/* its peak inst rate */
 	long	 row_elapsed;	/* its elapsed seconds */
+	/* The last completed row is still the line on screen. A repaint with
+	 * nothing new redraws it, and the line breaks only before something
+	 * new is painted, so a final row is never followed by another. */
+	int	 row_open;
+	uint64_t row_mark;	/* bytes_done when that row was painted */
+	uint64_t row_total;	/* bytes_total when that row was painted */
+	int	 row_phase;	/* relay_phase() when that row was painted */
+	int	 rows;		/* completed rows painted in this run */
 } relay;
 
 /* The core requires a counter, but the relay fill never reads it. */
@@ -290,13 +298,23 @@ hpn_meter_relabel(struct hpn_meter *meter, const void *owner, const char *label)
 void
 hpn_meter_stop(struct hpn_meter *meter, const void *owner)
 {
+	double elapsed, rate;
+
 	if (!meter_owned(meter, owner, "stop"))
 		return;
+	/* The completion frame's rate is the whole-transfer average, the
+	 * figure a local final line shows. A frame-mode source never paints
+	 * that line, so rate_ema still holds the last tick's running
+	 * estimate, or 0 for a transfer shorter than one tick. */
+	elapsed = monotime_double() - meter->start_t;
+	rate = 0;
+	if (elapsed >= 0.001)
+		rate = (*meter->ctr - meter->start_pos) / elapsed;
 	/* The display session needs two positions. First, the last painted
 	 * one decides whether a final repaint is owed, since a completed
 	 * transfer's last alarm paint is usually short of 100%. Second, the
 	 * fresh counter gives the completion frame's byte totals. */
-	pm_display_end(meter->cur_pos, *meter->ctr, meter->total, meter->rate_ema);
+	pm_display_end(meter->cur_pos, *meter->ctr, meter->total, rate);
 	/* only now, because that final repaint goes through refresh, which
 	 * paints only the current meter */
 	current_meter = NULL;
@@ -423,6 +441,25 @@ hpn_meter_refresh_current(int force_update)
 
 /* ---- relay source ----------------------------------------------------- */
 
+/* The phase a row was painted in, so a phase change counts as new */
+static int
+relay_phase(void)
+{
+	return (relay.verifying << 1) | relay.resuming;
+}
+
+/* Fill view with the completed row held in the row_* snapshot */
+static void
+relay_row_view(struct meter_view *view)
+{
+	view->cur = view->total = (off_t)relay.row_bytes;
+	view->rate = (long long)relay.row_rate;
+	view->inst = (off_t)relay.row_peak;
+	view->done = 1;
+	view->percent = 100;
+	view->elapsed_sec = relay.row_elapsed;
+}
+
 /* The relay fill. Everything shown comes from the stored frame telemetry.
  * The only local inputs are wall-clock ages: the total elapsed time for
  * the completion line, and the last frame's age for stall detection, so a
@@ -453,6 +490,21 @@ relay_fill(struct hpn_meter *meter, struct meter_view *view)
 		view->label = vlabel;
 	}
 
+	/* An open row is the line on screen. With nothing new since it, the
+	 * repaint redraws that row. Anything new breaks the line first, so
+	 * the row stays as history. */
+	if (relay.row_open) {
+		if (!relay.row_pending && !relay.blind &&
+		    relay.bytes_done == relay.row_mark &&
+		    relay.bytes_total == relay.row_total &&
+		    relay_phase() == relay.row_phase) {
+			relay_row_view(view);
+			return;
+		}
+		pm_meter_line_break();
+		relay.row_open = 0;
+	}
+
 	/* Liveness mode: the source is sending but its progress cannot be
 	 * read, so show only the running time, or a stall once nothing has
 	 * arrived. The END line, if one decodes, is still the normal one. */
@@ -467,19 +519,11 @@ relay_fill(struct hpn_meter *meter, struct meter_view *view)
 	}
 
 	/* A completed-file row: one preserved line per source-side file
-	 * boundary, shown as a done row with the file's bytes, its average
-	 * and peak rates, and its elapsed time. The average is derived here,
-	 * but from the exact byte span between two boundary frames over the
-	 * wall time between them. That whole-file quotient cannot alias
-	 * against the frame cadence the way a per-sample rate would. */
+	 * boundary, shown as a done row with the file's bytes, the source's
+	 * rate for it, its peak, and its elapsed time. */
 	if (relay.row_pending) {
 		relay.row_pending = 0;
-		view->cur = view->total = (off_t)relay.row_bytes;
-		view->rate = (long long)relay.row_avg;
-		view->inst = (off_t)relay.row_peak;
-		view->done = 1;
-		view->percent = 100;
-		view->elapsed_sec = relay.row_elapsed;
+		relay_row_view(view);
 		return;
 	}
 
@@ -513,14 +557,19 @@ relay_fill(struct hpn_meter *meter, struct meter_view *view)
 	view->eta_sec = relay.eta_sec;
 	view->done = relay.done;
 	view->stalled = !relay.done && silent;
+	/* a completed verify line times the verify phase alone */
 	view->elapsed_sec = (long)(now - relay.started);
+	if (relay.done && relay.verifying)
+		view->elapsed_sec = (long)(now - relay.file_start);
 
 	/* The rate and inst choices are the relay's own, so they live here
 	 * and not in the shared renderer. First, a silent source shows no
 	 * rate, because its last value is stale. Second, completion shows
 	 * the transfer-phase peak, because a verify-phase hash peak is not a
 	 * network rate. The relay never derives a rate or ETA locally. */
-	if (relay.done && relay.rate_inst_peak_xfer > 0)
+	if (relay.done && relay.verifying)
+		view->inst = (off_t)relay.rate_inst_max;
+	else if (relay.done && relay.rate_inst_peak_xfer > 0)
 		view->inst = (off_t)relay.rate_inst_peak_xfer;
 	else if (relay.done)
 		view->inst = (off_t)relay.rate_inst_max;
@@ -578,6 +627,24 @@ relay_start_once(const char *label)
 	}
 }
 
+/* Paint the row held in the row_* snapshot and keep it open */
+static void
+relay_paint_row(void)
+{
+	relay.row_pending = 1;
+	refresh_progress_meter(1);
+	/* The fill clears row_pending when it paints the row. A refresh that
+	 * did not reach the fill leaves it set, and nothing is open. */
+	if (!relay.row_pending) {
+		relay.row_open = 1;
+		relay.row_mark = relay.bytes_done;
+		relay.row_total = relay.bytes_total;
+		relay.row_phase = relay_phase();
+	}
+	relay.row_pending = 0;
+	relay.rows++;
+}
+
 /* Take one PROGRESS frame from the remote source. The frame consumers
  * (scp -R and hpn3scp) call this for every frame. The first frame starts
  * the meter under label. Otherwise it does nothing while the relay meter
@@ -589,7 +656,7 @@ relay_start_once(const char *label)
 void
 hpn_meter_relay_sample(const char *label, const struct hpns_progress *frame)
 {
-	double now, span;
+	double now;
 
 	relay_start_once(label);
 	if (current_meter != &relay_meter)
@@ -631,8 +698,9 @@ hpn_meter_relay_sample(const char *label, const struct hpns_progress *frame)
 	/* HPNS_F_BOUNDARY marks a frame the source emitted at a serial file
 	 * boundary, carrying that file's exact end state (see
 	 * hpn_pm_meter_done). Preserve a completed-file row. Its bytes are the
-	 * span since the last boundary, its average is that span over the
-	 * wall time, and its peak is the largest frame inst seen within it.
+	 * span since the last boundary, its rate is the one the source
+	 * measured, as a local meter shows, and its peak is the largest frame
+	 * inst seen within it.
 	 * A rise in files_done is not a boundary, because a fleet source's
 	 * external counts rise on ordinary ticks and would paint spurious
 	 * rows. Rows are limited to one per second, so a source streaming
@@ -640,19 +708,12 @@ hpn_meter_relay_sample(const char *label, const struct hpns_progress *frame)
 	 * into the next row, which then covers every file since the last
 	 * one. */
 	if ((frame->flags & HPNS_F_BOUNDARY) && now - relay.last_break >= 1.0) {
-		span = now - relay.file_start;
 		relay.last_break = now;
 		relay.row_bytes = frame->bytes_done - relay.file_base;
-		relay.row_avg = 0;
-		if (span >= 0.001)
-			relay.row_avg = (uint64_t)(relay.row_bytes / span);
+		relay.row_rate = frame->rate_bps;
 		relay.row_peak = relay.file_inst_max;
-		relay.row_elapsed = (long)span;
-		relay.row_pending = 1;
-		refresh_progress_meter(1);
-		/* clear it in case the refresh did not reach the fill */
-		relay.row_pending = 0;
-		pm_meter_line_break();
+		relay.row_elapsed = (long)(now - relay.file_start);
+		relay_paint_row();
 		relay.file_base = frame->bytes_done;
 		relay.file_start = now;
 		relay.file_inst_max = 0;
@@ -660,34 +721,48 @@ hpn_meter_relay_sample(const char *label, const struct hpns_progress *frame)
 	refresh_progress_meter(0);
 }
 
-/* END received: force the completion line, with 100%, the total elapsed
- * time, and the peak instantaneous rate. The caller still closes the meter
- * for the trailing newline. */
+/* END received: leave the final line local hpnscp would. A run that ends
+ * in the verify phase completes its verify line in place. After serial
+ * rows, the last row stands when it covers every byte, and otherwise one
+ * more row covers the files since it. A run without rows, a parallel one,
+ * gets a single completion line for the whole run. Rates stay the
+ * source's own. The caller still closes the meter for the trailing
+ * newline. */
 void
 hpn_meter_relay_end(uint64_t bytes_done)
 {
-	double now, dur;
+	double now;
 
 	if (current_meter != &relay_meter)
 		return;
+	now = monotime_double();
+	relay.done = 1;
+	relay.rate_inst = 0;
+	relay.last_frame = now;
+	/* the verify line keeps its hash bytes and is the final line */
+	if (relay.verifying) {
+		refresh_progress_meter(1);
+		return;
+	}
+	relay.resuming = 0;
+	if (relay.rows > 0) {
+		/* the last row already covers every byte */
+		if (relay.row_open && bytes_done == relay.row_mark)
+			return;
+		/* the files since the last row get one row, as a fold does */
+		relay.row_bytes = 0;
+		if (bytes_done > relay.file_base)
+			relay.row_bytes = bytes_done - relay.file_base;
+		relay.row_rate = relay.rate;
+		relay.row_peak = relay.file_inst_max;
+		relay.row_elapsed = (long)(now - relay.file_start);
+		relay.bytes_done = bytes_done;
+		relay_paint_row();
+		return;
+	}
 	relay.bytes_done = bytes_done;
 	if (bytes_done > relay.bytes_total)
 		relay.bytes_total = bytes_done;
-	relay.done = 1;
-	/* The phases are over at END, so the completion line summarizes the
-	 * transfer without a "verify:" or "resume check:" prefix. */
-	relay.verifying = 0;
-	relay.resuming = 0;
-	/* The whole-run average for the completion line, matching the local
-	 * meter. It is computed over the full local duration, so the frames'
-	 * per-tick steps cannot alias it. */
-	now = monotime_double();
-	dur = now - relay.started;
-	relay.rate = 0;
-	if (dur >= 0.001)
-		relay.rate = (uint64_t)(bytes_done / dur);
-	relay.rate_inst = 0;
-	relay.last_frame = now;
 	refresh_progress_meter(1);
 }
 

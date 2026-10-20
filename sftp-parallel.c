@@ -1088,7 +1088,11 @@ sftp_parallel_progress_start_counted(struct sftp_parallel *fleet, const char *ve
  * since the meter is bound to that thread and a repaint from here is
  * refused. If the reporter has not answered within two of its ticks it is
  * busy rather than gone, so the binding is dropped and the stop paints from
- * this thread. */
+ * this thread.
+ *
+ * The final line's average runs to that paint, so it can include up to
+ * one reporter tick (REPORTER_TICK_MS) of waiting after the last byte.
+ * That is noise on a long transfer, but it shows on one of a few seconds. */
 void
 sftp_parallel_progress_stop(struct sftp_parallel *fleet)
 {
