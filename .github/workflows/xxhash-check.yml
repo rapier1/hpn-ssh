@@ -1,0 +1,52 @@
+name: xxHash update check
+
+# Open an issue when xxHash has a release newer than the vendored xxhash.h.
+# It never changes the code, because updating stays a manual decision.
+# GitHub runs scheduled workflows only from the default branch.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # main
+    - name: compare the vendored version with the latest release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        ours=$(awk '/^#define XXH_VERSION_(MAJOR|MINOR|RELEASE)/ {print $3}' \
+            xxhash.h | paste -sd. -)
+        latest=$(gh api repos/Cyan4973/xxHash/releases/latest --jq .tag_name)
+        latest=${latest#v}
+        echo "vendored xxhash.h: $ours, latest xxHash release: $latest"
+        if [ -z "$ours" ] || [ -z "$latest" ]; then
+          echo "::error::could not read a version"
+          exit 1
+        fi
+        # sort -V orders 0.10.0 after 0.8.3, where a plain sort would not
+        newest=$(printf '%s\n%s\n' "$ours" "$latest" | sort -V | tail -1)
+        if [ "$newest" = "$ours" ]; then
+          exit 0
+        fi
+        # one open issue per release, however many weeks it stays open
+        found=$(gh issue list --state open --search "xxHash $latest in:title" \
+            --json number --jq length)
+        if [ "$found" != 0 ]; then
+          echo "an open issue already reports xxHash $latest"
+          exit 0
+        fi
+        gh issue create \
+          --title "xxHash $latest is available (xxhash.h is $ours)" \
+          --body "xxHash $latest is out: https://github.com/Cyan4973/xxHash/releases/tag/v$latest
+
+        The vendored xxhash.h is $ours. Updating it is a manual decision.
+        XXH3's output is frozen, so an update should not change the hashes
+        that resume and verify compare between versions."
