@@ -663,14 +663,7 @@ There is no server option to disable it: like
 .Cm zlib@openssh.com ,
 it only ever activates when a client asks for it, and it obeys the same
 post-authentication (delayed) timing.
-.It Cm ZstdLevel
-HPN: the zstd compression level
-.Pq 1 No to No 19 , No default No 3
-the server uses for ITS outbound direction (downloads) when a client
-negotiates
-.Cm zstd@hpnssh.org .
-Each side sets its own outbound level independently; this does not
-affect what the client uses for uploads.
+The server compresses what it sends at the level the client asked for.
 .It Cm DenyGroups
 This keyword can be followed by a list of group name patterns, separated
 by spaces.

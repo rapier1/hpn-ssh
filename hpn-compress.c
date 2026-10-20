@@ -16,49 +16,107 @@
  *
  */
 
-/*
- * hpn-compress.c - zstd transport compression (see hpn-compress.h).
- */
+/* hpn-compress.c - zstd transport compression (see hpn-compress.h). */
 
 #include "includes.h"
 
 #include <sys/types.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "log.h"
+#include "packet.h"
 #include "sshbuf.h"
 #include "ssherr.h"
+#include "xmalloc.h"
 #include "hpn-compress.h"
+
+/* The marker that carries the client's level to the server, inside the
+ * client's compression proposal. It is not a method, so the server never
+ * picks it, and a server that does not know it ignores it. */
+#define HPN_ZSTD_MARKER_PREFIX	"zstd-level-"
+#define HPN_ZSTD_MARKER_SUFFIX	"@hpnssh.org"
+
+/* The client's compression proposal for zstd at level: the method, then
+ * the marker. The string is static and good until the next call. */
+const char *
+hpn_zstd_client_proposal(int level)
+{
+	static char proposal[64];
+
+	snprintf(proposal, sizeof(proposal), "%s,%s%d%s", HPN_ZSTD_COMP_NAME,
+	    HPN_ZSTD_MARKER_PREFIX, level, HPN_ZSTD_MARKER_SUFFIX);
+	return proposal;
+}
+
+/* Take the level from the client's marker for what the server sends. A
+ * proposal without a marker, or with a level out of range, leaves the
+ * level as it was. */
+void
+hpn_zstd_take_peer_level(struct ssh *ssh, const char *proposal)
+{
+	size_t plen = strlen(HPN_ZSTD_MARKER_PREFIX);
+	size_t slen = strlen(HPN_ZSTD_MARKER_SUFFIX);
+	char *list, *cp, *name;
+	const char *errstr;
+	size_t nlen;
+	int level;
+
+	if (proposal == NULL)
+		return;
+	list = cp = xstrdup(proposal);
+	while ((name = strsep(&cp, ",")) != NULL) {
+		nlen = strlen(name);
+		if (nlen <= plen + slen ||
+		    strncmp(name, HPN_ZSTD_MARKER_PREFIX, plen) != 0 ||
+		    strcmp(name + nlen - slen, HPN_ZSTD_MARKER_SUFFIX) != 0)
+			continue;
+		name[nlen - slen] = '\0';
+		level = (int)strtonum(name + plen, HPN_ZSTD_LEVEL_MIN,
+		    HPN_ZSTD_LEVEL_MAX, &errstr);
+		if (errstr != NULL)
+			debug_f("ignoring the zstd level marker: level %s",
+			    errstr);
+		else {
+			debug_f("the client asked for zstd level %d", level);
+			ssh_packet_set_zstd_level(ssh, level);
+		}
+		break;
+	}
+	free(list);
+}
 
 #ifdef HAVE_LIBZSTD
 
 #include <zstd.h>
 
-/*
- * Decompressor window cap: the compressor at levels 1-19 never uses a
- * window above 8 MiB (windowLog 23), so 24 (16 MiB) accepts every
- * frame we can negotiate while bounding the memory an authenticated
- * peer's frames can demand - a cap the zlib path never had.
- */
+/* The decompressor's window limit, as a power of two. The compressor at
+ * levels 1 to 19 never uses a window above 8 MiB (windowLog 23), so 16 MiB
+ * accepts every frame we negotiate while bounding the memory an
+ * authenticated peer's frames can demand. The zlib path has no such cap. */
 #define HPN_ZSTD_WINDOW_LOG_MAX	24
 
-/* transform chunk; matches the spirit of zlib's 4 KiB working buffer
- * but sized for zstd's appetite */
+/* The stack buffer each compress or uncompress pass fills before copying
+ * to the output. zlib's path uses 4 KiB, and zstd works in larger blocks. */
 #define HPN_ZSTD_IOBUF		(16 * 1024)
 
+/* Outgoing state: the zstd context, its level, and the byte counts the
+ * debug summary reports when it is freed. */
 struct hpn_zstd_out {
 	ZSTD_CCtx *cctx;
 	int level;
-	unsigned long long raw_in;	/* pre-compression bytes (diag) */
-	unsigned long long comp_out;	/* post-compression bytes (diag) */
+	uint64_t raw_in;	/* bytes before compression */
+	uint64_t comp_out;	/* bytes after compression */
 };
 
+/* Incoming state: the zstd context and the byte counts behind the
+ * decompression ratio, which scales the channel window. */
 struct hpn_zstd_in {
 	ZSTD_DCtx *dctx;
-	unsigned long long comp_in;	/* wire (compressed) bytes seen */
-	unsigned long long raw_out;	/* plaintext (decompressed) bytes */
+	uint64_t comp_in;	/* compressed bytes from the wire */
+	uint64_t raw_out;	/* bytes after decompression */
 };
 
 static int
@@ -127,7 +185,8 @@ hpn_zstd_out_free(struct hpn_zstd_out **outp)
 	if (o == NULL)
 		return;
 	debug("compress outgoing (zstd): raw data %llu, compressed %llu, "
-	    "factor %.2f", o->raw_in, o->comp_out,
+	    "factor %.2f", (unsigned long long)o->raw_in,
+	    (unsigned long long)o->comp_out,
 	    o->raw_in == 0 ? 0.0 : (double)o->comp_out / o->raw_in);
 	ZSTD_freeCCtx(o->cctx);
 	free(o);
@@ -235,7 +294,7 @@ hpn_zstd_uncompress(struct hpn_zstd_in *i, struct sshbuf *in,
 u_int
 hpn_zstd_in_ratio_milli(struct hpn_zstd_in *i)
 {
-	unsigned long long r;
+	uint64_t r;
 
 	if (i == NULL || i->comp_in < (1ULL << 20))
 		return 1000;

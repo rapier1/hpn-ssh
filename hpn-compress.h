@@ -27,9 +27,9 @@
  * zlib path could never have falls out of the fleet design.
  *
  * All zstd knowledge lives here; packet.c only dispatches on the
- * negotiated method.  Compression level is a LOCAL parameter per
- * direction (there is no protocol field for it): the client's -z int
- * governs its outbound stream, the server's ZstdLevel its own.
+ * negotiated method.  The client's level governs both directions. It
+ * reaches the server as a marker in the client's compression proposal
+ * (see hpn_zstd_client_proposal).
  */
 
 #ifndef HPN_COMPRESS_H
@@ -40,6 +40,7 @@
 #define HPN_ZSTD_LEVEL_MAX	19
 #define HPN_ZSTD_LEVEL_DEFAULT	3
 
+struct ssh;
 struct sshbuf;
 struct hpn_zstd_out;	/* opaque; one per outbound direction */
 struct hpn_zstd_in;	/* opaque; one per inbound direction */
@@ -49,6 +50,13 @@ struct hpn_zstd_in;	/* opaque; one per inbound direction */
  * [MIN, MAX] are clamped.  Both return SSH_ERR_* on failure and
  * SSH_ERR_FEATURE_UNSUPPORTED when built without libzstd.
  */
+/* The client's compression proposal for zstd at a level: the method and
+ * a marker that carries the level, so the server compresses at it too. */
+const char *hpn_zstd_client_proposal(int);
+
+/* Server side. Take the client's level from its compression proposal. */
+void	hpn_zstd_take_peer_level(struct ssh *, const char *);
+
 int	hpn_zstd_out_start(struct hpn_zstd_out **outp, int level);
 int	hpn_zstd_in_start(struct hpn_zstd_in **inp);
 void	hpn_zstd_out_free(struct hpn_zstd_out **outp);

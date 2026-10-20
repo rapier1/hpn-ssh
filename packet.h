@@ -86,8 +86,6 @@ struct ssh {
 
 	/* logging data for ServerLogging patch*/
 	double start_time;
-	u_long fdout_bytes;
-	u_long stdin_bytes;
 
 	/* track that we are in a none cipher state */
 	int none;

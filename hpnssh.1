@@ -178,7 +178,7 @@ HPN: request zstd transport compression
 at the given
 .Ar level
 .Pq 1 No fastest to No 19 No best
-for this connection's outbound direction.
+for both directions of the connection.
 This is a faster alternative to
 .Fl C
 zlib compression, intended to be a throughput win on bandwidth-limited
@@ -191,8 +191,6 @@ is a deliberate request, not a hint;
 and
 .Fl C
 are mutually exclusive.
-The peer's own outbound level is set independently
-.Pq Cm ZstdLevel No on a server .
 .Pp
 .It Fl c Ar cipher_spec
 Selects the cipher specification for encrypting the session.

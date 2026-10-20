@@ -168,10 +168,10 @@ struct session_state {
 	int compression_in_failures;
 	int compression_out_failures;
 
-	/* HPN zstd@hpnssh.org streams (hpn-compress.c); NULL until the
-	 * method is negotiated and enabled.  zstd_level 0 = unset (the
-	 * module applies its default); set via ssh_packet_set_zstd_level
-	 * from -z (client) / ZstdLevel (server). */
+	/* HPN zstd@hpnssh.org streams (hpn-compress.c), NULL until the method
+	 * is negotiated and enabled. A zstd_level of 0 means unset, and the
+	 * module applies its default. The client sets it from -z, and the
+	 * server from the level in the client's proposal. */
 	struct hpn_zstd_out *zstd_out;
 	struct hpn_zstd_in *zstd_in;
 	int zstd_level;
@@ -2250,22 +2250,29 @@ sshpkt_fatal(struct ssh *ssh, int r, const char *fmt, ...)
 /* this prints out the final log entry */
 void
 sshpkt_final_log_entry (struct ssh *ssh) {
+	uint64_t ibytes, obytes;
 	double total_time;
 
+	/* packet.c is shared, and a client has no server line to write */
+	if (!ssh->state->server_side)
+		return;
+	/* IN and OUT are as the client sees them. IN is what the server
+	 * sent, and OUT is what it received. */
+	ssh_packet_get_bytes(ssh, &ibytes, &obytes);
 	if (ssh->start_time < 1) {
 		/* this will produce a NaN in the output so don't do that - cjr */
 		total_time = 0;
-		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %lu;OUT: %lu;Duration: %.1f;tPut_in: N/A;tPut_out: N/A",
+		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %llu;OUT: %llu;Duration: %.1f;tPut_in: N/A;tPut_out: N/A",
 		    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
-		    ssh->stdin_bytes, ssh->fdout_bytes, total_time);
+		    (unsigned long long)obytes, (unsigned long long)ibytes,
+		    total_time);
 	}
 	else {
 		total_time = monotime_double() - ssh->start_time;
-		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %lu;OUT: %lu;Duration: %.1f;tPut_in: %.1f;tPut_out: %.1f",
+		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %llu;OUT: %llu;Duration: %.1f;tPut_in: %.1f;tPut_out: %.1f",
 		    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
-		    ssh->stdin_bytes, ssh->fdout_bytes, total_time,
-		    ssh->stdin_bytes / total_time,
-		    ssh->fdout_bytes / total_time);
+		    (unsigned long long)obytes, (unsigned long long)ibytes,
+		    total_time, obytes / total_time, ibytes / total_time);
 	}
 }
 
@@ -2561,11 +2568,9 @@ ssh_packet_set_server(struct ssh *ssh)
 	ssh->kex->server = 1; /* XXX unify? */
 }
 
-/*
- * HPN: set the LOCAL outbound zstd compression level (client -z, server
- * ZstdLevel).  Level is not negotiated - each side compresses its own
- * direction at its own setting; 0 means the module default.
- */
+/* HPN: set the zstd compression level. The client sets it from -z, and the
+ * server from the level in the client's proposal, so both directions use
+ * the client's level. 0 means the module default. */
 void
 ssh_packet_set_zstd_level(struct ssh *ssh, int level)
 {
@@ -2716,6 +2721,7 @@ ssh_packet_get_state(struct ssh *ssh, struct sshbuf *m)
 	    (r = sshbuf_put_u64(m, state->p_read.blocks)) != 0 ||
 	    (r = sshbuf_put_u32(m, state->p_read.packets)) != 0 ||
 	    (r = sshbuf_put_u64(m, state->p_read.bytes)) != 0 ||
+	    (r = sshbuf_put_u32(m, (u_int)state->zstd_level)) != 0 || /* HPN */
 	    (r = sshbuf_put_stringb(m, state->input)) != 0 ||
 	    (r = sshbuf_put_stringb(m, state->output)) != 0 ||
 	    (r = sshbuf_put_u32(m, ENCODE_INT(state->interactive_mode))) != 0 ||
@@ -2852,7 +2858,7 @@ ssh_packet_set_state(struct ssh *ssh, struct sshbuf *m)
 	const u_char *input, *output;
 	size_t ilen, olen;
 	int r;
-	u_int interactive, qos_interactive, qos_other;
+	u_int interactive, qos_interactive, qos_other, zstd_level;
 
 	if ((r = kex_from_blob(m, &ssh->kex)) != 0 ||
 	    (r = newkeys_from_blob(m, ssh, MODE_OUT)) != 0 ||
@@ -2866,8 +2872,12 @@ ssh_packet_set_state(struct ssh *ssh, struct sshbuf *m)
 	    (r = sshbuf_get_u32(m, &state->p_read.seqnr)) != 0 ||
 	    (r = sshbuf_get_u64(m, &state->p_read.blocks)) != 0 ||
 	    (r = sshbuf_get_u32(m, &state->p_read.packets)) != 0 ||
-	    (r = sshbuf_get_u64(m, &state->p_read.bytes)) != 0)
+	    (r = sshbuf_get_u64(m, &state->p_read.bytes)) != 0 ||
+	    (r = sshbuf_get_u32(m, &zstd_level)) != 0)
 		return r;
+	/* HPN: the client's zstd level, set before set_postauth below
+	 * starts the delayed compression that uses it */
+	state->zstd_level = (int)zstd_level;
 	/*
 	 * We set the time here so that in post-auth privsep child we
 	 * count from the completion of the authentication.

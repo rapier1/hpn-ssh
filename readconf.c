@@ -58,6 +58,7 @@
 #include "digest.h"
 #include "sshbuf.h"
 #include "version.h"
+#include "hpn-compress.h"	/* HPN: ZstdLevel bounds */
 
 /* Format of the configuration file:
 
@@ -1511,7 +1512,22 @@ parse_time:
 		 * proposes zstd@hpnssh.org alone and a peer without it
 		 * fails the KEX rather than silently degrading. */
 		intptr = &options->zstd_level;
-		goto parse_int;
+		arg = argv_next(&ac, &av);
+		if ((errstr = atoi_err(arg, &value)) != NULL) {
+			error("%s line %d: integer value %s.",
+			    filename, linenum, errstr);
+			goto out;
+		}
+		/* the range the -z options accept */
+		if (value < HPN_ZSTD_LEVEL_MIN || value > HPN_ZSTD_LEVEL_MAX) {
+			error("%s line %d: ZstdLevel must be %d to %d.",
+			    filename, linenum, HPN_ZSTD_LEVEL_MIN,
+			    HPN_ZSTD_LEVEL_MAX);
+			goto out;
+		}
+		if (*activep && *intptr == -1)
+			*intptr = value;
+		break;
 
 	/*
 	 * We check to see if the command comes from the command

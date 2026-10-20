@@ -226,15 +226,16 @@ order_hostkeyalgs(char *host, struct sockaddr *hostaddr, u_short port,
 
 /*
  * HPN: the client's compression proposal.  -z / ZstdLevel means zstd is
- * REQUIRED: propose zstd@hpnssh.org alone, so a peer without it fails
- * the KEX with a clear no-match instead of silently degrading to the
- * slow zlib or to nothing.  Otherwise the stock zlib/none list.
+ * REQUIRED: propose zstd@hpnssh.org alone, with the marker that carries
+ * the level to the server, so a peer without it fails the KEX with a
+ * clear no-match instead of silently degrading to the slow zlib or to
+ * nothing.  Otherwise the stock zlib/none list.
  */
 static const char *
 client_compression_list(void)
 {
 	if (options.zstd_level > 0)
-		return HPN_ZSTD_COMP_NAME;
+		return hpn_zstd_client_proposal(options.zstd_level);
 	return compression_alg_list(options.compression);
 }
 

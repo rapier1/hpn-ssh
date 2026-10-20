@@ -421,9 +421,6 @@ server_loop2(struct ssh *ssh, Authctxt *authctxt)
 	collect_children(ssh);
 	free(pfd);
 
-	/* write final log entry (do we need this here? -cjr)*/
-	sshpkt_final_log_entry(ssh);
-
 	/* free all channels, no more reads and writes */
 	channel_free_all(ssh);
 

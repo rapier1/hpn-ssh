@@ -60,6 +60,7 @@
 #include "canohost.h"
 #include "digest.h"
 #include "xmalloc.h"
+#include "hpn-compress.h"	/* HPN: the client's zstd level */
 
 /* prototype */
 static int kex_choose_conf(struct ssh *, uint32_t seq);
@@ -1093,6 +1094,10 @@ kex_choose_conf(struct ssh *ssh, uint32_t seq)
 		    "rsa-sha2-512,rsa-sha2-512-cert-v01@openssh.com"))
 			kex->flags |= KEX_RSA_SHA2_512_SUPPORTED;
 	}
+
+	/* HPN: the client's zstd level governs what the server sends too */
+	if (kex->server)
+		hpn_zstd_take_peer_level(ssh, peer[PROPOSAL_COMP_ALGS_STOC]);
 
 	/* Algorithm Negotiation */
 	if ((r = choose_kex(kex, cprop[PROPOSAL_KEX_ALGS],
