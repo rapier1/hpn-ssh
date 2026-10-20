@@ -49,6 +49,7 @@
 #include "sshpty.h"
 #include "readconf.h"
 #include "clientloop.h"
+#include "hpn-mux-signal.h"
 
 /* from ssh.c */
 extern int tty_flag;
@@ -131,6 +132,7 @@ struct mux_master_state {
 #define MUX_FWD_DYNAMIC 3
 
 #define MUX_EXT_INFO		0x00000001
+#define MUX_EXT_HPN_SIGNAL	0x00000100	/* HPN: hpn-mux-signal.c */
 
 /* Bitmask of supported extensions */
 static u_int extensions = 0;
@@ -521,6 +523,11 @@ mux_master_process_ext_info(struct ssh *ssh, u_int rid,
 	} else if (strcmp(name, "channels") == 0) {
 		if ((msg = channel_open_message(ssh)) == NULL)
 			fatal_f("channel_open_message");
+		status = 1;
+	} else if (strcmp(name, HPN_MUX_SIGNAL_EXT) == 0) {
+		/* HPN: an action rather than information, see
+		 * hpn-mux-signal.c */
+		msg = hpn_mux_signal_sessions(ssh);
 		status = 1;
 	} else {
 		msg = xstrdup("info request type not supported");
@@ -1217,6 +1224,10 @@ mux_master_read_cb(struct ssh *ssh, Channel *c)
 		if ((r = sshbuf_put_cstring(out, "info")) != 0 ||
 		    (r = sshbuf_put_cstring(out, "0")) != 0)
 			fatal_fr(r, "put info extension");
+		/* HPN: the session signal request, see hpn-mux-signal.c */
+		if ((r = sshbuf_put_cstring(out, HPN_MUX_SIGNAL_EXT)) != 0 ||
+		    (r = sshbuf_put_cstring(out, "0")) != 0)
+			fatal_fr(r, "put signal extension");
 		if ((r = sshbuf_put_stringb(c->output, out)) != 0)
 			fatal_fr(r, "enqueue");
 		debug3_f("channel %d: hello sent", c->self);
@@ -1691,6 +1702,9 @@ mux_client_hello_exchange(int fd, int timeout_ms)
 		if (strcmp(name, "info") == 0) {
 			debug("Received 'info' extension");
 			extensions |= MUX_EXT_INFO;
+		} else if (strcmp(name, HPN_MUX_SIGNAL_EXT) == 0) {
+			debug("Received '%s' extension", name);	/* HPN */
+			extensions |= MUX_EXT_HPN_SIGNAL;
 		} else {
 			debug2("Unrecognised master extension \"%s\"", name);
 		}
@@ -2450,6 +2464,15 @@ muxclient(const char *path)
 		    "connection" : "channels");
 		if (info == NULL)
 			fatal_f("info request failed");
+		printf("%s", info);
+		exit(0);
+	case SSHMUX_COMMAND_HPN_SIGNAL:
+		/* HPN: rides the info request, see hpn-mux-signal.c */
+		if (!(extensions & MUX_EXT_HPN_SIGNAL))
+			fatal("mux server does not support signal request");
+		info = mux_client_request_info(sock, HPN_MUX_SIGNAL_EXT);
+		if (info == NULL)
+			fatal_f("signal request failed");
 		printf("%s", info);
 		exit(0);
 	case SSHMUX_COMMAND_TERMINATE:

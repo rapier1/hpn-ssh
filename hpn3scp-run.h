@@ -27,6 +27,10 @@
 #define HPN3SCP_RUN_H
 
 #include <sys/types.h>	/* for pid_t, size_t, and u_char */
+#include <signal.h>	/* for sig_atomic_t */
+
+/* how long a cancelled run waits for its child to end, in seconds */
+#define HPN_RUN_CANCEL_SEC	5
 
 /* Defined in misc.h and hpn-status-frame.h. Only pointers are needed
  * here, so callers need not include either. */
@@ -70,6 +74,21 @@ struct hpn_run_hooks {
 	 * leaves stdin as the child inherits it. */
 	const u_char	*stdin_data;
 	size_t		 stdin_len;	/* the length of stdin_data */
+	/* Keep stdin open after the payload until the child is done, as the
+	 * source's lifeline. Our exit closes it, which cancels the copy. */
+	int		 stdin_hold;
+	/* Set by the caller's signal handler to cancel the run. The run then
+	 * closes stdin, the source's lifeline, and gives the child
+	 * HPN_RUN_CANCEL_SEC to end. NULL never cancels. */
+	volatile sig_atomic_t *cancel;
+	/* once, when the run starts a cancel */
+	void (*on_cancel)(void *ctx);
+	/* once, when the child has not ended in time, just before the run
+	 * stops it */
+	void (*on_cancel_timeout)(void *ctx);
+	/* Start the child in its own process group, so a terminal's ^C
+	 * reaches only the caller, which then cancels in order. */
+	int		 own_pgrp;
 	void		*ctx;		/* passed to every hook */
 };
 

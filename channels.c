@@ -1141,6 +1141,21 @@ channel_format_status(const Channel *c)
 }
 
 /*
+ * HPN: call cb for every allocated channel. hpn-mux-signal.c uses it to
+ * find the sessions a ControlMaster carries. cb must not free channels.
+ */
+void
+channel_foreach(struct ssh *ssh, void (*cb)(struct ssh *, Channel *, void *),
+    void *ctx)
+{
+	u_int i;
+
+	for (i = 0; i < ssh->chanctxt->channels_alloc; i++)
+		if (ssh->chanctxt->channels[i] != NULL)
+			cb(ssh, ssh->chanctxt->channels[i], ctx);
+}
+
+/*
  * Returns a message describing the currently open forwarded connections,
  * suitable for sending to the client.  The message contains crlf pairs for
  * newlines.

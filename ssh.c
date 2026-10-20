@@ -762,6 +762,8 @@ main(int ac, char **av)
 				muxclient_command = SSHMUX_COMMAND_CONNINFO;
 			else if (strcmp(optarg, "channels") == 0)
 				muxclient_command = SSHMUX_COMMAND_CHANINFO;
+			else if (strcmp(optarg, "signal") == 0) /* HPN */
+				muxclient_command = SSHMUX_COMMAND_HPN_SIGNAL;
 			else if (strcmp(optarg, "forward") == 0)
 				muxclient_command = SSHMUX_COMMAND_FORWARD;
 			else if (strcmp(optarg, "exit") == 0)

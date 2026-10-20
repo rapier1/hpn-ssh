@@ -126,7 +126,8 @@ P11OBJS= ssh-pkcs11-client.o
 SKOBJS=	ssh-sk-client.o
 
 SSHOBJS= ssh.o readconf.o clientloop.o sshtty.o \
-	sshconnect.o sshconnect2.o mux.o cipher-switch.o ssh-pkcs11.o $(SKOBJS)
+	sshconnect.o sshconnect2.o mux.o cipher-switch.o hpn-mux-signal.o \
+	ssh-pkcs11.o $(SKOBJS)
 
 SSHDOBJS=sshd.o \
 	platform-listen.o \

@@ -216,6 +216,15 @@ It is forwarded to the source's
 A peer without zstd support fails the transfer rather than silently
 falling back.
 .El
+.Pp
+An interrupt cancels the copy on both hosts and leaves partial files in
+place for
+.Fl Z .
+A second interrupt exits without waiting for the source to stop.
+A source too old to read its arguments from standard input may keep
+copying if
+.Nm
+is killed outright.
 .Sh AUTHENTICATION
 .Nm
 runs on the launcher, but the file data moves source-to-target, so it is

@@ -528,9 +528,11 @@ Valid commands are:
 .Dq proxy
 (connect to a running multiplexing master in proxy mode),
 .Dq exit
-(request the master to exit), and
+(request the master to exit),
 .Dq stop
-(request the master to stop accepting further multiplexing requests).
+(request the master to stop accepting further multiplexing requests), and
+.Dq signal
+(interrupt the commands of the master's sessions, an HPN-SSH extension).
 .Pp
 .It Fl o Ar option
 Can be used to give options in the format used in the configuration file.

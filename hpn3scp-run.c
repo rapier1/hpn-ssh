@@ -51,6 +51,8 @@
 #define RUN_TICK_MS		1000
 /* seconds without a frame before a status run passes output through */
 #define RUN_DEGRADE_SEC		5.0
+/* the poll interval while a cancel waits, so it ends promptly */
+#define RUN_CANCEL_POLL_MS	100
 
 /* The frame parser's context in hpn_run_status(): the caller's hooks,
  * whether a HELLO or PROGRESS frame has arrived, and how many PROGRESS
@@ -164,6 +166,20 @@ exec_child(struct arglist *args, int stdout_fd, int stdin_fd, int stderr_fd)
 	_exit(127);
 }
 
+/* The stdin payload is all written. Close stdin to give the child EOF, or
+ * with stdin_hold move it to *held_fd, out of the poll set, where it stays
+ * open until the run ends. */
+static void
+run_stdin_done(const struct hpn_run_hooks *hooks, int stdin_pfds[2],
+    int *held_fd)
+{
+	if (hooks->stdin_hold)
+		*held_fd = stdin_pfds[1];
+	else
+		close(stdin_pfds[1]);
+	stdin_pfds[1] = -1;
+}
+
 /* Run args with its stdout on a pipe, write the hooks' stdin payload as
  * the child reads it, and pass each HPNS frame to run_frame(). A quiet
  * poll ticks the caller. A source that sends no frame within
@@ -181,8 +197,9 @@ hpn_run_status(struct arglist *args, pid_t *pidp,
 	double start_time;
 	size_t left, sent = 0;
 	ssize_t n;
-	int stdout_pfds[2], stdin_pfds[2] = { -1, -1 };
+	int stdout_pfds[2], stdin_pfds[2] = { -1, -1 }, held_fd = -1;
 	int status, passthrough = 0, npfd, ready, sigpipe_saved = 0;
+	double cancel_at = 0;
 	sshsig_t old_sigpipe;
 	pid_t pid;
 
@@ -199,12 +216,18 @@ hpn_run_status(struct arglist *args, pid_t *pidp,
 		fatal_f("fork: %s", strerror(errno));
 
 	if (pid == 0) {
+		if (hooks->own_pgrp)
+			(void)setpgid(0, 0);
 		/* the child closes the parent's ends of the pipes and execs */
 		close(stdout_pfds[0]);
 		if (stdin_pfds[1] != -1)
 			close(stdin_pfds[1]);
 		exec_child(args, stdout_pfds[1], stdin_pfds[0], -1);
 	}
+	/* Both sides set the group, so whichever runs first, no terminal
+	 * signal reaches the child through ours. */
+	if (hooks->own_pgrp)
+		(void)setpgid(pid, pid);
 	/* the parent keeps only its own pipe ends */
 	close(stdout_pfds[1]);
 	/* the caller's signal handler can now find the child */
@@ -217,12 +240,13 @@ hpn_run_status(struct arglist *args, pid_t *pidp,
 		 * child that exits without reading must not kill us with
 		 * SIGPIPE, and scp's own SIGPIPE handler would. */
 		set_nonblock(stdin_pfds[1]);
+		/* a held lifeline must not outlive us in a later child */
+		if (hooks->stdin_hold)
+			(void)fcntl(stdin_pfds[1], F_SETFD, FD_CLOEXEC);
 		old_sigpipe = ssh_signal(SIGPIPE, SIG_IGN);
 		sigpipe_saved = 1;
-		if (hooks->stdin_len == 0) {
-			close(stdin_pfds[1]);
-			stdin_pfds[1] = -1;
-		}
+		if (hooks->stdin_len == 0)
+			run_stdin_done(hooks, stdin_pfds, &held_fd);
 	}
 
 	/* a fresh parser, and the degrade timer starting now */
@@ -233,6 +257,30 @@ hpn_run_status(struct arglist *args, pid_t *pidp,
 
 	/* watch the child's output, and its stdin while the payload lasts */
 	for (;;) {
+		/* A cancel closes stdin once, which is the source's lifeline,
+		 * then gives the child HPN_RUN_CANCEL_SEC to end. One still
+		 * running after that is stopped, and the caller tears down
+		 * the rest. */
+		if (hooks->cancel != NULL && *hooks->cancel && cancel_at == 0) {
+			cancel_at = monotime_double();
+			if (stdin_pfds[1] != -1) {
+				close(stdin_pfds[1]);
+				stdin_pfds[1] = -1;
+			}
+			if (held_fd != -1) {
+				close(held_fd);
+				held_fd = -1;
+			}
+			if (hooks->on_cancel != NULL)
+				hooks->on_cancel(hooks->ctx);
+		}
+		if (cancel_at != 0 &&
+		    monotime_double() - cancel_at > HPN_RUN_CANCEL_SEC) {
+			if (hooks->on_cancel_timeout != NULL)
+				hooks->on_cancel_timeout(hooks->ctx);
+			kill(pid, SIGTERM);
+			break;
+		}
 		pfd[0].fd = stdout_pfds[0];
 		pfd[0].events = POLLIN;
 		npfd = 1;
@@ -241,7 +289,8 @@ hpn_run_status(struct arglist *args, pid_t *pidp,
 			pfd[1].events = POLLOUT;
 			npfd = 2;
 		}
-		if ((ready = poll(pfd, npfd, RUN_TICK_MS)) == -1) {
+		if ((ready = poll(pfd, npfd,
+		    cancel_at != 0 ? RUN_CANCEL_POLL_MS : RUN_TICK_MS)) == -1) {
 			if (errno == EINTR) {
 				/* a signal, such as the meter's SIGALRM, woke
 				 * us, so let the caller repaint */
@@ -258,11 +307,13 @@ hpn_run_status(struct arglist *args, pid_t *pidp,
 			    hooks->stdin_len - sent);
 			if (n > 0)
 				sent += (size_t)n;
-			if ((n == -1 && errno != EAGAIN && errno != EINTR) ||
-			    sent == hooks->stdin_len) {
+			if (n == -1 && errno != EAGAIN && errno != EINTR) {
+				/* the child stopped reading, so even a held
+				 * lifeline has nothing left to hold */
 				close(stdin_pfds[1]);
 				stdin_pfds[1] = -1;
-			}
+			} else if (sent == hooks->stdin_len)
+				run_stdin_done(hooks, stdin_pfds, &held_fd);
 		}
 		/* only a quiet poll counts toward the degrade timer */
 		if (ready == 0) {
@@ -327,6 +378,8 @@ hpn_run_status(struct arglist *args, pid_t *pidp,
 	close(stdout_pfds[0]);
 	if (stdin_pfds[1] != -1)
 		close(stdin_pfds[1]);
+	if (held_fd != -1)
+		close(held_fd);
 	/* SIG_DFL is a null pointer, so a flag, not the handler, records the
 	 * save */
 	if (sigpipe_saved)

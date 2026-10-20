@@ -357,6 +357,8 @@ int      channel_still_open(struct ssh *);
 int	 channel_tty_open(struct ssh *);
 const char *channel_format_extended_usage(const Channel *);
 char	*channel_open_message(struct ssh *);
+void	 channel_foreach(struct ssh *,
+	    void (*)(struct ssh *, Channel *, void *), void *); /* HPN */
 void	 channel_report_open(struct ssh *, int);
 int	 channel_find_open(struct ssh *);
 

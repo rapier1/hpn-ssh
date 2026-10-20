@@ -101,6 +101,13 @@ static struct {
 	int	 ready;		/* later runs join the master */
 } mux = { NULL, "", -1, 0 };
 
+/* The signal that asked to cancel the copy, or 0. The handler sets it only
+ * while cancel_armed says the launch is running. */
+static volatile sig_atomic_t cancel_signo;
+static volatile sig_atomic_t cancel_armed;
+/* the source did not confirm the stop within HPN_RUN_CANCEL_SEC */
+static int cancel_unconfirmed;
+
 /* The name of a phase as the GUI sees it, the value of a PHASE event. */
 static const char *
 phase_name(enum run_phase phase)
@@ -289,6 +296,10 @@ ssh_base_args(const struct run_state *session, arglist *args,
 	if (mux.ready) {
 		addargs(args, "-oControlPath=%s", mux.path);
 		addargs(args, "-oControlMaster=no");
+		/* A joining ssh never prompts. If the master is gone it fails
+		 * rather than ask for a password from the launch's own process
+		 * group, which does not own the terminal. */
+		addargs(args, "-oBatchMode=yes");
 	}
 	/* the host was checked by valid_host(), and -- keeps it an operand */
 	addargs(args, "--");
@@ -309,12 +320,17 @@ mux_kill(void)
 	}
 }
 
-/* SIGINT, SIGTERM, or SIGHUP: stop the shared login, then die of the
- * signal. A GUI cancel should instead set a flag that run_session()
- * checks between phases, and tear down through mux_close(). */
+/* SIGINT, SIGTERM, or SIGHUP. During the launch, the first one only asks
+ * the run to cancel, which stops the copy on the source and waits for it.
+ * A second one, or any outside the launch, stops the shared login and
+ * dies of the signal at once. */
 static void
 mux_signal(int signo)
 {
+	if (cancel_armed && cancel_signo == 0) {
+		cancel_signo = signo;
+		return;
+	}
 	mux_kill();
 	ssh_signal(signo, SIG_DFL);
 	kill(getpid(), signo);
@@ -361,6 +377,32 @@ mux_close(const struct run_state *session)
 	mux.dir = NULL;
 	mux.ready = 0;
 	mux.pid = -1;
+}
+
+/* Ask the shared login to send INT to the copy's session, which stops a
+ * source too old for the stdin lifeline. It is best effort, because a
+ * source that already stopped, or an sshd that refuses the request as it
+ * does for a forced command, leaves nothing more to do. */
+static void
+mux_signal_source(const struct run_state *session)
+{
+	arglist args;
+	char output[256];
+
+	if (!mux.ready)
+		return;
+	ssh_source_options(session, &args, 0, 0);
+	addargs(&args, "-oControlPath=%s", mux.path);
+	addargs(&args, "-O");
+	addargs(&args, "signal");
+	addargs(&args, "--");
+	addargs(&args, "%s", session->src.host);
+	/* capturing stderr too keeps the reply off the terminal */
+	if (hpn_run_capture(&args, output, sizeof(output), 2000, NULL,
+	    1) != 0)
+		debug("the login to %s did not take the signal request",
+		    session->src.host);
+	freeargs(&args);
 }
 
 /* Open the run's shared login to the source host: a background master
@@ -572,6 +614,28 @@ ev_degrade(void *ctx)
 	    "continues without progress");
 }
 
+/* A cancel began: say what is happening and how to stop waiting. The run
+ * has closed the lifeline, and the signal reaches a source without one. */
+static void
+ev_cancel(void *ctx)
+{
+	struct run_state *session = ctx;
+	char *msg;
+
+	xasprintf(&msg, "cancelling: waiting for %s to stop the copy "
+	    "(interrupt again to stop now)", session->src.host);
+	proto_emit_warning(msg);
+	free(msg);
+	mux_signal_source(session);
+}
+
+/* The source did not end within HPN_RUN_CANCEL_SEC of the cancel. */
+static void
+ev_cancel_timeout(void *ctx)
+{
+	cancel_unconfirmed = 1;
+}
+
 /* Print the human-mode completion summary when -V or -Z was given, so the
  * user can walk away and trust the result. A clean run reports the files
  * that came through, and a verify failure points at the per-file detail
@@ -694,6 +758,13 @@ do_launch(struct run_state *session)
 	hooks.on_mismatch = ev_mismatch;
 	/* discard raw bytes from a source that does not send frames */
 	hooks.passthrough_fd = -1;
+	/* A first ^C or SIGTERM cancels in order. The launch ssh, in its own
+	 * process group, survives it to carry the cancel to the source and
+	 * report the copy's end. */
+	hooks.cancel = &cancel_signo;
+	hooks.on_cancel = ev_cancel;
+	hooks.on_cancel_timeout = ev_cancel_timeout;
+	hooks.own_pgrp = 1;
 	hooks.ctx = session;
 
 	/* Describe the launch for the shared policy. */
@@ -707,6 +778,8 @@ do_launch(struct run_state *session)
 	launch.source_host = session->src.host;
 	/* a legacy retry joins the shared login, so it asks for nothing */
 	launch.shared_login = mux.ready;
+	/* the source stops the copy everywhere if we cancel or die */
+	launch.lifeline = 1;
 	launch.hooks = &hooks;
 	launch.plain_hooks = &hooks;
 	launch.pidp = &session->child;
@@ -716,7 +789,9 @@ do_launch(struct run_state *session)
 
 	/* stdin mode first, and the legacy command line only for a source
 	 * that cannot read the list */
+	cancel_armed = 1;
 	r = hpn_launch_args_run(&launch);
+	cancel_armed = 0;
 	hpn_meter_relay_finish();
 	freeargs(&args);
 	freeargs(&ssh_stdin);
@@ -827,7 +902,7 @@ run_session(struct run_state *session)
 	const char *why = NULL;
 	char *msg;
 	struct target_keyset keyset;
-	int r, ret = 1, counts_known;
+	int r, ret = 1, counts_known, cancelled = 0;
 
 	memset(&keyset, 0, sizeof(keyset));
 
@@ -883,6 +958,25 @@ run_session(struct run_state *session)
 
 	proto_emit_phase(phase_name(RUN_MONITOR));
 	r = do_launch(session);
+	/* A cancel that came before the source's END stopped the copy, so
+	 * the run reports that rather than the failure it caused. One after
+	 * END came too late to matter, and the run ends as it would have. */
+	if (cancel_signo != 0 && !endinfo.got) {
+		cancelled = 1;
+		if (cancel_unconfirmed)
+			xasprintf(&msg, "copy cancelled, but %s did not confirm "
+			    "it stopped within %d seconds", session->src.host,
+			    HPN_RUN_CANCEL_SEC);
+		else
+			xasprintf(&msg, "copy cancelled; the copy on %s has "
+			    "stopped", session->src.host);
+		proto_emit_error(msg);
+		free(msg);
+		proto_emit_phase(phase_name(RUN_COMPLETE));
+		proto_emit_done(0, 128 + cancel_signo, 0, 0, failtally.verify,
+		    failtally.transfer);
+		goto out;
+	}
 	/* A run that ended without the source's END frame failed before it
 	 * reported a result, for example when the source could not log in to
 	 * the target. The source's own messages are on stderr, so the event
@@ -932,6 +1026,11 @@ run_session(struct run_state *session)
  out:
 	mux_close(session);
 	hpn3scp_free_keyset(&keyset);
+	/* a cancelled run dies of its signal, as an uncancelled one would */
+	if (cancelled) {
+		ssh_signal(cancel_signo, SIG_DFL);
+		kill(getpid(), cancel_signo);
+	}
 	return ret;
 }
 

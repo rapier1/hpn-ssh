@@ -33,6 +33,8 @@
 
 #include <errno.h>
 #include <glob.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -52,8 +54,10 @@
 #include "hpn-launch-args.h"
 
 /* ENV-VAR HPN_ARGS_STDIN: a third-party launcher (hpn3scp, hpnscp -R) puts
- * HPN_ARGS_STDIN=1 in the env prefix of the source's command. hpnscp then
- * reads its arguments from stdin instead of its command line. */
+ * HPN_ARGS_STDIN in the env prefix of the source's command. hpnscp then
+ * reads its arguments from stdin instead of its command line. With 1 the
+ * launcher closes stdin after them. With 2 stdin stays open as the
+ * lifeline, and its closing cancels the copy. */
 #define HPN_ARGS_STDIN_ENV	"HPN_ARGS_STDIN"
 
 /* the characters a shell acts on as commands, refused on a legacy
@@ -88,39 +92,105 @@ static int launch_args_strict;
 static char *launch_args_known_host;
 static enum launch_args_mode launch_args_known_mode;
 
-/* Read stdin to EOF into buf, the way upstream's sshbuf_load_fd() reads a
- * file, but held to HPN_LAUNCH_ARGS_MAX by the buffer's own size limit.
- * Returns 0, or -1 with the cause logged. */
+/* Read len more bytes of the argument list from stdin onto buf. The
+ * buffer's size limit holds the list to HPN_LAUNCH_ARGS_MAX, and is
+ * checked before anything is allocated. Returns 0, or -1 with the cause
+ * logged. */
 static int
-launch_args_slurp(struct sshbuf *buf)
+launch_args_read(struct sshbuf *buf, size_t len)
 {
-	u_char chunk[4096];
-	size_t len;
+	u_char *p;
+	int r;
+
+	if ((r = sshbuf_reserve(buf, len, &p)) != 0) {
+		if (r == SSH_ERR_NO_BUFFER_SPACE)
+			error_f("argument list exceeds %d bytes",
+			    HPN_LAUNCH_ARGS_MAX);
+		else
+			error_fr(r, "store argument list");
+		return -1;
+	}
+	/* atomicio() comes up short with errno EPIPE at EOF */
+	if (atomicio(read, STDIN_FILENO, p, len) != len) {
+		error_f("read argument list: %s",
+		    errno == EPIPE ? "it ends early" : strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+/* Read the argument list from stdin by its own counts: the u32 count,
+ * then each argument's u32 length and bytes. The read stops at the end of
+ * the list rather than at EOF, so stdin can stay open after it as the
+ * lifeline. Returns 0, or -1 with the cause logged. */
+static int
+launch_args_load(struct sshbuf *buf)
+{
+	uint32_t count, len, i;
 	int r;
 
 	if ((r = sshbuf_set_max_size(buf, HPN_LAUNCH_ARGS_MAX)) != 0) {
 		error_fr(r, "set argument list limit");
 		return -1;
 	}
-	for (;;) {
-		/* atomicio() returns 0 with errno EPIPE at EOF */
-		if ((len = atomicio(read, STDIN_FILENO, chunk,
-		    sizeof(chunk))) == 0) {
-			if (errno == EPIPE)
-				return 0;
-			error_f("read argument list: %s", strerror(errno));
+	if (launch_args_read(buf, 4) != 0)
+		return -1;
+	count = PEEK_U32(sshbuf_ptr(buf));
+	/* a corrupt count stops at the size limit, since every argument
+	 * takes at least its 4-byte length */
+	for (i = 0; i < count; i++) {
+		if (launch_args_read(buf, 4) != 0)
 			return -1;
-		}
-		/* the size limit turns an oversized list into a put error */
-		if ((r = sshbuf_put(buf, chunk, len)) != 0) {
-			if (r == SSH_ERR_NO_BUFFER_SPACE)
-				error_f("argument list exceeds %d bytes",
-				    HPN_LAUNCH_ARGS_MAX);
-			else
-				error_fr(r, "store argument list");
+		len = PEEK_U32(sshbuf_ptr(buf) + sshbuf_len(buf) - 4);
+		if (launch_args_read(buf, len) != 0)
 			return -1;
-		}
 	}
+	return 0;
+}
+
+/* Report whether stdin is at EOF, reading at most one byte. */
+static int
+launch_args_at_eof(void)
+{
+	u_char c;
+	ssize_t n;
+
+	while ((n = read(STDIN_FILENO, &c, 1)) == -1 && errno == EINTR)
+		;
+	return n == 0;
+}
+
+/* The lifeline watcher. The launcher holds stdin open for the whole run,
+ * so its closing means the launcher cancelled the copy or died. Either
+ * way the copy stops on every host. INT goes to hpnscp's whole process
+ * group, as sshd sends a signal request, and that group holds the copy's
+ * ssh connections to the target. As they die the target's sshd closes the
+ * sessions, and its side of the copy ends. Any data on stdin is ignored. */
+static void *
+launch_args_lifeline(void *arg)
+{
+	u_char c;
+	ssize_t n;
+
+	while ((n = read(STDIN_FILENO, &c, 1)) > 0 ||
+	    (n == -1 && errno == EINTR))
+		;
+	debug_f("stdin closed: stopping the copy");
+	killpg(getpgrp(), SIGINT);
+	return NULL;
+}
+
+/* Start the lifeline watcher. Failing to start it is fatal, because the
+ * launcher relies on it to cancel the copy. */
+static void
+launch_args_lifeline_start(void)
+{
+	pthread_t tid;
+	int r;
+
+	if ((r = pthread_create(&tid, NULL, launch_args_lifeline, NULL)) != 0)
+		fatal_f("start the stdin lifeline: %s", strerror(r));
+	(void)pthread_detach(tid);
 }
 
 /* Replace argc and argv with the list on stdin when the launcher armed
@@ -137,10 +207,16 @@ hpn_launch_args_stdin(int *argcp, char ***argvp)
 	char **argv;
 	uint32_t count;
 	u_int i;
-	int r;
+	int r, lifeline;
 
 	armed = getenv(HPN_ARGS_STDIN_ENV);
-	if (armed == NULL || strcmp(armed, "1") != 0)
+	if (armed == NULL)
+		return;
+	if (strcmp(armed, "1") == 0)
+		lifeline = 0;
+	else if (strcmp(armed, "2") == 0)
+		lifeline = 1;
+	else
 		return;
 	/* consumed here, so nothing this process starts inherits it */
 	unsetenv(HPN_ARGS_STDIN_ENV);
@@ -162,8 +238,11 @@ hpn_launch_args_stdin(int *argcp, char ***argvp)
 
 	if ((buf = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
-	if (launch_args_slurp(buf) != 0)
+	if (launch_args_load(buf) != 0)
 		fatal_f("cannot read the argument list from stdin");
+	/* without the lifeline the launcher closed stdin after the list */
+	if (!lifeline && !launch_args_at_eof())
+		fatal_f("trailing data after the argument list");
 	if ((r = sshbuf_get_u32(buf, &count)) != 0)
 		fatal_fr(r, "argument count");
 	/* every argument takes at least its 4-byte length, so a count larger
@@ -179,9 +258,6 @@ hpn_launch_args_stdin(int *argcp, char ***argvp)
 		if ((r = sshbuf_get_cstring(buf, &argv[i + 1], NULL)) != 0)
 			fatal_fr(r, "argument %u", i);
 	}
-	if (sshbuf_len(buf) != 0)
-		fatal_f("%zu bytes of trailing data after the argument list",
-		    sshbuf_len(buf));
 	sshbuf_free(buf);
 
 	*argcp = (int)count + 1;
@@ -192,6 +268,8 @@ hpn_launch_args_stdin(int *argcp, char ***argvp)
 	 * so the launcher can tell this hpnscp read the list. The number of
 	 * streams is not known yet. */
 	hpn_pm_frame_mode(0);
+	if (lifeline)
+		launch_args_lifeline_start();
 }
 
 /* Expand the local source operands with glob(3) when the arguments came
@@ -368,20 +446,22 @@ launch_args_try_stdin(const struct hpn_launch *launch,
 
 	/* The command line is fixed text: env arms the relay and stdin mode,
 	 * and the program word follows with no arguments, because the source
-	 * reads the list only into an empty command line. */
+	 * reads the list only into an empty command line. Mode 2 asks the
+	 * source to watch stdin as its lifeline. */
 	memset(&cmd, 0, sizeof(cmd));
 	launch_args_append(&cmd, launch->ssh_stdin);
 	addargs(&cmd, "env");
 	addargs(&cmd, "%s", launch_args_relay());
-	addargs(&cmd, "%s=1", HPN_ARGS_STDIN_ENV);
+	addargs(&cmd, "%s=%d", HPN_ARGS_STDIN_ENV, launch->lifeline ? 2 : 1);
 	addargs(&cmd, "%s", launch->program);
 	launch_args_debug("stdin", &cmd);
 
 	/* The caller's hooks stay as given. This run adds the list as the
-	 * session's stdin. */
+	 * session's stdin, held open after it for a lifeline. */
 	hooks = *launch->hooks;
 	hooks.stdin_data = sshbuf_ptr(list);
 	hooks.stdin_len = sshbuf_len(list);
+	hooks.stdin_hold = launch->lifeline;
 	r = hpn_run_status(&cmd, launch->pidp, &hooks, res);
 	freeargs(&cmd);
 	sshbuf_free(list);
@@ -480,8 +560,10 @@ hpn_launch_args_run(const struct hpn_launch *launch)
 	if (res.got_hello)
 		launch_args_learn(launch->source_host, LAUNCH_ARGS_STDIN);
 	/* A HELLO, a signal, or any status but 1 is this run's answer. Only
-	 * exit 1 without a HELLO is an older hpnscp that printed its usage. */
-	if (res.got_hello || !res.exited || res.exit_status != 1)
+	 * exit 1 without a HELLO is an older hpnscp that printed its usage.
+	 * A cancelled run is never retried, which would start a new copy. */
+	if (res.got_hello || !res.exited || res.exit_status != 1 ||
+	    (launch->hooks->cancel != NULL && *launch->hooks->cancel))
 		return r;
 	launch_args_learn(launch->source_host, LAUNCH_ARGS_LEGACY);
 	return launch_args_legacy(launch, 1);

@@ -25,11 +25,14 @@
  * source's shell. The list is a u32 count followed by that many sshbuf
  * strings, at most HPN_LAUNCH_ARGS_MAX bytes in all.
  *
- * hpnscp reads the list only when HPN_ARGS_STDIN=1 is set and it was
+ * hpnscp reads the list only when HPN_ARGS_STDIN is set and it was
  * started with no arguments, so the variable never overrides arguments a
- * wrapper or forced command gave it. A source too old to read the list
- * gets the legacy command line instead, with a warning, unless
- * -X StrictArgs refuses it. */
+ * wrapper or forced command gave it. With HPN_ARGS_STDIN=1 the launcher
+ * closes stdin after the list. With HPN_ARGS_STDIN=2 it holds stdin open
+ * for the whole run as a lifeline, and hpnscp stops the copy on every
+ * host when stdin closes, because the launcher cancelled or died. A
+ * source too old to read the list gets the legacy command line instead,
+ * with a warning, unless -X StrictArgs refuses it. */
 
 #ifndef HPN_LAUNCH_ARGS_H
 #define HPN_LAUNCH_ARGS_H
@@ -62,6 +65,8 @@ struct hpn_launch {
 	const struct arglist *args;	/* the program's arguments */
 	const char	*source_host;	/* named in messages */
 	int		 shared_login;	/* a retry joins a login already made */
+	/* in stdin mode, hold stdin open as the source's lifeline */
+	int		 lifeline;
 	/* the hooks for a relayed run, and for a legacy run without the
 	 * relay */
 	const struct hpn_run_hooks *hooks;
@@ -102,7 +107,7 @@ struct hpn_scp_remote {
  * with no arguments, replace argc and argv with the list read from stdin,
  * keeping argv[0]. Otherwise leave them alone. A bad or oversized list is
  * fatal. It unsets HPN_ARGS_STDIN, and in stdin mode it arms the relay,
- * so HELLO goes out on stdout. */
+ * so HELLO goes out on stdout. With the lifeline it then watches stdin. */
 void	hpn_launch_args_stdin(int *, char ***);
 
 /* Source side. After option parsing, expand the local source operands as

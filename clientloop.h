@@ -77,6 +77,7 @@ void client_expect_confirm(struct ssh *, int, const char *,
 #define SSHMUX_COMMAND_PROXY		8	/* Open new connection */
 #define SSHMUX_COMMAND_CONNINFO		9	/* Show connection information */
 #define SSHMUX_COMMAND_CHANINFO		10	/* Show channels information */
+#define SSHMUX_COMMAND_HPN_SIGNAL	11	/* HPN: signal the sessions */
 
 void	muxserver_listen(struct ssh *);
 int	muxclient(const char *);
