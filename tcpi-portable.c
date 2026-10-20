@@ -16,8 +16,13 @@
  *
  */
 
+/* tcpi-portable.c - the kernel's TCP connection state through one portable
+ * view, struct tcpi_portable (see tcpi-portable.h). */
+
+/* Defined before any system header, because macOS hides struct
+ * tcp_connection_info and TCP_CONNECTION_INFO under strict POSIX. */
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
-# define _DARWIN_C_SOURCE 1	/* expose struct tcp_connection_info / TCP_CONNECTION_INFO; hidden under strict POSIX */
+# define _DARWIN_C_SOURCE 1
 #endif
 
 #include "includes.h"
@@ -30,16 +35,15 @@
 #include <stddef.h>
 #include <string.h>
 
-/*
- * Pull in the kernel's "struct tcp_info" exactly the way metrics.h does:
- * <linux/tcp.h> on Linux (its field set is richer and version-gated by
- * the LINUX_VERSION_CODE macros that defines.h already provides via
- * <linux/version.h>), <netinet/tcp.h> on the BSDs.  We never include
- * both in one translation unit -- they each define a conflicting "struct
- * tcp_info".  OpenBSD's struct first appears in 7.7 (May 2025); the
- * autoconf member check gates it so pre-7.7 falls through to the
- * unsupported path below.
- */
+/* Include the header that defines this platform's TCP state structure.
+ * Linux has struct tcp_info in <linux/tcp.h>, with fields gated below by
+ * the LINUX_VERSION_CODE macros from defines.h. FreeBSD and NetBSD have it
+ * in <netinet/tcp.h>. The two headers define conflicting versions, so only
+ * one is ever included. macOS has struct tcp_connection_info instead.
+ * OpenBSD has struct tcp_info from 7.7 on, and configure's check for its
+ * tcpi_snd_cwnd member sends older releases to the unsupported path.
+ * TCPI_PORTABLE_SUPPORTED marks a platform with such a structure, and
+ * TCPI_PORTABLE_MACOS marks macOS, whose structure has its own reader. */
 #if defined(__linux__)
 # include <linux/tcp.h>
 # define TCPI_PORTABLE_SUPPORTED 1
@@ -47,7 +51,7 @@
 # include <netinet/tcp.h>
 # define TCPI_PORTABLE_SUPPORTED 1
 #elif defined(__APPLE__)
-# include <netinet/tcp.h>	/* struct tcp_connection_info, TCP_CONNECTION_INFO */
+# include <netinet/tcp.h>	/* struct tcp_connection_info */
 # define TCPI_PORTABLE_SUPPORTED 1
 # define TCPI_PORTABLE_MACOS 1
 #elif defined(__OpenBSD__) && defined(HAVE_STRUCT_TCP_INFO_TCPI_SND_CWND)
@@ -57,6 +61,8 @@
 
 #include "tcpi-portable.h"
 
+/* Whether this build can read the TCP state structure at all, fixed when
+ * it was compiled. */
 int
 tcpi_portable_supported(void)
 {
@@ -70,22 +76,16 @@ tcpi_portable_supported(void)
 #ifdef TCPI_PORTABLE_SUPPORTED
 
 #ifdef TCPI_PORTABLE_MACOS
-/*
- * macOS has no Linux-style TCP_INFO; it exposes getsockopt(TCP_CONNECTION_INFO)
- * -> struct tcp_connection_info instead.  Read that and normalise into struct
- * tcpi_portable.  Conversions vs the Linux/BSD tcp_info layout:
- *   - RTT fields are MILLISECONDS on macOS; tcpi_portable wants microseconds
- *     -> x1000.  (srtt/rttcur are documented "in ms"; tcpi_rttvar has no unit
- *     comment in the SDK header but is assumed ms for consistency.)
- *   - snd_cwnd / snd_ssthresh are BYTES on macOS; tcpi_portable expresses them
- *     in SEGMENTS (Linux convention) -> divide by tcpi_maxseg (guard /0).
- *   - retransmits arrive as a sender-side packet counter (txretransmitpackets).
- * Fields macOS does not provide (min_rtt, notsent_bytes, delivery_rate,
- * busy_time, rwnd_limited, rcv_wnd[6.2], the RTO trio) are left unflagged in
- * avail_flags -- the same reduced set the BSDs present, which the classifier
- * already gates on and degrades against.  macOS ships a fixed struct, so no
- * TCPI_FIELD_IN length-gate is needed here.
- */
+/* macOS has no TCP_INFO. It offers struct tcp_connection_info through
+ * TCP_CONNECTION_INFO instead, read here into struct tcpi_portable. Its RTT
+ * fields are in milliseconds and become microseconds. The SDK header gives
+ * srtt and rttcur in milliseconds and rttvar no unit, so rttvar is assumed
+ * to match. snd_cwnd and snd_ssthresh are in bytes and become segments,
+ * the Linux unit. Retransmits come from the sender's packet counter. macOS
+ * lacks min_rtt, notsent_bytes, delivery_rate, busy_time, rwnd_limited,
+ * rcv_wnd and the RTO counters, so their bits stay clear. That is the same
+ * reduced set the BSDs give, which the congestion classifier handles. The
+ * structure has a fixed size, so no TCPI_FIELD_IN check is needed. */
 int
 tcpi_portable_get(int fd, struct tcpi_portable *out)
 {
@@ -95,29 +95,30 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	memset(out, 0, sizeof(*out));
 	memset(&tci, 0, sizeof(tci));
 
-	if (getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &tci, &tcilen) != 0)
+	if (getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &tci,
+	    &tcilen) != 0)
 		return -1;
 
-	/* Tier 1 -- always populated on a supported platform. */
+	/* Tier 1, filled on every supported platform */
 	out->state = tci.tcpi_state;
-	out->options = (u_int8_t)tci.tcpi_options;
+	out->options = (uint8_t)tci.tcpi_options;
 	out->snd_wscale = tci.tcpi_snd_wscale;
 	out->rcv_wscale = tci.tcpi_rcv_wscale;
 	out->snd_mss = tci.tcpi_maxseg;
 	out->rtt = tci.tcpi_srtt * 1000;	/* ms -> usec */
-	out->rttvar = tci.tcpi_rttvar * 1000;	/* assumed ms -> usec (see note) */
-	out->rcv_space = tci.tcpi_rcv_wnd;	/* advertised recv window, bytes */
+	out->rttvar = tci.tcpi_rttvar * 1000;	/* assumed ms -> usec */
+	out->rcv_space = tci.tcpi_rcv_wnd;	/* advertised window, bytes */
 	if (tci.tcpi_maxseg > 0) {
-		/* macOS reports these in bytes; express in segments. */
+		/* bytes on macOS, segments here */
 		out->snd_cwnd = tci.tcpi_snd_cwnd / tci.tcpi_maxseg;
 		out->snd_ssthresh = tci.tcpi_snd_ssthresh / tci.tcpi_maxseg;
 	}
 
-	/* Tier 1.5 -- cumulative retransmits (sender-side packets). */
+	/* Tier 1.5, the cumulative counters */
 	out->total_retrans = tci.tcpi_txretransmitpackets;
 	out->avail_flags |= TCPI_AVAIL_TOTAL_RETRANS;
 
-	out->segs_out = (u_int32_t)tci.tcpi_txpackets;
+	out->segs_out = (uint32_t)tci.tcpi_txpackets;
 	out->avail_flags |= TCPI_AVAIL_SEGS_OUT;
 
 	out->bytes_received = tci.tcpi_rxbytes;
@@ -128,27 +129,21 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 
 #else  /* Linux / BSD via struct tcp_info */
 
-/*
- * A field is genuinely present only if getsockopt wrote at least through
- * its last byte.  getsockopt returns min(our_buffer, kernel_struct) and
- * writes the real length back into the socklen_t (value-result).  This
- * runtime gate -- not the build-time LINUX_VERSION_CODE gate below -- is
- * what makes the accessor correct under binary distribution: a packaged
- * binary is built against one kernel's headers but runs on whatever
- * kernel the user has, which is usually older and almost never the same.
- * The compile-time #if only proves the field exists in the header we
- * built against; it says nothing about the running kernel.  We zero the
- * struct first, so an unwritten field reads as 0 -- without this check we
- * would mistake that 0 for a real value and wrongly set its avail bit.
- *
- * offsetof/sizeof do not work on bitfield members, so any group that
- * contains a bitfield gates on a normal sibling field from the same
- * kernel version instead.
- */
+/* True when getsockopt wrote field in full. getsockopt copies the shorter
+ * of our struct and the kernel's, and stores the length it wrote in len.
+ * This runtime check, not the build-time LINUX_VERSION_CODE gates below,
+ * is what keeps the reader right in a packaged binary, which is built
+ * against one kernel's headers and usually runs on an older kernel. The
+ * #if only proves the field is in the header we built against. Because
+ * the struct is zeroed first, an unwritten field reads as 0, and without
+ * this check that 0 would pass for a real value and set its avail bit.
+ * offsetof and sizeof do not work on bitfields, so a group that holds a
+ * bitfield is gated on a plain field of the same kernel version. */
 #define TCPI_FIELD_IN(len, field)					\
 	((len) >= (socklen_t)(offsetof(struct tcp_info, field) +	\
 	    sizeof(((const struct tcp_info *)0)->field)))
 
+/* Linux and the BSDs: read struct tcp_info into struct tcpi_portable. */
 int
 tcpi_portable_get(int fd, struct tcpi_portable *out)
 {
@@ -161,13 +156,10 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &tilen) != 0)
 		return -1;
 
-	/*
-	 * Tier 1 -- safe region (through tcpi_rcv_space).  Every field is
-	 * read by name against the locally compiled header, so the
-	 * window-scale nibble-vs-byte difference and the tcpi_snd_bwnd
-	 * offset shift between platforms are resolved by the compiler; we
-	 * never reinterpret a foreign byte layout.
-	 */
+	/* Tier 1, through tcpi_rcv_space. Each field is read by name from the
+	 * header this was built against, so the compiler resolves the window
+	 * scale's nibbles or bytes and FreeBSD's extra tcpi_snd_bwnd. No byte
+	 * layout is ever reinterpreted. */
 	out->state = ti.tcpi_state;
 	out->options = ti.tcpi_options;
 	out->snd_wscale = ti.tcpi_snd_wscale;
@@ -175,17 +167,26 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	out->snd_mss = ti.tcpi_snd_mss;
 	out->rtt = ti.tcpi_rtt;
 	out->rttvar = ti.tcpi_rttvar;
-	out->snd_ssthresh = ti.tcpi_snd_ssthresh;
+	/* Segments here. Linux reports both in segments and NetBSD reports
+	 * cwnd in segments. The other BSD values are in bytes. */
+#if defined(__linux__) || defined(__NetBSD__)
 	out->snd_cwnd = ti.tcpi_snd_cwnd;
+#else
+	if (ti.tcpi_snd_mss > 0)
+		out->snd_cwnd = ti.tcpi_snd_cwnd / ti.tcpi_snd_mss;
+#endif
+#if defined(__linux__)
+	out->snd_ssthresh = ti.tcpi_snd_ssthresh;
+#else
+	if (ti.tcpi_snd_mss > 0)
+		out->snd_ssthresh = ti.tcpi_snd_ssthresh / ti.tcpi_snd_mss;
+#endif
 	out->rcv_space = ti.tcpi_rcv_space;
 
-	/*
-	 * Receive-side slow-start threshold: the kernel's current allowance
-	 * for the advertised receive window.  Part of the Linux base set
-	 * (it precedes tcpi_rcv_space), but the FreeBSD/NetBSD headers only
-	 * carry a __tcpi_rcv_ssthresh placeholder, so it is Linux-only in
-	 * practice and flag-gated accordingly.
-	 */
+	/* The receive-side slow-start threshold, the kernel's current allowance
+	 * for the advertised window. Linux has it in its base set, ahead of
+	 * tcpi_rcv_space. FreeBSD and NetBSD carry only a placeholder, so it is
+	 * flagged on Linux alone. */
 #if defined(__linux__)
 	if (TCPI_FIELD_IN(tilen, tcpi_rcv_ssthresh)) {
 		out->rcv_ssthresh = ti.tcpi_rcv_ssthresh;
@@ -193,15 +194,11 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	}
 #endif
 
-	/*
-	 * Tier 1.5 -- cumulative retransmits.  Linux names it
-	 * tcpi_total_retrans (part of the early base set); FreeBSD/NetBSD
-	 * expose the equivalent tcpi_snd_rexmitpack.  OpenBSD also has
-	 * tcpi_snd_rexmitpack but privilege-gates the extension region
-	 * (unprivileged callers read 0), and hpnsftp runs unprivileged -- so
-	 * we deliberately leave it unflagged on OpenBSD rather than advertise
-	 * a value that is indistinguishable from "no retransmits".
-	 */
+	/* Tier 1.5, cumulative retransmits. Linux has tcpi_total_retrans in its
+	 * base set, and FreeBSD and NetBSD have tcpi_snd_rexmitpack. OpenBSD
+	 * has tcpi_snd_rexmitpack too, but fills it only for a privileged
+	 * caller, and HPN-SSH's clients are not. Its 0 would look like no
+	 * retransmits, so OpenBSD leaves the field unflagged. */
 #if defined(__linux__)
 	if (TCPI_FIELD_IN(tilen, tcpi_total_retrans)) {
 		out->total_retrans = ti.tcpi_total_retrans;
@@ -214,13 +211,10 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	}
 #endif
 
-	/*
-	 * Tier 2 -- Linux-only, kernel-version-gated.  The #if guards make
-	 * each field name compile only where the build header declares it;
-	 * the TCPI_FIELD_IN runtime gate then confirms the running kernel
-	 * actually populated it.  These fields are permanently absent on the
-	 * BSDs (not merely old-kernel), so they stay unflagged off Linux.
-	 */
+	/* Tier 2, Linux only and gated by kernel version. Each #if compiles a
+	 * field only where the build header declares it, and TCPI_FIELD_IN then
+	 * confirms the running kernel filled it. The BSDs never have these
+	 * fields, so they stay unflagged there. */
 #if defined(__linux__)
 # if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
 	if (TCPI_FIELD_IN(tilen, tcpi_bytes_received)) {
@@ -245,7 +239,8 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	}
 # endif
 # if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
-	/* app_limited is a bitfield (no offsetof); gate on its u64 sibling. */
+	/* app_limited is a bitfield, so delivery_rate, from the same kernel
+	 * version, gates it */
 	if (TCPI_FIELD_IN(tilen, tcpi_delivery_rate)) {
 		out->delivery_rate = ti.tcpi_delivery_rate;
 		out->delivery_rate_app_limited =
@@ -270,10 +265,8 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 	}
 # endif
 # if LINUX_VERSION_CODE >= KERNEL_VERSION(6,7,0)
-	/*
-	 * The 6.7 RTO trio landed in one commit; gate on the last (highest
-	 * offset) member so its presence implies all three are written.
-	 */
+	/* the three RTO counters arrived together in 6.7, so the last of them
+	 * gates all three */
 	if (TCPI_FIELD_IN(tilen, tcpi_total_rto_time)) {
 		out->total_rto = ti.tcpi_total_rto;
 		out->total_rto_recoveries = ti.tcpi_total_rto_recoveries;
@@ -292,6 +285,7 @@ tcpi_portable_get(int fd, struct tcpi_portable *out)
 
 #else /* !TCPI_PORTABLE_SUPPORTED */
 
+/* No TCP state structure on this platform: fail with ENOTSUP. */
 int
 tcpi_portable_get(int fd, struct tcpi_portable *out)
 {
