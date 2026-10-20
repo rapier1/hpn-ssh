@@ -605,11 +605,12 @@ relay_start(const char *label)
 }
 
 /* Restart the per-file tracking at a phase change. The frames' cumulative
- * bytes change domain with the phase, and the new phase's peaks are its
- * own. */
+ * bytes change domain with the phase, and the new phase's rate and peaks
+ * are its own. */
 static void
 relay_phase_reset(double now)
 {
+	relay.rate = 0;
 	relay.rate_inst_max = 0;
 	relay.file_base = 0;
 	relay.file_inst_max = 0;
@@ -686,7 +687,10 @@ hpn_meter_relay_sample(const char *label, const struct hpns_progress *frame)
 		relay.bytes_total = frame->bytes_total;
 		relay.total_known = 1;
 	}
-	relay.rate = frame->rate_bps;
+	/* A file's start frame has no rate yet. Take it only on that
+	 * file's own 0% line, not on one still showing merged files. */
+	if (frame->rate_bps > 0 || frame->bytes_done == relay.file_base)
+		relay.rate = frame->rate_bps;
 	relay.rate_inst = frame->rate_inst_bps;
 	if (frame->rate_inst_bps > relay.rate_inst_max)
 		relay.rate_inst_max = frame->rate_inst_bps;
