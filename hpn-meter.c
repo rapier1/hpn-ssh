@@ -66,11 +66,6 @@ static struct {
 	uint64_t rate;		/* source-smoothed */
 	uint64_t rate_inst;	/* source last-interval */
 	uint64_t rate_inst_max;	/* peak inst within the current phase */
-	/* Transfer-phase peak, latched when verify starts. The completion
-	 * line summarizes the transfer, and a verify-phase hash peak can
-	 * legitimately exceed link speed, which would read there as an
-	 * impossible network rate. */
-	uint64_t rate_inst_peak_xfer;
 	uint32_t eta_sec;	/* source's ETA, or HPNS_ETA_UNKNOWN */
 	int	 verifying;	/* HPNS_F_VERIFY seen: label the phase */
 	int	 resuming;	/* HPNS_F_RESUME live: label the phase */
@@ -418,10 +413,13 @@ hpn_meter_refresh_current(int force_update)
 	else
 		view.percent = (int)((float)meter->cur_pos / meter->total * 100);
 	view.rate = (long long)meter->rate_ema;
+	/* A completed line shows the peak, which is never below the average.
+	 * A transfer that finished inside one sample would otherwise show its
+	 * whole byte count as the peak. */
 	if (bytes_left > 0 || total_unknown)
 		view.inst = delta_pos;
 	else
-		view.inst = meter->max_delta;	/* complete: show the peak */
+		view.inst = MAXIMUM(meter->max_delta, (off_t)meter->rate_ema);
 	view.delta = delta_pos;
 	view.elapsed = elapsed;
 	/* An ETA too large for the frame's u32 reads as unknown. Converting
@@ -454,7 +452,8 @@ relay_row_view(struct meter_view *view)
 {
 	view->cur = view->total = (off_t)relay.row_bytes;
 	view->rate = (long long)relay.row_rate;
-	view->inst = (off_t)relay.row_peak;
+	/* a peak is never below the average */
+	view->inst = (off_t)MAXIMUM(relay.row_peak, relay.row_rate);
 	view->done = 1;
 	view->percent = 100;
 	view->elapsed_sec = relay.row_elapsed;
@@ -564,14 +563,11 @@ relay_fill(struct hpn_meter *meter, struct meter_view *view)
 
 	/* The rate and inst choices are the relay's own, so they live here
 	 * and not in the shared renderer. First, a silent source shows no
-	 * rate, because its last value is stale. Second, completion shows
-	 * the transfer-phase peak, because a verify-phase hash peak is not a
-	 * network rate. The relay never derives a rate or ETA locally. */
-	if (relay.done && relay.verifying)
-		view->inst = (off_t)relay.rate_inst_max;
-	else if (relay.done && relay.rate_inst_peak_xfer > 0)
-		view->inst = (off_t)relay.rate_inst_peak_xfer;
-	else if (relay.done)
+	 * rate, because its last value is stale. Second, a completed line
+	 * shows its own phase's peak, so a verify line's hash peak never
+	 * stands in for a network rate. The relay never derives a rate or
+	 * ETA locally. */
+	if (relay.done)
 		view->inst = (off_t)relay.rate_inst_max;
 	else if (silent)
 		view->inst = 0;
@@ -581,6 +577,10 @@ relay_fill(struct hpn_meter *meter, struct meter_view *view)
 		view->rate = 0;
 	else
 		view->rate = (long long)relay.rate;
+	/* A completed line's peak is never below its average. A source
+	 * takes no timed sample of a transfer shorter than one tick. */
+	if (relay.done && view->inst < view->rate)
+		view->inst = (off_t)view->rate;
 }
 
 /* Start the relay meter. It differs from the counter sources on purpose.
@@ -676,9 +676,7 @@ hpn_meter_relay_sample(const char *label, const struct hpns_progress *frame)
 	}
 	if ((frame->flags & HPNS_F_VERIFY) && !relay.verifying) {
 		relay.verifying = 1;
-		/* latch the transfer peak for the completion line, then
-		 * track the verify phase's own peak separately */
-		relay.rate_inst_peak_xfer = relay.rate_inst_max;
+		/* the verify line reports the verify phase's own rates */
 		relay_phase_reset(now);
 	}
 	relay.bytes_done = frame->bytes_done;

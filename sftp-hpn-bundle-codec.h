@@ -153,6 +153,11 @@ ssize_t sftp_hpn_bundle_writer_pack_next(struct sftp_hpn_bundle_writer *,
  * the writer. Do not free it. */
 const char *sftp_hpn_bundle_writer_error(struct sftp_hpn_bundle_writer *);
 
+/* The file data bytes packed so far over every entry, without the
+ * framing. */
+uint64_t sftp_hpn_bundle_writer_data_bytes(
+    const struct sftp_hpn_bundle_writer *);
+
 /* Construct a parser. cb and ctx must stay valid for the parser's
  * lifetime. Returns NULL only when cb is NULL. */
 struct sftp_hpn_bundle_parser *sftp_hpn_bundle_parser_new(

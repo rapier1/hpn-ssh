@@ -175,13 +175,16 @@ render_meter_line(const char *label, int percent, off_t bytes_shown,
 		xextendf(&buf, NULL, "%s/s", format_rate(inst_rate));
 	}
 
+	/* HPN: every tail is as wide as " - stalled -". A repaint does not
+	 * clear the line, so a narrower tail after a stall would leave its
+	 * last "-" behind. */
 	switch (tail) {
 	case METER_TAIL_STALLED:
 		/* HPN: the space keeps it off the inst column */
 		xextendf(&buf, NULL, " - stalled -");
 		break;
 	case METER_TAIL_UNKNOWN:
-		xextendf(&buf, NULL, "  --:-- ETA");
+		xextendf(&buf, NULL, "  --:-- ETA ");
 		break;
 	case METER_TAIL_ETA:
 	case METER_TAIL_DONE:
@@ -197,7 +200,7 @@ render_meter_line(const char *label, int percent, off_t bytes_shown,
 		} else
 			xextendf(&buf, NULL, "  %02d:%02d", minutes, seconds);
 		xextendf(&buf, NULL,
-		    tail == METER_TAIL_ETA ? " ETA" : "    ");
+		    tail == METER_TAIL_ETA ? " ETA " : "     ");
 		break;
 	}
 

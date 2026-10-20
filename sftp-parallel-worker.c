@@ -1089,8 +1089,9 @@ worker_run_bundle(struct sftp_worker *worker,
 	opts.preserve = fleet->cfg.preserve_flag;
 	opts.fsync = fleet->cfg.fsync_flag;
 	opts.writer_pool = fleet->cfg.writer_pool;
+	/* no progress counter, since the fleet counts its own bytes */
 	bundle_rc = sftp_hpn_bundle_upload(worker->conn, "", entries, batch_n,
-	    &opts);
+	    &opts, NULL);
 	t_end_ms = monotime_ms();
 
 	for (i = 0; i < batch_n; i++) {

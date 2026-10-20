@@ -1390,6 +1390,33 @@ bundle_member_xfer(struct sftp_conn *conn, struct sftp_hpn_bundle_acc *acc,
 	return sftp_hpn_report_transfer(conn, rc, src, dst, acc->sizes[i]);
 }
 
+/* Start the meter for one bundle flush when progress is shown, and
+ * return whether it started. The bundle meters as one BUNDLE-kind unit
+ * carrying acc->nmembers files. Bundled files never reach sftp_upload or
+ * sftp_download, so without it a serial bundle shows no meter at all.
+ * Declaring every member at the start lets the frame stream count them,
+ * and a bundle of only empty files meters too, since the kind renders a
+ * zero total as complete. Parallel workers call the bundle functions
+ * directly, so this never touches the parallel aggregate meter. The
+ * caller stops the meter before any per-file fallback, which runs meters
+ * of its own. */
+static int
+bundle_meter_start(struct sftp_hpn_bundle_acc *acc, off_t *ctr)
+{
+	char label[32];
+	off_t total = 0;
+	int i;
+
+	if (!showprogress)
+		return 0;
+	for (i = 0; i < acc->nmembers; i++)
+		total += acc->sizes[i];
+	snprintf(label, sizeof(label), "%d files", acc->nmembers);
+	return hpn_meter_start(hpn_meter_serial(), acc, HPN_METER_BUNDLE,
+	    HPN_METER_DOM_TRANSFER, label, total, ctr,
+	    (u_int)acc->nmembers) == 0;
+}
+
 /* Upload half of sftp_hpn_bundle_acc_flush: send the batch as one
  * hpn-bundle stream. Upload gets no per-member status back, so the
  * bundle succeeds or fails as a whole. A server that cannot bundle gets
@@ -1403,7 +1430,8 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 {
 	struct sftp_hpn_bundle_upload_entry *entries;
 	struct sftp_bundle_opts opts;
-	int i, rc, failures = 0;
+	off_t meter_ctr = 0;
+	int i, rc, failures = 0, meter_on;
 
 	entries = xcalloc(acc->nmembers, sizeof(*entries));
 	for (i = 0; i < acc->nmembers; i++) {
@@ -1414,8 +1442,12 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 	opts.preserve = preserve_flag;
 	opts.fsync = fsync_flag;
 	opts.writer_pool = sftp_conn_hpn(conn)->bundle_cfg.writer_pool;
+	meter_on = bundle_meter_start(acc, &meter_ctr);
 	/* entries carry full remote paths */
-	rc = sftp_hpn_bundle_upload(conn, "", entries, acc->nmembers, &opts);
+	rc = sftp_hpn_bundle_upload(conn, "", entries, acc->nmembers, &opts,
+	    meter_on ? &meter_ctr : NULL);
+	if (meter_on)
+		hpn_meter_stop(hpn_meter_serial(), acc);
 	switch (rc) {
 	case SFTP_HPN_BUNDLE_OK:
 		for (i = 0; i < acc->nmembers; i++) {
@@ -1469,32 +1501,15 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 {
 	struct sftp_hpn_bundle_download_entry *entries;
 	struct sftp_bundle_opts opts;
-	int i, rc, failures = 0;
-	off_t meter_ctr = 0, meter_total = 0;
-	char meter_label[32];
-	int meter_on;
+	off_t meter_ctr = 0;
+	int i, rc, failures = 0, meter_on;
 
 	entries = xcalloc(acc->nmembers, sizeof(*entries));
 	for (i = 0; i < acc->nmembers; i++) {
 		entries[i].remote_path = acc->src_paths[i];
 		entries[i].local_path = acc->dst_paths[i];
-		meter_total += acc->sizes[i];
 	}
-	/* Meter the bundle as one BUNDLE-kind unit carrying acc->nmembers
-	 * files. Bundled files never reach sftp_download, so without it a
-	 * serial bundle shows no meter at all. Declaring every member at the
-	 * start lets the frame stream count them, and a bundle of only empty
-	 * files meters too, since the kind renders a zero total as complete.
-	 * Parallel workers call sftp_hpn_bundle_download directly, so this
-	 * never touches the parallel aggregate meter. */
-	meter_on = showprogress;
-	if (meter_on) {
-		snprintf(meter_label, sizeof(meter_label), "%d files",
-		    acc->nmembers);
-		hpn_meter_start(hpn_meter_serial(), acc, HPN_METER_BUNDLE,
-		    HPN_METER_DOM_TRANSFER, meter_label, meter_total,
-		    &meter_ctr, (u_int)acc->nmembers);
-	}
+	meter_on = bundle_meter_start(acc, &meter_ctr);
 	memset(&opts, 0, sizeof(opts));
 	opts.preserve = preserve_flag;
 	opts.fsync = fsync_flag;

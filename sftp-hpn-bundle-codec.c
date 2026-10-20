@@ -116,6 +116,7 @@ struct sftp_hpn_bundle_writer {
 	struct writer_file *cur;	/* the entry currently being emitted */
 	int      cur_fd;		/* open() result for cur->src_path */
 	uint64_t cur_data_emitted;	/* bytes of data written into out so far */
+	uint64_t data_emitted;		/* the same over every entry */
 	/* Streaming XXH3 of cur's data, kept across entries and reset for
 	 * each one that asked for its hash; NULL until first needed. */
 	XXH3_state_t *hash_state;
@@ -412,6 +413,7 @@ sftp_hpn_bundle_writer_pack_next(struct sftp_hpn_bundle_writer *writer,
 				    out + written, (size_t)nread);
 			written += (size_t)nread;
 			writer->cur_data_emitted += (uint64_t)nread;
+			writer->data_emitted += (uint64_t)nread;
 			continue;
 		}
 
@@ -433,6 +435,16 @@ sftp_hpn_bundle_writer_error(struct sftp_hpn_bundle_writer *writer)
 	if (writer == NULL)
 		return NULL;
 	return writer->err;
+}
+
+/* The file data bytes packed so far over every entry, without the
+ * framing. */
+uint64_t
+sftp_hpn_bundle_writer_data_bytes(const struct sftp_hpn_bundle_writer *writer)
+{
+	if (writer == NULL)
+		return 0;
+	return writer->data_emitted;
 }
 
 /* Put the parser in PS_ERROR and record why. Only the first error is kept,

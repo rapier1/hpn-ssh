@@ -340,9 +340,6 @@ int sftp_upload_batch_finish(struct sftp_conn *conn,
  * Server support detected via the `hpn-bundle@hpnssh.org` extension
  * advertised in SSH_FXP_VERSION (see SFTP_EXT_HPN_BUNDLE in sftp-client.c).
  * When unsupported, caller must fall back to per-file uploads.
- *
- * See project_phase5_bundling_design.md in the memory store for the full
- * protocol and architectural notes.
  */
 
 struct sftp_hpn_bundle_upload_entry {
@@ -364,6 +361,8 @@ struct sftp_hpn_bundle_upload_entry {
  *   mode and current mtime.
  * fsync_flag: when non-zero, request the server fsync each extracted
  *   file before the bundle is closed.
+ * progress: when not NULL, advances by each file data byte as the server
+ *   acks the WRITE that carried it.
  *
  * Returns one of enum sftp_hpn_bundle_result.  On any non-OK return all
  * entries[].result are set to -1 (the protocol does not return per-record
@@ -399,7 +398,7 @@ struct sftp_bundle_opts {
 int sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n,
-    const struct sftp_bundle_opts *opts);
+    const struct sftp_bundle_opts *opts, off_t *progress);
 
 /* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
 int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);

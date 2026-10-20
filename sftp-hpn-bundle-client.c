@@ -183,6 +183,12 @@ struct bundle_write_ctx {
 	uint32_t     *wsizes;
 	uint32_t      wsizes_cap;
 
+	/* The caller's progress counter, and a ring of each WRITE's file
+	 * data bytes slotted like wsizes, so bundle_drain_n can advance the
+	 * counter as each WRITE is acked. Both NULL without a counter. */
+	off_t        *progress;
+	uint32_t     *wdata;
+
 	/* Drain-stall record, reset with the ctx for each upload and reported
 	 * by the always-on DRAIN-FAIL log in bundle_drain_n and by the
 	 * HPN_PARALLEL_TRACE timing line. drain_last_ok_s is the monotime of
@@ -1080,18 +1086,23 @@ bundle_drain_n(struct bundle_write_ctx *ctx, size_t limit)
 			sftp_conn_rdahead_account(ctx->conn,
 			    ctx->wsizes[(ctx->n_drained - 1) %
 			    ctx->wsizes_cap]);
+		/* an acked WRITE's file data has landed, which is where a
+		 * plain upload counts its progress too */
+		if (ctx->wdata != NULL)
+			*ctx->progress += ctx->wdata[(ctx->n_drained - 1) %
+			    ctx->wsizes_cap];
 	}
 	sshbuf_free(msg);
 	return rc;
 }
 
-/* Send one WRITE carrying the next slice of the codec stream. When the
- * in-flight count has reached the read-ahead depth, drain half the
- * pipeline first. Returns 0 on success, -1 on any failure, with
- * ctx->any_fail set. */
+/* Send one WRITE carrying the next slice of the codec stream, of which
+ * data_bytes are file data. When the in-flight count has reached the
+ * read-ahead depth, drain half the pipeline first. Returns 0 on success,
+ * -1 on any failure, with ctx->any_fail set. */
 static int
 bundle_ul_send_write(struct bundle_write_ctx *ctx,
-    const u_char *buffer, size_t length)
+    const u_char *buffer, size_t length, size_t data_bytes)
 {
 	struct sshbuf *msg;
 	u_int rid;
@@ -1138,11 +1149,15 @@ bundle_ul_send_write(struct bundle_write_ctx *ctx,
 		return -1;
 	}
 
-	/* Remember this WRITE's byte count in its ring slot. A STATUS
-	 * reply carries no size, so bundle_drain_n reads it back from here
-	 * to feed the read-ahead controller real bytes. */
+	/* Remember this WRITE's byte count and file data count in their
+	 * ring slots. A STATUS reply carries no size, so bundle_drain_n reads
+	 * them back from here to feed the read-ahead controller real bytes
+	 * and to advance the progress counter. */
 	if (ctx->wsizes != NULL)
 		ctx->wsizes[ctx->n_sent % ctx->wsizes_cap] = (uint32_t)length;
+	if (ctx->wdata != NULL)
+		ctx->wdata[ctx->n_sent % ctx->wsizes_cap] =
+		    (uint32_t)data_bytes;
 	r = send_msg(ctx->conn, msg);
 	sshbuf_free(msg);
 	if (r != 0) {
@@ -1170,7 +1185,9 @@ bundle_ul_send_write(struct bundle_write_ctx *ctx,
  * side of hpn-bundle-open@hpnssh.org. The codec packs the files into its
  * length-prefixed record stream, sent as one OPEN, pipelined WRITEs and a
  * CLOSE; process_hpn_bundle_open in sftp-hpn-bundle-server.c feeds the
- * bytes back through the codec to recreate the files under dest_dir.
+ * bytes back through the codec to recreate the files under dest_dir. A
+ * non-NULL progress advances by the file data in each WRITE as it is
+ * acked.
  *
  * Wire format:
  *   client -> server:
@@ -1192,7 +1209,7 @@ int
 sftp_hpn_bundle_upload(struct sftp_conn *conn,
     const char *remote_dest_dir,
     struct sftp_hpn_bundle_upload_entry *entries, int n_entries,
-    const struct sftp_bundle_opts *opts)
+    const struct sftp_bundle_opts *opts, off_t *progress)
 {
 	const int preserve_flag = opts->preserve;
 	const int fsync_flag = opts->fsync;
@@ -1235,6 +1252,16 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	if (ctx.wsizes == NULL)
 		debug_f("hpn-bundle: wsizes calloc failed; "
 		    "rdahead controller will see zero-byte acks");
+	/* Per-WRITE file data ring, only for a progress counter. NULL on
+	 * alloc failure is non-fatal, and the meter just does not advance. */
+	if (progress != NULL) {
+		ctx.wdata = calloc(ctx.wsizes_cap, sizeof(uint32_t));
+		if (ctx.wdata != NULL)
+			ctx.progress = progress;
+		else
+			debug_f("hpn-bundle: wdata calloc failed; "
+			    "the bundle meter will not advance");
+	}
 
 	/* Reset the request policy denial flag for this bundle attempt. */
 	sftp_conn_clear_policy_denied(conn);
@@ -1339,6 +1366,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	/* ------ Pack/send loop ------ */
 	t_send_start = monotime_double();
 	for (;;) {
+		uint64_t data_before = sftp_hpn_bundle_writer_data_bytes(writer);
 		ssize_t produced = sftp_hpn_bundle_writer_pack_next(writer,
 		    outbuf, sizeof(outbuf));
 		if (produced < 0) {
@@ -1349,7 +1377,9 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 		if (produced == 0)
 			break;	/* EOA reached, all bytes sent */
 		bytes_total += (uint64_t)produced;
-		if (bundle_ul_send_write(&ctx, outbuf, (size_t)produced) != 0)
+		if (bundle_ul_send_write(&ctx, outbuf, (size_t)produced,
+		    (size_t)(sftp_hpn_bundle_writer_data_bytes(writer) -
+		    data_before)) != 0)
 			goto cleanup;
 	}
 	t_send_done = monotime_double();
@@ -1448,6 +1478,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	sftp_hpn_bundle_writer_free(writer);
 	free(handle);
 	free(ctx.wsizes);
+	free(ctx.wdata);
 	sshbuf_free(msg);
 
 	/* Classify the failure for the caller's bundle-eligibility decision.
