@@ -2252,6 +2252,7 @@ void
 sshpkt_final_log_entry (struct ssh *ssh) {
 	uint64_t ibytes, obytes;
 	double total_time;
+	const char *comp_fields;
 
 	/* packet.c is shared, and a client has no server line to write */
 	if (!ssh->state->server_side)
@@ -2259,20 +2260,26 @@ sshpkt_final_log_entry (struct ssh *ssh) {
 	/* IN and OUT are as the client sees them. IN is what the server
 	 * sent, and OUT is what it received. */
 	ssh_packet_get_bytes(ssh, &ibytes, &obytes);
+	/* The compression fields go last, so the existing fields keep their
+	 * places in the line. */
+	comp_fields = hpn_zstd_log_fields(ssh->state->zstd_out,
+	    ssh->state->zstd_in, ssh->state->compression_out_started ||
+	    ssh->state->compression_in_started);
 	if (ssh->start_time < 1) {
 		/* this will produce a NaN in the output so don't do that - cjr */
 		total_time = 0;
-		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %llu;OUT: %llu;Duration: %.1f;tPut_in: N/A;tPut_out: N/A",
+		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %llu;OUT: %llu;Duration: %.1f;tPut_in: N/A;tPut_out: N/A%s",
 		    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
 		    (unsigned long long)obytes, (unsigned long long)ibytes,
-		    total_time);
+		    total_time, comp_fields);
 	}
 	else {
 		total_time = monotime_double() - ssh->start_time;
-		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %llu;OUT: %llu;Duration: %.1f;tPut_in: %.1f;tPut_out: %.1f",
+		logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %llu;OUT: %llu;Duration: %.1f;tPut_in: %.1f;tPut_out: %.1f%s",
 		    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
 		    (unsigned long long)obytes, (unsigned long long)ibytes,
-		    total_time, obytes / total_time, ibytes / total_time);
+		    total_time, obytes / total_time, ibytes / total_time,
+		    comp_fields);
 	}
 }
 
@@ -2577,16 +2584,11 @@ ssh_packet_set_zstd_level(struct ssh *ssh, int level)
 	ssh->state->zstd_level = level;
 }
 
-/*
- * Incoming decompression expansion ratio (plaintext/wire) x1000, or 1000
- * (1.0x) when zstd decompression is not active.  channel_tcpwinsz uses it
- * to convert the wire-level rcv_space BDP into a plaintext channel window.
- */
+/* HPN: the incoming zstd decompression ratio in thousandths, or 1.0x when
+ * zstd is not active (see hpn_zstd_in_ratio_milli). */
 u_int
 ssh_packet_get_decomp_ratio_milli(struct ssh *ssh)
 {
-	if (ssh->state->zstd_in == NULL)
-		return 1000;
 	return hpn_zstd_in_ratio_milli(ssh->state->zstd_in);
 }
 

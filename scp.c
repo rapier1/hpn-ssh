@@ -127,7 +127,6 @@
 #include "hpn-compress.h"		/* HPN: -z zstd level bounds */
 #include "sftp-parallel.h"
 #include "sftp-lustre-client.h"	/* maybe_apply_lustre_layout_parent */
-#include "hpn-exit-codes.h"
 
 extern char *__progname;
 

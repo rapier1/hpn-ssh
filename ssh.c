@@ -1070,8 +1070,8 @@ main(int ac, char **av)
 			break;
 		case 'z': {
 			/* HPN: require zstd transport compression at this
-			 * level (our outbound direction; the peer's level
-			 * is its own).  A peer without zstd fails the KEX. */
+			 * level. The level governs both directions, and a
+			 * peer without zstd fails the KEX. */
 			const char *zerr = NULL;
 
 			options.zstd_level = (int)strtonum(optarg,
@@ -1295,6 +1295,13 @@ main(int ac, char **av)
 	if (options.zstd_level > 0 && options.compression > 0)
 		fatal("-z (zstd) and -C (zlib compression) are "
 		    "mutually exclusive");
+#ifndef HAVE_LIBZSTD
+	/* HPN: without libzstd the KEX can never pick zstd@hpnssh.org, so a
+	 * requested level could only fail there. Refuse it here instead. */
+	if (options.zstd_level > 0)
+		fatal("zstd compression (-z or ZstdLevel) is not supported "
+		    "by this build");
+#endif
 
 	if (options.user == NULL) {
 		user_was_default = 1;

@@ -16,50 +16,52 @@
  *
  */
 
-#ifndef HPN_EXIT_CODES_H
-#define HPN_EXIT_CODES_H
-
-/*
- * HPN process exit codes for transport self-termination.
+/* hpn-exit-codes.h - the exit codes a parallel worker uses to report why
+ * its transport ended itself.
  *
- * When a parallel-streams worker (an hpnssh child) self-diagnoses a fatal
- * transport condition, it exits with one of these codes.  The orchestrator
- * reaps the worker, reads WEXITSTATUS, and uses the code to label the death
- * and pick a respawn policy.  Exactly one byte of signal -- a policy hint,
- * not a diagnostics channel (richer detail goes to the worker stderr log).
+ * A worker's congestion monitor ends the transport when it judges the
+ * connection wedged. On the client side the worker's hpnssh exits with one
+ * of these codes. On the server side the monitor sends the code as an
+ * exit-status, and the client keeps it over the later status the session
+ * teardown sends (clientloop.c). The orchestrator reaps the worker, and
+ * classify_worker_death labels and counts the death by its code. The code
+ * is a label only. The worker is respawned either way, and the detail goes
+ * to the worker's stderr (one file per worker with hpnsftp -W).
  *
- * Reserved block: 80-89.  Chosen to avoid values already in use:
+ * The codes take the reserved block 80-89, clear of values already in use:
  *   0        success
  *   1        general error (sftp.c)
  *   57       SFTP_EX_VERIFY_FAILED (sftp-client.h)
  *   58       HPN_EXIT_STRICT_ARGS (hpn-launch-args.h)
  *   64-78    BSD sysexits (EX_*)
- *   127      execvp-failed sentinel (spawn_worker_ssh)
- *   255      ssh transport-level error (cleanup_exit)
+ *   127      exec failure in spawn_worker_ssh
+ *   255      ssh transport error (cleanup_exit)
  *
- * Delivery is best-effort: a hard wedge may block the connection that would
- * carry the code (or the report).  When a code does not arrive, the
- * orchestrator falls back to inferring the death mode from the wait status
- * and its own kill bookkeeping -- see the reap-side classifier.
- */
+ * Delivery is best effort. A hard wedge may block the connection that
+ * would carry the code. When no code arrives, classify_worker_death falls
+ * back on the wait status and its own kill bookkeeping. */
+
+#ifndef HPN_EXIT_CODES_H
+#define HPN_EXIT_CODES_H
+
 #define HPN_EXIT_TCP_BASE		80
 
-#define HPN_EXIT_TCP_WEDGE		80	/* cwnd collapse / RTO stall:
-						 * we have data, the network has
-						 * stopped moving it.  Respawn
-						 * (fresh connection may help). */
-#define HPN_EXIT_TCP_PATH_DEGRADED	81	/* sustained loss / elevated RTT,
-						 * not a full wedge.  Respawn on
-						 * a tight budget. */
-#define HPN_EXIT_TCP_PEER_STALL		82	/* peer receive window pinned
-						 * shut: the far end isn't
-						 * draining (server/disk bound).
-						 * Respawn unlikely to help;
-						 * back off. */
+/* cwnd collapse or an RTO stall. The worker has data, and the network has
+ * stopped moving it. */
+#define HPN_EXIT_TCP_WEDGE		80
+
+/* Sustained loss or elevated RTT short of a wedge. Reserved: the monitor
+ * reports PATH_DEGRADED but does not exit on it yet. */
+#define HPN_EXIT_TCP_PATH_DEGRADED	81
+
+/* The peer has kept its receive window shut past the emergency brake
+ * horizon (hpn-congestion-monitor.c). The far end is not draining, which
+ * points at the server or its disk. */
+#define HPN_EXIT_TCP_PEER_STALL		82
 
 #define HPN_EXIT_TCP_MAX		89
 
-/* True if `code` is one of the reserved HPN transport self-termination codes. */
+/* True if code is one of the reserved transport self-termination codes. */
 #define HPN_EXIT_IS_TCP(code) \
 	((code) >= HPN_EXIT_TCP_BASE && (code) <= HPN_EXIT_TCP_MAX)
 

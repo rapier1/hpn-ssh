@@ -251,7 +251,7 @@ ssh_kex2(struct ssh *ssh, char *host, struct sockaddr_storage *hostaddr,
 	xxx_hostaddr = *hostaddr;
 	xxx_conn_info = ssh_conn_info_dup(cinfo);
 
-	/* HPN: our outbound zstd level (the peer's is its own affair) */
+	/* HPN: the zstd level, which governs both directions */
 	if (options.zstd_level > 0)
 		ssh_packet_set_zstd_level(ssh, options.zstd_level);
 

@@ -74,6 +74,7 @@
 #include "misc.h"
 #include "channels.h"
 #include "tcpi-portable.h"	/* cross-platform TCP_INFO / TCP_CONNECTION_INFO accessor */
+#include "hpn-compress.h"	/* HPN: HPN_ZSTD_RATIO_ONE */
 #include "compat.h"
 #include "canohost.h"
 #include "pathnames.h"
@@ -1453,7 +1454,7 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 			/* HPN: both signals are WIRE (post-compression)
 			 * sizes, but the channel window flow-controls
 			 * PLAINTEXT data.  Scale by the measured
-			 * decompression ratio (x1000; 1000 = none) so the
+			 * decompression ratio (in thousandths) so the
 			 * window reflects the plaintext BDP. */
 			u_int ratio_m = ssh_packet_get_decomp_ratio_milli(ssh);
 			u_int32_t cap_src = 0;
@@ -1465,7 +1466,8 @@ channel_tcpwinsz(struct ssh *ssh, Channel *c)
 				cap_src = t.rcv_space;
 			if (cap_src > 0) {
 				u_int32_t bdp_cap = (u_int32_t)MINIMUM(
-				    (uint64_t)cap_src * ratio_m / 1000 *
+				    (uint64_t)cap_src * ratio_m /
+				    HPN_ZSTD_RATIO_ONE *
 				    CHANNEL_WINDOW_RCVSPACE_PCT / 100,
 				    (uint64_t)0xffffffffU);
 				if (bdp_cap < CHANNEL_OUTPUT_HWM_FLOOR)
