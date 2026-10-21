@@ -1,14 +1,7 @@
 /*
- * sftp-lustre.h - Lustre layout mechanism for HPN-SSH SFTP.
+ * Copyright (c) 2024-2026 The Board of Trustees of Carnegie Mellon University.
  *
- * Part of HPN-SSH, NOT upstream OpenSSH.  Public interface to the Lustre layout
- * helpers extracted from sftp-hpn-server.c.  Linked into BOTH the server (which
- * applies layout for uploads via the hpn-file-layout extension) and the client
- * (which applies layout to LOCAL destinations for downloads).  The layout ABI
- * structs/constants are private to sftp-lustre.c; callers only need these
- * prototypes.  Setters return HPN_FILE_LAYOUT_* codes (sftp-hpn-server.h).
- *
- * Copyright (c) 2024-2026 Pittsburgh Supercomputing Center / HPN-SSH project.
+ *  Author: Chris Rapier <rapier@psc.edu>
  *
  * This library or code is free software; you can redistribute it and/or
  * modify it under the terms of the BSD 2 Clause License.
@@ -23,43 +16,48 @@
  *
  */
 
+/* sftp-lustre.h - the Lustre layout interface: set a directory's layout,
+ * and read the stripe geometry a path gets.
+ *
+ * Both ends link it. The server applies layouts for the hpn-file-layout
+ * extension, and the client applies them to local destinations on
+ * download. The layout ABI stays private to sftp-lustre.c, and the setters
+ * return the HPN_FILE_LAYOUT_* codes from sftp-hpn-server.h. */
+
 #ifndef _SFTP_LUSTRE_H
 #define _SFTP_LUSTRE_H
 
 #include <stdint.h>
 
-/*
- * The layout status for the errno of a failed layout call: a filesystem
- * that cannot take the layout, not Lustre or without composite support,
- * answers HPN_FILE_LAYOUT_NOT_FS, a site that forbids it _PERM, and
- * anything else _FAIL.  The setters here and the server's directory open
- * share it, so every failure maps the same way.
- */
-uint32_t lustre_layout_status(int err);
+/* The stripe geometry that files created at a path get: the path, then
+ * where to put the stripe size and count. Each field comes from the
+ * nearest layout up the tree that sets it, and a composite layout gives
+ * its first component not on the MDT. Returns 1 with both fields above 0,
+ * or 0 with both 0. Off Linux it always returns 0. */
+int lustre_get_stripe(const char *, uint64_t *, uint32_t *);
 
-/*
- * Set the layout a directory should get, the one policy for both ends of a
- * transfer: a tiered composite when small_threshold is above zero and the
- * filesystem takes it - [0, small_threshold) on one OST, the rest striped
- * across stripe_count - otherwise, or when the composite is refused, a
- * plain stripe_count-wide RAID0 stripe.  The _fd form works on an open
- * directory, the server's case; the _path form opens it, for the client's
- * local destination (download parity).  Returns HPN_FILE_LAYOUT_OK/_NOT_FS/
- * _PERM/_FAIL and reports the count applied and the HPN_FILE_LAYOUT_KIND_*
- * set.  Off Linux both answer NOT_FS.
- */
-uint32_t lustre_set_layout_fd(int fd, uint32_t stripe_count,
-    uint32_t small_threshold, uint32_t *applied_out, uint32_t *kind_out);
-uint32_t lustre_set_layout_path(const char *dir, uint32_t stripe_count,
-    uint32_t small_threshold, uint32_t *applied_out, uint32_t *kind_out);
+/* Map the errno of a failed layout call, or of opening a directory for
+ * one, to an HPN_FILE_LAYOUT_* status: NOT_FS for a filesystem that cannot
+ * take the layout, PERM for a site that forbids it, and FAIL for anything
+ * else. The setters and the server's directory open share it, so every
+ * failure maps the same way. */
+uint32_t lustre_layout_status(int);
 
-/*
- * Read a directory's default OST stripe geometry (count + size) via
- * getxattr("lustre.lov") - no lfs(1) subprocess.  Reports the OST (non-MDT)
- * component of a composite/DoM layout.  Returns 1 iff both *stripe_size and
- * *stripe_count are > 0, else 0.
- */
-int lustre_get_stripe(const char *path, uint64_t *stripe_size,
-    uint32_t *stripe_count);
+/* Set the layout a directory should get, one policy for both ends of a
+ * transfer. The arguments are the directory, the stripe count, the tiered
+ * threshold, and where to put the count applied and the
+ * HPN_FILE_LAYOUT_KIND_* set. With a threshold above 0 the layout is a
+ * tiered composite: [0, threshold) on one OST, the rest across stripe count
+ * OSTs. Otherwise, or when the filesystem refuses the composite, it is a
+ * plain RAID0 stripe across stripe count OSTs. A stripe count above 0xFFFF
+ * fails. The _fd form takes an open directory, the server's case. The
+ * _path form opens one, following a symlink, for the client's local
+ * destination on download. Both return an HPN_FILE_LAYOUT_* status, and
+ * the count applied is the one requested, which Lustre may clamp silently.
+ * Off Linux the setters behind them return NOT_FS. */
+uint32_t lustre_set_layout_fd(int, uint32_t, uint32_t, uint32_t *,
+    uint32_t *);
+uint32_t lustre_set_layout_path(const char *, uint32_t, uint32_t,
+    uint32_t *, uint32_t *);
 
 #endif /* _SFTP_LUSTRE_H */

@@ -16,17 +16,19 @@
  *
  */
 
-/* sftp-hpn-server.h - HPN-SSH server-side SFTP extensions.
+/* sftp-hpn-server.h - the hpn-fs-info, hpn-check-file, sftp-hash-range,
+ * and hpn-file-layout SFTP extensions.
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- * Server-side HPN extension handlers are isolated here so that
- * sftp-server.c carries a minimal diff against upstream.
+ * The header has two halves. The wire protocol (the extension names, the
+ * request and reply formats, and their constants) is shared by both sides,
+ * and client code includes this header for it alone. The handler
+ * prototypes are the server's. They keep the handlers out of
+ * sftp-server.c, so that file carries a small diff against upstream.
  *
  * Upstream merge note: sftp-server.c's extended_handlers[] table names
  * the HPN handlers declared here and in the bundle and tree headers
- * directly; they have upstream's handler shape, so no wrapper sits
- * between the table and them.
- */
+ * directly. They have upstream's handler shape, so no wrapper sits
+ * between the table and them. */
 
 #ifndef _SFTP_HPN_SERVER_H
 #define _SFTP_HPN_SERVER_H
@@ -89,15 +91,15 @@
  * in it. EXPERIMENTAL; HPNLustreStripeCount=0 in ssh_config turns it off.
  *
  *   request:  string path
- *             uint32 stripe_count   0 for all available, as lfs -c 0
+ *             uint32 stripe_count   0 for the filesystem default, as lfs -c 0
  *             uint32 small_threshold
  *                                   0 for a plain stripe; above 0, a tiered
  *                                   composite with [0, small_threshold) on
  *                                   one OST and the rest striped across
  *                                   stripe_count OSTs
  *   reply:    uint32 status         one of the codes below
- *             uint32 applied_count  the count set, which the filesystem may
- *                                   clamp below the request; 0 on error
+ *             uint32 applied_count  the count requested, which Lustre may
+ *                                   clamp silently; 0 on error
  *             uint32 layout_kind    one of the kinds below
  *
  * Lustre is the only backend today; the generic name leaves room for
@@ -113,8 +115,7 @@
 #define HPN_FILE_LAYOUT_KIND_STRIPE	0	/* plain RAID0 stripe */
 #define HPN_FILE_LAYOUT_KIND_TIERED	1	/* tiered composite */
 
-/*
- * Heartbeats for the two hash extensions. The server's check-file and
+/* Heartbeats for the two hash extensions. The server's check-file and
  * hash-range handlers send one every HPN_HASH_HEARTBEAT_INTERVAL_SEC
  * while they hash, once a second so the client's meter has a fresh
  * figure at each redraw. Each renews the client's watchdog pause for
@@ -133,13 +134,11 @@
  * SFTP_HASH_RANGE_MAX_RANGES.
  *
  * Heartbeats prove liveness, not progress. A client that sees done stop
- * advancing for HPN_VERIFY_PROGRESS_STALL_SEC fails the connection, since
- * the request cannot be abandoned on a live one: a late reply would
- * desynchronize it.
- */
+ * advancing for HPN_VERIFY_PROGRESS_STALL_SEC (sftp-hpn-verify.h) fails
+ * the connection, since the request cannot be abandoned on a live one: a
+ * late reply would desynchronize it. */
 #define HPN_HASH_HEARTBEAT_INTERVAL_SEC	1
 #define HPN_HEARTBEAT_REFRESH_SEC	30
-#define HPN_VERIFY_PROGRESS_STALL_SEC	120
 #define HPN_HASH_CHECK_FILE_HEARTBEAT	0xC0FFEEDEADBEEF42ULL
 #define HPN_NUM_HASHES_HEARTBEAT	0xFFFFFFFE
 

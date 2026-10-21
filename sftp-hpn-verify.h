@@ -24,6 +24,11 @@
 #include <sys/types.h>
 #include <stdint.h>
 
+/* How long verify waits for the server's bytes-hashed figure to advance,
+ * with heartbeats still arriving, before it fails the connection. The
+ * heartbeat protocol is in sftp-hpn-server.h. */
+#define HPN_VERIFY_PROGRESS_STALL_SEC	120
+
 struct sftp_conn;
 struct sftp_hpn_conn;
 
