@@ -197,6 +197,7 @@ sftp_hpn_conn_free(struct sftp_hpn_conn *hpn)
 		free(hpn->verify_failed_paths[i]);
 	free(hpn->verify_failed_paths);
 	free(hpn->pace.bw);
+	free(hpn->layout_parent);
 	freezero(hpn, sizeof(*hpn));
 }
 
@@ -2474,7 +2475,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 	sftp_hpn_dir_attrs_from_stat(&sb, preserve_flag, &dir_attrs);
 
 	/* Serial prints progress. Parallel marks the enumeration phase. */
-	sink->enter_dir(sink, src, dst);
+	sink->enter_dir(sink, src, dst, depth, created);
 
 	if ((dirp = opendir(src)) == NULL) {
 		error("local opendir \"%s\": %s", src, strerror(errno));

@@ -121,7 +121,7 @@
 
 #include "sftp-common.h"
 #include "sftp-client.h"
-#include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
+#include "sftp-client-internal.h"	/* the verify and stripe count setters */
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
 #include "sftp-hpn-transferlog.h"
 #include "hpn-compress.h"		/* HPN: -z zstd level bounds */

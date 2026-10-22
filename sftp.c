@@ -60,10 +60,10 @@ typedef void EditLine;
 #include "sftp-client.h"
 #include "sftp-hpn-transferlog.h"
 #include "hpn-compress.h"		/* HPN: -z zstd level bounds */
-#include "sftp-client-internal.h"	/* sftp_conn_set_verify_transfer */
+#include "sftp-client-internal.h"	/* the verify and Lustre accessors */
 #include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
 #include "sftp-usergroup.h"
-#include "sftp-lustre-client.h"	/* maybe_apply_lustre_layout{,_local} */
+#include "sftp-lustre-client.h"	/* maybe_apply_lustre_layout_parent */
 #include "sftp-parallel.h"
 #include "progressmeter.h"	/* pm_mprintf */
 
@@ -1319,6 +1319,8 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		}
 	}
 
+	/* HPN: a new command asks again about each destination's parent */
+	sftp_conn_forget_layout_parent(conn);
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
 		tmp = xstrdup(g.gl_pathv[i]);
 		if ((filename = basename(tmp)) == NULL) {
@@ -1523,6 +1525,8 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		sftp_parallel_set_file_total(parallel_orch, total_files);
 	}
 
+	/* HPN: a new command asks again about each destination's parent */
+	sftp_conn_forget_layout_parent(conn);
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
 		if (stat(g.gl_pathv[i], &sb) == -1) {
 			err = -1;

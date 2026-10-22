@@ -1426,10 +1426,10 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 			    local_path, remote_path, remote_path, size, mode,
 			    resume, verify);
 	}
-	/* When a control connection is supplied, route through the
-	 * speculative-split decision so a single large file produces
-	 * multiple range work units (feeds the byte-based scale-up
-	 * trigger). Otherwise, fall back to a whole-file unit. */
+	/* When a control connection is supplied, route through the split
+	 * decision, so a single large file can become several range units
+	 * spread across the workers. Otherwise, fall back to a whole-file
+	 * unit. */
 	else if (conn != NULL)
 		rc = submit_upload_maybe_split(fleet, conn, local_path, remote_path,
 		    size, mode);

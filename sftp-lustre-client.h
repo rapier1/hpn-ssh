@@ -16,52 +16,59 @@
  *
  */
 
-/*
- * sftp-lustre-client.h - client-side Lustre layout policy for the
- * parallel-streams orchestrator (HPNLustreStripeCount).  The filesystem
- * MECHANISM (layout ABI, setstripe/getstripe wrappers) lives in
- * sftp-lustre.c; this module is the client POLICY deciding when and how
- * to apply a layout to a destination directory.
- *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- */
+/* sftp-lustre-client.h - the client's Lustre layout policy for parallel
+ * transfers (HPNLustreStripeCount). It sets a destination directory's
+ * layout before files land in it, so they inherit it. This module decides
+ * when and what to ask for. The layout ABI and the calls that set and read
+ * layouts live in sftp-lustre.c. */
+
 #ifndef SFTP_LUSTRE_CLIENT_H
 #define SFTP_LUSTRE_CLIENT_H
 
 struct sftp_parallel;
 struct sftp_conn;
 
-/*
- * HPNLustreStripeCount entry point.  Called by the recursive walker after
- * mkdir of a destination subdirectory, and through
- * maybe_apply_lustre_layout_parent() for a single-file upload.  No-op when the feature is
- * disabled (HPNLustreStripeCount=0), not in parallel mode, the server
- * does not advertise hpn-file-layout, the destination is not on Lustre,
- * the current stripe count already meets or exceeds the desired count,
- * or a prior call on the same conn returned a non-success status (the
- * declined-latch is checked first so subsequent calls short-circuit).
- * On success emits one INFO log line.  Safe to call repeatedly on the
- * same directory - Lustre setstripe is idempotent.
- */
-void maybe_apply_lustre_layout(struct sftp_parallel *fleet,
-    struct sftp_conn *conn, const char *dst);
+/* What maybe_apply_lustre_layout() learned about its directory. UNKNOWN
+ * means it stopped before asking, or the query failed, so the next call
+ * asks again. NOT_LUSTRE means the directory is on another filesystem.
+ * SETTLED means a layout was set or refused, or the directory already had
+ * the plain stripe asked for. */
+enum lustre_layout_result {
+	LUSTRE_LAYOUT_UNKNOWN,
+	LUSTRE_LAYOUT_NOT_LUSTRE,
+	LUSTRE_LAYOUT_SETTLED
+};
 
-/*
- * Local twin of maybe_apply_lustre_layout for DOWNLOADS: dst is a LOCAL
- * destination directory and this process is the writer, so the layout is
- * applied directly via sftp-lustre.c instead of the wire extension.  Same
- * HPNLustreStripeCount policy (0=off, unset=tiered composite sized to the
- * worker count, N=plain N-stripe with an exact-match skip).  Non-Lustre
- * destinations are skipped silently.  conn supplies only the resolved
- * config value.
- */
-void maybe_apply_lustre_layout_local(struct sftp_parallel *fleet,
-    struct sftp_conn *conn, const char *dst);
+/* Upload side. The arguments are the fleet, the connection, and a remote
+ * destination directory. The parallel walker calls it for each directory
+ * it enters, and maybe_apply_lustre_layout_parent() for a single-file
+ * upload. It does nothing unless the transfer is parallel,
+ * HPNLustreStripeCount is not 0, the server has hpn-fs-info and
+ * hpn-file-layout, and the directory is on Lustre. A plain stripe of N
+ * skips a directory already at exactly N. Success logs at debug level. Any
+ * other reply logs once and stops later requests on the connection. Returns
+ * what it learned about the directory. */
+enum lustre_layout_result maybe_apply_lustre_layout(struct sftp_parallel *,
+    struct sftp_conn *, const char *);
+
+/* Download side, the same policy applied to a local destination directory
+ * through sftp-lustre.c. The arguments are the fleet, the connection, and
+ * the directory. The parallel walker calls it after each mkdir, and
+ * maybe_apply_lustre_layout_parent() for a single-file download. There is
+ * no fs-info query. A directory that is not on Lustre gets NOT_FS from the
+ * setter, logs at debug level, and the next directory is tried again. PERM
+ * and FAIL log once at INFO and stop later attempts on the connection. */
+void maybe_apply_lustre_layout_local(struct sftp_parallel *,
+    struct sftp_conn *, const char *);
 
 /* Apply the layout to the parent directory of a single-file -j transfer's
- * destination, the case the walker does not cover. sftp.c and scp.c call
- * it before submitting the file. local selects the download variant. */
+ * destination, the case the walker does not cover. The arguments are the
+ * fleet, the connection, the destination file's path, and 1 for a local
+ * destination (a download) or 0 for a remote one (an upload). sftp.c and
+ * scp.c call it before submitting the file. The files of one command share
+ * a parent, so the connection remembers the last parent that got an
+ * answer, and later calls for it return at once. */
 void maybe_apply_lustre_layout_parent(struct sftp_parallel *,
-    struct sftp_conn *, const char *path, int local);
+    struct sftp_conn *, const char *, int);
 
 #endif /* SFTP_LUSTRE_CLIENT_H */

@@ -3262,11 +3262,14 @@ struct serial_ul_sink {
 
 static void
 serial_ul_enter_dir(struct sftp_upload_sink *sink, const char *src,
-    const char *dst)
+    const char *dst, int depth, int created)
 {
 	struct serial_ul_sink	*ctx = (struct serial_ul_sink *)sink;
 
-	(void)dst;	/* shared signature, only the parallel sink uses it */
+	/* shared signature, only the parallel sink uses these */
+	(void)dst;
+	(void)depth;
+	(void)created;
 	if (ctx->print_flag && ctx->print_flag != SFTP_PROGRESS_ONLY)
 		pm_mprintf("Entering %s\n", src);
 }

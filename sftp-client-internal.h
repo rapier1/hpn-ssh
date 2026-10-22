@@ -195,6 +195,13 @@ void sftp_conn_verify_park_hashed(struct sftp_conn *, const char *local_path,
 void sftp_conn_set_lustre_stripe_count(struct sftp_conn *, int);
 int  sftp_conn_lustre_stripe_count(struct sftp_conn *);
 
+/* Forget the parent directory that maybe_apply_lustre_layout_parent()
+ * remembers, so the next call asks again. sftp.c calls it at the start of
+ * each get and put, since a directory can be replaced or changed between
+ * commands. scp runs one command per process and does not need it. Safe
+ * when conn or conn->hpn is NULL. */
+void sftp_conn_forget_layout_parent(struct sftp_conn *);
+
 /* The SFTP payload bytes that actually crossed the wire on this
  * connection: WRITE data sent on uploads and DATA received on downloads,
  * without SSH framing or cipher overhead. The worker's completed-bytes

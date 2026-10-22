@@ -301,17 +301,28 @@ struct sftp_hpn_conn {
 	volatile off_t  *hash_meter_ctr;
 	volatile uint64_t hash_meter_base;
 
-	/* HPNLustreStripeCount from ssh_config: -1 auto (the -j count, when
-	 * the destination is Lustre with fewer stripes), 0 off (never call
-	 * hpn-file-layout), else the stripe count to ask for under the same
-	 * condition. Read for each directory the walk creates, until
-	 * layout_set_declined ends the calls. */
+	/* HPNLustreStripeCount from ssh_config: -1 auto (a tiered layout
+	 * across the -j count), 0 off, else a plain stripe of that count.
+	 * Read for each directory a parallel transfer creates, until a latch
+	 * below ends the calls. */
 	int              lustre_stripe_count;
 
 	/* Set after the first non-success reply to hpn-file-layout, so later
 	 * directories skip the round trip and the log gets one line, not one
 	 * per directory. Lives as long as the connection. */
 	int              layout_set_declined;
+
+	/* The same for a download's local destination: set after the first
+	 * PERM or FAIL from setting a local layout. Separate from
+	 * layout_set_declined, since one session can go both ways. */
+	int              local_layout_declined;
+
+	/* The last parent directory maybe_apply_lustre_layout_parent() got
+	 * an answer for, and 1 when it was local. Later files of the same
+	 * command skip it. sftp.c clears it at the start of each get and
+	 * put. Owned, freed with the connection. */
+	char            *layout_parent;
+	int              layout_parent_local;
 
 	/* Read-ahead controller. Sizes the in-flight window to the path's
 	 * BDP instead of a flat num_requests. */
@@ -459,10 +470,12 @@ struct sftp_tree_dl_sink {
  * two share an address. struct sftp_tree_dl_sink is the download twin. */
 struct sftp_upload_sink {
 	/* Once per directory, after its attrs are known and before it is
-	 * enumerated. Serial prints "Entering src"; parallel applies the
-	 * Lustre layout to dst and enters the enumerate phase. */
+	 * enumerated. depth is its level below the root, which is 0, and
+	 * created is 1 when this transfer made it. Serial prints "Entering
+	 * src". Parallel applies the Lustre layout to dst and enters the
+	 * enumerate phase. */
 	void (*enter_dir)(struct sftp_upload_sink *sink, const char *src,
-	         const char *dst);
+	         const char *dst, int depth, int created);
 	/* Transfer regular local file src to dst. src_sb is its stat. 0 or
 	 * -1. */
 	int  (*xfer_file)(struct sftp_upload_sink *sink, const char *src,

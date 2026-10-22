@@ -69,6 +69,10 @@ struct parallel_ul_sink {
 	struct sftp_parallel	*fleet;
 	struct sftp_conn	*conn;
 	int	resume, verify;
+	/* What the layout call learned about the directory entered last at
+	 * each depth. During the depth-first walk, the entry one level up is
+	 * the current directory's parent. */
+	enum lustre_layout_result layout[HPN_WALK_MAX_DEPTH];
 };
 
 /* Parallel download sink for the shared tree walk consumer
@@ -98,14 +102,26 @@ parallel_dirattrs(struct sftp_parallel *fleet)
 
 static void
 parallel_ul_enter_dir(struct sftp_upload_sink *sink, const char *src,
-    const char *dst)
+    const char *dst, int depth, int created)
 {
 	struct parallel_ul_sink	*ctx = (struct parallel_ul_sink *)sink;
+	enum lustre_layout_result result;
 
 	(void)src;	/* shared signature, only the serial sink prints it */
+	if (depth < 0 || depth >= HPN_WALK_MAX_DEPTH)
+		fatal_f("walk depth %d out of range", depth);
 	/* Lay out this already-created directory for Lustre before any files
-	 * land in it, then enter the enumerate phase. */
-	maybe_apply_lustre_layout(ctx->fleet, ctx->conn, dst);
+	 * land in it, then enter the enumerate phase. A directory this walk
+	 * created is on its parent's filesystem, so when the parent is not
+	 * Lustre, neither is it, and the query is skipped. The root, and a
+	 * directory that already existed and may be a mount point, are always
+	 * asked. */
+	if (created && depth > 0 &&
+	    ctx->layout[depth - 1] == LUSTRE_LAYOUT_NOT_LUSTRE)
+		result = LUSTRE_LAYOUT_NOT_LUSTRE;
+	else
+		result = maybe_apply_lustre_layout(ctx->fleet, ctx->conn, dst);
+	ctx->layout[depth] = result;
 	sftp_parallel_set_walker_phase(ctx->fleet, SFTP_WKP_ENUM);
 }
 

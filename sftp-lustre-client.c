@@ -16,18 +16,17 @@
  *
  */
 
-/*
- * sftp-lustre-client.c - client-side Lustre layout policy for the
- * parallel-streams orchestrator (HPNLustreStripeCount), extracted verbatim
- * from sftp-parallel-walk.c.  The upload path asks the SERVER to set the
- * destination directory's default layout via the hpn-file-layout wire
- * extension; the download path applies it LOCALLY through the sftp-lustre.c
- * mechanism wrappers.  Policy only - the layout ABI and the setstripe/
- * getstripe mechanics stay in sftp-lustre.c so other filesystems can grow
- * their own policy modules without touching the transfer code.
+/* sftp-lustre-client.c - the client's Lustre layout policy for parallel
+ * transfers (HPNLustreStripeCount).
  *
- * This file is part of HPN-SSH and is NOT part of upstream OpenSSH.
- */
+ * On an upload the client asks the server to set the destination
+ * directory's layout through the hpn-file-layout extension. On a download
+ * it sets the local destination's layout itself through sftp-lustre.c.
+ * This file decides when and what to ask for. The layout ABI and the calls
+ * that set and read layouts stay in sftp-lustre.c, so another filesystem
+ * can get a policy module of its own without touching the transfer code.
+ * The connection's stripe count setting, and the latch that stops asking
+ * after a refusal, live here too. */
 
 #include "includes.h"
 
@@ -40,34 +39,30 @@
 
 #include "xmalloc.h"
 #include "log.h"
-#include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
-#include "sftp-client-internal.h"  /* sftp_conn_lustre_stripe_count */
-#include "sftp-hpn-client.h"        /* sftp_hpn_set_file_layout */
-#include "sftp-hpn-server.h"        /* HPN_FILE_LAYOUT_* */
-#include "sftp-lustre.h"            /* local layout apply (download parity) */
+#include "sftp-client-internal.h"	/* sftp_conn_hpn, count accessors */
+#include "sftp-hpn-client.h"	/* struct sftp_hpn_conn, the layout request */
+#include "sftp-hpn-server.h"	/* HPN_FILE_LAYOUT_* */
+#include "sftp-lustre.h"	/* lustre_get_stripe, lustre_set_layout_path */
 #include "sftp-parallel.h"
 #include "sftp-lustre-client.h"
 
-/*
- * Fallback small/large boundary for the tiered auto layout (see
- * maybe_apply_lustre_layout).  The threshold is normally derived from the
- * destination filesystem's actual OST stripe size (a file smaller than one
- * stripe gains nothing from striping); this constant is used only when the
- * server does not report a stripe size (old server, or a query miss).  1 MiB
- * matches the common Lustre default stripe size.
- */
-#define LUSTRE_SMALL_THRESHOLD_FALLBACK  (1u * 1024u * 1024u)   /* 1 MiB */
+/* The tiered layout's small-file boundary when no stripe size is known.
+ * The boundary is normally the filesystem's stripe size, since a file
+ * smaller than one stripe gains nothing from striping. This fallback
+ * covers a server that reports no stripe size and a local destination
+ * whose layout cannot be read. 1 MiB is the common Lustre default stripe
+ * size. */
+#define LUSTRE_SMALL_THRESHOLD_FALLBACK  (1024 * 1024)   /* 1 MiB */
 
-/*
- * Resolve the tiered small-file threshold from a 64-bit stripe size.  The
- * threshold is carried in a u32 (the hpn-file-layout wire field and the local
- * lustre setter), so a stripe >= 4 GiB - or an exact multiple of 2^32 - would
- * truncate to a bogus value (e.g. 0, which disables the small-file tier).
- * Clamp to UINT32_MAX; a 4 GiB "small file" boundary is already well past any
- * sane ceiling.  A zero stripe (server reported none) falls back to 1 MiB.
- */
+/* The tiered layout's small-file boundary for a stripe size: the size
+ * itself, the fallback when it is 0 (unknown), or UINT32_MAX when it does
+ * not fit the 32-bit boundary that the hpn-file-layout request and the
+ * local setter carry. Lustre's own stripe size is 32 bits, but hpn-fs-info
+ * sends it as 64, so only a server can report a larger one. Without the
+ * clamp it would truncate, and a multiple of 2^32 would truncate to 0,
+ * which turns the small-file tier off. */
 static uint32_t
 stripe_to_small_threshold(uint64_t stripe_size)
 {
@@ -78,121 +73,143 @@ stripe_to_small_threshold(uint64_t stripe_size)
 	return (uint32_t)stripe_size;
 }
 
-/* Query and set the latch that records the server declining
+/* Query and set the latch that records the server turning down
  * hpn-file-layout on this connection. maybe_apply_lustre_layout() sets it
- * after the first refusal, so later calls skip the round trip. Safe when
- * conn or conn->hpn is NULL. */
+ * after the first reply that is not OK, NOT_FS included, so later
+ * directories skip the round trip. Safe when conn or conn->hpn is NULL. */
 static int
 sftp_conn_layout_set_declined(struct sftp_conn *conn)
 {
-	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 
-	return h != NULL && h->layout_set_declined;
+	return hpn != NULL && hpn->layout_set_declined;
 }
 
 static void
-sftp_conn_set_layout_set_declined(struct sftp_conn *conn, int v)
+sftp_conn_set_layout_set_declined(struct sftp_conn *conn)
 {
-	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 
-	if (h != NULL)
-		h->layout_set_declined = v ? 1 : 0;
+	if (hpn != NULL)
+		hpn->layout_set_declined = 1;
 }
 
-/*
- * HPNLustreStripeCount (EXPERIMENTAL): one-shot helper run at the top of
- * the upload walker.  Queries the destination directory's filesystem via
- * hpn-fs-info; if it's Lustre, asks the server to set the directory's default
- * layout via hpn-file-layout.  Default/auto requests a tiered composite layout
- * (small files on a single OST below the stripe-size threshold - one OST object,
- * no over-striping, no MDT data - large files striped across n_workers OSTs);
- * an explicit HPNLustreStripeCount=N requests a plain N-wide stripe instead.
- * Subsequent files created in the directory (including those extracted from
- * bundles) inherit the layout.
+/* Query and set the download side's latch: set after the first PERM or
+ * FAIL from setting a local destination's layout, so later directories
+ * skip the attempt. Separate from the upload latch, since one session can
+ * go both ways. Safe when conn or conn->hpn is NULL. */
+static int
+sftp_conn_local_layout_declined(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
+	return hpn != NULL && hpn->local_layout_declined;
+}
+
+static void
+sftp_conn_set_local_layout_declined(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
+	if (hpn != NULL)
+		hpn->local_layout_declined = 1;
+}
+
+/* The layout HPNLustreStripeCount asks for. Returns 0 when the setting is
+ * off or the transfer is not parallel. Otherwise returns 1, with
+ * *use_tiered set for the auto setting and *desired the stripe count, the
+ * worker count under auto. */
+static int
+layout_request(struct sftp_parallel *fleet, struct sftp_conn *conn,
+    int *use_tiered, int *desired)
+{
+	int configured;
+	int n_workers;
+
+	configured = sftp_conn_lustre_stripe_count(conn);
+	if (configured == 0)
+		return 0;  /* HPNLustreStripeCount=0 turns it off */
+	n_workers = sftp_parallel_num_streams(fleet);
+	if (n_workers < 2)
+		return 0;  /* not in parallel mode */
+	*use_tiered = (configured < 0);
+	*desired = *use_tiered ? n_workers : configured;
+	return 1;
+}
+
+/* Upload side of HPNLustreStripeCount. For a directory the upload creates,
+ * or the parent of a single-file upload's destination, ask hpn-fs-info for
+ * its filesystem. On Lustre, ask the server through hpn-file-layout to set
+ * the directory's layout, which the files created in it then inherit,
+ * those extracted from bundles included. By default the layout is tiered:
+ * files below the stripe size on one OST, larger ones across as many OSTs
+ * as there are workers. HPNLustreStripeCount=N asks for a plain stripe
+ * across N OSTs instead.
  *
- * Silent on every non-Lustre destination - operators of non-Lustre sites
- * see nothing change.  On Lustre destinations the actual stripe-set
- * action emits one INFO line per directory modified.  Server-side
- * failure (EPERM, controlled OST pools) emits one WARN line and latches
- * conn->hpn->layout_set_declined so subsequent calls short-circuit.
- *
- * Called only when parallel mode is engaged (-j N with N >= 2); skipped
- * on single-stream transfers.
- */
-void
+ * It does nothing unless the transfer is parallel (-j 2 or more), the
+ * setting is not 0, and the server has both extensions. A destination that
+ * is not Lustre changes nothing and logs nothing. Success logs at debug
+ * level. Any other reply logs once, at INFO for PERM and FAIL and at debug
+ * for NOT_FS, and latches the connection so later directories skip the
+ * request. Returns NOT_LUSTRE when hpn-fs-info names another filesystem,
+ * SETTLED after any reply to the request or for a directory already at N,
+ * and UNKNOWN when it stops before asking or the query fails.
+ * Experimental. */
+enum lustre_layout_result
 maybe_apply_lustre_layout(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *dst)
 {
 	struct sftp_fs_info info;
 	int desired;
-	int configured;
-	int n_workers;
 	int use_tiered;
 	uint32_t small_threshold = 0;
 	uint32_t applied = 0;
-	uint32_t layout_kind = 0;
-	int rc;
+	uint32_t layout_kind = HPN_FILE_LAYOUT_KIND_STRIPE;
+	int status;
 
 	if (fleet == NULL || conn == NULL || dst == NULL)
-		return;
+		return LUSTRE_LAYOUT_UNKNOWN;
+	/* an earlier request was turned down */
 	if (sftp_conn_layout_set_declined(conn))
-		return;  /* prior failure on this conn - short-circuit */
-
-	configured = sftp_conn_lustre_stripe_count(conn);
-	if (configured == 0)
-		return;  /* HPNLustreStripeCount=0 → feature disabled */
-
-	n_workers = sftp_parallel_num_streams(fleet);
-	if (n_workers < 2)
-		return;  /* not in parallel mode */
-
+		return LUSTRE_LAYOUT_UNKNOWN;
+	if (!layout_request(fleet, conn, &use_tiered, &desired))
+		return LUSTRE_LAYOUT_UNKNOWN;
+	/* the server is too old or built without it */
 	if (!sftp_conn_has_file_layout(conn))
-		return;  /* server is too old or built without it */
-
-	/*
-	 * Default/auto (HPNLustreStripeCount unset = -1): tiered composite -
-	 * small files on a single OST, large files striped across n_workers OSTs.
-	 * Explicit HPNLustreStripeCount=N: plain N-wide stripe.
-	 */
-	use_tiered = (configured < 0);
-	desired    = use_tiered ? n_workers : configured;
+		return LUSTRE_LAYOUT_UNKNOWN;
 
 	sftp_parallel_set_walker_phase(fleet, SFTP_WKP_FSINFO);
 	if (sftp_fs_info(conn, dst, &info) != 0)
-		return;  /* server lacks hpn-fs-info, or query failed */
+		return LUSTRE_LAYOUT_UNKNOWN;  /* no hpn-fs-info, or it failed */
 	if (strcmp(info.fs_type, "lustre") != 0)
-		return;  /* not a Lustre destination */
-	/*
-	 * Tiered small/large boundary: derive it from the filesystem's actual
-	 * OST stripe size (a file smaller than one stripe gains nothing from
-	 * striping).  Fall back to the 1 MiB constant when the server reports no
-	 * size.  0 for the explicit plain-stripe path (no tiering).
-	 */
+		return LUSTRE_LAYOUT_NOT_LUSTRE;
+	/* The tiered boundary is the filesystem's stripe size, since a file
+	 * smaller than one stripe gains nothing from striping. 0 means no
+	 * tiers. */
 	small_threshold = use_tiered
 	    ? stripe_to_small_threshold(info.stripe_size)
 	    : 0;
-	/*
-	 * Plain-stripe path: HPNLustreStripeCount=N is authoritative, so apply
-	 * unless the dir is already at exactly N.  The guard must honour a
-	 * request to NARROW a wider inherited default (e.g. an offset=-1
-	 * stripe-8 project root) just as well as widen - a ">=" test silently
-	 * dropped every narrowing request.  The tiered path always (re)applies:
-	 * the current stripe_count can't distinguish a tiered composite from a
-	 * plain layout, and re-setting the dir default is cheap and idempotent.
-	 */
+	/* A plain stripe of N is authoritative, so it is set unless the
+	 * directory already has exactly N. The test must let a request narrow
+	 * a wider inherited layout, such as a stripe-8 project root, as well
+	 * as widen one. A >= test once dropped every narrowing request. The
+	 * tiered layout is always set: the stripe count cannot tell a tiered
+	 * layout from a plain one, and setting it again is cheap and
+	 * idempotent. */
 	if (!use_tiered && info.stripe_count == (uint32_t)desired) {
 		debug_f("Lustre auto-stripe: \"%s\" already at stripe_count=%u "
 		    "(desired %d); no change", dst, info.stripe_count, desired);
-		return;
+		return LUSTRE_LAYOUT_SETTLED;
 	}
 
 	sftp_parallel_set_walker_phase(fleet, SFTP_WKP_LAYOUT);
-	rc = sftp_hpn_set_file_layout(conn, dst, (u_int32_t)desired,
+	status = sftp_hpn_set_file_layout(conn, dst, (uint32_t)desired,
 	    small_threshold, &applied, &layout_kind);
-	switch (rc) {
+	/* one line per outcome, and any reply but OK stops later requests */
+	switch (status) {
 	case HPN_FILE_LAYOUT_OK:
-		/* Success is silent at default verbosity (like the rest of the
-		 * auto-tuning); -v recovers it.  PERM/FAIL below stay loud. */
+		/* Success is silent at default verbosity, like the rest of the
+		 * auto-tuning, and -v shows it. PERM and FAIL stay loud. */
 		debug("Lustre auto-stripe: \"%s\" -> %s "
 		    "(stripe_count %u)", dst,
 		    layout_kind == HPN_FILE_LAYOUT_KIND_TIERED ?
@@ -202,89 +219,76 @@ maybe_apply_lustre_layout(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		debug_f("Lustre auto-stripe: \"%s\" reports not on a "
 		    "layout-capable filesystem despite fs-info=lustre; "
 		    "skipping further calls on this connection", dst);
-		sftp_conn_set_layout_set_declined(conn, 1);
+		sftp_conn_set_layout_set_declined(conn);
 		break;
 	case HPN_FILE_LAYOUT_PERM:
 		logit("Lustre auto-stripe: \"%s\": permission "
 		    "denied; layout will not be set for the rest of this "
-		    "transfer.  Disable with HPNLustreStripeCount=0.", dst);
-		sftp_conn_set_layout_set_declined(conn, 1);
+		    "session. Disable with HPNLustreStripeCount=0.", dst);
+		sftp_conn_set_layout_set_declined(conn);
 		break;
 	default:
 		logit("Lustre auto-stripe: \"%s\": layout set "
 		    "failed (status %d); layout will not be set for the rest "
-		    "of this transfer.", dst, rc);
-		sftp_conn_set_layout_set_declined(conn, 1);
+		    "of this session.", dst, status);
+		sftp_conn_set_layout_set_declined(conn);
 		break;
 	}
+	return LUSTRE_LAYOUT_SETTLED;
 }
 
-/*
- * Local twin of maybe_apply_lustre_layout for DOWNLOADS.  The destination
- * directory is on a LOCAL filesystem and this process is the writer, so the
- * layout is applied directly (lustre_set_layout_path) instead of via
- * the hpn-file-layout wire extension.  The policy block mirrors the upload
- * side exactly: HPNLustreStripeCount 0=disabled, unset(<0)=tiered composite
- * sized to n_workers, explicit N=plain N-stripe with the exact-match skip
- * (narrowing honored, same as upload).  The tiered small/large boundary
- * comes from the local dir's existing stripe geometry when present, else
- * the 1 MiB fallback.
+/* Download side of HPNLustreStripeCount: the same policy, applied
+ * directly with lustre_set_layout_path, since the destination directory is
+ * local and this process writes it. The tiered boundary comes from the
+ * directory's own stripe geometry, or the fallback when it has none.
  *
- * Differences from the wire version, both deliberate:
- *  - No declined-latch: the latch exists to save wire round-trips on a
- *    server that refused; locally one open+xattr attempt per created
- *    directory is negligible next to the mkdir itself, and a NOT_FS
- *    (ext4/xfs dest) just returns quietly each time.
- *  - No fs-info gate: the setter's own NOT_FS result is the detection.
- */
+ * It differs from the upload side in two ways, both deliberate. It runs no
+ * fs-info query, since the setter's NOT_FS is the test. And NOT_FS, from an
+ * ext4 or xfs destination, sets no latch, since one attempt per directory
+ * costs little next to the mkdir. PERM and FAIL log once at INFO and set
+ * the download side's own latch, so later directories skip the attempt. */
 void
 maybe_apply_lustre_layout_local(struct sftp_parallel *fleet,
     struct sftp_conn *conn, const char *dst)
 {
-	uint64_t l_ssize = 0;
-	uint32_t l_scount = 0;
+	uint64_t stripe_size = 0;
+	uint32_t stripe_count = 0;
 	uint32_t small_threshold;
 	uint32_t applied = 0;
 	uint32_t layout_kind = HPN_FILE_LAYOUT_KIND_STRIPE;
-	uint32_t rc;
-	int configured;
-	int n_workers;
+	uint32_t status;
 	int use_tiered;
 	int desired;
 
 	if (fleet == NULL || conn == NULL || dst == NULL)
 		return;
-	configured = sftp_conn_lustre_stripe_count(conn);
-	if (configured == 0)
-		return;  /* HPNLustreStripeCount=0 -> feature disabled */
-	n_workers = sftp_parallel_num_streams(fleet);
-	if (n_workers < 2)
-		return;  /* not in parallel mode */
+	if (sftp_conn_local_layout_declined(conn))
+		return;  /* an earlier attempt was refused */
+	if (!layout_request(fleet, conn, &use_tiered, &desired))
+		return;
 
-	use_tiered = (configured < 0);
-	desired    = use_tiered ? n_workers : configured;
-
-	/* Local stripe geometry feeds the tiered boundary and the plain-path
-	 * exact-match skip.  A failed read means "no default set, or not
-	 * Lustre" - proceed and let the setter's NOT_FS decide. */
-	(void)lustre_get_stripe(dst, &l_ssize, &l_scount);
-	if (!use_tiered && l_scount == (uint32_t)desired) {
+	/* The directory's stripe geometry feeds the tiered boundary and the
+	 * plain stripe's "already at N" test. A failed read leaves both 0, and
+	 * the setter's NOT_FS then decides. */
+	(void)lustre_get_stripe(dst, &stripe_size, &stripe_count);
+	if (!use_tiered && stripe_count == (uint32_t)desired) {
 		debug_f("Lustre auto-stripe (local): \"%s\" already at "
 		    "stripe_count=%u (desired %d); no change",
-		    dst, l_scount, desired);
+		    dst, stripe_count, desired);
 		return;
 	}
 	small_threshold = use_tiered
-	    ? stripe_to_small_threshold(l_ssize)
+	    ? stripe_to_small_threshold(stripe_size)
 	    : 0;
 
-	rc = lustre_set_layout_path(dst, (uint32_t)desired, small_threshold,
-	    &applied, &layout_kind);
-	switch (rc) {
+	status = lustre_set_layout_path(dst, (uint32_t)desired,
+	    small_threshold, &applied, &layout_kind);
+	/* one line per outcome, and PERM or FAIL stops later attempts */
+	switch (status) {
 	case HPN_FILE_LAYOUT_OK:
-		/* Success is silent at default verbosity, mirroring the wire
-		 * variant above; PERM stays loud. */
-		debug("Lustre auto-stripe (experimental): local \"%s\" -> %s "
+		/* Success is silent at default verbosity, as on the upload
+		 * side. */
+		debug("Lustre auto-stripe (local): \"%s\" -> %s "
 		    "(stripe_count %u)", dst,
 		    layout_kind == HPN_FILE_LAYOUT_KIND_TIERED ?
 		    "tiered composite" : "plain stripe", applied);
@@ -294,15 +298,61 @@ maybe_apply_lustre_layout_local(struct sftp_parallel *fleet,
 		    "layout-capable filesystem; skipping", dst);
 		break;
 	case HPN_FILE_LAYOUT_PERM:
-		logit("Lustre auto-stripe (experimental): local \"%s\": "
-		    "permission denied; layout not set.  Disable with "
-		    "HPNLustreStripeCount=0.", dst);
+		logit("Lustre auto-stripe (local): \"%s\": permission "
+		    "denied; layout will not be set for the rest of this "
+		    "session. Disable with HPNLustreStripeCount=0.", dst);
+		sftp_conn_set_local_layout_declined(conn);
 		break;
 	default:
-		debug_f("Lustre auto-stripe (local): \"%s\" layout set "
-		    "failed (status %u)", dst, rc);
+		logit("Lustre auto-stripe (local): \"%s\": layout set "
+		    "failed (status %u); layout will not be set for the rest "
+		    "of this session.", dst, status);
+		sftp_conn_set_local_layout_declined(conn);
 		break;
 	}
+}
+
+/* True when parent, on the side local names, is the last parent
+ * maybe_apply_lustre_layout_parent() got an answer for. Safe when conn or
+ * conn->hpn is NULL. */
+static int
+layout_parent_remembered(struct sftp_conn *conn, const char *parent,
+    int local)
+{
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
+	return hpn != NULL && hpn->layout_parent != NULL &&
+	    hpn->layout_parent_local == local &&
+	    strcmp(hpn->layout_parent, parent) == 0;
+}
+
+/* Remember parent and its side as the last parent that got an answer,
+ * replacing the one before. Safe when conn or conn->hpn is NULL. */
+static void
+layout_parent_remember(struct sftp_conn *conn, const char *parent, int local)
+{
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
+	if (hpn == NULL)
+		return;
+	free(hpn->layout_parent);
+	hpn->layout_parent = xstrdup(parent);
+	hpn->layout_parent_local = local;
+}
+
+/* Drop the remembered parent, so the next
+ * maybe_apply_lustre_layout_parent() call asks again. Declared in
+ * sftp-client-internal.h, and sftp.c calls it at the start of each get and
+ * put. Safe when conn or conn->hpn is NULL. */
+void
+sftp_conn_forget_layout_parent(struct sftp_conn *conn)
+{
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
+
+	if (hpn == NULL)
+		return;
+	free(hpn->layout_parent);
+	hpn->layout_parent = NULL;
 }
 
 /* Apply the layout to the parent directory of path, for a single-file -j
@@ -317,37 +367,46 @@ maybe_apply_lustre_layout_parent(struct sftp_parallel *fleet,
 
 	if (path == NULL)
 		return;
+	/* POSIX lets dirname write into its argument, so it gets a copy */
 	copy = xstrdup(path);
 	parent = dirname(copy);
-	if (local)
+	/* an earlier file of this command already settled this parent */
+	if (layout_parent_remembered(conn, parent, local)) {
+		free(copy);
+		return;
+	}
+	/* The twins check the setting, the worker count, and their latches.
+	 * The local twin's early returns hold for the whole command, so any
+	 * call settles its parent. On the upload side UNKNOWN is not
+	 * remembered, so a failed query is tried again. */
+	if (local) {
 		maybe_apply_lustre_layout_local(fleet, conn, parent);
-	else
-		maybe_apply_lustre_layout(fleet, conn, parent);
+		layout_parent_remember(conn, parent, local);
+	} else if (maybe_apply_lustre_layout(fleet, conn, parent) !=
+	    LUSTRE_LAYOUT_UNKNOWN)
+		layout_parent_remember(conn, parent, local);
 	free(copy);
 }
 
-/* ==========================================================================
- * Conn-side lustre/layout bridge wrappers (moved from sftp-client.c).
- *
- * Reach HPN per-connection state through sftp_conn_hpn(); behavior-identical
- * to the originals.  Declared in sftp-client-internal.h; call sites unchanged.
- * ========================================================================== */
-
+/* Set and read the connection's HPNLustreStripeCount, declared in
+ * sftp-client-internal.h with the other accessors that reach the HPN state
+ * through sftp_conn_hpn(). Without HPN state the count reads 0, which turns
+ * the layout policy off. */
 void
 sftp_conn_set_lustre_stripe_count(struct sftp_conn *conn, int value)
 {
-	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 
-	if (h != NULL)
-		h->lustre_stripe_count = value;
+	if (hpn != NULL)
+		hpn->lustre_stripe_count = value;
 }
 
 int
 sftp_conn_lustre_stripe_count(struct sftp_conn *conn)
 {
-	struct sftp_hpn_conn *h = sftp_conn_hpn(conn);
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 
-	if (h == NULL)
+	if (hpn == NULL)
 		return 0;
-	return h->lustre_stripe_count;
+	return hpn->lustre_stripe_count;
 }
