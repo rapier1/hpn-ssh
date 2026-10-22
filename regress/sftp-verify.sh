@@ -1,15 +1,15 @@
 #	HPN-SSH sftp-verify.sh
 #	Placed in the Public Domain.
 #
-#	Exercises the verified-resume hash gate (Option A) and the
-#	HPNVerifyTransfer post-transfer integrity check.
+#	Exercises the verified-resume hash gate and the -V post-transfer
+#	integrity check.
 #
 #	The gate is the security-critical piece: a destination that is the
 #	SAME SIZE as the source but has different content (the range-split
 #	crash-resume sparse-hole scenario) must be detected by hashing and
 #	re-transferred, NOT trusted on size alone.
 
-tid="sftp verified resume gate and HPNVerifyTransfer"
+tid="sftp verified resume gate and -V verify"
 
 # Need a source large enough that a full-file hash is meaningful.
 increase_datafile_size 512
@@ -49,9 +49,11 @@ rm -f ${COPY}.1 ${COPY}.2
 cp ${DATA} ${COPY}.1
 cp ${DATA} ${COPY}.2
 echo "reputv ${COPY}.1 ${COPY}.2" | \
-    ${SFTP} -D ${SFTPSERVER} -q -b - >/dev/null 2>&1 || \
+    ${SFTP} -D ${SFTPSERVER} -q -b - >${OBJ}/verify.out 2>&1 || \
     fail "reputv (identical) failed"
 cmp ${COPY}.1 ${COPY}.2 || fail "reputv corrupted an identical file"
+grep "File skipped:.*Identical" ${OBJ}/verify.out >/dev/null || \
+    fail "reputv did not skip an identical destination"
 
 # ---- Part 2: -V whole-file verify (post-transfer integrity check) ----
 # -V is the program switch that replaced the old HPNVerifyTransfer
@@ -79,6 +81,8 @@ fi
 teed=$(grep -c "verify: teed source hash for" ${OBJ}/verify.out)
 [ "$teed" -eq 1 ] || \
     fail "-V clean upload used $teed teed source hashes, wanted 1"
+grep "verify phase: 1 file(s) parked" ${OBJ}/verify.out >/dev/null || \
+    fail "-V clean upload did not run the verify phase"
 
 # ---- Part 3: -V on a serial recursive upload ----
 # Each file's source hash is teed as the upload reads it and taken into
@@ -118,6 +122,8 @@ if [ "$teed" -ne "$want" ]; then
 fi
 grep -q "VERIFY FAILED" ${OBJ}/verify.out && \
     fail "-V put -r reported a false-positive mismatch"
+grep "verify phase: [1-9][0-9]* file(s) parked" ${OBJ}/verify.out \
+    >/dev/null || fail "-V put -r did not run the verify phase"
 
 stop_sshd
 rm -rf ${VSRC} ${VDST}

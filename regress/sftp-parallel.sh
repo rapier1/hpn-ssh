@@ -6,13 +6,22 @@ tid="sftp parallel streams"
 COPY2=${OBJ}/copy2
 SRCDIR=${OBJ}/par-src
 DSTDIR=${OBJ}/par-dst
+PLOG=${OBJ}/sftp-parallel.log
 
 parclean() {
 	rm -rf ${COPY} ${COPY2} ${SRCDIR} ${DSTDIR}
 	mkdir -p ${SRCDIR} ${DSTDIR}
 }
 
-# parallel transfers require a real sshd (ControlMaster)
+# A failed parallel setup falls back to one stream and the transfer still
+# succeeds, so each run also checks the log for that fallback. -v after -q
+# brings back the info line that reports it.
+check_parallel() {
+	grep "falling back to single-stream mode" ${PLOG} >/dev/null &&
+	    fail "$1: parallel setup failed and fell back to one stream"
+}
+
+# Each parallel worker opens its own connection, so a real sshd is needed.
 start_sshd
 
 # Ensure test data is large enough to exercise parallel paths
@@ -22,12 +31,13 @@ increase_datafile_size 512
 for J in 1 2 4; do
 	verbose "$tid: put single file j=$J"
 	parclean
-	${SFTP} -j $J -q -S "$SSH" -F $OBJ/ssh_config \
+	${SFTP} -j $J -q -v -S "$SSH" -F $OBJ/ssh_config \
 	    -P ${PORT} -o BatchMode=yes \
-	    -b - ${USER}@somehost > /dev/null 2>&1 <<EOF
+	    -b - ${USER}@somehost > /dev/null 2>${PLOG} <<EOF
 put ${DATA} ${COPY}
 EOF
 	r=$?
+	check_parallel "put j=$J"
 	if [ $r -ne 0 ]; then
 		fail "put j=$J failed with $r"
 	else
@@ -36,12 +46,13 @@ EOF
 
 	verbose "$tid: get single file j=$J"
 	parclean
-	${SFTP} -j $J -q -S "$SSH" -F $OBJ/ssh_config \
+	${SFTP} -j $J -q -v -S "$SSH" -F $OBJ/ssh_config \
 	    -P ${PORT} -o BatchMode=yes \
-	    -b - ${USER}@somehost > /dev/null 2>&1 <<EOF
+	    -b - ${USER}@somehost > /dev/null 2>${PLOG} <<EOF
 get ${DATA} ${COPY}
 EOF
 	r=$?
+	check_parallel "get j=$J"
 	if [ $r -ne 0 ]; then
 		fail "get j=$J failed with $r"
 	else
@@ -57,9 +68,9 @@ for J in 2 4; do
 	for i in 1 2 3 4 5; do
 		cp ${DATA} ${SRCDIR}/file${i}
 	done
-	${SFTP} -j $J -q -S "$SSH" -F $OBJ/ssh_config \
+	${SFTP} -j $J -q -v -S "$SSH" -F $OBJ/ssh_config \
 	    -P ${PORT} -o BatchMode=yes \
-	    -b - ${USER}@somehost > /dev/null 2>&1 <<EOF
+	    -b - ${USER}@somehost > /dev/null 2>${PLOG} <<EOF
 put ${SRCDIR}/file1 ${DSTDIR}/file1
 put ${SRCDIR}/file2 ${DSTDIR}/file2
 put ${SRCDIR}/file3 ${DSTDIR}/file3
@@ -67,6 +78,7 @@ put ${SRCDIR}/file4 ${DSTDIR}/file4
 put ${SRCDIR}/file5 ${DSTDIR}/file5
 EOF
 	r=$?
+	check_parallel "multi-put j=$J"
 	if [ $r -ne 0 ]; then
 		fail "multi-put j=$J failed with $r"
 	else
@@ -82,9 +94,9 @@ EOF
 		cp ${DATA} ${SRCDIR}/file${i}
 	done
 	mkdir -p ${DSTDIR}
-	${SFTP} -j $J -q -S "$SSH" -F $OBJ/ssh_config \
+	${SFTP} -j $J -q -v -S "$SSH" -F $OBJ/ssh_config \
 	    -P ${PORT} -o BatchMode=yes \
-	    -b - ${USER}@somehost > /dev/null 2>&1 <<EOF
+	    -b - ${USER}@somehost > /dev/null 2>${PLOG} <<EOF
 get ${SRCDIR}/file1 ${DSTDIR}/file1
 get ${SRCDIR}/file2 ${DSTDIR}/file2
 get ${SRCDIR}/file3 ${DSTDIR}/file3
@@ -92,6 +104,7 @@ get ${SRCDIR}/file4 ${DSTDIR}/file4
 get ${SRCDIR}/file5 ${DSTDIR}/file5
 EOF
 	r=$?
+	check_parallel "multi-get j=$J"
 	if [ $r -ne 0 ]; then
 		fail "multi-get j=$J failed with $r"
 	else
@@ -111,12 +124,13 @@ for J in 2 4; do
 	cp ${DATA} ${SRCDIR}/sub1/a
 	cp ${DATA} ${SRCDIR}/sub1/b
 	cp ${DATA} ${SRCDIR}/sub2/c
-	${SFTP} -j $J -q -S "$SSH" -F $OBJ/ssh_config \
+	${SFTP} -j $J -q -v -S "$SSH" -F $OBJ/ssh_config \
 	    -P ${PORT} -o BatchMode=yes \
-	    -b - ${USER}@somehost > /dev/null 2>&1 <<EOF
+	    -b - ${USER}@somehost > /dev/null 2>${PLOG} <<EOF
 put -r ${SRCDIR} ${DSTDIR}/uploaded
 EOF
 	r=$?
+	check_parallel "recursive put j=$J"
 	if [ $r -ne 0 ]; then
 		fail "recursive put j=$J failed with $r"
 	else
@@ -131,12 +145,13 @@ EOF
 	cp ${DATA} ${SRCDIR}/sub1/a
 	cp ${DATA} ${SRCDIR}/sub1/b
 	cp ${DATA} ${SRCDIR}/sub2/c
-	${SFTP} -j $J -q -S "$SSH" -F $OBJ/ssh_config \
+	${SFTP} -j $J -q -v -S "$SSH" -F $OBJ/ssh_config \
 	    -P ${PORT} -o BatchMode=yes \
-	    -b - ${USER}@somehost > /dev/null 2>&1 <<EOF
+	    -b - ${USER}@somehost > /dev/null 2>${PLOG} <<EOF
 get -r ${SRCDIR} ${DSTDIR}/downloaded
 EOF
 	r=$?
+	check_parallel "recursive get j=$J"
 	if [ $r -ne 0 ]; then
 		fail "recursive get j=$J failed with $r"
 	else
@@ -146,3 +161,4 @@ EOF
 done
 
 parclean
+rm -f ${PLOG}

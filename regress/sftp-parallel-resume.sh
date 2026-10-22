@@ -10,10 +10,12 @@
 
 tid="sftp parallel reget resume"
 
+PLOG=${OBJ}/sftp-parallel-resume.log
+
 # parallel transfers require a real sshd
 start_sshd
 
-# 1200 KiB source so the 1 MiB truncation case is meaningful.
+# 1200 KiB source, so every partial below is well short of it.
 increase_datafile_size 1200
 
 for size in 0 1023 600k; do
@@ -26,12 +28,17 @@ for size in 0 1023 600k; do
 		;;
 	esac
 
-	${SFTP} -j 4 -q -S "$SSH" -F $OBJ/ssh_config \
+	${SFTP} -j 4 -q -v -S "$SSH" -F $OBJ/ssh_config \
 	    -P ${PORT} -o BatchMode=yes \
-	    -b - ${USER}@somehost > /dev/null 2>&1 <<EOF
+	    -b - ${USER}@somehost > /dev/null 2>${PLOG} <<EOF
 reget ${DATA} ${COPY}
 EOF
 	r=$?
+	# A failed parallel setup falls back to one stream and still
+	# succeeds, so the log must not show that fallback. -v after -q
+	# brings back the line that reports it.
+	grep "falling back to single-stream mode" ${PLOG} >/dev/null && \
+	    fail "reget onto ${size} partial did not use the -j orchestrator"
 	if [ $r -ne 0 ]; then
 		fail "reget onto ${size} partial failed with $r"
 	else
@@ -40,4 +47,4 @@ EOF
 	fi
 done
 
-rm -f ${COPY}
+rm -f ${COPY} ${PLOG}

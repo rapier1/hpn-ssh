@@ -16,8 +16,7 @@ DSTDIR=${OBJ}/respawn-dst
 SFTP_LOG=${OBJ}/respawn-sftp.log
 
 if [ ! -r /proc/self/environ ]; then
-	verbose "$tid: skipped (no /proc environ support)"
-	exit 0
+	skip "no /proc environ support"
 fi
 
 start_sshd
@@ -32,7 +31,7 @@ for i in 1 2 3 4; do
 done
 
 verbose "$tid: throttled put -r with mid-transfer worker kill"
-${SFTP} -j 2 -l 4000 -q -S "$SSH" -F $OBJ/ssh_config \
+${SFTP} -j 2 -l 4000 -q -v -S "$SSH" -F $OBJ/ssh_config \
     -P ${PORT} -o BatchMode=yes \
     -b - ${USER}@somehost > ${SFTP_LOG} 2>&1 <<EOF &
 put -r ${SRCDIR} ${DSTDIR}/up
@@ -74,6 +73,18 @@ else
 		diff -r ${SRCDIR} ${DSTDIR}/up || \
 		    fail "destination differs from source after worker kill"
 	fi
+	# The surviving worker could finish the transfer alone, so the log
+	# must show the killed worker dropping mid-transfer and being
+	# respawned. -v after -q brings back the debug lines.
+	grep "will attempt to respawn" ${SFTP_LOG} >/dev/null || \
+	    fail "the killed worker was not seen to drop mid-transfer"
+	grep "initiating respawn for" ${SFTP_LOG} >/dev/null || \
+	    fail "the orchestrator did not respawn the killed worker"
+	grep "worker respawn failed" ${SFTP_LOG} >/dev/null && \
+	    fail "the respawned worker failed to start"
 fi
 
-rm -rf ${SRCDIR} ${DSTDIR} ${SFTP_LOG}
+# Keep the tree and the log on failure; they are the only evidence.
+if [ ${RESULT} -eq 0 ]; then
+	rm -rf ${SRCDIR} ${DSTDIR} ${SFTP_LOG}
+fi

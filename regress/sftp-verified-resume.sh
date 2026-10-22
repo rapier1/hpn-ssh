@@ -28,7 +28,8 @@ for size in 0 1k size-1 larger corrupt same; do
         touch ${COPY}.2
         ;;
     size-1)
-        dd if=${COPY}.1 of=${COPY}.2 bs=1023 count=1 >/dev/null 2>&1
+        dd if=${COPY}.1 of=${COPY}.2 bs=`expr $(wc -c < ${COPY}.1) - 1` \
+            count=1 >/dev/null 2>&1
         ;;
     larger)
         # Dest is larger than source; verified resume skips it
@@ -66,6 +67,16 @@ for size in 0 1k size-1 larger corrupt same; do
         cmp ${COPY}.1 ${COPY}.2 || fail "corrupted result after reputv size=${size}"
         ;;
     esac
+    case "${size}" in
+    1k|size-1)
+        grep "prefix hash match, resuming at offset" ${CLIENT_LOG} \
+            >/dev/null || fail "reputv did not resume for size=${size}"
+        ;;
+    corrupt)
+        grep "prefix hash mismatch; restarting" ${CLIENT_LOG} \
+            >/dev/null || fail "reputv did not restart for size=${size}"
+        ;;
+    esac
 done
 
 # Verify that a resumed upload actually picks up from the right offset
@@ -77,8 +88,8 @@ dd if=${COPY}.1 of=${COPY}.2 bs=1024 count=1 >/dev/null 2>&1
 echo "reputv ${COPY}.1 ${COPY}.2" | \
     ${SFTP} -D ${SFTPSERVER} -vvv >${CLIENT_LOG} 2>&1 \
     || fail "reputv failed for resume offset check"
-grep -i "resum" ${CLIENT_LOG} >/dev/null \
-    || fail "no resume indication in log for valid partial"
+grep "resuming at offset 1024" ${CLIENT_LOG} >/dev/null \
+    || fail "reputv did not resume at offset 1024"
 cmp ${COPY}.1 ${COPY}.2 || fail "corrupted result after reputv resume offset check"
 
 rm -f ${COPY}.1 ${COPY}.2
@@ -98,7 +109,8 @@ for size in 0 1k size-1 larger corrupt same; do
         touch ${COPY}.2
         ;;
     size-1)
-        dd if=${COPY}.1 of=${COPY}.2 bs=1023 count=1 >/dev/null 2>&1
+        dd if=${COPY}.1 of=${COPY}.2 bs=`expr $(wc -c < ${COPY}.1) - 1` \
+            count=1 >/dev/null 2>&1
         ;;
     larger)
         cp ${COPY}.1 ${COPY}.2
@@ -131,6 +143,16 @@ for size in 0 1k size-1 larger corrupt same; do
         cmp ${COPY}.1 ${COPY}.2 || fail "corrupted result after regetv size=${size}"
         ;;
     esac
+    case "${size}" in
+    1k|size-1)
+        grep "prefix hash match, resuming at offset" ${CLIENT_LOG} \
+            >/dev/null || fail "regetv did not resume for size=${size}"
+        ;;
+    corrupt)
+        grep "prefix hash mismatch; restarting" ${CLIENT_LOG} \
+            >/dev/null || fail "regetv did not restart for size=${size}"
+        ;;
+    esac
 done
 
 # Verify that a resumed download actually picks up from the right offset.
@@ -141,8 +163,8 @@ dd if=${COPY}.1 of=${COPY}.2 bs=1024 count=1 >/dev/null 2>&1
 echo "regetv ${COPY}.1 ${COPY}.2" | \
     ${SFTP} -D ${SFTPSERVER} -vvv >${CLIENT_LOG} 2>&1 \
     || fail "regetv failed for resume offset check"
-grep -i "resum" ${CLIENT_LOG} >/dev/null \
-    || fail "no resume indication in log for valid partial (regetv)"
+grep "resuming at offset 1024" ${CLIENT_LOG} >/dev/null \
+    || fail "regetv did not resume at offset 1024"
 cmp ${COPY}.1 ${COPY}.2 || fail "corrupted result after regetv resume offset check"
 
 rm -f ${COPY}.1 ${COPY}.2

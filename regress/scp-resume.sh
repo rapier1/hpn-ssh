@@ -3,6 +3,7 @@
 tid="scp-resume"
 
 COPY2=${OBJ}/copy2
+OUT=${OBJ}/scp-resume.out
 DIR=${COPY}.dd
 DIR2=${COPY}.dd2
 
@@ -23,8 +24,6 @@ scpclean() {
 }
 
 # The resume function uses xxhash (bundled, header-only) -- no OpenSSL needed.
-# Verified resume (-Z) is SFTP-only: confirm the legacy SCP protocol (-O)
-# refuses it, then exercise the supported SFTP path for both put and get.
 
 # Verified resume (-Z) is SFTP-only.  Confirm the legacy SCP protocol (-O)
 # refuses the combination loudly instead of silently degrading.
@@ -61,7 +60,8 @@ for mode in sftp; do
 				touch ${COPY}.2
 				;;
 			size-1)
-				dd if=${COPY}.1 of=${COPY}.2 bs=1023 count=1 \
+				dd if=${COPY}.1 of=${COPY}.2 \
+				    bs=`expr $(wc -c < ${COPY}.1) - 1` count=1 \
 				    >/dev/null 2>&1
 				;;
 			larger)
@@ -86,51 +86,49 @@ for mode in sftp; do
 				;;
 			esac
 
+			# Keep the prepared destination, to show a skip left it
+			# alone. -v puts the resume decision in the output.
+			cp ${COPY}.2 ${COPY}.2.before
 			if test $direction = put; then
-				if test $mode = sftp; then
-					case "${size}" in
-					same)
-						# SFTP put skips identical files (exit 0).
-						$SCP -Z $scpopts ${COPY}.1 somehost:${COPY}.2 \
-						    || fail "$tag put -Z failed size=${size}"
-						cmp ${COPY}.1 ${COPY}.2 \
-						    || fail "$tag corrupted after put -Z size=${size}"
-						continue
-						;;
-					larger)
-						# SFTP put skips when dest is larger (exit 0);
-						# dest is intentionally left untouched.
-						$SCP -Z $scpopts ${COPY}.1 somehost:${COPY}.2 \
-						    || fail "$tag put -Z failed size=${size}"
-						continue
-						;;
-					esac
-				fi
-				$SCP -Z $scpopts ${COPY}.1 somehost:${COPY}.2 \
-				    || fail "$tag put -Z failed size=${size}"
-				cmp ${COPY}.1 ${COPY}.2 \
-				    || fail "$tag corrupted after put -Z size=${size}"
+				$SCP -v -Z $scpopts ${COPY}.1 somehost:${COPY}.2 \
+				    >${OUT} 2>&1 || fail "$tag put -Z failed size=${size}"
 			else
-				if test $mode = sftp; then
-					case "${size}" in
-					larger)
-						# SFTP get skips when dest is larger (exit 0);
-						# dest is intentionally left untouched (a larger
-						# file can't be a partial of the source).
-						$SCP -Z $scpopts somehost:${COPY}.1 ${COPY}.2 \
-						    || fail "$tag get -Z failed size=${size}"
-						continue
-						;;
-					esac
-				fi
-				$SCP -Z $scpopts somehost:${COPY}.1 ${COPY}.2 \
-				    || fail "$tag get -Z failed size=${size}"
-				cmp ${COPY}.1 ${COPY}.2 \
-				    || fail "$tag corrupted after get -Z size=${size}"
+				$SCP -v -Z $scpopts somehost:${COPY}.1 ${COPY}.2 \
+				    >${OUT} 2>&1 || fail "$tag get -Z failed size=${size}"
 			fi
+			case "${size}" in
+			larger)
+				grep "File skipped:.*Target is larger" ${OUT} \
+				    >/dev/null || \
+				    fail "$tag $direction did not skip a larger dest"
+				cmp ${COPY}.2.before ${COPY}.2 || \
+				    fail "$tag $direction changed a larger dest"
+				;;
+			*)
+				cmp ${COPY}.1 ${COPY}.2 || \
+				    fail "$tag corrupted after $direction -Z size=${size}"
+				;;
+			esac
+			case "${direction}:${size}" in
+			*:same)
+				grep "File skipped:.*Identical" ${OUT} >/dev/null || \
+				    fail "$tag $direction did not skip an identical dest"
+				;;
+			*:1k|*:size-1)
+				grep "prefix hash match, resuming at offset" ${OUT} \
+				    >/dev/null || \
+				    fail "$tag $direction did not resume size=${size}"
+				;;
+			*:corrupt)
+				grep "prefix hash mismatch; restarting" ${OUT} \
+				    >/dev/null || \
+				    fail "$tag $direction did not restart size=${size}"
+				;;
+			esac
 		done
 	done
 done
 
 scpclean
+rm -f ${COPY}.1 ${COPY}.2 ${COPY}.2.before ${OUT}
 rm -f ${OBJ}/scp-ssh-wrapper.scp
