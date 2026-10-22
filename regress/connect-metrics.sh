@@ -11,6 +11,8 @@ METRICS_PATH=${OBJ}/test-metrics
 start_sshd
 
 trace "metrics file creation"
+# The client appends to these files, so clear any left by an earlier run.
+rm -f ${METRICS_PATH}.local ${METRICS_PATH}.remote
 ${SSH} -oMetrics=yes -oMetricsPath=${METRICS_PATH} \
     -F $OBJ/ssh_config somehost "cat ${DATA}" > ${COPY}
 if [ $? -ne 0 ]; then

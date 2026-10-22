@@ -13,6 +13,8 @@ if [ $? -ne 0 ]; then
 	fail "ssh transfer with TcpRcvBufPoll=yes failed"
 fi
 cmp ${DATA} ${COPY} || fail "corrupted copy after TcpRcvBufPoll=yes transfer"
+grep "Enabled Dynamic Window Scaling" $TEST_SSH_LOGFILE >/dev/null ||
+    fail "TcpRcvBufPoll=yes did not enable dynamic window scaling"
 rm -f ${COPY}
 
 trace "TcpRcvBufPoll=no transfer"
@@ -22,6 +24,8 @@ if [ $? -ne 0 ]; then
 	fail "ssh transfer with TcpRcvBufPoll=no failed"
 fi
 cmp ${DATA} ${COPY} || fail "corrupted copy after TcpRcvBufPoll=no transfer"
+grep "Enabled Dynamic Window Scaling" $TEST_SSH_LOGFILE >/dev/null &&
+    fail "TcpRcvBufPoll=no still enabled dynamic window scaling"
 rm -f ${COPY}
 
 stop_sshd
