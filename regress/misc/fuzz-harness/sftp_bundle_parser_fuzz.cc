@@ -1,4 +1,22 @@
 /*
+ * Copyright (c) 2026 The Board of Trustees of Carnegie Mellon University.
+ *
+ *  Author: Chris Rapier <rapier@psc.edu>
+ *
+ * This library or code is free software; you can redistribute it and/or
+ * modify it under the terms of the BSD 2 Clause License.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+ * for more details.
+ *
+ * You should have received a copy of the BSD 2-Clause License along with this
+ * code, if not, see https://opensource.org/license/bsd-2-clause.
+ *
+ */
+
+/*
  * sftp_bundle_parser_fuzz.cc - libFuzzer harness for the HPN-SSH bundle
  * codec parser (sftp_hpn_bundle_parser_feed, sftp-hpn-bundle-codec.c).
  *
@@ -58,7 +76,7 @@ extern "C" {
 #include "log.h"
 #include "sftp-hpn-bundle-codec.h"
 
-/* --- KEEP IN SYNC WITH sftp-hpn-server.c:bundle_path_is_safe --------- */
+/* --- KEEP IN SYNC WITH sftp-hpn-bundle-server.c:bundle_path_is_safe -- */
 static int
 bundle_path_is_safe(const char *p, const char *dest_dir)
 {
@@ -157,7 +175,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
 	/*
 	 * Feed in wire-sized chunks so cross-chunk header reassembly is
-	 * exercised.  The first byte selects a chunk size in [1, 512] so
+	 * exercised.  The first byte selects a chunk size in [1, 256] so
 	 * the fuzzer can steer the split boundary (a header spanning two
 	 * feeds is a distinct code path from a header delivered whole).
 	 */

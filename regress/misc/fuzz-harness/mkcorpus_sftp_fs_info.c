@@ -1,4 +1,22 @@
 /*
+ * Copyright (c) 2026 The Board of Trustees of Carnegie Mellon University.
+ *
+ *  Author: Chris Rapier <rapier@psc.edu>
+ *
+ * This library or code is free software; you can redistribute it and/or
+ * modify it under the terms of the BSD 2 Clause License.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+ * for more details.
+ *
+ * You should have received a copy of the BSD 2-Clause License along with this
+ * code, if not, see https://opensource.org/license/bsd-2-clause.
+ *
+ */
+
+/*
  * mkcorpus_sftp_fs_info.c - generate seed corpus for sftp_fs_info_fuzz.
  *
  * Writes a handful of small wire-format blobs to ./sftp_fs_info_corpus/.
@@ -18,9 +36,9 @@
  *   gpfs.bin       - fs_type="gpfs", zeros for stripe fields,
  *                    block_size=1MiB
  *   empty.bin      - fs_type="" (length-zero cstring)
- *   maxname.bin    - fs_type set to a 31-byte string (one less than
- *                    the parser's strlcpy limit of 32, so the
- *                    successful-parse branch still fires)
+ *   maxname.bin    - a 31-byte fs_type, the longest the client's
+ *                    32-byte fs_type buffer keeps whole
+ *   overname.bin   - a 40-byte fs_type, which the client truncates
  *
  * All integers are big-endian per SSH wire format.  We write the
  * bytes by hand rather than pulling in sshbuf to keep this generator
@@ -96,9 +114,11 @@ int main(void)
 	write_blob("ext4.bin",    "ext4",   0,         0, 4096);
 	write_blob("gpfs.bin",    "gpfs",   0,         0, 1048576ull);
 	write_blob("empty.bin",   "",       0,         0, 0);
-	write_blob("maxname.bin", "A_LONG_FILESYSTEM_TYPE_NAME_31",
+	write_blob("maxname.bin", "A_LONG_FILESYSTEM_TYPE_NAME_031",
+	    0, 0, 65536);
+	write_blob("overname.bin", "A_FILESYSTEM_TYPE_NAME_LONGER_THAN_32_CH",
 	    0, 0, 65536);
 
-	fprintf(stderr, "wrote 5 seeds to %s/\n", CORPUS_DIR);
+	fprintf(stderr, "wrote 6 seeds to %s/\n", CORPUS_DIR);
 	return 0;
 }

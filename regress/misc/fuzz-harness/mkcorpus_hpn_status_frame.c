@@ -1,4 +1,22 @@
 /*
+ * Copyright (c) 2026 The Board of Trustees of Carnegie Mellon University.
+ *
+ *  Author: Chris Rapier <rapier@psc.edu>
+ *
+ * This library or code is free software; you can redistribute it and/or
+ * modify it under the terms of the BSD 2 Clause License.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+ * for more details.
+ *
+ * You should have received a copy of the BSD 2-Clause License along with this
+ * code, if not, see https://opensource.org/license/bsd-2-clause.
+ *
+ */
+
+/*
  * Seed-corpus generator for hpn_status_frame_fuzz: emits a handful of
  * well-formed frame streams through the real encoders (which also gives
  * the encoders a smoke test), each prefixed with the chunk-size byte the
@@ -40,6 +58,7 @@ main(int argc, char **argv)
 	struct hpns_progress p;
 	struct hpns_end e;
 	struct hpns_filefail ff;
+	struct hpns_filedone fd;
 
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <outdir>\n", argv[0]);
@@ -148,6 +167,49 @@ main(int argc, char **argv)
 	ff.path_len = (uint16_t)sizeof(longpath);
 	o += hpns_encode_filefail(buf + o, &ff);
 	write_seed(argv[1], "filefail-clamped", buf, o);
+
+	/* a session reporting each file: HELLO, two FILEDONEs (the second
+	 * skipped, with an empty path), PROGRESS, END; chunk size 7 */
+	memset(&fd, 0, sizeof(fd));
+	e.files_failed = 0;
+	e.ok = 1;
+	o = 0;
+	buf[o++] = 7;
+	o += hpns_encode_hello(buf + o, &h);
+	fd.status = HPNS_FD_SUCCESS;
+	fd.size = 1048576;
+	fd.path = (const u_char *)"/data/done.bin";
+	fd.path_len = (uint16_t)strlen((const char *)fd.path);
+	o += hpns_encode_filedone(buf + o, &fd);
+	fd.status = HPNS_FD_SKIPPED;
+	fd.size = 0;
+	fd.path = NULL;
+	fd.path_len = 0;
+	o += hpns_encode_filedone(buf + o, &fd);
+	o += hpns_encode_progress(buf + o, &p);
+	o += hpns_encode_end(buf + o, &e);
+	write_seed(argv[1], "session-done", buf, o);
+
+	/* single FILEDONE, byte-at-a-time */
+	o = 0;
+	buf[o++] = 1;
+	fd.status = HPNS_FD_VERIFIED;
+	fd.size = 4096;
+	fd.path = (const u_char *)"file.dat";
+	fd.path_len = 8;
+	o += hpns_encode_filedone(buf + o, &fd);
+	write_seed(argv[1], "filedone", buf, o);
+
+	/* over-cap path: the encoder clamps to HPNS_FILEDONE_MAXPATH and the
+	 * caller sets HPNS_FD_TRUNCATED */
+	o = 0;
+	buf[o++] = 5;
+	fd.status = HPNS_FD_REPAIRED | HPNS_FD_TRUNCATED;
+	fd.size = 2147483648ULL;
+	fd.path = longpath;
+	fd.path_len = (uint16_t)sizeof(longpath);
+	o += hpns_encode_filedone(buf + o, &fd);
+	write_seed(argv[1], "filedone-clamped", buf, o);
 
 	return 0;
 }

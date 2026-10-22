@@ -1,4 +1,22 @@
 /*
+ * Copyright (c) 2026 The Board of Trustees of Carnegie Mellon University.
+ *
+ *  Author: Chris Rapier <rapier@psc.edu>
+ *
+ * This library or code is free software; you can redistribute it and/or
+ * modify it under the terms of the BSD 2 Clause License.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the BSD 2-Clause License
+ * for more details.
+ *
+ * You should have received a copy of the BSD 2-Clause License along with this
+ * code, if not, see https://opensource.org/license/bsd-2-clause.
+ *
+ */
+
+/*
  * mkcorpus_sftp_bundle_parser.c - generate seed corpus for
  * sftp_bundle_parser_fuzz by driving the in-tree bundle-codec *writer*
  * (sftp-hpn-bundle-codec.c) to emit valid streams.
@@ -66,9 +84,12 @@ stage_file(int idx, size_t sz, char *out, size_t outlen)
 	close(fd);
 }
 
-/* Pack the given specs into one bundle stream and write it as a seed. */
+/* Pack the given specs into one bundle stream and write it as a seed.
+ * The harness takes the first input byte as its feed size (the byte plus
+ * one), so each seed starts with chunk, then the stream. */
 static void
-write_seed(const char *seed, const struct file_spec *specs, int n)
+write_seed(const char *seed, u_char chunk, const struct file_spec *specs,
+    int n)
 {
 	struct sftp_hpn_bundle_writer *w = sftp_hpn_bundle_writer_new();
 	if (w == NULL)
@@ -96,6 +117,8 @@ write_seed(const char *seed, const struct file_spec *specs, int n)
 	FILE *f = fopen(path, "wb");
 	if (f == NULL)
 		err(1, "fopen %s", path);
+	if (fputc(chunk, f) == EOF)
+		err(1, "fwrite %s", path);
 
 	u_char buf[8192];
 	for (;;) {
@@ -104,7 +127,7 @@ write_seed(const char *seed, const struct file_spec *specs, int n)
 			errx(1, "pack_next: %s",
 			    sftp_hpn_bundle_writer_error(w));
 		if (got == 0)
-			break;   /* EOA + trailing zero blocks emitted */
+			break;   /* the end record has been emitted */
 		if (fwrite(buf, (size_t)got, 1, f) != 1)
 			err(1, "fwrite %s", path);
 	}
@@ -120,19 +143,24 @@ main(void)
 	if (mkdir(SCRATCH, 0777) != 0 && errno != EEXIST)
 		err(1, "mkdir " SCRATCH);
 
+	/* The first argument to write_seed is the harness feed size less
+	 * one. 255 feeds a small stream whole. The small values split a
+	 * header across feeds, and 22 feeds exactly the 23-byte fixed
+	 * header, so the path starts a new feed. */
+
 	/* empty.bin - a single zero-length entry (header, no data blocks). */
 	const struct file_spec empty[] = { { "empty", 0, 0644 } };
-	write_seed("empty.bin", empty, 1);
+	write_seed("empty.bin", 255, empty, 1);
 
 	/* small.bin - one small file (13 data bytes; the codec length-
 	 * prefixes the data, no block padding). */
 	const struct file_spec small[] = { { "small.txt", 13, 0644 } };
-	write_seed("small.bin", small, 1);
+	write_seed("small.bin", 6, small, 1);
 
 	/* r512.bin - one exactly-512-byte file: no block boundary exists in
 	 * this codec, but 512 is a common chunking size worth a seed. */
 	const struct file_spec block[] = { { "block.dat", 512, 0600 } };
-	write_seed("r512.bin", block, 1);
+	write_seed("r512.bin", 255, block, 1);
 
 	/* longname.bin - a > 100-byte path to stress the u16 path_len field
 	 * and the writer's max-path handling (the codec stores the path
@@ -142,7 +170,7 @@ main(void)
 	      "characters/so/the/long/path/handling/is/exercised/file.dat",
 	      64, 0644 }
 	};
-	write_seed("longname.bin", longname, 1);
+	write_seed("longname.bin", 22, longname, 1);
 
 	/* multi.bin - several entries in one stream (inter-entry state). */
 	const struct file_spec multi[] = {
@@ -150,7 +178,7 @@ main(void)
 	    { "dir/b", 0, 0644 },
 	    { "dir/sub/c", 4096, 0755 },
 	};
-	write_seed("multi.bin", multi, 3);
+	write_seed("multi.bin", 99, multi, 3);
 
 	/* Clean up scratch files (best effort). */
 	for (int i = 0; i < 8; i++) {
