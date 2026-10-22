@@ -38,23 +38,41 @@ put -r ${SRCDIR} ${DSTDIR}/up
 EOF
 SFTP_PID=$!
 
-# Find a worker: an ssh child of the sftp process carrying the
-# HPN_PARALLEL_WORKER environment marker.  Poll up to ~5s.
-WORKER=""
+# A kill during parallel setup makes the whole setup fail and fall back
+# to one stream, which tests nothing here. Wait until a file has data,
+# so setup is over and the transfer is in flight. Poll up to ~10s.
 n=0
-while [ $n -lt 25 ]; do
-	for p in $(pgrep -P ${SFTP_PID} 2>/dev/null); do
-		if [ -r /proc/$p/environ ] && \
-		    tr '\0' '\n' < /proc/$p/environ 2>/dev/null | \
-		    grep -q '^HPN_PARALLEL_WORKER='; then
-			WORKER=$p
-			break 2
-		fi
-	done
-	# stop polling if the transfer already finished
+while [ $n -lt 50 ]; do
+	landed=$(find ${DSTDIR}/up -type f -size +0 2>/dev/null | wc -l)
+	[ "$landed" -ge 1 ] && break
 	kill -0 ${SFTP_PID} 2>/dev/null || break
 	sleep 0.2
 	n=$((n + 1))
+done
+if [ "$landed" -lt 1 ]; then
+	kill ${SFTP_PID} 2>/dev/null
+	wait ${SFTP_PID} 2>/dev/null
+	fatal "no file had data after ~10s, so no kill would land mid-transfer"
+fi
+grep "falling back to single-stream mode" ${SFTP_LOG} >/dev/null && \
+    fail "parallel setup failed before the kill"
+
+# Find the busy worker. Workers are the ssh children of the sftp process
+# that carry the HPN_PARALLEL_WORKER environment marker. A few files
+# travel as one unit, a bundle or a pipelined batch, on a single worker,
+# so the other worker is idle and killing it leaves nothing to requeue.
+# The busy one is the worker whose ssh has written the most.
+WORKER=""
+most=-1
+for p in $(pgrep -P ${SFTP_PID} 2>/dev/null); do
+	tr '\0' '\n' < /proc/$p/environ 2>/dev/null | \
+	    grep -q '^HPN_PARALLEL_WORKER=' || continue
+	written=$(awk '/^wchar:/ { print $2 }' /proc/$p/io 2>/dev/null)
+	written=${written:-0}
+	if [ "$written" -gt "$most" ]; then
+		most=$written
+		WORKER=$p
+	fi
 done
 
 if [ -z "$WORKER" ]; then
