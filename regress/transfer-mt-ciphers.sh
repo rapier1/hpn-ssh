@@ -18,6 +18,14 @@ for c in chacha20-poly1305-mt@hpnssh.org aes256-ctr aes128-ctr; do
 		fail "ssh transfer failed with cipher $c"
 	fi
 	cmp ${DATA} ${COPY} || fail "corrupted copy after transfer with cipher $c"
+	# MT ciphers are off by design in FIPS mode.
+	grep "FIPS mode is enabled" $TEST_SSH_LOGFILE >/dev/null && continue
+	case $c in
+	chacha*)	mtlog="chachapoly_new_mt: <main thread" ;;
+	*)		mtlog="AES-CTR MT spawned a thread" ;;
+	esac
+	grep "$mtlog" $TEST_SSH_LOGFILE >/dev/null ||
+	    fail "cipher $c did not switch to its multithreaded form"
 done
 
 rm -f ${COPY}
