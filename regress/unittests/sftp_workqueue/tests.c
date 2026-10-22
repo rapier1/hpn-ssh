@@ -8,7 +8,9 @@
  * Exits 0 on success, nonzero on any failure with a diagnostic.
  *
  * Coverage: basic push/pop, FIFO ordering, MPMC stress, shutdown drain,
- * shutdown wakes blocked threads, high-watermark tracking, capacity bound.
+ * shutdown wakes blocked threads, capacity bound, invalid capacity, the
+ * non-blocking pushes and pop, drain after shutdown, and the kick and
+ * timeout that end wait_activity.
  */
 
 #include <assert.h>
@@ -142,7 +144,7 @@ test_capacity_blocks_push(void)
 	OK("capacity_blocks_push");
 }
 
-/* --- 5. MPMC stress: 4 producers × 4 consumers × 10000 items each --- */
+/* --- 5. MPMC stress: 4 producers x 4 consumers x 10000 items each --- */
 #define MPMC_PRODUCERS 4
 #define MPMC_CONSUMERS 4
 #define MPMC_PER_PRODUCER 10000
@@ -231,6 +233,146 @@ test_invalid(void)
 	OK("invalid");
 }
 
+/* --- 7. non-blocking pushes: trypush adds at the tail, trypush_front
+ * at the head, both return 1 when full and -1 after shutdown --- */
+static void
+test_trypush(void)
+{
+	struct sftp_hpn_workqueue *q = sftp_hpn_workqueue_new(3);
+	void *p = NULL;
+
+	if (sftp_hpn_workqueue_trypush(q, (void *)1) != 0) FAIL("trypush 1");
+	if (sftp_hpn_workqueue_trypush(q, (void *)2) != 0) FAIL("trypush 2");
+	/* The head is slot 0 here, so this also wraps to the last slot. */
+	if (sftp_hpn_workqueue_trypush_front(q, (void *)3) != 0)
+		FAIL("trypush_front 3");
+	if (sftp_hpn_workqueue_trypush(q, (void *)4) != 1)
+		FAIL("trypush on a full queue should return 1");
+	if (sftp_hpn_workqueue_trypush_front(q, (void *)5) != 1)
+		FAIL("trypush_front on a full queue should return 1");
+	if (sftp_hpn_workqueue_depth(q) != 3)
+		FAIL("depth %d after pushes onto a full queue",
+		    sftp_hpn_workqueue_depth(q));
+	/* The item pushed at the head comes out first. */
+	intptr_t order[] = { 3, 1, 2 };
+	for (int i = 0; i < 3; i++) {
+		if (sftp_hpn_workqueue_pop(q, &p) != 0) FAIL("pop %d", i);
+		if ((intptr_t)p != order[i])
+			FAIL("order: got %td want %td", (intptr_t)p, order[i]);
+	}
+	sftp_hpn_workqueue_shutdown(q);
+	if (sftp_hpn_workqueue_trypush(q, (void *)6) != -1)
+		FAIL("trypush after shutdown should return -1");
+	if (sftp_hpn_workqueue_trypush_front(q, (void *)7) != -1)
+		FAIL("trypush_front after shutdown should return -1");
+	sftp_hpn_workqueue_free(q);
+	OK("trypush");
+}
+
+/* --- 8. trypop never waits and refuses a shut-down queue, while drain
+ * still hands out what is left --- */
+static void
+test_trypop_drain(void)
+{
+	struct sftp_hpn_workqueue *q = sftp_hpn_workqueue_new(4);
+	void *p = NULL;
+
+	if (sftp_hpn_workqueue_trypop(q, &p) != -1)
+		FAIL("trypop on an empty queue should return -1");
+	sftp_hpn_workqueue_push(q, (void *)1);
+	sftp_hpn_workqueue_push(q, (void *)2);
+	sftp_hpn_workqueue_push(q, (void *)3);
+	if (sftp_hpn_workqueue_trypop(q, &p) != 0 || (intptr_t)p != 1)
+		FAIL("trypop should return the head item");
+	sftp_hpn_workqueue_shutdown(q);
+	if (sftp_hpn_workqueue_trypop(q, &p) != -1)
+		FAIL("trypop after shutdown should return -1");
+	if (sftp_hpn_workqueue_depth(q) != 2)
+		FAIL("trypop took an item from a shut-down queue");
+	for (intptr_t want = 2; want <= 3; want++) {
+		if (sftp_hpn_workqueue_drain(q, &p) != 0)
+			FAIL("drain %td after shutdown", want);
+		if ((intptr_t)p != want)
+			FAIL("drain order: got %td want %td", (intptr_t)p, want);
+	}
+	if (sftp_hpn_workqueue_drain(q, &p) != -1)
+		FAIL("drain on an empty queue should return -1");
+	sftp_hpn_workqueue_free(q);
+	OK("trypop_drain");
+}
+
+/* --- 9. wait_activity ends on a kick, a shutdown or its timeout, but
+ * not on a push --- */
+enum delayed_op { OP_NONE, OP_PUSH, OP_KICK, OP_SHUTDOWN };
+
+struct delayed_args {
+	struct sftp_hpn_workqueue *q;
+	enum delayed_op op;
+};
+
+static void *
+delayed(void *arg)
+{
+	struct delayed_args *a = arg;
+
+	usleep(30000);
+	switch (a->op) {
+	case OP_PUSH:
+		sftp_hpn_workqueue_push(a->q, (void *)1);
+		break;
+	case OP_KICK:
+		sftp_hpn_workqueue_kick(a->q);
+		break;
+	case OP_SHUTDOWN:
+		sftp_hpn_workqueue_shutdown(a->q);
+		break;
+	case OP_NONE:
+		break;
+	}
+	return NULL;
+}
+
+/* Run op on another thread 30ms in, wait up to timeout_ms on a fresh
+ * queue, and return how long the wait took in milliseconds. */
+static long
+timed_wait(enum delayed_op op, int timeout_ms)
+{
+	struct sftp_hpn_workqueue *q = sftp_hpn_workqueue_new(4);
+	struct delayed_args a = { .q = q, .op = op };
+	struct timespec t0, t1;
+	pthread_t t;
+	void *p;
+
+	pthread_create(&t, NULL, delayed, &a);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	sftp_hpn_workqueue_wait_activity(q, timeout_ms);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	pthread_join(t, NULL);
+	sftp_hpn_workqueue_shutdown(q);
+	while (sftp_hpn_workqueue_drain(q, &p) == 0)
+		;
+	sftp_hpn_workqueue_free(q);
+	return (t1.tv_sec - t0.tv_sec) * 1000 +
+	    (t1.tv_nsec - t0.tv_nsec) / 1000000;
+}
+
+static void
+test_wait_activity(void)
+{
+	long ms;
+
+	/* The bounds are loose so a loaded machine does not fail them. */
+	if ((ms = timed_wait(OP_NONE, 50)) < 40)
+		FAIL("wait returned before its timeout (%ldms)", ms);
+	if ((ms = timed_wait(OP_PUSH, 300)) < 250)
+		FAIL("a push ended the wait (%ldms)", ms);
+	if ((ms = timed_wait(OP_KICK, 5000)) >= 2500)
+		FAIL("a kick did not end the wait (%ldms)", ms);
+	if ((ms = timed_wait(OP_SHUTDOWN, 5000)) >= 2500)
+		FAIL("a shutdown did not end the wait (%ldms)", ms);
+	OK("wait_activity");
+}
+
 int
 main(void)
 {
@@ -240,6 +382,9 @@ main(void)
 	test_capacity_blocks_push();
 	test_mpmc_stress();
 	test_invalid();
+	test_trypush();
+	test_trypop_drain();
+	test_wait_activity();
 	printf("\nall workqueue tests passed\n");
 	return 0;
 }
