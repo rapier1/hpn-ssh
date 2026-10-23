@@ -16,8 +16,9 @@
  * called by a name other than "ssh" or "Secure Shell".
  */
 
-#include <stdarg.h>	/* va_list (xvasprintf); glibc pulls this in via other
-			 * headers transitively, musl does not */
+/* HPN: va_list, for xvasprintf. glibc pulls stdarg.h in through other
+ * headers, musl does not. */
+#include <stdarg.h>
 
 void	*xmalloc(size_t);
 void	*xcalloc(size_t, size_t);

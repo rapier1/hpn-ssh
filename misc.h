@@ -101,7 +101,6 @@ void	 monotime_ts(struct timespec *);
 void	 monotime_tv(struct timeval *);
 time_t	 monotime(void);
 double	 monotime_double(void);
-uint64_t monotime_ns(void);
 uint64_t monotime_ms(void);	/* HPN */
 void	 lowercase(char *s);
 int	 unix_listener(const char *, int, int);
@@ -217,15 +216,11 @@ int	 safe_path(const char *, struct stat *, const char *, uid_t,
 int	 safe_path_fd(int, const char *, struct passwd *,
 	    char *err, size_t errlen);
 
-/*
- * mkdir(2) wrapper with mkdir-p semantics: creates dirpath and any
- * missing parent directories with the given mode.  Returns 0 on
- * success (or if dirpath already exists), -1 on any other failure
- * (errno set).  An existing path that isn't a directory is treated
- * as success too - the caller is expected to follow up with a stat
- * if the type matters.
- */
-int	 mkdir_p(const char *dirpath, mode_t mode);
+/* HPN: mkdir -p. Create the path and any missing parents with mode.
+ * Returns 0 on success or when the path already exists, even as a
+ * non-directory, so a caller that needs a directory stats it after.
+ * Returns -1 with errno set on any other failure. */
+int	 mkdir_p(const char *, mode_t);
 
 /* authorized_key-style options parsing helpers */
 int	opt_flag(const char *opt, int allow_negate, const char **optsp);

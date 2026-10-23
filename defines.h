@@ -1011,28 +1011,22 @@ struct winsize {
 # endif
 #endif
 
-/*
- * HPN SFTP bundle-mode size bounds and default, in bytes.  Single source of
- * truth shared by the client HPNBundleSize config clamp (readconf.c) and the
- * parallel-transfer accumulator target (BUNDLE_TARGET_BYTES_* in
- * sftp-parallel-internal.h).  When changed, update the ssh_config sample and
- * hpnssh_config.5 to match.
- */
+/* HPN: SFTP bundle size bounds and default, in bytes. The HPNBundleSize
+ * clamp in readconf.c and the bundle accumulators' defaults
+ * (sftp-parallel-config.c, sftp-hpn-client.c) all use them. When they
+ * change, update the ssh_config sample and hpnssh_config.5 to match. */
 #define HPN_BUNDLE_SIZE_MIN		(1 * 1024 * 1024)	/* 1 MiB */
 #define HPN_BUNDLE_SIZE_MAX		(256 * 1024 * 1024)	/* 256 MiB */
 #define HPN_BUNDLE_SIZE_DEFAULT		(32 * 1024 * 1024)	/* 32 MiB */
 
-/* HPN calls a refusal issued by sftp-server's -P/-p request denylist or
- * allowlist (request_permitted()) a "request policy" denial, and that is
- * the sense of "policy" wherever the HPN code uses the word. The server
- * appends this marker to the SSH_FXP_STATUS error string of such a
- * PERMISSION_DENIED, as opposed to a filesystem error like a directory
- * ACL, so an HPN client can recognise a class-wide denial, every file of
- * this kind will be refused, and abort the whole transfer instead of
- * re-denying every file one by one. */
+/* HPN: the marker sftp-server appends to the SSH_FXP_STATUS message of a
+ * PERMISSION_DENIED issued by its -P/-p request denylist or allowlist
+ * (request_permitted()), as opposed to a filesystem error such as a
+ * directory ACL. HPN calls that a "request policy" denial, the sense of
+ * "policy" wherever the HPN code uses the word. Every file of that kind
+ * will be refused, so a client that sees the marker aborts the transfer
+ * instead of being denied file by file. */
 #define HPN_POLICY_DENIED_TAG		"hpn-policy-denied"
-
-#endif /* _DEFINES_H */
 
 /* used to enable checking linux kernel versions */
 #if defined(__linux__)
@@ -1042,3 +1036,5 @@ struct winsize {
 #ifndef KERNEL_VERSION /* shouldn't be necessary to define this */
 #define KERNEL_VERSION(a,b,c) (((a) <<16) + ((b) << 8) +(c))
 #endif
+
+#endif /* _DEFINES_H */

@@ -64,16 +64,13 @@ static int log_on_stderr = 1;
 static int log_stderr_fd = STDERR_FILENO;
 /* HPN: optional guard pair bracketing stderr log writes, registered by
  * the progress meter so log lines and meter redraws never interleave on
- * the terminal.  NULL (the default) means no guard. */
+ * the terminal. NULL (the default) means no guard. */
 static void (*log_output_guard_enter)(void);
 static void (*log_output_guard_exit)(void);
-
-void
-log_set_output_guard(void (*enter)(void), void (*exit_fn)(void))
-{
-	log_output_guard_enter = enter;
-	log_output_guard_exit = exit_fn;
-}
+/* HPN: the last ERROR-level message logged on each thread, so a worker
+ * reads back its own error. See hpn_get_last_error(). */
+static __thread char hpn_last_error_msg[256];
+static void hpn_log_capture_error(const char *);
 static int log_facility = LOG_AUTH;
 static const char *argv0;
 static log_handler_fn *log_handler;
@@ -343,6 +340,15 @@ log_redirect_stderr_to(const char *logfile)
 	log_stderr_fd = fd;
 }
 
+/* HPN: register the guard pair that brackets each stderr log write. The
+ * progress meter sets it. NULL for either clears that side. */
+void
+log_set_output_guard(void (*enter)(void), void (*exit_fn)(void))
+{
+	log_output_guard_enter = enter;
+	log_output_guard_exit = exit_fn;
+}
+
 #define MSGBUFSIZ 1024
 
 void
@@ -414,12 +420,9 @@ do_log(LogLevel level, int force, const char *suffix, const char *fmt,
 		snprintf(fmtbuf, sizeof(fmtbuf), "%s: %s", msgbuf, suffix);
 		strlcpy(msgbuf, fmtbuf, sizeof(msgbuf));
 	}
-	/* HPN: snapshot the most recent ERROR-level message into per-thread
-	 * storage so structured callers (e.g. the parallel-streams
-	 * failed-paths summary) can attach the cause to a higher-level
-	 * event without having to plumb error strings through every API.
-	 * Captured BEFORE strnvis so the user sees the raw cause string.
-	 * See hpn_get_last_error / hpn_clear_last_error below. */
+	/* HPN: keep the last ERROR-level message for this thread, for
+	 * hpn_get_last_error(). It is taken before strnvis(), so it is not
+	 * escaped twice: whoever prints it later escapes it then. */
 	if (level == SYSLOG_LEVEL_ERROR)
 		hpn_log_capture_error(msgbuf);
 	strnvis(fmtbuf, msgbuf, sizeof(fmtbuf),
@@ -517,6 +520,8 @@ sshlogv(const char *file, const char *func, int line, int showfunc,
 	do_log(level, forced, suffix, fmt2, args);
 }
 
+/* HPN: sshlogv() with a wall-clock timestamp, [HH:MM:SS.mmm], ahead of the
+ * message. The _ft macros in log.h use it. */
 void
 sshlogv_ts(const char *file, const char *func, int line, int showfunc,
     LogLevel level, const char *suffix, const char *fmt, va_list args)
@@ -537,6 +542,7 @@ sshlogv_ts(const char *file, const char *func, int line, int showfunc,
 	sshlogv(file, func, line, showfunc, level, suffix, tsfmt, args);
 }
 
+/* HPN: the variadic form of sshlogv_ts(). */
 void
 sshlog_ts(const char *file, const char *func, int line, int showfunc,
     LogLevel level, const char *suffix, const char *fmt, ...)
@@ -722,24 +728,9 @@ log_ratelimit(struct log_ratelimit_ctx *rl, time_t now, int *active,
 	return 1;
 }
 
-/* ── HPN: per-thread last-error capture ──────────────────────────────────
- *
- * Holds the most recent ERROR-level log message produced on the calling
- * thread.  Populated automatically by do_log() above.  HPN-aware
- * callers read it via hpn_get_last_error() to attach the cause string
- * to higher-level structured events (e.g. the parallel-streams
- * failed-paths summary).
- *
- * Per-thread storage means the worker thread that hit the error is the
- * same one that reads it back - no cross-thread races.
- *
- * ~260 bytes per thread.  Used by the parallel-streams failed-paths
- * summary; size of that bounded path list is set by
- * HPN_FAILED_PATHS_MAX in sftp-parallel.c.
- */
-static __thread char hpn_last_error_msg[256];
-
-void
+/* HPN: keep msg as this thread's last error. do_log() calls it for each
+ * ERROR-level message. */
+static void
 hpn_log_capture_error(const char *msg)
 {
 	if (msg == NULL)
@@ -747,12 +738,15 @@ hpn_log_capture_error(const char *msg)
 	strlcpy(hpn_last_error_msg, msg, sizeof(hpn_last_error_msg));
 }
 
+/* HPN: this thread's last ERROR-level message, or "" if there is none. */
 const char *
 hpn_get_last_error(void)
 {
 	return hpn_last_error_msg;
 }
 
+/* HPN: forget this thread's last error, so a later read does not report
+ * a stale one. */
 void
 hpn_clear_last_error(void)
 {

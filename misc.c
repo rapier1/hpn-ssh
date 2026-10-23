@@ -1923,19 +1923,10 @@ monotime_double(void)
 	return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
-uint64_t
-monotime_ns(void)
-{
-	struct timespec ts;
-
-	monotime_ts(&ts);
-	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-/* HPN: millisecond monotonic clock.  The parallel-transfer bookkeeping
+/* HPN: millisecond monotonic clock. The parallel-transfer bookkeeping
  * (watchdog, throughput estimation, idle accounting) needs sub-second
- * resolution but nothing near nanoseconds; millisecond values keep those
- * timestamps in atomic-friendly integers without the ns unit noise. */
+ * resolution but nothing near nanoseconds. Milliseconds keep those
+ * timestamps in integers that atomics can hold. */
 uint64_t
 monotime_ms(void)
 {
@@ -2502,26 +2493,21 @@ safe_path_fd(int fd, const char *file, struct passwd *pw,
 	return safe_path(file, &st, pw->pw_dir, pw->pw_uid, err, errlen);
 }
 
-/*
- * Create dirpath and any missing parent directories with mode.
- *
- * Like `mkdir -p`: walks the path components left-to-right, mkdir'ing
- * each segment in turn and ignoring EEXIST so a partially-existing
- * tree is fine.  Returns 0 on success or -1 (errno set) on the first
- * mkdir failure that isn't EEXIST.
- *
- * An existing path that isn't a directory is treated as success here -
- * we only care that the path is reachable.  Callers that need the
- * leaf to be a directory should stat afterward.
- */
+/* HPN: mkdir -p. Create each component of dirpath in turn, left to right,
+ * ignoring EEXIST so a partly existing tree is fine. Returns 0, or -1 with
+ * errno set at the first failure that is not EEXIST. A path that already
+ * exists as a non-directory counts as success, so callers that need a
+ * directory stat it after. */
 int
 mkdir_p(const char *dirpath, mode_t mode)
 {
 	char *p, *q;
 	int rc = 0;
 
-	if (dirpath == NULL || *dirpath == '\0')
+	if (dirpath == NULL || *dirpath == '\0') {
+		errno = ENOENT;		/* what mkdir("") reports */
 		return -1;
+	}
 	p = strdup(dirpath);
 	if (p == NULL)
 		return -1;
