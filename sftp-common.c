@@ -138,6 +138,7 @@ decode_attrib(struct sshbuf *b, Attrib *a)
 		if (count > 0x100000)
 			return SSH_ERR_INVALID_FORMAT;
 		for (i = 0; i < count; i++) {
+			/* HPN: free a decoded type when the value read fails */
 			type = NULL;
 			data = NULL;
 			if ((r = sshbuf_get_cstring(b, &type, NULL)) != 0 ||

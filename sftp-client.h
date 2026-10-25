@@ -47,19 +47,6 @@ struct sftp_statvfs {
 	uint64_t f_namemax;
 };
 
-/*
- * Filesystem information returned by the hpn-fs-info@hpnssh.org extension.
- * Used by the parallel orchestrator to align byte-range splits to Lustre/GPFS
- * stripe boundaries.  All fields zero/empty if the server does not support
- * the extension.
- */
-struct sftp_fs_info {
-	char     fs_type[32];   /* "lustre", "gpfs", "ext4", "xfs", etc. */
-	uint64_t stripe_size;   /* bytes per stripe; 0 if not applicable */
-	uint32_t stripe_count;  /* number of OSTs/stripes; 0 if not applicable */
-	uint64_t block_size;    /* optimal I/O block size (always present) */
-};
-
 /* Used for limits response on the wire from the server */
 struct sftp_limits {
 	uint64_t packet_length;
@@ -74,81 +61,13 @@ struct sftp_limits {
 #define SFTP_PROGRESS_ONLY	2	/* progress bar only */
 
 /*
- * Exit code returned by hpnsftp/hpnscp when one or more files fail
- * post-transfer XXH3 verification (verify transfer) or the verified
- * resume gate.  The transfer is NOT aborted on a mismatch - the file is
- * re-transferred (resume) or flagged (verify) and a summary is printed -
- * but the process exits non-zero so automation can detect it.  57 = a
- * Pittsburgh/PSC nod (Heinz 57); chosen to avoid the existing 0/1/255
- * exit codes and the BSD sysexits block (64-78).
- */
-#define SFTP_EX_VERIFY_FAILED	57
-
-/*
- * Single canonical message for "the remote can't do verified resume".
- * Referenced by sftp_upload, sftp_download, and the parallel submit path
- * so every verified-resume fatal reads identically regardless of mode or
- * direction.  Verified resume requires the server's hpn-check-file@hpnssh.org
- * extension; when it is absent we fail loudly rather than silently degrade
- * to an unverified resume or a full re-transfer behind the user's back.
- */
-#define RESUME_INCOMPAT_MSG \
-	"The remote is not compatible with verified resume. " \
-	"Please upgrade the remote to at least HPN-SSH 19.0.0"
-
-/*
  * Initialise a SSH filexfer connection. Returns NULL on error or
  * a pointer to a initialized sftp_conn struct on success.
  */
 struct sftp_conn *sftp_init(int, int, u_int, u_int, uint64_t);
 void sftp_free(struct sftp_conn *);
-/* Returns non-zero if the connection suffered an unrecoverable I/O error.
- * Workers should check this after a failed transfer and exit their loop. */
-int sftp_conn_is_dead(struct sftp_conn *);
-
-/* HPN: non-zero if a PERMISSION_DENIED reply was seen since the last
- * clear; clear resets it.  Used to make a refused op non-retryable. */
-int sftp_conn_saw_perm_denied(struct sftp_conn *);
-void sftp_conn_clear_perm_denied(struct sftp_conn *);
-/* HPN: latch the sticky permission-denied flag (the internal set-sites). */
-void sftp_conn_set_perm_denied(struct sftp_conn *);
-
-/* HPN: a refused op was a -P/-p request-policy denial (server-tagged), not a
- * filesystem error.  check_policy_tag reads the SSH_FXP_STATUS error-message
- * just after the status code and latches the flag if it carries the tag. */
-int sftp_conn_saw_policy_denied(struct sftp_conn *);
-void sftp_conn_clear_policy_denied(struct sftp_conn *);
-void sftp_conn_check_policy_tag(struct sftp_conn *, struct sshbuf *);
-
-/*
- * Mark a connection as dead with prominent diagnostic logging, without
- * terminating the process. Used to replace fatal() in code paths that
- * may run inside a parallel-streams worker, where fatal() would crash
- * the entire orchestrator.
- *
- * After this call, sftp_conn_is_dead() returns true and subsequent RPC
- * calls on this connection short-circuit to error returns. Callers must
- * still propagate the failure via their own return value (or rely on
- * the worker thread's per-unit conn->dead post-check to abandon the
- * unit and exit so the watchdog can respawn).
- */
-void sftp_conn_die(struct sftp_conn *, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
-
-/* Returns non-zero if a protocol-level violation was detected (ID mismatch,
- * unexpected packet type). Distinct from sftp_conn_is_dead: indicates possible
- * MITM attack or serious server corruption. The parallel orchestrator aborts
- * the entire transfer on violation rather than retrying the affected worker. */
-int sftp_conn_is_protocol_violation(struct sftp_conn *);
 
 u_int sftp_proto_version(struct sftp_conn *);
-
-/*
- * HPN: server-advertised per-user parallel-worker cap.
- * -1 = not advertised (stock/non-HPN server); 0 = advertised, no cap;
- * N>0 = advertised cap.  Used by the orchestrator to clamp -j.
- */
-int sftp_conn_max_workers_cap(struct sftp_conn *);
 
 /* Query server limits */
 int sftp_get_limits(struct sftp_conn *, struct sftp_limits *);
@@ -179,28 +98,6 @@ int sftp_lstat(struct sftp_conn *, const char *, int, Attrib *);
 
 /* Set file attributes of 'path' */
 int sftp_setstat(struct sftp_conn *, const char *, Attrib *);
-
-/*
- * Apply N independent directory setstats with a bounded outstanding-request
- * window instead of one blocking round trip each.  Used by the deferred
- * directory-attribute apply (sftp_hpn_dirattrs_apply); see the definition
- * for the in-order-reply contract it relies on.
- */
-int sftp_setstat_pipeline(struct sftp_conn *, char **, Attrib *, int);
-
-/*
- * Create N sibling directories with a bounded outstanding-request window
- * instead of one blocking mkdir round trip each.  created_out[i] is set to
- * 1 iff we created it (0 if it pre-existed).  Used by the recursive upload
- * walks; see the definition for the sibling-independence and stat-fallback
- * contract.
- */
-int sftp_mkdir_pipeline(struct sftp_conn *, char **, Attrib *, int, u_char *,
-    u_char *);
-
-/* Max sibling directories created as one atomic (fully-drained) mkdir batch;
- * larger sibling sets are chunked.  Covers ~99.9% of trees in one pass;
- * value-aligned with BUNDLE_BATCH_MAX_FILES for consistency. */
 
 /* Set file attributes of open file 'handle' */
 int sftp_fsetstat(struct sftp_conn *, const u_char *, u_int, Attrib *);
@@ -270,234 +167,6 @@ int sftp_upload(struct sftp_conn *, const char *, const char *,
     int, int, int, int, int);
 
 /*
- * Verify transfer post-transfer integrity check: XXH3 the full local and
- * remote file and compare.  Returns 0 = match, 1 = mismatch (corruption),
- * -1 = could not verify (server lacks hpn-check-file or I/O error).
- */
-
-/*
- * Per-file descriptor for a pipelined upload batch.  Caller fills local_path
- * and remote_path; result is written by the function (0 = success, -1 = fail).
- */
-struct sftp_upload_batch_entry {
-	const char *local_path;
-	const char *remote_path;
-	int         result;
-	/* Source hash teed during the send, for the verify phase. */
-	int         have_src_hash;
-	uint64_t    src_hash;
-};
-
-/* BEGIN HPN: pipelined batch send and finish
- *
- * Upload N files with pipelined SSH_FXP_OPEN/CLOSE (all N opens in one burst,
- * transfer sequentially, all N closes in one burst) so per-file open/close RTT
- * is amortised from 2*N down to 2 - critical for many-small-file workloads at
- * high latency.  resume is not supported; all other flags apply to every entry.
- *
- * The send/finish split lets the caller pipeline back-to-back batches: send the
- * next batch's OPENs (phase 1) while the
- * previous batch's CLOSE STATUSes are still being collected (phase 5).
- *
- *   pending = sftp_upload_batch_send(conn, entries, n, ..., prev_pending);
- *     // does phases 1, 2, 3a-d, 4 for the new batch.
- *     // if prev_pending != NULL: drains it (phase 5 of previous batch)
- *     // AFTER the new batch's phase 1, so the server-side processing of
- *     // prev's CLOSEs overlaps with this batch's OPENs on the wire.
- *     // prev_pending is freed during the drain.
- *
- *   sftp_upload_batch_finish(conn, pending);
- *     // drains the new batch's phase 5.  Free's pending.
- *
- * On error during send (connection dies, protocol violation), all entries
- * in BOTH the current batch and prev (if drain failed) are marked failed
- * and the function returns NULL.  Caller must NOT call finish on a
- * NULL pending. */
-struct sftp_upload_batch_pending;
-
-struct sftp_upload_batch_pending *sftp_upload_batch_send(
-    struct sftp_conn *conn,
-    struct sftp_upload_batch_entry *entries, int n,
-    int preserve_flag, int fsync_flag, int inplace_flag,
-    struct sftp_upload_batch_pending *prev);
-
-int sftp_upload_batch_finish(struct sftp_conn *conn,
-    struct sftp_upload_batch_pending *pending);
-
-/* END HPN: pipelined batch send and finish */
-
-/* BEGIN HPN: hpn-bundle small-file streaming
- *
- * Bundle upload via the `hpn-bundle-open@hpnssh.org` SFTP extension.
- * Many small files are packed into a single bundle byte stream and
- * delivered through one OPEN / WRITE x N / CLOSE sequence - amortising the
- * per-file OPEN/CLOSE round-trip cost that limits small-file throughput
- * even after the pipelined batch path.
- *
- * Composes with parallel streams: each worker handles its own bundles
- * over its own SSH connection; many concurrent bundles in flight.
- *
- * Server support detected via the `hpn-bundle@hpnssh.org` extension
- * advertised in SSH_FXP_VERSION (see SFTP_EXT_HPN_BUNDLE in sftp-client.c).
- * When unsupported, caller must fall back to per-file uploads.
- */
-
-struct sftp_hpn_bundle_upload_entry {
-	const char *local_path;
-	const char *remote_path;   /* relative path inside the bundle dest */
-	int         result;        /* 0 = ok; -1 = failed (set by function) */
-	/* Source hash of the packed data, for the verify phase. */
-	int         have_src_hash;
-	uint64_t    src_hash;
-};
-
-/*
- * Upload N small files as a single bundle stream to remote_dest_dir.  The
- * server's hpn-bundle handler extracts each file into remote_dest_dir/
- * preserving the relative path supplied in entries[i].remote_path.
- *
- * preserve_flag: when non-zero, file mode + mtime are carried in the record
- *   header and applied on extract.  Otherwise extracted files use 0644
- *   mode and current mtime.
- * fsync_flag: when non-zero, request the server fsync each extracted
- *   file before the bundle is closed.
- * progress: when not NULL, advances by each file data byte as the server
- *   acks the WRITE that carried it.
- *
- * Returns one of enum sftp_hpn_bundle_result.  On any non-OK return all
- * entries[].result are set to -1 (the protocol does not return per-record
- * status - whole-bundle re-queue).  The caller MUST distinguish the cause:
- * SERVER_CANT is a permanent, connection-agnostic reason (the server refused
- * the bundle or lacks the extension) and the units should be marked
- * bundle_ineligible (single-file fallback); TRANSPORT_FAILED means only THIS
- * worker's connection died mid-bundle - the units bundle fine on a healthy
- * worker, so they stay bundle-eligible and are simply re-queued.  Failure
- * values are negative so legacy `!= 0` / `< 0` checks still see failure.
- */
-enum sftp_hpn_bundle_result {
-	SFTP_HPN_BUNDLE_OK               =  0,
-	SFTP_HPN_BUNDLE_SERVER_CANT      = -1, /* permanent: refused / no ext */
-	SFTP_HPN_BUNDLE_TRANSPORT_FAILED = -2, /* transient: this conn died */
-	SFTP_HPN_BUNDLE_POLICY_DENIED    = -3, /* permanent: -P/-p policy forbids
-						* this whole class - abort the
-						* transfer, do not fall back */
-};
-
-/*
- * Per-transfer flags shared by both bundle entry points. They travel in a
- * struct rather than as positional ints because all three are int and a
- * transposed pair compiles cleanly, moves every byte correctly, and only
- * shows up as a feature that quietly stopped working.
- */
-struct sftp_bundle_opts {
-	int preserve;		/* preserve mode and times */
-	int fsync;		/* fsync each file after writing */
-	int writer_pool;	/* extract through the writer pool */
-};
-
-int sftp_hpn_bundle_upload(struct sftp_conn *conn,
-    const char *remote_dest_dir,
-    struct sftp_hpn_bundle_upload_entry *entries, int n,
-    const struct sftp_bundle_opts *opts, off_t *progress);
-
-/* True iff the server advertised the hpn-bundle@hpnssh.org extension. */
-int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
-
-/*
- * Install the resolved bundling knobs (HPNUseBundle, HPNBundleSize,
- * HPNWriterPool) on the connection.  The serial-path recursive walks
- * read them; scp also re-latches them in parallel mode so the main
- * connection matches the workers' configuration.
- * Without this call the connection uses the options' documented defaults
- * (bundling on, writer pool on, default bundle size).
- */
-void sftp_conn_set_bundle_config(struct sftp_conn *conn, int use_bundle,
-    uint64_t bundle_size, int writer_pool);
-
-/* True iff the server advertised hpn-bundle-fetch@hpnssh.org (download). */
-int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
-
-/* True iff the server advertised both hpn-dtree-open and hpn-dtree-read,
- * the chunked download walk. */
-int sftp_conn_has_tree_walk(struct sftp_conn *conn);
-
-/*
- * True iff the server advertised hpn-check-file@hpnssh.org, i.e. it can
- * answer the XXH3 hash queries that verified resume depends on.  Lets the
- * parallel submit path (which sees struct sftp_conn only as opaque) make
- * the up-front "can this remote verify?" decision in the main thread.
- */
-int sftp_conn_has_hpn_check_file(struct sftp_conn *conn);
-
-/*
- * Run the classic (single-conn) post-transfer verify phase: verify every file
- * parked by sftp_conn_verify_park during the command's transfers, recording
- * mismatches on the conn.  Call once at the end of each put/get command (the
- * single-conn analogue of the -j orchestrator's verify phase); no-op when
- * nothing was parked.
- */
-void sftp_conn_verify_run_phase(struct sftp_conn *conn);
-
-/* Number of files parked for the classic verify phase (0 in parallel mode or
- * with verify off).  Used to gate the "Verifying N file(s)..." start line. */
-int sftp_conn_verify_pending_count(struct sftp_conn *conn);
-
-/*
- * Drain the classic (single-conn) post-transfer verify failures recorded by
- * the verify phase.  Ownership of *out_paths and its strings transfers to the
- * caller; the conn's list resets to empty.  Mirrors
- * sftp_parallel_drain_verify_failures so the end-of-run summary + exit code
- * cover classic and parallel transfers uniformly.  Returns the count.
- */
-int sftp_conn_drain_verify_failures(struct sftp_conn *conn,
-    char ***out_paths, int *out_used);
-
-/*
- * True iff the server advertised sftp-hash-range@hpnssh.org, i.e. it can
- * answer batched per-range XXH3 queries used by chunked resume to re-transfer
- * only mismatched chunks instead of the whole file.
- */
-int sftp_conn_has_hash_range(struct sftp_conn *conn);
-
-/*
- * True iff the server advertised hpn-file-layout@hpnssh.org, i.e. it can
- * apply a filesystem layout (today: Lustre stripe count) to a destination
- * directory before files land in it.  Used by HPNLustreStripeCount.
- */
-int sftp_conn_has_file_layout(struct sftp_conn *conn);
-
-/* True iff the server advertised hpn-fs-info@hpnssh.org. */
-int sftp_conn_has_fs_info(struct sftp_conn *conn);
-
-/*
- * Download-side counterpart of sftp_hpn_bundle_upload.  Asks the server to
- * pack the listed `entries[].remote_path` files into a single bundle stream,
- * then unpacks locally into each `entries[].local_path`.  Per-entry result
- * codes are written into entries[i].result (0 = ok, -1 = skipped/failed).
- *
- * Returns an enum sftp_hpn_bundle_result: OK when the transaction
- * succeeded, even if some per-entry results are -1; SERVER_CANT when the
- * server refused or lacks the extension; TRANSPORT_FAILED when this
- * connection died mid-bundle; POLICY_DENIED when the server's request
- * policy forbids the whole class. Any non-OK return marks every entry -1.
- * The caller must keep SERVER_CANT and TRANSPORT_FAILED apart: only the
- * former justifies falling back to per-file downloads.
- *
- * Implementation lives in sftp-hpn-client.c.
- */
-struct sftp_hpn_bundle_download_entry {
-	const char *remote_path;
-	const char *local_path;
-	int         result;
-};
-
-int sftp_hpn_bundle_download(struct sftp_conn *conn,
-    struct sftp_hpn_bundle_download_entry *entries, int n,
-    const struct sftp_bundle_opts *opts, off_t *progress);
-
-/* END HPN: hpn-bundle small-file streaming */
-
-/*
  * Recursively upload 'local_directory' to 'remote_directory'. Preserve
  * times if 'pflag' is set. 'verify' is propagated to each file upload.
  */
@@ -530,74 +199,6 @@ int sftp_get_users_groups_by_id(struct sftp_conn *conn,
     const u_int *gids, u_int ngids,
     char ***usernamesp, char ***groupnamesp);
 
-/*
- * Query the server for filesystem type and stripe geometry of the given path.
- * Fills *info on success; on error or if the extension is unsupported, *info
- * is zeroed (all-zeros is a safe "unknown" sentinel for callers).
- * Returns 0 on success, -1 if the extension is unsupported or the query failed.
- */
-int sftp_fs_info(struct sftp_conn *, const char *path, struct sftp_fs_info *info);
-
-/*
- * Pre-create a remote file at exactly `size` bytes (O_CREAT|O_TRUNC + setstat
- * size) so that parallel range-upload workers can subsequently open it with
- * O_WRONLY and write their byte ranges concurrently without racing on creation.
- * Returns 0 on success, -1 on error.
- */
-int sftp_create_file(struct sftp_conn *, const char *remote_path, mode_t,
-    int *permanent_out);
-
-/*
- * Upload a byte range of a local file to the corresponding byte range of a
- * remote file.  The remote file must already exist at the correct size (i.e.
- * pre-created by the orchestrator).  Opens the remote file with O_WRONLY only
- * (no O_CREAT, no O_TRUNC) so concurrent range workers don't clobber each other.
- *
- * local_path    - source file on the local filesystem
- * remote_path   - destination file on the remote server
- * range_offset  - byte offset in both files where this range starts
- * range_length  - number of bytes to transfer
- * acked_out     - highwater (contiguous acked bytes) for resume-on-requeue
- * warm          - optional warm-handle cache (NULL = open+close every call,
- *                 the original behaviour).  When non-NULL and warm->handle is
- *                 already set, the open remote handle is REUSED (the caller
- *                 guarantees it is for THIS remote_path); on a clean success
- *                 the handle is left OPEN and stored back in *warm so the next
- *                 same-file range skips the close/reopen + cold-window dip at
- *                 the boundary.  On any error/yield the handle is closed and
- *                 *warm cleared.  The caller owns *warm and must close it
- *                 (sftp_close + free) when it moves to a different file or
- *                 goes idle.
- *
- * Returns 0 on success, -1 on error.
- */
-struct sftp_range_warm {
-	u_char *handle;       /* open remote handle, or NULL */
-	size_t  handle_len;
-	char   *path;         /* strdup of the remote path it is open on */
-};
-int sftp_upload_range(struct sftp_conn *, const char *local_path,
-    const char *remote_path, off_t range_offset, off_t range_length,
-    off_t *acked_out, struct sftp_range_warm *warm, uint64_t *range_hash_out);
-
-/*
- * Download a byte range of a remote file into the corresponding byte range
- * of a local file.  The local file must already exist at the correct size
- * (pre-created by the orchestrator).  Opens the local file with O_WRONLY
- * only (no O_CREAT, no O_TRUNC) so concurrent range workers don't clobber
- * each other.
- *
- * remote_path   - source file on the remote server
- * local_path    - destination file on the local filesystem
- * range_offset  - byte offset in both files where this range starts
- * range_length  - number of bytes to transfer
- *
- * Returns 0 on success, -1 on error.
- */
-int sftp_download_range(struct sftp_conn *, const char *remote_path,
-    const char *local_path, off_t range_offset, off_t range_length,
-    off_t *acked_out);
-
 /* Concatenate paths, taking care of slashes. Caller must free result. */
 char *sftp_path_append(const char *, const char *);
 
@@ -610,5 +211,363 @@ int sftp_remote_is_dir(struct sftp_conn *conn, const char *path);
 
 /* Check whether path returned from glob(..., GLOB_MARK, ...) is a directory */
 int sftp_globpath_is_dir(const char *pathname);
+
+/* HPN-SSH additions.
+ *
+ * Everything below is HPN-specific with no upstream counterpart, collected in
+ * one block so the upstream declarations above keep their original order and
+ * OpenSSH merges do not collide with HPN code. */
+
+/* HPN: filesystem information from the hpn-fs-info@hpnssh.org extension. The
+ * parallel orchestrator uses it to align byte-range splits to Lustre/GPFS
+ * stripe boundaries. All fields are zero/empty when the server lacks the
+ * extension. */
+struct sftp_fs_info {
+	char     fs_type[32];   /* "lustre", "gpfs", "ext4", "xfs", etc. */
+	uint64_t stripe_size;   /* bytes per stripe; 0 if not applicable */
+	uint32_t stripe_count;  /* number of OSTs/stripes; 0 if not applicable */
+	uint64_t block_size;    /* optimal I/O block size (always present) */
+};
+
+/* HPN: exit code from hpnsftp/hpnscp when one or more files fail post-transfer
+ * XXH3 verification or the verified-resume gate. A mismatch does not abort the
+ * transfer. The file is re-transferred (resume) or flagged (verify) and a
+ * summary printed, but the process exits non-zero so automation can detect it.
+ * 57 is a Pittsburgh/PSC nod (Heinz 57), chosen to miss the 0/1/255 codes and
+ * the BSD sysexits block (64-78). */
+#define SFTP_EX_VERIFY_FAILED	57
+
+/* HPN: single canonical message for "the remote cannot do verified resume".
+ * Referenced by sftp_upload, sftp_download, and the parallel submit path so
+ * every verified-resume fatal reads identically regardless of mode or
+ * direction. Verified resume requires the server's hpn-check-file@hpnssh.org
+ * extension. When it is absent we fail loudly rather than silently degrade to
+ * an unverified resume or a full re-transfer behind the user's back. */
+#define RESUME_INCOMPAT_MSG \
+	"The remote is not compatible with verified resume. " \
+	"Please upgrade the remote to at least HPN-SSH 19.0.0"
+
+/* HPN: non-zero if the connection suffered an unrecoverable I/O error.
+ * Workers should check this after a failed transfer and exit their loop. */
+int sftp_conn_is_dead(struct sftp_conn *);
+
+/* HPN: non-zero if a PERMISSION_DENIED reply was seen since the last
+ * clear; clear resets it.  Used to make a refused op non-retryable. */
+int sftp_conn_saw_perm_denied(struct sftp_conn *);
+void sftp_conn_clear_perm_denied(struct sftp_conn *);
+/* HPN: latch the sticky permission-denied flag (the internal set-sites). */
+void sftp_conn_set_perm_denied(struct sftp_conn *);
+
+/* HPN: a refused op was a -P/-p request-policy denial (server-tagged), not a
+ * filesystem error.  check_policy_tag reads the SSH_FXP_STATUS error-message
+ * just after the status code and latches the flag if it carries the tag. */
+int sftp_conn_saw_policy_denied(struct sftp_conn *);
+void sftp_conn_clear_policy_denied(struct sftp_conn *);
+void sftp_conn_check_policy_tag(struct sftp_conn *, struct sshbuf *);
+
+/* HPN: mark a connection dead with prominent diagnostic logging, without
+ * terminating the process. Replaces fatal() in code paths that may run inside
+ * a parallel-streams worker, where fatal() would crash the whole orchestrator.
+ *
+ * After this call sftp_conn_is_dead() returns true and subsequent RPC calls on
+ * this connection short-circuit to error returns. Callers must still propagate
+ * the failure through their own return value, or rely on the worker thread's
+ * per-unit conn->dead post-check to abandon the unit and exit so the watchdog
+ * can respawn. */
+void sftp_conn_die(struct sftp_conn *, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+/* HPN: non-zero if a protocol-level violation was detected (ID mismatch,
+ * unexpected packet type). Distinct from sftp_conn_is_dead: indicates possible
+ * MITM attack or serious server corruption. The parallel orchestrator aborts
+ * the entire transfer on violation rather than retrying the affected worker. */
+int sftp_conn_is_protocol_violation(struct sftp_conn *);
+
+/* HPN: server-advertised per-user parallel-worker cap. -1 = not advertised
+ * (stock/non-HPN server), 0 = advertised with no cap, N>0 = advertised cap.
+ * The orchestrator uses it to clamp -j. */
+int sftp_conn_max_workers_cap(struct sftp_conn *);
+
+/* HPN: apply N independent directory setstats with a bounded outstanding-request
+ * window instead of one blocking round trip each. Used by the deferred
+ * directory-attribute apply (sftp_hpn_dirattrs_apply). See the definition for
+ * the in-order-reply contract it relies on. */
+int sftp_setstat_pipeline(struct sftp_conn *, char **, Attrib *, int);
+
+/* HPN: create N sibling directories with a bounded outstanding-request window
+ * instead of one blocking mkdir round trip each. created_out[i] is set to 1
+ * iff we created it, 0 if it pre-existed. Used by the recursive upload walks.
+ * See the definition for the sibling-independence and stat-fallback contract. */
+int sftp_mkdir_pipeline(struct sftp_conn *, char **, Attrib *, int, u_char *,
+    u_char *);
+
+/* HPN: per-file descriptor for a pipelined upload batch. The caller fills
+ * local_path and remote_path. The function writes result (0 = success,
+ * -1 = fail). */
+struct sftp_upload_batch_entry {
+	const char *local_path;
+	const char *remote_path;
+	int         result;
+	/* Source hash teed during the send, for the verify phase. */
+	int         have_src_hash;
+	uint64_t    src_hash;
+};
+
+/* BEGIN HPN: pipelined batch send and finish
+ *
+ * Upload N files with pipelined SSH_FXP_OPEN/CLOSE (all N opens in one burst,
+ * transfer sequentially, all N closes in one burst) so per-file open/close RTT
+ * is amortised from 2*N down to 2, critical for many-small-file workloads at
+ * high latency. Resume is not supported; all other flags apply to every entry.
+ *
+ * The send/finish split lets the caller pipeline back-to-back batches: send the
+ * next batch's OPENs (phase 1) while the previous batch's CLOSE STATUSes are
+ * still being collected (phase 5).
+ *
+ *   pending = sftp_upload_batch_send(conn, entries, n, ..., prev_pending);
+ *     // does phases 1, 2, 3a-d, 4 for the new batch.
+ *     // if prev_pending != NULL: drains it (phase 5 of previous batch)
+ *     // AFTER the new batch's phase 1, so the server-side processing of
+ *     // prev's CLOSEs overlaps with this batch's OPENs on the wire.
+ *     // prev_pending is freed during the drain.
+ *
+ *   sftp_upload_batch_finish(conn, pending);
+ *     // drains the new batch's phase 5.  Frees pending.
+ *
+ * On error during send (connection dies, protocol violation) all entries in
+ * both the current batch and prev (if the drain failed) are marked failed and
+ * the function returns NULL. The caller must NOT call finish on a NULL
+ * pending. */
+struct sftp_upload_batch_pending;
+
+struct sftp_upload_batch_pending *sftp_upload_batch_send(
+    struct sftp_conn *conn,
+    struct sftp_upload_batch_entry *entries, int n,
+    int preserve_flag, int fsync_flag, int inplace_flag,
+    struct sftp_upload_batch_pending *prev);
+
+int sftp_upload_batch_finish(struct sftp_conn *conn,
+    struct sftp_upload_batch_pending *pending);
+
+/* END HPN: pipelined batch send and finish */
+
+/* BEGIN HPN: hpn-bundle small-file streaming
+ *
+ * Bundle upload via the hpn-bundle-open@hpnssh.org SFTP extension. Many small
+ * files are packed into a single bundle byte stream and delivered through one
+ * OPEN / WRITE x N / CLOSE sequence, amortising the per-file OPEN/CLOSE
+ * round-trip cost that limits small-file throughput even after the pipelined
+ * batch path.
+ *
+ * Composes with parallel streams: each worker handles its own bundles over its
+ * own SSH connection, many concurrent bundles in flight.
+ *
+ * Server support is detected via the hpn-bundle@hpnssh.org extension advertised
+ * in SSH_FXP_VERSION (see SFTP_EXT_HPN_BUNDLE in sftp-client.c). When
+ * unsupported, the caller must fall back to per-file uploads. */
+
+struct sftp_hpn_bundle_upload_entry {
+	const char *local_path;
+	const char *remote_path;   /* relative path inside the bundle dest */
+	int         result;        /* 0 = ok; -1 = failed (set by function) */
+	/* Source hash of the packed data, for the verify phase. */
+	int         have_src_hash;
+	uint64_t    src_hash;
+};
+
+/* HPN: upload N small files as a single bundle stream to remote_dest_dir. The
+ * server's hpn-bundle handler extracts each file into remote_dest_dir/,
+ * preserving the relative path supplied in entries[i].remote_path.
+ *
+ * opts->preserve:    when non-zero, file mode and mtime are carried in the
+ *                    record header and applied on extract. Otherwise extracted
+ *                    files use 0644 mode and the current mtime.
+ * opts->fsync:       when non-zero, ask the server to fsync each extracted file
+ *                    before the bundle is closed.
+ * opts->writer_pool: when non-zero, extract through the server's writer pool.
+ * progress:          when not NULL, advances by each file data byte as the
+ *                    server acks the WRITE that carried it.
+ *
+ * Returns one of enum sftp_hpn_bundle_result. On any non-OK return all
+ * entries[].result are set to -1 (the protocol does not return per-record
+ * status, so the whole bundle is re-queued). The caller MUST distinguish the
+ * cause. SERVER_CANT is a permanent, connection-agnostic reason (the server
+ * refused the bundle or lacks the extension) and the units should be marked
+ * bundle_ineligible for single-file fallback. TRANSPORT_FAILED means only this
+ * worker's connection died mid-bundle; the units bundle fine on a healthy
+ * worker, so they stay bundle-eligible and are simply re-queued. Failure
+ * values are negative so legacy != 0 / < 0 checks still see failure. */
+enum sftp_hpn_bundle_result {
+	SFTP_HPN_BUNDLE_OK               =  0,
+	SFTP_HPN_BUNDLE_SERVER_CANT      = -1, /* permanent: refused / no ext */
+	SFTP_HPN_BUNDLE_TRANSPORT_FAILED = -2, /* transient: this conn died */
+	SFTP_HPN_BUNDLE_POLICY_DENIED    = -3, /* permanent: -P/-p policy forbids
+						* this whole class - abort the
+						* transfer, do not fall back */
+};
+
+/* HPN: per-transfer flags shared by both bundle entry points. They travel in a
+ * struct rather than as positional ints because all three are int, so a
+ * transposed pair compiles cleanly, moves every byte correctly, and shows up
+ * only as a feature that quietly stopped working. */
+struct sftp_bundle_opts {
+	int preserve;		/* preserve mode and times */
+	int fsync;		/* fsync each file after writing */
+	int writer_pool;	/* extract through the writer pool */
+};
+
+int sftp_hpn_bundle_upload(struct sftp_conn *conn,
+    const char *remote_dest_dir,
+    struct sftp_hpn_bundle_upload_entry *entries, int n,
+    const struct sftp_bundle_opts *opts, off_t *progress);
+
+/* HPN: true iff the server advertised the hpn-bundle@hpnssh.org extension. */
+int sftp_conn_has_hpn_bundle(struct sftp_conn *conn);
+
+/* HPN: install the resolved bundling knobs (HPNUseBundle, HPNBundleSize,
+ * HPNWriterPool) on the connection. The serial-path recursive walks read
+ * them. scp also re-latches them in parallel mode so the main connection
+ * matches the workers' configuration. Without this call the connection uses
+ * the options' documented defaults (bundling on, writer pool on, default
+ * bundle size). */
+void sftp_conn_set_bundle_config(struct sftp_conn *conn, int use_bundle,
+    uint64_t bundle_size, int writer_pool);
+
+/* HPN: true iff the server advertised hpn-bundle-fetch@hpnssh.org (download). */
+int sftp_conn_has_hpn_bundle_fetch(struct sftp_conn *conn);
+
+/* HPN: true iff the server advertised both hpn-dtree-open and hpn-dtree-read,
+ * the chunked download walk. */
+int sftp_conn_has_tree_walk(struct sftp_conn *conn);
+
+/* HPN: true iff the server advertised hpn-check-file@hpnssh.org, i.e. it can
+ * answer the XXH3 hash queries that verified resume depends on. Lets the
+ * parallel submit path (which sees struct sftp_conn only as opaque) make the
+ * up-front "can this remote verify?" decision in the main thread. */
+int sftp_conn_has_hpn_check_file(struct sftp_conn *conn);
+
+/* HPN: run the classic (single-conn) post-transfer verify phase: verify every
+ * file parked by sftp_conn_verify_park during the command's transfers,
+ * recording mismatches on the conn. Call once at the end of each put/get
+ * command, the single-conn analogue of the -j orchestrator's verify phase.
+ * No-op when nothing was parked. */
+void sftp_conn_verify_run_phase(struct sftp_conn *conn);
+
+/* HPN: number of files parked for the classic verify phase (0 in parallel mode
+ * or with verify off). Used to gate the "Verifying N file(s)..." start line. */
+int sftp_conn_verify_pending_count(struct sftp_conn *conn);
+
+/* HPN: drain the classic (single-conn) post-transfer verify failures recorded
+ * by the verify phase. Ownership of *out_paths and its strings transfers to the
+ * caller; the conn's list resets to empty. Mirrors
+ * sftp_parallel_drain_verify_failures so the end-of-run summary and exit code
+ * cover classic and parallel transfers uniformly. Returns the count. */
+int sftp_conn_drain_verify_failures(struct sftp_conn *conn,
+    char ***out_paths, int *out_used);
+
+/* HPN: true iff the server advertised sftp-hash-range@hpnssh.org, i.e. it can
+ * answer batched per-range XXH3 queries used by chunked resume to re-transfer
+ * only mismatched chunks instead of the whole file. */
+int sftp_conn_has_hash_range(struct sftp_conn *conn);
+
+/* HPN: true iff the server advertised hpn-file-layout@hpnssh.org, i.e. it can
+ * apply a filesystem layout (today: Lustre stripe count) to a destination
+ * directory before files land in it. Used by HPNLustreStripeCount. */
+int sftp_conn_has_file_layout(struct sftp_conn *conn);
+
+/* HPN: true iff the server advertised hpn-fs-info@hpnssh.org. */
+int sftp_conn_has_fs_info(struct sftp_conn *conn);
+
+/* HPN: download-side counterpart of sftp_hpn_bundle_upload. Asks the server to
+ * pack the listed entries[].remote_path files into a single bundle stream, then
+ * unpacks locally into each entries[].local_path. Per-entry result codes are
+ * written into entries[i].result (0 = ok, -1 = skipped/failed).
+ *
+ * Returns an enum sftp_hpn_bundle_result: OK when the transaction succeeded,
+ * even if some per-entry results are -1; SERVER_CANT when the server refused or
+ * lacks the extension; TRANSPORT_FAILED when this connection died mid-bundle;
+ * POLICY_DENIED when the server's request policy forbids the whole class. Any
+ * non-OK return marks every entry -1. The caller must keep SERVER_CANT and
+ * TRANSPORT_FAILED apart: only the former justifies falling back to per-file
+ * downloads.
+ *
+ * Implementation lives in sftp-hpn-client.c. */
+struct sftp_hpn_bundle_download_entry {
+	const char *remote_path;
+	const char *local_path;
+	int         result;
+};
+
+int sftp_hpn_bundle_download(struct sftp_conn *conn,
+    struct sftp_hpn_bundle_download_entry *entries, int n,
+    const struct sftp_bundle_opts *opts, off_t *progress);
+
+/* END HPN: hpn-bundle small-file streaming */
+
+/* HPN: query the server for filesystem type and stripe geometry of the given
+ * path. Fills *info on success. On error, or if the extension is unsupported,
+ * *info is zeroed (all-zeros is a safe "unknown" sentinel for callers). Returns
+ * 0 on success, -1 if the extension is unsupported or the query failed. */
+int sftp_fs_info(struct sftp_conn *, const char *path, struct sftp_fs_info *info);
+
+/* HPN: create remote_path if it does not already exist, WITHOUT truncating
+ * (opened WRITE|CREAT, no TRUNC) and with its permission bits set to
+ * mode & 07777. Parallel range-upload workers then open the file O_WRONLY and
+ * write their byte ranges concurrently. The final size is established by the
+ * ranges, not here. permanent_out, when not NULL, is set to 1 if the create
+ * failed with a permanent error (permission denied) so the caller gives up
+ * instead of retrying. Returns 0 on success, -1 on error. */
+int sftp_create_file(struct sftp_conn *, const char *remote_path, mode_t,
+    int *permanent_out);
+
+/* HPN: upload a byte range of a local file to the corresponding byte range of a
+ * remote file. The remote file must already exist at the correct size (i.e.
+ * pre-created by the orchestrator). Opens the remote file O_WRONLY only (no
+ * O_CREAT, no O_TRUNC) so concurrent range workers don't clobber each other.
+ *
+ * local_path     - source file on the local filesystem
+ * remote_path    - destination file on the remote server
+ * range_offset   - byte offset in both files where this range starts
+ * range_length   - number of bytes to transfer
+ * acked_out      - highwater of contiguous acked bytes, for resume on requeue
+ * warm           - optional warm-handle cache (NULL = open+close every call,
+ *                  the original behaviour). When non-NULL and warm->handle is
+ *                  already set, the open remote handle is REUSED (the caller
+ *                  guarantees it is for THIS remote_path); on a clean success
+ *                  the handle is left OPEN and stored back in *warm so the next
+ *                  same-file range skips the close/reopen and the cold-window
+ *                  dip at the boundary. On any error or yield the handle is
+ *                  closed and *warm cleared. The caller owns *warm and must
+ *                  close it (sftp_close + free) when it moves to a different
+ *                  file or goes idle.
+ * range_hash_out - optional; receives the teed source hash of this range for
+ *                  the verify phase, written only when the range transfers in
+ *                  one shot (NULL to skip).
+ *
+ * Returns 0 on success, -1 on error. */
+struct sftp_range_warm {
+	u_char *handle;       /* open remote handle, or NULL */
+	size_t  handle_len;
+	char   *path;         /* strdup of the remote path it is open on */
+};
+int sftp_upload_range(struct sftp_conn *, const char *local_path,
+    const char *remote_path, off_t range_offset, off_t range_length,
+    off_t *acked_out, struct sftp_range_warm *warm, uint64_t *range_hash_out);
+
+/* HPN: download a byte range of a remote file into the corresponding byte range
+ * of a local file. The local file must already exist at the correct size
+ * (pre-created by the orchestrator). Opens the local file O_WRONLY only (no
+ * O_CREAT, no O_TRUNC) so concurrent range workers don't clobber each other.
+ *
+ * remote_path  - source file on the remote server
+ * local_path   - destination file on the local filesystem
+ * range_offset - byte offset in both files where this range starts
+ * range_length - number of bytes to transfer
+ * acked_out    - highwater of contiguous bytes written, for resume on requeue
+ *
+ * Returns 0 on success, -1 on error. */
+int sftp_download_range(struct sftp_conn *, const char *remote_path,
+    const char *local_path, off_t range_offset, off_t range_length,
+    off_t *acked_out);
 
 #endif
