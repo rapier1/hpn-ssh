@@ -41,6 +41,7 @@
 
 struct sftp_parallel;
 struct sftp_conn;	/* opaque; defined in sftp-client.c */
+struct Attrib;		/* sftp-common.h */
 
 /*
  * Hard cap on the number of parallel worker SSH connections per process.
@@ -350,18 +351,22 @@ void sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg);
  * the remote file when speculative range-splitting applies, and NULL
  * submits the file as one whole-file unit.
  *
+ * src_attrs are the source file's attributes. The size and mode come
+ * from them, and a file split into ranges gets their mode and times once
+ * its last range lands, under -p.
+ *
  * resume and verify carry the originating command's intent (reget vs
  * regetv, scp -Z); the rules they impose are documented at the definition
  * in sftp-parallel-unit.c.
  */
 int sftp_parallel_submit_upload(struct sftp_parallel *fleet,
     struct sftp_conn *conn,
-    const char *local_path, const char *remote_path, off_t size, mode_t mode,
-    int resume, int verify);
+    const char *local_path, const char *remote_path,
+    const struct Attrib *src_attrs, int resume, int verify);
 int sftp_parallel_submit_download(struct sftp_parallel *fleet,
     struct sftp_conn *conn,
-    const char *remote_path, const char *local_path, off_t size, mode_t mode,
-    int resume, int verify);
+    const char *remote_path, const char *local_path,
+    const struct Attrib *src_attrs, int resume, int verify);
 
 /*
  * Walker-helper accessors. Exposed for sftp-parallel-walk.c (the

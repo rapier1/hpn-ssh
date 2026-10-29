@@ -2070,12 +2070,14 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 			errs = 1;
 		}
 	} else if (parallel_orch != NULL) {
+		Attrib sa;
+
 		/* HPNLustreStripeCount: stripe the remote destination
 		 * directory first, as sftp.c does. */
 		maybe_apply_lustre_layout_parent(parallel_orch, conn, abs_dst, 0);
+		stat_to_attrib(&st, &sa);
 		if (sftp_parallel_submit_upload(parallel_orch, conn, src,
-		    abs_dst, st.st_size, st.st_mode,
-		    resume_flag, resume_flag) != 0) {
+		    abs_dst, &sa, resume_flag, resume_flag) != 0) {
 			error("failed to upload file %s to %s", src, targ);
 			errs = 1;
 		}
@@ -2384,21 +2386,15 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 			 * range-split decision and meter, then submit.
 			 */
 			Attrib ga;
-			off_t fsize = 0;
-			mode_t fmode = 0;
 
-			if (sftp_stat(conn, g.gl_pathv[i], 1, &ga) == 0) {
-				if (ga.flags & SSH2_FILEXFER_ATTR_SIZE)
-					fsize = (off_t)ga.size;
-				if (ga.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
-					fmode = ga.perm;
-			}
+			if (sftp_stat(conn, g.gl_pathv[i], 1, &ga) != 0)
+				attrib_clear(&ga);
 			/* HPNLustreStripeCount: stripe the local destination
 			 * directory first, as sftp.c does. */
 			maybe_apply_lustre_layout_parent(parallel_orch, conn,
 			    abs_dst, 1);
 			if (sftp_parallel_submit_download(parallel_orch, conn,
-			    g.gl_pathv[i], abs_dst, fsize, fmode,
+			    g.gl_pathv[i], abs_dst, &ga,
 			    resume_flag, resume_flag) != 0)
 				err = -1;
 		} else {

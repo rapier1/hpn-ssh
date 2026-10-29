@@ -495,6 +495,9 @@ struct sftp_range_tracker {
 	/* vslots allocation count: `total` when allocated, 0 when not. Index by
 	 * this, not total. */
 	int                      vslots_n;
+	/* The source's mode and times, never its size or owner. The first
+	 * range creates the file with this mode and the last applies it. */
+	Attrib                   attrs;
 };
 
 /* One schedulable piece of transfer work: the unit the producers queue and

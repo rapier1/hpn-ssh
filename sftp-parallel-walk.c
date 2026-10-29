@@ -134,10 +134,12 @@ parallel_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
     const char *dst, const struct stat *src_sb)
 {
 	struct parallel_ul_sink	*ctx = (struct parallel_ul_sink *)sink;
+	Attrib			 src_attrs;
 
 	sftp_parallel_set_walker_phase(ctx->fleet, SFTP_WKP_SUBMIT);
+	stat_to_attrib(src_sb, &src_attrs);
 	if (sftp_parallel_submit_upload(ctx->fleet, ctx->conn, src, dst,
-	    src_sb->st_size, src_sb->st_mode, ctx->resume, ctx->verify) != 0) {
+	    &src_attrs, ctx->resume, ctx->verify) != 0) {
 		if (sftp_parallel_is_aborting(ctx->fleet)) {
 			debug("submit \"%s\" refused (abort in progress)", src);
 			sftp_parallel_walker_record_failure(ctx->fleet, src,
@@ -274,22 +276,14 @@ parallel_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
 	return 0;
 }
 
-/* Hand one regular file to the fleet. Size and mode come out of the server's
- * attrs because the submit API takes plain scalars rather than an Attrib. A
- * server that sends neither leaves the size at 0 and the mode for umask to
+/* Hand one regular file to the fleet with the server's attrs. A server that
+ * sends no size or mode leaves the size at 0 and the mode for umask to
  * decide. Refusals are recorded as in parallel_ul_xfer_file. */
 static int
 parallel_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
     const char *dst, Attrib *attrs)
 {
 	struct parallel_dl_sink	*ctx = (struct parallel_dl_sink *)sink;
-	off_t			 fsize = 0;
-	mode_t			 fmode = 0666;
-
-	if (attrs->flags & SSH2_FILEXFER_ATTR_SIZE)
-		fsize = (off_t)attrs->size;
-	if (attrs->flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
-		fmode = attrs->perm;
 
 	/* Streaming hands files over while a batch is being read, and the
 	 * server lists far faster than the fleet transfers. Wait for the fleet
@@ -299,7 +293,7 @@ parallel_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 	sftp_parallel_await_capacity(ctx->fleet);
 
 	if (sftp_parallel_submit_download(ctx->fleet, ctx->conn, src, dst,
-	    fsize, fmode, ctx->resume, ctx->verify) != 0) {
+	    attrs, ctx->resume, ctx->verify) != 0) {
 		if (sftp_parallel_is_aborting(ctx->fleet)) {
 			debug("submit download \"%s\" refused (abort in "
 			    "progress)", src);

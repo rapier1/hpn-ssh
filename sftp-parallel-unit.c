@@ -147,10 +147,11 @@ parallel_unit_free(struct sftp_work_unit *u)
  */
 static struct sftp_range_tracker *
 range_tracker_new(int total, enum sftp_range_target target, const char *path,
-    const char *src_path, int verify, int writer_cap)
+    const char *src_path, int verify, int writer_cap, const Attrib *attrs)
 {
 	struct sftp_range_tracker *t = xcalloc(1, sizeof(*t));
 	pthread_mutex_init(&t->mu, NULL);
+	t->attrs      = *attrs;
 	t->total      = total;
 	t->remaining  = total;
 	t->any_failed = 0;
@@ -260,6 +261,7 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
 {
 	struct sftp_range_tracker *t = u->range_tracker;
 	int r = 0, permanent = 0;
+	mode_t mode;
 
 	if (t == NULL)
 		return 0;
@@ -268,12 +270,14 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
 		pthread_mutex_unlock(&t->mu);
 		return 0;
 	}
+	/* Every range reopens the file to write, so it is created with the
+	 * owner write bit on, as sftp_download does. range_file_finish
+	 * restores the exact mode where a serial transfer would have. */
+	mode = t->attrs.perm | S_IWUSR;
 	if (t->target == SFTP_RANGE_TARGET_REMOTE) {
-		r = sftp_create_file(conn, t->path,
-		    u->mode != 0 ? u->mode : 0644, &permanent);
+		r = sftp_create_file(conn, t->path, mode, &permanent);
 	} else {
-		int fd = open(t->path, O_WRONLY | O_CREAT,
-		    u->mode != 0 ? u->mode : 0666);
+		int fd = open(t->path, O_WRONLY | O_CREAT, mode);
 		if (fd >= 0)
 			close(fd);
 		else {
@@ -291,6 +295,48 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
 		u->no_retry = 1;
 	pthread_mutex_unlock(&t->mu);
 	return r;
+}
+
+/*
+ * Finish a range-split file once its last range lands cleanly, as a serial
+ * transfer would. Under -p it gets the source's mode and times, and under
+ * -f it is synced. Without -p, an upload whose source mode lacks the owner
+ * write bit still gets that mode back, since a serial upload creates the
+ * file with it and parallel_unit_ensure_file had to add the bit. Runs on
+ * the worker that finished the last range, over its own connection.
+ * Failures are logged and leave the transfer counted as done, as on the
+ * serial paths.
+ */
+static void
+range_file_finish(struct sftp_range_tracker *t, struct sftp_worker *worker)
+{
+	struct sftp_parallel *fleet = worker->parent;
+	int preserve_flag = fleet->cfg.preserve_flag;
+	int fsync_flag = fleet->cfg.fsync_flag;
+	Attrib mode_only;
+	int fd;
+
+	if (t->target == SFTP_RANGE_TARGET_REMOTE) {
+		if (preserve_flag || fsync_flag)
+			sftp_hpn_upload_finish_remote(worker->conn, t->path,
+			    &t->attrs, preserve_flag, fsync_flag, 1);
+		if (!preserve_flag && (t->attrs.perm & S_IWUSR) == 0) {
+			attrib_clear(&mode_only);
+			mode_only.flags = SSH2_FILEXFER_ATTR_PERMISSIONS;
+			mode_only.perm = t->attrs.perm;
+			(void)sftp_setstat(worker->conn, t->path, &mode_only);
+		}
+		return;
+	}
+	if (!preserve_flag && !fsync_flag)
+		return;
+	if ((fd = open(t->path, O_WRONLY)) == -1) {
+		error("open local \"%s\": %s", t->path, strerror(errno));
+		return;
+	}
+	sftp_hpn_download_finish_local(fd, t->path, t->attrs.perm, &t->attrs,
+	    preserve_flag, fsync_flag, 1);
+	close(fd);
 }
 
 /*
@@ -343,6 +389,11 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 
 	if (!was_last)
 		return 0;
+
+	/* The file is complete, so give it -p and -f before anything reads
+	 * it back. Only the failure paths pass no worker. */
+	if (!incomplete && worker != NULL)
+		range_file_finish(t, worker);
 
 	if (incomplete) {
 		/*
@@ -932,10 +983,10 @@ bundle_target_for(const struct sftp_parallel *fleet)
 
 static int submit_upload_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
-    off_t file_size, mode_t mode);
+    off_t file_size, mode_t mode, const Attrib *final_attrs);
 static int submit_download_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *remote_path, const char *local_path,
-    off_t file_size, mode_t mode);
+    off_t file_size, mode_t mode, const Attrib *final_attrs);
 
 /*
  * Roll back one bundle member's submit accounting and free it. Used when a
@@ -1279,7 +1330,7 @@ submit_resume_whole_file(struct sftp_parallel *fleet, struct sftp_conn *conn,
 static int
 submit_resume_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     enum sftp_op op, const char *src, const char *dst, const char *remote,
-    off_t src_size, off_t dest_size, mode_t mode)
+    off_t src_size, off_t dest_size, const Attrib *final_attrs)
 {
 	struct sftp_range_tracker *tracker;
 	off_t span = (off_t)parallel_unit_split_min_size(fleet);
@@ -1303,7 +1354,8 @@ submit_resume_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	tracker = range_tracker_new(n,
 	    op == SFTP_OP_UPLOAD ? SFTP_RANGE_TARGET_REMOTE :
 	    SFTP_RANGE_TARGET_LOCAL, /*path=*/dst, /*src=*/src,
-	    /*verify=*/fleet->cfg.verify_transfer, fleet->cfg.writers_per_inode_cap);
+	    /*verify=*/fleet->cfg.verify_transfer,
+	    fleet->cfg.writers_per_inode_cap, final_attrs);
 	tracker->file_bytes = src_size;
 
 	for (i = 0; i < n; i++) {
@@ -1322,7 +1374,6 @@ submit_resume_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		    SFTP_OP_RESUME_SPAN : tail_op,
 		    src, dst, offset, length, tracker);
 		ru->range_index = i;
-		ru->mode = mode;
 		if (tracker->vslots != NULL) {
 			tracker->vslots[i].off = (u_int64_t)offset;
 			tracker->vslots[i].len = (u_int64_t)length;
@@ -1367,6 +1418,34 @@ parallel_verify_item_bytes_estimate(struct sftp_parallel *fleet,
 }
 
 /*
+ * Split a source's attrs into what a submit needs: the size, the mode for a
+ * whole-file unit, and final_attrs for a file split into ranges, which keep
+ * only the mode and times. The setuid, setgid, and sticky bits are dropped,
+ * as we do not preserve ownership. The serial paths mask the same way, so a
+ * transfer gets the same permissions with or without -j. A source with no
+ * mode, which only a server can send, gets 0666 as in sftp_download.
+ */
+static void
+submit_attrs(const Attrib *src_attrs, off_t *size, mode_t *mode,
+    Attrib *final_attrs)
+{
+	*size = 0;
+	*mode = 0666;
+	attrib_clear(final_attrs);
+	if (src_attrs->flags & SSH2_FILEXFER_ATTR_SIZE)
+		*size = (off_t)src_attrs->size;
+	if (src_attrs->flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
+		*mode = src_attrs->perm & 0777;
+	final_attrs->flags = SSH2_FILEXFER_ATTR_PERMISSIONS;
+	final_attrs->perm = *mode;
+	if (src_attrs->flags & SSH2_FILEXFER_ATTR_ACMODTIME) {
+		final_attrs->flags |= SSH2_FILEXFER_ATTR_ACMODTIME;
+		final_attrs->atime = src_attrs->atime;
+		final_attrs->mtime = src_attrs->mtime;
+	}
+}
+
+/*
  * Submit one file for upload. conn is optional: when present it is used to
  * query stripe geometry and pre-create the remote file so the file can be
  * split across workers by byte range; NULL submits it as a single
@@ -1380,13 +1459,15 @@ parallel_verify_item_bytes_estimate(struct sftp_parallel *fleet,
  */
 int
 sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
-    const char *local_path, const char *remote_path, off_t size, mode_t mode,
+    const char *local_path, const char *remote_path, const Attrib *src_attrs,
     int resume, int verify)
 {
-	/* Do not preserve set[ug]id or the sticky bit here, as we do not
-	 * preserve ownership.  The serial paths mask the same way, so a
-	 * transfer gets the same permissions with or without -j. */
-	mode &= 0777;
+	Attrib final_attrs;
+	off_t size;
+	mode_t mode;
+	int rc;
+
+	submit_attrs(src_attrs, &size, &mode, &final_attrs);
 
 	/* A new command is submitting, so demote walker-phase DONE back to
 	 * SUBMIT: sftp_parallel_wait leaves it DONE, and the endgame
@@ -1396,7 +1477,6 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
 		__atomic_store_n(&fleet->walker_phase, SFTP_WKP_SUBMIT,
 		    __ATOMIC_RELAXED);
-	int rc;
 
 	if (resume || verify) {
 		rc = -1;
@@ -1419,7 +1499,8 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 			    ra.size > 0 && (off_t)ra.size < size)
 				rc = submit_resume_split(fleet, conn,
 				    SFTP_OP_UPLOAD, local_path, remote_path,
-				    remote_path, size, (off_t)ra.size, mode);
+				    remote_path, size, (off_t)ra.size,
+				    &final_attrs);
 		}
 		if (rc != 0)
 			rc = submit_resume_whole_file(fleet, conn, SFTP_OP_UPLOAD,
@@ -1432,7 +1513,7 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	 * unit. */
 	else if (conn != NULL)
 		rc = submit_upload_maybe_split(fleet, conn, local_path, remote_path,
-		    size, mode);
+		    size, mode, &final_attrs);
 	else
 		rc = parallel_unit_submit(fleet,
 		    make_unit(SFTP_OP_UPLOAD, local_path, remote_path, size, mode));
@@ -1462,20 +1543,21 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 int
 sftp_parallel_submit_download(struct sftp_parallel *fleet,
     struct sftp_conn *conn,
-    const char *remote_path, const char *local_path, off_t size, mode_t mode,
+    const char *remote_path, const char *local_path, const Attrib *src_attrs,
     int resume, int verify)
 {
-	/* Do not preserve set[ug]id or the sticky bit here, as we do not
-	 * preserve ownership.  The serial paths mask the same way, so a
-	 * transfer gets the same permissions with or without -j. */
-	mode &= 0777;
+	Attrib final_attrs;
+	off_t size;
+	mode_t mode;
+	int rc;
+
+	submit_attrs(src_attrs, &size, &mode, &final_attrs);
 
 	/* Demote DONE back to SUBMIT (see sftp_parallel_submit_upload). */
 	if (fleet != NULL && __atomic_load_n(&fleet->walker_phase,
 	    __ATOMIC_RELAXED) == SFTP_WKP_DONE)
 		__atomic_store_n(&fleet->walker_phase, SFTP_WKP_SUBMIT,
 		    __ATOMIC_RELAXED);
-	int rc;
 
 	if (resume || verify) {
 		rc = -1;
@@ -1491,7 +1573,7 @@ sftp_parallel_submit_download(struct sftp_parallel *fleet,
 			    st.st_size < size)
 				rc = submit_resume_split(fleet, conn,
 				    SFTP_OP_DOWNLOAD, remote_path, local_path,
-				    remote_path, size, st.st_size, mode);
+				    remote_path, size, st.st_size, &final_attrs);
 		}
 		if (rc != 0)
 			rc = submit_resume_whole_file(fleet, conn,
@@ -1500,7 +1582,7 @@ sftp_parallel_submit_download(struct sftp_parallel *fleet,
 	}
 	else if (conn != NULL)
 		rc = submit_download_maybe_split(fleet, conn, remote_path, local_path,
-		    size, mode);
+		    size, mode, &final_attrs);
 	else
 		rc = parallel_unit_submit(fleet,
 		    make_unit(SFTP_OP_DOWNLOAD, remote_path, local_path, size, mode));
@@ -1716,7 +1798,7 @@ make_download_range_unit(const char *remote_path, const char *local_path,
 static int
 submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
-    off_t file_size, mode_t mode,
+    off_t file_size, const Attrib *final_attrs,
     off_t range_size, int num_ranges)
 {
 	int i, effective_ranges = 0;
@@ -1764,7 +1846,8 @@ submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	 * units do not pass through execute_unit's whole-file verify). */
 	tracker = range_tracker_new(effective_ranges,
 	    SFTP_RANGE_TARGET_REMOTE, remote_path, /*src=*/local_path,
-	    /*verify=*/fleet->cfg.verify_transfer, fleet->cfg.writers_per_inode_cap);
+	    /*verify=*/fleet->cfg.verify_transfer,
+	    fleet->cfg.writers_per_inode_cap, final_attrs);
 	tracker->file_bytes = file_size;
 
 	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
@@ -1815,7 +1898,7 @@ submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
 static int
 submit_download_ranges(struct sftp_parallel *fleet,
     const char *remote_path, const char *local_path,
-    off_t file_size, mode_t mode,
+    off_t file_size, const Attrib *final_attrs,
     off_t range_size, int num_ranges)
 {
 	int i, effective_ranges = 0;
@@ -1856,7 +1939,8 @@ submit_download_ranges(struct sftp_parallel *fleet,
 	/* Download: local file is the target, remote file is the source. */
 	tracker = range_tracker_new(effective_ranges,
 	    SFTP_RANGE_TARGET_LOCAL, local_path, /*src=*/remote_path,
-	    /*verify=*/fleet->cfg.verify_transfer, fleet->cfg.writers_per_inode_cap);
+	    /*verify=*/fleet->cfg.verify_transfer,
+	    fleet->cfg.writers_per_inode_cap, final_attrs);
 	tracker->file_bytes = file_size;
 
 	for (i = 0; i < effective_ranges; i++) {
@@ -1969,7 +2053,7 @@ compute_range_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 static int
 submit_download_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *remote_path, const char *local_path,
-    off_t file_size, mode_t mode)
+    off_t file_size, mode_t mode, const Attrib *final_attrs)
 {
 	off_t range_size;
 	int num_ranges;
@@ -1977,7 +2061,7 @@ submit_download_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	if (compute_range_split(fleet, conn, remote_path, file_size,
 	    &range_size, &num_ranges) &&
 	    submit_download_ranges(fleet, remote_path, local_path,
-	    file_size, mode, range_size, num_ranges) == 0)
+	    file_size, final_attrs, range_size, num_ranges) == 0)
 		return 0;
 	/* No split, or pre-creation failed - whole-file. */
 	return parallel_unit_submit(fleet, make_unit(SFTP_OP_DOWNLOAD,
@@ -1992,7 +2076,7 @@ submit_download_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 static int
 submit_upload_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
     const char *local_path, const char *remote_path,
-    off_t file_size, mode_t mode)
+    off_t file_size, mode_t mode, const Attrib *final_attrs)
 {
 	off_t range_size;
 	int num_ranges;
@@ -2000,7 +2084,7 @@ submit_upload_maybe_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	if (compute_range_split(fleet, conn, remote_path, file_size,
 	    &range_size, &num_ranges) &&
 	    submit_upload_ranges(fleet, conn, local_path, remote_path,
-	    file_size, mode, range_size, num_ranges) == 0)
+	    file_size, final_attrs, range_size, num_ranges) == 0)
 		return 0;
 	/* No split, or pre-creation failed - whole-file. */
 	return parallel_unit_submit(fleet, make_unit(SFTP_OP_UPLOAD,

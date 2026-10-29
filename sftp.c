@@ -1388,19 +1388,13 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			 * a known size.
 			 */
 			Attrib ga;
-			off_t fsize = 0;
-			mode_t fmode = 0;
 			int have = (sftp_glob_get_attrib(g.gl_pathv[i],
 			    &ga) == 0);
 			if (!have &&
 			    sftp_stat(conn, g.gl_pathv[i], 1, &ga) == 0)
 				have = 1;
-			if (have) {
-				if (ga.flags & SSH2_FILEXFER_ATTR_SIZE)
-					fsize = (off_t)ga.size;
-				if (ga.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)
-					fmode = ga.perm;
-			}
+			if (!have)
+				attrib_clear(&ga);
 			/* Glob / direct dispatch bypasses the walker; register
 			 * both sides' directories so whole-file verify factors
 			 * the path (download: local=abs_dst, remote=src). */
@@ -1408,8 +1402,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			sftp_parallel_register_verify_dir(parallel_orch,
 			    g.gl_pathv[i]);
 			if (sftp_parallel_submit_download(parallel_orch, conn,
-			    g.gl_pathv[i], abs_dst, fsize, fmode,
-			    resume, verify) != 0)
+			    g.gl_pathv[i], abs_dst, &ga, resume, verify) != 0)
 				err = -1;
 		} else {
 			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
@@ -1583,6 +1576,8 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
 		} else if (parallel_orch != NULL) {
+			Attrib sa;
+
 			/* HPNLustreStripeCount: stripe the remote destination
 			 * directory, so a single-file -j put fans out across
 			 * OSTs too. */
@@ -1594,9 +1589,9 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			sftp_parallel_register_verify_dir(parallel_orch,
 			    g.gl_pathv[i]);
 			sftp_parallel_register_verify_dir(parallel_orch, abs_dst);
+			stat_to_attrib(&sb, &sa);
 			if (sftp_parallel_submit_upload(parallel_orch, conn,
-			    g.gl_pathv[i], abs_dst,
-			    sb.st_size, sb.st_mode, resume, verify) != 0)
+			    g.gl_pathv[i], abs_dst, &sa, resume, verify) != 0)
 				err = -1;
 		} else {
 			int ur = sftp_upload(conn, g.gl_pathv[i], abs_dst,
