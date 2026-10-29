@@ -73,8 +73,9 @@
 #define VERIFY_UNVERIFIABLE_TRIES	3
 
 /* SIGINT flag, defined by both binaries that link this file, sftp.c and
- * scp.c, and set by their handlers. The auto-repair loop polls it so a
- * multi-attempt repair stops on Ctrl-C instead of grinding on. */
+ * scp.c. Only sftp.c's handler sets it, since scp's SIGINT handler exits.
+ * The auto-repair loop polls it so a multi-attempt repair stops on Ctrl-C
+ * instead of grinding on. */
 extern _Atomic sig_atomic_t interrupted;
 
 /* Meter gate, also defined by both binaries. The verify phase gates its

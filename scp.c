@@ -175,7 +175,7 @@ size_t sftp_nrequests;
 int sftp_no_verify_repair;	/* -X VerifyRepair=no -> 1 (auto-repair off) */
 
 /* Needed for sftp */
-volatile sig_atomic_t interrupted = 0;
+_Atomic sig_atomic_t interrupted = 0;	/* HPN: match the externs */
 
 int sftp_glob(struct sftp_conn *, const char *, int,
     int (*)(const char *, int), glob_t *); /* proto for sftp-glob.c */

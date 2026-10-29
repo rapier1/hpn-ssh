@@ -851,6 +851,11 @@ struct sftp_parallel {
 	 * sftp_parallel_await_capacity. */
 	uint64_t                    outstanding_cap;
 
+	/* Files per pipelined upload batch. UPLOAD_BATCH_SIZE, or fewer when
+	 * the open-file limit cannot hold a full batch for every worker. Set
+	 * once at start by fleet_size_upload_batch. */
+	int                         upload_batch_size;
+
 	/* Worker re-queue overflow list (FIFO of already-allocated units),
 	 * guarded by retry_overflow_mu. Parked units stay counted in
 	 * pending, so sftp_parallel_wait cannot complete while any remain.

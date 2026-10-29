@@ -32,6 +32,7 @@
 #include "includes.h"
 
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <errno.h>
@@ -95,6 +96,60 @@ work_queue_depth(const struct sftp_parallel_config *cfg)
 	if (depth > WORK_QUEUE_DEPTH_MAX)
 		depth = WORK_QUEUE_DEPTH_MAX;
 	return depth;
+}
+
+/* Descriptors a worker needs besides its batch: the two pipes to its ssh,
+ * and room for a range or a bundle member. */
+#define WORKER_FD_OVERHEAD	4
+/* Descriptors kept for the rest of the process: stdio, logs, the control
+ * connection and the walk. */
+#define FLEET_FD_RESERVE	64
+
+/* A pipelined upload batch holds every file in it open at once, so each
+ * worker can hold UPLOAD_BATCH_SIZE files, and a full fleet can need more
+ * descriptors than a default soft limit allows. Raise the soft open-file
+ * limit toward what the fleet needs, up to the hard limit. If that still
+ * falls short, shrink the batch so every worker fits. */
+static void
+fleet_size_upload_batch(struct sftp_parallel *fleet)
+{
+	int nworkers = fleet->cfg.num_streams, batch = UPLOAD_BATCH_SIZE;
+#if defined(HAVE_GETRLIMIT) && defined(HAVE_SETRLIMIT) && \
+    defined(RLIMIT_NOFILE)
+	struct rlimit rl;
+	rlim_t need, limit;
+	long per_worker;
+
+	need = (rlim_t)nworkers * (UPLOAD_BATCH_SIZE + WORKER_FD_OVERHEAD) +
+	    FLEET_FD_RESERVE;
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0 &&
+	    rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < need) {
+		limit = need;
+		if (rl.rlim_max != RLIM_INFINITY && limit > rl.rlim_max)
+			limit = rl.rlim_max;
+		rl.rlim_cur = limit;
+		if (setrlimit(RLIMIT_NOFILE, &rl) == -1) {
+			debug_f("setrlimit: %s", strerror(errno));
+			if (getrlimit(RLIMIT_NOFILE, &rl) == -1)
+				goto out;
+			limit = rl.rlim_cur;
+		} else
+			debug_f("raised the open-file limit to %llu",
+			    (unsigned long long)limit);
+		/* Still short at the hard limit, so give each worker an
+		 * equal share of what is left after the reserve. */
+		if (limit < need) {
+			per_worker = ((long)limit - FLEET_FD_RESERVE) /
+			    nworkers - WORKER_FD_OVERHEAD;
+			batch = (int)MAXIMUM(MINIMUM(per_worker,
+			    UPLOAD_BATCH_SIZE), 1);
+			verbose("open-file limit %llu allows %d files per "
+			    "upload batch", (unsigned long long)limit, batch);
+		}
+	}
+ out:
+#endif
+	fleet->upload_batch_size = batch;
 }
 
 /* Ceiling on outstanding FILES, for a producer that enumerates far faster
@@ -362,6 +417,7 @@ sftp_parallel_start(const struct sftp_parallel_config *cfg)
 		error_f("workqueue allocation failed");
 		goto fail;
 	}
+	fleet_size_upload_batch(fleet);
 
 	/* Spawn workers in parallel to overlap SSH handshakes, but cap
 	 * the number of simultaneous unauthenticated connections to stay

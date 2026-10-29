@@ -302,12 +302,15 @@ int sftp_mkdir_pipeline(struct sftp_conn *, char **, Attrib *, int, u_char *,
     u_char *);
 
 /* HPN: per-file descriptor for a pipelined upload batch. The caller fills
- * local_path and remote_path. The function writes result (0 = success,
- * -1 = fail). */
+ * local_path and remote_path. The batch writes result (0 = success,
+ * -1 = fail) and perm_denied. */
 struct sftp_upload_batch_entry {
 	const char *local_path;
 	const char *remote_path;
 	int         result;
+	/* Set when the entry failed on a permission denial, which no retry
+	 * can clear. */
+	int         perm_denied;
 	/* Source hash teed during the send, for the verify phase. */
 	int         have_src_hash;
 	uint64_t    src_hash;
@@ -315,29 +318,30 @@ struct sftp_upload_batch_entry {
 
 /* BEGIN HPN: pipelined batch send and finish
  *
- * Upload N files with pipelined SSH_FXP_OPEN/CLOSE (all N opens in one burst,
- * transfer sequentially, all N closes in one burst) so per-file open/close RTT
- * is amortised from 2*N down to 2, critical for many-small-file workloads at
- * high latency. Resume is not supported; all other flags apply to every entry.
+ * Upload n files with their OPENs sent in one burst and their CLOSEs in
+ * another, so a batch pays two round trips for opens and closes instead of
+ * two per file. Each small file's -p setstat and fsync go out in the CLOSE
+ * burst too. That matters most for many small files at high latency. The
+ * parallel workers use it when the server lacks the bundle extension.
+ * Resume is not supported. Every other flag applies to every entry.
  *
- * The send/finish split lets the caller pipeline back-to-back batches: send the
- * next batch's OPENs (phase 1) while the previous batch's CLOSE STATUSes are
- * still being collected (phase 5).
+ * Splitting send and finish lets the caller overlap batches. Send puts the
+ * next batch's OPENs on the wire while the previous batch's CLOSE replies
+ * are still arriving.
  *
  *   pending = sftp_upload_batch_send(conn, entries, n, ..., prev_pending);
- *     // does phases 1, 2, 3a-d, 4 for the new batch.
- *     // if prev_pending != NULL: drains it (phase 5 of previous batch)
- *     // AFTER the new batch's phase 1, so the server-side processing of
- *     // prev's CLOSEs overlaps with this batch's OPENs on the wire.
- *     // prev_pending is freed during the drain.
+ *     // phases 1 to 4 for the new batch. Given prev_pending, it collects
+ *     // that batch's replies, its phase 5, after sending the new OPENs,
+ *     // and frees it.
  *
  *   sftp_upload_batch_finish(conn, pending);
- *     // drains the new batch's phase 5.  Frees pending.
+ *     // phase 5 for the new batch. Frees pending.
  *
- * On error during send (connection dies, protocol violation) all entries in
- * both the current batch and prev (if the drain failed) are marked failed and
- * the function returns NULL. The caller must NOT call finish on a NULL
- * pending. */
+ * If the batch fails before its CLOSEs go out, because the connection died
+ * or broke protocol, its entries that are still open are marked failed and
+ * send returns NULL, which leaves nothing to finish. The previous batch is
+ * drained either way, and its entries keep the results the drain gave
+ * them. */
 struct sftp_upload_batch_pending;
 
 struct sftp_upload_batch_pending *sftp_upload_batch_send(

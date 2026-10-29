@@ -825,6 +825,20 @@ worker_finalize_one_entry(struct sftp_parallel *fleet, struct sftp_worker *worke
 	    "batch unit");
 }
 
+/* Retires one member of an upload batch. The batch judged the entry's own
+ * permission denial, and that verdict replaces the connection's flag, which
+ * can hold another batch's denials. */
+static void
+worker_finalize_batch_entry(struct sftp_parallel *fleet,
+    struct sftp_worker *worker, struct sftp_work_unit *unit,
+    const struct sftp_upload_batch_entry *entry)
+{
+	sftp_conn_clear_perm_denied(worker->conn);
+	if (entry->perm_denied)
+		unit->no_retry = 1;
+	worker_finalize_one_entry(fleet, worker, unit, entry->result);
+}
+
 /*
  * Retires the members of the carried-over batch and clears it. The caller
  * has already collected that batch's replies, either through
@@ -847,7 +861,7 @@ worker_finalize_prev_batch(struct sftp_worker *worker)
 		/* Carry the teed source hash to the verify park. */
 		unit->have_src_hash = entry->have_src_hash;
 		unit->src_hash = entry->src_hash;
-		worker_finalize_one_entry(fleet, worker, unit, entry->result);
+		worker_finalize_batch_entry(fleet, worker, unit, entry);
 	}
 	free(worker->batch_prev_units);
 	free(worker->batch_prev_entries);
@@ -866,18 +880,16 @@ worker_finalize_prev_batch(struct sftp_worker *worker)
  * replies are already in the socket, and blocking on an empty queue without
  * reading them stalls the server behind TCP back-pressure.
  *
- * The permission-denied signal is cleared first so a denial from an earlier
- * unit cannot make every member of this batch permanent. The pending struct
- * is freed by sftp_upload_batch_finish; the two arrays are ours to free.
+ * sftp_upload_batch_finish frees the pending struct, and
+ * worker_finalize_prev_batch frees the two arrays.
  */
 static void
 worker_drain_pipeline(struct sftp_worker *worker)
 {
 	if (worker->batch_prev_pending == NULL)
 		return;
-	sftp_conn_clear_perm_denied(worker->conn); /* scope to this batch drain */
 	(void)sftp_upload_batch_finish(worker->conn, worker->batch_prev_pending);
-	worker->batch_prev_pending = NULL; /* freed elsewhere */
+	worker->batch_prev_pending = NULL; /* finish freed it */
 	worker_finalize_prev_batch(worker);
 }
 
@@ -892,8 +904,9 @@ worker_drain_pipeline(struct sftp_worker *worker)
  * opens are already on the wire, which is the point of the split. Its
  * members are retired here once that drain has run.
  *
- * A failed send marks every entry in both batches failed and returns NULL,
- * so this batch is retired immediately and nothing is carried over.
+ * A failed send fails every entry of this batch and returns NULL, so this
+ * batch is retired at once and nothing is carried over. The previous batch
+ * was drained first and keeps its results.
  */
 static void
 worker_run_batch_pipelined(struct sftp_worker *worker,
@@ -903,9 +916,6 @@ worker_run_batch_pipelined(struct sftp_worker *worker,
 	struct sftp_upload_batch_entry *entries;
 	struct sftp_work_unit **units;
 	struct sftp_upload_batch_pending *new_pending;
-
-	/* scope the permanent-denial signal to this batch's drain. */
-	sftp_conn_clear_perm_denied(worker->conn);
 
 	/* Pipelined path: heap-allocate the entry and unit arrays so they
 	 * survive across the next parallel_worker_thread iteration. */
@@ -932,11 +942,11 @@ worker_run_batch_pipelined(struct sftp_worker *worker,
 	worker_finalize_prev_batch(worker);
 
 	if (new_pending == NULL) {
-		/* This batch's send failed. Every entry has result == -1;
-		 * finalise inline and don't carry over. */
+		/* This batch's send failed, so every entry has failed.
+		 * Retire them now and carry nothing over. */
 		for (int i = 0; i < batch_n; i++)
-			worker_finalize_one_entry(fleet, worker, units[i],
-			    entries[i].result);
+			worker_finalize_batch_entry(fleet, worker, units[i],
+			    &entries[i]);
 		free(units);
 		free(entries);
 	} else {
@@ -1411,7 +1421,7 @@ worker_run_batch(struct sftp_worker *worker, struct sftp_work_unit *first)
 	if (worker->bundle_enabled)
 		batch_cap = BUNDLE_BATCH_MAX_FILES;
 	else
-		batch_cap = UPLOAD_BATCH_SIZE;
+		batch_cap = fleet->upload_batch_size;
 	batch = xcalloc((size_t)batch_cap, sizeof(*batch));
 	batch_n = worker_collect_batch(worker, first, batch, batch_cap,
 	    &leftover);

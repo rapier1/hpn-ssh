@@ -20,10 +20,10 @@
  * upstream's sftp-client.h.
  *
  * It holds two things. The first is the narrow bridge out of sftp-client.c:
- * send_msg, get_msg, and get_handle with their static qualifiers removed,
- * plus three accessors (sftp_conn_hpn, sftp_conn_exts, and
- * sftp_conn_alloc_msg_id). That bridge is all sftp-client.c gains, so the
- * diff against upstream stays small on every merge. The second is the
+ * send_msg, get_msg, get_handle, and send_open with their static
+ * qualifiers removed, plus three accessors (sftp_conn_hpn, sftp_conn_exts,
+ * and sftp_conn_alloc_msg_id). That bridge is all sftp-client.c gains, so
+ * the diff against upstream stays small on every merge. The second is the
  * per-connection HPN accessors, defined in sftp-hpn-client.c,
  * sftp-hpn-verify.c, and sftp-lustre-client.c. They reach the HPN state
  * through sftp_conn_hpn(). The HPN client modules use the header, as do
@@ -64,6 +64,12 @@ int  get_msg(struct sftp_conn *, struct sshbuf *);
  * describe the request in the error logged on failure. */
 u_char *get_handle(struct sftp_conn *, u_int, size_t *, const char *, ...)
     __attribute__((format(printf, 4, 5)));
+
+/* Open path with the given SSH2_FXF_* flags and attributes, or empty
+ * attributes when a is NULL. tag names the file in the error logged on
+ * failure. Returns 0 with a handle the caller frees, or -1. */
+int  send_open(struct sftp_conn *, const char *, const char *, u_int,
+    Attrib *, u_char **, size_t *);
 
 /* The next outbound message id for this connection: conn->msg_id++
  * without the caller needing struct sftp_conn's layout. */
@@ -221,6 +227,17 @@ void     sftp_conn_bytes_wired_add(struct sftp_conn *, uint64_t);
  * the verify phase under -V. Returns -1 when rc is -1, and 0 otherwise. */
 int sftp_hpn_report_transfer(struct sftp_conn *, int rc, const char *src,
     const char *dst, off_t size);
+
+/* Apply -p and -f to a download that a verified resume finished early.
+ * modified is 0 when the local copy was already identical. */
+void sftp_hpn_download_finish_local(int local_fd, const char *local_path,
+    u_int mode, const Attrib *a, int preserve_flag, int fsync_flag,
+    int modified);
+
+/* Apply -p and -f to an upload that a resume finished early. modified is
+ * 0 when the remote copy was already identical. */
+void sftp_hpn_upload_finish_remote(struct sftp_conn *, const char *remote_path,
+    Attrib *a, int preserve_flag, int fsync_flag, int modified);
 
 /* Hash-work accounting, shared by every hash phase. Work is counted in
  * work-bytes, two for each byte compared, one per leg.

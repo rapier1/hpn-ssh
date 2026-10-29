@@ -226,8 +226,8 @@ struct sftp_hpn_conn {
 	u_int            last_status;
 
 	/* The server's per-user worker cap from hpn-max-workers@hpnssh.org:
-	 * -1 not advertised (a stock server), 0 advertised with no cap, else
-	 * the cap. */
+	 * -1 not advertised (a stock server) or malformed, 0 advertised with
+	 * no cap, else the cap. */
 	int              hpn_max_workers_cap;
 
 	/* Progress hook for the parallel orchestrator, added to atomically per
@@ -429,7 +429,9 @@ struct sftp_tree_dl_sink {
 	/* Transfer regular file src to dst. 0 or -1. */
 	int  (*xfer_file)(struct sftp_tree_dl_sink *sink, const char *src,
 	         const char *dst, Attrib *attrs);
-	/* Record a per-entry failure. reason is a static string. */
+	/* Optional. Record a per-entry failure. reason is a static string.
+	 * NULL when the caller keeps no failure list, as serial and crossload
+	 * do. */
 	void (*fail)(struct sftp_tree_dl_sink *sink, const char *path,
 	         const char *reason);
 	/* True when the walk should stop: interrupt or fleet abort. */
@@ -480,14 +482,17 @@ struct sftp_upload_sink {
 	 * -1. */
 	int  (*xfer_file)(struct sftp_upload_sink *sink, const char *src,
 	         const char *dst, const struct stat *src_sb);
-	/* Before the pipelined mkdir batch. Parallel enters the mkdir phase. */
+	/* Optional. Before the pipelined mkdir batch. Parallel enters the
+	 * mkdir phase. NULL when the caller has no walker phases, as serial
+	 * does. */
 	void (*before_mkdir)(struct sftp_upload_sink *sink);
 	/* Defer this directory's final remote attrs. The driver applies the
 	 * created-or-preserve gate, so a call here means they are wanted. */
 	void (*defer_dir)(struct sftp_upload_sink *sink, const char *dst,
 	         const Attrib *attrs);
-	/* Record a per-entry failure. reason is a short message the sink
-	 * must use at once, since it may be strerror's buffer. */
+	/* Optional. Record a per-entry failure. reason is a short message the
+	 * sink must use at once, since it may be strerror's buffer. NULL when
+	 * the caller keeps no failure list, as serial does. */
 	void (*fail)(struct sftp_upload_sink *sink, const char *path,
 	         const char *reason);
 	/* True when the walk should stop: interrupt or fleet abort. */
@@ -505,7 +510,8 @@ int  sftp_hpn_ensure_local_dir(const char *dst, const Attrib *dirattrib,
 void sftp_hpn_dirattrs_defer_remote(struct sftp_hpn_dirattr_list *dl,
     const char *path, const Attrib *attrs);
 void sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
-    const char *path, mode_t mode, mode_t tmpmode, const Attrib *dirattrib);
+    const char *path, mode_t mode, mode_t tmpmode, const Attrib *dirattrib,
+    int preserve_flag);
 void sftp_hpn_dirattrs_apply(struct sftp_conn *conn,
     struct sftp_hpn_dirattr_list *dl);
 void sftp_hpn_dirattrs_free(struct sftp_hpn_dirattr_list *dl);

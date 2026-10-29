@@ -946,8 +946,7 @@ process_init(void)
 
 		snprintf(capbuf, sizeof(capbuf), "%d",
 		    hpn_max_concurrent_workers);
-		if ((r = sshbuf_put_cstring(msg,
-		    "hpn-max-workers@hpnssh.org")) != 0 ||
+		if ((r = sshbuf_put_cstring(msg, HPN_EXT_MAX_WORKERS)) != 0 ||
 		    (r = sshbuf_put_cstring(msg, capbuf)) != 0)
 			fatal_fr(r, "compose hpn-max-workers");
 	}

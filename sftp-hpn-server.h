@@ -44,6 +44,11 @@
 #define HPN_EXT_HASH_RANGE	"sftp-hash-range@hpnssh.org"
 #define HPN_EXT_FILE_LAYOUT	"hpn-file-layout@hpnssh.org"
 
+/* Advertised in SSH_FXP_VERSION, with no request behind it: the
+ * operator's per-user parallel-worker cap as a decimal count, 0 for no
+ * cap. */
+#define HPN_EXT_MAX_WORKERS	"hpn-max-workers@hpnssh.org"
+
 /*
  * hpn-fs-info: a path's filesystem type and stripe geometry.
  *

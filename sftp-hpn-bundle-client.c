@@ -56,6 +56,7 @@
 #include "sftp-client-internal.h"
 #include "sftp-hpn-client.h"	/* struct sftp_hpn_conn + adaptive rdahead API */
 #include "sftp-hpn-bundle.h"
+#include "sftp-hpn-bundle-server.h"	/* HPN_EXT_BUNDLE_* names */
 #include "sftp-hpn-bundle-codec.h"
 #include "sftp-hpn-bundle-pool.h"	/* shared writer pool (extract overlap) */
 
@@ -729,8 +730,7 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	flags = preserve_flag ? HPN_BUNDLE_FLAG_PRESERVE : 0;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, open_id)) != 0 ||
-	    (r = sshbuf_put_cstring(msg,
-	        "hpn-bundle-fetch@hpnssh.org")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_BUNDLE_FETCH)) != 0 ||
 	    (r = sshbuf_put_u32(msg, flags)) != 0 ||
 	    (r = sshbuf_put_u32(msg, (u_int)n_entries)) != 0) {
 		error_f("compose hpn-bundle-fetch header: %s", ssh_err(r));
@@ -1287,7 +1287,7 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 	/* create the bundle open msg. fail on error */
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, open_id)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "hpn-bundle-open@hpnssh.org")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_BUNDLE_OPEN)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, remote_dest_dir)) != 0 ||
 	    (r = sshbuf_put_u32(msg, flags)) != 0)
 		fatal_fr(r, "compose hpn-bundle-open");

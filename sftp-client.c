@@ -54,45 +54,14 @@
 #include "sftp-client.h"
 #include "sftp-hpn-client.h"	/* HPN: per-conn state, walk sinks */
 #include "sftp-hpn-verify.h"	/* HPN: chunked resume and verify helpers */
-#include "sftp-hpn-server.h"	/* HPN: HPN_EXT_CHECK_FILE */
+#include "sftp-hpn-server.h"	/* HPN: extension names */
+#include "sftp-hpn-bundle-server.h"	/* HPN: bundle extension names */
 #include "sftp-hpn-tree.h"	/* HPN: dtree extension names, depth cap */
 #include "hpn-meter.h"	/* HPN: progress meter core */
 #include "sftp-client-internal.h"	/* HPN: sftp_conn accessors */
 
-extern _Atomic sig_atomic_t interrupted;
+extern _Atomic sig_atomic_t interrupted;	/* HPN: workers read it */
 extern int showprogress;
-
-/*
- * Per-stream isolation audit (feature-parallel-streams, Phase 1 step 1).
- *
- * Every API in this file accepts struct sftp_conn *, and that struct (defined
- * below) holds all per-connection state: fd pair, request ID counter,
- * protocol version, server extension bits, and bandwidth limiters. The file
- * has no file-scope state that requires locking; helper functions are
- * stateless or take state through parameters. Two extern globals
- * (interrupted, showprogress) are read-only from here. Two struct sftp_conn
- * instances can therefore coexist in separate threads without sharing state,
- * provided each owns a distinct fd pair and is touched by at most one thread
- * at a time.
- *
- * Concurrency hazards live OUTSIDE this file:
- *   - progressmeter.c is a single global; concurrent start/stop/refresh from
- *     workers will collide. Parallel mode must use aggregate-driven progress
- *     reporting rather than per-file calls into start_progress_meter.
- *     Verified (Phase 1 step 3): every start_progress_meter / stop_progress_meter
- *     call site in this file is guarded by the extern int showprogress, so
- *     the orchestrator can suppress per-file calls by setting showprogress=0
- *     before invoking sftp_download/sftp_upload from workers, then drive a
- *     single aggregate progress meter from the producer/reporter thread.
- *   - progressmeter.c installs a SIGALRM handler. Under pthreads the worker
- *     threads must mask SIGALRM so timer ticks deliver only to the
- *     producer/main thread.
- *   - sftp.c keeps a single sshpid; the parallel orchestrator tracks an
- *     array of pids (master + N workers).
- *
- * If any new file-scope state is introduced here, parallelizability must be
- * reconsidered.
- */
 
 /* Default size of buffer for up/download (fix sftp.1 scp.1 if changed) */
 #define DEFAULT_COPY_BUFLEN	131072	/* 128 KB; raised from 32 KB for HPN */
@@ -107,14 +76,6 @@ extern int showprogress;
 /* Maximum depth to descend in directory trees */
 #define MAX_DIR_DEPTH 64
 
-/* The HPN walks carry their own copy of this cap because upstream's lives in
- * a .c file.  A client chooses its walk from what the server advertises, so
- * the two must agree or the same command stops at a different depth against a
- * stock server than an HPN one.  This is the only place both are visible. */
-#if MAX_DIR_DEPTH != HPN_WALK_MAX_DEPTH
-# error "MAX_DIR_DEPTH and HPN_WALK_MAX_DEPTH must match"
-#endif
-
 /* Directory separator characters */
 #ifdef HAVE_CYGWIN
 # define SFTP_DIRECTORY_CHARS      "/\\"
@@ -125,8 +86,6 @@ extern int showprogress;
 struct sftp_conn {
 	int fd_in;
 	int fd_out;
-	struct sftp_hpn_conn *hpn;  /* HPN: per-connection extensions (dead flag,
-				     * live counter) */
 	u_int download_buflen;
 	u_int upload_buflen;
 	u_int num_requests;
@@ -145,7 +104,8 @@ struct sftp_conn {
 	u_int exts;
 	uint64_t limit_kbps;
 	struct bwlimit bwlimit_in, bwlimit_out;
-	struct sshbuf *msg;	/* persistent message buffer, reset by send_msg/get_msg */
+	struct sshbuf *msg;	/* HPN: recycled message buffer */
+	struct sftp_hpn_conn *hpn;	/* HPN: per-connection HPN state */
 };
 
 /* Tracks in-progress requests during file transfers */
@@ -168,12 +128,27 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
  * the upstream declarations above keep their original order and OpenSSH
  * merges do not collide with HPN code. */
 
+/* HPN: thread safety. Each parallel worker drives its own struct
+ * sftp_conn on its own thread, and all per-connection state lives in
+ * that struct. This file only reads the externs interrupted and
+ * showprogress. The file-scope variables below and the serial progress
+ * meter are used only when showprogress is set, and the orchestrator
+ * clears it while workers run. New file-scope state must follow the
+ * same rules. */
+
 /* HPN: request window for the directory setstat and mkdir pipelines. */
 #define SFTP_DIR_PIPELINE_WINDOW 64
 
+/* HPN: the HPN walks cap depth with HPN_WALK_MAX_DEPTH. It must equal
+ * MAX_DIR_DEPTH, and this is the only file that sees both. See
+ * sftp-hpn-tree.h for why. */
+#if MAX_DIR_DEPTH != HPN_WALK_MAX_DEPTH
+# error "MAX_DIR_DEPTH and HPN_WALK_MAX_DEPTH must match"
+#endif
+
 /* HPN: serial download sink for sftp_tree_download_consume and its
  * readdir fallback. It creates local dirs, bundles or downloads regular
- * files and defers directory attrs. fail() is a no-op because the
+ * files and defers directory attrs. It has no fail(), since the
  * consumer's -1 return carries the error. aborting() reports an interrupt
  * or a bundle flush that aborted. */
 struct serial_dl_sink {
@@ -192,8 +167,9 @@ struct serial_dl_sink {
 
 /* HPN: serial upload sink for sftp_upload_walk_consume. It bundles or
  * uploads each regular file, defers the remote dir attrs and prints
- * "Entering". fail() is a no-op because the driver's -1 return carries the
- * error. aborting() reports an interrupt or a bundle flush that aborted. */
+ * "Entering". It has no fail(), since the driver's -1 return carries the
+ * error, and no before_mkdir(), since serial has no walker phases.
+ * aborting() reports an interrupt or a bundle flush that aborted. */
 struct serial_ul_sink {
 	struct sftp_upload_sink		base;
 	struct sftp_conn	       *conn;
@@ -219,6 +195,11 @@ struct batch_file {
 	u_int		close_id;
 	u_int		write_id;	/* small-file single WRITE */
 	int		write_sent;	/* write_id went out */
+	/* What phase 4 sent ahead of a small file's CLOSE (the in-place
+	 * size, the -p attrs, the fsync), in send order, for phase 5. */
+	u_int		pre_close_ids[3];
+	const char     *pre_close_what[3];
+	int		npre_close;
 	int		failed;
 };
 
@@ -236,7 +217,8 @@ struct sftp_upload_batch_pending {
 /* HPN: crossload sink, remote to remote through this client. The download
  * drivers walk the origin with conn set to from, and this sink writes each
  * entry to the destination to. make_dir creates the destination directory
- * and defers its setstat. xfer_file crossloads one file. */
+ * and defers its setstat. xfer_file crossloads one file. It has no fail(),
+ * since crossload is serial and the driver's -1 return carries the error. */
 struct crossload_sink {
 	struct sftp_tree_dl_sink	base;
 	struct sftp_conn	       *from;
@@ -289,10 +271,6 @@ sftpio(void *_bwlimit, size_t amount)
 	return 0;
 }
 
-/* HPN: send_msg / get_msg / get_handle dropped `static` qualifier so
- * HPN-only client code (sftp-hpn-client.c) can implement extension
- * helpers like sftp_hpn_bundle_download without redefining the SFTP
- * transport layer.  Declarations live in sftp-client-internal.h. */
 int
 send_msg(struct sftp_conn *conn, struct sshbuf *m)
 {
@@ -304,10 +282,10 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 	if (conn->hpn->dead) /* HPN */
 		return -1;
 
-	/* HPN: a streamed reply owns the connection until it drains; see
-	 * reply_stream_active.  Sending here would interleave this request's
-	 * reply with the remaining chunks and desynchronise both readers, so
-	 * fail loudly at the offending call site rather than corrupt quietly. */
+	/* HPN: a streamed reply owns the connection until it drains (see
+	 * reply_stream_active). A request sent now would interleave its reply
+	 * with the rest of the stream and break both readers, so die at the
+	 * call site that broke the rule rather than corrupt the stream. */
 	if (conn->hpn->reply_stream_active)
 		fatal_f("request sent while a streamed reply is in flight on "
 		    "this connection");
@@ -330,12 +308,11 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 
 	if (atomiciov6(writev, conn->fd_out, iov, 2, sftpio, bw) !=
 	    msg_len + sizeof(mlen)) {
-		/* EPIPE/EBADF mean the connection is simply GONE - the ssh
-		 * child died, or the orchestrator's abort closed the fd under
-		 * us (every worker hits this at once on a user interrupt).
-		 * That condition is always surfaced better elsewhere (respawn
-		 * notice, transfer-health summary), so keep it out of the
-		 * user's face; anything else is a real send error. */
+		/* HPN: EPIPE and EBADF mean the connection is gone. Either
+		 * the ssh child died, or the orchestrator's abort closed the
+		 * fd, which every worker hits at once on an interrupt. The
+		 * respawn notice and the transfer summary report that better,
+		 * so log it at debug. Any other errno is a real send error. */
 		if (errno == EPIPE || errno == EBADF)
 			debug("sftp: send: %s", strerror(errno));
 		else
@@ -350,11 +327,38 @@ send_msg(struct sftp_conn *conn, struct sshbuf *m)
 	return 0;
 }
 
+/* HPN: a read from the transport pipe came up short, so the connection is
+ * gone. Log it at debug, since the respawn notice and the transfer summary
+ * report it better, mark the connection dead and return -1. what names the
+ * part of the message being read. */
+static int
+get_msg_read_failed(struct sftp_conn *conn, const char *what, size_t got,
+    size_t want)
+{
+	int saved_errno = errno;
+
+	if (saved_errno == EPIPE || saved_errno == ECONNRESET)
+		debug("sftp: connection closed");
+	else
+		debug("sftp: read: %s", strerror(saved_errno));
+	/* ENV-VAR HPN_PARALLEL_TRACE: show who closed the transport pipe. A
+	 * read of 0 between messages is a clean EOF from the peer, and a
+	 * partial read means it vanished mid-message. The pipe to the ssh
+	 * child is local, so this is almost always EOF, not a TCP errno. */
+	if (getenv("HPN_PARALLEL_TRACE") != NULL)
+		logit("sftp CONN-DIAG: get_msg %s-read got=%zu/%zu "
+		    "errno=%d(%s)", what, got, want, saved_errno,
+		    saved_errno == 0 ? "EOF" : strerror(saved_errno));
+	conn->hpn->dead = 1;
+	return -1;
+}
+
 static int
 get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 {
 	u_int msg_len;
 	u_char *p;
+	size_t got;
 	int r;
 
 	if (conn->hpn->dead) /* HPN */
@@ -363,34 +367,21 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 	sshbuf_reset(m);
 	if ((r = sshbuf_reserve(m, 4, &p)) != 0)
 		fatal_fr(r, "reserve");
-	{
-	size_t got = atomicio6(read, conn->fd_in, p, 4, sftpio,
+	got = atomicio6(read, conn->fd_in, p, 4, sftpio,
 	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL);
-	if (got != 4) {
-		int e = errno;
-		if (e == EPIPE || e == ECONNRESET)
-			debug("sftp: connection closed");
-		else
-			debug("sftp: read: %s", strerror(e));
-		/*
-		 * ENV-VAR HPN_PARALLEL_TRACE: surface who closed the transport
-		 * pipe.  got=0 between messages = clean peer EOF (transport
-		 * exited / server closed the channel); a partial read = peer
-		 * vanished mid-message.  The pipe to the ssh child is local,
-		 * so this is almost always EOF, not a TCP errno.
-		 */
-		if (getenv("HPN_PARALLEL_TRACE") != NULL)
-			logit("sftp CONN-DIAG: get_msg hdr-read got=%zu/4 "
-			    "errno=%d(%s)", got, e,
-			    e == 0 ? "EOF" : strerror(e));
-		conn->hpn->dead = 1; /* HPN */
-		return -1;
-	}
-	}
+	if (got != 4) /* HPN */
+		return get_msg_read_failed(conn, "hdr", got, 4);
 
 	if ((r = sshbuf_get_u32(m, &msg_len)) != 0)
 		fatal_fr(r, "sshbuf_get_u32");
 	if (msg_len > SFTP_MAX_MSG_LENGTH) {
+		/* HPN: after the handshake, an oversized message breaks this
+		 * connection, not the process, which may hold other workers. */
+		if (!initial) {
+			error("Received message too long %u", msg_len);
+			sftp_conn_set_protocol_violation(conn);
+			return -1;
+		}
 		do_log2(initial ? SYSLOG_LEVEL_ERROR : SYSLOG_LEVEL_FATAL,
 		    "Received message too long %u", msg_len);
 		fatal("Ensure the remote shell produces no output "
@@ -399,23 +390,10 @@ get_msg_extended(struct sftp_conn *conn, struct sshbuf *m, int initial)
 
 	if ((r = sshbuf_reserve(m, msg_len, &p)) != 0)
 		fatal_fr(r, "reserve");
-	{
-	size_t gotb = atomicio6(read, conn->fd_in, p, msg_len, sftpio,
+	got = atomicio6(read, conn->fd_in, p, msg_len, sftpio,
 	    conn->limit_kbps > 0 ? &conn->bwlimit_in : NULL);
-	if (gotb != msg_len) {
-		int e = errno;
-		if (e == EPIPE)
-			debug("sftp: connection closed");
-		else
-			debug("sftp: read: %s", strerror(e));
-		if (getenv("HPN_PARALLEL_TRACE") != NULL)
-			logit("sftp CONN-DIAG: get_msg body-read got=%zu/%u "
-			    "errno=%d(%s)", gotb, msg_len, e,
-			    e == 0 ? "EOF" : strerror(e));
-		conn->hpn->dead = 1; /* HPN */
-		return -1;
-	}
-	}
+	if (got != msg_len) /* HPN */
+		return get_msg_read_failed(conn, "body", got, msg_len);
 
 	return 0;
 }
@@ -433,13 +411,10 @@ send_string_request(struct sftp_conn *conn, u_int id, u_int code, const char *s,
 	struct sshbuf *msg = conn->msg;
 	int r;
 
-	/*
-	 * Reset before building: response-reading helpers (e.g. get_status)
-	 * do not consume the full STATUS packet - error-message and
-	 * language-tag strings are left unread.  Without this reset, those
-	 * leftover bytes would be prepended to the outgoing request by
-	 * send_msg(), corrupting the message stream.
-	 */
+	/* HPN: conn->msg is reused, and a reply reader such as get_status
+	 * leaves a STATUS reply's error message and language tag unread.
+	 * Reset it, or send_msg would send those bytes ahead of this
+	 * request. */
 	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, code)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
@@ -456,7 +431,7 @@ send_string_attrs_request(struct sftp_conn *conn, u_int id, u_int code,
 	struct sshbuf *msg = conn->msg;
 	int r;
 
-	/* Reset for the same reason as send_string_request above. */
+	/* HPN: reset conn->msg, as in send_string_request. */
 	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, code)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
@@ -468,6 +443,20 @@ send_string_attrs_request(struct sftp_conn *conn, u_int id, u_int code,
 	    conn->fd_out, code, id, a->flags, a->perm);
 }
 
+/* HPN: keep a STATUS reply's code, so a caller can tell a permission
+ * denial from other failures, and latch a denial for the retry policy. A
+ * denial from the server's -P/-p policy also latches a policy abort. msg
+ * must be positioned at the reply's error message. */
+static void
+record_status(struct sftp_conn *conn, struct sshbuf *msg, u_int status)
+{
+	conn->hpn->last_status = status;
+	if (status == SSH2_FX_PERMISSION_DENIED) {
+		sftp_conn_set_perm_denied(conn);
+		sftp_conn_check_policy_tag(conn, msg);
+	}
+}
+
 static u_int
 get_status(struct sftp_conn *conn, u_int expected_id)
 {
@@ -476,13 +465,19 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 	u_int id, status;
 	int r;
 
-	/* Recycled conn->msg buffer (18.10 feature-sftp-allocs); error
-	 * returns instead of fatal (parallel-streams fault isolation). */
+	/* HPN: every failure here returns SSH2_FX_CONNECTION_LOST and marks
+	 * the connection, so a parallel worker fails its unit instead of
+	 * taking the process down. */
 	if (get_msg(conn, msg) != 0)
 		return SSH2_FX_CONNECTION_LOST;
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &id)) != 0)
-		fatal_fr(r, "compose");
+	    (r = sshbuf_get_u32(msg, &id)) != 0) {
+		/* HPN: a truncated reply breaks this connection, not the
+		 * process, as the checks below do. */
+		error_fr(r, "parse");
+		sftp_conn_set_protocol_violation(conn);
+		return SSH2_FX_CONNECTION_LOST;
+	}
 
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible MITM or "
@@ -498,16 +493,15 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 		return SSH2_FX_CONNECTION_LOST;
 	}
 
-	if ((r = sshbuf_get_u32(msg, &status)) != 0)
-		fatal_fr(r, "parse");
+	if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+		error_fr(r, "parse status");
+		sftp_conn_set_protocol_violation(conn); /* HPN */
+		return SSH2_FX_CONNECTION_LOST;
+	}
 
 	debug3("SSH2_FXP_STATUS %u", status);
 
-	conn->hpn->last_status = status; /* HPN: permanent-failure classification */
-	if (status == SSH2_FX_PERMISSION_DENIED) {
-		sftp_conn_set_perm_denied(conn); /* HPN: sticky no-retry signal */
-		sftp_conn_check_policy_tag(conn, msg); /* HPN: policy-abort */
-	}
+	record_status(conn, msg, status); /* HPN */
 	return status;
 }
 
@@ -531,8 +525,13 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 	if (get_msg(conn, msg) != 0)
 		return NULL;
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &id)) != 0)
-		fatal_fr(r, "parse");
+	    (r = sshbuf_get_u32(msg, &id)) != 0) {
+		/* HPN: a truncated reply breaks this connection, not the
+		 * process, as in get_status. */
+		error_fr(r, "parse");
+		sftp_conn_set_protocol_violation(conn);
+		return NULL;
+	}
 
 	if (id != expected_id) {
 		error("%s: ID mismatch (%u != %u) - possible MITM or "
@@ -542,13 +541,12 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 		return NULL;
 	}
 	if (type == SSH2_FXP_STATUS) {
-		if ((r = sshbuf_get_u32(msg, &status)) != 0)
-			fatal_fr(r, "parse status");
-		conn->hpn->last_status = status; /* HPN */
-		if (status == SSH2_FX_PERMISSION_DENIED) {
-			sftp_conn_set_perm_denied(conn); /* HPN: sticky no-retry */
-			sftp_conn_check_policy_tag(conn, msg); /* HPN */
+		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+			error_fr(r, "parse status");
+			sftp_conn_set_protocol_violation(conn); /* HPN */
+			return NULL;
 		}
+		record_status(conn, msg, status); /* HPN */
 		if (errfmt != NULL)
 			error("%s: %s", errmsg, fx2txt(status));
 		return NULL;
@@ -560,8 +558,11 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 		return NULL;
 	}
 
-	if ((r = sshbuf_get_string(msg, &handle, len)) != 0)
-		fatal_fr(r, "parse handle");
+	if ((r = sshbuf_get_string(msg, &handle, len)) != 0) {
+		error_fr(r, "parse handle");
+		sftp_conn_set_protocol_violation(conn); /* HPN */
+		return NULL;
+	}
 
 	return handle;
 }
@@ -581,8 +582,13 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 		return -1;
 
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &id)) != 0)
-		fatal_fr(r, "parse");
+	    (r = sshbuf_get_u32(msg, &id)) != 0) {
+		/* HPN: a truncated reply breaks this connection, not the
+		 * process, as in get_status. */
+		error_fr(r, "parse");
+		sftp_conn_set_protocol_violation(conn);
+		return -1;
+	}
 
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible MITM or "
@@ -593,8 +599,11 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
 
-		if ((r = sshbuf_get_u32(msg, &status)) != 0)
-			fatal_fr(r, "parse status");
+		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+			error_fr(r, "parse status");
+			sftp_conn_set_protocol_violation(conn); /* HPN */
+			return -1;
+		}
 		if (quiet)
 			debug("stat remote: %s", fx2txt(status));
 		else
@@ -634,8 +643,13 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 		return -1;
 
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &id)) != 0)
-		fatal_fr(r, "parse");
+	    (r = sshbuf_get_u32(msg, &id)) != 0) {
+		/* HPN: a truncated reply breaks this connection, not the
+		 * process, as in get_status. */
+		error_fr(r, "parse");
+		sftp_conn_set_protocol_violation(conn);
+		return -1;
+	}
 
 	debug3("Received statvfs reply T:%u I:%u", type, id);
 	if (id != expected_id) {
@@ -647,8 +661,11 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
 
-		if ((r = sshbuf_get_u32(msg, &status)) != 0)
-			fatal_fr(r, "parse status");
+		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+			error_fr(r, "parse status");
+			sftp_conn_set_protocol_violation(conn); /* HPN */
+			return -1;
+		}
 		if (quiet)
 			debug("remote statvfs: %s", fx2txt(status));
 		else
@@ -673,8 +690,11 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 	    (r = sshbuf_get_u64(msg, &st->f_favail)) != 0 ||
 	    (r = sshbuf_get_u64(msg, &st->f_fsid)) != 0 ||
 	    (r = sshbuf_get_u64(msg, &flag)) != 0 ||
-	    (r = sshbuf_get_u64(msg, &st->f_namemax)) != 0)
-		fatal_fr(r, "parse statvfs");
+	    (r = sshbuf_get_u64(msg, &st->f_namemax)) != 0) {
+		error_fr(r, "parse statvfs");
+		sftp_conn_set_protocol_violation(conn); /* HPN */
+		return -1;
+	}
 
 	st->f_flag = (flag & SSH2_FXE_STATVFS_ST_RDONLY) ? ST_RDONLY : 0;
 	st->f_flag |= (flag & SSH2_FXE_STATVFS_ST_NOSUID) ? ST_NOSUID : 0;
@@ -687,8 +707,8 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
     uint64_t limit_kbps)
 {
 	u_char type;
-	struct sftp_conn *ret;
 	struct sshbuf *msg;
+	struct sftp_conn *ret;
 	int r;
 
 	ret = xcalloc(1, sizeof(*ret));
@@ -700,12 +720,12 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	    transfer_buflen ? transfer_buflen : DEFAULT_COPY_BUFLEN;
 	ret->num_requests =
 	    num_requests ? num_requests : DEFAULT_NUM_REQUESTS;
-	/* HPN: seed the adaptive read-ahead controller with -R as its ceiling. */
+	/* HPN: num_requests is the read-ahead controller's ceiling. */
 	sftp_conn_rdahead_init(ret, ret->num_requests);
 	ret->exts = 0;
-	ret->hpn->hpn_max_workers_cap = -1;	/* -1 until/unless the server advertises */
 	ret->limit_kbps = 0;
 
+	/* HPN: the connection keeps this buffer for its later requests. */
 	if ((ret->msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	msg = ret->msg;
@@ -715,30 +735,28 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 
 	send_msg(ret, msg);
 
-	if (get_msg_extended(ret, msg, 1) < 0) {
-		/*
-		 * The transport closed the connection before the SFTP
-		 * handshake completed (e.g. it refused the requested cipher
-		 * and exited with its own message). Let that message stand
-		 * rather than reporting a bogus "type 0" packet.
-		 */
-		sshbuf_free(ret->msg);
-		free(ret);
-		return(NULL);
-	}
+	/* HPN: the transport closed before the handshake finished, for
+	 * example after refusing the cipher with its own message. Let that
+	 * message stand instead of reporting a bogus "type 0" packet. */
+	if (get_msg_extended(ret, msg, 1) < 0)
+		goto fail;
 
 	/* Expecting a VERSION reply */
-	if ((r = sshbuf_get_u8(msg, &type)) != 0)
-		fatal_fr(r, "parse type");
+	if ((r = sshbuf_get_u8(msg, &type)) != 0) {
+		/* HPN: workers call this too, so a bad reply fails the
+		 * connection, not the process. */
+		error_fr(r, "parse type");
+		goto fail;
+	}
 	if (type != SSH2_FXP_VERSION) {
 		error("Invalid packet back from SSH2_FXP_INIT (type %u)",
 		    type);
-		sshbuf_free(ret->msg);
-		free(ret);
-		return(NULL);
+		goto fail; /* HPN */
 	}
-	if ((r = sshbuf_get_u32(msg, &ret->version)) != 0)
-		fatal_fr(r, "parse version");
+	if ((r = sshbuf_get_u32(msg, &ret->version)) != 0) {
+		error_fr(r, "parse version");
+		goto fail; /* HPN */
+	}
 
 	debug2("Remote version: %u", ret->version);
 
@@ -750,8 +768,11 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		int known = 0;
 
 		if ((r = sshbuf_get_cstring(msg, &name, NULL)) != 0 ||
-		    (r = sshbuf_get_string(msg, &value, &vlen)) != 0)
-			fatal_fr(r, "parse extension");
+		    (r = sshbuf_get_string(msg, &value, &vlen)) != 0) {
+			error_fr(r, "parse extension");
+			free(name);
+			goto fail; /* HPN */
+		}
 		if (strcmp(name, "posix-rename@openssh.com") == 0 &&
 		    strcmp((char *)value, "1") == 0) {
 			ret->exts |= SFTP_EXT_POSIX_RENAME;
@@ -795,64 +816,64 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 			known = 1;
 		} else if (strcmp(name, HPN_EXT_CHECK_FILE) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
+			/* HPN: the server hashes a file's leading bytes. */
 			ret->exts |= SFTP_EXT_HPN_CHECK_FILE;
 			known = 1;
-		} else if (strcmp(name, "sftp-hash-range@hpnssh.org") == 0 &&
+		} else if (strcmp(name, HPN_EXT_HASH_RANGE) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
-			/* Chunked resume: per-range XXH3 batching so a verified
-			 * resume re-transfers only mismatched chunks instead of
-			 * the whole file on size-match-hash-mismatch.  See
-			 * project-chunked-resume-plan memory. */
+			/* HPN: the server hashes many ranges of a file in one
+			 * request, so a verified resume resends only the
+			 * ranges that differ. */
 			ret->exts |= SFTP_EXT_HASH_RANGE;
 			known = 1;
-		} else if (strcmp(name, "hpn-fs-info@hpnssh.org") == 0 &&
+		} else if (strcmp(name, HPN_EXT_FS_INFO) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
+			/* HPN: a path's filesystem type and stripe geometry. */
 			ret->exts |= SFTP_EXT_HPN_FS_INFO;
 			known = 1;
 		} else if (strcmp(name, HPN_EXT_DTREE_OPEN) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
+			/* HPN: opens a chunked tree walk on the server. */
 			ret->exts |= SFTP_EXT_HPN_DTREE_OPEN;
 			known = 1;
 		} else if (strcmp(name, HPN_EXT_DTREE_READ) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
-			/* With tree-open, the chunked tree walk. The download
-			 * walks use it in place of per-directory readdir. */
+			/* HPN: reads the walk tree-open opened. The download
+			 * walks need both, and use them in place of
+			 * per-directory readdir. */
 			ret->exts |= SFTP_EXT_HPN_DTREE_READ;
 			known = 1;
-		} else if (strcmp(name, "hpn-bundle@hpnssh.org") == 0 &&
+		} else if (strcmp(name, HPN_EXT_BUNDLE) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
-			/* the server accepts bundle uploads through
-			 * hpn-bundle-open@hpnssh.org */
+			/* HPN: the server accepts bundle uploads through
+			 * hpn-bundle-open. */
 			ret->exts |= SFTP_EXT_HPN_BUNDLE;
 			known = 1;
-		} else if (strcmp(name, "hpn-bundle-fetch@hpnssh.org") == 0 &&
+		} else if (strcmp(name, HPN_EXT_BUNDLE_FETCH) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
-			/* the server packs a bundle from a list of paths */
+			/* HPN: the server packs a bundle from a list of
+			 * paths. */
 			ret->exts |= SFTP_EXT_HPN_BUNDLE_FETCH;
 			known = 1;
-		} else if (strcmp(name, "hpn-file-layout@hpnssh.org") == 0 &&
+		} else if (strcmp(name, HPN_EXT_FILE_LAYOUT) == 0 &&
 		    strcmp((char *)value, "1") == 0) {
-			/* Server can apply a Lustre stripe layout to a
-			 * destination directory before files land there.
-			 * Used by HPNLustreStripeCount auto-stripe.  See
-			 * sftp-hpn-server.h for wire format. */
+			/* HPN: the server sets a Lustre stripe layout on a
+			 * destination directory before files land in it.
+			 * HPNLustreStripeCount uses it. */
 			ret->exts |= SFTP_EXT_HPN_FILE_LAYOUT;
 			known = 1;
-		} else if (strcmp(name, "hpn-max-workers@hpnssh.org") == 0) {
-			/* Operator's per-user parallel-worker cap.  The value
-			 * is a decimal count, not a revision: 0 = HPN server
-			 * with no cap, N>0 = cap.  The orchestrator clamps -j
-			 * to it (and applies a conservative default when this
-			 * is absent, i.e. a non-HPN server). */
-			const char *errstr = NULL;
-			long long v = strtonum((char *)value, 0,
-			    1000000, &errstr);
-			/* Parse generously; the orchestrator clamps to the
-			 * hard SFTP_PARALLEL_MAX_WORKERS ceiling. */
+		} else if (strcmp(name, HPN_EXT_MAX_WORKERS) == 0) {
+			const char *errstr;
+			int workers;
+
+			/* HPN: the operator's per-user parallel-worker cap,
+			 * a count rather than a revision. 0 means no cap. A
+			 * malformed value counts as not advertised, so the
+			 * conservative default applies. */
+			workers = (int)strtonum((char *)value, 0, 1000000,
+			    &errstr);
 			if (errstr == NULL)
-				ret->hpn->hpn_max_workers_cap = (int)v;
-			else
-				ret->hpn->hpn_max_workers_cap = 0; /* malformed = no cap */
+				ret->hpn->hpn_max_workers_cap = workers;
 			known = 1;
 		}
 		if (known) {
@@ -868,8 +889,11 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	/* Query the server for its limits */
 	if (ret->exts & SFTP_EXT_LIMITS) {
 		struct sftp_limits limits;
-		if (sftp_get_limits(ret, &limits) != 0)
-			fatal_f("limits failed");
+		if (sftp_get_limits(ret, &limits) != 0) {
+			/* HPN: a worker's connection can drop here. */
+			error_f("limits failed");
+			goto fail;
+		}
 
 		/* If the caller did not specify, find a good value */
 		if (transfer_buflen == 0) {
@@ -902,6 +926,10 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	}
 
 	return ret;
+
+ fail:
+	sftp_free(ret);	/* HPN: also frees msg and the HPN state */
+	return(NULL);
 }
 
 void
@@ -909,8 +937,8 @@ sftp_free(struct sftp_conn *conn)
 {
 	if (conn == NULL)
 		return;
-	sshbuf_free(conn->msg);        /* recycled message buffer */
-	sftp_hpn_conn_free(conn->hpn); /* HPN per-conn state */
+	sshbuf_free(conn->msg);	/* HPN: recycled message buffer */
+	sftp_hpn_conn_free(conn->hpn);	/* HPN: per-connection HPN state */
 	freezero(conn, sizeof(*conn));
 }
 
@@ -920,16 +948,14 @@ sftp_proto_version(struct sftp_conn *conn)
 	return conn->version;
 }
 
-/* Cooperative yield requested for this connection (tail redistribution)?
- * Checked once per loop iteration by the range transfer paths. */
+/* HPN: nonzero once the reporter asks this worker to yield the rest of its
+ * range (HPNTailRedistribute). The range transfer loops poll it. */
 static int
 yield_requested(struct sftp_conn *conn)
 {
 	return conn->hpn->yield_flag != NULL &&
 	    __atomic_load_n(conn->hpn->yield_flag, __ATOMIC_RELAXED);
 }
-
-/* END HPN */
 
 int
 sftp_get_limits(struct sftp_conn *conn, struct sftp_limits *limits)
@@ -944,7 +970,7 @@ sftp_get_limits(struct sftp_conn *conn, struct sftp_limits *limits)
 		return -1;
 	}
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
@@ -958,14 +984,19 @@ sftp_get_limits(struct sftp_conn *conn, struct sftp_limits *limits)
 		return -1;
 
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &msg_id)) != 0)
-		fatal_fr(r, "parse");
+	    (r = sshbuf_get_u32(msg, &msg_id)) != 0) {
+		/* HPN: workers query limits too, so a bad reply fails the
+		 * connection, not the process. */
+		error_fr(r, "parse");
+		sftp_conn_set_protocol_violation(conn);
+		return -1;
+	}
 
 	debug3("Received limits reply T:%u I:%u", type, msg_id);
 	if (id != msg_id) {
 		error_f("ID mismatch (%u != %u) - possible protocol corruption",
 		    msg_id, id);
-		sftp_conn_set_protocol_violation(conn);
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
 	}
 	if (type != SSH2_FXP_EXTENDED_REPLY) {
@@ -980,8 +1011,11 @@ sftp_get_limits(struct sftp_conn *conn, struct sftp_limits *limits)
 	if ((r = sshbuf_get_u64(msg, &limits->packet_length)) != 0 ||
 	    (r = sshbuf_get_u64(msg, &limits->read_length)) != 0 ||
 	    (r = sshbuf_get_u64(msg, &limits->write_length)) != 0 ||
-	    (r = sshbuf_get_u64(msg, &limits->open_handles)) != 0)
-		fatal_fr(r, "parse limits");
+	    (r = sshbuf_get_u64(msg, &limits->open_handles)) != 0) {
+		error_fr(r, "parse limits");
+		sftp_conn_set_protocol_violation(conn); /* HPN */
+		return -1;
+	}
 
 	return 0;
 }
@@ -993,7 +1027,7 @@ sftp_close(struct sftp_conn *conn, const u_char *handle, u_int handle_len)
 	struct sshbuf *msg = conn->msg;
 	int r;
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_CLOSE)) != 0 ||
@@ -1004,8 +1038,15 @@ sftp_close(struct sftp_conn *conn, const u_char *handle, u_int handle_len)
 	debug3("Sent message SSH2_FXP_CLOSE I:%u", id);
 
 	status = get_status(conn, id);
-	if (status != SSH2_FX_OK)
-		debug("close remote: %s", fx2txt(status));
+	if (status != SSH2_FX_OK) {
+		/* HPN: stay quiet when the connection is gone, since that is
+		 * reported where it broke. On a live connection a failed close
+		 * may be the only report of a remote write error. */
+		if (sftp_conn_is_dead(conn))
+			debug("close remote: %s", fx2txt(status));
+		else
+			error("close remote: %s", fx2txt(status));
+	}
 
 	return status == SSH2_FX_OK ? 0 : -1;
 }
@@ -1024,7 +1065,7 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 	if (dir)
 		*dir = NULL;
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	id = conn->msg_id++;
 
@@ -1057,30 +1098,36 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 			fatal_fr(r, "compose READDIR");
 		send_msg(conn, msg);
 
-		if (get_msg(conn, msg) != 0) {
-			status = -1;
-			goto out;
-		}
+		if (get_msg(conn, msg) != 0)
+			goto out; /* HPN */
 
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &id)) != 0)
-			fatal_fr(r, "parse");
+		    (r = sshbuf_get_u32(msg, &id)) != 0) {
+			/* HPN: a parallel walk reads directories on the
+			 * control connection while workers transfer, so a
+			 * bad reply fails the connection, not the process. */
+			error_fr(r, "parse");
+			sftp_conn_set_protocol_violation(conn);
+			goto out;
+		}
 
 		debug3("Received reply T:%u I:%u", type, id);
 
 		if (id != expected_id) {
 			error_f("ID mismatch (%u != %u) - possible protocol corruption",
 			    id, expected_id);
-			sftp_conn_set_protocol_violation(conn);
-			status = -1;
+			sftp_conn_set_protocol_violation(conn); /* HPN */
 			goto out;
 		}
 
 		if (type == SSH2_FXP_STATUS) {
 			u_int rstatus;
 
-			if ((r = sshbuf_get_u32(msg, &rstatus)) != 0)
-				fatal_fr(r, "parse status");
+			if ((r = sshbuf_get_u32(msg, &rstatus)) != 0) {
+				error_fr(r, "parse status");
+				sftp_conn_set_protocol_violation(conn); /* HPN */
+				goto out;
+			}
 			debug3("Received SSH2_FXP_STATUS %d", rstatus);
 			if (rstatus == SSH2_FX_EOF)
 				break;
@@ -1089,15 +1136,20 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 		} else if (type != SSH2_FXP_NAME) {
 			error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
 			    "possible protocol corruption", SSH2_FXP_NAME, type);
-			sftp_conn_set_protocol_violation(conn);
-			status = -1;
+			sftp_conn_set_protocol_violation(conn); /* HPN */
 			goto out;
 		}
 
-		if ((r = sshbuf_get_u32(msg, &count)) != 0)
-			fatal_fr(r, "parse count");
-		if (count > SSHBUF_SIZE_MAX)
-			fatal_f("nonsensical number of entries");
+		if ((r = sshbuf_get_u32(msg, &count)) != 0) {
+			error_fr(r, "parse count");
+			sftp_conn_set_protocol_violation(conn); /* HPN */
+			goto out;
+		}
+		if (count > SSHBUF_SIZE_MAX) {
+			error_f("nonsensical number of entries");
+			sftp_conn_set_protocol_violation(conn); /* HPN */
+			goto out;
+		}
 		if (count == 0)
 			break;
 		debug3("Received %d SSH2_FXP_NAME responses", count);
@@ -1108,8 +1160,12 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 			if ((r = sshbuf_get_cstring(msg, &filename,
 			    NULL)) != 0 ||
 			    (r = sshbuf_get_cstring(msg, &longname,
-			    NULL)) != 0)
-				fatal_fr(r, "parse filenames");
+			    NULL)) != 0) {
+				error_fr(r, "parse filenames");
+				free(filename);
+				sftp_conn_set_protocol_violation(conn); /* HPN */
+				goto out;
+			}
 			if ((r = decode_attrib(msg, &a)) != 0) {
 				error_fr(r, "couldn't decode attrib");
 				free(filename);
@@ -1300,42 +1356,41 @@ sftp_setstat(struct sftp_conn *conn, const char *path, Attrib *a)
 	return status == SSH2_FX_OK ? 0 : -1;
 }
 
-/*
- * Apply N independent SSH2_FXP_SETSTAT requests with a bounded window of
- * outstanding requests instead of one blocking round trip each.  The SFTP
- * server replies in request order on a connection (get_status treats an
- * out-of-order id as a protocol violation), so we send a window, then
- * drain-and-refill in order.  Directory setstats have no inter-directory
- * dependency, so this is safe; it collapses the deferred directory-attr
- * batch (upload_dir / parallel wait) from ~N sequential RTTs to ~N/window.
- * Best-effort like sftp_setstat: a failed setstat is logged, not fatal.
- * Returns the number of failures.
- */
+/* HPN: apply n SETSTATs with up to SFTP_DIR_PIPELINE_WINDOW in flight,
+ * rather than one round trip each. It relies on the server handling
+ * requests and replies in order, as OpenSSH's sftp-server does, though the
+ * SFTP draft allows reordering. That keeps the caller's order and lets the
+ * drain match replies by position. A failed setstat is logged and the rest
+ * go ahead, as with sftp_setstat. Returns the number of failures. */
 int
 sftp_setstat_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
     int n)
 {
 	u_int *ids;
 	u_int status;
-	int sent = 0, recv = 0, failures = 0, window;
+	int sent, recv = 0, failures = 0, window;
 
 	if (n <= 0)
 		return 0;
-	window = n < SFTP_DIR_PIPELINE_WINDOW ?
-	    n : SFTP_DIR_PIPELINE_WINDOW;
+	window = MINIMUM(n, SFTP_DIR_PIPELINE_WINDOW);
 	ids = xcalloc(n, sizeof(*ids));
 
 	debug2_f("pipelining %d directory setstats (window %d)", n, window);
+	/* Fill the window. */
 	for (sent = 0; sent < window; sent++) {
 		ids[sent] = conn->msg_id++;
 		send_string_attrs_request(conn, ids[sent], SSH2_FXP_SETSTAT,
 		    paths[sent], strlen(paths[sent]), &attrs[sent]);
 	}
+	/* Collect the replies in send order, and send the next path as each
+	 * one comes back. */
 	while (recv < n) {
 		status = get_status(conn, ids[recv]);
 		if (status == SSH2_FX_CONNECTION_LOST) {
-			/* Dead/compromised connection - stop draining; the
-			 * remaining replies go unread as the conn tears down. */
+			/* The connection is dead or out of step with the
+			 * server. Count every path without a reply as
+			 * failed and stop. The unread replies go with the
+			 * connection. */
 			failures += n - recv;
 			break;
 		}
@@ -1345,6 +1400,8 @@ sftp_setstat_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 			failures++;
 		}
 		recv++;
+		/* That reply freed a slot in the window. Send the next
+		 * path into it. */
 		if (sent < n) {
 			ids[sent] = conn->msg_id++;
 			send_string_attrs_request(conn, ids[sent],
@@ -1357,28 +1414,15 @@ sftp_setstat_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 	return failures;
 }
 
-/*
- * Create N sibling directories (paths[], creation attrs[]) with a bounded
- * window of outstanding SSH2_FXP_MKDIR requests instead of one blocking
- * round trip each.  Siblings are order-independent (each depends only on
- * the already-existing parent), so pipelining is safe; the caller chunks
- * drains fully before returning, so every directory
- * provably exists before its files are written.  Each directory is created
- * with owner write+exec forced (mirrors sftp_hpn_ensure_remote_dir) so the
- * transfer can write into a read-only source directory; the real mode is
- * restored by the deferred setstat.  created_out[i] is set to 1 iff we
- * created it (mkdir succeeded), 0 if it pre-existed - which drives the
- * "created || preserve" deferred-setstat decision, upstream-identical.
- * mkdir failures (rare: pre-existing dir) fall back to an individual stat
- * to distinguish a tolerable existing directory from a real error.
- * Returns the number of real failures.
- *
- * failed_out[i] is set to 1 for each of those real failures, or may be NULL.
- * The count alone tells a caller that something failed but not what, and a
- * caller that descends into these directories needs to know which ones do not
- * exist: writing into them fails per file, and deferring their attributes
- * applies a setstat to whatever else occupies the path.
- */
+/* HPN: create n sibling directories with up to SFTP_DIR_PIPELINE_WINDOW
+ * MKDIRs in flight, rather than one round trip each. Like
+ * sftp_setstat_pipeline, it relies on in-order replies. Each directory gets
+ * owner write and search added, as in sftp_hpn_ensure_remote_dir, so a copy
+ * of a read-only source directory can still be filled. The deferred setstat
+ * restores its real mode. created_out[i] is set when this call created
+ * paths[i]. failed_out[i], which may be NULL, is set when paths[i] could not
+ * be created, so the caller can skip it. A directory that already existed
+ * is neither. Returns the number of failures. */
 int
 sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
     int n, u_char *created_out, u_char *failed_out)
@@ -1391,20 +1435,18 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 
 	if (n <= 0)
 		return 0;
-	window = n < SFTP_DIR_PIPELINE_WINDOW ?
-	    n : SFTP_DIR_PIPELINE_WINDOW;
+	window = MINIMUM(n, SFTP_DIR_PIPELINE_WINDOW);
 	ids = xcalloc(n, sizeof(*ids));
 	failed = xcalloc(n, sizeof(*failed));
 	memset(created_out, 0, (size_t)n);
 	if (failed_out != NULL)
 		memset(failed_out, 0, (size_t)n);
 
-	/*
-	 * Phase 1: pipeline all the MKDIRs and drain their statuses in order.
-	 * Defer the stat of any failure to phase 2 - a stat issued here would
-	 * collide with the still-outstanding mkdir replies (in-order stream).
-	 */
+	/* Phase 1: send every MKDIR and collect the replies. A failure is only
+	 * noted here. Checking it with a stat now would read one of the
+	 * outstanding MKDIR replies as the stat's own. */
 	debug2_f("pipelining %d directory mkdirs (window %d)", n, window);
+	/* Fill the window. */
 	for (sent = 0; sent < window; sent++) {
 		mkdir_attrs = attrs[sent];
 		mkdir_attrs.perm |= (S_IWUSR|S_IXUSR);
@@ -1412,14 +1454,20 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 		send_string_attrs_request(conn, ids[sent], SSH2_FXP_MKDIR,
 		    paths[sent], strlen(paths[sent]), &mkdir_attrs);
 	}
+	/* Collect the replies in send order, and send the next path as each
+	 * one comes back. */
 	while (recv < n) {
 		status = get_status(conn, ids[recv]);
 		if (status == SSH2_FX_CONNECTION_LOST) {
-			failures += n - recv;
-			/* Everything from here on is unanswered, so none of it
-			 * was created.  Mark it so the caller does not descend
-			 * into directories that may not exist. */
+			/* The connection is gone. Nothing from here on was
+			 * answered, and the failures already noted cannot be
+			 * checked with a stat, so all of them count as failed.
+			 * Marking them keeps the caller out of directories
+			 * that may not exist. */
+			failures += nfailed + n - recv;
 			if (failed_out != NULL) {
+				for (k = 0; k < nfailed; k++)
+					failed_out[failed[k]] = 1;
 				for (k = recv; k < n; k++)
 					failed_out[k] = 1;
 			}
@@ -1430,8 +1478,10 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 		if (status == SSH2_FX_OK)
 			created_out[recv] = 1;
 		else
-			failed[nfailed++] = recv;
+			failed[nfailed++] = recv;	/* stat it in phase 2 */
 		recv++;
+		/* That reply freed a slot in the window. Send the next
+		 * path into it. */
 		if (sent < n) {
 			mkdir_attrs = attrs[sent];
 			mkdir_attrs.perm |= (S_IWUSR|S_IXUSR);
@@ -1444,11 +1494,10 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 	}
 	free(ids);
 
-	/*
-	 * Phase 2 (usually empty): the stream is now drained, so an individual
-	 * stat per failure is safe.  Tolerate a pre-existing directory
-	 * (created_out stays 0 -> no spurious setstat); anything else is real.
-	 */
+	/* Phase 2, usually empty: every reply is in, so a stat per failure is
+	 * safe now. A directory that already exists is fine and keeps
+	 * created_out at 0, so the caller defers no setstat for it. Anything
+	 * else is a real failure. */
 	for (k = 0; k < nfailed; k++) {
 		int i = failed[k];
 		Attrib existing;
@@ -1491,7 +1540,7 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 {
 	struct sshbuf *msg = conn->msg;
 	u_int expected_id, count, id;
-	char *filename, *longname;
+	char *filename = NULL, *longname = NULL;	/* HPN */
 	Attrib a;
 	u_char type;
 	int r;
@@ -1502,7 +1551,7 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 
 	expected_id = id = conn->msg_id++;
 	if (expand) {
-		/* Reset for the same reason as send_string_request. */
+		/* HPN: reset for the same reason as send_string_request. */
 		sshbuf_reset(msg);
 		debug2("Sending SSH2_FXP_EXTENDED(expand-path@openssh.com) "
 		    "\"%s\"", path);
@@ -1521,13 +1570,18 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 	if (get_msg(conn, msg) != 0)
 		return NULL;
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &id)) != 0)
-		fatal_fr(r, "parse");
+	    (r = sshbuf_get_u32(msg, &id)) != 0) {
+		/* HPN: a bad reply fails the connection, not the process, as
+		 * in get_status. */
+		error_fr(r, "parse");
+		sftp_conn_set_protocol_violation(conn);
+		return NULL;
+	}
 
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible protocol corruption",
 		    id, expected_id);
-		sftp_conn_set_protocol_violation(conn);
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return NULL;
 	}
 
@@ -1536,8 +1590,11 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 		char *errmsg;
 
 		if ((r = sshbuf_get_u32(msg, &status)) != 0 ||
-		    (r = sshbuf_get_cstring(msg, &errmsg, NULL)) != 0)
-			fatal_fr(r, "parse status");
+		    (r = sshbuf_get_cstring(msg, &errmsg, NULL)) != 0) {
+			error_fr(r, "parse status");
+			sftp_conn_set_protocol_violation(conn); /* HPN */
+			return NULL;
+		}
 		error("%s %s: %s", expand ? "expand" : "realpath",
 		    path, *errmsg == '\0' ? fx2txt(status) : errmsg);
 		free(errmsg);
@@ -1545,19 +1602,30 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 	} else if (type != SSH2_FXP_NAME) {
 		error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
 		    "possible protocol corruption", SSH2_FXP_NAME, type);
-		sftp_conn_set_protocol_violation(conn);
+		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return NULL;
 	}
 
-	if ((r = sshbuf_get_u32(msg, &count)) != 0)
-		fatal_fr(r, "parse count");
-	if (count != 1)
-		fatal("Got multiple names (%d) from %s", count, what);
+	if ((r = sshbuf_get_u32(msg, &count)) != 0) {
+		error_fr(r, "parse count");
+		sftp_conn_set_protocol_violation(conn); /* HPN */
+		return NULL;
+	}
+	if (count != 1) {
+		error("Got multiple names (%d) from %s", count, what);
+		sftp_conn_set_protocol_violation(conn); /* HPN */
+		return NULL;
+	}
 
 	if ((r = sshbuf_get_cstring(msg, &filename, NULL)) != 0 ||
 	    (r = sshbuf_get_cstring(msg, &longname, NULL)) != 0 ||
-	    (r = decode_attrib(msg, &a)) != 0)
-		fatal_fr(r, "parse filename/attrib");
+	    (r = decode_attrib(msg, &a)) != 0) {
+		error_fr(r, "parse filename/attrib");
+		free(filename);
+		free(longname);
+		sftp_conn_set_protocol_violation(conn); /* HPN */
+		return NULL;
+	}
 
 	debug3("%s %s -> %s", what, path, filename);
 
@@ -1592,6 +1660,7 @@ int
 sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 {
 	Attrib junk, attr;
+	struct sshbuf *msg = conn->msg;
 	u_char *old_handle, *new_handle;
 	u_int mode, status, id;
 	size_t old_handle_len, new_handle_len;
@@ -1625,12 +1694,10 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	attr.perm = mode;
 	attr.flags |= SSH2_FILEXFER_ATTR_PERMISSIONS;
 
-	struct sshbuf *msg = conn->msg;
-
 	attrib_clear(&junk); /* Send empty attributes */
 
 	/* Open the old file for reading */
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_OPEN)) != 0 ||
@@ -1648,7 +1715,7 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 		return -1;
 
 	/* Open the new file for writing */
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_OPEN)) != 0 ||
@@ -1664,12 +1731,13 @@ sftp_copy(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	new_handle = get_handle(conn, id, &new_handle_len,
 	    "remote open(\"%s\")", newpath);
 	if (new_handle == NULL) {
+		sftp_close(conn, old_handle, old_handle_len); /* HPN */
 		free(old_handle);
 		return -1;
 	}
 
 	/* Copy the file data */
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
@@ -1707,8 +1775,9 @@ sftp_rename(struct sftp_conn *conn, const char *oldpath, const char *newpath,
 	u_int status, id;
 	int r, use_ext = (conn->exts & SFTP_EXT_POSIX_RENAME) && !force_legacy;
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
+
 	/* Send rename request */
 	id = conn->msg_id++;
 	if (use_ext) {
@@ -1756,8 +1825,9 @@ sftp_hardlink(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	debug2("Sending SSH2_FXP_EXTENDED(hardlink@openssh.com) "
 	    "\"%s\" to \"%s\"", oldpath, newpath);
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
+
 	/* Send link request */
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
@@ -1791,8 +1861,9 @@ sftp_symlink(struct sftp_conn *conn, const char *oldpath, const char *newpath)
 	}
 	debug2("Sending SSH2_FXP_SYMLINK \"%s\" to \"%s\"", oldpath, newpath);
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
+
 	/* Send symlink request */
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_SYMLINK)) != 0 ||
@@ -1824,7 +1895,7 @@ sftp_fsync(struct sftp_conn *conn, u_char *handle, u_int handle_len)
 		return -1;
 	debug2("Sending SSH2_FXP_EXTENDED(fsync@openssh.com)");
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	/* Send fsync request */
 	id = conn->msg_id++;
@@ -1847,7 +1918,7 @@ sftp_fsync(struct sftp_conn *conn, u_char *handle, u_int handle_len)
 char *
 sftp_readlink(struct sftp_conn *conn, const char *path)
 {
-	struct sshbuf *msg = conn->msg;
+	struct sshbuf *msg;
 	u_int expected_id, count, id;
 	char *filename, *longname;
 	Attrib a;
@@ -1859,18 +1930,16 @@ sftp_readlink(struct sftp_conn *conn, const char *path)
 	expected_id = id = conn->msg_id++;
 	send_string_request(conn, id, SSH2_FXP_READLINK, path, strlen(path));
 
-	if (get_msg(conn, msg) != 0)
-		return NULL;
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+
+	get_msg(conn, msg);
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
 	    (r = sshbuf_get_u32(msg, &id)) != 0)
 		fatal_fr(r, "parse");
 
-	if (id != expected_id) {
-		error_f("ID mismatch (%u != %u) - possible protocol corruption",
-		    id, expected_id);
-		sftp_conn_set_protocol_violation(conn);
-		return NULL;
-	}
+	if (id != expected_id)
+		fatal("ID mismatch (%u != %u)", id, expected_id);
 
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
@@ -1878,13 +1947,11 @@ sftp_readlink(struct sftp_conn *conn, const char *path)
 		if ((r = sshbuf_get_u32(msg, &status)) != 0)
 			fatal_fr(r, "parse status");
 		error("Couldn't readlink: %s", fx2txt(status));
+		sshbuf_free(msg);
 		return(NULL);
-	} else if (type != SSH2_FXP_NAME) {
-		error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
-		    "possible protocol corruption", SSH2_FXP_NAME, type);
-		sftp_conn_set_protocol_violation(conn);
-		return NULL;
-	}
+	} else if (type != SSH2_FXP_NAME)
+		fatal("Expected SSH2_FXP_NAME(%u) packet, got %u",
+		    SSH2_FXP_NAME, type);
 
 	if ((r = sshbuf_get_u32(msg, &count)) != 0)
 		fatal_fr(r, "parse count");
@@ -1899,6 +1966,8 @@ sftp_readlink(struct sftp_conn *conn, const char *path)
 	debug3("SSH_FXP_READLINK %s -> %s", path, filename);
 
 	free(longname);
+
+	sshbuf_free(msg);
 
 	return filename;
 }
@@ -1919,7 +1988,7 @@ sftp_statvfs(struct sftp_conn *conn, const char *path, struct sftp_statvfs *st,
 
 	debug2("Sending SSH2_FXP_EXTENDED(statvfs@openssh.com) \"%s\"", path);
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	id = conn->msg_id++;
 
@@ -1938,7 +2007,7 @@ int
 sftp_fstatvfs(struct sftp_conn *conn, const u_char *handle, u_int handle_len,
     struct sftp_statvfs *st, int quiet)
 {
-	struct sshbuf *msg = conn->msg;
+	struct sshbuf *msg;
 	u_int id;
 
 	if ((conn->exts & SFTP_EXT_FSTATVFS) == 0) {
@@ -1948,16 +2017,17 @@ sftp_fstatvfs(struct sftp_conn *conn, const u_char *handle, u_int handle_len,
 
 	debug2("Sending SSH2_FXP_EXTENDED(fstatvfs@openssh.com)");
 
-	/* Reset for the same reason as send_string_request. */
-	sshbuf_reset(msg);
 	id = conn->msg_id++;
 
+	if ((msg = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, "fstatvfs@openssh.com")) != 0 ||
 	    (r = sshbuf_put_string(msg, handle, handle_len)) != 0)
 		fatal_fr(r, "compose");
 	send_msg(conn, msg);
+	sshbuf_free(msg);
 
 	return get_decode_statvfs(conn, st, id, quiet);
 }
@@ -1977,7 +2047,7 @@ sftp_lsetstat(struct sftp_conn *conn, const char *path, Attrib *a)
 
 	debug2("Sending SSH2_FXP_EXTENDED(lsetstat@openssh.com) \"%s\"", path);
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	id = conn->msg_id++;
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
@@ -2002,7 +2072,7 @@ send_read_request(struct sftp_conn *conn, u_int id, uint64_t offset,
 	struct sshbuf *msg = conn->msg;
 	int r;
 
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_READ)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
@@ -2013,7 +2083,7 @@ send_read_request(struct sftp_conn *conn, u_int id, uint64_t offset,
 	send_msg(conn, msg);
 }
 
-static int
+int
 send_open(struct sftp_conn *conn, const char *path, const char *tag,
     u_int openmode, Attrib *a, u_char **handlep, size_t *handle_lenp)
 {
@@ -2033,7 +2103,7 @@ send_open(struct sftp_conn *conn, const char *path, const char *tag,
 		attrib_clear(&junk); /* Send empty attributes */
 		a = &junk;
 	}
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	/* Send open request */
 	id = conn->msg_id++;
@@ -2068,17 +2138,12 @@ progress_meter_path(const char *path)
 	return progresspath;
 }
 
-/*
- * Serial resume-check meter (HPN): spans the pre-transfer hash work in the
- * verify branches of sftp_upload/sftp_download, so a -Z user sees progress
- * instead of a silent stretch while both ends hash the existing partial.
- * The hash engines feed the counter at heartbeat cadence through the
- * registered pointer (sftp_conn_set_hash_meter_ctr), which is what lets the
- * meter advance while this single thread is blocked in the hash protocol
- * loop.  No-op when showprogress is off (quiet, batch, parallel workers -
- * the orchestrator renders its own aggregate resume-check stretch).
- * end() is idempotent, so convergent exit paths may all call it.
- */
+/* HPN: start the serial meter for a verified resume's hash check, which
+ * sftp_download and sftp_upload run before any data moves. Without it the
+ * user sees nothing while both ends hash the partial file. The hash code
+ * advances resume_meter_counter through the pointer registered here, so
+ * the meter moves while this thread waits on the hash exchange. Does
+ * nothing when showprogress is off, which includes parallel workers. */
 static void
 resume_check_meter_begin(struct sftp_conn *conn, off_t total)
 {
@@ -2094,11 +2159,14 @@ resume_check_meter_begin(struct sftp_conn *conn, off_t total)
 	resume_meter_on = 1;
 }
 
+/* HPN: stop the resume-check meter. A no-op when begin did not start
+ * one, so every exit path can call it. */
 static void
 resume_check_meter_end(struct sftp_conn *conn)
 {
 	if (!resume_meter_on)
 		return;
+	/* Unhook the counter so later hash work does not advance it. */
 	sftp_conn_set_hash_meter_ctr(conn, NULL);
 	hpn_meter_stop(hpn_meter_serial(), conn);
 	resume_meter_on = 0;
@@ -2168,73 +2236,63 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		return -1;
 	}
 	if (resume_flag) {
-		/* -1=error, 1=identical, 2=target larger than source */
+		/* HPN: -1 error, 1 identical, 2 target larger than source. */
 		int skip_ret = -1;
-		int chunked_metered = 0;	/* the chunked re-fetch ran its
-						 * own transfer meter, which
-						 * counts the file at stop */
+		/* HPN: set when the chunked refetch ran its own transfer
+		 * meter, which counts the file when it stops. */
+		int chunked_metered = 0;
 		if (fstat(local_fd, &st) == -1) {
 			error("stat local \"%s\": %s",
 			    local_path, strerror(errno));
-			goto resume_fail;
+			goto resume_exit;
 		}
 		if (st.st_size < 0) {
 			error("\"%s\" has negative size", local_path);
-			goto resume_fail;
+			goto resume_exit;
 		}
 		if (verify) {
-			/*
-			 * Verified resume requires hpn-check-file@hpnssh.org.
-			 * Check it up front (before inspecting the local file)
-			 * so the failure is identical whether the local file
-			 * is absent, partial, or full-size - mirroring
-			 * sftp_upload.  No silent fallback to a fresh
-			 * download; the caller asked for verification.  See
-			 * RESUME_INCOMPAT_MSG.
-			 */
+			int chunked, match;
+
+			/* HPN: verified resume needs hpn-check-file. Check it
+			 * before looking at the local file, so the failure is
+			 * the same whether that file is absent, partial, or
+			 * full size, as in sftp_upload. The caller asked for
+			 * verification, so there is no quiet fallback to a
+			 * fresh download. */
 			if (!sftp_conn_has_hpn_check_file(conn))
 				fatal("\"%s\": %s", remote_path,
 				    RESUME_INCOMPAT_MSG);
-			/* Resume-check meter: spans the hash work below in
-			 * WORK-bytes - the overlap is hashed on both ends. */
+			/* HPN: the resume-check meter counts the hashing below
+			 * in work-bytes. Both ends hash the overlap. */
 			resume_check_meter_begin(conn,
 			    2 * MINIMUM(st.st_size, (off_t)size));
 			if ((uint64_t)st.st_size == size) {
-				/*
-				 * Chunked-resume fast path: when the server
-				 * supports sftp-hash-range@hpnssh.org, hash
-				 * per-chunk and re-fetch only mismatched chunks
-				 * instead of truncating + re-downloading the
-				 * whole file.  Declines (returns -1) on small
-				 * files, missing extension, or internal
-				 * failure; we fall through to the whole-file
-				 * gate below - same correctness, just costlier
-				 * on a size-match-hash-mismatch.
-				 */
-				int chunked =
-				    sftp_hpn_try_chunked_resume_download(
-				        conn, local_fd, local_path,
-				        remote_path, (off_t)size,
-				        st.st_size /* dest-EOF clamp */);
+				/* HPN: with sftp-hash-range, hash in chunks and
+				 * fetch only the chunks that differ, instead of
+				 * downloading the whole file again. It declines
+				 * with -1 for a small file, a server without the
+				 * extension, or an internal failure. The
+				 * whole-file check below then decides, which is
+				 * as correct but slower on a mismatch. */
+				chunked = sftp_hpn_try_chunked_resume_download(
+				    conn, local_fd, local_path, remote_path,
+				    (off_t)size,
+				    st.st_size /* dest-EOF clamp */);
 				if (chunked >= 0) {
 					if (chunked == 0 && showprogress)
 						chunked_metered = 1;
 					skip_ret = chunked == 1 ? 1 : 0;
-					goto resume_fail;
+					goto resume_exit;
 				}
 
-				/*
-				 * Option A: equal size does NOT imply equal
-				 * content.  A range-split download pre-creates
-				 * the local file at full size, so a crashed
-				 * transfer leaves it full-size with sparse-zero
-				 * holes.  Hash the whole file on both ends and
-				 * skip only if they match; otherwise truncate
-				 * and re-download.  Closes the crash-resume
-				 * sparse-hole corruption gap.
-				 */
-				int match = sftp_hpn_prefix_match(conn,
-				    local_fd, remote_path, size);
+				/* HPN: equal size does not mean equal content.
+				 * A range-split download creates the local file
+				 * at full size, so a crash leaves it full size
+				 * with holes of zeros. Hash the whole file on
+				 * both ends and skip only when they match.
+				 * Otherwise truncate and download again. */
+				match = sftp_hpn_prefix_match(conn, local_fd,
+				    remote_path, size);
 
 				if (match == 1) {
 					debug("verified transfer: "
@@ -2242,7 +2300,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					    "\"%s\" already complete",
 					    local_path);
 					skip_ret = 1; /* identical */
-					goto resume_fail;
+					goto resume_exit;
 				}
 				debug("verified transfer: same size "
 				    "but hash %s for \"%s\"; "
@@ -2252,48 +2310,38 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				if (ftruncate(local_fd, 0) == -1) {
 					error("truncate \"%s\": %s",
 					    local_path, strerror(errno));
-					goto resume_fail;
+					goto resume_exit;
 				}
-				/* offset stays 0; fresh download */
+				/* offset stays 0 for a fresh download */
 			} else if ((uint64_t)st.st_size > size) {
 				skip_ret = 2; /* target larger than source */
-				goto resume_fail;
+				goto resume_exit;
 			} else if (st.st_size > 0) {
-				/*
-				 * Chunked verify FIRST (mirrors the upload
-				 * side): a lazily-created range-split local
-				 * partial grows to its pwrite highwater and
-				 * may hold interior holes below that size -
-				 * prefix resume would append past them and
-				 * corrupt.  Chunks past local EOF are clamped
-				 * as known-missing (never hashed) and
-				 * re-fetched directly.  Declines fall through
-				 * to prefix resume (sequential partials,
-				 * sub-threshold files).
-				 */
-				int dchunked =
-				    sftp_hpn_try_chunked_resume_download(
-				        conn, local_fd, local_path,
-				        remote_path, (off_t)size,
-				        st.st_size /* dest-EOF clamp */);
-				if (dchunked >= 0) {
-					if (dchunked == 0 && showprogress)
+				/* HPN: try the chunked check first, as the
+				 * upload side does. A range-split partial grows
+				 * to its highest write and can hold holes below
+				 * that size, which a prefix resume would append
+				 * past. Chunks past the local end are fetched
+				 * without hashing. A decline falls through to
+				 * the prefix resume, for sequential partials and
+				 * files under the chunk threshold. */
+				chunked = sftp_hpn_try_chunked_resume_download(
+				    conn, local_fd, local_path, remote_path,
+				    (off_t)size,
+				    st.st_size /* dest-EOF clamp */);
+				if (chunked >= 0) {
+					if (chunked == 0 && showprogress)
 						chunked_metered = 1;
-					skip_ret = dchunked == 1 ? 1 : 0;
-					goto resume_fail;
+					skip_ret = chunked == 1 ? 1 : 0;
+					goto resume_exit;
 				}
 
-				/*
-				 * Partial local file: hash the overlapping
-				 * prefix to decide resume (continue) vs
-				 * restart (truncate).  The server always
-				 * returns the real prefix hash off the platter
-				 * (no trust shortcut), so the comparison below
-				 * is exact.
-				 */
-				int match = sftp_hpn_prefix_match(conn,
-				    local_fd, remote_path,
-				    (uint64_t)st.st_size);
+				/* HPN: hash the overlapping prefix to choose
+				 * between resuming and restarting. The server
+				 * hashes the data on its disk, so the comparison
+				 * is exact. */
+				match = sftp_hpn_prefix_match(conn, local_fd,
+				    remote_path, (uint64_t)st.st_size);
 
 				if (match == 1) {
 					debug("verified resume: prefix "
@@ -2312,31 +2360,35 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 						error("truncate \"%s\": %s",
 						    local_path,
 						    strerror(errno));
-						goto resume_fail;
+						goto resume_exit;
 					}
 					/* offset stays 0 */
 				}
 			}
-			/* st.st_size == 0 (or size-match mismatch, now
-			 * truncated): fresh download, offset stays 0 */
+			/* An empty local file, or a same-size mismatch that
+			 * was truncated, downloads fresh from offset 0. */
 		} else {
 			/* Plain size-only resume */
 			if ((uint64_t)st.st_size > size) {
 				skip_ret = 2; /* target larger than source */
-				goto resume_fail;
+				goto resume_exit;
 			}
 			offset = highwater = maxack = st.st_size;
 		}
 		goto resume_done;
- resume_fail:
+ resume_exit:
 		resume_check_meter_end(conn);
 		sftp_close(conn, handle, handle_len);
 		free(handle);
+		/* HPN: an identical or repaired file still gets -p and -f. */
+		if (skip_ret == 0 || skip_ret == 1)
+			sftp_hpn_download_finish_local(local_fd, local_path,
+			    mode, a, preserve_flag, fsync_flag, skip_ret == 0);
 		if (local_fd != -1)
 			close(local_fd);
+		/* HPN: count a file settled without a transfer meter. A
+		 * chunked refetch counted its file itself. */
 		if (skip_ret >= 0 && !chunked_metered)
-			/* resolved without a transfer meter; a chunked
-			 * re-fetch metered and counted the file itself */
 			hpn_pm_count_file();
 		return skip_ret;
  resume_done:
@@ -2358,6 +2410,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	while (num_req > 0 || max_req > 0) {
 		u_char *data;
 		size_t len;
+		double t_data_start;
 
 		/*
 		 * Simulate EOF on interrupt: stop sending new requests and
@@ -2384,34 +2437,32 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 		}
 
 		sshbuf_reset(msg);
-		/* Time the DATA-reply read so the rdahead controller can
-		 * react to a wedged path - same mechanism as the upload-
-		 * side STATUS-read instrumentation in do_upload_body.  A
-		 * read that blocks longer than the threshold means the
-		 * server isn't sending DATA back fast enough (TCP back-
-		 * pressure, busy server-side I/O, etc.); signal so the
-		 * controller can halve depth and re-probe. */
-		{
-			double t_data_start = monotime_double();
-			if (get_msg(conn, msg) != 0)
-				break;
-			if (monotime_double() - t_data_start >
-			    RDAHEAD_BP_THRESHOLD_SEC)
-				sftp_conn_rdahead_backpressure_signal(conn);
-		}
+		/* HPN: time the wait for a DATA reply, as do_upload_body
+		 * times its STATUS replies. A wait past the threshold means
+		 * the server is slow to send, from TCP backpressure or busy
+		 * server I/O, so the read-ahead controller halves its depth
+		 * and probes again. */
+		t_data_start = monotime_double();
+		if (get_msg(conn, msg) != 0)
+			break;
+		if (monotime_double() - t_data_start > RDAHEAD_BP_THRESHOLD_SEC)
+			sftp_conn_rdahead_backpressure_signal(conn);
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &id)) != 0)
-			fatal_fr(r, "parse");
+		    (r = sshbuf_get_u32(msg, &id)) != 0) {
+			/* HPN: workers download through here, so a bad reply
+			 * fails the connection, not the process. The drain
+			 * after the loop fails the file. */
+			error_fr(r, "parse");
+			sftp_conn_set_protocol_violation(conn);
+			break;
+		}
 		debug3("Received reply T:%u I:%u R:%d", type, id, max_req);
 
 		/* Find the request in our queue */
 		if ((req = request_find(&requests, id)) == NULL) {
-			/* Was fatal("Unexpected reply %u", id); - would
-			 * crash the entire orchestrator if this worker is
-			 * one of N in a parallel-streams transfer.  Mark
-			 * this connection dead and bail to the worker
-			 * thread's safety net, which checks conn->dead and
-			 * triggers respawn. */
+			/* HPN: an unknown reply id breaks this connection,
+			 * not the process. A parallel worker sees the dead
+			 * connection and respawns. */
 			sftp_conn_die(conn, "Unexpected reply %u", id);
 			read_error = 1;
 			max_req = 0;
@@ -2421,8 +2472,14 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 
 		switch (type) {
 		case SSH2_FXP_STATUS:
-			if ((r = sshbuf_get_u32(msg, &status)) != 0)
-				fatal_fr(r, "parse status");
+			if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+				error_fr(r, "parse status");
+				sftp_conn_set_protocol_violation(conn); /* HPN */
+				read_error = 1;
+				max_req = 0;
+				num_req = 0;
+				break;
+			}
 			if (status != SSH2_FX_EOF)
 				read_error = 1;
 			max_req = 0;
@@ -2431,8 +2488,14 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			num_req--;
 			break;
 		case SSH2_FXP_DATA:
-			if ((r = sshbuf_get_string(msg, &data, &len)) != 0)
-				fatal_fr(r, "parse data");
+			if ((r = sshbuf_get_string(msg, &data, &len)) != 0) {
+				error_fr(r, "parse data");
+				sftp_conn_set_protocol_violation(conn); /* HPN */
+				read_error = 1;
+				max_req = 0;
+				num_req = 0;
+				break;
+			}
 			debug3("Received data %llu -> %llu",
 			    (unsigned long long)req->offset,
 			    (unsigned long long)req->offset + len - 1);
@@ -2448,14 +2511,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			}
 			sftp_conn_bytes_wired_add(conn, (uint64_t)len);
 			if (len == 0) {
-				/* Anti-livelock guard (upstream c1cebbc7c):
-				 * tolerate one zero-length DATA reply, rule
-				 * a second a broken server.  Was fatal_f() -
-				 * from a worker thread that kills the whole
-				 * orchestrator (cf. the "Unexpected reply"
-				 * conversion above), so mark the connection
-				 * dead and bail to the safety net; the
-				 * in-flight drain below sets read_error. */
+				/* HPN: allow one zero-length DATA reply, and
+				 * treat a second as a broken server. That fails
+				 * the connection, not the process. The drain
+				 * after the loop sets read_error. */
 				if (seen_zerolen) {
 					sftp_conn_die(conn,
 					    "server sent zero data length");
@@ -2489,7 +2548,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					reordered = 1;
 			}
 			progress_counter += len;
-			sftp_conn_live_account(conn, len); /* HPN */
+			if (!write_error)
+				sftp_conn_live_account(conn, len); /* HPN */
 			free(data);
 
 			if (len == req->len) {
@@ -2521,7 +2581,7 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 					    num_req);
 					max_req = 1;
 				} else {
-					/* HPN adaptive read-ahead window. */
+					/* HPN: adaptive read-ahead window */
 					max_req = sftp_conn_rdahead_window(conn,
 					    len);
 				}
@@ -2532,15 +2592,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			    "possible protocol corruption", SSH2_FXP_DATA, type);
 			sftp_conn_set_protocol_violation(conn);
 			read_error = 1;
-			/*
-			 * Drain the in-flight TAILQ inline so the outer while
-			 * exits on the NEXT condition check (num_req == 0 &&
-			 * max_req == 0) rather than waiting for get_msg() to
-			 * fail.  This guarantees the "requests still in queue"
-			 * sanity fatal() below is unreachable on the protocol-
-			 * violation path, and avoids one extra get_msg() RTT
-			 * against a connection we already know is dead.
-			 */
+			/* HPN: drain the queue here, so the loop ends at its
+			 * next check. That saves a get_msg round trip on a
+			 * connection already known to be broken. */
 			while ((req = TAILQ_FIRST(&requests)) != NULL) {
 				TAILQ_REMOVE(&requests, req, tq);
 				free(req);
@@ -2554,16 +2608,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	if (showprogress && size)
 		hpn_meter_stop(hpn_meter_serial(), conn);
 
-	/*
-	 * Requests still queued here means the loop broke early on a dead
-	 * connection (get_msg failure, or an unexpected reply) - num_req tracks
-	 * the queue, so a clean num_req==0 loop exit always leaves it empty.
-	 * This is a survivable per-worker event, NOT a clean completion: drain
-	 * the queue, mark the connection dead, and fail the download soft so the
-	 * worker's safety net respawns it, rather than fatal()-ing and taking
-	 * the whole parallel orchestrator down with it (cf. the "Unexpected
-	 * reply" sftp_conn_die above).
-	 */
+	/* HPN: requests still queued here mean the loop stopped early on a
+	 * broken connection, since a clean exit leaves the queue empty.
+	 * Drain it, mark the connection dead, and fail this file. A parallel
+	 * worker then respawns instead of ending the run. */
 	if (TAILQ_FIRST(&requests) != NULL) {
 		if (!sftp_conn_is_dead(conn))
 			sftp_conn_die(conn, "download of \"%s\" ended with "
@@ -2597,10 +2645,9 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			    strerror(errno));
 	}
 	if (read_error) {
-		/* status can still be SSH2_FX_OK here when the failure was
-		 * a connection death (cause already logged by
-		 * sftp_conn_die) - fx2txt would print a baffling
-		 * "No error", so omit the status clause. */
+		/* HPN: status is still SSH2_FX_OK when the connection died,
+		 * and the cause is already logged. Leave out fx2txt's
+		 * "No error" then. */
 		if (status == SSH2_FX_OK)
 			error("read remote \"%s\" failed", remote_path);
 		else
@@ -2620,6 +2667,10 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			status = SSH2_FX_FAILURE;
 		else
 			status = SSH2_FX_OK;
+		/* HPN: a verified resume that finds the file identical, or
+		 * repairs it in chunks, returns before reaching this block,
+		 * so sftp_hpn_download_finish_local copies it for that case,
+		 * up to the end marker below. Keep the two in sync. */
 		/* Override umask and utimes if asked */
 #ifdef HAVE_FCHMOD
 		if (preserve_flag && fchmod(local_fd, mode) == -1)
@@ -2646,17 +2697,14 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 				error("local sync \"%s\": %s",
 				    local_path, strerror(errno));
 		}
-	}
+	} /* HPN: end copied block for sftp_hpn_download_finish_local */
 	close(local_fd);
 	free(handle);
 
-	/*
-	 * Park for the post-transfer verify phase (HPN): every downloaded file -
-	 * single-file and recursive, since download_dir_internal funnels through
-	 * here - is verified after the command's transfers finish (closing the
-	 * classic `get -r` gap).  Only on a clean download.  No-op unless verify
-	 * enabled.
-	 */
+	/* HPN: park a clean download for the verify phase that runs after
+	 * the command's transfers. Single and recursive downloads both pass
+	 * through here. A no-op unless verify transfer is on, and skipped
+	 * on worker connections, which park through the orchestrator. */
 	if (status == SSH2_FX_OK)
 		sftp_conn_verify_park(conn, local_path, remote_path,
 		    /*local_is_target=*/1, (off_t)size);
@@ -2664,27 +2712,28 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 	return status == SSH2_FX_OK ? 0 : -1;
 }
 
+/* HPN: the serial download sink's make_dir. It creates the local directory
+ * writable, so the walk can fill it, and defers its real mode, and its times
+ * under -p, to the end of the transfer. */
 static int
 serial_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
     const char *dst, const Attrib *attrs)
 {
 	struct serial_dl_sink	*ctx = (struct serial_dl_sink *)sink;
 	mode_t			 mode, tmpmode;
-	Attrib			 defrd_attrs;
 
 	if (ctx->print_flag && ctx->print_flag != SFTP_PROGRESS_ONLY)
 		pm_mprintf("Retrieving %s\n", src);
 	if (sftp_hpn_ensure_local_dir(dst, attrs, &mode, &tmpmode) != 0)
 		return -1;
-	defrd_attrs = *attrs;
-	if (!ctx->preserve_flag)
-		defrd_attrs.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-	if (ctx->preserve_flag || mode != tmpmode)
-		sftp_hpn_dirattrs_defer_local(ctx->dirs, dst, mode, tmpmode,
-		    &defrd_attrs);
+	sftp_hpn_dirattrs_defer_local(ctx->dirs, dst, mode, tmpmode, attrs,
+	    ctx->preserve_flag);
 	return 0;
 }
 
+/* HPN: the serial download sink's xfer_file. A small file joins the bundle
+ * and is fetched when the bundle flushes. Any other file is downloaded now.
+ * Returns -1 when the download or a flush fails. */
 static int
 serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
     const char *dst, Attrib *attrs)
@@ -2694,6 +2743,7 @@ serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 
 	if ((attrs->flags & SSH2_FILEXFER_ATTR_SIZE) &&
 	    sftp_hpn_bundle_acc_eligible(ctx->bundle_acc, attrs->size)) {
+		/* Add the file, and send the bundle now if that filled it. */
 		if (sftp_hpn_bundle_acc_add(ctx->bundle_acc, src, dst,
 		    (off_t)attrs->size)) {
 			int flush_result = sftp_hpn_bundle_acc_flush(ctx->conn,
@@ -2717,16 +2767,8 @@ serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 	    (off_t)attrs->size);
 }
 
-static void
-serial_dl_fail(struct sftp_tree_dl_sink *sink, const char *path,
-    const char *reason)
-{
-	/* Serial has no failure list; the consumer's -1 return carries it. */
-	(void)sink;
-	(void)path;
-	(void)reason;
-}
-
+/* HPN: the serial download sink's aborting. The walk stops on an interrupt
+ * or once a bundle flush has aborted. */
 static int
 serial_dl_aborting(struct sftp_tree_dl_sink *sink)
 {
@@ -2735,13 +2777,12 @@ serial_dl_aborting(struct sftp_tree_dl_sink *sink)
 	return interrupted || ctx->flush_aborted;
 }
 
-/* Print a walk notice on its own line above the meter, which repaints
- * below it on its next tick. Follows the meter's own gate, so -q and
- * batch mode print nothing. */
+/* HPN: the serial download sink's notice. It prints a walk notice on its
+ * own line above the meter, which repaints below it on its next tick. It
+ * follows the meter's own gate, so -q and batch mode print nothing. */
 static void
 serial_dl_notice(struct sftp_tree_dl_sink *sink, const char *text)
 {
-	(void)sink;
 	if (showprogress)
 		pm_mprintf("%s\n", text);
 }
@@ -2755,56 +2796,53 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	int ret;
 	struct sftp_hpn_bundle_acc bundle_acc;
 	struct sftp_hpn_dirattr_list dirs = { NULL, 0, 0 };
+	struct serial_dl_sink sink;
 
 	if ((src_canon = sftp_realpath(conn, src)) == NULL) {
 		error("download \"%s\": path canonicalization failed", src);
 		return -1;
 	}
 
-	/* HPN: one bundle accumulator for the WHOLE walk - download
-	 * bundles span directories, matching the parallel producer, so
-	 * serial and -j modes fetch identical bundles for the same
-	 * corpus.  A no-op unless the server advertises
-	 * hpn-bundle-fetch, HPNUseBundle is on, and this is not a
-	 * resume transfer, plain or verified. */
+	/* HPN: one bundle accumulator serves the whole walk, so download
+	 * bundles span directories, as in the parallel producer. Serial and
+	 * -j runs then fetch the same bundles for the same tree. It does
+	 * nothing unless the server advertises hpn-bundle-fetch,
+	 * HPNUseBundle is on, and the transfer is not a resume, plain or
+	 * verified. */
 	sftp_hpn_bundle_acc_init(&bundle_acc, conn, resume_flag || verify,
 	    /*download*/1);
 
-	{
-		struct serial_dl_sink sink = {
-			.base = {
-				.make_dir = serial_dl_make_dir,
-				.xfer_file = serial_dl_xfer_file,
-				.fail = serial_dl_fail,
-				.aborting = serial_dl_aborting,
-				.notice = serial_dl_notice,
-			},
-			.conn = conn,
-			.bundle_acc = &bundle_acc,
-			.dirs = &dirs,
-			.preserve_flag = preserve_flag,
-			.print_flag = print_flag,
-			.resume_flag = resume_flag,
-			.verify = verify,
-			.fsync_flag = fsync_flag,
-			.inplace_flag = inplace_flag,
-		};
+	sink = (struct serial_dl_sink){
+		.base = {
+			.make_dir = serial_dl_make_dir,
+			.xfer_file = serial_dl_xfer_file,
+			.aborting = serial_dl_aborting,
+			.notice = serial_dl_notice },
+		.conn = conn,
+		.bundle_acc = &bundle_acc,
+		.dirs = &dirs,
+		.preserve_flag = preserve_flag,
+		.print_flag = print_flag,
+		.resume_flag = resume_flag,
+		.verify = verify,
+		.fsync_flag = fsync_flag,
+		.inplace_flag = inplace_flag };
 
-		/* HPN: the chunked tree walk when the server supports it,
-		 * else the recursive readdir fallback; both replay through the
-		 * same serial sink into the shared bundle accumulator and
-		 * deferred-attr list, so the flush/apply below is identical. */
-		if (sftp_conn_has_tree_walk(conn))
-			ret = sftp_tree_download_consume(conn, src_canon, dst,
-			    dirattrib, follow_link_flag, &sink.base);
-		else
-			ret = sftp_readdir_download_consume(conn, src_canon,
-			    dst, 0, MAX_DIR_DEPTH, dirattrib, follow_link_flag,
-			    &sink.base);
-	}
+	/* HPN: use the chunked tree walk when the server has it, else the
+	 * readdir fallback. Both feed the same sink, bundle accumulator,
+	 * and deferred directory attributes, so the steps below are the
+	 * same for either. */
+	if (sftp_conn_has_tree_walk(conn))
+		ret = sftp_tree_download_consume(conn, src_canon, dst,
+		    dirattrib, follow_link_flag, &sink.base);
+	else
+		ret = sftp_readdir_download_consume(conn, src_canon, dst, 0,
+		    MAX_DIR_DEPTH, dirattrib, follow_link_flag, &sink.base);
 
-	/* Fetch any members still pending.  Skip when interrupted - a
-	 * re-run re-walks; do not start new work on the way out. */
+	/* HPN: fetch the members still pending. Skip this after an
+	 * interrupt, since a rerun walks again and nothing new should start
+	 * on the way out. A failed flush empties the accumulator and stops
+	 * the walk, so after one this does nothing. */
 	if (!interrupted) {
 		if (sftp_hpn_bundle_acc_flush(conn, &bundle_acc, preserve_flag,
 		    print_flag, verify, fsync_flag, inplace_flag) != 0)
@@ -2812,8 +2850,8 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	}
 	sftp_hpn_bundle_acc_free(&bundle_acc);
 
-	/* Apply the deferred directory attributes now that all content
-	 * (including the final bundle) has landed. */
+	/* HPN: apply the deferred directory attributes now that every
+	 * file, the final bundle included, has landed. */
 	sftp_hpn_dirattrs_apply(conn, &dirs);
 	sftp_hpn_dirattrs_free(&dirs);
 
@@ -2821,14 +2859,16 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	return ret;
 }
 
-/*
- * Core write loop shared by sftp_upload and the pipelined batch upload path.
- * See sftp-client.h (sftp_upload_batch_send/finish) for design notes.
+/* HPN: the write loop shared by sftp_upload and the pipelined batch upload
+ * (see sftp_upload_batch_send in sftp-client.h). It writes local_fd to the
+ * open remote handle from resume_offset, which is 0 for a whole file. For a
+ * resume the caller has already seeked local_fd there. It then truncates,
+ * preserves, and fsyncs as asked. It closes neither local_fd nor the remote
+ * handle. Returns 0 on success, or -1 if the file failed.
  *
- * Does NOT close local_fd or call sftp_close on the remote handle.
- * resume_offset: 0 for normal uploads; caller has already seeked local_fd
- *   when non-zero.
- */
+ * The loop came from upstream's sftp_upload. A merge will not carry an
+ * upstream change to that loop into this copy, so port such changes here
+ * by hand. */
 static int
 do_upload_body(struct sftp_conn *conn,
     int local_fd, off_t local_size,
@@ -2842,12 +2882,12 @@ do_upload_body(struct sftp_conn *conn,
 	off_t offset, progress_counter;
 	u_char type, *data;
 	struct sshbuf *msg;
-	Attrib t;
+	Attrib trunc_attrs;
 	uint32_t startid, ackid;
 	uint64_t highwater = resume_offset, maxack = 0;
 	struct request *ack = NULL;
 	struct requests acks;
-	int r;
+	int r, read_error = 0;
 
 	TAILQ_INIT(&acks);
 
@@ -2863,13 +2903,10 @@ do_upload_body(struct sftp_conn *conn,
 		    &progress_counter, 1);
 	}
 
-	/*
-	 * HPN 1b: when post-transfer verify is enabled and this is a whole-
-	 * file upload (offset 0), tee the source bytes into a streaming XXH3
-	 * as we read them, so the verify step need not re-read the source.
-	 */
-	if (conn->hpn != NULL && conn->hpn->verify_transfer_enabled &&
-	    resume_offset == 0)
+	/* HPN: when post-transfer verify is on and this is a whole-file
+	 * upload, hash the source bytes as they are read, so the verify step
+	 * need not read the source again. */
+	if (conn->hpn->verify_transfer_enabled && resume_offset == 0)
 		sftp_hpn_src_arm(conn->hpn);
 
 	if ((msg = sshbuf_new()) == NULL)
@@ -2883,7 +2920,7 @@ do_upload_body(struct sftp_conn *conn,
 		 * Simulate an EOF on interrupt, allowing ACKs from the
 		 * server to drain.
 		 */
-		if (interrupted || status != SSH2_FX_OK)
+		if (interrupted || read_error || status != SSH2_FX_OK)
 			len = 0;
 		else do
 			len = read(local_fd, data, conn->upload_buflen);
@@ -2891,10 +2928,16 @@ do_upload_body(struct sftp_conn *conn,
 		    (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK));
 
 		if (len == -1) {
-			fatal("read local \"%s\": %s",
+			/* HPN: fail this file rather than the process, which
+			 * may hold other workers. Stop reading and let the
+			 * writes already sent drain like an EOF. */
+			error("read local \"%s\": %s",
 			    local_path, strerror(errno));
-		} else if (len != 0) {
-			/* HPN 1b: hash the source bytes as they are read so the
+			read_error = 1;
+			len = 0;
+		}
+		if (len != 0) {
+			/* HPN: hash the source bytes as they are read, so the
 			 * inline source hash reflects the on-disk source. */
 			sftp_hpn_src_feed(conn->hpn, data, (size_t)len);
 			ack = request_enqueue(&acks, ++id, len, offset);
@@ -2915,30 +2958,27 @@ do_upload_body(struct sftp_conn *conn,
 			break;
 
 		if (ack == NULL) {
-			/* Was fatal("Unexpected ACK %u", id); - would crash the
-			 * entire orchestrator if this worker is one of N in a
-			 * parallel-streams transfer.  Mark this connection dead
-			 * and bail to the worker thread's safety net, which
-			 * checks conn->dead and triggers respawn. */
+			/* HPN: a protocol error kills this connection, not the
+			 * process. The worker sees the dead connection and
+			 * respawns it. */
 			sftp_conn_die(conn, "Unexpected ACK %u", id);
-			status = -1;
 			break;
 		}
 
 		/* HPN adaptive read-ahead: cap outstanding writes at the
-		 * controller's current depth (num_requests when disabled). */
+		 * controller's current depth, which never exceeds
+		 * num_requests. */
 		if (id == startid || len == 0 ||
 		    id - ackid >= sftp_conn_rdahead_cap(conn)) {
 			u_int rid;
 			double t_status_start;
 
 			sshbuf_reset(msg);
-			/* Time the STATUS read so the rdahead controller
-			 * can react to wedged paths (Pattern 2 stall in
-			 * the 2026-05-30 campaign).  A read above the
-			 * threshold means the pipeline is too deep for
-			 * the current path; signal the controller to
-			 * halve its depth and re-probe. */
+			/* HPN: time the STATUS read so the read-ahead
+			 * controller can react to a wedged path. A read
+			 * longer than the threshold means the pipeline is
+			 * too deep for the path, so the controller halves
+			 * its depth and probes again. */
 			t_status_start = monotime_double();
 			if (get_msg(conn, msg) != 0)
 				break;
@@ -2950,11 +2990,9 @@ do_upload_body(struct sftp_conn *conn,
 				fatal_fr(r, "parse");
 
 			if (type != SSH2_FXP_STATUS) {
-				/* Was fatal("Expected SSH2_FXP_STATUS..."). */
 				sftp_conn_die(conn,
 				    "Expected SSH2_FXP_STATUS(%d) packet, "
 				    "got %d", SSH2_FXP_STATUS, type);
-				status = -1;
 				break;
 			}
 
@@ -2966,10 +3004,8 @@ do_upload_body(struct sftp_conn *conn,
 
 			/* Find the request in our queue */
 			if ((ack = request_find(&acks, rid)) == NULL) {
-				/* Was fatal("Can't find request for ID %u"). */
 				sftp_conn_die(conn,
 				    "Can't find request for ID %u", rid);
-				status = -1;
 				break;
 			}
 			TAILQ_REMOVE(&acks, ack, tq);
@@ -3004,41 +3040,59 @@ do_upload_body(struct sftp_conn *conn,
 		if (offset < 0)
 			fatal_f("offset < 0");
 	}
+	/* HPN: a loop that broke out early leaves requests queued. */
+	while ((ack = TAILQ_FIRST(&acks)) != NULL) {
+		TAILQ_REMOVE(&acks, ack, tq);
+		free(ack);
+	}
 	sshbuf_free(msg);
 
 	if (showprogress)
 		hpn_meter_stop(hpn_meter_serial(), conn);
 	free(data);
 
-	if (status == SSH2_FX_OK && !interrupted) {
+	if (status == SSH2_FX_OK && !interrupted && !read_error &&
+	    !sftp_conn_is_dead(conn)) {
 		highwater = maxack;
-		/* HPN 1b: whole file read cleanly - finalize the inline hash. */
+		/* HPN: the whole file was read cleanly, so finish the inline
+		 * hash. */
 		sftp_hpn_src_finish(conn->hpn);
 	} else {
-		/* partial/aborted upload: discard so verify re-reads the source. */
+		/* HPN: a partial upload. Discard the hash so verify reads the
+		 * source again. */
 		sftp_hpn_src_dispose(conn->hpn);
 	}
+	/* HPN: the lost connection was reported where it failed, and every
+	 * request below would fail on it too. */
+	if (sftp_conn_is_dead(conn))
+		return -1;
 	if (status != SSH2_FX_OK) {
 		error("write remote \"%s\": %s", remote_path, fx2txt(status));
 		if (status == SSH2_FX_PERMISSION_DENIED)
 			sftp_conn_set_perm_denied(conn); /* HPN: no-retry */
 		status = SSH2_FX_FAILURE;
-	}
+	} else if (read_error)
+		status = SSH2_FX_FAILURE;
 
 	if (inplace_flag || (resume && (status != SSH2_FX_OK || interrupted))) {
 		debug("truncating at %llu", (unsigned long long)highwater);
-		attrib_clear(&t);
-		t.flags = SSH2_FILEXFER_ATTR_SIZE;
-		t.size = highwater;
-		sftp_fsetstat(conn, handle, handle_len, &t);
+		attrib_clear(&trunc_attrs);
+		trunc_attrs.flags = SSH2_FILEXFER_ATTR_SIZE;
+		trunc_attrs.size = highwater;
+		sftp_fsetstat(conn, handle, handle_len, &trunc_attrs);
 	}
 
+	/* HPN: a resume that finds the file identical, or repairs it in
+	 * chunks, returns before reaching this block, so
+	 * sftp_hpn_upload_finish_remote applies the same -p and -f by path
+	 * for that case, up to the end marker below. Keep the two in sync. */
 	/* Override umask and utimes if asked */
 	if (preserve_flag)
 		sftp_fsetstat(conn, handle, handle_len, a);
 
 	if (fsync_flag)
 		(void)sftp_fsync(conn, (u_char *)(uintptr_t)handle, handle_len);
+	/* HPN: end copied block for sftp_hpn_upload_finish_remote */
 
 	return status == SSH2_FX_OK ? 0 : -1;
 }
@@ -3057,6 +3111,12 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	off_t resume_offset = 0;
 	int status = 0;
 	int effective_inplace = inplace_flag;
+	/* HPN: how a resume settled the file without the transfer loop:
+	 * 0 repaired, 1 identical, 2 target larger than source. */
+	int skip_ret = 0;
+	/* HPN: set when the chunked resend ran its own transfer meter,
+	 * which counts the file when it stops. */
+	int chunked_metered = 0;
 
 	debug2_f("upload local \"%s\" to remote \"%s\"",
 	    local_path, remote_path);
@@ -3083,126 +3143,95 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 	if (!preserve_flag)
 		a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 
-	/*
-	 * Verified resume (verify=1): stat the remote file quietly.  If it
-	 * exists and has data, compare XXH3_64bits hashes of the overlapping
-	 * prefix.  A match means we can resume; a mismatch (or any error)
-	 * means we restart from scratch, forcing truncation of the remote file
-	 * regardless of inplace_flag.
-	 *
-	 * If the server does not advertise hpn-check-file@hpnssh.org we cannot
-	 * verify anything, so we fail loudly (fatal below) rather than silently
-	 * degrade to a blind size-only resume or a full re-transfer - the
-	 * caller explicitly requested hash verification.
-	 */
+	/* HPN: a verified resume stats the remote file quietly. When it exists
+	 * and holds data, compare hashes of the overlap. A match resumes, or
+	 * skips a file already complete. A mismatch or an error restarts from
+	 * scratch and truncates the remote file, even under --inplace. A
+	 * server without hpn-check-file cannot verify, and the caller asked
+	 * for verification, so that is fatal rather than a quiet fallback. */
 	if (verify) {
+		int chunked, match;
+
 		debug3_f("verify=1 inplace_flag=%d exts=0x%x HPN_CHECK_FILE=0x%x",
 		    inplace_flag, conn->exts, SFTP_EXT_HPN_CHECK_FILE);
 		if (!sftp_conn_has_hpn_check_file(conn)) {
-			/* No silent fallback - see RESUME_INCOMPAT_MSG. */
 			fatal("\"%s\": %s", local_path, RESUME_INCOMPAT_MSG);
-		} else if (sftp_stat(conn, remote_path, 1 /* quiet */, &c) == 0
-		    && c.size > 0) {
+		} else if (sftp_stat(conn, remote_path, 1 /* quiet */,
+		    &c) == 0 && c.size > 0) {
 			debug3_f("remote file exists, size=%llu local_size=%llu",
 			    (unsigned long long)c.size,
 			    (unsigned long long)sb.st_size);
-			/* Resume-check meter: spans the hash work below in
-			 * WORK-bytes - the overlap is hashed on both ends. */
+			/* HPN: the resume-check meter counts the hashing below
+			 * in work-bytes. Both ends hash the overlap. */
 			resume_check_meter_begin(conn,
 			    2 * MINIMUM((off_t)c.size, sb.st_size));
 			if ((off_t)c.size == sb.st_size) {
-				/*
-				 * Chunked-resume fast path: when the server
-				 * supports sftp-hash-range@hpnssh.org, hash
-				 * per-chunk and re-transfer only mismatched
-				 * chunks instead of the whole file.  Declines
-				 * (returns -1) on small files, missing
-				 * extension, or any internal failure, in which
-				 * case we fall through to the whole-file gate
-				 * below - same correctness, just costlier on a
-				 * size-match-hash-mismatch.
-				 */
-				int chunked = sftp_hpn_try_chunked_resume_upload(
+				/* HPN: with sftp-hash-range, hash in chunks and
+				 * resend only the chunks that differ, instead
+				 * of the whole file. It declines with -1 for a
+				 * small file, a server without the extension,
+				 * or an internal failure. The whole-file check
+				 * below then decides, which is as correct but
+				 * slower on a mismatch. */
+				chunked = sftp_hpn_try_chunked_resume_upload(
 				    conn, local_fd, local_path, remote_path,
 				    sb.st_size, (off_t)c.size /* dest clamp */);
 				if (chunked >= 0) {
-					resume_check_meter_end(conn);
-					close(local_fd);
-					/* a chunked re-send metered and
-					 * counted the file itself */
-					if (!(chunked == 0 && showprogress))
-						hpn_pm_count_file();
-					return chunked; /* 1=skip, 0=success */
+					if (chunked == 0 && showprogress)
+						chunked_metered = 1;
+					skip_ret = chunked;
+					goto resume_exit;
 				}
 
-				/*
-				 * Option A: equal size does NOT imply equal
-				 * content.  A range-split destination is
-				 * pre-created at full size, so a crashed
-				 * transfer leaves it full-size with sparse-zero
-				 * holes.  Hash the whole file on both ends and
-				 * only treat it as complete if they match;
-				 * otherwise re-upload from scratch.  Closes the
-				 * crash-resume sparse-hole corruption gap.
-				 */
-				int match = sftp_hpn_prefix_match(conn,
-				    local_fd, remote_path,
-				    (uint64_t)sb.st_size);
+				/* HPN: equal size does not mean equal content.
+				 * A range-split upload creates the remote file
+				 * at full size, so a crash leaves it full size
+				 * with holes of zeros. Hash the whole file on
+				 * both ends and skip only when they match.
+				 * Otherwise upload it again from scratch. */
+				match = sftp_hpn_prefix_match(conn, local_fd,
+				    remote_path, (uint64_t)sb.st_size);
 
 				if (match == 1) {
 					debug("verified transfer: full-file hash "
 					    "match, \"%s\" already complete",
 					    local_path);
-					resume_check_meter_end(conn);
-					close(local_fd);
-					hpn_pm_count_file();
-					return 1; /* identical */
+					skip_ret = 1; /* identical */
+					goto resume_exit;
 				}
 				debug("verified transfer: same size but hash "
 				    "%s for \"%s\"; re-uploading from "
 				    "scratch", match == 0 ? "mismatch" :
 				    "failed", local_path);
-				resume = 0;           /* fresh upload */
-				effective_inplace = 0; /* force TRUNC */
+				resume = 0;	/* fresh upload */
+				effective_inplace = 0;	/* force TRUNC */
 			} else if ((off_t)c.size > sb.st_size) {
-				resume_check_meter_end(conn);
-				close(local_fd);
-				hpn_pm_count_file();
-				return 2; /* target larger than source */
+				skip_ret = 2; /* target larger than source */
+				goto resume_exit;
 			} else {
-				/*
-				 * c.size < sb.st_size: partial remote file.
-				 * Chunked verify FIRST: a lazily-created
-				 * range-split partial grows to its pwrite
-				 * highwater and may hold interior holes below
-				 * that size - prefix resume would append past
-				 * them and corrupt.  Interior holes
-				 * hash-mismatch and re-send; chunks past
-				 * remote EOF are clamped client-side as
-				 * known-missing (never hashed on either end)
-				 * and re-sent directly.  Declines (-1) fall
-				 * through to prefix resume, reached only for
-				 * sequentially written partials and files
-				 * below the chunk threshold.
-				 */
-				int chunked = sftp_hpn_try_chunked_resume_upload(
+				/* HPN: a partial remote file. Try the chunked
+				 * check first, as the download side does. A
+				 * range-split partial grows to its highest write
+				 * and can hold holes below that size, which a
+				 * prefix resume would append past. Holes hash
+				 * differently and are resent, and chunks past
+				 * the remote end are sent without hashing. A
+				 * decline falls through to the prefix resume,
+				 * for sequential partials and files under the
+				 * chunk threshold. */
+				chunked = sftp_hpn_try_chunked_resume_upload(
 				    conn, local_fd, local_path, remote_path,
 				    sb.st_size, (off_t)c.size /* dest clamp */);
 				if (chunked >= 0) {
-					resume_check_meter_end(conn);
-					close(local_fd);
-					/* a chunked re-send metered and
-					 * counted the file itself */
-					if (!(chunked == 0 && showprogress))
-						hpn_pm_count_file();
-					return chunked; /* 1=skip, 0=success */
+					if (chunked == 0 && showprogress)
+						chunked_metered = 1;
+					skip_ret = chunked;
+					goto resume_exit;
 				}
-				/*
-				 * Hash the overlapping prefix to decide whether
-				 * we can safely resume (append) or must restart.
-				 */
-				int match = sftp_hpn_prefix_match(conn,
-				    local_fd, remote_path, c.size);
+				/* HPN: hash the overlapping prefix to choose
+				 * between appending and restarting. */
+				match = sftp_hpn_prefix_match(conn, local_fd,
+				    remote_path, c.size);
 
 				if (match == 1) {
 					debug("verified resume: prefix hash "
@@ -3213,27 +3242,24 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 					debug("verified resume: prefix hash "
 					    "%s; restarting upload",
 					    match == 0 ? "mismatch" : "failed");
-					resume = 0;           /* force fresh upload */
-					effective_inplace = 0; /* force TRUNC */
+					resume = 0;	/* force fresh upload */
+					effective_inplace = 0;	/* force TRUNC */
 				}
 			}
-			/* fall-through paths (mismatch -> fresh upload,
-			 * prefix decision) converge here */
+			/* The mismatch and prefix paths meet here. */
 			resume_check_meter_end(conn);
 		} else {
 			debug3_f("remote file absent or empty; fresh upload");
 		}
-		/* If resume is still 0 (no remote file, empty file, extension
-		 * missing, or hash mismatch) we fall through to a fresh upload. */
+		/* resume is still 0 for a missing or empty remote file or a
+		 * hash mismatch, which upload fresh. */
 	}
 	debug3_f("after verify: resume=%d effective_inplace=%d",
 	    resume, effective_inplace);
 
-	/*
-	 * Plain size-only resume (or verify already set resume=1 above).
-	 * When verify set resume=1 the stat and size check were already done;
-	 * skip them with the !verify guard.
-	 */
+	/* HPN: a plain size-only resume, or a verified one that matched
+	 * above. Verify already did the stat and the size checks, so skip
+	 * them then. */
 	if (resume) {
 		if (!verify) {
 			/* Get remote file size if it exists */
@@ -3242,14 +3268,12 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 				return -1;
 			}
 			if ((off_t)c.size == sb.st_size) {
-				close(local_fd);
-				hpn_pm_count_file();
-				return 1; /* identical */
+				skip_ret = 1; /* identical */
+				goto resume_exit;
 			}
 			if ((off_t)c.size > sb.st_size) {
-				close(local_fd);
-				hpn_pm_count_file();
-				return 2; /* target larger than source */
+				skip_ret = 2; /* target larger than source */
+				goto resume_exit;
 			}
 		}
 		if (lseek(local_fd, (off_t)c.size, SEEK_SET) == -1) {
@@ -3259,11 +3283,9 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 		resume_offset = (off_t)c.size;
 	}
 
-	/*
-	 * If not resuming (fresh upload or verify-restart after hash mismatch),
-	 * ensure local_fd is at offset 0.  sftp_hpn_xxhash_local_fd() may have
-	 * left it positioned partway through the file.
-	 */
+	/* HPN: a fresh upload, or a restart after a hash mismatch, reads from
+	 * offset 0. The hashing above may have left local_fd partway through
+	 * the file. */
 	if (!resume && lseek(local_fd, 0, SEEK_SET) == -1) {
 		error("lseek local \"%s\": %s", local_path, strerror(errno));
 		close(local_fd);
@@ -3299,36 +3321,48 @@ sftp_upload(struct sftp_conn *conn, const char *local_path,
 
 	free(handle);
 
-	/*
-	 * Park for the post-transfer verify phase (HPN): every uploaded file -
-	 * single-file and recursive, since upload_dir_internal funnels through
-	 * here - is verified after the command's transfers finish (closing the
-	 * classic recursive-verify gap).  Only on a clean upload; resume-skipped
-	 * files returned earlier.  No-op unless verify enabled.
-	 */
+	/* HPN: park a clean upload for the verify phase that runs after the
+	 * command's transfers. Single and recursive uploads both pass
+	 * through here. A no-op unless verify transfer is on, and skipped on
+	 * worker connections, which park through the orchestrator. */
 	if (r == 0 && status == 0)
 		sftp_conn_verify_park(conn, local_path, remote_path,
 		    /*local_is_target=*/0, sb.st_size);
 	else
-		sftp_hpn_src_dispose(conn->hpn);	/* no park takes the hash */
+		sftp_hpn_src_dispose(conn->hpn);	/* HPN: no park takes it */
 
 	return (r != 0 || status != 0) ? -1 : 0;
+
+ resume_exit:
+	/* HPN: a resume settled the file without the transfer loop. An
+	 * identical or repaired file still gets -p and -f. */
+	resume_check_meter_end(conn);
+	close(local_fd);
+	if (skip_ret == 0 || skip_ret == 1)
+		sftp_hpn_upload_finish_remote(conn, remote_path, &a,
+		    preserve_flag, fsync_flag, skip_ret == 0);
+	/* HPN: a chunked resend counted its file itself. */
+	if (!chunked_metered)
+		hpn_pm_count_file();
+	return skip_ret;
 }
 
+/* HPN: the serial upload sink's enter_dir. It prints "Entering src" as
+ * upstream's upload walk does. dst, depth and created are for the
+ * parallel sink. */
 static void
 serial_ul_enter_dir(struct sftp_upload_sink *sink, const char *src,
     const char *dst, int depth, int created)
 {
 	struct serial_ul_sink	*ctx = (struct serial_ul_sink *)sink;
 
-	/* shared signature, only the parallel sink uses these */
-	(void)dst;
-	(void)depth;
-	(void)created;
 	if (ctx->print_flag && ctx->print_flag != SFTP_PROGRESS_ONLY)
 		pm_mprintf("Entering %s\n", src);
 }
 
+/* HPN: the serial upload sink's xfer_file. A small file joins the bundle
+ * and is sent when the bundle flushes. Any other file is uploaded now.
+ * Returns -1 when the upload or a flush fails. */
 static int
 serial_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
     const char *dst, const struct stat *src_sb)
@@ -3338,6 +3372,7 @@ serial_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
 
 	if (sftp_hpn_bundle_acc_eligible(ctx->bundle_acc,
 	    (uint64_t)src_sb->st_size)) {
+		/* Add the file, and send the bundle now if that filled it. */
 		if (sftp_hpn_bundle_acc_add(ctx->bundle_acc, src, dst,
 		    src_sb->st_size)) {
 			int flush_result = sftp_hpn_bundle_acc_flush(ctx->conn,
@@ -3359,12 +3394,8 @@ serial_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
 	    src_sb->st_size);
 }
 
-static void
-serial_ul_before_mkdir(struct sftp_upload_sink *sink)
-{
-	(void)sink;	/* serial has no walker phase */
-}
-
+/* HPN: the serial upload sink's defer_dir. It queues the directory's final
+ * remote attrs for the end of the transfer. */
 static void
 serial_ul_defer_dir(struct sftp_upload_sink *sink, const char *dst,
     const Attrib *attrs)
@@ -3374,16 +3405,8 @@ serial_ul_defer_dir(struct sftp_upload_sink *sink, const char *dst,
 	sftp_hpn_dirattrs_defer_remote(ctx->dirs, dst, attrs);
 }
 
-static void
-serial_ul_fail(struct sftp_upload_sink *sink, const char *path,
-    const char *reason)
-{
-	/* Serial has no failure list; the driver's -1 return carries it. */
-	(void)sink;
-	(void)path;
-	(void)reason;
-}
-
+/* HPN: the serial upload sink's aborting. The walk stops on an interrupt
+ * or once a bundle flush has aborted. */
 static int
 serial_ul_aborting(struct sftp_upload_sink *sink)
 {
@@ -3442,9 +3465,7 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 				.base = {
 					.enter_dir = serial_ul_enter_dir,
 					.xfer_file = serial_ul_xfer_file,
-					.before_mkdir = serial_ul_before_mkdir,
 					.defer_dir = serial_ul_defer_dir,
-					.fail = serial_ul_fail,
 					.aborting = serial_ul_aborting,
 				},
 				.conn = conn,
@@ -3481,8 +3502,13 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	return ret;
 }
 
+/* HPN: ask the server, through hpn-fs-info, which filesystem holds path
+ * and how it is striped, for range alignment and Lustre layouts. Fills
+ * info and returns 0. Returns -1 with info zeroed when the server lacks the
+ * extension or rejects the request, or the connection fails. */
 int
-sftp_fs_info(struct sftp_conn *conn, const char *path, struct sftp_fs_info *info)
+sftp_fs_info(struct sftp_conn *conn, const char *path,
+    struct sftp_fs_info *info)
 {
 	struct sshbuf *msg;
 	u_char type;
@@ -3490,19 +3516,20 @@ sftp_fs_info(struct sftp_conn *conn, const char *path, struct sftp_fs_info *info
 	char *fs_type = NULL;
 	int r;
 
+	/* Zero it first, so every failure leaves it empty. */
 	memset(info, 0, sizeof(*info));
 
 	if (!sftp_conn_has_fs_info(conn))
 		return -1;
 
-	debug2("Sending SSH2_FXP_EXTENDED(hpn-fs-info@hpnssh.org) \"%s\"", path);
+	debug2("Sending SSH2_FXP_EXTENDED(%s) \"%s\"", HPN_EXT_FS_INFO, path);
 	id = conn->msg_id++;
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
-	    (r = sshbuf_put_cstring(msg, "hpn-fs-info@hpnssh.org")) != 0 ||
+	    (r = sshbuf_put_cstring(msg, HPN_EXT_FS_INFO)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, path)) != 0)
 		fatal_fr(r, "compose");
 	send_msg(conn, msg);
@@ -3510,7 +3537,7 @@ sftp_fs_info(struct sftp_conn *conn, const char *path, struct sftp_fs_info *info
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
-	if (get_msg_extended(conn, msg, 0) != 0) {
+	if (get_msg(conn, msg) != 0) {
 		debug_f("no reply (connection dead)");
 		sshbuf_free(msg);
 		return -1;
@@ -3525,6 +3552,7 @@ sftp_fs_info(struct sftp_conn *conn, const char *path, struct sftp_fs_info *info
 		sshbuf_free(msg);
 		return -1;
 	}
+	/* A STATUS here means the server rejected the request. */
 	if (type != SSH2_FXP_EXTENDED_REPLY) {
 		debug_f("expected SSH2_FXP_EXTENDED_REPLY, got %u", type);
 		sshbuf_free(msg);
@@ -3548,23 +3576,19 @@ sftp_fs_info(struct sftp_conn *conn, const char *path, struct sftp_fs_info *info
 	return 0;
 }
 
-/*
- * sftp_create_file - create the remote file if absent, WITHOUT truncating
- * an existing one and WITHOUT pinning a logical size.  Used by the lazy
- * first-writer gate of range-split transfers: the file appears on the
- * remote only once data is actually about to flow, and its size then
- * grows with the pwrite highwater (honest sizes for interrupted
- * transfers; verified resume handles the short file via chunk clamping).
- * Sets *permanent_out on failures that retrying cannot cure
- * (SSH2_FX_PERMISSION_DENIED).
- */
+/* HPN: create remote_path if it is absent, without truncating an existing
+ * file or setting its size. The range-split transfers call it just before
+ * the first write, so the file appears only once data is about to flow and
+ * then grows with the data written. An interrupted transfer leaves an honest
+ * size, and verified resume handles the short file. Sets *permanent_out
+ * when retrying cannot help, which means a permission denial. */
 int
 sftp_create_file(struct sftp_conn *conn, const char *remote_path, mode_t mode,
     int *permanent_out)
 {
 	u_char *handle = NULL;
-	size_t  handle_len;
-	Attrib  a;
+	size_t handle_len;
+	Attrib a;
 
 	if (permanent_out != NULL)
 		*permanent_out = 0;
@@ -3573,49 +3597,46 @@ sftp_create_file(struct sftp_conn *conn, const char *remote_path, mode_t mode,
 	a.perm = mode & 07777;
 	if (send_open(conn, remote_path, "lazy-create",
 	    SSH2_FXF_WRITE | SSH2_FXF_CREAT, &a, &handle, &handle_len) != 0) {
-		/* send_open already logged; classify permission failures so
-		 * the unit gives up instead of retrying a permanent error. */
-		if (permanent_out != NULL &&
+		/* send_open has logged the error. A failure that leaves the
+		 * connection alive came from the server's own STATUS reply,
+		 * so last_status is this open's. A permission denial is
+		 * permanent, and the unit gives up rather than retrying. */
+		if (permanent_out != NULL && !sftp_conn_is_dead(conn) &&
 		    conn->hpn->last_status == SSH2_FX_PERMISSION_DENIED)
 			*permanent_out = 1;
 		return -1;
 	}
+	/* The file exists now, and a failed close does not change that. */
 	(void)sftp_close(conn, handle, handle_len);
 	free(handle);
 	return 0;
 }
 
+/* HPN: upload one byte range of a local file into the same range of the
+ * remote file. The contract is at the prototype in sftp-client.h. */
 int
 sftp_upload_range(struct sftp_conn *conn, const char *local_path,
     const char *remote_path, off_t range_offset, off_t range_length,
     off_t *acked_out, struct sftp_range_warm *warm, uint64_t *range_hash_out)
 {
 	struct sshbuf *msg;
-	struct request {
-		u_int id;
-		size_t len;
-		uint64_t offset;
-		TAILQ_ENTRY(request) tq;
-	};
-	TAILQ_HEAD(, request) acks;
+	struct requests acks;
 	struct request *ack;
 	u_char *handle = NULL, *data = NULL, type;
 	size_t handle_len;
-	u_int id, ackid;
+	u_int id, rid, outstanding = 0;
 	uint32_t status = SSH2_FX_OK;
 	off_t offset = range_offset, bytes_left = range_length;
 	off_t first_fail_off = -1;
-	int local_fd = -1, ret = -1, r, yielded = 0, teed = 0;
+	int local_fd = -1, ret = -1, r, yielded = 0, teed = 0, read_failed = 0;
 
 	if (acked_out != NULL)
 		*acked_out = 0;
 	TAILQ_INIT(&acks);
 
-	/* Defensive: submit_upload_ranges only ever emits positive-length
-	 * ranges (its effective_ranges pass drops any <= 0), so a non-positive
-	 * length here means a malformed range unit reached the wire.  Reject it
-	 * rather than skipping the send loop and returning success, which would
-	 * launder the bug as a completed transfer. */
+	/* submit_upload_ranges only emits ranges of positive length, so
+	 * anything else is a malformed unit. Fail it, rather than skip the
+	 * send loop and report a transfer that never happened. */
 	if (range_length <= 0) {
 		error_f("refusing upload range of non-positive length %lld "
 		    "for \"%s\"", (long long)range_length, remote_path);
@@ -3631,15 +3652,11 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		    (long long)range_offset, strerror(errno));
 		goto out;
 	}
-	/*
-	 * Warm handle: reuse the open remote handle across consecutive same-
-	 * file ranges (skips the close/reopen + cold-window dip at the range
-	 * boundary).  The caller is expected to keep warm->handle for THIS
-	 * remote_path (it closes a stale one on file change); we also verify
-	 * warm->path matches here, so a caller-side slip opens fresh rather
-	 * than writing this range into the previous file's handle.  Otherwise
-	 * open fresh, without O_CREAT/O_TRUNC - the file was pre-created.
-	 */
+	/* Reuse the warm handle when the previous range was this same file.
+	 * That skips the close and reopen, and the slow start after them. The
+	 * caller closes a stale handle when the file changes, and the path
+	 * check here opens fresh if it ever does not. Otherwise open without
+	 * O_CREAT or O_TRUNC, because the file already exists. */
 	if (warm != NULL && warm->handle != NULL &&
 	    warm->path != NULL && strcmp(warm->path, remote_path) == 0) {
 		handle = warm->handle;
@@ -3650,40 +3667,37 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 
 	data = xmalloc(conn->upload_buflen);
 	id = conn->msg_id;
-	ackid = id + 1;
 	offset = range_offset;
 	bytes_left = range_length;
 
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 
-	/* Verify transfer: tee this range's source bytes into a streaming
-	 * XXH3 as we read them to send, so the finalize verify can reuse the
-	 * hash instead of re-reading the source.  Only when the caller asked
-	 * (range_hash_out != NULL).  A range that does not transfer in one
-	 * clean pass (yield / partial / retry) leaves acked < range_length;
-	 * the caller detects that and re-reads just that range at finalize. */
-	if (range_hash_out != NULL && conn->hpn != NULL) {
+	/* With verify on, hash the source bytes as they are read, so the
+	 * verify step can use the hash instead of reading the source again.
+	 * The caller asks for it with range_hash_out. A range that does not
+	 * finish in one clean pass, through a yield, failure, or retry, acks
+	 * less than range_length, and the caller then reads just that range
+	 * again at verify time. */
+	if (range_hash_out != NULL) {
 		sftp_hpn_src_arm(conn->hpn);
 		teed = 1;
 	}
 
 	for (;;) {
 		int len = 0;
-		size_t outstanding = id - ackid + 1;
 
-		/* Cooperative yield (HPN tail redistribution): stop sending
-		 * NEW writes; the in-order ack drain below runs to completion,
-		 * so the contiguous-acked highwater lands exactly at the end
-		 * of the last write already sent - the caller requeues only
-		 * the untouched remainder. */
+		/* A yield stops new writes. The drain below still collects
+		 * every write already sent, so the acked offset ends where
+		 * the last of them ended, and the caller requeues only the
+		 * rest. */
 		if (!yielded && yield_requested(conn))
 			yielded = 1;
 
-		/* Send new requests while there is data and pipeline capacity.
-		 * HPN adaptive read-ahead caps the depth (num_requests when
-		 * disabled). */
-		while (!yielded && bytes_left > 0 &&
+		/* Send writes while there is data and room in the pipeline.
+		 * The read-ahead controller sets the depth, which never
+		 * exceeds num_requests. */
+		while (!yielded && !read_failed && bytes_left > 0 &&
 		    outstanding < sftp_conn_rdahead_cap(conn) &&
 		    status == SSH2_FX_OK) {
 			size_t want = conn->upload_buflen;
@@ -3695,11 +3709,11 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			    (errno == EINTR || errno == EAGAIN ||
 			     errno == EWOULDBLOCK));
 			if (len <= 0) {
-				/* Mid-range EOF/read-error: should be
-				 * impossible on an intact source (length is
-				 * clamped at submit).  Loudly diagnose - the
-				 * silent break here masked partial sends as
-				 * success until 2026-06-12. */
+				/* A read failure or early EOF inside the range
+				 * means the source changed or is unreadable.
+				 * Stop reading. The writes already sent drain,
+				 * and the check after the loop fails the range
+				 * for retry. */
 				error("read local \"%s\" at offset %lld: "
 				    "len=%d errno=%s (range [%lld+%lld), "
 				    "%lld left)", local_path,
@@ -3708,19 +3722,18 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 				    (long long)range_offset,
 				    (long long)range_length,
 				    (long long)bytes_left);
+				read_failed = 1;
 				break;
 			}
 
-			/* Tee the clean source bytes so the verify hash
-			 * reflects the source as read. */
+			/* Hash the bytes as read, so the verify hash
+			 * reflects the source. */
 			if (teed)
 				sftp_hpn_src_feed(conn->hpn, data, (size_t)len);
 
-			ack = xcalloc(1, sizeof(*ack));
-			ack->id     = ++id;
-			ack->len    = (size_t)len;
-			ack->offset = (uint64_t)offset;
-			TAILQ_INSERT_TAIL(&acks, ack, tq);
+			ack = request_enqueue(&acks, ++id, (size_t)len,
+			    (uint64_t)offset);
+			outstanding++;
 
 			sshbuf_reset(msg);
 			if ((r = sshbuf_put_u8(msg, SSH2_FXP_WRITE)) != 0 ||
@@ -3735,24 +3748,19 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 
 			offset    += len;
 			bytes_left -= len;
-			outstanding = id - ackid + 1;
 		}
 
 		/* Drain one ACK per iteration. */
 		if (TAILQ_EMPTY(&acks))
 			break;
-		ack = TAILQ_FIRST(&acks);
 		sshbuf_reset(msg);
-		/* Check get_msg_extended return - connection death (EPIPE)
-		 * already sets conn->hpn->dead inside get_msg_extended.
-		 * Without this check, the subsequent parse would fatal_fr
-		 * on the empty msg buffer and crash the orchestrator.
-		 *
-		 * Time the STATUS read so a wedged-path signal can reach
-		 * the rdahead controller - same mechanism as do_upload_body. */
+		/* Time the STATUS read so the read-ahead controller can react
+		 * to a wedged path, as in do_upload_body. A dead connection
+		 * fails here, before the parse below could fatal on an empty
+		 * reply. */
 		{
 			double t_status_start = monotime_double();
-			if (get_msg_extended(conn, msg, 0) != 0) {
+			if (get_msg(conn, msg) != 0) {
 				status = SSH2_FX_FAILURE;
 				break;
 			}
@@ -3761,10 +3769,9 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 				sftp_conn_rdahead_backpressure_signal(conn);
 		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &ackid)) != 0)
+		    (r = sshbuf_get_u32(msg, &rid)) != 0)
 			fatal_fr(r, "parse status");
 		if (type != SSH2_FXP_STATUS) {
-			/* Was fatal_f("expected SSH2_FXP_STATUS..."). */
 			sftp_conn_die(conn,
 			    "expected SSH2_FXP_STATUS(%u), got %u",
 			    SSH2_FXP_STATUS, type);
@@ -3773,16 +3780,22 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		}
 		if ((r = sshbuf_get_u32(msg, &status)) != 0)
 			fatal_fr(r, "parse status code");
+		/* Match the reply to its write by id, like do_upload_body. */
+		if ((ack = request_find(&acks, rid)) == NULL) {
+			sftp_conn_die(conn, "unexpected reply id %u", rid);
+			status = SSH2_FX_FAILURE;
+			break;
+		}
 		if (status != SSH2_FX_OK) {
 			error("write remote \"%s\" at offset %llu: %s",
 			    remote_path, (unsigned long long)ack->offset,
 			    fx2txt(status));
 			if (status == SSH2_FX_PERMISSION_DENIED)
 				sftp_conn_set_perm_denied(conn); /* HPN: no-retry */
-			/* Highwater clamp: acks are processed in order, but
-			 * the loop keeps draining after a failed write, so
-			 * later OK acks would advance the head past a HOLE.
-			 * Contiguous progress ends at the first failure. */
+			/* The loop keeps draining after a failed write, and
+			 * later successes would move the head of the list
+			 * past the hole. Contiguous progress ends at the
+			 * lowest failed offset. */
 			if (first_fail_off < 0 ||
 			    (off_t)ack->offset < first_fail_off)
 				first_fail_off = (off_t)ack->offset;
@@ -3793,24 +3806,23 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			 * estimator (see sftp_conn_pace_ack). */
 			sftp_conn_pace_ack(conn, ack->len,
 			    conn->num_requests);
-			/* Report incremental progress so the orchestrator's
-			 * bps window sees a steady stream rather than a step
-			 * at range completion. */
+			/* Report progress per ack, so the orchestrator's
+			 * rate window sees a steady stream rather than a
+			 * step when the range completes. */
 			sftp_conn_live_account(conn, ack->len);
 		}
 		TAILQ_REMOVE(&acks, ack, tq);
 		free(ack);
+		outstanding--;
 	}
 	sshbuf_free(msg);
 
-	/* GUARD (run BEFORE the close decision so 'status' is final): a range
-	 * that did not send every byte is NOT a success, whatever the status
-	 * says - the send loop can exit early (local read failure, future
-	 * logic changes) and silently finalizing a short range as complete is
-	 * data loss.  Fail it; the caller's retry/highwater-resume machinery
-	 * finishes the remainder.  A cooperative yield takes this path
-	 * deliberately (quietly): the non-success return routes the remainder
-	 * through the same requeue machinery, reclassified as voluntary. */
+	/* This check runs before the close decision, so status is final. A
+	 * range that did not send every byte is not a success, whatever the
+	 * status says. Finishing a short range as complete would lose data,
+	 * so fail it and let the caller's retry send the rest. A yield takes
+	 * this path on purpose, and quietly. The caller sees the failure and
+	 * requeues the remainder as a voluntary handoff. */
 	if (status == SSH2_FX_OK && bytes_left > 0) {
 		if (yielded)
 			debug("range [%lld+%lld) of \"%s\" yielded with %lld "
@@ -3826,16 +3838,20 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		status = SSH2_FX_FAILURE;
 	}
 
-	/*
-	 * Warm-handle close decision: leave the handle OPEN for the next same-
-	 * file range ONLY on a clean success; otherwise close it now (a
-	 * failed, yielded, or wedged handle must never be reused).  On the
-	 * leave-open path, ownership of `handle` passes to *warm and we NULL
-	 * the local so the out: free does not touch it.
-	 */
+	/* Keep the handle open for the next range of the same file only
+	 * after a clean success. A failed, yielded, or wedged handle is never
+	 * reused, so close it. When it stays open, *warm owns it, and handle
+	 * is cleared so the free at out leaves it alone. */
 	if (status == SSH2_FX_OK && warm != NULL) {
 		if (warm->handle != handle) {
-			/* freshly opened this call - take ownership into *warm */
+			/* Opened by this call, so *warm takes it over. A
+			 * handle left there for another path is closed
+			 * first, rather than leaked. */
+			if (warm->handle != NULL) {
+				(void)sftp_close(conn, warm->handle,
+				    warm->handle_len);
+				free(warm->handle);
+			}
 			free(warm->path);
 			warm->handle = handle;
 			warm->handle_len = handle_len;
@@ -3860,14 +3876,12 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	    (long long)range_offset, (long long)range_length, ret, status,
 	    (long long)offset, (long long)bytes_left,
 	    TAILQ_EMPTY(&acks) ? "none" : "some");
-	/*
-	 * Contiguous-acked highwater for resume-on-requeue (HPN).  Acks are
-	 * processed strictly in order, so everything below the head of the
-	 * outstanding list is acknowledged; with the list empty, everything
-	 * sent is.  Clamped at the first failed write offset (a hole ends
-	 * contiguity).  On success the caller does not need it; on failure
-	 * the worker requeues only [range_offset + acked, end).
-	 */
+	/* HPN: the contiguous acked offset, so a requeue resumes there. The
+	 * list of outstanding writes stays in offset order, so everything
+	 * below its head is acknowledged, and with the list empty everything
+	 * sent is. A failed write ends contiguity at its offset. On success
+	 * the caller does not need it. On failure the worker requeues only
+	 * [range_offset + acked, end). */
 	if (acked_out != NULL) {
 		off_t acked_end = TAILQ_EMPTY(&acks) ?
 		    offset : (off_t)TAILQ_FIRST(&acks)->offset;
@@ -3881,9 +3895,9 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		TAILQ_REMOVE(&acks, ack, tq);
 		free(ack);
 	}
-	/* Finalize the tee.  src_take writes *range_hash_out only when the
-	 * teed byte count equals range_length; the caller additionally gates
-	 * on a clean (acked == range_length) transfer before trusting it. */
+	/* Finish the hash. src_take writes *range_hash_out only when the
+	 * hashed byte count equals range_length, and the caller also checks
+	 * that the whole range was acked before trusting it. */
 	if (teed) {
 		sftp_hpn_src_finish(conn->hpn);
 		(void)sftp_hpn_src_take(conn->hpn, (uint64_t)range_length,
@@ -3895,22 +3909,29 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 	return ret;
 }
 
-/* Lowest outstanding read offset (HPN highwater helper): everything below
- * the floor of the in-flight request set has been received and written.
- * With nothing outstanding, contiguity extends to next_off. */
-static off_t
-dl_outstanding_floor(struct requests *requests, uint64_t next_off)
+/* HPN: give up on every read still outstanding in sftp_download_range and
+ * free them. Their data never arrived, so contiguous progress ends at the
+ * lowest of their offsets, or at next_off when none is left. *contig_end
+ * is lowered to that, where -1 means nothing has bounded it yet. */
+static void
+dl_abandon_requests(struct requests *requests, uint64_t next_off,
+    off_t *contig_end)
 {
 	struct request *req;
 	off_t lowest = (off_t)next_off;
 
-	TAILQ_FOREACH(req, requests, tq) {
+	while ((req = TAILQ_FIRST(requests)) != NULL) {
 		if ((off_t)req->offset < lowest)
 			lowest = (off_t)req->offset;
+		TAILQ_REMOVE(requests, req, tq);
+		free(req);
 	}
-	return lowest;
+	if (*contig_end < 0 || lowest < *contig_end)
+		*contig_end = lowest;
 }
 
+/* HPN: download one byte range of a remote file into the same range of the
+ * local file. The contract is at the prototype in sftp-client.h. */
 int
 sftp_download_range(struct sftp_conn *conn, const char *remote_path,
     const char *local_path, off_t range_offset, off_t range_length,
@@ -3924,17 +3945,20 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	u_int id, buflen, num_req, max_req, status = SSH2_FX_OK;
 	uint64_t remote_offset;
 	off_t bytes_left;
+	double t_data_start;
 	int local_fd = -1, read_error = 0, write_error = 0, write_errno = 0;
 	int ret = -1, r, yielded = 0, seen_zerolen = 0;
-	off_t contig_end = -1;	/* HPN: min over failure-site floors/clamps */
+	/* HPN: where contiguous progress stops, the lowest offset any failure
+	 * bounded it at. -1 until one does. */
+	off_t contig_end = -1;
 
 	if (acked_out != NULL)
 		*acked_out = 0;
 	TAILQ_INIT(&requests);
 
-	/* Defensive: see sftp_upload_range - a non-positive range length is a
-	 * malformed unit (submit_download_ranges never emits one); reject it
-	 * instead of silently "succeeding" on an empty send/recv loop. */
+	/* submit_download_ranges only emits ranges of positive length, so
+	 * anything else is a malformed unit. Fail it, as sftp_upload_range
+	 * does, rather than succeed on an empty loop. */
 	if (range_length <= 0) {
 		error_f("refusing download range of non-positive length %lld "
 		    "for \"%s\"", (long long)range_length, remote_path);
@@ -3946,8 +3970,8 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	    SSH2_FXF_READ, NULL, &handle, &handle_len) != 0)
 		return -1;
 
-	/* Open pre-created local file for writing; no O_CREAT/O_TRUNC -
-	 * the orchestrator pre-created it at the correct size. */
+	/* Open the local file for writing, without O_CREAT or O_TRUNC,
+	 * because the orchestrator created it at the right size. */
 	if ((local_fd = open(local_path, O_WRONLY)) < 0) {
 		error("open local \"%s\": %s", local_path, strerror(errno));
 		sftp_close(conn, handle, handle_len);
@@ -3956,6 +3980,8 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 
 	buflen = conn->download_buflen;
 	num_req = 0;
+	/* Start with one read. The read-ahead controller widens the window
+	 * as replies arrive. */
 	max_req = 1;
 	remote_offset = (uint64_t)range_offset;
 	bytes_left = range_length;
@@ -3964,12 +3990,11 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 		fatal_f("sshbuf_new failed");
 
 	while (num_req > 0 || (bytes_left > 0 && max_req > 0)) {
-		/* Cooperative yield (HPN tail redistribution): stop issuing
-		 * NEW read requests; the loop drains everything already in
-		 * flight (those bytes were the most expensive to earn on a
-		 * slow stream - keep them), then exits with remote_offset at
-		 * the end of the last issued request, which is exactly the
-		 * highwater the clean-drain math below reports. */
+		/* A yield stops new reads. The reads already in flight still
+		 * drain, since those bytes were the costliest to get on a
+		 * slow stream. The loop then exits with remote_offset at the
+		 * end of the last read issued, which is the acked offset the
+		 * code below reports. */
 		if (!yielded && yield_requested(conn)) {
 			yielded = 1;
 			max_req = 0;
@@ -3990,22 +4015,14 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 		}
 
 		sshbuf_reset(msg);
-		/* Time the DATA-reply read so the rdahead controller can
-		 * react to a wedged path - same mechanism as the upload-
-		 * side STATUS-read instrumentation in sftp_upload_range. */
-		double t_data_start = monotime_double();
-		if (get_msg_extended(conn, msg, 0) != 0) {
+		/* Time the DATA read so the read-ahead controller can react
+		 * to a wedged path, as sftp_upload_range does for its STATUS
+		 * reads. */
+		t_data_start = monotime_double();
+		if (get_msg(conn, msg) != 0) {
 			read_error = 1;
-			if (acked_out != NULL) {
-				off_t lowest = dl_outstanding_floor(&requests,
-				    remote_offset);
-				if (contig_end < 0 || lowest < contig_end)
-					contig_end = lowest;
-			}
-			while ((req = TAILQ_FIRST(&requests)) != NULL) {
-				TAILQ_REMOVE(&requests, req, tq);
-				free(req);
-			}
+			dl_abandon_requests(&requests, remote_offset,
+			    &contig_end);
 			num_req = max_req = 0;
 			break;
 		}
@@ -4015,9 +4032,10 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 		    (r = sshbuf_get_u32(msg, &id)) != 0)
 			fatal_fr(r, "parse");
 		if ((req = request_find(&requests, id)) == NULL) {
-			/* Worker thread: a fatal here would kill the
-			 * orchestrator. Mark the conn dead and let the drain
-			 * below fail the range soft, as sftp_download does. */
+			/* This runs in a worker, where fatal would kill the
+			 * orchestrator. Mark the connection dead, and the
+			 * check after the loop fails the range, as
+			 * sftp_download does. */
 			sftp_conn_die(conn, "unexpected reply id %u", id);
 			read_error = 1;
 			num_req = max_req = 0;
@@ -4026,6 +4044,9 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 
 		switch (type) {
 		case SSH2_FXP_STATUS:
+			/* Any STATUS reply to a read fails the range. The
+			 * range lies inside the file, so even EOF means the
+			 * file shrank. */
 			if ((r = sshbuf_get_u32(msg, &status)) != 0)
 				fatal_fr(r, "parse status");
 			if (status == SSH2_FX_EOF)
@@ -4037,21 +4058,10 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			if (status == SSH2_FX_PERMISSION_DENIED)
 				sftp_conn_set_perm_denied(conn); /* HPN: no-retry */
 			read_error = 1;
-			/* The failing read's own offset bounds contiguity. */
-			if (contig_end < 0 || (off_t)req->offset < contig_end)
-				contig_end = (off_t)req->offset;
-			if (acked_out != NULL) {
-				off_t lowest = dl_outstanding_floor(&requests,
-				    remote_offset);
-				if (contig_end < 0 || lowest < contig_end)
-					contig_end = lowest;
-			}
-			TAILQ_REMOVE(&requests, req, tq);
-			free(req);
-			while ((req = TAILQ_FIRST(&requests)) != NULL) {
-				TAILQ_REMOVE(&requests, req, tq);
-				free(req);
-			}
+			/* The failed read is still in the list, so its own
+			 * offset bounds contiguity too. */
+			dl_abandon_requests(&requests, remote_offset,
+			    &contig_end);
 			num_req = max_req = 0;
 			break;
 		case SSH2_FXP_DATA: {
@@ -4060,8 +4070,8 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			if ((r = sshbuf_get_string(msg, &data, &len)) != 0)
 				fatal_fr(r, "parse data");
 			if (len > req->len) {
-				/* Same worker-thread hazard as the unexpected
-				 * reply id above. Fail the range soft. */
+				/* The same worker hazard as the unexpected
+				 * reply id above. Fail the range. */
 				sftp_conn_die(conn, "received more data than "
 				    "requested %zu > %zu", len, req->len);
 				free(data);
@@ -4070,9 +4080,9 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				break;
 			}
 			if (len == 0) {
-				/* Same anti-livelock guard as sftp_download
-				 * (upstream c1cebbc7c). A second zero-length
-				 * DATA reply means a broken server. */
+				/* The same livelock guard as sftp_download. A
+				 * second zero-length DATA reply means a broken
+				 * server. */
 				if (seen_zerolen) {
 					sftp_conn_die(conn,
 					    "server sent zero data length");
@@ -4084,6 +4094,9 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				seen_zerolen = 1;
 			}
 			sftp_conn_bytes_wired_add(conn, (uint64_t)len);
+			/* Later replies are still written after a write error,
+			 * as in sftp_download, but only the first error is kept
+			 * and nothing more counts as progress. */
 			if ((lseek(local_fd, (off_t)req->offset,
 			    SEEK_SET) == -1 ||
 			    atomicio(vwrite, local_fd, data, len) != len) &&
@@ -4091,12 +4104,12 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				write_errno = errno;
 				write_error = 1;
 				max_req = 0;
-				/* Data past this point may be received but
-				 * is not on disk; bound contiguity here. */
+				/* Data past this point may have arrived but is
+				 * not on disk, so contiguity ends here. */
 				if (contig_end < 0 ||
 				    (off_t)req->offset < contig_end)
 					contig_end = (off_t)req->offset;
-			} else
+			} else if (!write_error)
 				sftp_conn_live_account(conn, len);
 			free(data);
 			if (len == req->len) {
@@ -4104,15 +4117,17 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 				free(req);
 				num_req--;
 			} else {
-				/* Short read - re-request remainder. */
+				/* Short read. Request the rest. */
 				req->id = conn->msg_id++;
 				req->len -= len;
 				req->offset += len;
 				send_read_request(conn, req->id, req->offset,
 				    (u_int)req->len, handle, handle_len);
 			}
+			/* HPN: a yield or a write error set max_req to 0, and
+			 * it stays 0. Otherwise the read-ahead controller sets
+			 * the window. */
 			if (max_req > 0)
-				/* HPN adaptive read-ahead window. */
 				max_req = sftp_conn_rdahead_window(conn, len);
 			break;
 		}
@@ -4122,48 +4137,29 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			    SSH2_FXP_DATA, type);
 			sftp_conn_set_protocol_violation(conn);
 			read_error = 1;
-			if (acked_out != NULL) {
-				off_t lowest = dl_outstanding_floor(&requests,
-				    remote_offset);
-				if (contig_end < 0 || lowest < contig_end)
-					contig_end = lowest;
-			}
-			while ((req = TAILQ_FIRST(&requests)) != NULL) {
-				TAILQ_REMOVE(&requests, req, tq);
-				free(req);
-			}
+			dl_abandon_requests(&requests, remote_offset,
+			    &contig_end);
 			num_req = max_req = 0;
 			break;
 		}
 	}
 	sshbuf_free(msg);
 
-	/*
-	 * Same as the single-file path: a non-empty queue here is a dead
-	 * connection (early break), not a clean completion.  Fail soft so the
-	 * worker respawns instead of fatal()-ing the whole orchestrator.
-	 */
+	/* As in sftp_download, reads still queued here mean the connection
+	 * was lost, not that the range finished. Fail the range, so the
+	 * worker respawns instead of taking the orchestrator down. */
 	if (TAILQ_FIRST(&requests) != NULL) {
 		if (!sftp_conn_is_dead(conn))
 			sftp_conn_die(conn, "range download of \"%s\" ended "
 			    "with requests still in flight (connection lost)",
 			    remote_path);
-		if (acked_out != NULL) {
-			off_t lowest = dl_outstanding_floor(&requests,
-			    remote_offset);
-			if (contig_end < 0 || lowest < contig_end)
-				contig_end = lowest;
-		}
-		while ((req = TAILQ_FIRST(&requests)) != NULL) {
-			TAILQ_REMOVE(&requests, req, tq);
-			free(req);
-		}
+		dl_abandon_requests(&requests, remote_offset, &contig_end);
 		read_error = 1;
 	}
 
-	/* HPN highwater out: contiguous bytes received AND written from the
-	 * range start.  contig_end < 0 means no failure bounded it (clean
-	 * completion or nothing in flight): everything requested landed. */
+	/* HPN: the contiguous bytes received and written from the start of
+	 * the range. contig_end < 0 means no failure bounded it, so
+	 * everything requested landed. */
 	if (acked_out != NULL) {
 		off_t acked_end = (contig_end >= 0) ?
 		    contig_end : (off_t)remote_offset;
@@ -4172,15 +4168,13 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			*acked_out = acked_end - range_offset;
 	}
 
-	/* GUARD (twin of upload_range's): a range that did not request and
-	 * receive every byte is NOT a success, whatever the error flags say -
-	 * the request loop can exit early (max_req collapse, future logic
-	 * changes) and silently finalizing a short range as complete is data
-	 * loss.  bytes_left counts the unrequested remainder; with no
-	 * outstanding requests it must be zero at a genuine completion.  A
-	 * cooperative yield takes this path deliberately (quietly): the
-	 * non-success return routes the remainder through the same requeue
-	 * machinery, and the caller reclassifies it as voluntary. */
+	/* This check mirrors sftp_upload_range's. A range that did not
+	 * request and receive every byte is not a success, whatever the
+	 * error flags say. Finishing a short range as complete would lose
+	 * data. bytes_left counts what was never requested, and with no reads
+	 * outstanding it must be zero when the range really finished. A
+	 * yield takes this path on purpose, and quietly. The caller sees the
+	 * failure and requeues the remainder as a voluntary handoff. */
 	if (!read_error && !write_error && bytes_left > 0) {
 		if (yielded)
 			debug("range [%lld+%lld) of \"%s\" yielded with %lld "
@@ -4212,22 +4206,22 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 	return ret;
 }
 
-/*
- * Mark every entry in the batch that has not already been recorded as
- * failed as failed.  Used by the batch upload path when a collection phase
- * hits a dead connection or a protocol problem mid-batch: rather than
- * calling fatal_fr (which terminates the entire process - catastrophic
- * for parallel workers handling unrelated transfers), we abandon the
- * batch.  The caller (worker_thread) re-queues each failed entry via
- * worker_process_result on a fresh connection.
- */
+/* HPN: fail every entry of the batch that is still open and has not
+ * already failed, and set *any_fail. Collecting an entry's CLOSE reply
+ * frees its handle, so a file that closed cleanly keeps its success. The
+ * batch path calls this when collecting replies hits a dead connection or
+ * a protocol error. Abandoning the batch, instead of calling fatal, keeps
+ * the other parallel workers running. The worker retries each failed entry
+ * through worker_finalize_one_entry, on a fresh connection when this one
+ * died. */
 static void
 batch_fail_all_remaining(struct batch_file *files,
     struct sftp_upload_batch_entry *entries, int n, int *any_fail)
 {
 	int i;
+
 	for (i = 0; i < n; i++) {
-		if (!files[i].failed) {
+		if (files[i].handle != NULL && !files[i].failed) {
 			files[i].failed = 1;
 			entries[i].result = -1;
 			*any_fail = 1;
@@ -4235,97 +4229,79 @@ batch_fail_all_remaining(struct batch_file *files,
 	}
 }
 
-/* ── BEGIN Phase 4 gap 1: sliding-window batch send/finish ────────────────
- *
- * Implementation note: an unsplit batch would do all 5 phases back-to-back.
- * Splitting into send (phases 1-4) and finish (phase 5)
- * lets the caller pipeline: the next batch's OPENs (phase 1) can be on
- * the wire while the previous batch's CLOSE STATUSes (phase 5) are still
- * coming back.  Saves ~1 RTT per batch boundary.
- *
- * Wire ordering when send is called with prev != NULL:
- *   1. Send THIS batch's OPENs (phase 1)
- *   2. Drain PREV's CLOSE STATUSes (the prev_finish step) - they should be
- *      arriving / arrived since prev's CLOSEs were sent before this call
- *   3. Collect THIS batch's HANDLEs (phase 2)
- *   4. The rest of phases 3-4 for this batch
- *
- * The overlap: between step 1 (we send opens) and step 2 (we read close
- * statuses), the server is processing both - sending close statuses for
- * prev AND opening files for the current batch - concurrently.
- */
+/* HPN: the batch upload is split in two, so consecutive batches overlap.
+ * sftp_upload_batch_send runs phases 1 to 4: it sends the OPENs, collects
+ * the handles, writes the files, and sends the CLOSEs.
+ * sftp_upload_batch_finish runs phase 5 and collects the CLOSE replies.
+ * Given the previous batch, send puts this batch's OPENs on the wire, then
+ * collects the previous batch's CLOSE replies, then this batch's handles.
+ * The server works on both batches at once, which saves about one round
+ * trip per batch. */
 
-/* Phase 5 + cleanup, factored out for use by both finish and error paths. */
+/* HPN: phase 5 of the batch upload. Collect each file's replies in send
+ * order: first those to what phase 4 sent ahead of its CLOSE, then the
+ * CLOSE's own. Fail each entry whose close failed. Then close the local
+ * files still open and free files. sftp_upload_batch_finish is the only
+ * caller. Returns -1 if any entry failed, else 0. */
 static int
 batch_phase5_and_cleanup(struct sftp_conn *conn,
     struct sftp_upload_batch_entry *entries, struct batch_file *files,
     int n, int any_fail_in)
 {
-	struct sshbuf *msg;
-	int i, r, any_fail = any_fail_in;
+	u_int status;
+	int i, k, any_fail = any_fail_in;
 
 	debug_f("batch upload phase 5: collecting %d close replies", n);
-	if ((msg = sshbuf_new()) == NULL)
-		fatal_f("sshbuf_new failed");
 	for (i = 0; i < n; i++) {
-		u_char type;
-		u_int status, rid;
-
+		/* An entry that never opened has no replies to collect. */
 		if (files[i].handle == NULL)
 			continue;
-		if (get_msg(conn, msg) != 0) {
-			error_f("batch close: connection closed while "
-			    "collecting responses (entry %d/%d)", i, n);
-			batch_fail_all_remaining(files, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
+		/* Replies come back in send order, so the next ones must
+		 * belong to entry i. get_status checks each id. The ones
+		 * ahead of the CLOSE are best effort, as in sftp_upload. A
+		 * failure is logged and the file's result stands. */
+		for (k = 0; k < files[i].npre_close; k++) {
+			status = get_status(conn, files[i].pre_close_ids[k]);
+			if (status == SSH2_FX_CONNECTION_LOST)
+				goto lost;
+			if (status != SSH2_FX_OK)
+				error("batch %s \"%s\": %s",
+				    files[i].pre_close_what[k],
+				    entries[i].remote_path, fx2txt(status));
 		}
-		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
-			error_fr(r, "parse batch close response");
-			batch_fail_all_remaining(files, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
-		}
-		if (type != SSH2_FXP_STATUS) {
-			error_f("batch close: expected SSH2_FXP_STATUS(%d), "
-			    "got %d - connection may be corrupt",
-			    SSH2_FXP_STATUS, type);
-			sftp_conn_set_protocol_violation(conn); /* HPN */
-			batch_fail_all_remaining(files, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
-		}
-		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
-			error_fr(r, "parse batch close status");
-			batch_fail_all_remaining(files, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
-		}
-		if (rid != files[i].close_id) {
-			error_f("batch close ID mismatch: got %u expected %u "
-			    "- possible MITM or server corruption",
-			    rid, files[i].close_id);
-			sftp_conn_set_protocol_violation(conn); /* HPN */
-			batch_fail_all_remaining(files, entries, n, &any_fail);
-			sshbuf_free(msg);
-			goto cleanup;
-		}
+		status = get_status(conn, files[i].close_id);
+		if (status == SSH2_FX_CONNECTION_LOST)
+			goto lost;
+		/* A failed close can mean the server could not flush the
+		 * data, so the file is not trusted as complete. */
 		if (status != SSH2_FX_OK) {
 			error("batch close \"%s\": %s",
 			    entries[i].remote_path, fx2txt(status));
+			if (status == SSH2_FX_PERMISSION_DENIED)
+				entries[i].perm_denied = 1;
 			if (!files[i].failed) {
 				files[i].failed = 1;
 				entries[i].result = -1;
 				any_fail = 1;
 			}
 		}
+		/* This entry is settled. Its NULL handle tells
+		 * batch_fail_all_remaining to leave it alone. */
 		free(files[i].handle);
 		files[i].handle = NULL;
 	}
-	sshbuf_free(msg);
+	goto cleanup;
+
+ lost:
+	/* get_status found the connection dead or broken, so no more
+	 * replies are coming. */
+	error_f("batch close: no usable reply while collecting (entry %d/%d)",
+	    i, n);
+	batch_fail_all_remaining(files, entries, n, &any_fail);
 
  cleanup:
+	/* Close any local file phase 3 left open, and free the handle of any
+	 * entry whose reply never came. */
 	for (i = 0; i < n; i++) {
 		if (files[i].local_fd >= 0)
 			close(files[i].local_fd);
@@ -4336,19 +4312,77 @@ batch_phase5_and_cleanup(struct sftp_conn *conn,
 	return any_fail ? -1 : 0;
 }
 
+/* HPN: collect a sent batch's CLOSE replies and free it. The contract is
+ * at the prototype in sftp-client.h. */
 int
 sftp_upload_batch_finish(struct sftp_conn *conn,
     struct sftp_upload_batch_pending *pending)
 {
 	int rc;
+
+	/* send returns NULL when it sent no CLOSEs, so there is nothing to
+	 * collect. */
 	if (pending == NULL)
 		return 0;
 	rc = batch_phase5_and_cleanup(conn, pending->entries, pending->files,
 	    pending->nentries, pending->any_fail);
+	/* Phase 5 freed files. The entries belong to the caller. */
 	free(pending);
 	return rc;
 }
 
+/* HPN: send, without waiting, what a small batch file needs before its
+ * CLOSE, in the order sftp_upload applies it: the in-place size, the -p
+ * attrs, and the fsync. Each request is recorded so phase 5 can collect its
+ * reply. The server handles requests on one handle in order, so these land
+ * after the file's WRITE and before its CLOSE. */
+static void
+batch_send_pre_close(struct sftp_conn *conn, struct batch_file *file,
+    int preserve_flag, int fsync_flag, int inplace_flag)
+{
+	struct sshbuf *msg = conn->msg;
+	Attrib trunc_attrs;
+	u_int id;
+	int r;
+
+	file->npre_close = 0;
+	/* In place left any old tail of the file, so cut it to size. */
+	if (inplace_flag) {
+		attrib_clear(&trunc_attrs);
+		trunc_attrs.flags = SSH2_FILEXFER_ATTR_SIZE;
+		trunc_attrs.size = (uint64_t)file->sb.st_size;
+		id = conn->msg_id++;
+		send_string_attrs_request(conn, id, SSH2_FXP_FSETSTAT,
+		    file->handle, file->handle_len, &trunc_attrs);
+		file->pre_close_ids[file->npre_close] = id;
+		file->pre_close_what[file->npre_close++] = "truncate";
+	}
+	if (preserve_flag) {
+		id = conn->msg_id++;
+		send_string_attrs_request(conn, id, SSH2_FXP_FSETSTAT,
+		    file->handle, file->handle_len, &file->a);
+		file->pre_close_ids[file->npre_close] = id;
+		file->pre_close_what[file->npre_close++] = "setstat";
+	}
+	/* Like sftp_fsync, skip it when the server lacks the extension. */
+	if (fsync_flag && (conn->exts & SFTP_EXT_FSYNC) != 0) {
+		/* Reset for the same reason as send_string_request. */
+		sshbuf_reset(msg);
+		id = conn->msg_id++;
+		if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
+		    (r = sshbuf_put_u32(msg, id)) != 0 ||
+		    (r = sshbuf_put_cstring(msg, "fsync@openssh.com")) != 0 ||
+		    (r = sshbuf_put_string(msg, file->handle,
+		    file->handle_len)) != 0)
+			fatal_fr(r, "compose batch fsync");
+		send_msg(conn, msg);
+		file->pre_close_ids[file->npre_close] = id;
+		file->pre_close_what[file->npre_close++] = "fsync";
+	}
+}
+
+/* HPN: phases 1 to 4 of the batch upload, with the previous batch's phase
+ * 5 in between. The contract is at the prototype in sftp-client.h. */
 struct sftp_upload_batch_pending *
 sftp_upload_batch_send(struct sftp_conn *conn,
     struct sftp_upload_batch_entry *entries, int n,
@@ -4358,14 +4392,21 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	struct sftp_upload_batch_pending *pending;
 	struct batch_file *files;
 	struct sshbuf *msg;
-	u_int openmode = SSH2_FXF_WRITE | SSH2_FXF_CREAT | SSH2_FXF_TRUNC;
+	u_int openmode = SSH2_FXF_WRITE | SSH2_FXF_CREAT;
+	u_int status;
 	int i, r, any_fail = 0;
 
+	/* An empty batch sends nothing, but the previous batch still needs
+	 * its replies collected. */
 	if (n <= 0) {
 		if (prev != NULL)
 			(void)sftp_upload_batch_finish(conn, prev);
 		return NULL;
 	}
+	/* In place keeps the existing file, as in sftp_upload, and phase 4
+	 * sets its final size. */
+	if (!inplace_flag)
+		openmode |= SSH2_FXF_TRUNC;
 
 	debug_f("batch upload: n=%d preserve=%d fsync=%d inplace=%d",
 	    n, preserve_flag, fsync_flag, inplace_flag);
@@ -4374,13 +4415,11 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	for (i = 0; i < n; i++) {
 		files[i].local_fd = -1;
 		entries[i].result = 0;
+		entries[i].perm_denied = 0;
 	}
 
-	/*
-	 * Phase 1: open each local file and send the corresponding
-	 * SSH_FXP_OPEN request without waiting for the handle reply.
-	 * All N requests go out in a burst; the server queues them.
-	 */
+	/* Phase 1: open each local file and send its OPEN without waiting
+	 * for the handle. All n go out in one burst. */
 	debug_f("batch upload phase 1: sending %d SSH_FXP_OPEN requests", n);
 	for (i = 0; i < n; i++) {
 		if ((files[i].local_fd = open(entries[i].local_path,
@@ -4402,6 +4441,18 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 			any_fail = 1;
 			continue;
 		}
+		/* The walk queues only regular files, but the path may have
+		 * changed since. sftp_upload refuses the same. */
+		if (!S_ISREG(files[i].sb.st_mode)) {
+			error("batch local \"%s\" is not a regular file",
+			    entries[i].local_path);
+			close(files[i].local_fd);
+			files[i].local_fd = -1;
+			files[i].failed = 1;
+			entries[i].result = -1;
+			any_fail = 1;
+			continue;
+		}
 		stat_to_attrib(&files[i].sb, &files[i].a);
 		files[i].a.flags &= ~SSH2_FILEXFER_ATTR_SIZE;
 		files[i].a.flags &= ~SSH2_FILEXFER_ATTR_UIDGID;
@@ -4409,7 +4460,6 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		if (!preserve_flag)
 			files[i].a.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
 
-		/* Send SSH_FXP_OPEN without waiting for the handle reply. */
 		files[i].open_id = conn->msg_id++;
 		if ((msg = sshbuf_new()) == NULL)
 			fatal_f("sshbuf_new failed");
@@ -4423,29 +4473,18 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		sshbuf_free(msg);
 	}
 
-	/*
-	 * Drain the previous batch's deferred close STATUSes here, between
-	 * phase 1 (this batch's OPENs sent) and phase 2 (collect this batch's
-	 * HANDLEs).  The OPENs we just sent are now in flight to the server,
-	 * which will also send back the close STATUSes for the prev batch
-	 * (whose CLOSEs were sent before this call).  By draining now we
-	 * overlap server processing of THIS batch's opens with collection of
-	 * PREV batch's close statuses - saving ~1 RTT per batch boundary.
-	 *
-	 * If the drain fails (connection died, protocol violation), prev's
-	 * remaining entries are marked failed inside finish; we still proceed
-	 * with this batch.  If this batch's connection is dead too, phase 2
-	 * below will fail naturally.
-	 */
+	/* Collect the previous batch's replies now, between this batch's
+	 * OPENs and its handles. The server works on both at once, which
+	 * saves about one round trip per batch. A failed drain fails the
+	 * previous batch's open entries inside finish. This batch goes on,
+	 * and fails on its own in phase 2 if the connection is gone. */
 	if (prev != NULL) {
 		(void)sftp_upload_batch_finish(conn, prev);
 		prev = NULL;
 	}
 
-	/*
-	 * Phase 2: collect handles in the same order the opens were sent.
-	 * One RTT covers all N replies.
-	 */
+	/* Phase 2: collect the handles in the order the OPENs went out. One
+	 * round trip covers all n. */
 	debug_f("batch upload phase 2: collecting %d handles", n);
 	for (i = 0; i < n; i++) {
 		if (files[i].failed)
@@ -4454,6 +4493,12 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		    &files[i].handle_len,
 		    "batch dest open \"%s\"", entries[i].remote_path);
 		if (files[i].handle == NULL) {
+			/* A failure that leaves the connection alive came
+			 * from the server's own STATUS, so a denial is this
+			 * entry's. */
+			if (!sftp_conn_is_dead(conn) &&
+			    conn->hpn->last_status == SSH2_FX_PERMISSION_DENIED)
+				entries[i].perm_denied = 1;
 			close(files[i].local_fd);
 			files[i].local_fd = -1;
 			files[i].failed = 1;
@@ -4462,51 +4507,48 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		}
 	}
 
-	/*
-	 * Phase 3a: burst-write all small files (size <= upload_buflen).
-	 * Each file fits in a single SSH_FXP_WRITE; we send all N requests
-	 * without collecting ACKs, so N round-trips collapse to one.
-	 * Large files and empty files are skipped here; they are handled
-	 * in Phase 3d below.
-	 */
+	/* Phase 3a: write each small file, one that fits in a single WRITE,
+	 * without waiting for the replies, so n round trips become one. Large
+	 * files wait for phase 3c. */
 	debug_f("batch upload phase 3: transferring %d files", n);
 	{
 		u_char *data = xmalloc(conn->upload_buflen);
 
 		for (i = 0; i < n; i++) {
-			ssize_t len;
+			size_t len;
 
 			if (files[i].failed || files[i].handle == NULL)
 				continue;
 			if (files[i].sb.st_size > (off_t)conn->upload_buflen)
-				continue; /* large file - handled in phase 3d */
+				continue; /* a large file waits for phase 3c */
 			if (files[i].sb.st_size == 0) {
-				/* Empty file: remote is already zeroed by TRUNC open. */
+				/* An empty file needs no WRITE. TRUNC emptied
+				 * it, or phase 4 sets its size in place. */
 				close(files[i].local_fd);
 				files[i].local_fd = -1;
 				continue;
 			}
-			/* Read the entire file in one shot. */
-			do {
-				len = read(files[i].local_fd, data,
-				    (size_t)files[i].sb.st_size);
-			} while (len == -1 && (errno == EINTR ||
-			    errno == EAGAIN || errno == EWOULDBLOCK));
+			/* Read the whole file. A short read means it changed
+			 * since its fstat. */
+			len = atomicio(read, files[i].local_fd, data,
+			    (size_t)files[i].sb.st_size);
 			close(files[i].local_fd);
 			files[i].local_fd = -1;
-			if (len <= 0) {
+			if (len != (size_t)files[i].sb.st_size) {
 				error("read local \"%s\": %s",
-				    entries[i].local_path, strerror(errno));
+				    entries[i].local_path, errno == EPIPE ?
+				    "file shrank while being read" :
+				    strerror(errno));
 				files[i].failed = 1;
 				entries[i].result = -1;
 				any_fail = 1;
 				continue;
 			}
-			/* Tee the source hash for the verify phase; the whole
-			 * file is in the buffer. */
+			/* The whole file is in the buffer, so hash it there
+			 * for the verify phase. */
 			entries[i].have_src_hash = sftp_hpn_src_hash_buf(conn->hpn,
-			    data, (size_t)len, &entries[i].src_hash) == 0;
-			/* Send SSH_FXP_WRITE; ACK collected in phase 3b. */
+			    data, len, &entries[i].src_hash) == 0;
+			/* Phase 3b collects the reply. */
 			files[i].write_id = conn->msg_id++;
 			files[i].write_sent = 1;
 			if ((msg = sshbuf_new()) == NULL)
@@ -4525,111 +4567,45 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		free(data);
 	}
 
-	/*
-	 * Phase 3b: collect STATUS replies for all small-file writes.
-	 * The server responds in request order; one RTT covers all N.
-	 *
-	 * On dead connection or protocol violation here we abandon the
-	 * rest of the batch (mark all unfailed entries failed, skip to
-	 * cleanup).  Calling fatal_fr in this loop would terminate the
-	 * whole process - catastrophic for parallel workers handling
-	 * unrelated transfers - so we degrade gracefully instead.
-	 */
-	{
-		if ((msg = sshbuf_new()) == NULL)
-			fatal_f("sshbuf_new failed");
-		for (i = 0; i < n; i++) {
-			u_char type;
-			u_int status, rid;
-
-			if (!files[i].write_sent)
-				continue; /* no write sent for this entry */
-			if (get_msg(conn, msg) != 0) {
-				error_f("batch write: connection closed while "
-				    "collecting responses (entry %d/%d)", i, n);
-				batch_fail_all_remaining(files, entries, n,
-				    &any_fail);
-				sshbuf_free(msg);
-				goto send_failed;
-			}
-			if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-			    (r = sshbuf_get_u32(msg, &rid)) != 0) {
-				error_fr(r, "parse batch write response");
-				batch_fail_all_remaining(files, entries, n,
-				    &any_fail);
-				sshbuf_free(msg);
-				goto send_failed;
-			}
-			if (type != SSH2_FXP_STATUS) {
-				error_f("batch write: expected SSH2_FXP_STATUS(%d), "
-				    "got %d - connection may be corrupt",
-				    SSH2_FXP_STATUS, type);
-				sftp_conn_set_protocol_violation(conn); /* HPN */
-				batch_fail_all_remaining(files, entries, n,
-				    &any_fail);
-				sshbuf_free(msg);
-				goto send_failed;
-			}
-			if ((r = sshbuf_get_u32(msg, &status)) != 0) {
-				error_fr(r, "parse batch write status");
-				batch_fail_all_remaining(files, entries, n,
-				    &any_fail);
-				sshbuf_free(msg);
-				goto send_failed;
-			}
-			if (rid != files[i].write_id) {
-				error_f("batch write ID mismatch: got %u expected "
-				    "%u - possible MITM or server corruption",
-				    rid, files[i].write_id);
-				sftp_conn_set_protocol_violation(conn); /* HPN */
-				batch_fail_all_remaining(files, entries, n,
-				    &any_fail);
-				sshbuf_free(msg);
-				goto send_failed;
-			}
+	/* Phase 3b: collect the small-file WRITE replies in send order. One
+	 * round trip covers all n. A lost connection or a protocol error
+	 * abandons the batch rather than calling fatal, which would take the
+	 * other parallel workers down with it. */
+	for (i = 0; i < n; i++) {
+		if (!files[i].write_sent)
+			continue; /* no write sent for this entry */
+		status = get_status(conn, files[i].write_id);
+		if (status == SSH2_FX_CONNECTION_LOST) {
+			error_f("batch write: no usable reply while collecting "
+			    "(entry %d/%d)", i, n);
+			batch_fail_all_remaining(files, entries, n, &any_fail);
+			goto send_failed;
+		}
+		if (status != SSH2_FX_OK) {
+			error("write remote \"%s\": %s",
+			    entries[i].remote_path, fx2txt(status));
+			if (status == SSH2_FX_PERMISSION_DENIED)
+				entries[i].perm_denied = 1;
+			files[i].failed = 1;
+			entries[i].result = -1;
+			any_fail = 1;
+		} else
 			sftp_conn_live_account(conn,
 			    files[i].sb.st_size); /* HPN */
-			if (status != SSH2_FX_OK) {
-				error("write remote \"%s\": %s",
-				    entries[i].remote_path, fx2txt(status));
-				if (status == SSH2_FX_PERMISSION_DENIED)
-					sftp_conn_set_perm_denied(conn); /* HPN */
-				files[i].failed = 1;
-				entries[i].result = -1;
-				any_fail = 1;
-			}
-		}
-		sshbuf_free(msg);
 	}
 
-	/*
-	 * Phase 3c: apply preserve / fsync to successfully written small files.
-	 */
-	for (i = 0; i < n; i++) {
-		if (files[i].failed || files[i].handle == NULL)
-			continue;
-		if (files[i].sb.st_size > (off_t)conn->upload_buflen)
-			continue; /* large file - handled below */
-		if (preserve_flag)
-			sftp_fsetstat(conn, files[i].handle,
-			    files[i].handle_len, &files[i].a);
-		if (fsync_flag)
-			(void)sftp_fsync(conn, files[i].handle,
-			    files[i].handle_len);
-	}
-
-	/*
-	 * Phase 3d: large files - one at a time via do_upload_body.
-	 * preserve and fsync are applied inside do_upload_body per file.
-	 */
+	/* Phase 3c: upload each large file in turn through do_upload_body,
+	 * which applies its own in-place size, -p attrs and fsync. */
 	for (i = 0; i < n; i++) {
 		if (files[i].failed || files[i].handle == NULL)
 			continue;
 		if (files[i].sb.st_size <= (off_t)conn->upload_buflen)
-			continue; /* small file - already handled */
+			continue; /* a small file went in phase 3a */
 		debug_f("batch upload large file %d/%d: %s -> %s (%lld bytes)",
 		    i + 1, n, entries[i].local_path, entries[i].remote_path,
 		    (long long)files[i].sb.st_size);
+		/* Scope the connection's denial flag to this one file. */
+		sftp_conn_clear_perm_denied(conn);
 		r = do_upload_body(conn, files[i].local_fd, files[i].sb.st_size,
 		    files[i].handle, files[i].handle_len, &files[i].a,
 		    entries[i].local_path, entries[i].remote_path,
@@ -4645,19 +4621,25 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		}
 		files[i].local_fd = -1;
 		if (r != 0) {
+			if (sftp_conn_saw_perm_denied(conn))
+				entries[i].perm_denied = 1;
 			files[i].failed = 1;
 			entries[i].result = -1;
 			any_fail = 1;
 		}
 	}
 
-	/*
-	 * Phase 4: send all SSH_FXP_CLOSE requests in a burst (no waiting).
-	 */
+	/* Phase 4: send every CLOSE in one burst. Each small file that wrote
+	 * cleanly gets its in-place size, -p attrs and fsync just ahead of its
+	 * CLOSE, in the same burst. */
 	debug_f("batch upload phase 4: sending %d SSH_FXP_CLOSE requests", n);
 	for (i = 0; i < n; i++) {
 		if (files[i].handle == NULL)
 			continue;
+		if (!files[i].failed &&
+		    files[i].sb.st_size <= (off_t)conn->upload_buflen)
+			batch_send_pre_close(conn, &files[i], preserve_flag,
+			    fsync_flag, inplace_flag);
 		files[i].close_id = conn->msg_id++;
 		if ((msg = sshbuf_new()) == NULL)
 			fatal_f("sshbuf_new failed");
@@ -4670,10 +4652,8 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 		sshbuf_free(msg);
 	}
 
-	/* Phase 5 is deferred to sftp_upload_batch_finish - packaged into
-	 * a pending struct and returned to the caller, who calls finish later,
-	 * after sending the next batch's phase 1 OPENs (sliding-window
-	 * pipelining). */
+	/* Phase 5 waits for sftp_upload_batch_finish, so the caller can send
+	 * the next batch's OPENs first. */
 	pending = xcalloc(1, sizeof(*pending));
 	pending->entries  = entries;
 	pending->files    = files;
@@ -4682,11 +4662,8 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	return pending;
 
  send_failed:
-	/* Phase 3b error path: connection dead or protocol violation BEFORE
-	 * we sent phase 4 CLOSEs.  Mark every entry failed, clean up the
-	 * batch state, and return NULL.  Phase 4 CLOSEs are NOT sent, so
-	 * there is nothing for finish to collect - return NULL signals this
-	 * to the caller. */
+	/* Phase 3b failed before any CLOSE went out, so there is nothing for
+	 * finish to collect. Free the batch and return NULL. */
 	for (i = 0; i < n; i++) {
 		if (files[i].local_fd >= 0)
 			close(files[i].local_fd);
@@ -4696,40 +4673,26 @@ sftp_upload_batch_send(struct sftp_conn *conn,
 	return NULL;
 }
 
-/* ── END Phase 4 gap 1 ──────────────────────────────────────────────────── */
+/* HPN: accessors for the HPN modules, which cannot see struct sftp_conn.
+ * sftp-client-internal.h declares them. */
 
-/* ── BEGIN Phase 5: hpn-bundle accessors ─────────────────────────────────
- *
- * The bundle wire protocol implementations (sftp_hpn_bundle_upload,
- * sftp_hpn_bundle_download) live in sftp-hpn-client.c.  Only the small
- * accessors that need to peek inside struct sftp_conn stay here - they
- * cross the upstream-aligned / HPN boundary minimally.
- */
-
-/* Allocate the next outbound SFTP message id for `conn`.  Internal-only
- * accessor used by HPN extension code in sftp-hpn-client.c so it doesn't
- * have to know struct sftp_conn's layout (which lives in sftp-client.c).
- * Declared in sftp-client-internal.h. */
+/* HPN: the next outbound message id for conn. */
 u_int
 sftp_conn_alloc_msg_id(struct sftp_conn *conn)
 {
 	return conn->msg_id++;
 }
 
-/* The single bridge from the opaque struct sftp_conn (defined in this file)
- * to the HPN per-connection state hung off it.  HPN modules call this and
- * then operate on struct sftp_hpn_conn directly, which keeps every per-field
- * HPN accessor out of this upstream file.  Declared in
- * sftp-client-internal.h. */
+/* HPN: the HPN state hung off conn, or NULL for a NULL conn. HPN modules
+ * work on it directly, so no per-field accessor has to live in this file. */
 struct sftp_hpn_conn *
 sftp_conn_hpn(struct sftp_conn *conn)
 {
 	return conn == NULL ? NULL : conn->hpn;
 }
 
-/* Read the server-advertised SFTP extension bitmask.  Bridges the opaque
- * struct sftp_conn so the HPN has_*() predicates can live in
- * sftp-hpn-client.c.  Declared in sftp-client-internal.h. */
+/* HPN: the extensions the server advertised, or 0 for a NULL conn, so the
+ * has_*() predicates can live in sftp-hpn-client.c. */
 u_int
 sftp_conn_exts(struct sftp_conn *conn)
 {
@@ -5131,9 +5094,12 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 	return status == SSH2_FX_OK ? 0 : -1;
 }
 
+/* HPN: the crossload sink's make_dir. It creates dst on the destination,
+ * writable while the walk fills it, and defers its attrs to the end of the
+ * transfer, as upstream's crossload walk applies them. */
 static int
-crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
-    const Attrib *attrs)
+crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
+    const char *dst, const Attrib *attrs)
 {
 	struct crossload_sink	*ctx = (struct crossload_sink *)sink;
 	Attrib		 curdir = *attrs;
@@ -5157,14 +5123,18 @@ crossload_make_dir(struct sftp_tree_dl_sink *sink, const char *src, const char *
 	if (sftp_hpn_ensure_remote_dir(ctx->to, dst, &curdir, &created) != 0)
 		return -1;
 
+	/* A directory this walk made needs its real mode back, and under -p
+	 * any directory gets its attrs. */
 	if (created || ctx->preserve_flag)
 		sftp_hpn_dirattrs_defer_remote(ctx->dirs, dst, &curdir);
 	return 0;
 }
 
+/* HPN: the crossload sink's xfer_file. It crossloads one file from the
+ * origin to the destination. */
 static int
-crossload_xfer_file(struct sftp_tree_dl_sink *sink, const char *src, const char *dst,
-    Attrib *attrs)
+crossload_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
+    const char *dst, Attrib *attrs)
 {
 	struct crossload_sink	*ctx = (struct crossload_sink *)sink;
 
@@ -5176,19 +5146,11 @@ crossload_xfer_file(struct sftp_tree_dl_sink *sink, const char *src, const char 
 	return 0;
 }
 
-static void
-crossload_fail(struct sftp_tree_dl_sink *sink, const char *path, const char *reason)
-{
-	/* Crossload is serial. The driver's -1 return carries the error. */
-	(void)sink;
-	(void)path;
-	(void)reason;
-}
-
+/* HPN: the crossload sink's aborting. Only an interrupt stops the walk,
+ * since crossload has no bundles. */
 static int
 crossload_aborting(struct sftp_tree_dl_sink *sink)
 {
-	(void)sink;
 	return interrupted;
 }
 
@@ -5204,7 +5166,6 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 		.base = {
 			.make_dir = crossload_make_dir,
 			.xfer_file = crossload_xfer_file,
-			.fail = crossload_fail,
 			.aborting = crossload_aborting,
 		},
 		.from = from,

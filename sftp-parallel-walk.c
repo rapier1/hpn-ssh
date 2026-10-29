@@ -261,7 +261,6 @@ parallel_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
 {
 	struct parallel_dl_sink	*ctx = (struct parallel_dl_sink *)sink;
 	mode_t			 mode, tmpmode;
-	Attrib			 defrd_attrs;
 
 	(void)src;	/* parallel prints the root once at the caller, not per-dir */
 	if (sftp_hpn_ensure_local_dir(dst, attrs, &mode, &tmpmode) != 0) {
@@ -270,12 +269,8 @@ parallel_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
 		return -1;
 	}
 	maybe_apply_lustre_layout_local(ctx->fleet, ctx->conn, dst);
-	defrd_attrs = *attrs;
-	if (!ctx->preserve_flag)
-		defrd_attrs.flags &= ~SSH2_FILEXFER_ATTR_ACMODTIME;
-	if (ctx->preserve_flag || mode != tmpmode)
-		sftp_hpn_dirattrs_defer_local(parallel_dirattrs(ctx->fleet),
-		    dst, mode, tmpmode, &defrd_attrs);
+	sftp_hpn_dirattrs_defer_local(parallel_dirattrs(ctx->fleet), dst,
+	    mode, tmpmode, attrs, ctx->preserve_flag);
 	return 0;
 }
 
