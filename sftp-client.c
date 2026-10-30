@@ -2767,14 +2767,16 @@ serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 	    (off_t)attrs->size);
 }
 
-/* HPN: the serial download sink's aborting. The walk stops on an interrupt
- * or once a bundle flush has aborted. */
+/* HPN: the serial download sink's aborting. The walk stops on an
+ * interrupt, once a bundle flush has aborted, or once the connection is
+ * dead, since every later file would fail on it. */
 static int
 serial_dl_aborting(struct sftp_tree_dl_sink *sink)
 {
 	struct serial_dl_sink	*ctx = (struct serial_dl_sink *)sink;
 
-	return interrupted || ctx->flush_aborted;
+	return interrupted || ctx->flush_aborted ||
+	    sftp_conn_is_dead(ctx->conn);
 }
 
 /* HPN: the serial download sink's notice. It prints a walk notice on its
@@ -2986,8 +2988,13 @@ do_upload_body(struct sftp_conn *conn,
 			    RDAHEAD_BP_THRESHOLD_SEC)
 				sftp_conn_rdahead_backpressure_signal(conn);
 			if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-			    (r = sshbuf_get_u32(msg, &rid)) != 0)
-				fatal_fr(r, "parse");
+			    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+				/* HPN: a truncated reply fails the connection,
+				 * not the process. */
+				error_fr(r, "parse");
+				sftp_conn_set_protocol_violation(conn);
+				break;
+			}
 
 			if (type != SSH2_FXP_STATUS) {
 				sftp_conn_die(conn,
@@ -2996,8 +3003,11 @@ do_upload_body(struct sftp_conn *conn,
 				break;
 			}
 
-			if ((r = sshbuf_get_u32(msg, &status2)) != 0)
-				fatal_fr(r, "parse status");
+			if ((r = sshbuf_get_u32(msg, &status2)) != 0) {
+				error_fr(r, "parse status");
+				sftp_conn_set_protocol_violation(conn); /* HPN */
+				break;
+			}
 			debug3("SSH2_FXP_STATUS %u", status2);
 			if (status2 != SSH2_FX_OK)
 				status = status2; /* remember errors */
@@ -3405,14 +3415,16 @@ serial_ul_defer_dir(struct sftp_upload_sink *sink, const char *dst,
 	sftp_hpn_dirattrs_defer_remote(ctx->dirs, dst, attrs);
 }
 
-/* HPN: the serial upload sink's aborting. The walk stops on an interrupt
- * or once a bundle flush has aborted. */
+/* HPN: the serial upload sink's aborting. The walk stops on an interrupt,
+ * once a bundle flush has aborted, or once the connection is dead, since
+ * every later file would fail on it. */
 static int
 serial_ul_aborting(struct sftp_upload_sink *sink)
 {
 	struct serial_ul_sink	*ctx = (struct serial_ul_sink *)sink;
 
-	return interrupted || ctx->flush_aborted;
+	return interrupted || ctx->flush_aborted ||
+	    sftp_conn_is_dead(ctx->conn);
 }
 
 int
@@ -3422,70 +3434,69 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 {
 	char *dst_canon;
 	int ret;
+	int root_created;
+	struct stat sb;
+	Attrib root_attrs;
 	struct sftp_hpn_bundle_acc bundle_acc;
 	struct sftp_hpn_dirattr_list dirs = { NULL, 0, 0 };
+	struct serial_ul_sink sink;
 
 	if ((dst_canon = sftp_realpath(conn, dst)) == NULL) {
 		error("upload \"%s\": path canonicalization failed", dst);
 		return -1;
 	}
 
-	/* HPN: one bundle accumulator for the WHOLE walk - bundles span
-	 * directories, matching the parallel producer's grouping, so the
-	 * two modes ship identical bundles for the same corpus.  Disabled
-	 * (a no-op) unless the server supports bundles, HPNUseBundle is
-	 * on, and this is not a resume transfer, plain or verified. scp
-	 * expresses its -Z upload resume through verify alone. */
+	/* HPN: create the destination root first. The walk expects its dst
+	 * to exist, and creates each deeper directory in its parent's
+	 * pipelined mkdir batch. */
+	if (stat(src, &sb) == -1) {
+		error("stat local \"%s\": %s", src, strerror(errno));
+		free(dst_canon);
+		return -1;
+	}
+	if (!S_ISDIR(sb.st_mode)) {
+		error("\"%s\" is not a directory", src);
+		free(dst_canon);
+		return -1;
+	}
+	sftp_hpn_dir_attrs_from_stat(&sb, preserve_flag, &root_attrs);
+	if (sftp_hpn_ensure_remote_dir(conn, dst_canon, &root_attrs,
+	    &root_created) != 0) {
+		free(dst_canon);
+		return -1;
+	}
+
+	/* HPN: one bundle accumulator serves the whole walk, so upload
+	 * bundles span directories, as in the parallel producer. Serial and
+	 * -j runs then send the same bundles for the same tree. It does
+	 * nothing unless the server supports bundles, HPNUseBundle is on,
+	 * and the transfer is not a resume, plain or verified. scp asks for
+	 * its -Z upload resume through verify alone. */
 	sftp_hpn_bundle_acc_init(&bundle_acc, conn, resume || verify,
 	    /*download*/0);
 
-	/* Create the root destination directory before walking - every deeper
-	 * directory is created by its parent level's pipelined mkdir batch, so
-	 * upload_dir_internal assumes its dst already exists. */
-	{
-		struct stat rsb;
-		Attrib ra;
-		int rcreated = 0;
+	sink = (struct serial_ul_sink){
+		.base = {
+			.enter_dir = serial_ul_enter_dir,
+			.xfer_file = serial_ul_xfer_file,
+			.defer_dir = serial_ul_defer_dir,
+			.aborting = serial_ul_aborting },
+		.conn = conn,
+		.bundle_acc = &bundle_acc,
+		.dirs = &dirs,
+		.preserve_flag = preserve_flag,
+		.print_flag = print_flag,
+		.resume = resume,
+		.verify = verify,
+		.fsync_flag = fsync_flag,
+		.inplace_flag = inplace_flag };
+	ret = sftp_upload_walk_consume(conn, src, dst_canon, 0, MAX_DIR_DEPTH,
+	    root_created, preserve_flag, follow_link_flag, &sink.base);
 
-		if (stat(src, &rsb) == -1 || !S_ISDIR(rsb.st_mode)) {
-			error("stat local \"%s\": not a directory", src);
-			sftp_hpn_bundle_acc_free(&bundle_acc);
-			free(dst_canon);
-			return -1;
-		}
-		sftp_hpn_dir_attrs_from_stat(&rsb, preserve_flag, &ra);
-		if (sftp_hpn_ensure_remote_dir(conn, dst_canon, &ra,
-		    &rcreated) != 0) {
-			sftp_hpn_bundle_acc_free(&bundle_acc);
-			free(dst_canon);
-			return -1;
-		}
-		{
-			struct serial_ul_sink sink = {
-				.base = {
-					.enter_dir = serial_ul_enter_dir,
-					.xfer_file = serial_ul_xfer_file,
-					.defer_dir = serial_ul_defer_dir,
-					.aborting = serial_ul_aborting,
-				},
-				.conn = conn,
-				.bundle_acc = &bundle_acc,
-				.dirs = &dirs,
-				.preserve_flag = preserve_flag,
-				.print_flag = print_flag,
-				.resume = resume,
-				.verify = verify,
-				.fsync_flag = fsync_flag,
-				.inplace_flag = inplace_flag,
-			};
-			ret = sftp_upload_walk_consume(conn, src, dst_canon, 0,
-			    MAX_DIR_DEPTH, rcreated, preserve_flag,
-			    follow_link_flag, &sink.base);
-		}
-	}
-
-	/* Ship any members still pending.  Skip when interrupted - a
-	 * re-run re-walks; do not start new work on the way out. */
+	/* HPN: send the members still pending. Skip this after an
+	 * interrupt, since a rerun walks again and nothing new should start
+	 * on the way out. A failed flush empties the accumulator and stops
+	 * the walk, so after one this does nothing. */
 	if (!interrupted) {
 		if (sftp_hpn_bundle_acc_flush(conn, &bundle_acc, preserve_flag,
 		    print_flag, verify, fsync_flag, inplace_flag) != 0)
@@ -3493,8 +3504,8 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	}
 	sftp_hpn_bundle_acc_free(&bundle_acc);
 
-	/* Apply the deferred directory attributes now that all content
-	 * (including the final bundle) has landed. */
+	/* HPN: apply the deferred directory attributes now that every
+	 * file, the final bundle included, has landed. */
 	sftp_hpn_dirattrs_apply(conn, &dirs);
 	sftp_hpn_dirattrs_free(&dirs);
 
@@ -3543,8 +3554,12 @@ sftp_fs_info(struct sftp_conn *conn, const char *path,
 		return -1;
 	}
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &msg_id)) != 0)
-		fatal_fr(r, "parse");
+	    (r = sshbuf_get_u32(msg, &msg_id)) != 0) {
+		error_fr(r, "parse");
+		sftp_conn_set_protocol_violation(conn);
+		sshbuf_free(msg);
+		return -1;
+	}
 	if (msg_id != id) {
 		error_f("ID mismatch (%u != %u) - possible protocol corruption",
 		    msg_id, id);
@@ -3756,8 +3771,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 		sshbuf_reset(msg);
 		/* Time the STATUS read so the read-ahead controller can react
 		 * to a wedged path, as in do_upload_body. A dead connection
-		 * fails here, before the parse below could fatal on an empty
-		 * reply. */
+		 * fails here. */
 		{
 			double t_status_start = monotime_double();
 			if (get_msg(conn, msg) != 0) {
@@ -3769,8 +3783,14 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 				sftp_conn_rdahead_backpressure_signal(conn);
 		}
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &rid)) != 0)
-			fatal_fr(r, "parse status");
+		    (r = sshbuf_get_u32(msg, &rid)) != 0) {
+			/* A truncated reply fails the connection, not the
+			 * process, which runs the other workers. */
+			error_fr(r, "parse status");
+			sftp_conn_set_protocol_violation(conn);
+			status = SSH2_FX_FAILURE;
+			break;
+		}
 		if (type != SSH2_FXP_STATUS) {
 			sftp_conn_die(conn,
 			    "expected SSH2_FXP_STATUS(%u), got %u",
@@ -3778,8 +3798,12 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			status = SSH2_FX_FAILURE;
 			break;
 		}
-		if ((r = sshbuf_get_u32(msg, &status)) != 0)
-			fatal_fr(r, "parse status code");
+		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+			error_fr(r, "parse status code");
+			sftp_conn_set_protocol_violation(conn);
+			status = SSH2_FX_FAILURE;
+			break;
+		}
 		/* Match the reply to its write by id, like do_upload_body. */
 		if ((ack = request_find(&acks, rid)) == NULL) {
 			sftp_conn_die(conn, "unexpected reply id %u", rid);
@@ -4029,8 +4053,17 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 		if (monotime_double() - t_data_start > RDAHEAD_BP_THRESHOLD_SEC)
 			sftp_conn_rdahead_backpressure_signal(conn);
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &id)) != 0)
-			fatal_fr(r, "parse");
+		    (r = sshbuf_get_u32(msg, &id)) != 0) {
+			/* A truncated reply fails the connection, not the
+			 * process, as a lost connection does above. */
+			error_fr(r, "parse");
+			sftp_conn_set_protocol_violation(conn);
+			read_error = 1;
+			dl_abandon_requests(&requests, remote_offset,
+			    &contig_end);
+			num_req = max_req = 0;
+			break;
+		}
 		if ((req = request_find(&requests, id)) == NULL) {
 			/* This runs in a worker, where fatal would kill the
 			 * orchestrator. Mark the connection dead, and the
@@ -4047,8 +4080,12 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			/* Any STATUS reply to a read fails the range. The
 			 * range lies inside the file, so even EOF means the
 			 * file shrank. */
-			if ((r = sshbuf_get_u32(msg, &status)) != 0)
-				fatal_fr(r, "parse status");
+			if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+				/* Fail the range below, as a bad message. */
+				error_fr(r, "parse status");
+				sftp_conn_set_protocol_violation(conn);
+				status = SSH2_FX_BAD_MESSAGE;
+			}
 			if (status == SSH2_FX_EOF)
 				error("read remote \"%s\": unexpected EOF "
 				    "within range", remote_path);
@@ -4067,8 +4104,13 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 		case SSH2_FXP_DATA: {
 			u_char *data;
 			size_t len;
-			if ((r = sshbuf_get_string(msg, &data, &len)) != 0)
-				fatal_fr(r, "parse data");
+			if ((r = sshbuf_get_string(msg, &data, &len)) != 0) {
+				error_fr(r, "parse data");
+				sftp_conn_set_protocol_violation(conn);
+				read_error = 1;
+				num_req = max_req = 0;
+				break;
+			}
 			if (len > req->len) {
 				/* The same worker hazard as the unexpected
 				 * reply id above. Fail the range. */
@@ -4724,30 +4766,24 @@ handle_dest_replies(struct sftp_conn *to, const char *to_path, int synchronous,
 				break; /* fd not ready */
 		}
 		sshbuf_reset(msg);
-		get_msg(to, msg);
+		if (get_msg(to, msg) != 0)	/* HPN: the connection is gone */
+			goto lost;
 
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &id)) != 0)
-			fatal_fr(r, "dest parse");
+		    (r = sshbuf_get_u32(msg, &id)) != 0) {
+			error_fr(r, "dest parse");	/* HPN */
+			goto violation;
+		}
 		debug3("Received dest reply T:%u I:%u R:%u", type, id, *nreqsp);
 		if (type != SSH2_FXP_STATUS) {
 			error_f("Expected SSH2_FXP_STATUS(%d) packet, got %d - "
 			    "possible protocol corruption", SSH2_FXP_STATUS, type);
-			sftp_conn_set_protocol_violation(to);
-			if (*write_errorp == 0)
-				*write_errorp = SSH2_FX_CONNECTION_LOST;
-			/*
-			 * NOTE: *nreqsp is intentionally NOT decremented on
-			 * this exit path - we break with replies still
-			 * "outstanding".  Callers (sftp_crossload, scp) must
-			 * check *write_errorp for completion; do not trust
-			 * *nreqsp == 0 to mean "all writes acked" without
-			 * also verifying *write_errorp == 0.
-			 */
-			break;
+			goto violation;
 		}
-		if ((r = sshbuf_get_u32(msg, &status)) != 0)
-			fatal_fr(r, "parse dest status");
+		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+			error_fr(r, "parse dest status");	/* HPN */
+			goto violation;
+		}
 		debug3("dest SSH2_FXP_STATUS %u", status);
 		if (status != SSH2_FX_OK) {
 			/* record first error */
@@ -4772,6 +4808,17 @@ handle_dest_replies(struct sftp_conn *to, const char *to_path, int synchronous,
 		(*nreqsp)--;
 	}
 	debug3_f("done: %u outstanding replies", *nreqsp);
+	return;
+
+ violation:
+	/* HPN: a malformed reply breaks this connection, not the process. */
+	sftp_conn_set_protocol_violation(to);
+ lost:
+	/* HPN: the replies still outstanding stay counted in *nreqsp, so a
+	 * caller must check *write_errorp, not *nreqsp == 0, to know every
+	 * write was acked. */
+	if (*write_errorp == 0)
+		*write_errorp = SSH2_FX_CONNECTION_LOST;
 }
 
 int
@@ -4849,12 +4896,13 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 	while (num_req > 0 || max_req > 0) {
 		u_char *data;
 		size_t len;
+		double t_data_start;
 
 		/*
 		 * Simulate EOF on interrupt: stop sending new requests and
 		 * allow outstanding requests to drain gracefully
 		 */
-		if (interrupted) {
+		if (interrupted || sftp_conn_is_dead(to)) { /* HPN */
 			if (num_req == 0) /* If we haven't started yet... */
 				break;
 			max_req = 0;
@@ -4879,19 +4927,22 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 		    &num_upload_req, &write_error);
 
 		sshbuf_reset(msg);
-		/* Time the DATA-reply read from the source connection so
-		 * the rdahead controller on `from` can react to a wedged
-		 * download - same mechanism as the other data-side reads.
-		 * Note: backpressure here is fired on `from`, not `to` -
-		 * the wedge is on the download path. */
-		double t_data_start = monotime_double();
+		/* HPN: time the wait for a DATA reply, as sftp_download does.
+		 * The signal goes to from, since a slow reply means the read
+		 * side is wedged. */
+		t_data_start = monotime_double();
 		if (get_msg(from, msg) != 0)
 			break;
 		if (monotime_double() - t_data_start > RDAHEAD_BP_THRESHOLD_SEC)
 			sftp_conn_rdahead_backpressure_signal(from);
 		if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-		    (r = sshbuf_get_u32(msg, &id)) != 0)
-			fatal_fr(r, "parse");
+		    (r = sshbuf_get_u32(msg, &id)) != 0) {
+			/* HPN: a bad reply fails the connection, not the
+			 * process. The drain after the loop fails the file. */
+			error_fr(r, "parse");
+			sftp_conn_set_protocol_violation(from);
+			break;
+		}
 		debug3("Received origin reply T:%u I:%u R:%d",
 		    type, id, max_req);
 
@@ -4906,8 +4957,14 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 
 		switch (type) {
 		case SSH2_FXP_STATUS:
-			if ((r = sshbuf_get_u32(msg, &status)) != 0)
-				fatal_fr(r, "parse status");
+			if ((r = sshbuf_get_u32(msg, &status)) != 0) {
+				error_fr(r, "parse status");
+				sftp_conn_set_protocol_violation(from); /* HPN */
+				read_error = 1;
+				max_req = 0;
+				num_req = 0;
+				break;
+			}
 			if (status != SSH2_FX_EOF)
 				read_error = 1;
 			max_req = 0;
@@ -4916,14 +4973,19 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 			num_req--;
 			break;
 		case SSH2_FXP_DATA:
-			if ((r = sshbuf_get_string(msg, &data, &len)) != 0)
-				fatal_fr(r, "parse data");
+			if ((r = sshbuf_get_string(msg, &data, &len)) != 0) {
+				error_fr(r, "parse data");
+				sftp_conn_set_protocol_violation(from); /* HPN */
+				read_error = 1;
+				max_req = 0;
+				num_req = 0;
+				break;
+			}
 			debug3("Received data %llu -> %llu",
 			    (unsigned long long)req->offset,
 			    (unsigned long long)req->offset + len - 1);
 			if (len > req->len) {
-				/* Same fail-soft bail as sftp_download. */
-				sftp_conn_die(from,
+				sftp_conn_die(from,	/* HPN */
 				    "Received more data than asked for "
 				    "%zu > %zu", len, req->len);
 				free(data);
@@ -4934,11 +4996,10 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 			}
 			sftp_conn_bytes_wired_add(from, (uint64_t)len);
 			if (len == 0) {
-				/* Same anti-livelock guard and fail-soft
-				 * bail as sftp_download (see the comment
-				 * there); the post-loop drain sets
-				 * read_error and the dest truncates to
-				 * zero as on any crossload read failure. */
+				/* HPN: allow one zero-length DATA reply, and
+				 * treat a second as a broken server. That fails
+				 * the connection, not the process. The drain
+				 * after the loop sets read_error. */
 				if (seen_zerolen) {
 					sftp_conn_die(from,
 					    "server sent zero data length");
@@ -4997,8 +5058,7 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 					    num_req);
 					max_req = 1;
 				} else {
-					/* HPN adaptive read-ahead
-					 * (origin / read side). */
+					/* HPN: adaptive read-ahead window */
 					max_req = sftp_conn_rdahead_window(from,
 					    len);
 				}
@@ -5009,7 +5069,9 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 			    "possible protocol corruption", SSH2_FXP_DATA, type);
 			sftp_conn_set_protocol_violation(from);
 			read_error = 1;
-			/* See sftp_download() switch-default for rationale. */
+			/* HPN: drain the queue here, so the loop ends at its
+			 * next check. That saves a get_msg round trip on a
+			 * connection already known to be broken. */
 			while ((req = TAILQ_FIRST(&requests)) != NULL) {
 				TAILQ_REMOVE(&requests, req, tq);
 				free(req);
@@ -5027,13 +5089,10 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 	debug3_f("waiting for %u replies from destination", num_upload_req);
 	handle_dest_replies(to, to_path, 1, &num_upload_req, &write_error);
 
-	/*
-	 * Same as the download read paths (sftp_download / sftp_download_range):
-	 * a non-empty SOURCE-read queue here means the `from` connection broke
-	 * mid-transfer, not a clean completion.  Fail soft - mark `from` dead and
-	 * set read_error - instead of fatal()-ing the whole process.  (The dest
-	 * write side is handled separately above via handle_dest_replies.)
-	 */
+	/* HPN: requests still queued here mean the loop stopped early on a
+	 * broken read connection, since a clean exit leaves the queue empty.
+	 * Drain it, mark from dead, and fail this file. handle_dest_replies
+	 * above has already recorded the write side in write_error. */
 	if (TAILQ_FIRST(&requests) != NULL) {
 		if (!sftp_conn_is_dead(from))
 			sftp_conn_die(from, "crossload read of \"%s\" ended "
@@ -5058,8 +5117,9 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 		}
 	}
 	if (read_error) {
-		/* Same as sftp_download: SSH2_FX_OK here means the origin
-		 * connection died (already logged); no status clause. */
+		/* HPN: as in sftp_download, SSH2_FX_OK here means the origin
+		 * connection died, which was logged where it failed, so there
+		 * is no status to show. */
 		if (status == SSH2_FX_OK)
 			error("read origin \"%s\" failed", from_path);
 		else
@@ -5146,12 +5206,16 @@ crossload_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 	return 0;
 }
 
-/* HPN: the crossload sink's aborting. Only an interrupt stops the walk,
- * since crossload has no bundles. */
+/* HPN: the crossload sink's aborting. The walk stops on an interrupt, or
+ * once either connection is dead, since every later file would fail on
+ * it. */
 static int
 crossload_aborting(struct sftp_tree_dl_sink *sink)
 {
-	return interrupted;
+	struct crossload_sink	*ctx = (struct crossload_sink *)sink;
+
+	return interrupted || sftp_conn_is_dead(ctx->from) ||
+	    sftp_conn_is_dead(ctx->to);
 }
 
 int
@@ -5166,14 +5230,12 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 		.base = {
 			.make_dir = crossload_make_dir,
 			.xfer_file = crossload_xfer_file,
-			.aborting = crossload_aborting,
-		},
+			.aborting = crossload_aborting },
 		.from = from,
 		.to = to,
 		.dirs = &dirs,
 		.preserve_flag = preserve_flag,
-		.print_flag = print_flag,
-	};
+		.print_flag = print_flag };
 
 	if ((from_path_canon = sftp_realpath(from, from_path)) == NULL) {
 		error("crossload \"%s\": path canonicalization failed",
@@ -5181,9 +5243,9 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 		return -1;
 	}
 
-	/* Reuse the download drivers with conn set to from. Use the chunked
-	 * tree walk when the origin supports it, else the recursive readdir
-	 * fallback. The sink writes to the destination. */
+	/* HPN: reuse the download drivers with conn set to from. Use the
+	 * chunked tree walk when the origin supports it, else the recursive
+	 * readdir fallback. The sink writes to the destination. */
 	if (sftp_conn_has_tree_walk(from))
 		ret = sftp_tree_download_consume(from, from_path_canon,
 		    to_path, dirattrib, follow_link_flag, &sink.base);
@@ -5192,7 +5254,7 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 		    to_path, 0, MAX_DIR_DEPTH, dirattrib, follow_link_flag,
 		    &sink.base);
 
-	/* Apply the deferred directory setstats on the destination. */
+	/* HPN: apply the deferred directory setstats on the destination. */
 	sftp_hpn_dirattrs_apply(to, &dirs);
 	sftp_hpn_dirattrs_free(&dirs);
 
@@ -5216,7 +5278,7 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 	u_int i, expected_id, id;
 	char *name, **usernames = NULL, **groupnames = NULL;
 	u_char type;
-	int r;
+	int r, ret = -1;	/* HPN */
 
 	*usernamesp = *groupnamesp = NULL;
 	if (!sftp_can_get_users_groups_by_id(conn))
@@ -5225,7 +5287,7 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 	if ((uidbuf = sshbuf_new()) == NULL ||
 	    (gidbuf = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
-	/* Reset for the same reason as send_string_request. */
+	/* HPN: reset for the same reason as send_string_request. */
 	sshbuf_reset(msg);
 	expected_id = id = conn->msg_id++;
 	debug2("Sending SSH2_FXP_EXTENDED(users-groups-by-id@openssh.com)");
@@ -5245,42 +5307,35 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 	    (r = sshbuf_put_stringb(msg, gidbuf)) != 0)
 		fatal_fr(r, "compose");
 	send_msg(conn, msg);
-	if (get_msg(conn, msg) != 0) {
-		sshbuf_free(uidbuf);
-		sshbuf_free(gidbuf);
-		return -1;
-	}
+	if (get_msg(conn, msg) != 0)
+		goto out;	/* HPN */
 	if ((r = sshbuf_get_u8(msg, &type)) != 0 ||
-	    (r = sshbuf_get_u32(msg, &id)) != 0)
-		fatal_fr(r, "parse");
+	    (r = sshbuf_get_u32(msg, &id)) != 0) {
+		error_fr(r, "parse");	/* HPN */
+		goto violation;
+	}
 	if (id != expected_id) {
 		error_f("ID mismatch (%u != %u) - possible protocol corruption",
 		    id, expected_id);
-		sftp_conn_set_protocol_violation(conn);
-		sshbuf_free(uidbuf);
-		sshbuf_free(gidbuf);
-		return -1;
+		goto violation;
 	}
 	if (type == SSH2_FXP_STATUS) {
 		u_int status;
 		char *errmsg;
 
 		if ((r = sshbuf_get_u32(msg, &status)) != 0 ||
-		    (r = sshbuf_get_cstring(msg, &errmsg, NULL)) != 0)
-			fatal_fr(r, "parse status");
+		    (r = sshbuf_get_cstring(msg, &errmsg, NULL)) != 0) {
+			error_fr(r, "parse status");	/* HPN */
+			goto violation;
+		}
 		error("users-groups-by-id %s",
 		    *errmsg == '\0' ? fx2txt(status) : errmsg);
 		free(errmsg);
-		sshbuf_free(uidbuf);
-		sshbuf_free(gidbuf);
-		return -1;
+		goto out;	/* HPN */
 	} else if (type != SSH2_FXP_EXTENDED_REPLY) {
 		error_f("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u - "
 		    "possible protocol corruption", SSH2_FXP_EXTENDED_REPLY, type);
-		sftp_conn_set_protocol_violation(conn);
-		sshbuf_free(uidbuf);
-		sshbuf_free(gidbuf);
-		return -1;
+		goto violation;
 	}
 
 	/* reuse */
@@ -5288,13 +5343,17 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 	sshbuf_free(gidbuf);
 	uidbuf = gidbuf = NULL;
 	if ((r = sshbuf_froms(msg, &uidbuf)) != 0 ||
-	    (r = sshbuf_froms(msg, &gidbuf)) != 0)
-		fatal_fr(r, "parse response");
+	    (r = sshbuf_froms(msg, &gidbuf)) != 0) {
+		error_fr(r, "parse response");	/* HPN */
+		goto violation;
+	}
 	if (nuids > 0) {
 		usernames = xcalloc(nuids, sizeof(*usernames));
 		for (i = 0; i < nuids; i++) {
-			if ((r = sshbuf_get_cstring(uidbuf, &name, NULL)) != 0)
-				fatal_fr(r, "parse user name");
+			if ((r = sshbuf_get_cstring(uidbuf, &name, NULL)) != 0) {
+				error_fr(r, "parse user name");	/* HPN */
+				goto violation;
+			}
 			/* Handle unresolved names */
 			if (*name == '\0') {
 				free(name);
@@ -5306,8 +5365,10 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 	if (ngids > 0) {
 		groupnames = xcalloc(ngids, sizeof(*groupnames));
 		for (i = 0; i < ngids; i++) {
-			if ((r = sshbuf_get_cstring(gidbuf, &name, NULL)) != 0)
-				fatal_fr(r, "parse user name");
+			if ((r = sshbuf_get_cstring(gidbuf, &name, NULL)) != 0) {
+				error_fr(r, "parse group name");	/* HPN */
+				goto violation;
+			}
 			/* Handle unresolved names */
 			if (*name == '\0') {
 				free(name);
@@ -5316,16 +5377,36 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 			groupnames[i] = name;
 		}
 	}
-	if (sshbuf_len(uidbuf) != 0)
-		fatal_f("unexpected extra username data");
-	if (sshbuf_len(gidbuf) != 0)
-		fatal_f("unexpected extra groupname data");
-	sshbuf_free(uidbuf);
-	sshbuf_free(gidbuf);
+	if (sshbuf_len(uidbuf) != 0) {
+		error_f("unexpected extra username data");	/* HPN */
+		goto violation;
+	}
+	if (sshbuf_len(gidbuf) != 0) {
+		error_f("unexpected extra groupname data");	/* HPN */
+		goto violation;
+	}
 	/* success */
 	*usernamesp = usernames;
 	*groupnamesp = groupnames;
-	return 0;
+	ret = 0;
+	goto out;
+
+ violation:
+	/* HPN: a malformed reply breaks this connection, not the process. */
+	sftp_conn_set_protocol_violation(conn);
+ out:
+	sshbuf_free(uidbuf);
+	sshbuf_free(gidbuf);
+	if (ret != 0) {
+		/* HPN: free the names read before the failure. */
+		for (i = 0; usernames != NULL && i < nuids; i++)
+			free(usernames[i]);
+		for (i = 0; groupnames != NULL && i < ngids; i++)
+			free(groupnames[i]);
+		free(usernames);
+		free(groupnames);
+	}
+	return ret;
 }
 
 char *

@@ -1821,7 +1821,9 @@ sftp_hpn_dirattrs_defer_local(struct sftp_hpn_dirattr_list *dl,
 		d->set_times = 1;
 		d->atime = dirattrib->atime;
 		d->mtime = dirattrib->mtime;
-	}
+	} else if (preserve_flag)
+		debug("Server did not send times for directory \"%s\"",
+		    path);
 }
 
 /* Depth of a path, counted in separators, for ordering the deferred attrs. */
