@@ -155,6 +155,11 @@ struct tree_dl_ctx {
 	/* Set once the abort notice has been shown, so an interrupt that
 	 * lands mid-batch reports itself once. */
 	int				 abort_noticed;
+	/* The relpath of a directory make_dir could not create, while the
+	 * walk is inside it, else NULL. The files below it are failed
+	 * without a transfer, and failed_files counts them. */
+	char				*failed_dir;
+	int				 failed_files;
 	/* -1 after any per-entry failure. */
 	int				 ret;
 };
@@ -1723,9 +1728,12 @@ sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
 
 /* Local counterpart for downloads: create the directory with the remote
  * mode, or 0777 when the server sent none, plus the owner write and
- * execute bits. An existing directory is fine, as in stock sftp. Reports
- * the final and the forced mode so the caller can defer the chmod when
- * they differ. */
+ * execute bits. An existing directory is fine, as in stock sftp, if this
+ * user can search it. One that cannot fails here once, since nothing
+ * below it could be opened. Write permission is not required, because a
+ * file that already exists, such as a resume target, can be written in a
+ * read-only directory. Reports the final and the forced mode so the
+ * caller can defer the chmod when they differ. */
 int
 sftp_hpn_ensure_local_dir(const char *dst, const Attrib *dirattrib,
     mode_t *mode_out, mode_t *tmpmode_out)
@@ -1747,6 +1755,11 @@ sftp_hpn_ensure_local_dir(const char *dst, const Attrib *dirattrib,
 		}
 		if (stat(dst, &sb) == -1 || !S_ISDIR(sb.st_mode)) {
 			error("\"%s\" exists but is not a directory", dst);
+			return -1;
+		}
+		if (access(dst, X_OK) == -1) {
+			error("local directory \"%s\": %s", dst,
+			    strerror(errno));
 			return -1;
 		}
 	}
@@ -2192,11 +2205,46 @@ dl_sink_fail(struct sftp_tree_dl_sink *sink, const char *path,
 		sink->fail(sink, path, reason);
 }
 
+/* Whether relpath rel lies below the directory relpath dir. */
+static int
+tree_relpath_under(const char *rel, const char *dir)
+{
+	size_t len = strlen(dir);
+
+	return strncmp(rel, dir, len) == 0 && rel[len] != '\0' &&
+	    strchr(HPN_WALK_SEPARATORS, rel[len]) != NULL;
+}
+
+/* Leave the subtree of a directory that could not be created. Report once
+ * how many files below it were not transferred, both on stderr and to the
+ * sink's failure list, then forget the directory. */
+static void
+tree_dl_leave_failed_dir(struct tree_dl_ctx *ctx)
+{
+	char *path, reason[64];
+
+	if (ctx->failed_dir == NULL)
+		return;
+	if (ctx->failed_files > 0) {
+		path = sftp_path_append(ctx->dst, ctx->failed_dir);
+		snprintf(reason, sizeof(reason),
+		    "%d files below it not transferred", ctx->failed_files);
+		error("\"%s\": %s", path, reason);
+		dl_sink_fail(ctx->sink, path, reason);
+		free(path);
+	}
+	free(ctx->failed_dir);
+	ctx->failed_dir = NULL;
+	ctx->failed_files = 0;
+}
+
 /* Per-record callback (see sftp_tree_record_cb). Directories are created
  * inline: the wire contract emits a parent before its children, so a dir's
- * parent already exists on disk when its record arrives. Regular files go
- * one of two ways. A streaming sink (the parallel fleet) takes each file as
- * it arrives, so transfer overlaps discovery. Otherwise the file is queued
+ * parent already exists on disk when its record arrives. A directory that
+ * cannot be created fails every file below it without a transfer, since
+ * none of them could be written. Regular files go one of two ways. A
+ * streaming sink (the parallel fleet) takes each file as it arrives, so
+ * transfer overlaps discovery. Otherwise the file is queued
  * and transferred once the batch ends, because a transfer issued while the
  * dtree-read reply is still arriving would collide with it on the control
  * connection. On abort the callback returns nonzero so the read stops
@@ -2240,10 +2288,32 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 	new_src = sftp_path_append(ctx->src, ent->relpath);
 	new_dst = sftp_path_append(ctx->dst, ent->relpath);
 
+	/* Inside a directory that could not be created, log each file as
+	 * failed and skip everything else. The walk is depth first, so the
+	 * subtree arrives in one run and the first record outside it ends
+	 * the run. The directory's own failure already set ret. */
+	if (ctx->failed_dir != NULL) {
+		if (tree_relpath_under(ent->relpath, ctx->failed_dir)) {
+			if (ent->rectype == HPN_DTREE_REC_REG) {
+				transferlog_file(HPNS_FD_FAILED,
+				    (attrs->flags & SSH2_FILEXFER_ATTR_SIZE) ?
+				    (off_t)attrs->size : 0, new_dst);
+				ctx->failed_files++;
+			}
+			free(new_src);
+			free(new_dst);
+			return 0;
+		}
+		tree_dl_leave_failed_dir(ctx);
+	}
+
 	switch (ent->rectype) {
 	case HPN_DTREE_REC_DIR:
-		if (ctx->sink->make_dir(ctx->sink, new_src, new_dst, attrs) != 0)
+		if (ctx->sink->make_dir(ctx->sink, new_src, new_dst,
+		    attrs) != 0) {
 			ctx->ret = -1;
+			ctx->failed_dir = xstrdup(ent->relpath);
+		}
 		free(new_src);
 		free(new_dst);
 		break;
@@ -2420,6 +2490,7 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	sftp_tree_walk_close(conn, &walk);
 	tree_dl_files_clear(&ctx);
 	free(ctx.files);
+	tree_dl_leave_failed_dir(&ctx);
 	return ctx.ret;
 }
 
