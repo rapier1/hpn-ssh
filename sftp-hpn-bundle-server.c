@@ -153,7 +153,8 @@ bundle_state_new(const char *dest_dir, uint32_t flags)
 		threads = bundle_writer_threads();
 		state->pool = bundle_write_pool_new(threads,
 		    (flags & HPN_BUNDLE_FLAG_PRESERVE) != 0,
-		    (flags & HPN_BUNDLE_FLAG_FSYNC) != 0, budget);
+		    (flags & HPN_BUNDLE_FLAG_FSYNC) != 0, /*owner_write=*/0,
+		    budget);
 		if (state->pool != NULL)
 			debug_f("hpn-bundle: writer pool active (%d threads, "
 			    "%llu-byte budget)", threads,
@@ -233,7 +234,6 @@ bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
 {
 	struct hpn_bundle_state *state = ctx;
 	char *full_copy, *parent;
-	mode_t perm;
 
 	if (!bundle_path_is_safe(path, state->dest_dir)) {
 		error_f("hpn-bundle: rejected entry pathname \"%s\" (empty, "
@@ -281,17 +281,15 @@ bundle_upload_entry_cb(void *ctx, const char *path, uint64_t size,
 		return 0;
 	}
 
-	perm = 0644;		/* what a plain SFTP upload without -p gets */
-	if (state->flags & HPN_BUNDLE_FLAG_PRESERVE)
-		perm = mode;
-
 	/* No O_TRUNC. A connection that dies mid-bundle can leave a lagging
 	 * server still draining buffered records while the client's re-send
 	 * writes the same file. Without O_TRUNC that stale writer can only
 	 * overwrite a prefix with identical bytes and never shrink the file.
 	 * The size is set by the ftruncate in entry_end_cb, which only a
-	 * writer that completes the entry reaches. */
-	state->cur_fd = open(state->cur_full_path, O_WRONLY | O_CREAT, perm);
+	 * writer that completes the entry reaches. The source mode is the
+	 * create mode, as for a plain SFTP upload. umask applies, and under
+	 * -p entry_end_cb forces the exact bits. */
+	state->cur_fd = open(state->cur_full_path, O_WRONLY | O_CREAT, mode);
 	if (state->cur_fd < 0) {
 		error_f("hpn-bundle: open \"%s\": %s",
 		    state->cur_full_path, strerror(errno));

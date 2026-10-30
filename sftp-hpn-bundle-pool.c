@@ -48,8 +48,9 @@ struct bundle_write_pool {
 	int             n_threads;
 	int             max_depth;	/* backpressure: queued-job count cap */
 	uint64_t        max_bytes;	/* backpressure: buffered-byte budget */
-	int             preserve;	/* apply each job's mode and mtime */
+	int             preserve;	/* force each job's exact mode and mtime */
 	int             do_fsync;	/* fsync each file before close */
+	int             owner_write;	/* add S_IWUSR to the create mode */
 
 	pthread_mutex_t mu;
 	pthread_cond_t  not_empty;	/* a job was queued, or shutdown */
@@ -107,9 +108,9 @@ bundle_write_one(struct bundle_write_pool *pool, struct bundle_write_job *job)
 	mode_t perm;
 	int fd, rc = 0;
 
-	perm = 0644;
-	if (pool->preserve)
-		perm = job->mode;
+	perm = job->mode;
+	if (pool->owner_write)
+		perm |= S_IWUSR;
 
 	/* No O_TRUNC, the ftruncate below sets the size. See the comment in
 	 * bundle_upload_entry_cb in sftp-hpn-bundle-server.c. */
@@ -270,7 +271,7 @@ bundle_pool_enqueue(struct bundle_write_pool *pool,
  * caller writes inline. */
 struct bundle_write_pool *
 bundle_write_pool_new(int n_threads, int preserve, int do_fsync,
-    uint64_t budget)
+    int owner_write, uint64_t budget)
 {
 	struct bundle_write_pool *pool;
 	int i, rc;
@@ -282,6 +283,7 @@ bundle_write_pool_new(int n_threads, int preserve, int do_fsync,
 	pool->max_bytes = budget;
 	pool->preserve  = preserve;
 	pool->do_fsync  = do_fsync;
+	pool->owner_write = owner_write;
 	pthread_mutex_init(&pool->mu, NULL);
 	pthread_cond_init(&pool->not_empty, NULL);
 	pthread_cond_init(&pool->not_full, NULL);

@@ -1260,11 +1260,12 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 	/* Rebuild the worker fleet if a prior interrupt tore it down. */
 	parallel_orch_ensure_alive(conn);
 
-	/* Push this command's effective preserve (per-command -p OR the
-	 * program-level -p) to the long-lived orchestrator: the parallel/bundle
-	 * path reads preserve from the orchestrator config; the single-stream
-	 * path below uses the pflag arg directly. */
+	/* HPN: push this command's effective -p and -f (per command or
+	 * program level) to the long-lived orchestrator, which stamps them
+	 * into each unit it queues. The single-stream path below uses the
+	 * arguments. */
 	sftp_parallel_set_preserve(parallel_orch, pflag || global_pflag);
+	sftp_parallel_set_fsync(parallel_orch, fflag || global_fflag);
 
 	abs_src = make_absolute_pwd_glob(xstrdup(src), pwd);
 	memset(&g, 0, sizeof(g));
@@ -1469,11 +1470,12 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 	/* Rebuild the worker fleet if a prior interrupt tore it down. */
 	parallel_orch_ensure_alive(conn);
 
-	/* Push this command's effective preserve (per-command -p OR the
-	 * program-level -p) to the long-lived orchestrator: the parallel/bundle
-	 * path reads preserve from the orchestrator config; the single-stream
-	 * path below uses the pflag arg directly. */
+	/* HPN: push this command's effective -p and -f (per command or
+	 * program level) to the long-lived orchestrator, which stamps them
+	 * into each unit it queues. The single-stream path below uses the
+	 * arguments. */
 	sftp_parallel_set_preserve(parallel_orch, pflag || global_pflag);
+	sftp_parallel_set_fsync(parallel_orch, fflag || global_fflag);
 
 	if (dst) {
 		tmp_dst = xstrdup(dst);

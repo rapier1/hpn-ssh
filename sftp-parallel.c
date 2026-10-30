@@ -1241,6 +1241,14 @@ sftp_parallel_set_preserve(struct sftp_parallel *fleet, int on)
 		fleet->cfg.preserve_flag = on ? 1 : 0;
 }
 
+/* Per-command fsync toggle, pushed like preserve above. */
+void
+sftp_parallel_set_fsync(struct sftp_parallel *fleet, int on)
+{
+	if (fleet != NULL)
+		fleet->cfg.fsync_flag = on ? 1 : 0;
+}
+
 int
 sftp_parallel_follow_link_flag(const struct sftp_parallel *fleet)
 {

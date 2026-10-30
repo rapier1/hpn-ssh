@@ -477,6 +477,9 @@ struct sftp_range_tracker {
 	/* Verify transfer: the last range to finalize parks the tracker for
 	 * the post-transfer verify phase. */
 	int                    verify;
+	/* The command's -p and -f, taken when the file is split. */
+	int                    preserve;
+	int                    fsync;
 	/* Per-inode writer cap: active_writers is the number of ranges writing
 	 * now, writer_cap the ceiling. Taken in the worker's dispatch gate and
 	 * released in worker_process_result. */
@@ -525,6 +528,12 @@ struct sftp_work_unit {
 	 * rule in sftp_parallel_submit_upload. */
 	int      resume;
 	int      verify;
+	/* The command's -p and -f, and whether it verifies the transfer.
+	 * parallel_unit_submit stamps them so a later command cannot change
+	 * them while the unit waits in the queue. */
+	int      preserve;
+	int      fsync;
+	int      verify_transfer;
 	/* Set after a bundle wire failure; the batch loop then dispatches the
 	 * unit through the per-file path. */
 	int      bundle_ineligible;

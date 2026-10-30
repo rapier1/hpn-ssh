@@ -308,12 +308,11 @@ bundle_dl_entry_cb(void *ctx, const char *path, uint64_t size,
 		return 0;
 	}
 
-	/* Create mode for the output file: the source permission bits
-	 * under -p, else 0644. Both are subject to umask here; -p forces
-	 * the exact bits with fchmod in bundle_dl_entry_end_cb. */
-	perm = 0644;
-	if (stream->preserve_flag)
-		perm = mode & 0777;
+	/* Create mode for the output file: the source permission bits plus
+	 * owner write, as a plain SFTP download creates it, so a re-send can
+	 * reopen the file. umask applies here, and -p forces the exact bits
+	 * with fchmod in bundle_dl_entry_end_cb. */
+	perm = (mode & 0777) | S_IWUSR;
 
 	/* Open without O_TRUNC, mirroring the upload extractor. The size is
 	 * set by ftruncate in bundle_dl_entry_end_cb, which only a completed
@@ -772,7 +771,8 @@ sftp_hpn_bundle_download(struct sftp_conn *conn,
 	 * serial, harmless. */
 	if (writer_pool) {
 		stream.pool = bundle_write_pool_new(bundle_writer_threads(),
-		    preserve_flag, fsync_flag, bundle_writer_budget());
+		    preserve_flag, fsync_flag, /*owner_write=*/1,
+		    bundle_writer_budget());
 		if (stream.pool != NULL)
 			debug_f("hpn-bundle-fetch: writer pool active (%d threads)",
 			    bundle_writer_threads());
@@ -1338,12 +1338,12 @@ sftp_hpn_bundle_upload(struct sftp_conn *conn,
 			continue;
 		}
 
-		perm = 0644;
+		/* The source mode always, as a plain SFTP upload sends it. The
+		 * source mtime only under -p. */
+		perm = sb.st_mode & 07777;
 		mtime = time(NULL);
-		if (preserve_flag) {
-			perm = sb.st_mode & 07777;
+		if (preserve_flag)
 			mtime = sb.st_mtime;
-		}
 
 		/* add a file to the bundle */
 		if (sftp_hpn_bundle_writer_add_file(writer,

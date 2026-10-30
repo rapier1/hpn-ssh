@@ -417,10 +417,12 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 		 * fatals here. Return 1/2 are "already complete" skip codes -
 		 * map to success below so the unit isn't retried.
 		 */
+		/* Arms the inline source hash when this unit is verified. */
+		sftp_conn_set_verify_transfer(worker->conn, unit->verify_transfer);
 		rc = sftp_upload(worker->conn, unit->src_path, unit->dst_path,
-		    fleet->cfg.preserve_flag, unit->resume, /*verify=*/unit->verify,
-		    fleet->cfg.fsync_flag, fleet->cfg.inplace_flag);
-		if (rc == 0 && fleet->cfg.verify_transfer) {
+		    unit->preserve, unit->resume, /*verify=*/unit->verify,
+		    unit->fsync, fleet->cfg.inplace_flag);
+		if (rc == 0 && unit->verify_transfer) {
 			/* sftp_upload leaves its teed source hash for the worker,
 			 * since its own park skips worker conns. */
 			unit->have_src_hash = sftp_hpn_src_take(
@@ -508,10 +510,10 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 	}
 	case SFTP_OP_DOWNLOAD:
 		rc = sftp_download(worker->conn, unit->src_path, unit->dst_path,
-		    /*Attrib*/NULL, fleet->cfg.preserve_flag,
-		    unit->resume, fleet->cfg.fsync_flag,
+		    /*Attrib*/NULL, unit->preserve,
+		    unit->resume, unit->fsync,
 		    fleet->cfg.inplace_flag, /*verify=*/unit->verify);
-		if (rc == 0 && fleet->cfg.verify_transfer)
+		if (rc == 0 && unit->verify_transfer)
 			parallel_verify_park_whole_file(fleet, unit->dst_path,
 			    unit->src_path, /*local_is_target=*/1, 0, 0);  /* local = downloaded */
 		if (rc == 1 || rc == 2) {
@@ -699,7 +701,7 @@ worker_process_result(struct sftp_worker *worker, struct sftp_work_unit *unit, i
 		 * phase follows (with -V the line defers to the verify
 		 * resolution). Range/span files log at tracker finalize. */
 		if ((unit->op == SFTP_OP_UPLOAD || unit->op == SFTP_OP_DOWNLOAD) &&
-		    (unit->skipped || !fleet->cfg.verify_transfer))
+		    (unit->skipped || !unit->verify_transfer))
 			transferlog_file(unit->skipped ? HPNS_FD_SKIPPED :
 			    HPNS_FD_SUCCESS, unit->size,
 			    unit->dst_path);
@@ -801,7 +803,7 @@ worker_finalize_one_entry(struct sftp_parallel *fleet, struct sftp_worker *worke
 		worker_record_completion(worker, unit->size, 1);
 		/* TransferLog: batched/bundled member success is final here
 		 * unless the verify phase will resolve it. */
-		if (!fleet->cfg.verify_transfer)
+		if (!unit->verify_transfer)
 			transferlog_file(HPNS_FD_SUCCESS,
 			    unit->size, unit->dst_path);
 		else if (unit->op == SFTP_OP_UPLOAD)
@@ -929,9 +931,12 @@ worker_run_batch_pipelined(struct sftp_worker *worker,
 	}
 
 	/* send() drains batch_prev_pending, if any, after its own
-	 * opens are on the wire; that overlap is the win. */
+	 * opens are on the wire; that overlap is the win. A batch holds one
+	 * command's -p, -f, and verify setting, which arms the inline source
+	 * hash. */
+	sftp_conn_set_verify_transfer(worker->conn, batch[0]->verify_transfer);
 	new_pending = sftp_upload_batch_send(worker->conn, entries, batch_n,
-	    fleet->cfg.preserve_flag, fleet->cfg.fsync_flag,
+	    batch[0]->preserve, batch[0]->fsync,
 	    fleet->cfg.inplace_flag,
 	    worker->batch_prev_pending);
 	/* batch_prev_pending has been freed inside send. */
@@ -1096,9 +1101,11 @@ worker_run_bundle(struct sftp_worker *worker,
 	 * on each containing directory anyway. Slight wire-size cost (full
 	 * path repeated in every record header) but trivial vs the small-file
 	 * payloads. */
-	opts.preserve = fleet->cfg.preserve_flag;
-	opts.fsync = fleet->cfg.fsync_flag;
+	opts.preserve = batch[0]->preserve;	/* one command per bundle */
+	opts.fsync = batch[0]->fsync;
 	opts.writer_pool = fleet->cfg.writer_pool;
+	/* The bundle writer hashes each member when this is verified. */
+	sftp_conn_set_verify_transfer(worker->conn, batch[0]->verify_transfer);
 	/* no progress counter, since the fleet counts its own bytes */
 	bundle_rc = sftp_hpn_bundle_upload(worker->conn, "", entries, batch_n,
 	    &opts, NULL);
@@ -1147,8 +1154,8 @@ worker_run_bundle_download(struct sftp_worker *worker,
 	}
 
 	t_start_ms = monotime_ms();
-	opts.preserve = fleet->cfg.preserve_flag;
-	opts.fsync = fleet->cfg.fsync_flag;
+	opts.preserve = batch[0]->preserve;	/* one command per bundle */
+	opts.fsync = batch[0]->fsync;
 	opts.writer_pool = fleet->cfg.writer_pool;
 	bundle_rc = sftp_hpn_bundle_download(worker->conn, entries, batch_n,
 	    &opts, /*progress=*/NULL);
@@ -1383,8 +1390,12 @@ worker_collect_batch(struct sftp_worker *worker, struct sftp_work_unit *first,
 		    batch_bytes + (uint64_t)next_unit->size > batch_byte_cap)
 			fits = 0;
 		if (next_unit->op != batch_op ||
+		    next_unit->preserve != first->preserve ||
+		    next_unit->fsync != first->fsync ||
+		    next_unit->verify_transfer != first->verify_transfer ||
 		    next_unit->bundle_ineligible || !fits) {
-			/* Wrong op, not bundleable, or no room: stop here and
+			/* Wrong op, another command's -p, -f, or verify
+			 * setting, not bundleable, or no room: stop here and
 			 * let the caller run it by itself. */
 			*leftover_out = next_unit;
 			break;

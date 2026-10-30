@@ -146,10 +146,14 @@ parallel_unit_free(struct sftp_work_unit *u)
  * frees the tracker.
  */
 static struct sftp_range_tracker *
-range_tracker_new(int total, enum sftp_range_target target, const char *path,
-    const char *src_path, int verify, int writer_cap, const Attrib *attrs)
+range_tracker_new(const struct sftp_parallel *fleet, int total,
+    enum sftp_range_target target, const char *path, const char *src_path,
+    const Attrib *attrs)
 {
 	struct sftp_range_tracker *t = xcalloc(1, sizeof(*t));
+	int verify = fleet->cfg.verify_transfer;
+	int writer_cap = fleet->cfg.writers_per_inode_cap;
+
 	pthread_mutex_init(&t->mu, NULL);
 	t->attrs      = *attrs;
 	t->total      = total;
@@ -159,6 +163,8 @@ range_tracker_new(int total, enum sftp_range_target target, const char *path,
 	t->path       = xstrdup(path);
 	t->src_path   = (src_path != NULL) ? xstrdup(src_path) : NULL;
 	t->verify     = verify;
+	t->preserve   = fleet->cfg.preserve_flag;
+	t->fsync      = fleet->cfg.fsync_flag;
 	/* Per-range verify slots, allocated for BOTH directions when verifying so
 	 * the range-granular parallel verify can fan a big file's transfer ranges
 	 * across the pool. Upload (REMOTE) tees a source hash into each slot
@@ -310,9 +316,8 @@ parallel_unit_ensure_file(struct sftp_conn *conn, struct sftp_work_unit *u)
 static void
 range_file_finish(struct sftp_range_tracker *t, struct sftp_worker *worker)
 {
-	struct sftp_parallel *fleet = worker->parent;
-	int preserve_flag = fleet->cfg.preserve_flag;
-	int fsync_flag = fleet->cfg.fsync_flag;
+	int preserve_flag = t->preserve;
+	int fsync_flag = t->fsync;
 	Attrib mode_only;
 	int fd;
 
@@ -1067,8 +1072,13 @@ parallel_bundle_add(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 	fleet->pending++;
 	pthread_mutex_unlock(&fleet->pending_mu);
 
-	/* A bundle carries one direction; flush a pending one of the other op. */
-	if (fleet->bundle_pending_n > 0 && fleet->bundle_pending_op != u->op)
+	/* A bundle carries one direction and one command's -p, -f, and
+	 * verify setting, so flush a pending one that differs. */
+	if (fleet->bundle_pending_n > 0 &&
+	    (fleet->bundle_pending_op != u->op ||
+	    fleet->bundle_pending[0]->preserve != u->preserve ||
+	    fleet->bundle_pending[0]->fsync != u->fsync ||
+	    fleet->bundle_pending[0]->verify_transfer != u->verify_transfer))
 		parallel_bundle_flush(fleet);
 	if (fleet->bundle_pending_n == fleet->bundle_pending_cap) {
 		int ncap = fleet->bundle_pending_cap ? fleet->bundle_pending_cap * 2 : 64;
@@ -1109,10 +1119,10 @@ parallel_bundle_flush_pending(struct sftp_parallel *fleet)
 }
 
 /*
- * Internal submit. Deliberately does NOT demote walker-phase DONE the way
- * the public submit entry points do: endgame-split pieces arrive here from
- * worker threads mid-drain, and demoting would un-arm the endgame state
- * they were created by.
+ * Internal submit, run only on the submit thread. It stamps the command's
+ * -p, -f, and verify setting into the unit, so the unit keeps them however
+ * long it waits in the queue. Unlike the public submit entry points, it
+ * leaves a walker phase of DONE alone.
  */
 int
 parallel_unit_submit(struct sftp_parallel *fleet, struct sftp_work_unit *u)
@@ -1126,6 +1136,9 @@ parallel_unit_submit(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 	 * need no per-site NULL check. */
 	if (u == NULL)
 		return -1;
+	u->preserve = fleet->cfg.preserve_flag;
+	u->fsync = fleet->cfg.fsync_flag;
+	u->verify_transfer = fleet->cfg.verify_transfer;
 	/* Bundle-eligibility gate: when bundle mode is enabled and the
 	 * unit's file size exceeds the per-target threshold, mark it
 	 * ineligible so the worker routes it through the single-file
@@ -1351,11 +1364,9 @@ submit_resume_split(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	    op == SFTP_OP_UPLOAD ? "upload" : "download", remote,
 	    (long long)dest_size, n_spans, (long long)tail_len, n_tail);
 
-	tracker = range_tracker_new(n,
+	tracker = range_tracker_new(fleet, n,
 	    op == SFTP_OP_UPLOAD ? SFTP_RANGE_TARGET_REMOTE :
-	    SFTP_RANGE_TARGET_LOCAL, /*path=*/dst, /*src=*/src,
-	    /*verify=*/fleet->cfg.verify_transfer,
-	    fleet->cfg.writers_per_inode_cap, final_attrs);
+	    SFTP_RANGE_TARGET_LOCAL, /*path=*/dst, /*src=*/src, final_attrs);
 	tracker->file_bytes = src_size;
 
 	for (i = 0; i < n; i++) {
@@ -1844,10 +1855,9 @@ submit_upload_ranges(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	 * tracker for post-transfer verify when verify transfer is on, so the
 	 * last range to finalize runs the whole-file integrity check (range
 	 * units do not pass through execute_unit's whole-file verify). */
-	tracker = range_tracker_new(effective_ranges,
+	tracker = range_tracker_new(fleet, effective_ranges,
 	    SFTP_RANGE_TARGET_REMOTE, remote_path, /*src=*/local_path,
-	    /*verify=*/fleet->cfg.verify_transfer,
-	    fleet->cfg.writers_per_inode_cap, final_attrs);
+	    final_attrs);
 	tracker->file_bytes = file_size;
 
 	/* Submit one SFTP_OP_UPLOAD_RANGE work unit per range. */
@@ -1937,10 +1947,9 @@ submit_download_ranges(struct sftp_parallel *fleet,
 		return -1;
 
 	/* Download: local file is the target, remote file is the source. */
-	tracker = range_tracker_new(effective_ranges,
+	tracker = range_tracker_new(fleet, effective_ranges,
 	    SFTP_RANGE_TARGET_LOCAL, local_path, /*src=*/remote_path,
-	    /*verify=*/fleet->cfg.verify_transfer,
-	    fleet->cfg.writers_per_inode_cap, final_attrs);
+	    final_attrs);
 	tracker->file_bytes = file_size;
 
 	for (i = 0; i < effective_ranges; i++) {

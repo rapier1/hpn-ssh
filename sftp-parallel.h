@@ -119,8 +119,9 @@ enum sftp_walker_phase {
  * Caller-filled configuration for one parallel session. sftp.c and scp.c
  * populate it from the command line and from ssh_config, then hand it to
  * sftp_parallel_start, which copies it into the fleet. Read-mostly after
- * that: workers and the reporter read it without locking, so anything that
- * changes per command must be atomic (preserve_flag) rather than plain.
+ * that: workers and the reporter read it without locking. preserve_flag,
+ * fsync_flag, and verify_transfer change per command. The submit thread
+ * stamps them into each unit, and workers read them there.
  */
 struct sftp_parallel_config {
 	int          num_streams;       /* N - must be >= 1 */
@@ -209,8 +210,7 @@ struct sftp_parallel_config {
 	int          lustre_stripe_count;
 
 	/* Transfer flags applied to every submitted unit */
-	/* _Atomic: per-command set_preserve() (main) races worker reads */
-	_Atomic int  preserve_flag;
+	int          preserve_flag;
 	int          fsync_flag;
 	int          inplace_flag;
 	int          follow_link_flag;
@@ -465,6 +465,10 @@ void sftp_parallel_set_verify_transfer(struct sftp_parallel *fleet, int on);
  * orchestrator persists across commands so each command pushes its effective
  * preserve here. No-op when fleet is NULL. */
 void sftp_parallel_set_preserve(struct sftp_parallel *fleet, int on);
+
+/* Per-command fsync toggle (put/get -f), pushed the same way as preserve.
+ * No-op when fleet is NULL. */
+void sftp_parallel_set_fsync(struct sftp_parallel *, int);
 
 /*
  * Register an app-layer round-trip-time estimate, in microseconds, for the

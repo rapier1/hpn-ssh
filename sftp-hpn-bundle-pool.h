@@ -75,11 +75,13 @@ struct bundle_write_job {
 int bundle_writer_threads(void);
 uint64_t bundle_writer_budget(void);
 
-/* Create a pool of n_threads writers. preserve applies each job's mode
- * and mtime, do_fsync fsyncs each file, budget is the buffered-byte
- * bound. Returns NULL on failure and the caller then writes inline. */
+/* Create a pool of n_threads writers. Each file is created with its job's
+ * mode. preserve forces that exact mode and the mtime, do_fsync fsyncs
+ * each file, owner_write adds the owner write bit at create as a plain
+ * SFTP download does, and budget is the buffered-byte bound. Returns NULL
+ * on failure and the caller then writes inline. */
 struct bundle_write_pool *bundle_write_pool_new(int n_threads, int preserve,
-    int do_fsync, uint64_t budget);
+    int do_fsync, int owner_write, uint64_t budget);
 
 /* Enqueue one complete file. Blocks while the byte budget or the count
  * cap is exceeded. Returns 0 and takes ownership of the job, or -1 once
