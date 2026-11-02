@@ -2415,6 +2415,12 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 		abs_dst = NULL;
 		free(tmp);
 		tmp = NULL;
+		/* HPN: a dead connection ends the command. Every later match
+		 * would fail the same way. */
+		if (sftp_conn_is_dead(conn)) {
+			err = -1;
+			break;
+		}
 	}
 
 out:
@@ -2903,6 +2909,12 @@ throughlocal_sftp(struct sftp_conn *from, struct sftp_conn *to,
 		abs_dst = NULL;
 		free(tmp);
 		tmp = NULL;
+		/* HPN: a dead connection at either end ends the command.
+		 * Every later match would fail the same way. */
+		if (sftp_conn_is_dead(from) || sftp_conn_is_dead(to)) {
+			err = -1;
+			break;
+		}
 	}
 
 out:

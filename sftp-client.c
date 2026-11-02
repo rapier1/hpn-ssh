@@ -1429,6 +1429,7 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 {
 	u_int *ids;
 	u_int status;
+	u_int *failed_status;
 	int *failed;
 	Attrib mkdir_attrs;
 	int sent, recv = 0, nfailed = 0, failures = 0, window, k;
@@ -1438,6 +1439,7 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 	window = MINIMUM(n, SFTP_DIR_PIPELINE_WINDOW);
 	ids = xcalloc(n, sizeof(*ids));
 	failed = xcalloc(n, sizeof(*failed));
+	failed_status = xcalloc(n, sizeof(*failed_status));
 	memset(created_out, 0, (size_t)n);
 	if (failed_out != NULL)
 		memset(failed_out, 0, (size_t)n);
@@ -1473,12 +1475,16 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 			}
 			free(ids);
 			free(failed);
+			free(failed_status);
 			return failures;
 		}
 		if (status == SSH2_FX_OK)
 			created_out[recv] = 1;
-		else
-			failed[nfailed++] = recv;	/* stat it in phase 2 */
+		else {
+			/* stat it in phase 2 */
+			failed_status[nfailed] = status;
+			failed[nfailed++] = recv;
+		}
 		recv++;
 		/* That reply freed a slot in the window. Send the next
 		 * path into it. */
@@ -1496,22 +1502,28 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 
 	/* Phase 2, usually empty: every reply is in, so a stat per failure is
 	 * safe now. A directory that already exists is fine and keeps
-	 * created_out at 0, so the caller defers no setstat for it. Anything
-	 * else is a real failure. */
+	 * created_out at 0, so the caller defers no setstat for it. Something
+	 * else in the way is reported as such. Otherwise the mkdir's own
+	 * status is the reason. */
 	for (k = 0; k < nfailed; k++) {
 		int i = failed[k];
 		Attrib existing;
 
 		if (sftp_stat(conn, paths[i], 1, &existing) == 0 &&
-		    (existing.flags & SSH2_FILEXFER_ATTR_PERMISSIONS) &&
-		    S_ISDIR(existing.perm))
-			continue;	/* pre-existing directory: tolerate */
-		error("remote mkdir \"%s\": failed", paths[i]);
+		    (existing.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)) {
+			if (S_ISDIR(existing.perm))
+				continue;	/* pre-existing directory */
+			error("\"%s\" exists but is not a directory",
+			    paths[i]);
+		} else
+			error("remote mkdir \"%s\": %s", paths[i],
+			    fx2txt(failed_status[k]));
 		if (failed_out != NULL)
 			failed_out[i] = 1;
 		failures++;
 	}
 	free(failed);
+	free(failed_status);
 	return failures;
 }
 

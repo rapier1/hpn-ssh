@@ -553,8 +553,10 @@ Appends one tab-delimited line per file
 to
 .Ar path
 (default
-.Pa ./hpnssh-transfer.log ) ,
+.Pa ./hpnssh-transfer. Ns Ar PID Ns Pa .log ) ,
 ending with a run total.
+File names are percent-encoded, so a tab, newline, or control
+character in a name cannot break a line.
 Statuses are
 .Cm success , skipped , verified , repaired ,
 and
@@ -567,7 +569,10 @@ a file that could not be verified is logged as
 The log target must be writable or
 .Nm
 exits before any connection is made.
-The path is used as given.
+A directory gets the default file name inside it.
+Any other path names the file itself, which must be a regular file and
+not a symbolic link.
+The path may not contain control characters.
 The log is purely informational: nothing ever reads it back.
 .It Cm StrictArgs
 With

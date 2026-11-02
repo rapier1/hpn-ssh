@@ -1421,6 +1421,12 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		}
 		free(abs_dst);
 		abs_dst = NULL;
+		/* HPN: a dead connection ends the command. Every later match
+		 * would fail the same way. */
+		if (sftp_conn_is_dead(conn)) {
+			err = -1;
+			break;
+		}
 	}
 
 	/*
@@ -1603,6 +1609,12 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			if (sftp_hpn_report_transfer(conn, ur, g.gl_pathv[i],
 			    abs_dst, sb.st_size) == -1)
 				err = -1;
+		}
+		/* HPN: a dead connection ends the command. Every later match
+		 * would fail the same way. */
+		if (sftp_conn_is_dead(conn)) {
+			err = -1;
+			break;
 		}
 	}
 

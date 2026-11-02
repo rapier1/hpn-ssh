@@ -1706,8 +1706,10 @@ int
 sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
     const Attrib *attrs, int *created)
 {
+	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	Attrib mkdir_attrs = *attrs;
 	Attrib dirattrib;
+	u_int mkdir_status;
 
 	*created = 0;
 	mkdir_attrs.perm |= (S_IWUSR|S_IXUSR);
@@ -1715,10 +1717,16 @@ sftp_hpn_ensure_remote_dir(struct sftp_conn *conn, const char *dst,
 		*created = 1;
 		return 0;
 	}
+	mkdir_status = hpn != NULL ? hpn->last_status : SSH2_FX_FAILURE;
 	/* SFTP has no portable EEXIST, so on a mkdir failure check whether
-	 * the path already exists as a directory. */
-	if (sftp_stat(conn, dst, 0, &dirattrib) != 0)
+	 * the path already exists as a directory. If nothing is there, the
+	 * mkdir's error is the cause. A dead connection logged its own. */
+	if (sftp_stat(conn, dst, 1, &dirattrib) != 0) {
+		if (!sftp_conn_is_dead(conn))
+			error("remote mkdir \"%s\": %s", dst,
+			    fx2txt(mkdir_status));
 		return -1;
+	}
 	if (!S_ISDIR(dirattrib.perm)) {
 		error("\"%s\" exists but is not a directory", dst);
 		return -1;

@@ -39,16 +39,17 @@
 #include "hpn-status-frame.h"	/* enum hpns_fd_status */
 
 /* Claim "-X TransferLog[=path]", with the name matched case-insensitively.
- * Without a path the log goes to ./hpnssh-transfer.log, and an empty path
- * is fatal. Returns 1 if claimed, so the caller does not forward it, and 0
- * otherwise. */
+ * Without a path the log goes to ./hpnssh-transfer.<PID>.log, and a
+ * directory gets that name inside it. An empty path or one with a control
+ * character is fatal. Returns 1 if claimed, so the caller does not
+ * forward it, and 0 otherwise. */
 int	transferlog_option(const char *);
 
 /* If TransferLog was given, open the log for appending and write the
- * run's start line. An unwritable target is fatal, so callers run this
- * before any connection is made and a bad path fails the run before any
- * work starts. Does nothing when the option was not given or the log is
- * already open. */
+ * run's start line. An unwritable target, a symlink, or anything but a
+ * regular file is fatal, so callers run this before any connection is
+ * made and a bad path fails the run before any work starts. Does nothing
+ * when the option was not given or the log is already open. */
 void	transferlog_begin(void);
 
 /* Turn the FILEDONE mirror on or off. A source started by a relay
@@ -64,10 +65,10 @@ void	transferlog_frames(int);
 int	transferlog_active(void);
 
 /* Record one file's final status as a line of status, size, and path,
- * separated by tabs. The path is local text from our own arguments and
- * is written as given. A NULL path is written as "(unknown)" and is not
- * mirrored. When the FILEDONE mirror is on, the status also goes to the
- * relay consumer. Safe to call from any thread. */
+ * separated by tabs. The path is local text from our own arguments, and
+ * the log line percent-encodes it. A NULL path is written as "(unknown)"
+ * and is not mirrored. When the FILEDONE mirror is on, the status also
+ * goes to the relay consumer. Safe to call from any thread. */
 void	transferlog_file(enum hpns_fd_status, off_t, const char *);
 
 /* The relay consumer's form, for a file a remote source reported in a

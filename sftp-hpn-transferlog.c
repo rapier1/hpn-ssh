@@ -29,6 +29,7 @@
 #include "includes.h"
 
 #include <sys/types.h>
+#include <sys/stat.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -37,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "log.h"
 #include "misc.h"
@@ -58,17 +60,24 @@ static int tl_files;			/* lines written, for the footer */
 static uint64_t tl_bytes;		/* their sizes, for the footer */
 
 /* Claim a -X option if it is TransferLog or TransferLog=path, and
- * remember it for begin(). Returns 1 if claimed and 0 otherwise. A
- * claimed option is not forwarded, since the log belongs to this host. */
+ * remember it for begin(). A path must be non-empty and free of control
+ * characters, so it can always be printed on one line. Returns 1 if
+ * claimed and 0 otherwise. A claimed option is not forwarded, since the
+ * log belongs to this host. */
 int
 transferlog_option(const char *opt)
 {
 	const char *path = NULL;
+	const u_char *p;
 
 	if (strncasecmp(opt, "TransferLog=", 12) == 0) {
 		path = opt + 12;
 		if (*path == '\0')
 			fatal("Missing TransferLog path");
+		for (p = (const u_char *)path; *p != '\0'; p++)
+			if (*p < 0x20 || *p == 0x7f)
+				fatal("TransferLog path contains a control "
+				    "character");
 	} else if (strcasecmp(opt, "TransferLog") != 0)
 		return 0;
 	tl_want = 1;
@@ -85,21 +94,38 @@ transferlog_option(const char *opt)
 void
 transferlog_begin(void)
 {
-	const char *path;
-	char stamp[64];
-	int fd;
+	struct stat sb;
+	char *path, stamp[64];
+	int fd, flags = O_WRONLY|O_CREAT|O_APPEND|O_NONBLOCK;
 
 	if (!tl_want || tl_out != NULL)
 		return;
-	path = "./hpnssh-transfer.log";
-	if (tl_path != NULL)
-		path = tl_path;
+	/* The default name carries the PID, so runs in one directory do not
+	 * share a log. A directory gets that name inside it. */
+	if (tl_path == NULL ||
+	    (stat(tl_path, &sb) == 0 && S_ISDIR(sb.st_mode)))
+		xasprintf(&path, "%s/hpnssh-transfer.%ld.log",
+		    tl_path == NULL ? "." : tl_path, (long)getpid());
+	else
+		path = xstrdup(tl_path);
 	/* The open is the early writability check. Callers run this before
 	 * any connection is established, so an unwritable target fails the
-	 * run before work starts. */
-	if ((fd = open(path, O_WRONLY|O_CREAT|O_APPEND, 0600)) == -1 ||
-	    (tl_out = fdopen(fd, "a")) == NULL)
+	 * run before work starts. It takes neither a symlink nor anything but
+	 * a regular file, so one planted under a predictable name in a shared
+	 * directory cannot redirect or stall the writes. O_NONBLOCK only
+	 * keeps the open from waiting on a FIFO. */
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	if ((fd = open(path, flags, 0600)) == -1)
 		fatal("TransferLog \"%s\": %s", path, strerror(errno));
+	if (fstat(fd, &sb) == -1 || !S_ISREG(sb.st_mode))
+		fatal("TransferLog \"%s\": not a regular file", path);
+	if ((flags = fcntl(fd, F_GETFL)) != -1)
+		(void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+	if ((tl_out = fdopen(fd, "a")) == NULL)
+		fatal("TransferLog \"%s\": %s", path, strerror(errno));
+	free(path);
 	tl_start = monotime_double();
 	format_absolute_time(time(NULL), stamp, sizeof(stamp));
 	fprintf(tl_out, "# hpnssh transfer log - run started %s\n", stamp);
@@ -145,11 +171,23 @@ write_line(enum hpns_fd_status status, off_t size, const char *path)
 
 /* Record one file's final status. The line goes to the log if it is
  * open, and to the relay consumer as a FILEDONE frame if the mirror is
- * on. path is local text and is written as given. */
+ * on. path is local text. The frame carries it as given, and the log line
+ * percent-encodes it, so a tab, newline, or control byte in a file name
+ * can neither split the line nor reach a terminal raw. */
 void
 transferlog_file(enum hpns_fd_status status, off_t size, const char *path)
 {
-	write_line(status, size, path);
+	char enc[3 * PATH_MAX + 1];	/* every byte as %XX */
+
+	if (tl_out != NULL) {
+		if (path == NULL)
+			write_line(status, size, NULL);
+		else {
+			hpns_pct_encode(enc, sizeof(enc), (const u_char *)path,
+			    strlen(path));
+			write_line(status, size, enc);
+		}
+	}
 	/* On the source side of a relay armed with "log", mirror the status
 	 * as a FILEDONE frame for the consumer's log or GUI file list. */
 	if (tl_frames && path != NULL)
