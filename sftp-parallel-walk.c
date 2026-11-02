@@ -229,8 +229,11 @@ sftp_parallel_upload_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
 		parallel_verify_prefix_register(fleet, src);
 		parallel_verify_prefix_register(fleet, dst);
 	}
+	/* A root that fails is one line in the logs, for the whole tree. */
 	if (stat(src, &root_sb) == -1 || !S_ISDIR(root_sb.st_mode)) {
 		error("stat local \"%s\": not a directory", src);
+		transferlog_tree_failure(TRANSFERLOG_UPLOAD, src, dst,
+		    "not a directory");
 		sftp_parallel_walker_record_failure(fleet, src,
 		    "not a directory");
 		return -1;
@@ -239,6 +242,8 @@ sftp_parallel_upload_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	    sftp_parallel_preserve_flag(fleet), &root_attrs);
 	if (sftp_hpn_ensure_remote_dir(conn, dst, &root_attrs,
 	    &root_created) != 0) {
+		transferlog_tree_failure(TRANSFERLOG_UPLOAD, src, dst,
+		    hpn_get_last_error());
 		sftp_parallel_walker_record_failure(fleet, dst,
 		    "cannot create or access destination directory");
 		return -1;
@@ -265,11 +270,9 @@ parallel_dl_make_dir(struct sftp_tree_dl_sink *sink, const char *src,
 	mode_t			 mode, tmpmode;
 
 	(void)src;	/* parallel prints the root once at the caller, not per-dir */
-	if (sftp_hpn_ensure_local_dir(dst, attrs, &mode, &tmpmode) != 0) {
-		sftp_parallel_walker_record_failure(ctx->fleet, dst,
-		    "cannot create local directory");
+	/* The walk reports a failure, for the summary and the logs */
+	if (sftp_hpn_ensure_local_dir(dst, attrs, &mode, &tmpmode) != 0)
 		return -1;
-	}
 	maybe_apply_lustre_layout_local(ctx->fleet, ctx->conn, dst);
 	sftp_hpn_dirattrs_defer_local(parallel_dirattrs(ctx->fleet), dst,
 	    mode, tmpmode, attrs, ctx->preserve_flag);
@@ -355,6 +358,7 @@ sftp_parallel_download_dir(struct sftp_parallel *fleet, struct sftp_conn *conn,
 			 * files can be handed over as they are discovered
 			 * instead of after each batch. See streams_files. */
 			.streams_files = 1,
+			.log_dir = TRANSFERLOG_DOWNLOAD,
 		},
 		.fleet = fleet,
 		.conn = conn,

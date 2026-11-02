@@ -163,7 +163,7 @@ typedef enum {
 	oHPNTailRedistribute,
 	oHPNMaxRetries, oHPNStallAbortTimeout, oHPNBundleSize,
 	oHPNMaxAuthConcurrent,
-	oHPNLustreStripeCount,
+	oHPNLustreStripeCount, oHPNFailureLog,
 	oDisableMTAES, oUseMPTCP, oHappyEyes, oHappyDelay,
 	oMetrics, oMetricsPath, oMetricsInterval, oFallback, oFallbackPort,
 	oZstdLevel,
@@ -313,6 +313,7 @@ static struct {
 	{ "hpnbundlesize", oHPNBundleSize },
 	{ "hpnmaxauthconcurrent", oHPNMaxAuthConcurrent },
 	{ "hpnlustrestripecount", oHPNLustreStripeCount },
+	{ "hpnfailurelog", oHPNFailureLog },
 	{ "usemptcp", oUseMPTCP},
 	{ "happyeyes", oHappyEyes },
 	{ "happydelay", oHappyDelay },
@@ -1404,6 +1405,10 @@ parse_time:
 
 	case oHPNTailRedistribute:
 		intptr = &options->hpn_tail_redistribute;
+		goto parse_flag;
+
+	case oHPNFailureLog:
+		intptr = &options->hpn_failure_log;
 		goto parse_flag;
 
 	case oHPNMaxRetries:
@@ -3018,6 +3023,7 @@ initialize_options(Options * options)
 	options->hpn_use_bundle = -1;
 	options->hpn_writer_pool = -1;
 	options->hpn_tail_redistribute = -1;
+	options->hpn_failure_log = -1;
 	options->hpn_max_retries = -1;
 	options->hpn_stall_abort_timeout = -1;
 	options->hpn_bundle_size = -1;
@@ -3236,6 +3242,8 @@ fill_default_options(Options * options)
 		options->hpn_writer_pool = 1;	/* default: yes */
 	if (options->hpn_tail_redistribute == -1)
 		options->hpn_tail_redistribute = 1;	/* default: yes */
+	if (options->hpn_failure_log == -1)
+		options->hpn_failure_log = 0;	/* default: no */
 	if (options->hpn_max_retries == -1) {
 		options->hpn_max_retries = 3;	/* default: 3 attempts */
 	} else if (options->hpn_max_retries < 1) {
@@ -4151,6 +4159,7 @@ dump_client_config(Options *o, const char *host)
 	dump_cfg_fmtint(oHPNUseBundle, o->hpn_use_bundle);
 	dump_cfg_fmtint(oHPNWriterPool, o->hpn_writer_pool);
 	dump_cfg_fmtint(oHPNTailRedistribute, o->hpn_tail_redistribute);
+	dump_cfg_fmtint(oHPNFailureLog, o->hpn_failure_log);
 	dump_cfg_int(oHPNMaxRetries, o->hpn_max_retries);
 	dump_cfg_int(oHPNStallAbortTimeout, o->hpn_stall_abort_timeout);
 	dump_cfg_int(oHPNMaxAuthConcurrent, o->hpn_max_auth_concurrent);

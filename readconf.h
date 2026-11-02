@@ -161,6 +161,10 @@ typedef struct {
 					  * disabled; >0 = explicit plain N-wide
 					  * stripe.  Only consulted by hpnsftp;
 					  * hpnssh ignores. */
+	int     hpn_failure_log;   /* HPNFailureLog: record each failed
+				    * transfer in a failure log (default: no).
+				    * Only consulted by hpnsftp and hpnscp;
+				    * hpnssh ignores. */
 	int     disable_multithreaded; /* Disable multithreaded aes-ctr */
         int     metrics; /* enable metrics */
         int     metrics_interval; /* time in seconds between polls */

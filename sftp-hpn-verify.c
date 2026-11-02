@@ -1353,6 +1353,14 @@ sftp_conn_verify_run_phase(struct sftp_conn *conn)
 				hpn->verify_failed_paths[
 				    hpn->verify_failed_count++] =
 				    xstrdup(entry->remote_path);
+				transferlog_failure(entry->local_is_target ?
+				    TRANSFERLOG_DOWNLOAD : TRANSFERLOG_UPLOAD,
+				    entry->local_is_target ?
+				    entry->remote_path : entry->local_path,
+				    entry->local_is_target ?
+				    entry->local_path : entry->remote_path,
+				    rc == 1 ? "does not match the source" :
+				    "could not be verified");
 			}
 			/* fold this file's work into the meter base so the
 			 * next file's progress continues from it */

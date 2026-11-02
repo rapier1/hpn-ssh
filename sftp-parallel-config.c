@@ -215,6 +215,7 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 	pcfg->max_auth_concurrent = 0;  /* 0 = auto */
 	pcfg->lustre_stripe_count = -1;  /* -1 = auto */
 	pcfg->verify_transfer = 0;  /* default off */
+	pcfg->failure_log = 0;  /* default off */
 
 	if (host == NULL || *host == '\0')
 		return -1;
@@ -238,19 +239,20 @@ sftp_parallel_apply_ssh_config(struct sftp_parallel_config *pcfg,
 		pcfg->bundle_size = (uint64_t)options.hpn_bundle_size;
 	pcfg->max_auth_concurrent = options.hpn_max_auth_concurrent;
 	pcfg->lustre_stripe_count = options.hpn_lustre_stripe_count;
+	pcfg->failure_log = (options.hpn_failure_log == 1);
 	/* verify_transfer is NOT an ssh_config option; it is requested per
 	 * transfer via -V (scp) / put-getv (sftp) and stays at the default 0
 	 * here, toggled later by the caller. */
 
 	debug_f("ssh_config: host=\"%s\" HPNUseBundle=%s HPNWriterPool=%s "
 	    "HPNTailRedistribute=%s HPNMaxRetries=%d HPNStallAbortTimeout=%d "
-	    "HPNBundleSize=%llu HPNMaxAuthConcurrent=%d",
+	    "HPNBundleSize=%llu HPNMaxAuthConcurrent=%d HPNFailureLog=%s",
 	    host, pcfg->use_bundle ? "yes" : "no",
 	    pcfg->writer_pool ? "yes" : "no",
 	    pcfg->tail_redistribute ? "yes" : "no", pcfg->max_retries,
 	    pcfg->stall_abort_timeout,
 	    (unsigned long long)pcfg->bundle_size,
-	    pcfg->max_auth_concurrent);
+	    pcfg->max_auth_concurrent, pcfg->failure_log ? "yes" : "no");
 
 	free_options(&options);
 	return 0;

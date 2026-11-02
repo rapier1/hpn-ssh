@@ -296,10 +296,11 @@ int sftp_setstat_pipeline(struct sftp_conn *, char **, Attrib *, int);
 
 /* HPN: create N sibling directories with a bounded outstanding-request window
  * instead of one blocking mkdir round trip each. created_out[i] is set to 1
- * iff we created it, 0 if it pre-existed. Used by the recursive upload walks.
- * See the definition for the sibling-independence and stat-fallback contract. */
+ * iff we created it, 0 if it pre-existed. failed_out[i] gets the reason one
+ * could not be created. Used by the recursive upload walks. See the
+ * definition for the sibling-independence and stat-fallback contract. */
 int sftp_mkdir_pipeline(struct sftp_conn *, char **, Attrib *, int, u_char *,
-    u_char *);
+    const char **);
 
 /* HPN: per-file descriptor for a pipelined upload batch. The caller fills
  * local_path and remote_path. The batch writes result (0 = success,

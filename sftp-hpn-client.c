@@ -65,6 +65,7 @@
 #include "utf8.h"		/* fmprintf */
 
 extern int showprogress;	/* progress gate, defined by sftp.c and scp.c */
+extern _Atomic sig_atomic_t interrupted;	/* sftp.c and scp.c */
 
 /* Adaptive upload pacing master switch (-X Pacing=), applied to each new
  * connection at init. On by default: it wins where the duty-cycle
@@ -156,10 +157,8 @@ struct tree_dl_ctx {
 	 * lands mid-batch reports itself once. */
 	int				 abort_noticed;
 	/* The relpath of a directory make_dir could not create, while the
-	 * walk is inside it, else NULL. The files below it are failed
-	 * without a transfer, and failed_files counts them. */
+	 * walk is inside it, else NULL. Everything below it is skipped. */
 	char				*failed_dir;
-	int				 failed_files;
 	/* -1 after any per-entry failure. */
 	int				 ret;
 };
@@ -1323,10 +1322,26 @@ sftp_hpn_bundle_acc_reset(struct sftp_hpn_bundle_acc *acc)
 	acc->path_bytes = 0;
 }
 
-/* Release everything the accumulator holds and disable it. */
+/* Write a failed TransferLog line for each member still in the batch.
+ * A bundle is all or nothing, so after a failure that stops the walk no
+ * member counts as delivered, not even one that landed. */
+static void
+bundle_acc_log_failed(struct sftp_hpn_bundle_acc *acc)
+{
+	int i;
+
+	for (i = 0; i < acc->nmembers; i++)
+		transferlog_file(HPNS_FD_FAILED, acc->sizes[i],
+		    acc->dst_paths[i]);
+}
+
+/* Release everything the accumulator holds and disable it. Members still
+ * in it were never sent, as when an interrupt skips the final flush, so
+ * each gets a failed TransferLog line. */
 void
 sftp_hpn_bundle_acc_free(struct sftp_hpn_bundle_acc *acc)
 {
+	bundle_acc_log_failed(acc);
 	sftp_hpn_bundle_acc_reset(acc);
 	free(acc->src_paths);
 	free(acc->dst_paths);
@@ -1344,8 +1359,8 @@ sftp_hpn_bundle_acc_free(struct sftp_hpn_bundle_acc *acc)
  * line. A success is left for the verify phase to log when -V is on.
  * Returns -1 when the transfer failed, else 0. */
 int
-sftp_hpn_report_transfer(struct sftp_conn *conn, int rc, const char *src,
-    const char *dst, off_t size)
+sftp_hpn_report_transfer(struct sftp_conn *conn, enum transferlog_dir dir,
+    int rc, const char *src, const char *dst, off_t size)
 {
 	/* In frame mode stdout carries the progress frames, so text goes to
 	 * stderr instead. */
@@ -1353,7 +1368,14 @@ sftp_hpn_report_transfer(struct sftp_conn *conn, int rc, const char *src,
 
 	switch (rc) {
 	case -1:
+		/* An interrupt is the user's choice, not a failure to record.
+		 * Otherwise the reason is the last error the transfer
+		 * logged. */
 		transferlog_file(HPNS_FD_FAILED, size, dst);
+		if (!interrupted)
+			transferlog_failure(dir, src, dst,
+			    hpn_get_last_error());
+		hpn_clear_last_error();
 		return -1;
 	case 1:
 		fmprintf(out, "File skipped: %s: Identical.\n", src);
@@ -1444,20 +1466,22 @@ bundle_member_xfer(struct sftp_conn *conn, struct sftp_hpn_bundle_acc *acc,
 {
 	const char *src = acc->src_paths[i];
 	const char *dst = acc->dst_paths[i];
-	int rc;
+	int rc, ret;
 
-	if (acc->is_download) {
+	if (acc->is_download)
 		rc = sftp_download(conn, src, dst, NULL, preserve_flag,
 		    /*resume*/0, fsync_flag, inplace_flag, verify);
-		if (rc == -1)
-			error("download \"%s\" to \"%s\" failed", src, dst);
-	} else {
+	else
 		rc = sftp_upload(conn, src, dst, preserve_flag,
 		    /*resume*/0, verify, fsync_flag, inplace_flag);
-		if (rc == -1)
-			error("upload \"%s\" to \"%s\" failed", src, dst);
-	}
-	return sftp_hpn_report_transfer(conn, rc, src, dst, acc->sizes[i]);
+	/* Report first, since the line below would replace the reason. */
+	ret = sftp_hpn_report_transfer(conn, acc->is_download ?
+	    TRANSFERLOG_DOWNLOAD : TRANSFERLOG_UPLOAD, rc, src, dst,
+	    acc->sizes[i]);
+	if (rc == -1)
+		error("%s \"%s\" to \"%s\" failed", acc->is_download ?
+		    "download" : "upload", src, dst);
+	return ret;
 }
 
 /* Start the meter for one bundle flush when progress is shown, and
@@ -1528,9 +1552,9 @@ bundle_acc_flush_upload(struct sftp_conn *conn,
 			sftp_conn_verify_park_hashed(conn, acc->src_paths[i],
 			    acc->dst_paths[i], entries[i].have_src_hash,
 			    entries[i].src_hash);
-			(void)sftp_hpn_report_transfer(conn, 0,
-			    acc->src_paths[i], acc->dst_paths[i],
-			    acc->sizes[i]);
+			(void)sftp_hpn_report_transfer(conn,
+			    TRANSFERLOG_UPLOAD, 0, acc->src_paths[i],
+			    acc->dst_paths[i], acc->sizes[i]);
 		}
 		break;
 	case SFTP_HPN_BUNDLE_SERVER_CANT:
@@ -1595,9 +1619,9 @@ bundle_acc_flush_download(struct sftp_conn *conn,
 				sftp_conn_verify_park(conn,
 				    acc->dst_paths[i], acc->src_paths[i],
 				    /*local_is_target=*/1, acc->sizes[i]);
-				(void)sftp_hpn_report_transfer(conn, 0,
-				    acc->src_paths[i], acc->dst_paths[i],
-				    acc->sizes[i]);
+				(void)sftp_hpn_report_transfer(conn,
+				    TRANSFERLOG_DOWNLOAD, 0, acc->src_paths[i],
+				    acc->dst_paths[i], acc->sizes[i]);
 				continue;
 			}
 			/* Per-entry failure: re-drive individually (the
@@ -1635,7 +1659,8 @@ bundle_acc_flush_download(struct sftp_conn *conn,
  * download, then empty it. Called when sftp_hpn_bundle_acc_add reports
  * the batch full and once more at the end of an uninterrupted walk.
  * Returns 0 on success, 1 when members failed but the walk can go on,
- * and -1 to abort on a policy denial or a dead connection. */
+ * and -1 to abort on a policy denial or a dead connection. Every member
+ * gets its TransferLog line, a failed one when the walk aborts. */
 int
 sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
     struct sftp_hpn_bundle_acc *acc, int preserve_flag, int print_flag,
@@ -1666,6 +1691,8 @@ sftp_hpn_bundle_acc_flush(struct sftp_conn *conn,
 	else
 		r = bundle_acc_flush_upload(conn, acc, preserve_flag,
 		    verify, fsync_flag, inplace_flag);
+	if (r < 0)
+		bundle_acc_log_failed(acc);
 	sftp_hpn_bundle_acc_reset(acc);
 	return r;
 }
@@ -2202,15 +2229,23 @@ tree_total_add(off_t *total, const Attrib *attrs)
 	return 0;
 }
 
-/* Report a per-entry failure to a download sink. fail is optional, and the
- * serial and crossload sinks leave it NULL because the consumer's -1 return
- * already carries the error. */
+/* Report a walk failure: src could not be walked, or dst could not be
+ * made, so nothing below it is transferred. It gets a line in both logs,
+ * unless the sink is aborting, since an interrupt or a lost connection is
+ * no failure of this path. A NULL reason takes the last error the walk
+ * logged. fail is optional. The -j sink records src for the end-of-run
+ * summary, and the serial and crossload sinks leave it NULL because the
+ * consumer's -1 return already carries the error. */
 static void
-dl_sink_fail(struct sftp_tree_dl_sink *sink, const char *path,
-    const char *reason)
+dl_sink_fail(struct sftp_tree_dl_sink *sink, const char *src,
+    const char *dst, const char *reason)
 {
+	if (reason == NULL)
+		reason = hpn_get_last_error();
+	if (!sink->aborting(sink))
+		transferlog_tree_failure(sink->log_dir, src, dst, reason);
 	if (sink->fail != NULL)
-		sink->fail(sink, path, reason);
+		sink->fail(sink, src, reason);
 }
 
 /* Whether relpath rel lies below the directory relpath dir. */
@@ -2223,27 +2258,12 @@ tree_relpath_under(const char *rel, const char *dir)
 	    strchr(HPN_WALK_SEPARATORS, rel[len]) != NULL;
 }
 
-/* Leave the subtree of a directory that could not be created. Report once
- * how many files below it were not transferred, both on stderr and to the
- * sink's failure list, then forget the directory. */
+/* Leave the subtree of a directory that could not be created. */
 static void
 tree_dl_leave_failed_dir(struct tree_dl_ctx *ctx)
 {
-	char *path, reason[64];
-
-	if (ctx->failed_dir == NULL)
-		return;
-	if (ctx->failed_files > 0) {
-		path = sftp_path_append(ctx->dst, ctx->failed_dir);
-		snprintf(reason, sizeof(reason),
-		    "%d files below it not transferred", ctx->failed_files);
-		error("\"%s\": %s", path, reason);
-		dl_sink_fail(ctx->sink, path, reason);
-		free(path);
-	}
 	free(ctx->failed_dir);
 	ctx->failed_dir = NULL;
-	ctx->failed_files = 0;
 }
 
 /* Per-record callback (see sftp_tree_record_cb). Directories are created
@@ -2282,32 +2302,27 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 	if (ent->rectype == HPN_DTREE_REC_ERROR &&
 	    (ent->relpath == NULL || *ent->relpath == '\0')) {
 		error("remote \"%s\": %s", ctx->src, fx2txt(ent->status));
-		dl_sink_fail(ctx->sink, ctx->src, "remote error");
+		dl_sink_fail(ctx->sink, ctx->src, ctx->dst,
+		    fx2txt(ent->status));
 		ctx->ret = -1;
 		return 0;
 	}
 	if (!sftp_tree_relpath_ok(ent->relpath)) {
 		error("tree walk: suspect path \"%s\" under \"%s\"",
 		    ent->relpath == NULL ? "(null)" : ent->relpath, ctx->src);
-		dl_sink_fail(ctx->sink, ctx->src, "suspect path");
+		dl_sink_fail(ctx->sink, ctx->src, ctx->dst, "suspect path");
 		ctx->ret = -1;
 		return 0;
 	}
 	new_src = sftp_path_append(ctx->src, ent->relpath);
 	new_dst = sftp_path_append(ctx->dst, ent->relpath);
 
-	/* Inside a directory that could not be created, log each file as
-	 * failed and skip everything else. The walk is depth first, so the
-	 * subtree arrives in one run and the first record outside it ends
-	 * the run. The directory's own failure already set ret. */
+	/* Inside a directory that could not be created, skip everything. The
+	 * directory's own line in the logs stands for it, and its failure
+	 * already set ret. The walk is depth first, so the subtree arrives in
+	 * one run and the first record outside it ends the run. */
 	if (ctx->failed_dir != NULL) {
 		if (tree_relpath_under(ent->relpath, ctx->failed_dir)) {
-			if (ent->rectype == HPN_DTREE_REC_REG) {
-				transferlog_file(HPNS_FD_FAILED,
-				    (attrs->flags & SSH2_FILEXFER_ATTR_SIZE) ?
-				    (off_t)attrs->size : 0, new_dst);
-				ctx->failed_files++;
-			}
 			free(new_src);
 			free(new_dst);
 			return 0;
@@ -2319,6 +2334,8 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 	case HPN_DTREE_REC_DIR:
 		if (ctx->sink->make_dir(ctx->sink, new_src, new_dst,
 		    attrs) != 0) {
+			/* make_dir logged why */
+			dl_sink_fail(ctx->sink, new_src, new_dst, NULL);
 			ctx->ret = -1;
 			ctx->failed_dir = xstrdup(ent->relpath);
 		}
@@ -2369,7 +2386,7 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 		break;
 	case HPN_DTREE_REC_ERROR:
 		error("remote \"%s\": %s", new_src, fx2txt(ent->status));
-		dl_sink_fail(ctx->sink, new_src, "remote error");
+		dl_sink_fail(ctx->sink, new_src, new_dst, fx2txt(ent->status));
 		ctx->ret = -1;
 		free(new_src);
 		free(new_dst);
@@ -2387,17 +2404,17 @@ tree_dl_consume_record(void *vctx, struct sftp_tree_ent *ent)
 /* Resolve the attrs of a remote download root and check that it is a
  * directory. Shared by the tree and readdir consumers. dirattrib is the
  * caller's attrs, or NULL to stat src into *statbuf. Returns the attrs to
- * use, or NULL after reporting the failure to the sink. */
+ * use, or NULL after reporting the failure of src to dst. */
 static Attrib *
-dl_root_attrs(struct sftp_conn *conn, const char *src, Attrib *dirattrib,
-    Attrib *statbuf, struct sftp_tree_dl_sink *sink)
+dl_root_attrs(struct sftp_conn *conn, const char *src, const char *dst,
+    Attrib *dirattrib, Attrib *statbuf, struct sftp_tree_dl_sink *sink)
 {
 	/* The caller may not have the root's attrs (top-level calls never
 	 * do), so stat it here. Fail only if that stat fails. */
 	if (dirattrib == NULL) {
 		if (sftp_stat(conn, src, 1, statbuf) != 0) {
 			error("stat remote \"%s\" directory failed", src);
-			dl_sink_fail(sink, src, "remote stat failed");
+			dl_sink_fail(sink, src, dst, "remote stat failed");
 			return NULL;
 		}
 		dirattrib = statbuf;
@@ -2405,7 +2422,7 @@ dl_root_attrs(struct sftp_conn *conn, const char *src, Attrib *dirattrib,
 	/* it's not actually a directory so this doesn't apply */
 	if (!S_ISDIR(dirattrib->perm)) {
 		error("\"%s\" is not a directory", src);
-		dl_sink_fail(sink, src, "not a directory");
+		dl_sink_fail(sink, src, dst, "not a directory");
 		return NULL;
 	}
 	return dirattrib;
@@ -2446,13 +2463,17 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	int			done = 0;
 
 	/* Check that the root is a directory before starting a walk. */
-	dirattrib = dl_root_attrs(conn, src, dirattrib, &ldirattrib, sink);
+	dirattrib = dl_root_attrs(conn, src, dst, dirattrib, &ldirattrib,
+	    sink);
 	if (dirattrib == NULL)
 		return -1;
 	/* Create the local root. The sink defers its attrs, and the serial
-	 * and crossload sinks print the "Retrieving" line. */
-	if (sink->make_dir(sink, src, dst, dirattrib) != 0)
+	 * and crossload sinks print the "Retrieving" line. make_dir logs why
+	 * it fails. */
+	if (sink->make_dir(sink, src, dst, dirattrib) != 0) {
+		dl_sink_fail(sink, src, dst, NULL);
 		return -1;
+	}
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.src = src;
@@ -2461,8 +2482,10 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 
 	if (follow_link_flag)
 		flags = HPN_DTREE_FOLLOW_SYMLINKS;
+	/* get_handle logs the server's reason for a root it cannot open */
+	hpn_clear_last_error();
 	if (sftp_tree_walk_open(conn, src, flags, &walk) != 0) {
-		dl_sink_fail(sink, src, "remote tree open failed");
+		dl_sink_fail(sink, src, dst, NULL);
 		return -1;
 	}
 
@@ -2478,7 +2501,7 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 		if (sftp_tree_walk_read(conn, &walk, HPN_DTREE_MAX_BATCH,
 		    tree_dl_consume_record, &ctx, &done) != 0) {
 			error("remote tree walk \"%s\" failed", src);
-			dl_sink_fail(sink, src, "remote tree walk failed");
+			dl_sink_fail(sink, src, dst, "remote tree walk failed");
 			ctx.ret = -1;
 			break;
 		}
@@ -2522,22 +2545,29 @@ sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
 	/* Bounds recursion, including symlink loops when following links. */
 	if (depth >= max_depth) {
 		error("Maximum directory depth exceeded: %d levels", depth);
-		dl_sink_fail(sink, src, "max directory depth exceeded");
+		dl_sink_fail(sink, src, dst, "max directory depth exceeded");
 		return -1;
 	}
 
 	/* check to see if we should use this download_consume() */
-	dirattrib = dl_root_attrs(conn, src, dirattrib, &ldirattrib, sink);
+	dirattrib = dl_root_attrs(conn, src, dst, dirattrib, &ldirattrib,
+	    sink);
 	if (dirattrib == NULL)
 		return -1;
 	/* Create dst. The sink's make_dir also prints progress, matches the
-	 * Lustre layout where supported and defers the attrs. */
-	if (sink->make_dir(sink, src, dst, dirattrib) != 0)
+	 * Lustre layout where supported and defers the attrs. It logs why it
+	 * fails. */
+	if (sink->make_dir(sink, src, dst, dirattrib) != 0) {
+		dl_sink_fail(sink, src, dst, NULL);
 		return -1;
-	/* Lists the whole directory before any entry is handled. */
+	}
+	/* Lists the whole directory before any entry is handled. The failure
+	 * is reported before the line below, which would replace the reason
+	 * sftp_readdir logged. */
+	hpn_clear_last_error();
 	if (sftp_readdir(conn, src, &entries) == -1) {
+		dl_sink_fail(sink, src, dst, NULL);
 		error("remote readdir \"%s\" failed", src);
-		dl_sink_fail(sink, src, "remote readdir failed");
 		return -1;
 	}
 
@@ -2565,7 +2595,8 @@ sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
 			 * points to. */
 			if (sftp_stat(conn, new_src, 1, &lsym) != 0) {
 				error("remote stat \"%s\" failed", new_src);
-				dl_sink_fail(sink, new_src, "remote stat failed");
+				dl_sink_fail(sink, new_src, new_dst,
+				    "remote stat failed");
 				ret = -1;
 				continue;
 			}
@@ -2593,15 +2624,19 @@ sftp_readdir_download_consume(struct sftp_conn *conn, const char *src,
 	return ret;
 }
 
-/* Report a per-entry failure to an upload sink. fail is optional, and the
- * serial sink leaves it NULL because the driver's -1 return already carries
- * the error. */
+/* Report an upload walk failure, as dl_sink_fail does. The serial sink
+ * leaves fail NULL because the driver's -1 return already carries the
+ * error. */
 static void
-ul_sink_fail(struct sftp_upload_sink *sink, const char *path,
-    const char *reason)
+ul_sink_fail(struct sftp_upload_sink *sink, const char *src,
+    const char *dst, const char *reason)
 {
+	if (reason == NULL)
+		reason = hpn_get_last_error();
+	if (!sink->aborting(sink))
+		transferlog_tree_failure(TRANSFERLOG_UPLOAD, src, dst, reason);
 	if (sink->fail != NULL)
-		sink->fail(sink, path, reason);
+		sink->fail(sink, src, reason);
 }
 
 /* Shared upload driver for serial and parallel. Enumerate the local
@@ -2627,18 +2662,18 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 	/* Bounds recursion, including symlink loops when following links. */
 	if (depth >= max_depth) {
 		error("Maximum directory depth exceeded: %d levels", depth);
-		ul_sink_fail(sink, src, "max directory depth exceeded");
+		ul_sink_fail(sink, src, dst, "max directory depth exceeded");
 		return -1;
 	}
 	/* stat, not lstat, so a symlinked root is followed like stock. */
 	if (stat(src, &sb) == -1) {
 		error("stat local \"%s\": %s", src, strerror(errno));
-		ul_sink_fail(sink, src, strerror(errno));
+		ul_sink_fail(sink, src, dst, strerror(errno));
 		return -1;
 	}
 	if (!S_ISDIR(sb.st_mode)) {
 		error("\"%s\" is not a directory", src);
-		ul_sink_fail(sink, src, "not a directory");
+		ul_sink_fail(sink, src, dst, "not a directory");
 		return -1;
 	}
 
@@ -2651,7 +2686,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 
 	if ((dirp = opendir(src)) == NULL) {
 		error("local opendir \"%s\": %s", src, strerror(errno));
-		ul_sink_fail(sink, src, strerror(errno));
+		ul_sink_fail(sink, src, dst, strerror(errno));
 		return -1;
 	}
 	while (((dp = readdir(dirp)) != NULL) && !sink->aborting(sink)) {
@@ -2671,7 +2706,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 		/* lstat first so symlinks can be told apart. */
 		if (lstat(new_src, &sb) == -1) {
 			logit("local lstat \"%s\": %s", new_src, strerror(errno));
-			ul_sink_fail(sink, new_src, strerror(errno));
+			ul_sink_fail(sink, new_src, new_dst, strerror(errno));
 			ret = -1;
 			continue;
 		}
@@ -2684,7 +2719,8 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 			if (stat(new_src, &sb) == -1) {
 				logit("local stat \"%s\": %s", new_src,
 				    strerror(errno));
-				ul_sink_fail(sink, new_src, strerror(errno));
+				ul_sink_fail(sink, new_src, new_dst,
+				    strerror(errno));
 				ret = -1;
 				continue;
 			}
@@ -2723,8 +2759,8 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 		Attrib	 *attrs = xcalloc(nsubdirs, sizeof(*attrs));
 		u_char	 *created_flags = xcalloc(nsubdirs,
 		    sizeof(*created_flags));
-		u_char	 *failed_flags = xcalloc(nsubdirs,
-		    sizeof(*failed_flags));
+		const char **failed_reasons = xcalloc(nsubdirs,
+		    sizeof(*failed_reasons));
 
 		for (i = 0; i < nsubdirs; i++) {
 			paths[i] = subdirs[i].dst;
@@ -2741,7 +2777,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 		 * did not happen: an empty subdirectory transfers nothing, so
 		 * nothing else notices the destination is missing. */
 		if (sftp_mkdir_pipeline(conn, paths, attrs, nsubdirs,
-		    created_flags, failed_flags) > 0)
+		    created_flags, failed_reasons) > 0)
 			ret = -1;
 		free(paths);
 		free(attrs);
@@ -2749,9 +2785,9 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 			/* Do not descend into one that failed. There is
 			 * nothing to write into, and deferring its attributes
 			 * would setstat whatever does occupy the path. */
-			if (failed_flags[i]) {
-				ul_sink_fail(sink, subdirs[i].dst,
-				    "remote mkdir failed");
+			if (failed_reasons[i] != NULL) {
+				ul_sink_fail(sink, subdirs[i].src,
+				    subdirs[i].dst, failed_reasons[i]);
 				continue;
 			}
 			if (sftp_upload_walk_consume(conn, subdirs[i].src,
@@ -2761,7 +2797,7 @@ sftp_upload_walk_consume(struct sftp_conn *conn, const char *src,
 				ret = -1;
 		}
 		free(created_flags);
-		free(failed_flags);
+		free(failed_reasons);
 	}
 	for (i = 0; i < nsubdirs; i++) {
 		free(subdirs[i].src);

@@ -173,7 +173,9 @@ parallel_verify_one(struct sftp_worker *worker, const char *local_path,
 	    local_is_target ? "local" : "remote",
 	    local_is_target ? local_path : remote_path,
 	    verify_rc < 0 ? "could not be verified" : "does NOT match source");
-	parallel_verify_fail_record(fleet, local_is_target, local_path, remote_path);
+	parallel_verify_fail_record(fleet, local_is_target, local_path,
+	    remote_path, verify_rc < 0 ? "could not be verified" :
+	    "does not match the source");
 	return 0;
 }
 
@@ -329,7 +331,9 @@ execute_unit(struct sftp_worker *worker, struct sftp_work_unit *unit)
 					    "could not be verified");
 					parallel_verify_fail_record(fleet,
 					    job->local_is_target, job->local_path,
-					    job->remote_path);
+					    job->remote_path, j_failed ?
+					    "does not match the source" :
+					    "could not be verified");
 				}
 				/* TransferLog: the final status for a
 				 * range-split file under -V. Any chunk that
@@ -550,11 +554,20 @@ worker_retire_failed_unit(struct sftp_parallel *fleet, struct sftp_worker *worke
     struct sftp_work_unit *unit, const char *cause)
 {
 	worker_record_completion(worker, 0, 0);
-	/* TransferLog: a whole-file give-up is the file's final status, while
-	 * range and span give-ups are logged once at tracker finalize. */
-	if (unit->op == SFTP_OP_UPLOAD || unit->op == SFTP_OP_DOWNLOAD)
+	/* The logs: a whole-file give-up is the file's final status, while
+	 * range and span give-ups are logged once at tracker finalize, which
+	 * keeps the first cause. The failure log leaves out the user's
+	 * interrupt and a fleet that is aborting. */
+	if (unit->op == SFTP_OP_UPLOAD || unit->op == SFTP_OP_DOWNLOAD) {
 		transferlog_file(HPNS_FD_FAILED, unit->size,
 		    unit->dst_path);
+		if (!parallel_user_abort_flag && !fleet->abort_flag)
+			transferlog_failure(unit->op == SFTP_OP_DOWNLOAD ?
+			    TRANSFERLOG_DOWNLOAD : TRANSFERLOG_UPLOAD,
+			    unit->src_path, unit->dst_path, cause);
+	} else
+		parallel_unit_tracker_note_failure(unit->range_tracker,
+		    cause);
 	(void)parallel_unit_tracker_finalize(unit->range_tracker, 1, worker);
 	worker_record_failed_path(fleet, unit, cause);
 	/* Dropping pending is what wakes sftp_parallel_wait, so it goes last,

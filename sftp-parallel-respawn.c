@@ -752,6 +752,11 @@ parallel_respawn_dispatch(struct sftp_parallel *fleet, int n_to_respawn)
 		error_ft("all workers gone with %llu unit(s) pending and no "
 		    "respawn could be launched -- aborting transfer",
 		    (unsigned long long)pending);
+		/* The transfer ends here. The failure log gets its one
+		 * connection-lost line, without paths, since the units still
+		 * pending span many files. */
+		transferlog_connection_lost(
+		    (enum transferlog_dir)fleet->last_dir, NULL, NULL);
 		sftp_parallel_abort(fleet);
 		return 1;
 	}

@@ -1415,18 +1415,26 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			/* Log the local copy's size, -1 when nothing landed. */
 			if (transferlog_active() && stat(abs_dst, &lsb) == 0)
 				sz = lsb.st_size;
-			if (sftp_hpn_report_transfer(conn, dr, g.gl_pathv[i],
-			    abs_dst, sz) == -1)
+			if (sftp_hpn_report_transfer(conn,
+			    TRANSFERLOG_DOWNLOAD, dr, g.gl_pathv[i], abs_dst,
+			    sz) == -1)
 				err = -1;
 		}
-		free(abs_dst);
-		abs_dst = NULL;
-		/* HPN: a dead connection ends the command. Every later match
-		 * would fail the same way. */
+		/* HPN: a dead connection ends the command, with one line in
+		 * the failure log. Every later match would fail the same
+		 * way. */
 		if (sftp_conn_is_dead(conn)) {
+			if (!interrupted)
+				transferlog_connection_lost(
+				    TRANSFERLOG_DOWNLOAD, g.gl_pathv[i],
+				    abs_dst);
+			free(abs_dst);
+			abs_dst = NULL;
 			err = -1;
 			break;
 		}
+		free(abs_dst);
+		abs_dst = NULL;
 	}
 
 	/*
@@ -1606,13 +1614,19 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			    pflag || global_pflag, resume, verify,
 			    fflag || global_fflag, 0);
 
-			if (sftp_hpn_report_transfer(conn, ur, g.gl_pathv[i],
-			    abs_dst, sb.st_size) == -1)
+			if (sftp_hpn_report_transfer(conn,
+			    TRANSFERLOG_UPLOAD, ur, g.gl_pathv[i], abs_dst,
+			    sb.st_size) == -1)
 				err = -1;
 		}
-		/* HPN: a dead connection ends the command. Every later match
-		 * would fail the same way. */
+		/* HPN: a dead connection ends the command, with one line in
+		 * the failure log. Every later match would fail the same
+		 * way. */
 		if (sftp_conn_is_dead(conn)) {
+			if (!interrupted)
+				transferlog_connection_lost(
+				    TRANSFERLOG_UPLOAD, g.gl_pathv[i],
+				    abs_dst);
 			err = -1;
 			break;
 		}
@@ -3977,6 +3991,7 @@ main(int argc, char **argv)
 			sftp_conn_set_bundle_config(conn, bcfg.use_bundle,
 			    bcfg.bundle_size, bcfg.writer_pool);
 			lustre_stripe_count = bcfg.lustre_stripe_count;
+			transferlog_failure_config(bcfg.failure_log);
 		}
 	}
 

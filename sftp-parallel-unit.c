@@ -435,9 +435,15 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 			    "failed permanently after retries", t->path);
 		}
 		/* TransferLog: the file's final status (interrupt included -
-		 * an aborted file is still not delivered). */
+		 * an aborted file is still not delivered). The failure log
+		 * leaves out the interrupt. */
 		transferlog_file(HPNS_FD_FAILED,
 		    t->file_bytes, t->path);
+		if (!parallel_user_abort_flag)
+			transferlog_failure(t->target ==
+			    SFTP_RANGE_TARGET_LOCAL ? TRANSFERLOG_DOWNLOAD :
+			    TRANSFERLOG_UPLOAD, t->src_path, t->path,
+			    t->fail_reason);
 	} else if (t->verify && worker != NULL) {
 		/*
 		 * Verify transfer: the file's last range just finished
@@ -460,8 +466,23 @@ parallel_unit_tracker_finalize_n(struct sftp_range_tracker *t, int n,
 	free(t->vslots);
 	free(t->path);
 	free(t->src_path);
+	free(t->fail_reason);
 	free(t);
 	return incomplete;
+}
+
+/* Keep the cause of a range's permanent failure, the first one only, for
+ * the file's one line in the failure log at finalize. */
+void
+parallel_unit_tracker_note_failure(struct sftp_range_tracker *t,
+    const char *cause)
+{
+	if (t == NULL || cause == NULL)
+		return;
+	pthread_mutex_lock(&t->mu);
+	if (t->fail_reason == NULL)
+		t->fail_reason = xstrdup(cause);
+	pthread_mutex_unlock(&t->mu);
 }
 
 /*
@@ -492,6 +513,7 @@ parallel_verify_tracker_free(struct sftp_range_tracker *t)
 	free(t->vslots);
 	free(t->path);
 	free(t->src_path);
+	free(t->fail_reason);
 	free(t);
 }
 
@@ -518,13 +540,20 @@ parallel_verify_park(struct sftp_parallel *fleet, struct sftp_range_tracker *t)
 /*
  * Record a file whose post-transfer verify (and its inline auto-repair) could
  * not be made to match, naming the DEST, so the run summary reports it and
- * hpnsftp exits SFTP_EX_VERIFY_FAILED.
+ * hpnsftp exits SFTP_EX_VERIFY_FAILED. It also goes to the failure log,
+ * with reason, unless the user interrupted the run.
  */
 void
 parallel_verify_fail_record(struct sftp_parallel *fleet, int local_is_target,
-    const char *local_path, const char *remote_path)
+    const char *local_path, const char *remote_path, const char *reason)
 {
 	char *desc;
+
+	if (!parallel_user_abort_flag)
+		transferlog_failure(local_is_target ? TRANSFERLOG_DOWNLOAD :
+		    TRANSFERLOG_UPLOAD, local_is_target ? remote_path :
+		    local_path, local_is_target ? local_path : remote_path,
+		    reason);
 
 	/* Name the DEST (the written, corrupt file), labeled local/remote. */
 	xasprintf(&desc, "%s file \"%s\"",
@@ -1136,6 +1165,10 @@ parallel_unit_submit(struct sftp_parallel *fleet, struct sftp_work_unit *u)
 	 * need no per-site NULL check. */
 	if (u == NULL)
 		return -1;
+	if (u->op == SFTP_OP_UPLOAD || u->op == SFTP_OP_UPLOAD_RANGE)
+		fleet->last_dir = TRANSFERLOG_UPLOAD;
+	else if (u->op == SFTP_OP_DOWNLOAD || u->op == SFTP_OP_DOWNLOAD_RANGE)
+		fleet->last_dir = TRANSFERLOG_DOWNLOAD;
 	u->preserve = fleet->cfg.preserve_flag;
 	u->fsync = fleet->cfg.fsync_flag;
 	u->verify_transfer = fleet->cfg.verify_transfer;

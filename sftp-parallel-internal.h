@@ -474,6 +474,9 @@ struct sftp_range_tracker {
 	off_t                  file_bytes; /* for the transfer log line */
 	char                  *path;       /* the file written (xstrdup'd) */
 	char                  *src_path;   /* the file read (xstrdup'd) */
+	/* The first permanent range failure's cause, for the file's line in
+	 * the failure log. Under mu. */
+	char                  *fail_reason;
 	/* Verify transfer: the last range to finalize parks the tracker for
 	 * the post-transfer verify phase. */
 	int                    verify;
@@ -923,6 +926,10 @@ struct sftp_parallel {
 	/* Set by sftp_parallel_abort, read by workers between units. */
 	volatile sig_atomic_t       abort_flag;
 
+	/* The transferlog_dir of the last unit submitted, which the failure
+	 * log names if every worker is lost. */
+	volatile sig_atomic_t       last_dir;
+
 	/* HPN: set when a worker sees a server -P/-p request-policy denial, a
 	 * class-wide refusal that would deny every file of this kind. The
 	 * reporting and idempotency latch for that path; the worker also raises
@@ -1076,6 +1083,8 @@ int	 hpn_strlist_drain(struct hpn_strlist *, char ***, int *);
 void	 parallel_unit_free(struct sftp_work_unit *);
 struct sftp_work_unit *parallel_unit_make_range(const char *, const char *,
 	    off_t, off_t, struct sftp_range_tracker *);
+void	 parallel_unit_tracker_note_failure(struct sftp_range_tracker *,
+	    const char *);
 int	 parallel_unit_tracker_finalize(struct sftp_range_tracker *, int,
 	    struct sftp_worker *);
 int	 parallel_unit_tracker_finalize_n(struct sftp_range_tracker *, int,
@@ -1116,7 +1125,7 @@ void	 parallel_verify_job_free(struct verify_job *);
 void	 parallel_verify_maybe_wave(struct sftp_parallel *);
 void	 parallel_verify_prefix_pool_reset(struct sftp_parallel *);
 void	 parallel_verify_fail_record(struct sftp_parallel *, int local_is_target,
-	    const char *local_path, const char *remote_path);
+	    const char *local_path, const char *remote_path, const char *);
 
 /* sftp-parallel-respawn.c - spawn/respawn lifecycle */
 void	 parallel_respawn_teardown_ssh(struct sftp_worker *);

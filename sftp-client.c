@@ -1420,12 +1420,13 @@ sftp_setstat_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
  * owner write and search added, as in sftp_hpn_ensure_remote_dir, so a copy
  * of a read-only source directory can still be filled. The deferred setstat
  * restores its real mode. created_out[i] is set when this call created
- * paths[i]. failed_out[i], which may be NULL, is set when paths[i] could not
- * be created, so the caller can skip it. A directory that already existed
- * is neither. Returns the number of failures. */
+ * paths[i]. failed_out, which may be NULL, gets the reason paths[i] could
+ * not be created, a static string, so the caller can skip and report it.
+ * A directory that already existed is neither. Returns the number of
+ * failures. */
 int
 sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
-    int n, u_char *created_out, u_char *failed_out)
+    int n, u_char *created_out, const char **failed_out)
 {
 	u_int *ids;
 	u_int status;
@@ -1441,8 +1442,10 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 	failed = xcalloc(n, sizeof(*failed));
 	failed_status = xcalloc(n, sizeof(*failed_status));
 	memset(created_out, 0, (size_t)n);
-	if (failed_out != NULL)
-		memset(failed_out, 0, (size_t)n);
+	if (failed_out != NULL) {
+		for (k = 0; k < n; k++)
+			failed_out[k] = NULL;
+	}
 
 	/* Phase 1: send every MKDIR and collect the replies. A failure is only
 	 * noted here. Checking it with a stat now would read one of the
@@ -1469,9 +1472,10 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 			failures += nfailed + n - recv;
 			if (failed_out != NULL) {
 				for (k = 0; k < nfailed; k++)
-					failed_out[failed[k]] = 1;
+					failed_out[failed[k]] =
+					    fx2txt(failed_status[k]);
 				for (k = recv; k < n; k++)
-					failed_out[k] = 1;
+					failed_out[k] = fx2txt(status);
 			}
 			free(ids);
 			free(failed);
@@ -1508,18 +1512,20 @@ sftp_mkdir_pipeline(struct sftp_conn *conn, char **paths, Attrib *attrs,
 	for (k = 0; k < nfailed; k++) {
 		int i = failed[k];
 		Attrib existing;
+		const char *reason;
 
 		if (sftp_stat(conn, paths[i], 1, &existing) == 0 &&
 		    (existing.flags & SSH2_FILEXFER_ATTR_PERMISSIONS)) {
 			if (S_ISDIR(existing.perm))
 				continue;	/* pre-existing directory */
-			error("\"%s\" exists but is not a directory",
-			    paths[i]);
-		} else
-			error("remote mkdir \"%s\": %s", paths[i],
-			    fx2txt(failed_status[k]));
+			reason = "exists but is not a directory";
+			error("\"%s\" %s", paths[i], reason);
+		} else {
+			reason = fx2txt(failed_status[k]);
+			error("remote mkdir \"%s\": %s", paths[i], reason);
+		}
 		if (failed_out != NULL)
-			failed_out[i] = 1;
+			failed_out[i] = reason;
 		failures++;
 	}
 	free(failed);
@@ -2751,7 +2757,7 @@ serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
     const char *dst, Attrib *attrs)
 {
 	struct serial_dl_sink	*ctx = (struct serial_dl_sink *)sink;
-	int			 download_result;
+	int			 download_result, ret;
 
 	if ((attrs->flags & SSH2_FILEXFER_ATTR_SIZE) &&
 	    sftp_hpn_bundle_acc_eligible(ctx->bundle_acc, attrs->size)) {
@@ -2773,10 +2779,12 @@ serial_dl_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 	download_result = sftp_download(ctx->conn, src, dst, attrs,
 	    ctx->preserve_flag, ctx->resume_flag, ctx->fsync_flag,
 	    ctx->inplace_flag, ctx->verify);
+	/* HPN: report first, since the line below would replace the reason */
+	ret = sftp_hpn_report_transfer(ctx->conn, TRANSFERLOG_DOWNLOAD,
+	    download_result, src, dst, (off_t)attrs->size);
 	if (download_result == -1)
 		error("Download of file %s to %s failed", src, dst);
-	return sftp_hpn_report_transfer(ctx->conn, download_result, src, dst,
-	    (off_t)attrs->size);
+	return ret;
 }
 
 /* HPN: the serial download sink's aborting. The walk stops on an
@@ -2813,6 +2821,10 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	struct serial_dl_sink sink;
 
 	if ((src_canon = sftp_realpath(conn, src)) == NULL) {
+		/* HPN: one line in the logs stands for the whole tree, with the
+		 * reason sftp_realpath logged */
+		transferlog_tree_failure(TRANSFERLOG_DOWNLOAD, src, dst,
+		    hpn_get_last_error());
 		error("download \"%s\": path canonicalization failed", src);
 		return -1;
 	}
@@ -2831,7 +2843,8 @@ sftp_download_dir(struct sftp_conn *conn, const char *src, const char *dst,
 			.make_dir = serial_dl_make_dir,
 			.xfer_file = serial_dl_xfer_file,
 			.aborting = serial_dl_aborting,
-			.notice = serial_dl_notice },
+			.notice = serial_dl_notice,
+			.log_dir = TRANSFERLOG_DOWNLOAD },
 		.conn = conn,
 		.bundle_acc = &bundle_acc,
 		.dirs = &dirs,
@@ -3390,7 +3403,7 @@ serial_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
     const char *dst, const struct stat *src_sb)
 {
 	struct serial_ul_sink	*ctx = (struct serial_ul_sink *)sink;
-	int			 upload_result;
+	int			 upload_result, ret;
 
 	if (sftp_hpn_bundle_acc_eligible(ctx->bundle_acc,
 	    (uint64_t)src_sb->st_size)) {
@@ -3410,10 +3423,12 @@ serial_ul_xfer_file(struct sftp_upload_sink *sink, const char *src,
 	}
 	upload_result = sftp_upload(ctx->conn, src, dst, ctx->preserve_flag,
 	    ctx->resume, ctx->verify, ctx->fsync_flag, ctx->inplace_flag);
+	/* HPN: report first, since the line below would replace the reason */
+	ret = sftp_hpn_report_transfer(ctx->conn, TRANSFERLOG_UPLOAD,
+	    upload_result, src, dst, src_sb->st_size);
 	if (upload_result == -1)
 		error("upload \"%s\" to \"%s\" failed", src, dst);
-	return sftp_hpn_report_transfer(ctx->conn, upload_result, src, dst,
-	    src_sb->st_size);
+	return ret;
 }
 
 /* HPN: the serial upload sink's defer_dir. It queues the directory's final
@@ -3454,26 +3469,37 @@ sftp_upload_dir(struct sftp_conn *conn, const char *src, const char *dst,
 	struct serial_ul_sink sink;
 
 	if ((dst_canon = sftp_realpath(conn, dst)) == NULL) {
+		/* HPN: one line in the logs stands for the whole tree, with the
+		 * reason sftp_realpath logged */
+		transferlog_tree_failure(TRANSFERLOG_UPLOAD, src, dst,
+		    hpn_get_last_error());
 		error("upload \"%s\": path canonicalization failed", dst);
 		return -1;
 	}
 
 	/* HPN: create the destination root first. The walk expects its dst
 	 * to exist, and creates each deeper directory in its parent's
-	 * pipelined mkdir batch. */
+	 * pipelined mkdir batch. A root that fails is one line in the logs,
+	 * for the whole tree. */
 	if (stat(src, &sb) == -1) {
 		error("stat local \"%s\": %s", src, strerror(errno));
+		transferlog_tree_failure(TRANSFERLOG_UPLOAD, src, dst_canon,
+		    strerror(errno));
 		free(dst_canon);
 		return -1;
 	}
 	if (!S_ISDIR(sb.st_mode)) {
 		error("\"%s\" is not a directory", src);
+		transferlog_tree_failure(TRANSFERLOG_UPLOAD, src, dst_canon,
+		    "not a directory");
 		free(dst_canon);
 		return -1;
 	}
 	sftp_hpn_dir_attrs_from_stat(&sb, preserve_flag, &root_attrs);
 	if (sftp_hpn_ensure_remote_dir(conn, dst_canon, &root_attrs,
 	    &root_created) != 0) {
+		transferlog_tree_failure(TRANSFERLOG_UPLOAD, src, dst_canon,
+		    hpn_get_last_error());
 		free(dst_canon);
 		return -1;
 	}
@@ -5212,6 +5238,11 @@ crossload_xfer_file(struct sftp_tree_dl_sink *sink, const char *src,
 
 	if (sftp_crossload(ctx->from, ctx->to, src, dst, attrs,
 	    ctx->preserve_flag) == -1) {
+		/* logged first, since the line below would replace the
+		 * reason */
+		if (!interrupted)
+			transferlog_failure(TRANSFERLOG_CROSSLOAD, src, dst,
+			    hpn_get_last_error());
 		error("crossload \"%s\" to \"%s\" failed", src, dst);
 		return -1;
 	}
@@ -5242,7 +5273,8 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 		.base = {
 			.make_dir = crossload_make_dir,
 			.xfer_file = crossload_xfer_file,
-			.aborting = crossload_aborting },
+			.aborting = crossload_aborting,
+			.log_dir = TRANSFERLOG_CROSSLOAD },
 		.from = from,
 		.to = to,
 		.dirs = &dirs,
@@ -5250,6 +5282,10 @@ sftp_crossload_dir(struct sftp_conn *from, struct sftp_conn *to,
 		.print_flag = print_flag };
 
 	if ((from_path_canon = sftp_realpath(from, from_path)) == NULL) {
+		/* HPN: one line in the logs stands for the whole tree, with the
+		 * reason sftp_realpath logged */
+		transferlog_tree_failure(TRANSFERLOG_CROSSLOAD, from_path,
+		    to_path, hpn_get_last_error());
 		error("crossload \"%s\": path canonicalization failed",
 		    from_path);
 		return -1;

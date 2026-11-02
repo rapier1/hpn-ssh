@@ -209,6 +209,10 @@ struct sftp_parallel_config {
 	 * >0 = explicit count. */
 	int          lustre_stripe_count;
 
+	/* HPNFailureLog from ssh_config. The fleet does not use it. The
+	 * caller hands it to transferlog_failure_config(). */
+	int          failure_log;
+
 	/* Transfer flags applied to every submitted unit */
 	int          preserve_flag;
 	int          fsync_flag;

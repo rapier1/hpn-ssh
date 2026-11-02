@@ -631,6 +631,18 @@ See the
 entry in
 .Xr hpnscp 1
 for the full description.
+.It Cm FailureLog Ns Op = Ns Ar path
+Records each path that should have been transferred and was not, with
+its source and destination and the reason, in
+.Ar path
+(default
+.Pa ./hpnssh-transfer-failure. Ns Ar PID Ns Pa .log ) .
+The file is created only when a failure happens.
+See the
+.Fl X
+entry in
+.Xr hpnscp 1
+for the full description.
 .El
 .El
 .Sh INTERACTIVE COMMANDS

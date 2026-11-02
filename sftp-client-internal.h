@@ -36,6 +36,8 @@
 #include <sys/types.h>
 #include <stdint.h>
 
+#include "sftp-hpn-transferlog.h"	/* enum transferlog_dir */
+
 struct sftp_conn;
 struct sftp_hpn_conn;
 struct sshbuf;
@@ -224,9 +226,12 @@ void     sftp_conn_bytes_wired_add(struct sftp_conn *, uint64_t);
  * -1 for a failure, 0 for success, 1 for a skip because the target is
  * identical, or 2 for a skip because it is larger. It prints the skip
  * notice for src and writes dst's TransferLog line, leaving a success to
- * the verify phase under -V. Returns -1 when rc is -1, and 0 otherwise. */
-int sftp_hpn_report_transfer(struct sftp_conn *, int rc, const char *src,
-    const char *dst, off_t size);
+ * the verify phase under -V. A failure that was not an interrupt also
+ * goes to the failure log, with dir and the thread's last error as the
+ * reason, so call this before logging anything else about the failure.
+ * Returns -1 when rc is -1, and 0 otherwise. */
+int sftp_hpn_report_transfer(struct sftp_conn *, enum transferlog_dir,
+    int rc, const char *src, const char *dst, off_t size);
 
 /* Apply -p and -f to a download that a verified resume finished early.
  * modified is 0 when the local copy was already identical. */

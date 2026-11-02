@@ -1406,6 +1406,33 @@ Consulted only by
 .Xr hpnsftp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
+.It Cm HPNFailureLog
+Controls whether
+.Xr hpnsftp 1
+and
+.Xr hpnscp 1
+record each path that fails to transfer in a failure log,
+.Pa ./hpnssh-transfer-failure. Ns Ar PID Ns Pa .log
+in the current directory.
+The file is created only when a failure happens.
+The argument must be
+.Cm yes
+or
+.Cm no .
+The default is
+.Cm no .
+The
+.Fl X Cm FailureLog
+option turns the log on for a single run and can name another path, as
+described in
+.Xr hpnscp 1 .
+.Cm no
+does not turn off a log that
+.Fl X Cm FailureLog
+asked for.
+.Xr hpnssh 1
+itself ignores this option.
+HPNSSH only.
 .It Cm HPNLustreStripeCount
 .Sy EXPERIMENTAL :
 desired Lustre stripe count for destination directories when

@@ -574,6 +574,29 @@ Any other path names the file itself, which must be a regular file and
 not a symbolic link.
 The path may not contain control characters.
 The log is purely informational: nothing ever reads it back.
+.It Cm FailureLog Ns Op = Ns Ar path
+Records each path that should have been transferred and was not, as one
+tab-delimited line
+.Pq direction, source path, destination path, reason
+in
+.Ar path
+(default
+.Pa ./hpnssh-transfer-failure. Ns Ar PID Ns Pa .log ) .
+The reason is the error the transfer printed.
+A directory that could not be read or created is one line, which stands
+for everything below it.
+A connection that dies and ends the transfer early adds one line.
+Transfers the user interrupted, and transfers that were retried and then
+succeeded, are not recorded.
+The file is created only when a failure happens, and ends with the
+failure count.
+A directory gets the default file name inside it.
+Without this option, a run with failures ends by saying how many failed.
+The
+.Cm HPNFailureLog
+option in
+.Xr hpnssh_config 5
+also turns it on.
 .It Cm StrictArgs
 With
 .Fl R ,

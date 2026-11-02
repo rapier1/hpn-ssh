@@ -1364,6 +1364,7 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 			sftp_conn_set_bundle_config(conn, bcfg.use_bundle,
 			    bcfg.bundle_size, bcfg.writer_pool);
 			lustre_stripe_count = bcfg.lustre_stripe_count;
+			transferlog_failure_config(bcfg.failure_log);
 		}
 	}
 	/* The layout hooks read HPNLustreStripeCount from the connection,
@@ -2085,11 +2086,13 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 		int ur = sftp_upload(conn, src, abs_dst, pflag, 0,
 		    resume_flag, 0, 1);
 
+		/* HPN: report first, since the line below would replace the
+		 * reason. */
+		if (sftp_hpn_report_transfer(conn, TRANSFERLOG_UPLOAD, ur, src,
+		    abs_dst, st.st_size) == -1)
+			errs = 1;
 		if (ur == -1)
 			error("failed to upload file %s to %s", src, targ);
-		if (sftp_hpn_report_transfer(conn, ur, src, abs_dst,
-		    st.st_size) == -1)
-			errs = 1;
 	}
 
 	free(abs_dst);
@@ -2407,20 +2410,28 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 			/* Log the local copy's size, -1 when nothing landed. */
 			if (transferlog_active() && stat(abs_dst, &lsb) == 0)
 				sz = lsb.st_size;
-			if (sftp_hpn_report_transfer(conn, dr, g.gl_pathv[i],
-			    abs_dst, sz) == -1)
+			if (sftp_hpn_report_transfer(conn,
+			    TRANSFERLOG_DOWNLOAD, dr, g.gl_pathv[i], abs_dst,
+			    sz) == -1)
 				err = -1;
+		}
+		/* HPN: a dead connection ends the command, with one line in
+		 * the failure log. Every later match would fail the same
+		 * way. */
+		if (sftp_conn_is_dead(conn)) {
+			if (!interrupted)
+				transferlog_connection_lost(
+				    TRANSFERLOG_DOWNLOAD, g.gl_pathv[i],
+				    abs_dst);
+			free(abs_dst);
+			abs_dst = NULL;
+			err = -1;
+			break;
 		}
 		free(abs_dst);
 		abs_dst = NULL;
 		free(tmp);
 		tmp = NULL;
-		/* HPN: a dead connection ends the command. Every later match
-		 * would fail the same way. */
-		if (sftp_conn_is_dead(conn)) {
-			err = -1;
-			break;
-		}
 	}
 
 out:
@@ -2902,19 +2913,32 @@ throughlocal_sftp(struct sftp_conn *from, struct sftp_conn *to,
 				err = -1;
 		} else {
 			if (sftp_crossload(from, to, g.gl_pathv[i], abs_dst,
-			    NULL, pflag) == -1)
+			    NULL, pflag) == -1) {
+				/* HPN: an interrupt is not a failure to
+				 * record */
+				if (!interrupted)
+					transferlog_failure(
+					    TRANSFERLOG_CROSSLOAD,
+					    g.gl_pathv[i], abs_dst,
+					    hpn_get_last_error());
 				err = -1;
+			}
+		}
+		/* HPN: a dead connection at either end ends the command, with
+		 * one line in the failure log. Every later match would fail
+		 * the same way. */
+		if (sftp_conn_is_dead(from) || sftp_conn_is_dead(to)) {
+			if (!interrupted)
+				transferlog_connection_lost(
+				    TRANSFERLOG_CROSSLOAD, g.gl_pathv[i],
+				    abs_dst);
+			err = -1;
+			break;
 		}
 		free(abs_dst);
 		abs_dst = NULL;
 		free(tmp);
 		tmp = NULL;
-		/* HPN: a dead connection at either end ends the command.
-		 * Every later match would fail the same way. */
-		if (sftp_conn_is_dead(from) || sftp_conn_is_dead(to)) {
-			err = -1;
-			break;
-		}
 	}
 
 out:

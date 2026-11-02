@@ -36,6 +36,7 @@
 #include <stdint.h>
 
 #include "sftp-common.h"
+#include "sftp-hpn-transferlog.h"	/* enum transferlog_dir */
 
 struct bwlimit;		/* misc.h; kept opaque here */
 struct sftp_conn;
@@ -429,8 +430,9 @@ struct sftp_tree_dl_sink {
 	/* Transfer regular file src to dst. 0 or -1. */
 	int  (*xfer_file)(struct sftp_tree_dl_sink *sink, const char *src,
 	         const char *dst, Attrib *attrs);
-	/* Optional. Record a per-entry failure. reason is a static string.
-	 * NULL when the caller keeps no failure list, as serial and crossload
+	/* Optional. Record a per-entry failure of source path for the
+	 * end-of-run summary. reason is valid only during the call. NULL
+	 * when the caller keeps no failure list, as serial and crossload
 	 * do. */
 	void (*fail)(struct sftp_tree_dl_sink *sink, const char *path,
 	         const char *reason);
@@ -453,6 +455,8 @@ struct sftp_tree_dl_sink {
 	 * and crossload transfer on that connection and keep the per-batch
 	 * queue. */
 	int streams_files;
+	/* The direction the failure log names for this walk's failures. */
+	enum transferlog_dir log_dir;
 };
 
 /* Per-mode callbacks for the shared upload driver, sftp_upload_walk_consume.
@@ -490,9 +494,10 @@ struct sftp_upload_sink {
 	 * created-or-preserve gate, so a call here means they are wanted. */
 	void (*defer_dir)(struct sftp_upload_sink *sink, const char *dst,
 	         const Attrib *attrs);
-	/* Optional. Record a per-entry failure. reason is a short message the
-	 * sink must use at once, since it may be strerror's buffer. NULL when
-	 * the caller keeps no failure list, as serial does. */
+	/* Optional. Record a per-entry failure of source path for the
+	 * end-of-run summary. reason is a short message the sink must use at
+	 * once, since it may be strerror's buffer. NULL when the caller keeps
+	 * no failure list, as serial does. */
 	void (*fail)(struct sftp_upload_sink *sink, const char *path,
 	         const char *reason);
 	/* True when the walk should stop: interrupt or fleet abort. */

@@ -173,6 +173,10 @@ itself: the per-file log is written on this host (default
 .Pa ./hpnssh-transfer. Ns Ar PID Ns Pa .log ) ,
 built from the source's per-file status stream, with remote file names
 percent-encoded before they are written.
+.Cm FailureLog Ns Op = Ns Ar path
+is consumed the same way: a file the source reports as failed is
+recorded here without its source path or reason, since the status
+stream does not carry them.
 See the
 .Fl X
 entry in
