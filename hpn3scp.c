@@ -77,6 +77,9 @@ static struct {
 	int		got;	/* an END frame arrived */
 } endinfo;
 
+/* A PROGRESS frame arrived, so the copy on the source was under way */
+static int copy_started;
+
 /* Liveness after the source's PROGRESS frames stop decoding */
 static struct {
 	int	warned;		/* the mismatch warning went out */
@@ -492,6 +495,7 @@ static void
 ev_progress(const struct hpns_progress *progress, void *ctx)
 {
 	(void)ctx;
+	copy_started = 1;
 	/* a frame that decodes ends liveness mode */
 	liveness.blind = 0;
 	if (proto_human()) {
@@ -900,7 +904,7 @@ static int
 run_session(struct run_state *session)
 {
 	const char *why = NULL;
-	char *msg;
+	char *msg, *src_spec, *dst_spec;
 	struct target_keyset keyset;
 	int r, ret = 1, counts_known, cancelled = 0;
 
@@ -987,6 +991,20 @@ run_session(struct run_state *session)
 		    "result (see its messages on stderr)", session->src.host);
 		proto_emit_error(msg);
 		free(msg);
+		/* After the copy was under way, a missing END means the
+		 * source's session ended early */
+		if (copy_started) {
+			xasprintf(&src_spec, "%s:%s", session->src.host,
+			    session->src.path != NULL ?
+			    session->src.path : ".");
+			xasprintf(&dst_spec, "%s:%s", session->dst.host,
+			    session->dst.path != NULL ?
+			    session->dst.path : "");
+			transferlog_connection_lost(TRANSFERLOG_THIRDPARTY,
+			    src_spec, dst_spec);
+			free(src_spec);
+			free(dst_spec);
+		}
 	}
 	/* A source that reported failure without a FILEFAIL frame, as a
 	 * serial transfer error does, leaves the front end no file_fail
