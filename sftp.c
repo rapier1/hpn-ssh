@@ -945,9 +945,8 @@ parallel_flush(struct sftp_conn *conn, int final)
 			rc = -1;
 		}
 		if (pstats.walker_failures_aggregate > 0) {
-			error("TRANSFER INCOMPLETE: %llu file(s) or director(y/ies) "
-			    "were skipped during the directory walk "
-			    "(stat/readdir/symlink errors)",
+			error("TRANSFER INCOMPLETE: %llu path(s) "
+			    "were skipped during the directory walk",
 			    (unsigned long long)pstats.walker_failures_aggregate);
 			rc = -1;
 		}
