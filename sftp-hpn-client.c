@@ -157,7 +157,8 @@ struct tree_dl_ctx {
 	 * lands mid-batch reports itself once. */
 	int				 abort_noticed;
 	/* The relpath of a directory make_dir could not create, while the
-	 * walk is inside it, else NULL. Everything below it is skipped. */
+	 * walk is inside it, else NULL. Everything below it is skipped, and
+	 * the next read asks the server to stop listing it. */
 	char				*failed_dir;
 	/* -1 after any per-entry failure. */
 	int				 ret;
@@ -2038,7 +2039,8 @@ sftp_tree_walk_open(struct sftp_conn *conn, const char *root, uint32_t flags,
 /* Send one hpn-dtree-read and hand each record of the reply to cb. The
  * reply is a run of DATA messages ended by BATCH_END, or by END when the
  * walk is complete, and every message is read before returning, so the
- * connection is ours until then. See reply_stream_active.
+ * connection is ours until then. See reply_stream_active. A non-NULL
+ * prune names a directory for the server to stop walking first.
  *
  * A message we cannot decode leaves the batch desynced, and the server
  * keeps sending the rest of it regardless. Leaving the connection alive
@@ -2048,7 +2050,8 @@ sftp_tree_walk_open(struct sftp_conn *conn, const char *root, uint32_t flags,
  * at fault. */
 int
 sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
-    uint32_t max_records, sftp_tree_record_cb cb, void *ctx, int *done)
+    uint32_t max_records, const char *prune, sftp_tree_record_cb cb,
+    void *ctx, int *done)
 {
 	struct sshbuf	*msg;
 	u_int		 id, rid;
@@ -2061,12 +2064,16 @@ sftp_tree_walk_read(struct sftp_conn *conn, struct sftp_tree_walk *walk,
 	if ((msg = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new failed");
 	id = sftp_conn_alloc_msg_id(conn);
-	debug3_f("sending hpn-dtree-read max=%u id=%u", max_records, id);
+	if (prune == NULL)
+		prune = "";
+	debug3_f("sending hpn-dtree-read max=%u prune=\"%s\" id=%u",
+	    max_records, prune, id);
 	if ((r = sshbuf_put_u8(msg, SSH2_FXP_EXTENDED)) != 0 ||
 	    (r = sshbuf_put_u32(msg, id)) != 0 ||
 	    (r = sshbuf_put_cstring(msg, HPN_EXT_DTREE_READ)) != 0 ||
 	    (r = sshbuf_put_string(msg, walk->handle, walk->handle_len)) != 0 ||
-	    (r = sshbuf_put_u32(msg, max_records)) != 0)
+	    (r = sshbuf_put_u32(msg, max_records)) != 0 ||
+	    (r = sshbuf_put_cstring(msg, prune)) != 0)
 		fatal_fr(r, "compose hpn-dtree-read request");
 	if (send_msg(conn, msg) != 0) {
 		logit_f("hpn-dtree-read: transport send failed");
@@ -2492,14 +2499,17 @@ sftp_tree_download_consume(struct sftp_conn *conn, const char *src,
 	/* One chunk per pass. Each record goes to tree_dl_consume_record,
 	 * which creates directories inline and queues regular files, and the
 	 * queue is transferred and emptied before the next read. Symlinks
-	 * are followed only when the caller asks. */
+	 * are followed only when the caller asks. A batch that ended inside
+	 * a directory that could not be created leaves it in failed_dir, and
+	 * the next read prunes it, so the server does not list the rest. */
 	do {
 		/* The transfer pauses while a batch is fetched. Tell the user
 		 * why, on every batch including the first. */
 		if (sink->notice != NULL)
 			sink->notice(sink, "Gathering file list from server.");
 		if (sftp_tree_walk_read(conn, &walk, HPN_DTREE_MAX_BATCH,
-		    tree_dl_consume_record, &ctx, &done) != 0) {
+		    ctx.failed_dir, tree_dl_consume_record, &ctx,
+		    &done) != 0) {
 			error("remote tree walk \"%s\" failed", src);
 			dl_sink_fail(sink, src, dst, "remote tree walk failed");
 			ctx.ret = -1;

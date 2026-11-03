@@ -26,7 +26,8 @@
  * from the root down to the current one stay open in the handle, one
  * per depth. That is what lets the client transfer each batch before
  * asking for the next, with memory bounded by one batch rather than
- * the whole tree.
+ * the whole tree. A read can first prune an open directory, one the
+ * client could not create, so the walk skips the rest of it.
  *
  * The walk is iterative over an explicit stack of levels, so it can
  * stop after any record and resume later. Records are emitted in the
@@ -238,6 +239,27 @@ tree_pop(struct hpn_tree_state *state)
 	state->depth--;
 }
 
+/* Close the open directory at relpath prune and every level below it,
+ * so the walk goes on in its parent. The client sends a directory it
+ * could not create, which is still open when a batch ended inside it.
+ * Only an exact match with an open level below the root counts, and
+ * anything else is ignored. */
+static void
+tree_prune(struct hpn_tree_state *state, const char *prune)
+{
+	int depth;
+
+	for (depth = 1; depth <= state->depth; depth++) {
+		if (strcmp(state->level[depth].relpath, prune) != 0)
+			continue;
+		debug_f("pruning \"%s\"", state->level[depth].abspath);
+		while (state->depth >= depth)
+			tree_pop(state);
+		return;
+	}
+	debug_f("prune \"%s\": not an open directory", prune);
+}
+
 /* Replace *st with the link target's stat. Named because it mutates
  * *st: the classification below reads st as either the lstat of the
  * entry or the stat of its target depending on whether this ran.
@@ -441,32 +463,36 @@ sftp_hpn_tree_open(uint32_t id)
 	free(root);
 }
 
-/* Handle an hpn-dtree-read request: string handle, uint32 max-records.
- * Emits up to that many records as DATA messages, then BATCH_END while
- * the tree has more, or END once it is exhausted. A read after END
- * replies END again. Zero, or more than HPN_DTREE_MAX_BATCH, means the
- * maximum. */
+/* Handle an hpn-dtree-read request: string handle, uint32 max-records,
+ * string prune-path. A non-empty prune-path is pruned first. Emits up to
+ * max-records records as DATA messages, then BATCH_END while the tree
+ * has more, or END once it is exhausted. A read after END replies END
+ * again. Zero, or more than HPN_DTREE_MAX_BATCH, means the maximum. */
 void
 sftp_hpn_tree_read(uint32_t id)
 {
 	struct hpn_tree_state	*state;
 	struct tree_emit	 emit;
 	u_char			*hbuf = NULL;
+	char			*prune = NULL;
 	size_t			 hlen = 0;
 	uint32_t		 max_records = 0;
 	int			 handle, r;
 
 	if ((r = sshbuf_get_string(iqueue, &hbuf, &hlen)) != 0 ||
-	    (r = sshbuf_get_u32(iqueue, &max_records)) != 0) {
+	    (r = sshbuf_get_u32(iqueue, &max_records)) != 0 ||
+	    (r = sshbuf_get_cstring(iqueue, &prune, NULL)) != 0) {
 		error_f("parse hpn-dtree-read request: %s", ssh_err(r));
 		send_status(id, SSH2_FX_BAD_MESSAGE);
 		free(hbuf);
+		free(prune);
 		return;
 	}
 	if (hlen != sizeof(uint32_t)) {
 		error_f("hpn-dtree-read: bad handle length %zu", hlen);
 		send_status(id, SSH2_FX_FAILURE);
 		free(hbuf);
+		free(prune);
 		return;
 	}
 	handle = (int)get_u32(hbuf);
@@ -474,12 +500,16 @@ sftp_hpn_tree_read(uint32_t id)
 	if ((state = handle_get_tree(handle)) == NULL) {
 		error_f("hpn-dtree-read: handle %d is not an open tree", handle);
 		send_status(id, SSH2_FX_FAILURE);
+		free(prune);
 		return;
 	}
 	if (max_records == 0 || max_records > HPN_DTREE_MAX_BATCH)
 		max_records = HPN_DTREE_MAX_BATCH;
-	debug3("request %u: hpn-dtree-read handle %d max %u", id, handle,
-	    max_records);
+	debug3("request %u: hpn-dtree-read handle %d max %u prune \"%s\"",
+	    id, handle, max_records, prune);
+	if (*prune != '\0')
+		tree_prune(state, prune);
+	free(prune);
 
 	emit.id = id;
 	emit.count = 0;

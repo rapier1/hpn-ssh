@@ -119,6 +119,10 @@ struct sftp_conn;
  *     string  handle
  *     uint32  max-records           (0, or more than HPN_DTREE_MAX_BATCH,
  *                                     means HPN_DTREE_MAX_BATCH)
+ *     string  prune-path            (empty, or the relative-path of a
+ *                                     directory open on the walk, which
+ *                                     the server closes with everything
+ *                                     below it before reading on)
  *   reply:  one or more SSH2_FXP_EXTENDED_REPLY with the same id, ending
  *           with a BATCH_END or END message:
  *     byte    version               (HPN_DTREE_VERSION)
@@ -196,16 +200,17 @@ int	sftp_tree_relpath_ok(const char *);
  * hpn-dtree-open for a root path with its request flags and keeps the
  * server's handle in the walk. read sends one hpn-dtree-read for up to the
  * given number of records and calls the callback once per record as the
- * reply arrives, under the sftp_tree_record_cb contract. It sets the done
- * flag once the walk has reached END. The reply is one or more messages on
- * the control connection, and read drains them all before returning, so
- * the callback must not send on that connection. close sends CLOSE for the
- * handle, unless the connection is dead, and frees it. Each returns 0, or
- * -1 on failure. */
+ * reply arrives, under the sftp_tree_record_cb contract. A non-NULL prune
+ * path asks the server to stop walking that directory first. It sets the
+ * done flag once the walk has reached END. The reply is one or more
+ * messages on the control connection, and read drains them all before
+ * returning, so the callback must not send on that connection. close
+ * sends CLOSE for the handle, unless the connection is dead, and frees
+ * it. Each returns 0, or -1 on failure. */
 int	sftp_tree_walk_open(struct sftp_conn *, const char *, uint32_t,
 	    struct sftp_tree_walk *);
 int	sftp_tree_walk_read(struct sftp_conn *, struct sftp_tree_walk *,
-	    uint32_t, sftp_tree_record_cb, void *, int *);
+	    uint32_t, const char *, sftp_tree_record_cb, void *, int *);
 int	sftp_tree_walk_close(struct sftp_conn *, struct sftp_tree_walk *);
 
 #endif /* _SFTP_HPN_TREE_H */
