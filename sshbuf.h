@@ -44,6 +44,9 @@
 #define SSHBUF_MAX_BIGNUM	(16384 / 8)	/* Max bignum *bytes* */
 #define SSHBUF_MAX_ECPOINT	((528 * 2 / 8) + 1) /* Max EC point *bytes* */
 #define MAX_LABEL_LEN           64 /*maximum size of sshbuf label */
+/* HPN: channel buffers above this size grow in 4 MB steps instead of
+ * SSHBUF_SIZE_INC (see sshbuf_allocate). */
+#define BUF_WATERSHED		(256 * 1024)
 #define sshbuf_new() sshbuf_new_label(__func__)
 
 struct sshbuf;

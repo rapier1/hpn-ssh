@@ -127,6 +127,7 @@ void	 ssh_packet_set_qos(struct ssh *, int, int);
 void     ssh_packet_set_server(struct ssh *);
 void     ssh_packet_set_zstd_level(struct ssh *, int);
 u_int    ssh_packet_get_decomp_ratio_milli(struct ssh *);
+size_t   ssh_packet_input_pending(struct ssh *);
 void     ssh_packet_set_authenticated(struct ssh *);
 void     ssh_packet_set_mux(struct ssh *);
 int	 ssh_packet_get_mux(struct ssh *);

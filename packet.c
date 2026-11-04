@@ -43,6 +43,7 @@
 #include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>	/* HPN: FIONREAD */
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -2590,6 +2591,24 @@ u_int
 ssh_packet_get_decomp_ratio_milli(struct ssh *ssh)
 {
 	return hpn_zstd_in_ratio_milli(ssh->state->zstd_in);
+}
+
+/* HPN: bytes that have arrived and not yet been processed: what is left
+ * in the input buffer plus what the kernel holds unread on the socket.
+ * Only the input buffer counts where FIONREAD is not available. */
+size_t
+ssh_packet_input_pending(struct ssh *ssh)
+{
+	struct session_state *state = ssh->state;
+	size_t pending = sshbuf_len(state->input);
+	int unread = 0;
+
+#ifdef FIONREAD
+	if (ioctl(state->connection_in, FIONREAD, &unread) == 0 &&
+	    unread > 0)
+		pending += (size_t)unread;
+#endif
+	return pending;
 }
 
 /* Set the state of the connection to post auth

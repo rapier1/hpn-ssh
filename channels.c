@@ -3709,6 +3709,28 @@ channel_from_packet_id(struct ssh *ssh, const char *where, const char *what)
 	return c;
 }
 
+/*
+ * HPN: before data_len more bytes go into c->output, make room for the
+ * whole burst that has already arrived, so a large burst costs one
+ * growth instead of one per 4 MB. Each growth copies and scrubs the
+ * buffer, and loss recovery can release hundreds of MB at once. The
+ * burst is what the packet layer holds unprocessed, capped at the credit
+ * the peer has left, since no more can arrive. It counts wire bytes, so
+ * a compressed burst undercounts and the rest grows in 4 MB steps as
+ * before. Below the watershed growth is cheap and the ioctl is skipped.
+ * On failure the put below grows the buffer as before.
+ */
+static void
+channel_output_reserve(struct ssh *ssh, Channel *c, size_t data_len)
+{
+	size_t burst;
+
+	if (sshbuf_len(c->output) + data_len <= BUF_WATERSHED)
+		return;
+	burst = MINIMUM(ssh_packet_input_pending(ssh), c->local_window);
+	(void)sshbuf_allocate(c->output, data_len + burst);
+}
+
 int
 channel_input_data(int type, uint32_t seq, struct ssh *ssh)
 {
@@ -3771,6 +3793,7 @@ channel_input_data(int type, uint32_t seq, struct ssh *ssh)
 		c->local_window_exceeded = 0;
 	}
 
+	channel_output_reserve(ssh, c, data_len);	/* HPN */
 	if (c->datagram) {
 		if ((r = sshbuf_put_string(c->output, data, data_len)) != 0)
 			fatal_fr(r, "channel %i: append datagram", c->self);

@@ -29,8 +29,6 @@
 #include "misc.h"
 /* #include "log.h" */
 
-#define BUF_WATERSHED 256*1024
-
 #ifdef SSHBUF_DEBUG
 # define SSHBUF_TELL(what) do { \
 		printf("%s:%d %s: %s size %zu alloc %zu off %zu max %zu\n", \
@@ -409,7 +407,9 @@ sshbuf_allocate(struct sshbuf *buf, size_t len)
 		   buf->label, buf, rlen, need, buf->max_size); */
 		/* easiest thing to do is grow the nuffer by 4MB each time. It might end
 		 * up being somewhat overallocated but works quickly */
-		need = (4*1024*1024);
+		/* HPN: but never less than the caller asked for, which a
+		 * channel sizing its output for a burst can exceed */
+		need = MAXIMUM(need, 4 * 1024 * 1024);
 		rlen = ROUNDUP(buf->alloc + need, SSHBUF_SIZE_INC);
 		/* debug_f ("Post: label: %s, %p, rlen is %zu need is %zu max_size is %zu", */
 		/* 	 buf->label, buf, rlen, need, buf->max_size); */
