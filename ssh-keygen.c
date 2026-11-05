@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-keygen.c,v 1.496 2026/09/15 08:00:01 djm Exp $ */
+/* $OpenBSD: ssh-keygen.c,v 1.500 2026/10/30 08:23:58 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1994 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -390,7 +390,7 @@ do_convert_to_pem(struct sshkey *k)
 }
 
 static void
-do_convert_to_hexdump(struct sshkey *k)
+do_convert_to_hexdump(struct sshkey *k, int private)
 {
 	struct sshbuf *b;
 	int r;
@@ -399,10 +399,13 @@ do_convert_to_hexdump(struct sshkey *k)
 		fatal_f("sshbuf_new failed");
 	/* pubkey */
 	if ((r = sshkey_putb(k, b)) != 0)
-		fatal_fr(r, "serialise private");
+		fatal_fr(r, "serialise public");
 	printf("Public %s key:\n", sshkey_type(k));
 	sshbuf_dump(b, stdout);
 	sshbuf_reset(b);
+	/* only a private key has private components to dump */
+	if (!private)
+		goto out;
 	if ((r = sshkey_private_serialize(k, b)) != 0) {
 		debug_fr(r, "serialise private");
 		goto out;
@@ -418,7 +421,7 @@ do_convert_to(struct passwd *pw)
 {
 	struct sshkey *k = NULL;
 	struct stat st;
-	int r;
+	int r, private = 0;
 
 	if (!have_identity)
 		ask_filename(pw, "Enter file in which the key is");
@@ -431,9 +434,13 @@ do_convert_to(struct passwd *pw)
 		    NULL, &k, NULL)) != 0 &&
 		    r == SSH_ERR_KEY_WRONG_PASSPHRASE)
 			k = load_identity(identity_file, NULL);
+		private = k != NULL;
 	}
-	if (k == NULL && (r = sshkey_load_public(identity_file, &k, NULL)) != 0)
+	if (k == NULL &&
+	    (r = sshkey_load_public(identity_file, &k, NULL)) != 0) {
 		k = load_identity(identity_file, NULL);
+		private = 1;
+	}
 
 	switch (convert_format) {
 	case FMT_RFC4716:
@@ -446,7 +453,7 @@ do_convert_to(struct passwd *pw)
 		do_convert_to_pem(k);
 		break;
 	case FMT_HEXDUMP:
-		do_convert_to_hexdump(k);
+		do_convert_to_hexdump(k, private);
 		break;
 	default:
 		fatal_f("unknown key format %d", convert_format);
@@ -968,15 +975,18 @@ do_fingerprint(struct passwd *pw)
 
 		/*
 		 * Try private keys first. Assume a key is private if
-		 * "SSH PRIVATE KEY" appears on the first line and we're
-		 * not reading from stdin (XXX support private keys on stdin).
+		 * the first line is a "-----BEGIN ... PRIVATE KEY-----"
+		 * header and we're not reading from stdin (XXX support
+		 * private keys on stdin). Keep going afterwards: ssh(1)
+		 * and sshd(8) would use any public keys that follow, so
+		 * they must be listed too.
 		 */
 		if (lnum == 1 && strcmp(identity_file, "-") != 0 &&
-		    strstr(cp, "PRIVATE KEY") != NULL) {
-			free(line);
-			fclose(f);
+		    strncmp(line, "-----BEGIN ", 11) == 0 &&
+		    strstr(line, "PRIVATE KEY") != NULL) {
 			fingerprint_private(path);
-			exit(0);
+			invalid = 0;
+			continue;
 		}
 
 		/*
@@ -1340,8 +1350,12 @@ do_known_hosts(struct passwd *pw, const char *name, int find_host,
 		fatal_fr(r, "hostkeys_foreach");
 	}
 
-	if (inplace)
-		fclose(ctx.out);
+	/* Don't replace the original with an incompletely-written copy */
+	if (inplace && (ferror(ctx.out) || fclose(ctx.out) != 0)) {
+		oerrno = errno;
+		unlink(tmp);
+		fatal("write %s: %s", tmp, strerror(oerrno));
+	}
 
 	if (ctx.invalid) {
 		error("%s is not a valid known_hosts file.", identity_file);
@@ -2501,6 +2515,58 @@ do_gen_krl(struct passwd *pw, int updating, const char *ca_key_path,
 	sshkey_free(ca);
 }
 
+/* Check a single key against a KRL; returns non-zero if it is revoked. */
+static int
+check_krl_key(struct ssh_krl *krl, const struct sshkey *k,
+    const char *path, const char *comment)
+{
+	int r;
+
+	r = ssh_krl_check_key(krl, k);
+	printf("%s%s%s%s: %s\n", path,
+	    *comment ? " (" : "", comment, *comment ? ")" : "",
+	    r == 0 ? "ok" : "REVOKED");
+	return r != 0;
+}
+
+/*
+ * Check every public key listed in a file (one per line) against a KRL,
+ * setting *revokedp if any is revoked. Returns the number of keys checked;
+ * zero if the file could not be opened or contains no public keys.
+ */
+static u_long
+check_krl_file(struct ssh_krl *krl, const char *path, int *revokedp)
+{
+	FILE *f;
+	struct sshkey *k;
+	char *cp, *line = NULL;
+	size_t linesize = 0;
+	u_long lnum = 0, nkeys = 0;
+
+	if ((f = fopen(path, "r")) == NULL)
+		return 0;
+	while (getline(&line, &linesize, f) != -1) {
+		lnum++;
+		cp = line + strspn(line, " \t");
+		cp[strcspn(cp, "\r\n")] = '\0';
+		if (*cp == '#' || *cp == '\0')
+			continue;
+		/* Stop if this looks like a private key */
+		if (strncmp(cp, "-----BEGIN", 10) == 0)
+			break;
+		if ((k = try_read_key(&cp)) == NULL)
+			fatal("%s:%lu: invalid key", path, lnum);
+		cp += strspn(cp, " \t");
+		if (check_krl_key(krl, k, path, *cp ? cp : path))
+			*revokedp = 1;
+		sshkey_free(k);
+		nkeys++;
+	}
+	fclose(f);
+	free(line);
+	return nkeys;
+}
+
 static void
 do_check_krl(struct passwd *pw, int print_krl, int argc, char **argv)
 {
@@ -2515,13 +2581,14 @@ do_check_krl(struct passwd *pw, int print_krl, int argc, char **argv)
 	if (print_krl)
 		krl_dump(krl, stdout);
 	for (i = 0; i < argc; i++) {
+		/* Test every key in the file, not just the first */
+		if (check_krl_file(krl, argv[i], &ret) != 0)
+			continue;
+		/* No public keys found; try the ".pub" suffix or a private key */
 		if ((r = sshkey_load_public(argv[i], &k, &comment)) != 0)
 			fatal_r(r, "Cannot load public key %s", argv[i]);
-		r = ssh_krl_check_key(krl, k);
-		printf("%s%s%s%s: %s\n", argv[i],
-		    *comment ? " (" : "", comment, *comment ? ")" : "",
-		    r == 0 ? "ok" : "REVOKED");
-		if (r != 0)
+		if (check_krl_key(krl, k, argv[i],
+		    comment == NULL ? "" : comment))
 			ret = 1;
 		sshkey_free(k);
 		free(comment);

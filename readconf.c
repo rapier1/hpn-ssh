@@ -1,4 +1,4 @@
-/* $OpenBSD: readconf.c,v 1.419 2026/10/05 06:03:40 dtucker Exp $ */
+/* $OpenBSD: readconf.c,v 1.424 2026/11/02 06:49:42 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -367,16 +367,59 @@ ssh_connection_hash(const char *thishost, const char *host, const char *portstr,
 	struct ssh_digest_ctx *md;
 	u_char conn_hash[SSH_DIGEST_MAX_LENGTH];
 
+	/*
+	 * Hash each field including its terminating NUL so that the field
+	 * boundaries are unambiguous; otherwise e.g. host "10.0.0.1" port
+	 * "2222" and host "10.0.0.12" port "222" would hash identically.
+	 */
 	if ((md = ssh_digest_start(SSH_DIGEST_SHA1)) == NULL ||
-	    ssh_digest_update(md, thishost, strlen(thishost)) < 0 ||
-	    ssh_digest_update(md, host, strlen(host)) < 0 ||
-	    ssh_digest_update(md, portstr, strlen(portstr)) < 0 ||
-	    ssh_digest_update(md, user, strlen(user)) < 0 ||
-	    ssh_digest_update(md, jumphost, strlen(jumphost)) < 0 ||
+	    ssh_digest_update(md, thishost, strlen(thishost) + 1) < 0 ||
+	    ssh_digest_update(md, host, strlen(host) + 1) < 0 ||
+	    ssh_digest_update(md, portstr, strlen(portstr) + 1) < 0 ||
+	    ssh_digest_update(md, user, strlen(user) + 1) < 0 ||
+	    ssh_digest_update(md, jumphost, strlen(jumphost) + 1) < 0 ||
 	    ssh_digest_final(md, conn_hash, sizeof(conn_hash)) < 0)
 		fatal_f("mux digest failed");
 	ssh_digest_free(md);
 	return tohex(conn_hash, ssh_digest_bytes(SSH_DIGEST_SHA1));
+}
+
+/*
+ * Returns the configured ProxyJump specification (all hops, including any
+ * user and port) in the form printed by "ssh -G" and expanded by the %j
+ * token, or an empty string if no jump host is set. Caller must free
+ * returned value.
+ */
+char *
+ssh_jump_spec(const Options *o)
+{
+	char *ret, portstr[NI_MAXSERV];
+	int i;
+
+	if (o->jump_host == NULL || (strcmp(o->jump_host, "none") == 0 &&
+	    o->jump_port == 0 && o->jump_user == NULL))
+		return xstrdup("");
+	/* Check for numeric addresses */
+	i = strchr(o->jump_host, ':') != NULL ||
+	    strspn(o->jump_host, "1234567890.") == strlen(o->jump_host);
+	snprintf(portstr, sizeof(portstr), "%d", o->jump_port);
+	xasprintf(&ret, "%s%s%s%s%s%s%s%s%s",
+	    /* optional additional jump spec */
+	    o->jump_extra == NULL ? "" : o->jump_extra,
+	    o->jump_extra == NULL ? "" : ",",
+	    /* optional user */
+	    o->jump_user == NULL ? "" : o->jump_user,
+	    o->jump_user == NULL ? "" : "@",
+	    /* opening [ if hostname is numeric */
+	    i ? "[" : "",
+	    /* mandatory hostname */
+	    o->jump_host,
+	    /* closing ] if hostname is numeric */
+	    i ? "]" : "",
+	    /* optional port number */
+	    o->jump_port <= 0 ? "" : ":",
+	    o->jump_port <= 0 ? "" : portstr);
+	return ret;
 }
 
 /*
@@ -682,8 +725,7 @@ expand_match_exec_or_include_path(const char *path, Options *options,
 	}
 	if (gethostname(thishost, sizeof(thishost)) == -1)
 		fatal("gethostname: %s", strerror(errno));
-	jmphost = option_clear_or_none(options->jump_host) ?
-	    "" : options->jump_host;
+	jmphost = ssh_jump_spec(options);
 	strlcpy(shorthost, thishost, sizeof(shorthost));
 	shorthost[strcspn(thishost, ".")] = '\0';
 	snprintf(portstr, sizeof(portstr), "%d", port);
@@ -708,6 +750,7 @@ expand_match_exec_or_include_path(const char *path, Options *options,
 	    "j", jmphost,
 	    (char *)NULL);
 	free(host);
+	free(jmphost);
 	free(conn_hash_hex);
 	return ret;
 }
@@ -2200,7 +2243,7 @@ parse_pubkey_algos:
 			}
 			free(p);
 			memset(&gl, 0, sizeof(gl));
-			r = glob(arg2, GLOB_TILDE, NULL, &gl);
+			r = glob(arg2, GLOB_TILDE, include_glob_error, &gl);
 			if (r == GLOB_NOMATCH) {
 				debug("%.200s line %d: include %s matched no "
 				    "files",filename, linenum, arg2);
@@ -3161,10 +3204,13 @@ fill_default_options(Options * options)
 		options->request_tty = REQUEST_TTY_AUTO;
 	if (options->session_type == -1)
 		options->session_type = SESSION_TYPE_DEFAULT;
-	if (options->stdin_null == -1)
-		options->stdin_null = 0;
 	if (options->fork_after_authentication == -1)
 		options->fork_after_authentication = 0;
+	/* ForkAfterAuthentication implies StdinNull, same as ssh -f */
+	if (options->fork_after_authentication)
+		options->stdin_null = 1;
+	if (options->stdin_null == -1)
+		options->stdin_null = 0;
 	if (options->proxy_use_fdpass == -1)
 		options->proxy_use_fdpass = 0;
 	if (options->canonicalize_max_dots == -1)
@@ -3729,6 +3775,24 @@ parse_ssh_uri(const char *uri, char **userp, char **hostp, int *portp)
 	return r;
 }
 
+char *
+supported_address_family(void)
+{
+	char buf[1024];
+	int i;
+
+	buf[0] = '\0';
+	for (i = 0; multistate_addressfamily[i].key != NULL; i++) {
+#ifndef HAVE_GETADDRINFO
+		if (strcmp(multistate_addressfamily[i].key, "inet6") == 0)
+			continue;
+#endif
+		strlcat(buf, multistate_addressfamily[i].key, sizeof(buf));
+		strlcat(buf, "\n", sizeof(buf));
+	}
+	return xstrdup(buf);
+}
+
 /* XXX the following is a near-verbatim copy from servconf.c; refactor */
 static const char *
 fmt_multistate_int(int val, const struct multistate *m)
@@ -3892,7 +3956,7 @@ void
 dump_client_config(Options *o, const char *host)
 {
 	int i, r;
-	char buf[8], *all_key;
+	char buf[8], *all_key, *jumpspec;
 
 	/*
 	 * Expand HostKeyAlgorithms name lists. This isn't handled in
@@ -4110,25 +4174,8 @@ dump_client_config(Options *o, const char *host)
 	if (o->jump_host == NULL)
 		dump_cfg_string(oProxyCommand, o->proxy_command);
 	else {
-		/* Check for numeric addresses */
-		i = strchr(o->jump_host, ':') != NULL ||
-		    strspn(o->jump_host, "1234567890.") == strlen(o->jump_host);
-		snprintf(buf, sizeof(buf), "%d", o->jump_port);
-		printf("proxyjump %s%s%s%s%s%s%s%s%s\n",
-		    /* optional additional jump spec */
-		    o->jump_extra == NULL ? "" : o->jump_extra,
-		    o->jump_extra == NULL ? "" : ",",
-		    /* optional user */
-		    o->jump_user == NULL ? "" : o->jump_user,
-		    o->jump_user == NULL ? "" : "@",
-		    /* opening [ if hostname is numeric */
-		    i ? "[" : "",
-		    /* mandatory hostname */
-		    o->jump_host,
-		    /* closing ] if hostname is numeric */
-		    i ? "]" : "",
-		    /* optional port number */
-		    o->jump_port <= 0 ? "" : ":",
-		    o->jump_port <= 0 ? "" : buf);
+		jumpspec = ssh_jump_spec(o);
+		printf("proxyjump %s\n", jumpspec);
+		free(jumpspec);
 	}
 }

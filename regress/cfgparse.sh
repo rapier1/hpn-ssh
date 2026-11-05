@@ -1,4 +1,4 @@
-#	$OpenBSD: cfgparse.sh,v 1.12 2026/07/22 00:37:24 dtucker Exp $
+#	$OpenBSD: cfgparse.sh,v 1.14 2026/11/02 07:06:52 dtucker Exp $
 #	Placed in the Public Domain.
 
 tid="sshd config parse"
@@ -26,7 +26,7 @@ verbose "reparse regress config"
 # Detect IPv6 support and if found, define variables for the needed
 # config lines.  This allows tests to also work on Portable platforms
 # lacking IPv6 support without having diffs that make syncs harder.
-if $SUDO ${SSHD} -tq -f $OBJ/sshd_config_minimal -oListenAddress=::1 ; then
+if ${SSH} -Qaddressfamily | grep inet6 >/dev/null; then
 	trace "IPv6 support detected"
 	LISTENADDRESS_IPV6_LOOPBACK="listenaddress ::1"
 	LISTENADDRESS_IPV6_LOOPBACK_1234="listenaddress [::1]:1234"
@@ -85,6 +85,15 @@ EOD
  grep -i '^maxstartups ' >$OBJ/sshd_config.2 &&
  diff -i $OBJ/sshd_config.0 $OBJ/sshd_config.2) || \
  fail "maxstartups idempotence"
+
+# Removal of the entire default algorithm set is an error.
+verbose "remove all algorithms"
+cat > $OBJ/sshd_config.1 <<EOD
+${SSHD_KEYS}
+PubkeyAcceptedAlgorithms -*
+EOD
+$SUDO ${SSHD} -tq -f $OBJ/sshd_config.1 && \
+ fail "pubkeyacceptedalgorithms empty after removal accepted"
 
 # cleanup
 rm -f $OBJ/sshd_config.[012]

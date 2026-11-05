@@ -1,4 +1,4 @@
-/* $OpenBSD: packet.h,v 1.108 2026/09/22 00:24:47 dtucker Exp $ */
+/* $OpenBSD: packet.h,v 1.109 2026/10/30 04:36:21 djm Exp $ */
 
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
@@ -200,6 +200,8 @@ void    sshpkt_final_log_entry (struct ssh *);
 int	sshpkt_start(struct ssh *ssh, u_char type);
 int	sshpkt_send(struct ssh *ssh);
 int     sshpkt_disconnect(struct ssh *, const char *fmt, ...)
+	    __attribute__((format(printf, 2, 3)));
+int     sshpkt_protocol_error(struct ssh *, const char *fmt, ...)
 	    __attribute__((format(printf, 2, 3)));
 int	sshpkt_add_padding(struct ssh *, u_char);
 void	sshpkt_fatal(struct ssh *ssh, int r, const char *fmt, ...)

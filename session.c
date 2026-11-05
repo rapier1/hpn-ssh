@@ -1,4 +1,4 @@
-/* $OpenBSD: session.c,v 1.351 2026/09/16 00:25:50 djm Exp $ */
+/* $OpenBSD: session.c,v 1.354 2026/10/30 02:31:36 djm Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -566,18 +566,16 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 	 * simplifies code in server_loop.  The descriptor is bidirectional.
 	 * Do this before forking (and cleanup in the child) so as to
 	 * detect and gracefully fail out-of-fd conditions.
+	 * On failure s->ptyfd and s->ttyfd remain owned by the session and
+	 * are closed by session_pty_cleanup().
 	 */
 	if ((fdout = dup(ptyfd)) == -1) {
 		error_f("dup #1: %s", strerror(errno));
-		close(ttyfd);
-		close(ptyfd);
 		return -1;
 	}
 	/* we keep a reference to the pty master */
 	if ((ptymaster = dup(ptyfd)) == -1) {
 		error_f("dup #2: %s", strerror(errno));
-		close(ttyfd);
-		close(ptyfd);
 		close(fdout);
 		return -1;
 	}
@@ -588,8 +586,6 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 		error_f("fork: %.100s", strerror(errno));
 		close(fdout);
 		close(ptymaster);
-		close(ttyfd);
-		close(ptyfd);
 		return -1;
 	case 0:
 		is_child = 1;
@@ -2067,17 +2063,24 @@ static int
 session_env_req(struct ssh *ssh, Session *s)
 {
 	char *name, *val;
+	size_t namelen, vallen;
 	u_int i;
 	int r;
 
-	if ((r = sshpkt_get_cstring(ssh, &name, NULL)) != 0 ||
-	    (r = sshpkt_get_cstring(ssh, &val, NULL)) != 0 ||
+	if ((r = sshpkt_get_cstring(ssh, &name, &namelen)) != 0 ||
+	    (r = sshpkt_get_cstring(ssh, &val, &vallen)) != 0 ||
 	    (r = sshpkt_get_end(ssh)) != 0)
 		sshpkt_fatal(ssh, r, "%s: parse packet", __func__);
 
 	/* Don't set too many environment variables */
 	if (s->num_env > 128) {
-		debug2("Ignoring env request %s: too many env vars", name);
+		debug2_f("ignoring env request %s: too many env vars", name);
+		goto fail;
+	}
+	/* or accept oversize ones */
+	if (namelen > 2048 || vallen > 16384) {
+		debug2_f("ignoring env request %.128s: "
+		    "name or value too long", name);
 		goto fail;
 	}
 
@@ -2672,9 +2675,14 @@ do_cleanup(struct ssh *ssh, Authctxt *authctxt)
 		return;
 
 #ifdef KRB5
-	if (options.kerberos_ticket_cleanup &&
-	    authctxt->krb5_ctx)
-		krb5_cleanup_proc(authctxt);
+	/*
+	 * Remove the ticket cache written by Kerberos password
+	 * authentication; if the login never completed there is no
+	 * session that could use it, regardless of KerberosTicketCleanup.
+	 */
+	if (authctxt->krb5_ctx && (options.kerberos_ticket_cleanup ||
+	    !authctxt->authenticated))
+ 		krb5_cleanup_proc(authctxt);
 #endif
 
 #ifdef GSSAPI

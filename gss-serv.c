@@ -1,4 +1,4 @@
-/* $OpenBSD: gss-serv.c,v 1.39 2026/09/16 00:37:52 djm Exp $ */
+/* $OpenBSD: gss-serv.c,v 1.41 2026/10/30 04:52:11 djm Exp $ */
 
 /*
  * Copyright (c) 2001-2003 Simon Wilkinson. All rights reserved.
@@ -368,7 +368,7 @@ ssh_gssapi_do_child(char ***envp, u_int *envsizep)
 }
 
 void
-ssh_gssapi_cleanup_global_client()
+ssh_gssapi_cleanup_global_client(void)
 {
 	OM_uint32 lmin;
 
@@ -380,7 +380,7 @@ ssh_gssapi_cleanup_global_client()
 
 /* Privileged */
 int
-ssh_gssapi_userok(char *user)
+ssh_gssapi_userok(struct passwd *pw)
 {
 	if (gssapi_client.exportedname.length == 0 ||
 	    gssapi_client.exportedname.value == NULL) {
@@ -388,7 +388,7 @@ ssh_gssapi_userok(char *user)
 		return 0;
 	}
 	if (gssapi_client.mech && gssapi_client.mech->userok)
-		if ((*gssapi_client.mech->userok)(&gssapi_client, user)) {
+		if ((*gssapi_client.mech->userok)(&gssapi_client, pw)) {
 			gssapi_client.userok = 1;
 			return 1;
 		} else {

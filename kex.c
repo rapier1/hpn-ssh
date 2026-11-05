@@ -1,4 +1,4 @@
-/* $OpenBSD: kex.c,v 1.196 2026/09/22 00:24:47 dtucker Exp $ */
+/* $OpenBSD: kex.c,v 1.198 2026/10/30 04:36:21 djm Exp $ */
 /*
  * Copyright (c) 2000, 2001 Markus Friedl.  All rights reserved.
  *
@@ -236,7 +236,7 @@ kex_protocol_error(int type, uint32_t seq, struct ssh *ssh)
 
 	/* If in strict mode, any unexpected message is an error */
 	if ((ssh->kex->flags & KEX_INITIAL) && ssh->kex->kex_strict) {
-		ssh_packet_disconnect(ssh, "strict KEX violation: "
+		return sshpkt_protocol_error(ssh, "strict KEX violation: "
 		    "unexpected packet type %u (seqnr %u)", type, seq);
 	}
 	error_f("type %u seq %u", type, seq);
@@ -676,7 +676,7 @@ kex_input_kexinit(int type, uint32_t seq, struct ssh *ssh)
 	free(kex->name);
 	kex->name = NULL;
 	if ((kex->flags & KEX_INIT_RECVD) != 0) {
-		ssh_packet_disconnect(ssh,
+		return sshpkt_protocol_error(ssh,
 		    "multiple KEXINIT received from peer");
 	}
 	kex->flags |= KEX_INIT_RECVD;
@@ -1091,10 +1091,12 @@ kex_choose_conf(struct ssh *ssh, uint32_t seq)
 		}
 		if (kex->kex_strict) {
 			debug3_f("will use strict KEX ordering");
-			if (seq != 0)
-				ssh_packet_disconnect(ssh,
+			if (seq != 0) {
+				r = sshpkt_protocol_error(ssh,
 				    "strict KEX violation: "
 				    "KEXINIT was not the first packet");
+				goto out;
+			}
 		}
 	}
 
@@ -1423,6 +1425,8 @@ kex_exchange_identification(struct ssh *ssh, int timeout_ms,
     const char *version_addendum)
 {
 	int remote_major, remote_minor, mismatch, oerrno = 0;
+	int have_timeout = timeout_ms > 0;
+	struct timespec now, remain, deadline;
 	size_t len, n;
 	int r, expect_nl;
 	u_char c;
@@ -1432,6 +1436,13 @@ kex_exchange_identification(struct ssh *ssh, int timeout_ms,
 	    ssh->kex->client_version : ssh->kex->server_version;
 	char *our_version_string = NULL, *peer_version_string = NULL;
 	char *cp, *remote_version = NULL;
+
+	/* The timeout applies to the whole exchange, not to each read */
+	if (have_timeout) {
+		monotime_ts(&now);
+		ms_to_timespec(&remain, timeout_ms);
+		timespecadd(&now, &remain, &deadline);
+	}
 
 	/* Prepare and send our banner */
 	sshbuf_reset(our_version);
@@ -1480,7 +1491,11 @@ kex_exchange_identification(struct ssh *ssh, int timeout_ms,
 		sshbuf_reset(peer_version);
 		expect_nl = 0;
 		for (;;) {
-			if (timeout_ms > 0) {
+			if (have_timeout) {
+				ptimeout_init(&remain);
+				ptimeout_deadline_monotime_tsp(&remain,
+				    &deadline);
+				timeout_ms = ptimeout_get_ms(&remain);
 				r = waitrfd(ssh_packet_get_connection_in(ssh),
 				    &timeout_ms, NULL);
 				if (r == -1 && errno == ETIMEDOUT) {
