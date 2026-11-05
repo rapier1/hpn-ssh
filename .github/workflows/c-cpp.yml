@@ -88,8 +88,8 @@ jobs:
           - { target: ubuntu-22.04, config: sk }
           - { target: ubuntu-22.04, config: without-openssl }
           - { target: ubuntu-latest, config: gcc-14 }
-          - { target: ubuntu-latest, config: clang-15 }
-          - { target: ubuntu-latest, config: clang-19 }
+          - { target: ubuntu-latest, config: clang-17 }
+          - { target: ubuntu-latest, config: clang-22 }
 # these don't support our crypto methods
 #          - { target: ubuntu-latest, config: boringssl }
 #          - { target: ubuntu-latest, config: aws-lc }
