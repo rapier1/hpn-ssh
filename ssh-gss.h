@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-gss.h,v 1.18 2026/09/16 00:37:52 djm Exp $ */
+/* $OpenBSD: ssh-gss.h,v 1.20 2026/10/30 04:52:11 djm Exp $ */
 /*
  * Copyright (c) 2001-2003 Simon Wilkinson. All rights reserved.
  *
@@ -61,6 +61,8 @@
 
 #define SSH_GSS_OIDTYPE 0x06
 
+struct passwd;
+
 typedef struct {
 	char *filename;
 	char *envvar;
@@ -82,7 +84,7 @@ typedef struct ssh_gssapi_mech_struct {
 	char *name;
 	gss_OID_desc oid;
 	int (*dochild) (ssh_gssapi_client *);
-	int (*userok) (ssh_gssapi_client *, char *);
+	int (*userok) (ssh_gssapi_client *, struct passwd *);
 	int (*localname) (ssh_gssapi_client *, char **);
 	void (*storecreds) (ssh_gssapi_client *);
 } ssh_gssapi_mech;
@@ -127,13 +129,13 @@ int ssh_gssapi_check_mechanism(Gssctxt **, gss_OID, const char *);
 
 /* In the server */
 OM_uint32 ssh_gssapi_server_ctx(Gssctxt **, gss_OID);
-int ssh_gssapi_userok(char *name);
+int ssh_gssapi_userok(struct passwd *);
 OM_uint32 ssh_gssapi_checkmic(Gssctxt *, gss_buffer_t, gss_buffer_t);
 void ssh_gssapi_do_child(char ***, u_int *);
 void ssh_gssapi_cleanup_creds(void);
 void ssh_gssapi_storecreds(void);
 const char *ssh_gssapi_displayname(void);
-void ssh_gssapi_cleanup_global_client();
+void ssh_gssapi_cleanup_global_client(void);
 
 #endif /* GSSAPI */
 

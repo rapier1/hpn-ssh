@@ -1,4 +1,4 @@
-/* $OpenBSD: sftp.c,v 1.260 2026/10/01 03:11:49 djm Exp $ */
+/* $OpenBSD: sftp.c,v 1.263 2026/10/30 04:54:01 djm Exp $ */
 /*
  * Copyright (c) 2001-2004 Damien Miller <djm@openbsd.org>
  *
@@ -1299,6 +1299,8 @@ makeargv(const char *arg, int *argcp, int sloppy, char *lastquote,
 					argvs[j++] = arg[i];
 				} else {
 					argvs[j++] = arg[i++];
+					if (arg[i] == '\0')
+						goto early_nul;
 					argvs[j++] = arg[i];
 				}
 			} else {
@@ -1663,7 +1665,11 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		break;
 	case I_RM:
 		path1 = make_absolute_pwd_glob(path1, *pwd);
-		sftp_glob(conn, path1, GLOB_NOCHECK, NULL, &g);
+		if (sftp_glob(conn, path1, GLOB_NOCHECK, NULL, &g) != 0) {
+			error("Can't glob \"%s\"", path1);
+			err = -1;
+			break;
+		}
 		for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
 			if (!quiet)
 				mprintf("Removing %s\n", g.gl_pathv[i]);
@@ -1775,7 +1781,11 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		attrib_clear(&a);
 		a.flags |= SSH2_FILEXFER_ATTR_PERMISSIONS;
 		a.perm = n_arg;
-		sftp_glob(conn, path1, GLOB_NOCHECK, NULL, &g);
+		if (sftp_glob(conn, path1, GLOB_NOCHECK, NULL, &g) != 0) {
+			error("Can't glob \"%s\"", path1);
+			err = -1;
+			break;
+		}
 		for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
 			if (!quiet)
 				mprintf("Changing mode on %s\n",
@@ -1789,7 +1799,11 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 	case I_CHOWN:
 	case I_CHGRP:
 		path1 = make_absolute_pwd_glob(path1, *pwd);
-		sftp_glob(conn, path1, GLOB_NOCHECK, NULL, &g);
+		if (sftp_glob(conn, path1, GLOB_NOCHECK, NULL, &g) != 0) {
+			error("Can't glob \"%s\"", path1);
+			err = -1;
+			break;
+		}
 		for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
 			if ((hflag ? sftp_lstat : sftp_stat)(conn,
 			    g.gl_pathv[i], 0, &aa) != 0) {
@@ -2277,7 +2291,7 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 	char *remote_path;
 	char *dir = NULL, *startdir = NULL;
 	char cmd[2048];
-	int err, interactive;
+	int r, err, interactive;
 	EditLine *el = NULL;
 #ifdef USE_LIBEDIT
 	const char *editor;
@@ -2332,23 +2346,26 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 		if (sftp_remote_is_dir(conn, dir) && file2 == NULL) {
 			if (!quiet)
 				mprintf("Changing to: %s\n", dir);
-			snprintf(cmd, sizeof cmd, "cd \"%s\"", dir);
-			if (parse_dispatch_command(conn, cmd,
+			r = snprintf(cmd, sizeof cmd, "cd \"%s\"", dir);
+			if (r < 0 || (size_t)r >= sizeof(cmd)) {
+				error("Remote path too long");
+				err = -1;
+				goto bad;
+			}
+		if (parse_dispatch_command(conn, cmd,
 			    &remote_path, startdir, 1, 0) != 0) {
-				free(dir);
-				free(startdir);
-				free(remote_path);
-				free(conn);
-				return (-1);
+				err = -1;
+				goto bad;
 			}
 		} else {
 			err = process_get(conn, dir, file2, remote_path, 0, 0,
 			    global_aflag, 0);
+ bad:
 			free(dir);
 			free(startdir);
 			free(remote_path);
 			free(conn);
-			return (err);
+			return err;
 		}
 		free(dir);
 	}

@@ -1,4 +1,4 @@
-/* $OpenBSD: auth2-pubkey.c,v 1.131 2026/10/01 02:01:51 djm Exp $ */
+/* $OpenBSD: auth2-pubkey.c,v 1.133 2026/10/30 09:04:01 djm Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  * Copyright (c) 2010 Damien Miller.  All rights reserved.
@@ -210,14 +210,9 @@ userauth_pubkey(struct ssh *ssh, const char *method)
 			fatal_fr(r, "parse signature packet");
 		if ((b = sshbuf_new()) == NULL)
 			fatal_f("sshbuf_new failed");
-		if (ssh->compat & SSH_OLD_SESSIONID) {
-			if ((r = sshbuf_putb(b, ssh->kex->session_id)) != 0)
-				fatal_fr(r, "put old session id");
-		} else {
-			if ((r = sshbuf_put_stringb(b,
-			    ssh->kex->session_id)) != 0)
-				fatal_fr(r, "put session id");
-		}
+		if ((r = sshbuf_put_stringb(b,
+		    ssh->kex->session_id)) != 0)
+			fatal_fr(r, "put session id");
 		if (!authctxt->valid || authctxt->user == NULL) {
 			debug2_f("disabled because of invalid user");
 			goto done;
@@ -504,6 +499,18 @@ match_principals_command(struct passwd *user_pw, const struct sshkey *key,
 		free(av[i]);
 		av[i] = tmp;
 	}
+
+	/*
+	 * If AuthorizedPrincipalsCommand was specified without arguments
+	 * then pass the target username as a single argument, as is done
+	 * for AuthorizedKeysCommand.
+	 */
+	if (ac == 1) {
+		av = xreallocarray(av, ac + 2, sizeof(*av));
+		av[ac++] = xstrdup(user_pw->pw_name);
+		av[ac] = NULL;
+	}
+
 	/* Prepare a printable command for logs, etc. */
 	command = argv_assemble(ac, av);
 

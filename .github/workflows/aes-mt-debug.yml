@@ -1,0 +1,93 @@
+name: AES-MT debug
+permissions: read-all
+on:
+  push:
+    branches: [ aes-mt-debug ]
+
+jobs:
+  debug:
+    name: "${{ matrix.target }} ${{ matrix.config }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ ubuntu-latest ]
+        config:
+          - openssl-3.1.0
+          - openssl-3.1.8
+          - openssl-3.1
+          - openssl-3.2.6
+          - openssl-3.2
+          - openssl-3.3.7
+          - openssl-3.3
+          - openssl-3.4.0
+          - openssl-3.4.8
+          - openssl-3.4
+          - openssl-3.5.0
+          - openssl-3.5.3
+          - openssl-3.5.9
+          - openssl-3.5
+          - openssl-3.6.5
+          - openssl-3.6
+          - openssl-4.0.3
+          - openssl-4.0
+          - openssl-4.1.0
+          - openssl-master
+    runs-on: ${{ matrix.target }}
+    env:
+      EPHEMERAL_VM: yes
+    steps:
+    - name: checkout
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # main
+    - name: runner info
+      run: |
+        uname -a
+        nproc
+        lscpu
+        cat /proc/sys/kernel/core_pattern
+    - name: setup CI system
+      run: |
+        sh -c "timeout 1200 .github/setup_ci.sh ${{ matrix.config }} ${{ matrix.target }} || .github/setup_ci.sh ${{ matrix.config }} ${{ matrix.target }}"
+    - name: openssl info
+      run: /opt/openssl/bin/openssl version -a
+    - name: install gdb
+      run: sudo apt-get install -qy gdb
+    - name: autoreconf
+      run: sh -c autoreconf
+    - name: configure
+      run: sh ./.github/configure.sh ${{ matrix.config }}
+    - name: make
+      run: make -j2
+    - name: failing tests with core dumps
+      run: |
+        sudo mkdir -p /var/empty
+        sudo mkdir -p /tmp/cores
+        sudo chmod 1777 /tmp/cores
+        sudo sysctl -w kernel.core_pattern=/tmp/cores/core.%e.%p
+        ulimit -c unlimited
+        make t-exec LTESTS="rekey try-ciphers dropbear-server" SUDO=sudo
+      env:
+        TEST_SSH_UNSAFE_PERMISSIONS: 1
+    - name: backtraces
+      if: always()
+      run: |
+        sudo chmod -R a+r /tmp/cores
+        for c in /tmp/cores/core.*; do
+          [ -e "$c" ] || continue
+          exe=$(file -b "$c" | sed -n "s/.*execfn: '\([^']*\)'.*/\1/p")
+          [ -n "$exe" ] || exe=./hpnssh
+          echo "==== $c ($exe)"
+          sudo gdb -batch -ex 'thread apply all bt full' "$exe" "$c"
+        done
+    - name: show logs
+      if: failure()
+      run: sh -c 'for i in regress/failed*.log; do echo ====; echo logfile $i; echo =====; tail -50 $i; done'
+    - name: save cores and logs
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # main
+      with:
+        name: ${{ matrix.target }}-${{ matrix.config }}-debug
+        path: |
+          /tmp/cores/
+          hpnssh
+          regress/failed*
+          regress/log/

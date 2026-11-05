@@ -1,5 +1,3 @@
-name: CI
-
 # For testing, you can set variables in your repo (Repo -> Settings ->
 # Security -> Actions -> Variables) to restrict the tests that are run.
 # The supported variables are:
@@ -21,6 +19,8 @@ name: CI
 #
 # LTESTS: Override the set of tests run.
 
+name: CI
+permissions: read-all
 on:
   push:
     branches: [ master, dev_major, dev_minor, DynamicWindow ]
@@ -45,7 +45,6 @@ jobs:
           - ubuntu-22.04-arm
           - ubuntu-24.04-arm
           - ubuntu-26.04-arm
-          - macos-14
           - macos-15
           - macos-15-intel
           - macos-26
@@ -89,8 +88,8 @@ jobs:
           - { target: ubuntu-22.04, config: sk }
           - { target: ubuntu-22.04, config: without-openssl }
           - { target: ubuntu-latest, config: gcc-14 }
-          - { target: ubuntu-latest, config: clang-15 }
-          - { target: ubuntu-latest, config: clang-19 }
+          - { target: ubuntu-latest, config: clang-17 }
+          - { target: ubuntu-latest, config: clang-22 }
 # these don't support our crypto methods
 #          - { target: ubuntu-latest, config: boringssl }
 #          - { target: ubuntu-latest, config: aws-lc }
@@ -109,8 +108,9 @@ jobs:
           - { target: ubuntu-latest, config: libressl-3.9.2 }
           - { target: ubuntu-latest, config: libressl-4.0.1 }
           - { target: ubuntu-latest, config: libressl-4.1.1 }
-          - { target: ubuntu-latest, config: libressl-4.2.0 }
-          - { target: ubuntu-latest, config: libressl-4.3.2 }
+          - { target: ubuntu-latest, config: libressl-4.2.3 }
+          - { target: ubuntu-latest, config: libressl-4.3.4 }
+          - { target: ubuntu-latest, config: libressl-4.4.0 }
           - { target: ubuntu-latest, config: openssl-master }
           - { target: ubuntu-latest, config: openssl-1.1.1 }
           - { target: ubuntu-latest, config: openssl-1.1.1t }
@@ -122,12 +122,13 @@ jobs:
           - { target: ubuntu-latest, config: openssl-3.2.6 }
           - { target: ubuntu-latest, config: openssl-3.3.7 }
           - { target: ubuntu-latest, config: openssl-3.4.0 }
-          - { target: ubuntu-latest, config: openssl-3.4.5 }
+          - { target: ubuntu-latest, config: openssl-3.4.8 }
           - { target: ubuntu-latest, config: openssl-3.5.0 }
           - { target: ubuntu-latest, config: openssl-3.5.3 }  # keep
-          - { target: ubuntu-latest, config: openssl-3.5.6 }
-          - { target: ubuntu-latest, config: openssl-3.6.2 }
-          - { target: ubuntu-latest, config: openssl-4.0.0 }
+          - { target: ubuntu-latest, config: openssl-3.5.9 }
+          - { target: ubuntu-latest, config: openssl-3.6.5 }
+          - { target: ubuntu-latest, config: openssl-4.0.3 }
+          - { target: ubuntu-latest, config: openssl-4.1.0 }
           - { target: ubuntu-latest, config: openssl-1.1.1_stable }
           - { target: ubuntu-latest, config: openssl-3.0 }  # stable branch
           - { target: ubuntu-latest, config: openssl-3.1 }  # stable branch
@@ -147,8 +148,6 @@ jobs:
           - { target: ubuntu-24.04-arm, config: kitchensink }
 # Can't copy the necessary pam file in darwin without
 # user interaction so skip these
-#          - { target: macos-15, config: pam }
-#          - { target: macos-14, config: pam }
 #          - { target: macos-15, config: pam }
 #          - { target: macos-26, config: pam }
 #          - { target: xcode-27, config: pam }
@@ -215,4 +214,6 @@ jobs:
         path: |
           config.h
           config.log
+          Makefile
+          openbsd-compat/Makefile
           regress/

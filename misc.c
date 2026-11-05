@@ -1,4 +1,4 @@
-/* $OpenBSD: misc.c,v 1.221 2026/09/16 17:31:27 dtucker Exp $ */
+/* $OpenBSD: misc.c,v 1.223 2026/10/30 08:07:36 djm Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  * Copyright (c) 2005-2020 Damien Miller.  All rights reserved.
@@ -452,7 +452,7 @@ static int
 waitfd(int fd, int *timeoutp, short events, volatile sig_atomic_t *stop)
 {
 	struct pollfd pfd;
-	struct timespec timeout;
+	struct timespec timeout, now, deadline;
 	int oerrno, r;
 	sigset_t nsigset, osigset;
 
@@ -460,12 +460,18 @@ waitfd(int fd, int *timeoutp, short events, volatile sig_atomic_t *stop)
 		timeoutp = NULL;
 	pfd.fd = fd;
 	pfd.events = events;
-	ptimeout_init(&timeout);
-	if (timeoutp != NULL)
-		ptimeout_deadline_ms(&timeout, *timeoutp);
+	if (timeoutp != NULL) {
+		/* Turn the relative timeout into an absolute deadline */
+		monotime_ts(&now);
+		ms_to_timespec(&timeout, *timeoutp);
+		timespecadd(&now, &timeout, &deadline);
+	}
 	if (stop != NULL)
 		sigfillset(&nsigset);
 	for (; timeoutp == NULL || *timeoutp >= 0;) {
+		ptimeout_init(&timeout);
+		if (timeoutp != NULL)
+			ptimeout_deadline_monotime_tsp(&timeout, &deadline);
 		if (stop != NULL) {
 			sigprocmask(SIG_BLOCK, &nsigset, &osigset);
 			if (*stop) {
@@ -479,8 +485,17 @@ waitfd(int fd, int *timeoutp, short events, volatile sig_atomic_t *stop)
 		oerrno = errno;
 		if (stop != NULL)
 			sigprocmask(SIG_SETMASK, &osigset, NULL);
-		if (timeoutp)
+		if (timeoutp != NULL) {
+			ptimeout_init(&timeout);
+			ptimeout_deadline_monotime_tsp(&timeout, &deadline);
 			*timeoutp = ptimeout_get_ms(&timeout);
+			/*
+			 * Callers treat a timeout <= 0 as "no timeout", so
+			 * never report that none remains when fd is ready.
+			 */
+			if (r > 0 && *timeoutp == 0)
+				*timeoutp = 1;
+		}
 		errno = oerrno;
 		if (r > 0)
 			return 0;
@@ -2749,6 +2764,21 @@ path_absolute(const char *path)
 	return (*path == '/') ? 1 : 0;
 }
 
+/*
+ * glob(3) error callback for configuration file Include directives.
+ * A directory that doesn't exist matches no files, but a failure to read
+ * one that does must not be mistaken for that: abort the glob instead.
+ */
+int
+include_glob_error(const char *path, int errnum)
+{
+	if (errnum == ENOENT || errnum == ENOTDIR)
+		return 0;
+	error("Include: unable to read directory %s: %s", path,
+	    strerror(errnum));
+	return 1;
+}
+
 void
 skip_space(char **cpp)
 {
@@ -3408,7 +3438,9 @@ mkdir_path(const char *target, mode_t mode)
 	}
 
 	/* Work through the path, component-wise */
-	while ((p = strsep(&dir, "/")) && p != '\0') {
+	while ((p = strsep(&dir, "/"))) {
+		if (*p == '\0')
+			continue;
 		if (strlcat(path, "/", plen) >= plen ||
 		    strlcat(path, p, plen) >= plen)
 			goto out;

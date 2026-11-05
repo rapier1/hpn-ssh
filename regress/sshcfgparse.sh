@@ -1,4 +1,4 @@
-#	$OpenBSD: sshcfgparse.sh,v 1.10 2025/05/06 06:05:48 djm Exp $
+#	$OpenBSD: sshcfgparse.sh,v 1.12 2026/10/30 08:12:58 djm Exp $
 #	Placed in the Public Domain.
 
 tid="ssh config parse"
@@ -73,6 +73,9 @@ f=`${SSH} -GF none -opubkeyacceptedalgorithms=-ssh-ed25519 host | \
     awk '/^pubkeyacceptedalgorithms /{print $2}'`
 expect_result_present "$f" "ssh-ed25519-cert-v01.*"
 expect_result_absent "$f" "ssh-ed25519"
+# Removal of the entire default set is an error.
+${SSH} -GF none '-opubkeyacceptedalgorithms=-*' host >/dev/null 2>&1 && \
+	fail "pubkeyacceptedalgorithms empty after removal accepted"
 # Append to default set.
 # This is not tested when built !WITH_OPENSSL
 # XXX need a test for this
@@ -97,6 +100,22 @@ f=`${SSH} -GF $OBJ/ssh_config.0 -oipqos=cs1 host | awk '/^ipqos /{print$2}'`
 expect_result_present "$f" "cs1"
 f=`${SSH} -GF $OBJ/ssh_config.0 -otunneldevice=3:4 host | awk '/^tunneldevice /{print$2}'`
 expect_result_present "$f" "3:4"
+
+verbose "forkafterauthentication implies stdinnull"
+f=`${SSH} -GF none host | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "no"
+f=`${SSH} -GF none -f host true | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "yes"
+f=`${SSH} -GF none -oforkafterauthentication=yes host true | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "yes"
+f=`${SSH} -GF none -oforkafterauthentication=no host | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "no"
+cat >$OBJ/ssh_config.0 <<EOD
+Host *
+    ForkAfterAuthentication yes
+EOD
+f=`${SSH} -GF $OBJ/ssh_config.0 host true | awk '/^stdinnull /{print$2}'`
+expect_result_present "$f" "yes"
 
 # cleanup
 rm -f $OBJ/ssh_config.[012]

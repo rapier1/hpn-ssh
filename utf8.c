@@ -1,4 +1,4 @@
-/* $OpenBSD: utf8.c,v 1.11 2020/05/01 06:28:52 djm Exp $ */
+/* $OpenBSD: utf8.c,v 1.12 2026/10/30 03:40:56 djm Exp $ */
 /*
  * Copyright (c) 2016 Ingo Schwarze <schwarze@openbsd.org>
  *
@@ -77,7 +77,12 @@ grow_dst(char **dst, size_t *sz, size_t maxsz, char **dp, size_t need)
 
 	if (*dp + need < *dst + *sz)
 		return 0;
-	tsz = *sz + 128;
+	/*
+	 * Grow geometrically to avoid recallocarray repeatedly having to
+	 * copy its buffer as the allocation grows.
+	 * Note: maxsz is always <=INT_MAX so we can't overflow the size_t;
+	 */
+	tsz = *sz + (*sz > 128 ? *sz : 128);
 	if (tsz > maxsz)
 		tsz = maxsz;
 	if ((tp = recallocarray(*dst, *sz, tsz, 1)) == NULL)
@@ -316,7 +321,7 @@ mprintf(const char *fmt, ...)
 /*
  * Set up libc for multibyte output in the user's chosen locale.
  *
- * XXX: we are known to have problems with Turkic languahes (i/I confusion) so
+ * XXX: we are known to have problems with Turkic languages (i/I confusion) so
  *      we deliberately fall back to the C locale for now. Longer term we
  *      should always prefer to select C.[encoding] if possible, but there's
  *      no standardisation in locales between systems, so we'll need to survey
@@ -339,7 +344,7 @@ msetlocale(void)
 			continue;
 		if (strncasecmp(cp, "tr", 2) != 0 &&
 		    strncasecmp(cp, "crh", 3) != 0 &&
-		    strncasecmp(cp, "az", 3) != 0)
+		    strncasecmp(cp, "az", 2) != 0)
 			break;
 		/*
 		 * If we're in a UTF-8 locale then prefer to use

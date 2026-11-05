@@ -201,6 +201,7 @@ if test "$GCC" = "yes" || test "$GCC" = "egcs"; then
 	OSSH_CHECK_CFLAG_COMPILE([-pipe])
 	OSSH_CHECK_CFLAG_COMPILE([-Wunknown-warning-option])
 	OSSH_CHECK_CFLAG_COMPILE([-Wno-error=discarded-qualifiers])
+	OSSH_CHECK_CFLAG_COMPILE([-Wno-error=incompatible-pointer-types-discards-qualifiers])
 	OSSH_CHECK_CFLAG_COMPILE([-Wno-error=format-truncation])
 	OSSH_CHECK_CFLAG_COMPILE([-Qunused-arguments])
 	OSSH_CHECK_CFLAG_COMPILE([-Wall])
@@ -3418,6 +3419,17 @@ if test "x$openssl" = "xyes" ; then
 	aws-lc|boringssl)
 		# Brainpool does not work with AWC-LS or BoringSSL.
 		unsupported_algorithms="$unsupported_algorithms mlkem768brainpoolp256r1-sha256"
+
+		# BoringSSL removed these in exports in commit 625475f
+		# Assume they are no larger than they were when removed.
+		AC_CHECK_DECL([OPENSSL_RSA_SMALL_MODULUS_BITS], [],
+		    AC_DEFINE([OPENSSL_RSA_SMALL_MODULUS_BITS], [3072],
+			[BoringSSL/AWS-LC does not provide this]),
+		    [[#include <openssl/rsa.h>]])
+		AC_CHECK_DECL([OPENSSL_RSA_MAX_PUBEXP_BITS], [],
+		    AC_DEFINE([OPENSSL_RSA_MAX_PUBEXP_BITS], [64],
+			[BoringSSL/AWS-LC does not provide this]),
+		    [[#include <openssl/rsa.h>]])
 		;;
 	*)
 		AC_CHECK_DECL([NID_brainpoolP256r1],
