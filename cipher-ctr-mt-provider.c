@@ -31,6 +31,7 @@
 #include <openssl/core_dispatch.h>
 #include <openssl/core_names.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include "xmalloc.h"
 #include "ossl3-provider-err.h"
 #include "num.h"
@@ -341,20 +342,16 @@ static const OSSL_PARAM *aes_mt_gettable_ctx_params(void *cctx, void *provctx)
 
 static int aes_mt_get_ctx_params(void *vctx, OSSL_PARAM params[])
 {
-    struct aes_mt_ctx_st *ctx = vctx;
-    int ok = 1;
+	/* vctx is the EVP_CIPHER_CTX from aes_mt_newctx_*(). */
+	EVP_CIPHER_CTX *evp_ctx = vctx;
+	OSSL_PARAM *p;
+	int ok = 1;
 
-    if (ctx->keylen > 0) {
-        OSSL_PARAM *p;
-
-        for (p = params; p->key != NULL; p++)
-            if (strcasecmp(p->key, "keylen") == 0
-                && provnum_set_size_t(p, ctx->keylen) < 0) {
-                ok = 0;
-                continue;
-            }
-    }
-    return ok;
+	for (p = params; p->key != NULL; p++)
+		if (strcasecmp(p->key, "keylen") == 0 &&
+		    provnum_set_size_t(p, EVP_CIPHER_CTX_key_length(evp_ctx)) < 0)
+			ok = 0;
+	return ok;
 }
 
 /* Parameters that libcrypto can send to this implementation */
@@ -365,26 +362,21 @@ static const OSSL_PARAM *aes_mt_settable_ctx_params(void *cctx, void *provctx)
 
 static int aes_mt_set_ctx_params(void *vctx, const OSSL_PARAM params[])
 {
-    struct aes_mt_ctx_st *ctx = vctx;
-    const OSSL_PARAM *p;
-    int ok = 1;
+	/* vctx is the EVP_CIPHER_CTX from aes_mt_newctx_*(). */
+	EVP_CIPHER_CTX *evp_ctx = vctx;
+	const OSSL_PARAM *p;
+	int ok = 1;
 
-    if (ctx->ongoing) {
-        ERR_raise(ERR_HANDLE(ctx), AES_MT_ONGOING_OPERATION);
-        return 0;
-    }
+	/* Each AES-CTR-MT variant has one fixed key length. */
+	for (p = params; p->key != NULL; p++)
+		if (strcasecmp(p->key, "keylen") == 0) {
+			size_t keyl = 0;
 
-    for (p = params; p->key != NULL; p++)
-        if (strcasecmp(p->key, "keylen") == 0) {
-            size_t keyl = 0;
-
-            if (provnum_get_size_t(&keyl, p) < 0) {
-                ok = 0;
-                continue;
-            }
-            ctx->keylen = keyl;
-        }
-    return ok;
+			if (provnum_get_size_t(&keyl, p) < 0 ||
+			    keyl != (size_t)EVP_CIPHER_CTX_key_length(evp_ctx))
+				ok = 0;
+		}
+	return ok;
 }
 
 #endif /*WITH_OPENSSL3*/
