@@ -1,4 +1,4 @@
-/* $OpenBSD: monitor_wrap.c,v 1.151 2026/09/16 06:23:16 djm Exp $ */
+/* $OpenBSD: monitor_wrap.c,v 1.153 2026/10/30 05:38:16 djm Exp $ */
 /*
  * Copyright 2002 Niels Provos <provos@citi.umich.edu>
  * Copyright 2002 Markus Friedl <markus@openbsd.org>
@@ -683,7 +683,23 @@ mm_session_pty_cleanup2(Session *s)
 		error("close(s->ptymaster/%d): %s",
 		    s->ptymaster, strerror(errno));
 
+	/*
+	 * If no command was started on this pty then do_exec_pty() never
+	 * took over the descriptors received in mm_pty_allocate(), so close
+	 * them here. Otherwise the channel owns the master and the slave was
+	 * closed after the fork.
+	 */
+	if (s->pid == 0) {
+		if (close(s->ptyfd) == -1)
+			error("close(s->ptyfd/%d): %s",
+			    s->ptyfd, strerror(errno));
+		if (close(s->ttyfd) == -1)
+			error("close(s->ttyfd/%d): %s",
+			    s->ttyfd, strerror(errno));
+	}
+
 	/* unlink pty from session */
+	s->ptyfd = s->ptymaster = -1;
 	s->ttyfd = -1;
 }
 
@@ -1195,7 +1211,7 @@ server_get_connection_info(struct ssh *ssh, int populate, int use_dns)
 
 	if (ssh == NULL || !populate)
 		return &ci;
-	ci.host = use_dns ? ssh_remote_hostname(ssh) : ssh_remote_ipaddr(ssh);
+	ci.host = auth_get_canonical_hostname(ssh, use_dns);
 	ci.address = ssh_remote_ipaddr(ssh);
 	ci.laddress = ssh_local_ipaddr(ssh);
 	ci.lport = ssh_local_port(ssh);

@@ -1,4 +1,4 @@
-/* $OpenBSD: sshconnect.c,v 1.386 2026/09/16 00:29:44 djm Exp $ */
+/* $OpenBSD: sshconnect.c,v 1.393 2026/10/30 08:39:48 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -58,9 +58,17 @@
 
 struct sshkey *previous_host_key = NULL;
 
+/*
+ * Set if the host key failed verification and we continued anyway
+ * (StrictHostKeyChecking=no). Used to refuse MITM-able forwarding
+ * requests that arrive after the connection is established, e.g.
+ * from multiplexing clients.
+ */
+int hostkey_untrusted = 0;
+
 static int matching_host_key_dns = 0;
 
-static pid_t proxy_command_pid = 0;
+static volatile pid_t proxy_command_pid = 0;
 
 /* import */
 extern int debug_flag;
@@ -301,15 +309,33 @@ ssh_proxy_connect(struct ssh *ssh, const char *host, const char *host_arg,
 	return 0;
 }
 
+/*
+ * Called from the SIGCHLD handler for each child it reaps. Forget the
+ * proxy command once it has been reaped, as its pid may be reused.
+ */
+void
+ssh_proxy_command_reaped(pid_t pid)
+{
+	if (pid == proxy_command_pid)
+		proxy_command_pid = 0;
+}
+
 void
 ssh_kill_proxy_command(void)
 {
+	sigset_t nset, oset;
+
 	/*
 	 * Send SIGHUP to proxy command if used. We don't wait() in
-	 * case it hangs and instead rely on init to reap the child
+	 * case it hangs and instead rely on init to reap the child.
+	 * Block SIGCHLD so it can't be reaped between the check and kill().
 	 */
+	sigemptyset(&nset);
+	sigaddset(&nset, SIGCHLD);
+	sigprocmask(SIG_BLOCK, &nset, &oset);
 	if (proxy_command_pid > 1)
 		kill(proxy_command_pid, SIGHUP);
+	sigprocmask(SIG_SETMASK, &oset, NULL);
 }
 
 #ifdef HAVE_IFADDRS_H
@@ -999,7 +1025,7 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 	int local = sockaddr_is_local(hostaddr);
 	int r, want_cert = sshkey_is_cert(host_key), host_ip_differ = 0;
 	int hostkey_trusted = 0; /* Known or explicitly accepted by user */
-	struct hostkeys *host_hostkeys, *ip_hostkeys;
+	struct hostkeys *host_hostkeys, *ip_hostkeys, *noport_hostkeys = NULL;
 	u_int i;
 
 	/*
@@ -1054,8 +1080,28 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 		    "HOSTNAME", cinfo, host_key, host);
 	}
 
+	/*
+	 * Entries without a port identifier apply to all ports on the host
+	 * (see HOST_NEW below), so also load these to check for revoked keys.
+	 */
+	if (options.host_key_alias == NULL && port != 0 &&
+	    port != SSH_DEFAULT_PORT && !clobber_port) {
+		noport_hostkeys = init_hostkeys();
+		for (i = 0; i < num_user_hostfiles; i++)
+			load_hostkeys(noport_hostkeys, hostname,
+			    user_hostfiles[i], 0);
+		for (i = 0; i < num_system_hostfiles; i++)
+			load_hostkeys(noport_hostkeys, hostname,
+			    system_hostfiles[i], 0);
+	}
+
+	/*
+	 * Load the keys for the address unconditionally, even if we were
+	 * offered a certificate: they are needed if the certificate doesn't
+	 * match a CA and we downgrade to the plain key at "retry" below.
+	 */
 	ip_hostkeys = NULL;
-	if (!want_cert && options.check_host_ip) {
+	if (options.check_host_ip) {
 		ip_hostkeys = init_hostkeys();
 		for (i = 0; i < num_user_hostfiles; i++)
 			load_hostkeys(ip_hostkeys, ip, user_hostfiles[i], 0);
@@ -1084,6 +1130,13 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 	 */
 	host_status = check_key_in_hostkeys(host_hostkeys, host_key,
 	    &host_found);
+	/* A revocation without a port identifier overrides any other match */
+	if (noport_hostkeys != NULL && check_key_in_hostkeys(noport_hostkeys,
+	    host_key, NULL) == HOST_REVOKED) {
+		debug("host key revoked without port identifier");
+		host_status = HOST_REVOKED;
+		host_found = NULL;
+	}
 
 	/*
 	 * If there are no hostfiles, or if the hostkey was found via
@@ -1101,6 +1154,12 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 	if (!want_cert && ip_hostkeys != NULL) {
 		ip_status = check_key_in_hostkeys(ip_hostkeys, host_key,
 		    &ip_found);
+		/*
+		 * A key that is revoked for the address must never be
+		 * accepted, regardless of what is recorded for the hostname.
+		 */
+		if (ip_status == HOST_REVOKED)
+			host_status = HOST_REVOKED;
 		if (host_status == HOST_CHANGED &&
 		    (ip_status != HOST_CHANGED ||
 		    (ip_found != NULL &&
@@ -1366,6 +1425,7 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 		 * the connection but without MITM-able authentication or
 		 * forwarding.
 		 */
+		hostkey_untrusted = 1;
 		if (options.password_authentication) {
 			error("Password authentication is disabled to avoid "
 			    "man-in-the-middle attacks.");
@@ -1468,6 +1528,8 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 		free_hostkeys(host_hostkeys);
 	if (ip_hostkeys != NULL)
 		free_hostkeys(ip_hostkeys);
+	if (noport_hostkeys != NULL)
+		free_hostkeys(noport_hostkeys);
 	return 0;
 
 fail:
@@ -1491,7 +1553,55 @@ fail:
 		free_hostkeys(host_hostkeys);
 	if (ip_hostkeys != NULL)
 		free_hostkeys(ip_hostkeys);
+	if (noport_hostkeys != NULL)
+		free_hostkeys(noport_hostkeys);
 	return -1;
+}
+
+/*
+ * Check whether the known_hosts files (or KnownHostsCommand) mark the host
+ * key as @revoked for this host. As in check_host_key(), the host is looked
+ * up with the port identifier and, if that is not the default, without it.
+ * Returns 1 if the key is revoked, 0 otherwise.
+ */
+static int
+host_key_revoked_in_hostfiles(char *hostname, struct sockaddr *hostaddr,
+    const struct ssh_conn_info *cinfo, struct sshkey *host_key)
+{
+	struct hostkeys *hostkeys;
+	char *host = NULL;
+	u_short port = options.port;
+	u_int i;
+	int revoked = 0;
+
+	hostkeys = init_hostkeys();
+	for (;;) {
+		get_hostfile_hostname_ipaddr(hostname, hostaddr, port,
+		    &host, NULL);
+		for (i = 0; i < options.num_user_hostfiles; i++)
+			load_hostkeys(hostkeys, host,
+			    options.user_hostfiles[i], 0);
+		for (i = 0; i < options.num_system_hostfiles; i++)
+			load_hostkeys(hostkeys, host,
+			    options.system_hostfiles[i], 0);
+		if (options.known_hosts_command != NULL && port != 0) {
+			load_hostkeys_command(hostkeys,
+			    options.known_hosts_command, "HOSTNAME", cinfo,
+			    host_key, host);
+		}
+		free(host);
+		if (options.host_key_alias != NULL || port == 0 ||
+		    port == SSH_DEFAULT_PORT)
+			break;
+		port = 0; /* retry without port identifier */
+	}
+	if (check_key_in_hostkeys(hostkeys, host_key, NULL) == HOST_REVOKED) {
+		debug_f("%s host key for %s is marked as revoked in known_hosts",
+		    sshkey_type(host_key), hostname);
+		revoked = 1;
+	}
+	free_hostkeys(hostkeys);
+	return revoked;
 }
 
 /* returns 0 if key verifies or -1 if key does NOT verify */
@@ -1575,9 +1685,16 @@ verify_host_key(char *host, struct sockaddr *hostaddr, struct sshkey *host_key,
 			sshkey_drop_cert(plain);
 		if (verify_host_key_dns(host, hostaddr, plain, &flags) == 0) {
 			if (flags & DNS_VERIFY_FOUND) {
+				/*
+				 * A secure DNS match is implicitly trusted, but a
+				 * key that known_hosts marks as revoked must never
+				 * be accepted; leave it to check_host_key().
+				 */
 				if (options.verify_host_key_dns == 1 &&
 				    flags & DNS_VERIFY_MATCH &&
-				    flags & DNS_VERIFY_SECURE) {
+				    flags & DNS_VERIFY_SECURE &&
+				    !host_key_revoked_in_hostfiles(host, hostaddr,
+				    cinfo, host_key)) {
 					r = 0;
 					goto out;
 				}
@@ -1653,10 +1770,21 @@ ssh_login(struct ssh *ssh, Sensitive *sensitive, const char *orighost,
 	/* Put the connection into non-blocking mode. */
 	ssh_packet_set_nonblocking(ssh);
 
+	/*
+	 * ConnectTimeout also covers the initial key exchange: bound each
+	 * packet read/write during KEX by the time remaining, rounded up to
+	 * whole seconds. Time spent at the host key prompt is not counted.
+	 */
+	if (timeout_ms > 0)
+		ssh_packet_set_timeout(ssh, timeout_ms / 1000 + 1, 1);
+
 	/* key exchange */
 	/* authenticate user */
 	debug("Authenticating to %s:%d as '%s'", host, port, server_user);
 	ssh_kex2(ssh, host, hostaddr, port, cinfo);
+	/* KEX done; use the keepalive timeout for the rest of the session. */
+	ssh_packet_set_timeout(ssh, options.server_alive_interval,
+	    options.server_alive_count_max);
 	kex_set_warn_weak_crypto(ssh, options.warn_weak_crypto &&
 	    !options.kex_algorithms_set);
 	if (!options.kex_algorithms_set && ssh->kex != NULL &&

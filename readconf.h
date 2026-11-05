@@ -1,4 +1,4 @@
-/* $OpenBSD: readconf.h,v 1.164 2026/09/16 00:13:58 djm Exp $ */
+/* $OpenBSD: readconf.h,v 1.166 2026/11/02 06:49:42 dtucker Exp $ */
 
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
@@ -244,6 +244,7 @@ typedef struct {
 const char *kex_default_pk_alg(void);
 char	*ssh_connection_hash(const char *thishost, const char *host,
     const char *portstr, const char *user, const char *jump_host);
+char	*ssh_jump_spec(const Options *);
 void     initialize_options(Options *);
 int      fill_default_options(Options *);
 void	 fill_default_options_for_canonicalization(Options *);
@@ -261,6 +262,7 @@ int	 default_ssh_port(void);
 int	 option_clear_or_none(const char *);
 int	 config_has_permitted_cnames(Options *);
 void	 dump_client_config(Options *o, const char *host);
+char	*supported_address_family(void);
 
 void	 add_local_forward(Options *, const struct Forward *);
 void	 add_remote_forward(Options *, const struct Forward *);

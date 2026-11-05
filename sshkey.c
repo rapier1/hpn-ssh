@@ -1,4 +1,4 @@
-/* $OpenBSD: sshkey.c,v 1.165 2026/10/01 07:07:49 djm Exp $ */
+/* $OpenBSD: sshkey.c,v 1.168 2026/10/30 09:02:03 djm Exp $ */
 /*
  * Copyright (c) 2000, 2001 Markus Friedl.  All rights reserved.
  * Copyright (c) 2008 Alexander von Gernler.  All rights reserved.
@@ -1455,9 +1455,16 @@ int
 sshkey_check_rsa_length(const struct sshkey *k, int min_size)
 {
 #ifdef WITH_OPENSSL
-	int nbits;
+	int r, nbits;
 
-	if (k == NULL || k->pkey == NULL ||
+	if (k == NULL)
+		return 0;
+	/* A certificate is no stronger than the CA key that signed it */
+	if (sshkey_is_cert(k) && k->cert != NULL &&
+	    (r = sshkey_check_rsa_length(k->cert->signature_key,
+	    min_size)) != 0)
+		return r;
+	if (k->pkey == NULL ||
 	    (k->type != KEY_RSA && k->type != KEY_RSA_CERT))
 		return 0;
 	nbits = EVP_PKEY_bits(k->pkey);
@@ -2553,6 +2560,8 @@ sshkey_serialize_private_sk(const struct sshkey *key, struct sshbuf *b)
 {
 	int r;
 
+	if (key->sk_key_handle == NULL)
+		return SSH_ERR_INVALID_ARGUMENT;
 	if ((r = sshbuf_put_cstring(b, key->sk_application)) != 0 ||
 	    (r = sshbuf_put_u8(b, key->sk_flags)) != 0 ||
 	    (r = sshbuf_put_stringb(b, key->sk_key_handle)) != 0 ||
@@ -3543,6 +3552,7 @@ sshkey_parse_private_pem_fileblob(struct sshbuf *blob, int type,
 	BIO *bio = NULL;
 	int r;
 	RSA *rsa = NULL;
+	const BIGNUM *rsa_n = NULL, *rsa_e = NULL;
 	EC_KEY *ecdsa = NULL;
 
 	if (keyp != NULL)
@@ -3585,6 +3595,20 @@ sshkey_parse_private_pem_fileblob(struct sshbuf *blob, int type,
 #ifdef DEBUG_PK
 		RSA_print_fp(stderr, rsa, 8);
 #endif
+		/*
+		 * libcrypto doesn't limit the size of the integers it decodes
+		 * from PEM, and RSA_blinding_on() below computes a modular
+		 * exponentiation using n and e. Apply the same upper bound
+		 * that sshbuf_get_bignum2() enforces for the other key formats
+		 * before doing any arithmetic on the key.
+		 */
+		RSA_get0_key(rsa, &rsa_n, &rsa_e, NULL);
+		if (rsa_n == NULL || rsa_e == NULL ||
+		    BN_num_bits(rsa_n) > SSHBUF_MAX_BIGNUM * 8 ||
+		    BN_num_bits(rsa_e) > SSHBUF_MAX_BIGNUM * 8) {
+			r = SSH_ERR_KEY_LENGTH;
+			goto out;
+		}
 		if (RSA_blinding_on(rsa, NULL) != 1 ||
 		    EVP_PKEY_set1_RSA(pk, rsa) != 1) {
 			r = SSH_ERR_LIBCRYPTO_ERROR;

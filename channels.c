@@ -1,4 +1,4 @@
-/* $OpenBSD: channels.c,v 1.470 2026/09/16 06:23:15 djm Exp $ */
+/* $OpenBSD: channels.c,v 1.478 2026/10/30 07:30:52 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -62,6 +62,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "xmalloc.h"
@@ -77,6 +78,7 @@
 #include "canohost.h"
 #include "pathnames.h"
 #include "match.h"
+#include "utf8.h"
 
 /* XXX remove once we're satisfied there's no lurking bugs */
 /* #define DEBUG_CHANNEL_POLL 1 */
@@ -222,6 +224,10 @@ struct ssh_channels {
 	char *bulk_classifier_tty, *bulk_classifier_notty;
 	/* Number of active bulk channels (set by channel_handler) */
 	u_int nbulk;
+
+	/* ratelimiting of forwarding refusals to avoid unlimited logspam */
+	struct log_ratelimit_ctx log_ratelimit;
+	int log_ratelimit_init_done;
 };
 
 /* helper */
@@ -616,6 +622,9 @@ channel_new(struct ssh *ssh, char *ctype, int type, int rfd, int wfd, int efd,
 	c->ctl_chan = -1;
 	c->delayed = 1;		/* prevent call to channel_post handler */
 	c->inactive_deadline = lookup_timeout(ssh, c->ctype);
+	/* channels created already open need a last used time for timeouts */
+	if (type == SSH_CHANNEL_OPEN)
+		channel_set_used_time(ssh, c);
 	TAILQ_INIT(&c->status_confirms);
 	channel_classify(ssh, c);
 	debug("channel %d: new %s [%s] (inactive timeout: %f)",
@@ -839,9 +848,18 @@ channel_free(struct ssh *ssh, Channel *c)
 		    other->type == SSH_CHANNEL_MUX_PROXY &&
 		    other->mux_ctx == c) {
 			other->mux_ctx = NULL;
-			other->type = SSH_CHANNEL_OPEN;
-			other->istate = CHAN_INPUT_CLOSED;
 			other->ostate = CHAN_OUTPUT_CLOSED;
+			if (other->have_remote_id) {
+				other->type = SSH_CHANNEL_OPEN;
+				other->istate = CHAN_INPUT_CLOSED;
+			} else {
+				/*
+				 * Peer hasn't answered the open yet, so we
+				 * can't send a close until it does.
+				 */
+				other->type = SSH_CHANNEL_OPENING;
+				other->istate = CHAN_INPUT_WAIT_DRAIN;
+			}
 		}
 	}
 	debug("channel %d: free: %s, nchannels %u", c->self,
@@ -1156,8 +1174,8 @@ channel_open_message(struct ssh *ssh)
 	struct sshbuf *buf;
 	Channel *c;
 	u_int i;
-	int r;
-	char *cp, *ret;
+	int r, w;
+	char *cp, *name, *ret;
 
 	if ((buf = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new");
@@ -1190,12 +1208,23 @@ channel_open_message(struct ssh *ssh)
 		case SSH_CHANNEL_X11_OPEN:
 		case SSH_CHANNEL_MUX_PROXY:
 		case SSH_CHANNEL_MUX_CLIENT:
+			/*
+			 * The remote name may have been supplied by the
+			 * peer; don't let embedded newlines or control
+			 * characters mess up the display.
+			 */
+			w = INT_MAX;
+			asmprintf(&name, INT_MAX, &w, "%s", c->remote_name);
+			if (name == NULL)
+				fatal_f("asmprintf failed");
 			cp = channel_format_status(c);
 			if ((r = sshbuf_putf(buf, "  #%d %.300s (%s)\r\n",
-			    c->self, c->remote_name, cp)) != 0) {
+			    c->self, name, cp)) != 0) {
+				free(name);
 				free(cp);
 				fatal_fr(r, "sshbuf_putf");
 			}
+			free(name);
 			free(cp);
 			continue;
 		default:
@@ -1760,7 +1789,7 @@ channel_decode_socks5(Channel *c, struct sshbuf *input, struct sshbuf *output)
 	uint16_t dest_port;
 	char dest_addr[255+1], ntop[INET6_ADDRSTRLEN];
 	u_int af;
-	int r, success = -1;;
+	int r, success = -1;
 	struct sshbuf *b = NULL;
 
 	debug2("channel %d: decode socks5 %s", c->self,
@@ -1784,8 +1813,11 @@ channel_decode_socks5(Channel *c, struct sshbuf *input, struct sshbuf *output)
 		success = socks_decode_error(c, r, __func__, "version");
 		goto out;
 	}
-	if (socks_ver != 5) /* shouldn't happen */
-		fatal_fr(r, "channel %d: internal error: not socks5", c->self);
+	if (socks_ver != 5) {
+		error_f("channel %d: SOCKS5 request with bad version %d",
+		    c->self, socks_ver);
+		goto out;
+	}
 
 	/* Parse SOCKS5 request header */
 	debug2("channel %d: socks5 post auth", c->self);
@@ -2569,7 +2601,19 @@ channel_handle_efd(struct ssh *ssh, Channel *c)
 static int
 channel_check_window(struct ssh *ssh, Channel *c)
 {
+	u_int excess;
 	int r;
+
+	/*
+	 * Data that the peer sent beyond the advertised window was never
+	 * charged against it, so don't hand back window for consuming it.
+	 * The excess is forgiven as it drains from the buffer instead.
+	 */
+	if (c->local_window_exceeded != 0) {
+		excess = MINIMUM(c->local_consumed, c->local_window_exceeded);
+		c->local_consumed -= excess;
+		c->local_window_exceeded -= excess;
+	}
 
 	if (c->type == SSH_CHANNEL_OPEN &&
 	    !(c->flags & (CHAN_CLOSE_SENT|CHAN_CLOSE_RCVD)) &&
@@ -2860,7 +2904,7 @@ channel_handler(struct ssh *ssh, int table, struct timespec *timeout)
 				if (timeout != NULL &&
 				    c->type == SSH_CHANNEL_OPEN &&
 				    channel_get_expiry(ssh, c) != 0) {
-					ptimeout_deadline_monotime(timeout,
+					ptimeout_deadline_monotime_double(timeout,
 					    channel_get_expiry(ssh, c));
 				}
 			} else if (timeout != NULL) {
@@ -2868,7 +2912,7 @@ channel_handler(struct ssh *ssh, int table, struct timespec *timeout)
 				 * Arrange for poll() wakeup when channel pause
 				 * timer expires.
 				 */
-				ptimeout_deadline_monotime(timeout,
+				ptimeout_deadline_monotime_double(timeout,
 				    c->notbefore);
 			}
 		}
@@ -3579,6 +3623,10 @@ channel_proxy_upstream(Channel *c, int type, uint32_t seq, struct ssh *ssh)
 			c->have_remote_id = 1;
 		}
 		break;
+	case SSH2_MSG_CHANNEL_OPEN_FAILURE:
+		/* peer refused the open; there will be no close to track */
+		channel_free(ssh, c);
+		break;
 	case SSH2_MSG_CHANNEL_CLOSE:
 		if (c->flags & CHAN_CLOSE_SENT)
 			channel_free(ssh, c);
@@ -3671,7 +3719,12 @@ channel_input_data(int type, uint32_t seq, struct ssh *ssh)
 		return 0;
 	}
 	if (win_len > c->local_window) {
-		c->local_window_exceeded += win_len - c->local_window;
+		u_int delta = win_len - c->local_window;
+
+		if (c->local_window_exceeded > UINT_MAX - delta)
+			c->local_window_exceeded = UINT_MAX;
+		else
+			c->local_window_exceeded += delta;
 		logit("channel %d: rcvd too much data %zu, win %u/%u "
 		    "(excess %u)", c->self, win_len, c->local_window,
 		    c->local_window_max, c->local_window_exceeded);
@@ -3681,10 +3734,8 @@ channel_input_data(int type, uint32_t seq, struct ssh *ssh)
 			ssh_packet_disconnect(ssh, "channel %d: peer ignored "
 			    "channel window", c->self);
 		}
-	} else {
+	} else
 		c->local_window -= win_len;
-		c->local_window_exceeded = 0;
-	}
 
 	if (c->datagram) {
 		if ((r = sshbuf_put_string(c->output, data, data_len)) != 0)
@@ -4441,8 +4492,7 @@ check_rfwd_permission(struct ssh *ssh, struct Forward *fwd)
 #ifdef SKIP_PRIVDROP
 	if (fwd->listen_path != NULL)
 		return 0;
-	if (allowed_open->listen_port != FWD_PERMIT_ANY_PORT &&
-	    allowed_open->listen_port < 1024)
+	if (fwd->listen_port != 0 && fwd->listen_port < 1024)
 		return 0;
 #endif
 
@@ -4473,29 +4523,59 @@ check_rfwd_permission(struct ssh *ssh, struct Forward *fwd)
 	return permit && permit_adm;
 }
 
+/*
+ * Forwarding requests cost the peer nothing and a refusal leaves the
+ * connection open, so the peer decides how many refusals are logged.
+ * Rate-limit them. Returns non-zero if the refusal should be logged at
+ * debug level instead of the usual INFO.
+ */
+int
+channel_fwd_refusal_ratelimited(struct ssh *ssh)
+{
+	struct ssh_channels *sc = ssh->chanctxt;
+	int ratelimited;
+	u_int ndropped = 0;
+
+	if (!sc->log_ratelimit_init_done) {
+		sc->log_ratelimit_init_done = 1;
+		log_ratelimit_init(&sc->log_ratelimit, 8, 60, 30, 2*60);
+	}
+	ratelimited = log_ratelimit(&sc->log_ratelimit, time(NULL),
+	    NULL, &ndropped);
+	if (ndropped != 0) {
+		logit("forwarding refusal logging rate-limited: additional %u "
+		    "requests refused", ndropped);
+	}
+	return ratelimited;
+}
+
 /* protocol v2 remote port fwd, used by sshd */
 int
 channel_setup_remote_fwd_listener(struct ssh *ssh, struct Forward *fwd,
     int *allocated_listen_port, struct ForwardOptions *fwd_opts)
 {
+	LogLevel level;
+
 	if (!check_rfwd_permission(ssh, fwd)) {
 		ssh_packet_send_debug(ssh, "port forwarding refused");
+		level = channel_fwd_refusal_ratelimited(ssh) ?
+		    SYSLOG_LEVEL_DEBUG1 : SYSLOG_LEVEL_INFO;
 		if (fwd->listen_path != NULL)
 			/* XXX always allowed, see remote_open_match() */
-			logit("Received request from %.100s port %d to "
-			    "remote forward to path \"%.100s\", "
+			do_log2(level, "Received request from %.100s port %d "
+			    "to remote forward to path \"%.100s\", "
 			    "but the request was denied.",
 			    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
 			    fwd->listen_path);
 		else if(fwd->listen_host != NULL)
-			logit("Received request from %.100s port %d to "
-			    "remote forward to host %.100s port %d, "
+			do_log2(level, "Received request from %.100s port %d "
+			    "to remote forward to host %.100s port %d, "
 			    "but the request was denied.",
 			    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
 			    fwd->listen_host, fwd->listen_port );
 		else
-			logit("Received request from %.100s port %d to remote "
-			    "forward, but the request was denied.",
+			do_log2(level, "Received request from %.100s port %d "
+			    "to remote forward, but the request was denied.",
 			    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh));
 		return 0;
 	}
@@ -5071,7 +5151,9 @@ channel_connect_to_port(struct ssh *ssh, const char *host, u_short port,
 	}
 
 	if (!permit || !permit_adm) {
-		logit("Received request from %.100s port %d to connect to "
+		do_log2(channel_fwd_refusal_ratelimited(ssh) ?
+		    SYSLOG_LEVEL_DEBUG1 : SYSLOG_LEVEL_INFO,
+		    "Received request from %.100s port %d to connect to "
 		    "host %.100s port %d, but the request was denied.",
 		    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh), host, port);
 		if (reason != NULL)
@@ -5130,7 +5212,9 @@ channel_connect_to_path(struct ssh *ssh, const char *path,
 	}
 
 	if (!permit || !permit_adm) {
-		logit("Received request to connect to path %.100s, "
+		do_log2(channel_fwd_refusal_ratelimited(ssh) ?
+		    SYSLOG_LEVEL_DEBUG1 : SYSLOG_LEVEL_INFO,
+		    "Received request to connect to path %.100s, "
 		    "but the request was denied.", path);
 		return NULL;
 	}

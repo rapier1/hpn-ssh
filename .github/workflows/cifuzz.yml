@@ -1,10 +1,15 @@
 name: CIFuzz
+permissions: read-all
 on:
   push:
+<<<<<<< HEAD
     branches: [master, dev_minor, dev_major, release_candidates]
     paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/cifuzz.yml' ]
+=======
+    paths: [ '**.c', '**.cc', '**.h', '**.m4', '**.sh', '**/Makefile.in', '**/Makefile', 'configure.ac', '.github/configs', '.github/workflows/cifuzz.yml' ]
+>>>>>>> openssh-master/master
   pull_request:
-    paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', '.github/configs', '.github/workflows/cifuzz.yml' ]
+    paths: [ '**.c', '**.cc', '**.h', '**.m4', '**.sh', '**/Makefile.in', '**/Makefile', 'configure.ac', '.github/configs', '.github/workflows/cifuzz.yml' ]
 
 jobs:
   Fuzzing:

@@ -1,7 +1,7 @@
 /* $OpenBSD: version.h,v 1.111 2026/10/05 09:54:05 djm Exp $ */
 
 #define SSH_VERSION	"OpenSSH_10.6"
-
-#define SSH_PORTABLE	"p1"
+#define SSH_PORTABLE	"p2"
 #define SSH_HPN         "_DynWin"
 #define SSH_RELEASE	SSH_VERSION SSH_PORTABLE SSH_HPN
+

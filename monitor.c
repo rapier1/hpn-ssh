@@ -1,4 +1,4 @@
-/* $OpenBSD: monitor.c,v 1.259 2026/09/16 00:37:07 djm Exp $ */
+/* $OpenBSD: monitor.c,v 1.263 2026/10/30 04:52:11 djm Exp $ */
 /*
  * Copyright 2002 Niels Provos <provos@citi.umich.edu>
  * Copyright 2002 Markus Friedl <markus@openbsd.org>
@@ -1006,6 +1006,32 @@ key_base_type_match(const char *method, const struct sshkey *key,
 	return found;
 }
 
+/*
+ * Check that the key satisfies the CASignatureAlgorithms and
+ * RequiredRSASize policies. These are also checked in the unprivileged
+ * authentication code, but are re-checked here so that they hold
+ * regardless of what the unprivileged process sends us.
+ * Returns 1 on success, 0 otherwise.
+ */
+static int
+key_policy_match(const char *method, const struct sshkey *key)
+{
+	int r;
+
+	if ((r = sshkey_check_cert_sigtype(key,
+	    options.ca_sign_algorithms)) != 0) {
+		error_r(r, "%s certificate signature algorithm not in "
+		    "CASignatureAlgorithms", method);
+		return 0;
+	}
+	if ((r = sshkey_check_rsa_length(key,
+	    options.required_rsa_size)) != 0) {
+		error_r(r, "%s refusing %s key", method, sshkey_type(key));
+		return 0;
+	}
+	return 1;
+}
+
 int
 mm_answer_authpassword(struct ssh *ssh, int sock, struct sshbuf *m)
 {
@@ -1309,6 +1335,8 @@ mm_answer_keyallowed(struct ssh *ssh, int sock, struct sshbuf *m)
 			if (!key_base_type_match(auth_method, key,
 			    options.pubkey_accepted_algos))
 				break;
+			if (!key_policy_match(auth_method, key))
+				break;
 			allowed = user_key_allowed(ssh, authctxt->pw, key,
 			    pubkey_auth_attempt, &opts);
 			break;
@@ -1320,6 +1348,8 @@ mm_answer_keyallowed(struct ssh *ssh, int sock, struct sshbuf *m)
 				break;
 			if (!key_base_type_match(auth_method, key,
 			    options.hostbased_accepted_algos))
+				break;
+			if (!key_policy_match(auth_method, key))
 				break;
 			allowed = hostbased_key_allowed(ssh, authctxt->pw,
 			    cuser, chost, key);
@@ -1386,23 +1416,12 @@ monitor_valid_userblob(struct ssh *ssh, const u_char *data, u_int datalen)
 	if ((b = sshbuf_from(data, datalen)) == NULL)
 		fatal_f("sshbuf_from");
 
-	if (ssh->compat & SSH_OLD_SESSIONID) {
-		p = sshbuf_ptr(b);
-		len = sshbuf_len(b);
-		if ((session_id2 == NULL) ||
-		    (len < session_id2_len) ||
-		    (timingsafe_bcmp(p, session_id2, session_id2_len) != 0))
-			fail++;
-		if ((r = sshbuf_consume(b, session_id2_len)) != 0)
-			fatal_fr(r, "consume");
-	} else {
-		if ((r = sshbuf_get_string_direct(b, &p, &len)) != 0)
-			fatal_fr(r, "parse sessionid");
-		if ((session_id2 == NULL) ||
-		    (len != session_id2_len) ||
-		    (timingsafe_bcmp(p, session_id2, session_id2_len) != 0))
-			fail++;
-	}
+	if ((r = sshbuf_get_string_direct(b, &p, &len)) != 0)
+		fatal_fr(r, "parse sessionid");
+	if ((session_id2 == NULL) ||
+	    (len != session_id2_len) ||
+	    (timingsafe_bcmp(p, session_id2, session_id2_len) != 0))
+		fail++;
 	if ((r = sshbuf_get_u8(b, &type)) != 0)
 		fatal_fr(r, "parse type");
 	if (type != SSH2_MSG_USERAUTH_REQUEST)
@@ -1611,10 +1630,13 @@ mm_answer_keyverify(struct ssh *ssh, int sock, struct sshbuf *m)
 			ret = SSH_ERR_SIGNATURE_INVALID;
 		}
 	}
+	if (ret == 0 && key_blobtype == MM_USERKEY &&
+	    auth_activate_options(ssh, key_opts) != 0) {
+		debug_f("key options inconsistent with existing");
+		ret = SSH_ERR_INVALID_ARGUMENT;
+	}
 	auth2_record_key(authctxt, ret == 0, key);
 
-	if (key_blobtype == MM_USERKEY && ret == 0)
-		auth_activate_options(ssh, key_opts);
 	monitor_reset_key_state();
 
 	sshbuf_reset(m);
@@ -2074,7 +2096,7 @@ mm_answer_gss_userok(struct ssh *ssh, int sock, struct sshbuf *m)
 	if (!options.gss_authentication)
 		fatal_f("GSSAPI authentication not enabled");
 
-	authenticated = authctxt->valid && ssh_gssapi_userok(authctxt->user);
+	authenticated = authctxt->valid && ssh_gssapi_userok(authctxt->pw);
 
 	sshbuf_reset(m);
 	if ((r = sshbuf_put_u32(m, authenticated)) != 0)

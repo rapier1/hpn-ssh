@@ -1,4 +1,4 @@
-/* $OpenBSD: mux.c,v 1.116 2026/09/23 21:42:39 djm Exp $ */
+/* $OpenBSD: mux.c,v 1.119 2026/10/30 08:39:48 djm Exp $ */
 /*
  * Copyright (c) 2002-2008 Damien Miller <djm@openbsd.org>
  *
@@ -49,6 +49,7 @@
 #include "sshpty.h"
 #include "readconf.h"
 #include "clientloop.h"
+#include "utf8.h"
 
 /* from ssh.c */
 extern int tty_flag;
@@ -56,6 +57,9 @@ extern Options options;
 extern char *host;
 extern struct sshbuf *command;
 extern volatile sig_atomic_t quit_pending;
+
+/* from sshconnect.c */
+extern int hostkey_untrusted;
 
 /* Context for session open confirmation callback */
 struct mux_session_confirm_ctx {
@@ -221,8 +225,16 @@ mux_master_control_cleanup_cb(struct ssh *ssh, int cid, int force, void *unused)
 		} else {
 			if (sc->istate == CHAN_INPUT_OPEN)
 				chan_read_failed(ssh, sc);
-			if (sc->ostate == CHAN_OUTPUT_OPEN)
+			if (sc->ostate == CHAN_OUTPUT_OPEN ||
+			    sc->ostate == CHAN_OUTPUT_WAIT_DRAIN)
 				chan_write_failed(ssh, sc);
+			/*
+			 * Also close the client's stderr, otherwise the
+			 * server could keep writing extended data to it
+			 * until the channel is fully closed.
+			 */
+			if (sc->efd != -1)
+				channel_close_fd(ssh, sc, &sc->efd);
 		}
 	}
 	channel_cancel_cleanup(ssh, c->self);
@@ -826,6 +838,15 @@ mux_master_process_open_fwd(struct ssh *ssh, u_int rid,
 			goto out;
 		}
 		break;
+	}
+
+	/* Forwarding was disabled when the host key failed verification */
+	if (hostkey_untrusted) {
+		logit_f("refusing %s: host key is not trusted", fwd_desc);
+		reply_error(reply, MUX_S_PERMISSION_DENIED, rid,
+		    "Port forwarding is disabled to avoid "
+		    "man-in-the-middle attacks");
+		goto out;
 	}
 
 	if (options.control_master == SSHCTL_MASTER_ASK ||
@@ -2450,7 +2471,7 @@ muxclient(const char *path)
 		    "connection" : "channels");
 		if (info == NULL)
 			fatal_f("info request failed");
-		printf("%s", info);
+		mprintf("%s", info);
 		exit(0);
 	case SSHMUX_COMMAND_TERMINATE:
 		mux_client_request_terminate(sock);

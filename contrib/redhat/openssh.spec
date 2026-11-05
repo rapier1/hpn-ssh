@@ -1,4 +1,4 @@
-%global ver 10.6p1
+%global ver 10.6p2
 %global rel 1%{?dist}
 
 # OpenSSH privilege separation requires a user & group ID
@@ -71,8 +71,8 @@ Release: %{rel}rescue
 Release: %{rel}
 %endif
 URL: https://www.openssh.com/portable.html
-Source0: https://ftp.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-%{version}.tar.gz
-Source1: https://web.archive.org/web/20131006102910/http://jmknoble.net/software/x11-ssh-askpass/x11-ssh-askpass-%{aversion}.tar.gz
+Source0: https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-%{version}.tar.gz
+Source1: https://github.com/openssh/x11-ssh-askpass/releases/download/v%{aversion}/x11-ssh-askpass-%{aversion}.tar.gz
 License: BSD
 Group: Applications/Internet
 BuildRoot: %{_tmppath}/%{name}-%{version}-buildroot
