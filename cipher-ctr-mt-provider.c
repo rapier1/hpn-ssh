@@ -78,7 +78,6 @@ OSSL_FUNC_core_pop_error_to_mark_fn *c_pop_error_to_mark;
 
 /* Errors used in this provider */
 #define AES_MT_E_MALLOC           1
-#define AES_MT_ONGOING_OPERATION  2
 #define AES_MT_BAD_KEYLEN         3
 
 /* typedef for function pointers */
@@ -86,10 +85,8 @@ typedef void(*fptr_t)(void);
 
 /* all of the various arrays we need */
 
-/* BAD_KEYLEN isn't being used at the moment */
 const OSSL_ITEM reasons[] = {
 	{ AES_MT_E_MALLOC, "Memory allocation failure" },
-	{ AES_MT_ONGOING_OPERATION, "Operation underway" },
 	{ AES_MT_BAD_KEYLEN, "Only 256, 192, and 128 Key lengths are supported" },
 	{ 0, NULL } /* Termination */
 };
@@ -364,6 +361,7 @@ static int aes_mt_set_ctx_params(void *vctx, const OSSL_PARAM params[])
 {
 	/* vctx is the EVP_CIPHER_CTX from aes_mt_newctx_*(). */
 	EVP_CIPHER_CTX *evp_ctx = vctx;
+	struct aes_mt_ctx_st *aes_mt_ctx;
 	const OSSL_PARAM *p;
 	int ok = 1;
 
@@ -373,8 +371,13 @@ static int aes_mt_set_ctx_params(void *vctx, const OSSL_PARAM params[])
 			size_t keyl = 0;
 
 			if (provnum_get_size_t(&keyl, p) < 0 ||
-			    keyl != (size_t)EVP_CIPHER_CTX_key_length(evp_ctx))
+			    keyl != (size_t)EVP_CIPHER_CTX_key_length(evp_ctx)) {
+				aes_mt_ctx = EVP_CIPHER_CTX_get_app_data(evp_ctx);
+				if (aes_mt_ctx != NULL)
+					ERR_raise(ERR_HANDLE(aes_mt_ctx),
+					    AES_MT_BAD_KEYLEN);
 				ok = 0;
+			}
 		}
 	return ok;
 }
