@@ -27,14 +27,18 @@
 #include <stdarg.h>
 
 #include "xmalloc.h"
+#include "log.h"	/* HPN: fatal, for uthash_fatal */
 #include "sftp.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
-#include "uthash.h"
+/* HPN: report a failed uthash allocation the way xmalloc does, not with
+ * a silent exit. */
+#define uthash_fatal(msg)	fatal("%s", msg)
+#include "uthash.h"	/* HPN: the glob attribute cache */
 
 int sftp_glob(struct sftp_conn *, const char *, int,
     int (*)(const char *, int), glob_t *);
-int sftp_glob_get_attrib(const char *path, Attrib *out);
+int sftp_glob_get_attrib(const char *, Attrib *);
 
 struct SFTP_OPENDIR {
 	SFTP_DIRENT **dir;
@@ -45,26 +49,25 @@ static struct {
 	struct sftp_conn *conn;
 } cur;
 
-/*
- * Attribute cache populated as a side effect of fudge_stat/fudge_lstat during
- * glob(3) expansion.  Lets callers (process_get in sftp.c) recover the file
- * size and mode that glob already paid an RTT to fetch, instead of issuing a
- * fresh stat per glob match.  Cleared at the start of every sftp_glob() call.
- *
- * Hard-capped at GLOB_ATTRIB_CACHE_MAX entries to bound memory under unusually
- * large globs; lookups past the cap simply miss and the caller falls back to
- * an explicit sftp_stat.  ~200 B/entry including string + uthash overhead, so
- * 262144 = ~50 MB worst case - comfortably above any realistic HPC glob.
- */
+/* HPN: attributes fetched by fudge_lstat and fudge_stat during glob(3)
+ * expansion, keyed by path. process_get in sftp.c reads them back, so a
+ * glob match costs no second stat round trip. sftp_glob clears the cache
+ * at the start of each call. */
 struct glob_attrib_entry {
-	char *path;	/* hash key (xstrdup'd) */
-	Attrib attrib;
-	UT_hash_handle hh;
+	char	       *path;		/* hash key (xstrdup'd) */
+	Attrib		attrib;
+	UT_hash_handle	hh;
 };
-#define GLOB_ATTRIB_CACHE_MAX 262144
-static struct glob_attrib_entry *attrib_cache;
-static size_t attrib_cache_count;
 
+/* HPN: the most paths the cache holds, to bound memory on a huge glob. A
+ * path past the cap is not cached, and process_get stats it itself. An
+ * entry is about 200 bytes with its path and hash overhead, so the cap is
+ * about 50 MB. */
+#define GLOB_ATTRIB_CACHE_MAX	262144
+static struct glob_attrib_entry *attrib_cache;
+static int attrib_cache_count;
+
+/* HPN: empty the cache. sftp_glob calls it before each expansion. */
 static void
 attrib_cache_clear(void)
 {
@@ -78,18 +81,22 @@ attrib_cache_clear(void)
 	attrib_cache_count = 0;
 }
 
+/* HPN: record a's attributes for path, replacing any earlier entry. A new
+ * path is dropped once the cache holds GLOB_ATTRIB_CACHE_MAX entries. */
 static void
 attrib_cache_record(const char *path, const Attrib *a)
 {
 	struct glob_attrib_entry *e;
 
-	if (attrib_cache_count >= GLOB_ATTRIB_CACHE_MAX)
-		return;
+	/* Replace before the cap check, so glob's stat of a symlink still
+	 * replaces its lstat attributes once the cache is full. */
 	HASH_FIND_STR(attrib_cache, path, e);
 	if (e != NULL) {
 		e->attrib = *a;
 		return;
 	}
+	if (attrib_cache_count >= GLOB_ATTRIB_CACHE_MAX)
+		return;
 	e = xcalloc(1, sizeof(*e));
 	e->path = xstrdup(path);
 	e->attrib = *a;
@@ -97,6 +104,8 @@ attrib_cache_record(const char *path, const Attrib *a)
 	attrib_cache_count++;
 }
 
+/* HPN: copy the attributes the last sftp_glob fetched for path into out.
+ * Returns 0, or -1 if path is not cached. */
 int
 sftp_glob_get_attrib(const char *path, Attrib *out)
 {
@@ -180,7 +189,7 @@ fudge_lstat(const char *path, struct stat *st)
 	if (sftp_lstat(cur.conn, path, 1, &a) != 0)
 		return -1;
 
-	attrib_cache_record(path, &a);
+	attrib_cache_record(path, &a);	/* HPN */
 	attrib_to_stat(&a, st);
 
 	return 0;
@@ -194,7 +203,7 @@ fudge_stat(const char *path, struct stat *st)
 	if (sftp_stat(cur.conn, path, 1, &a) != 0)
 		return -1;
 
-	attrib_cache_record(path, &a);
+	attrib_cache_record(path, &a);	/* HPN */
 	attrib_to_stat(&a, st);
 
 	return(0);
@@ -215,7 +224,7 @@ sftp_glob(struct sftp_conn *conn, const char *pattern, int flags,
 	pglob->gl_lstat = fudge_lstat;
 	pglob->gl_stat = fudge_stat;
 
-	attrib_cache_clear();
+	attrib_cache_clear();		/* HPN */
 	memset(&cur, 0, sizeof(cur));
 	cur.conn = conn;
 
