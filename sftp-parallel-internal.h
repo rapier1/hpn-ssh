@@ -68,8 +68,6 @@ struct sftp_hpn_dirattr_list;	/* deferred dir attrs */
 /* One second at the tick above; the reporter's slower cadence for the
  * watchdog pass, the reap loop and the fleet sample. */
 #define REPORTER_SLOW_TICKS     (1000 / REPORTER_TICK_MS)
-#define DEFAULT_TRANSFER_BUFLEN 131072	/* 128 KB; matches sftp-client.c */
-#define DEFAULT_NUM_REQUESTS    1024	/* 128 * 1024 = 128 MB per stream */
 
 /*
  * Maximum files to pipeline in one open+write+close batch. Sending N opens

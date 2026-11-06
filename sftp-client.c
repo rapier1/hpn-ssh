@@ -64,11 +64,7 @@ extern _Atomic sig_atomic_t interrupted;	/* HPN: workers read it */
 extern int showprogress;
 
 /* Default size of buffer for up/download (fix sftp.1 scp.1 if changed) */
-#define DEFAULT_COPY_BUFLEN	131072	/* 128 KB; raised from 32 KB for HPN */
-
-/* Default number of concurrent xfer requests (fix sftp.1 scp.1 if changed) */
-/* 1024 xfer requests * 128 KB = 128 MB in-flight; sized to not cap HPN channel window */
-#define DEFAULT_NUM_REQUESTS	1024
+#define DEFAULT_COPY_BUFLEN	32768
 
 /* Minimum amount of data to read at a time */
 #define MIN_READ_SIZE	512
@@ -718,10 +714,6 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 	ret->fd_out = fd_out;
 	ret->download_buflen = ret->upload_buflen =
 	    transfer_buflen ? transfer_buflen : DEFAULT_COPY_BUFLEN;
-	ret->num_requests =
-	    num_requests ? num_requests : DEFAULT_NUM_REQUESTS;
-	/* HPN: num_requests is the read-ahead controller's ceiling. */
-	sftp_conn_rdahead_init(ret, ret->num_requests);
 	ret->exts = 0;
 	ret->limit_kbps = 0;
 
@@ -916,6 +908,12 @@ sftp_init(int fd_in, int fd_out, u_int transfer_buflen, u_int num_requests,
 		ret->download_buflen = MINIMUM(ret->download_buflen, 20480);
 		ret->upload_buflen = MINIMUM(ret->upload_buflen, 20480);
 	}
+
+	/* HPN: size the request ceiling from the final buffer sizes, and
+	 * seed the read-ahead controller with it. */
+	ret->num_requests = sftp_hpn_request_ceiling(num_requests,
+	    MINIMUM(ret->download_buflen, ret->upload_buflen));
+	sftp_conn_rdahead_init(ret, ret->num_requests);
 
 	ret->limit_kbps = limit_kbps;
 	if (ret->limit_kbps > 0) {
@@ -3053,8 +3051,7 @@ do_upload_body(struct sftp_conn *conn,
 			sftp_conn_rdahead_account(conn, ack->len);
 			/* HPN adaptive upload pacing: feed the ack-rate
 			 * estimator (see sftp_conn_pace_ack). */
-			sftp_conn_pace_ack(conn, ack->len,
-			    conn->num_requests);
+			sftp_conn_pace_ack(conn, ack->len);
 			/*
 			 * Track both the highest offset acknowledged and the
 			 * highest *contiguous* offset acknowledged.
@@ -3866,8 +3863,7 @@ sftp_upload_range(struct sftp_conn *conn, const char *local_path,
 			sftp_conn_rdahead_account(conn, ack->len);
 			/* HPN adaptive upload pacing: feed the ack-rate
 			 * estimator (see sftp_conn_pace_ack). */
-			sftp_conn_pace_ack(conn, ack->len,
-			    conn->num_requests);
+			sftp_conn_pace_ack(conn, ack->len);
 			/* Report progress per ack, so the orchestrator's
 			 * rate window sees a steady stream rather than a
 			 * step when the range completes. */

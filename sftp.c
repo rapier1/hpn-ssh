@@ -3854,14 +3854,14 @@ main(int argc, char **argv)
 				}
 				copy_buffer_len = (size_t)llv;
 			} else if (strncasecmp(optarg, "nrequests=", 10) == 0) {
-				/* more than 10k to 15k requests starts stalling the connection
-				 * 8192 * default buffer size is 256MB of outstanding data.
-				 * if users need more then they need to up the buffer size */
-				llv = strtonum(optarg + 10, 1, 8 * 1024,
-					       &errstr);
+				/* the cap on the derived default, see
+				 * SFTP_HPN_MAX_REQUESTS */
+				llv = strtonum(optarg + 10, 1,
+					       SFTP_HPN_MAX_REQUESTS, &errstr);
 				if (errstr != NULL) {
-					fatal("Invalid number of requests. Must be between 1 and 8192. "
-					      "\"%s\": %s", optarg + 10, errstr);
+					fatal("Invalid number of requests. Must be between 1 and %d. "
+					      "\"%s\": %s", SFTP_HPN_MAX_REQUESTS,
+					      optarg + 10, errstr);
 				}
 				num_requests = (size_t)llv;
 			} else if (strncasecmp(optarg, "VerifyRepair=", 13) == 0) {
@@ -3876,7 +3876,7 @@ main(int argc, char **argv)
 					      "\"%s\": use yes or no", v);
 			} else if (strncasecmp(optarg, "Pacing=", 7) == 0) {
 				/* Adaptive upload pacing toggle (default
-				 * yes); see sftp_conn_pace_ack. */
+				 * no); see sftp_conn_pace_ack. */
 				const char *v = optarg + 7;
 				if (strcasecmp(v, "no") == 0)
 					sftp_hpn_pace_set_enabled(0);

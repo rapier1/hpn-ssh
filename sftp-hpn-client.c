@@ -68,11 +68,11 @@ extern int showprogress;	/* progress gate, defined by sftp.c and scp.c */
 extern _Atomic sig_atomic_t interrupted;	/* sftp.c and scp.c */
 
 /* Adaptive upload pacing master switch (-X Pacing=), applied to each new
- * connection at init. On by default: it wins where the duty-cycle
- * pathology lives, at -j1 and -j2, and measured neutral at -j4, -j8 and
- * on fast sinks. -X Pacing=no disables it. Read-only after option
- * parsing, so parallel workers may consult it without locking. */
-static int sftp_hpn_pace_default = 1;
+ * connection at init. Off by default, since it slows uploads to a
+ * destination that keeps up with the network. -X Pacing=yes enables it.
+ * Read-only after option parsing, so parallel workers may consult it
+ * without locking. */
+static int sftp_hpn_pace_default = 0;
 
 /* Adaptive read-ahead controller. See sftp-hpn-client.h for the
  * rationale. RDAHEAD_BP_THRESHOLD_SEC lives there too, so the
@@ -88,6 +88,9 @@ static int sftp_hpn_pace_default = 1;
  * backpressure signal shrinks it back, one cycle every 15 s or so. Half
  * the backpressure threshold, so recovery biases toward depth. */
 #define RDAHEAD_PROBE_INTERVAL_SEC	5.0
+/* The window the derived request ceiling fills, the largest channel
+ * window an HPN peer can advertise. */
+#define SFTP_HPN_WINDOW_TARGET	SSHBUF_SIZE_MAX
 
 /* Adaptive upload pacing. Rate-sample bucket, one ring slot per second
  * of delivered bytes. */
@@ -315,6 +318,20 @@ sftp_conn_watchdog_pause_until_ms(struct sftp_conn *conn)
  * Rationale in sftp-hpn-client.h at struct sftp_rdahead.
  * -------------------------------------------------------------------------- */
 
+/* The request ceiling sftp_init gives a connection once its buffer sizes
+ * are final. A caller's num_requests (-R) stands. Otherwise the ceiling
+ * is enough messages of msgsize bytes to fill SFTP_HPN_WINDOW_TARGET, so
+ * SFTP's flow control never caps the channel's. SFTP_HPN_MAX_REQUESTS
+ * bounds it, which matters only for small messages. */
+u_int
+sftp_hpn_request_ceiling(u_int num_requests, u_int msgsize)
+{
+	if (num_requests != 0)
+		return num_requests;
+	return MINIMUM(howmany(SFTP_HPN_WINDOW_TARGET, MAXIMUM(msgsize, 1)),
+	    SFTP_HPN_MAX_REQUESTS);
+}
+
 /* Seed the controller for a new connection: cap is num_requests, the -R
  * ceiling, the floor is RDAHEAD_FLOOR clamped to it, and probing starts
  * at the floor. Re-seeding a live controller resets it. */
@@ -330,7 +347,7 @@ sftp_conn_rdahead_init(struct sftp_conn *conn, uint32_t cap)
 	 * reiniting an exist struct at some point */
 	memset(&hpn->rd, 0, sizeof(hpn->rd));
 
-	/* the only caller sets cap to 1024 *but* again for safety */
+	/* sftp_init never passes 0, but a 0 cap would stop the controller */
 	hpn->rd.cap = cap ? cap : 1;
 
 	hpn->rd.floor = MINIMUM(RDAHEAD_FLOOR, hpn->rd.cap);
@@ -1070,13 +1087,15 @@ sftp_hpn_pace_mean(struct sftp_hpn_conn *hpn)
 }
 
 /* Feed one WRITE ack of len payload bytes into the controller: roll the
- * per-second rate bucket into the ring, hold off until a full pipeline
- * of num_requests has been acked and the grace period has passed, and
- * re-arm the actuator on the ARM_MS cadence. Called from the upload
- * ack-reap paths in sftp-client.c. There are extensive comments in this
- * because it's not necessarily transparent what we are doing or why. */
+ * per-second rate bucket into the ring, hold off until a full pipeline at
+ * the read-ahead controller's current depth has been acked and the grace
+ * period has passed, and re-arm the actuator on the ARM_MS cadence. The
+ * depth, not the -R ceiling, sets the wait, because a derived ceiling can
+ * be far deeper than the pipeline in use. Called from the upload ack-reap
+ * paths in sftp-client.c. There are extensive comments in this because
+ * it's not necessarily transparent what we are doing or why. */
 void
-sftp_conn_pace_ack(struct sftp_conn *conn, size_t len, u_int num_requests)
+sftp_conn_pace_ack(struct sftp_conn *conn, size_t len)
 {
 	struct sftp_hpn_conn *hpn = sftp_conn_hpn(conn);
 	uint64_t now_ms, elapsed_ms, bucket_rate, mean_rate, target_rate;
@@ -1108,7 +1127,7 @@ sftp_conn_pace_ack(struct sftp_conn *conn, size_t len, u_int num_requests)
 	hpn->pace.bucket_start_ms = now_ms;
 
 	if (!hpn->pace.active) {
-		if (hpn->pace.acks < num_requests ||
+		if (hpn->pace.acks < sftp_conn_rdahead_cap(conn) ||
 		    now_ms - hpn->pace.first_ack_ms <
 		    PACE_SKIP_MS + PACE_GRACE_MS)
 			return;

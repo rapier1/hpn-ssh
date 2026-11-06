@@ -56,9 +56,8 @@
 /*
  * Bundle codec output block size.  Each block becomes one SSH_FXP_WRITE
  * message on the upload path; on the download path it's the chunk
- * size for reading the packed bundle buffer.  128 KiB matches
- * DEFAULT_TRANSFER_BUFLEN.  Both ends use the same value so block
- * alignment is consistent across pack/unpack.
+ * size for reading the packed bundle buffer.  Both ends use the same
+ * value so block alignment is consistent across pack/unpack.
  */
 #define HPN_BUNDLE_BLOCK_BYTES     (128 * 1024)
 

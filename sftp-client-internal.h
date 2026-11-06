@@ -116,6 +116,16 @@ uint64_t sftp_conn_watchdog_pause_until_ms(struct sftp_conn *);
 void sftp_conn_watchdog_pause(struct sftp_conn *, unsigned int);
 void sftp_conn_watchdog_resume(struct sftp_conn *);
 
+/* The most requests the derived default allows in flight, and the upper
+ * bound on -X nrequests. A test at 32 KB messages found no stall up to
+ * 32768. */
+#define SFTP_HPN_MAX_REQUESTS	16384
+
+/* The request ceiling for a connection: a caller's num_requests as given,
+ * else enough messages of msgsize bytes to fill the largest channel
+ * window, up to SFTP_HPN_MAX_REQUESTS. */
+u_int	sftp_hpn_request_ceiling(u_int, u_int);
+
 /* Adaptive read-ahead controller. init seeds it with the connection's
  * num_requests, the -R cap. account feeds it the bytes of each completed
  * request and resizes the in-flight depth at window boundaries. cap
@@ -138,13 +148,13 @@ uint32_t sftp_conn_rdahead_window(struct sftp_conn *, size_t);
 void sftp_conn_rdahead_backpressure_signal(struct sftp_conn *);
 
 /* Adaptive upload pacing (see the pace member of struct sftp_hpn_conn).
- * set_enabled is the -X Pacing= master switch, on by default. ack feeds
- * one WRITE status's payload bytes, with the request depth, to the rate
- * estimator. bwlimit returns the token bucket the outbound path applies:
+ * set_enabled is the -X Pacing= master switch, off by default. ack feeds
+ * one WRITE status's payload bytes to the rate estimator. bwlimit
+ * returns the token bucket the outbound path applies:
  * the tighter of the adaptive ceiling and the user's -l bucket and rate,
  * or NULL for no limit. */
 void sftp_hpn_pace_set_enabled(int);
-void sftp_conn_pace_ack(struct sftp_conn *, size_t, u_int);
+void sftp_conn_pace_ack(struct sftp_conn *, size_t);
 struct bwlimit *sftp_conn_pace_bwlimit(struct sftp_conn *, struct bwlimit *,
     uint64_t);
 

@@ -91,11 +91,12 @@ struct stat;
 
 /* Adaptive SFTP read-ahead controller.
  *
- * The stock client keeps a fixed pipeline of num_requests (-R, default
- * 1024) outstanding 128 KB requests, about 128 MB in flight per
- * connection. The receive side must buffer all of it, so on a fat pipe
- * with N parallel workers the process RSS and the kernel SO_RCVBUF grow
- * into the gigabytes, far past what throughput needs.
+ * The stock client keeps a fixed pipeline of num_requests (-R)
+ * outstanding requests. The default ceiling here is sized to fill a
+ * 512 MB channel window, and the receive side must buffer whatever is in
+ * flight, so on a fat pipe with N parallel workers a fixed pipeline at
+ * the ceiling would grow the process RSS and the kernel SO_RCVBUF into
+ * the gigabytes, far past what throughput needs.
  *
  * This controller instead probes for the smallest depth that saturates
  * the path. Over a sliding window of one depth's worth of completed

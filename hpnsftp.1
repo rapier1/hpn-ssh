@@ -136,7 +136,8 @@ Specify the size of the buffer that
 uses when transferring files.
 Larger buffers require fewer round trips at the cost of higher
 memory consumption.
-The default is 32768 bytes.
+The default is the largest size the server advertises, up to 261120
+bytes, or 32768 bytes for a server that advertises none.
 .It Fl b Ar batchfile
 Batch mode reads a series of commands from an input
 .Ar batchfile
@@ -477,8 +478,8 @@ diagnostic messages from
 Specify how many requests may be outstanding at any one time.
 Increasing this may slightly improve file transfer speed
 but will increase memory usage.
-The default is 1024 outstanding requests providing for 32MB
-of outstanding data with a 32KB buffer.
+By default enough requests may be outstanding to keep 512MB in flight
+at the buffer size in use, up to 16384.
 .It Fl r
 Recursively copy entire directories when uploading and downloading.
 Note that
@@ -581,13 +582,15 @@ The valid options, whose names and values are case-insensitive, are:
 .It Cm nrequests Ns = Ns Ar value
 Controls how many concurrent SFTP read or write requests may be in progress
 at any point in time during a download or upload.
-This value must be between 1 and 8192.
-By default 1024 requests may be active concurrently.
+This value must be between 1 and 16384.
+By default enough requests may be active to keep 512MB in flight at the
+buffer size in use, up to 16384.
 .It Cm buffer Ns = Ns Ar value
 Controls the maximum buffer size for a single SFTP read/write operation used
 during download or upload. This value must be between 1B and 255KB. You may use
 the K unit for the size. E.g. 32768 or 32K.
-By default a 32KB buffer is used.
+By default the largest size the server advertises is used, up to 255KB,
+or 32KB for a server that advertises none.
 .It Cm VerifyRepair Ns = Ns Cm yes Ns | Ns Cm no
 When transfer verification is enabled, controls whether a verification
 failure is automatically repaired by re-transferring and re-verifying only
@@ -608,16 +611,17 @@ recovery, collapsing throughput into a stall-and-recover cycle.
 With pacing enabled the client continuously measures the rate at which the
 server acknowledges writes and limits its sending rate to slightly above
 that measured rate, keeping the destination out of the stall regime.
-The limit adapts per file and only takes effect when the destination is the
-bottleneck; transfers to destinations that can keep up with the network are
-not affected.
+The limit is re-measured every two seconds.
+Pacing can also slow transfers to destinations that keep up with the
+network, so it is best enabled only for a destination known to be slower
+than the network path.
 The first seconds of a connection are excluded from measurement and short
 transfers are never paced.
 An explicit
 .Fl l
 limit takes precedence when it is lower.
 The default is
-.Cm yes .
+.Cm no .
 .It Cm TransferLog Ns Op = Ns Ar path
 Appends one tab-delimited line per file
 .Pq status, size, path

@@ -358,11 +358,6 @@ spawn_one_worker(struct sftp_parallel *fleet)
 	worker->ssh_pid = -1;
 	pthread_mutex_init(&worker->mu, NULL);
 
-	u_int buflen = fleet->cfg.transfer_buflen ?
-	    fleet->cfg.transfer_buflen : DEFAULT_TRANSFER_BUFLEN;
-	u_int nreq = fleet->cfg.num_requests ?
-	    fleet->cfg.num_requests : DEFAULT_NUM_REQUESTS;
-
 	if (spawn_worker_ssh(&fleet->cfg,
 	    &worker->fd_in, &worker->fd_out, &worker->ssh_pid) != 0) {
 		error_ft("ssh spawn failed");
@@ -386,7 +381,9 @@ spawn_one_worker(struct sftp_parallel *fleet)
 	registered = 1;
 	if (fleet->abort_flag || fleet->stopped)
 		goto fail;
-	worker->conn = sftp_init(worker->fd_in, worker->fd_out, buflen, nreq,
+	/* 0 lets sftp_init size both, as it does on the serial path */
+	worker->conn = sftp_init(worker->fd_in, worker->fd_out,
+	    fleet->cfg.transfer_buflen, fleet->cfg.num_requests,
 	    fleet->cfg.limit_kbps);
 	spawning_pid_deregister(fleet, worker->ssh_pid);
 	registered = 0;
