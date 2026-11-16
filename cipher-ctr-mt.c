@@ -34,6 +34,9 @@
 #include "xmalloc.h"
 #include "log.h"
 #include <unistd.h>
+/* Report a failed uthash allocation the way xmalloc does, not with a silent
+ * exit. */
+#define uthash_fatal(msg)	fatal("%s", msg)
 #include "uthash.h"
 
 /* compatibility with old or broken OpenSSL versions */

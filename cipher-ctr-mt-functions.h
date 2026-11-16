@@ -30,6 +30,10 @@
 #include <sys/types.h>
 #include <pthread.h>
 #include "cipher-aesctr.h"
+#include "log.h"
+/* Report a failed uthash allocation the way xmalloc does, not with a silent
+ * exit. */
+#define uthash_fatal(msg)	fatal("%s", msg)
 #include "uthash.h"
 
 #ifndef USE_BUILTIN_RIJNDAEL
