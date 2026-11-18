@@ -130,29 +130,30 @@ typedef struct {
 	int     none_enabled;   /* Allow none to be used */
 	int     nonemac_enabled;   /* Allow none to be used */
 	int     hpn_use_bundle;    /* Use hpn-bundle SFTP extension for small-file
-				    * aggregation in hpnsftp (default: yes).
-				    * Only consulted by hpnsftp; hpnssh ignores. */
+				    * aggregation in hpnsftp and hpnscp
+				    * (default: yes). hpnssh ignores it. */
 	int     hpn_writer_pool;   /* Use the bundle writer pool (default: yes).
 				    * Off -> request serial extract (NO_POOL flag
 				    * on upload; client download pool skipped). */
 	int     hpn_tail_redistribute; /* Arm phase-C tail redistribution -
 				    * cooperative yield of a confirmed-lagging
 				    * endgame holder (default: yes). Client-only. */
-	int     hpn_max_retries;   /* Retry budget per work unit in hpnsftp's
-				    * parallel orchestrator.  Default 3,
-				    * clamped to [1, 20].  Only consulted by
-				    * hpnsftp; hpnssh ignores. */
-	int     hpn_stall_abort_timeout; /* hpnsftp fleet zero-progress abort
-				    * window in seconds.  Default 60; 0
-				    * disables the abort.  Only consulted by
-				    * hpnsftp; hpnssh ignores. */
-	int64_t hpn_bundle_size;   /* Bundle-mode target accumulator size in
-				    * bytes, hpnsftp client side.  Default
-				    * 4 MiB, clamped to [64 KiB, 64 MiB].
+	int     hpn_max_retries;   /* Retry budget per work unit in the -j
+				    * orchestrator of hpnsftp and hpnscp.
+				    * Default 3, clamped to [1, 20]. hpnssh
+				    * ignores it. */
+	int     hpn_stall_abort_timeout; /* -j fleet zero-progress abort
+				    * window in seconds, hpnsftp and hpnscp.
+				    * Default 60, and 0 disables the abort.
+				    * hpnssh ignores it. */
+	int64_t hpn_bundle_size;   /* Bundle target size in bytes, hpnsftp
+				    * and hpnscp. Default and clamp range are
+				    * HPN_BUNDLE_SIZE_* in defines.h.
 				    * -1 = unset (use compile-time default). */
 	int     hpn_max_auth_concurrent; /* Max concurrent worker SSH children
-					  * in the auth phase, hpnsftp client.
-					  * Default 8, clamped to [1, 64]. */
+					  * in the auth phase, hpnsftp and
+					  * hpnscp -j. Default 8, clamped to
+					  * [1, 64]. */
 	int     hpn_lustre_stripe_count; /* HPNLustreStripeCount (EXPERIMENTAL):
 					  * Lustre layout for destination dirs on
 					  * parallel (-j N) uploads.  -1 = auto

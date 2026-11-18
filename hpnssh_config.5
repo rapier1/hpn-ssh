@@ -1263,7 +1263,9 @@ HPNSSH only.
 .It Cm HPNMaxAuthConcurrent
 Caps the number of worker SSH children
 .Xr hpnsftp 1
-allows in the authentication phase simultaneously when running with
+and
+.Xr hpnscp 1
+allow in the authentication phase simultaneously when running with
 .Cm -j
 parallel streams.  Workers are spawned in parallel up to this limit;
 additional workers wait for an authentication slot before starting.
@@ -1280,12 +1282,16 @@ emitted on standard error. The default is
 (safely below the typical
 .Cm MaxStartups
 start-throttling threshold).  Consulted only by
-.Xr hpnsftp 1 ;
+.Xr hpnsftp 1
+and
+.Xr hpnscp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
 .It Cm HPNMaxRetries
 Sets the per-file retry budget used by
 .Xr hpnsftp 1
+and
+.Xr hpnscp 1
 when running with
 .Cm -j
 parallel streams. A failed transfer (transient transport error, server
@@ -1302,7 +1308,9 @@ inclusive; values outside this range are clamped and a warning is
 emitted on standard error. The default is
 .Cm 3
 (one initial attempt plus two retries). Consulted only by
-.Xr hpnsftp 1 ;
+.Xr hpnsftp 1
+and
+.Xr hpnscp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
 .It Cm HPNMemoryLimit
@@ -1379,6 +1387,8 @@ HPNSSH only.
 .It Cm HPNStallAbortTimeout
 Sets how many seconds the
 .Xr hpnsftp 1
+or
+.Xr hpnscp 1
 parallel-streams fleet may make zero aggregate progress before the transfer
 is aborted as unrecoverable. The abort is deliberately conservative: it fires
 only when the whole fleet has moved no data for this many seconds
@@ -1397,15 +1407,19 @@ is
 Operators on backends that legitimately pause for long periods (for example
 a filesystem recovering, or tape-backed storage staging data) may wish to
 raise it. Consulted only by
-.Xr hpnsftp 1 ;
+.Xr hpnsftp 1
+and
+.Xr hpnscp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
 .It Cm HPNTailRedistribute
 Controls whether
-.Xr hpnsftp 1 ,
+.Xr hpnsftp 1
+and
+.Xr hpnscp 1 ,
 when transferring with
 .Cm -j
-parallel streams, redistributes work away from a confirmed-lagging stream at the
+parallel streams, redistribute work away from a confirmed-lagging stream at the
 tail of a transfer. Near the end of a transfer one slow stream can be left
 holding the last of its range while faster streams sit idle; when enabled, the
 orchestrator detects that case and asks the lagging stream to cooperatively
@@ -1417,7 +1431,9 @@ or
 The default is
 .Cm yes .
 Consulted only by
-.Xr hpnsftp 1 ;
+.Xr hpnsftp 1
+and
+.Xr hpnscp 1 ;
 .Xr hpnssh 1
 itself ignores this option. HPNSSH only.
 .It Cm HPNFailureLog
