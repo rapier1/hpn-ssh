@@ -1511,6 +1511,14 @@ sftp_parallel_submit_upload(struct sftp_parallel *fleet, struct sftp_conn *conn,
 	mode_t mode;
 	int rc;
 
+	/* The walkers pass only regular files, but a glob or single-file
+	 * caller passes whatever matched. Refuse what sftp_upload refuses,
+	 * with its message. */
+	if ((src_attrs->flags & SSH2_FILEXFER_ATTR_PERMISSIONS) &&
+	    !S_ISREG(src_attrs->perm)) {
+		error("local \"%s\" is not a regular file", local_path);
+		return -1;
+	}
 	submit_attrs(src_attrs, &size, &mode, &final_attrs);
 
 	/* A new command is submitting, so demote walker-phase DONE back to
@@ -1595,6 +1603,12 @@ sftp_parallel_submit_download(struct sftp_parallel *fleet,
 	mode_t mode;
 	int rc;
 
+	/* As in sftp_parallel_submit_upload, with sftp_download's message. */
+	if ((src_attrs->flags & SSH2_FILEXFER_ATTR_PERMISSIONS) &&
+	    !S_ISREG(src_attrs->perm)) {
+		error("download %s: not a regular file", remote_path);
+		return -1;
+	}
 	submit_attrs(src_attrs, &size, &mode, &final_attrs);
 
 	/* Demote DONE back to SUBMIT (see sftp_parallel_submit_upload). */

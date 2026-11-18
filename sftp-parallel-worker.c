@@ -1314,15 +1314,12 @@ worker_should_terminate(struct sftp_worker *worker)
 		pthread_mutex_unlock(&fleet->workers_mu);
 
 		if (total >= 2) {
-			fatal("worker %d: protocol violation #%d in "
-			    "this session - sustained pattern, "
-			    "aborting hpnsftp (possible server "
-			    "corruption, MITM, or persistent "
-			    "hardware fault)", worker->id, total);
+			fatal("worker %d: repeated protocol violations, "
+			    "aborting", worker->id);
 		}
-		error_f("worker %d: protocol violation #%d - killing "
-		    "worker and respawning; one more this session "
-		    "will exit hpnsftp", worker->id, total);
+		error_f("worker %d: protocol violation, restarting the "
+		    "worker. A second violation will abort the session.",
+		    worker->id);
 		return 1;	/* the conn is dead either way */
 	}
 

@@ -30,7 +30,7 @@
 .Nd /HPNOpenSSH secure file transfer
 .Sh SYNOPSIS
 .Nm hpnsftp
-.Op Fl 46AaCfNpqrv
+.Op Fl 46AaCfNpqrVv
 .Op Fl B Ar buffer_size
 .Op Fl b Ar batchfile
 .Op Fl c Ar cipher
@@ -47,7 +47,9 @@
 .Op Fl S Ar program
 .Op Fl s Ar subsystem | sftp_server
 .Op Fl W Ar worker_log_dir
+.Op Fl w Ar writers_per_file
 .Op Fl X Ar sftp_option
+.Op Fl z Ar level
 .Ar destination
 .Sh DESCRIPTION
 .Nm
@@ -176,12 +178,26 @@ Echo of the command may be suppressed by prefixing the command with a
 character.
 These two prefixes may be combined in any order, for example
 .Ic -@ls /bsd .
+.Pp
+With
+.Fl j ,
+batch mode defers
+.Ic get
+and
+.Ic put
+(see
+.Ic defer ) .
+A failed transfer then aborts the batch at the next
+.Ic wait
+or
+.Ic defer Cm off ,
+or at the end of the batch, rather than at the command that queued it.
 .It Fl C
 Enables compression (via hpnssh's
 .Fl C
 flag).
 .It Fl z Ar level
-HPN: use zstd transport compression
+Use zstd transport compression
 .Pq Cm zstd@hpnssh.org
 at the given
 .Ar level
@@ -245,8 +261,7 @@ Each worker establishes its own SSH connection to the destination and
 operates a private SFTP session; the orchestrator distributes work
 units (whole files, small-file bundles, or byte-range chunks of large
 files) across them.
-Must be between 1 and 24; values outside this range are clamped at
-parse time.
+Must be between 1 and 24.
 .Pp
 Each worker authenticates its own connection with no terminal attached,
 so
@@ -326,17 +341,18 @@ hint noted above.
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
 .It Fl M Ar range_split_min_mb
-Set the minimum file size (in MiB) at which an individual file will be
-split into byte ranges across parallel workers.
-Files at or below this size are uploaded as a single whole-file work unit
-by one worker; files larger than this are split into byte ranges so that
-multiple workers cooperate on the same file.
+Set the minimum size, in MiB, of the byte ranges a large file is split
+into so that several parallel workers transfer it together.
+This applies to uploads and downloads alike.
+A file is split only when it is at least twice this size, into as many
+ranges of at least this size as fit.
+A smaller file goes whole to a single worker.
 Must be in the range
 .Bq 64, 10240
 MiB.
-The default is 2048 MiB (2 GiB).
+The default is 2048 MiB (2 GiB), so files under 4 GiB are not split.
 Lowering this value increases per-file parallelism at the cost of additional
-open/close round-trips per chunk; raising it favours whole-file uploads,
+open/close round-trips per range; raising it favours whole-file transfers,
 which trade per-file parallelism for fewer round-trips and lower
 filesystem-side commit serialization.
 This flag only takes effect together with
@@ -529,10 +545,14 @@ child's standard error stream to
 so a clear per-worker log is available when reporting failures
 or when developers ask the user to capture worker output.
 .Pp
+If
 .Ar worker_log_dir
-must already exist and be writable;
+does not exist,
 .Nm
-exits with a fatal error otherwise.
+creates it, along with any missing parents.
+.Nm
+exits with a fatal error if it cannot create the directory, or if the
+path is not a writable directory.
 A common choice is
 .Pa /tmp ,
 but any directory the user can write to (for example
@@ -760,10 +780,27 @@ first drains any outstanding transfers
 .Pq a synchronisation barrier
 and then restores blocking behaviour.
 With no argument the current setting is printed.
-Deferral is enabled automatically in batch mode
-.Pq Fl b ;
-disable it mid-batch when a command depends on earlier transfers having
-completed.
+Deferral has no effect without
+.Fl j ,
+and is enabled automatically in batch mode
+.Pq Fl b .
+.Pp
+While deferral is on, other commands run at once and do not wait for
+queued transfers.
+A command that uses a file a queued transfer is still writing may find it
+missing or incomplete.
+The same applies to a
+.Ic get
+of a file queued by an earlier
+.Ic put .
+Run
+.Ic wait
+before such a command.
+A failed transfer is reported at the next
+.Ic wait
+or
+.Ic defer Cm off ,
+or at the end of the session, rather than by the command that queued it.
 .It Xo Ic df
 .Op Fl hi
 .Op Ar path

@@ -476,14 +476,12 @@ get_status(struct sftp_conn *conn, u_int expected_id)
 	}
 
 	if (id != expected_id) {
-		error_f("ID mismatch (%u != %u) - possible MITM or "
-		    "server protocol corruption", id, expected_id);
+		error_f("ID mismatch (%u != %u)", id, expected_id);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return SSH2_FX_CONNECTION_LOST;
 	}
 	if (type != SSH2_FXP_STATUS) {
-		error_f("expected SSH2_FXP_STATUS(%u) packet, got %u - "
-		    "possible MITM or server protocol corruption",
+		error_f("expected SSH2_FXP_STATUS(%u) packet, got %u",
 		    SSH2_FXP_STATUS, type);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return SSH2_FX_CONNECTION_LOST;
@@ -530,8 +528,7 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 	}
 
 	if (id != expected_id) {
-		error("%s: ID mismatch (%u != %u) - possible MITM or "
-		    "server protocol corruption",
+		error("%s: ID mismatch (%u != %u)",
 		    errfmt == NULL ? __func__ : errmsg, id, expected_id);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return NULL;
@@ -547,8 +544,7 @@ get_handle(struct sftp_conn *conn, u_int expected_id, size_t *len,
 			error("%s: %s", errmsg, fx2txt(status));
 		return NULL;
 	} else if (type != SSH2_FXP_HANDLE) {
-		error("%s: expected SSH2_FXP_HANDLE(%u) packet, got %u - "
-		    "possible MITM or server protocol corruption",
+		error("%s: expected SSH2_FXP_HANDLE(%u) packet, got %u",
 		    errfmt == NULL ? __func__ : errmsg, SSH2_FXP_HANDLE, type);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return NULL;
@@ -587,8 +583,7 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 	}
 
 	if (id != expected_id) {
-		error_f("ID mismatch (%u != %u) - possible MITM or "
-		    "server protocol corruption", id, expected_id);
+		error_f("ID mismatch (%u != %u)", id, expected_id);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
 	}
@@ -606,8 +601,7 @@ get_decode_stat(struct sftp_conn *conn, u_int expected_id, int quiet, Attrib *a)
 			error("stat remote: %s", fx2txt(status));
 		return -1;
 	} else if (type != SSH2_FXP_ATTRS) {
-		error_f("expected SSH2_FXP_ATTRS(%u) packet, got %u - "
-		    "possible MITM or server protocol corruption",
+		error_f("expected SSH2_FXP_ATTRS(%u) packet, got %u",
 		    SSH2_FXP_ATTRS, type);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
@@ -649,8 +643,7 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 
 	debug3("Received statvfs reply T:%u I:%u", type, id);
 	if (id != expected_id) {
-		error_f("ID mismatch (%u != %u) - possible MITM or "
-		    "server protocol corruption", id, expected_id);
+		error_f("ID mismatch (%u != %u)", id, expected_id);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
 	}
@@ -668,8 +661,7 @@ get_decode_statvfs(struct sftp_conn *conn, struct sftp_statvfs *st,
 			error("remote statvfs: %s", fx2txt(status));
 		return -1;
 	} else if (type != SSH2_FXP_EXTENDED_REPLY) {
-		error_f("expected SSH2_FXP_EXTENDED_REPLY(%u) packet, "
-		    "got %u - possible MITM or server protocol corruption",
+		error_f("expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
 		    SSH2_FXP_EXTENDED_REPLY, type);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
@@ -992,8 +984,7 @@ sftp_get_limits(struct sftp_conn *conn, struct sftp_limits *limits)
 
 	debug3("Received limits reply T:%u I:%u", type, msg_id);
 	if (id != msg_id) {
-		error_f("ID mismatch (%u != %u) - possible protocol corruption",
-		    msg_id, id);
+		error_f("ID mismatch (%u != %u)", msg_id, id);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return -1;
 	}
@@ -1112,8 +1103,7 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 		debug3("Received reply T:%u I:%u", type, id);
 
 		if (id != expected_id) {
-			error_f("ID mismatch (%u != %u) - possible protocol corruption",
-			    id, expected_id);
+			error_f("ID mismatch (%u != %u)", id, expected_id);
 			sftp_conn_set_protocol_violation(conn); /* HPN */
 			goto out;
 		}
@@ -1132,8 +1122,8 @@ sftp_lsreaddir(struct sftp_conn *conn, const char *path, int print_flag,
 			error("Couldn't read directory: %s", fx2txt(rstatus));
 			goto out;
 		} else if (type != SSH2_FXP_NAME) {
-			error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
-			    "possible protocol corruption", SSH2_FXP_NAME, type);
+			error_f("Expected SSH2_FXP_NAME(%u) packet, got %u",
+			    SSH2_FXP_NAME, type);
 			sftp_conn_set_protocol_violation(conn); /* HPN */
 			goto out;
 		}
@@ -1595,8 +1585,7 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 	}
 
 	if (id != expected_id) {
-		error_f("ID mismatch (%u != %u) - possible protocol corruption",
-		    id, expected_id);
+		error_f("ID mismatch (%u != %u)", id, expected_id);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return NULL;
 	}
@@ -1616,8 +1605,8 @@ sftp_realpath_expand(struct sftp_conn *conn, const char *path, int expand)
 		free(errmsg);
 		return NULL;
 	} else if (type != SSH2_FXP_NAME) {
-		error_f("Expected SSH2_FXP_NAME(%u) packet, got %u - "
-		    "possible protocol corruption", SSH2_FXP_NAME, type);
+		error_f("Expected SSH2_FXP_NAME(%u) packet, got %u",
+		    SSH2_FXP_NAME, type);
 		sftp_conn_set_protocol_violation(conn); /* HPN */
 		return NULL;
 	}
@@ -2604,8 +2593,8 @@ sftp_download(struct sftp_conn *conn, const char *remote_path,
 			}
 			break;
 		default:
-			error_f("Expected SSH2_FXP_DATA(%u) packet, got %u - "
-			    "possible protocol corruption", SSH2_FXP_DATA, type);
+			error_f("Expected SSH2_FXP_DATA(%u) packet, got %u",
+			    SSH2_FXP_DATA, type);
 			sftp_conn_set_protocol_violation(conn);
 			read_error = 1;
 			/* HPN: drain the queue here, so the loop ends at its
@@ -3596,8 +3585,7 @@ sftp_fs_info(struct sftp_conn *conn, const char *path,
 		return -1;
 	}
 	if (msg_id != id) {
-		error_f("ID mismatch (%u != %u) - possible protocol corruption",
-		    msg_id, id);
+		error_f("ID mismatch (%u != %u)", msg_id, id);
 		sftp_conn_set_protocol_violation(conn);
 		sshbuf_free(msg);
 		return -1;
@@ -4208,8 +4196,7 @@ sftp_download_range(struct sftp_conn *conn, const char *remote_path,
 			break;
 		}
 		default:
-			error_f("expected SSH2_FXP_DATA(%u) packet, got %u - "
-			    "possible protocol corruption",
+			error_f("expected SSH2_FXP_DATA(%u) packet, got %u",
 			    SSH2_FXP_DATA, type);
 			sftp_conn_set_protocol_violation(conn);
 			read_error = 1;
@@ -4810,8 +4797,8 @@ handle_dest_replies(struct sftp_conn *to, const char *to_path, int synchronous,
 		}
 		debug3("Received dest reply T:%u I:%u R:%u", type, id, *nreqsp);
 		if (type != SSH2_FXP_STATUS) {
-			error_f("Expected SSH2_FXP_STATUS(%d) packet, got %d - "
-			    "possible protocol corruption", SSH2_FXP_STATUS, type);
+			error_f("Expected SSH2_FXP_STATUS(%d) packet, got %d",
+			    SSH2_FXP_STATUS, type);
 			goto violation;
 		}
 		if ((r = sshbuf_get_u32(msg, &status)) != 0) {
@@ -5099,8 +5086,8 @@ sftp_crossload(struct sftp_conn *from, struct sftp_conn *to,
 			}
 			break;
 		default:
-			error_f("Expected SSH2_FXP_DATA(%u) packet, got %u - "
-			    "possible protocol corruption", SSH2_FXP_DATA, type);
+			error_f("Expected SSH2_FXP_DATA(%u) packet, got %u",
+			    SSH2_FXP_DATA, type);
 			sftp_conn_set_protocol_violation(from);
 			read_error = 1;
 			/* HPN: drain the queue here, so the loop ends at its
@@ -5359,8 +5346,7 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 		goto violation;
 	}
 	if (id != expected_id) {
-		error_f("ID mismatch (%u != %u) - possible protocol corruption",
-		    id, expected_id);
+		error_f("ID mismatch (%u != %u)", id, expected_id);
 		goto violation;
 	}
 	if (type == SSH2_FXP_STATUS) {
@@ -5377,8 +5363,8 @@ sftp_get_users_groups_by_id(struct sftp_conn *conn,
 		free(errmsg);
 		goto out;	/* HPN */
 	} else if (type != SSH2_FXP_EXTENDED_REPLY) {
-		error_f("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u - "
-		    "possible protocol corruption", SSH2_FXP_EXTENDED_REPLY, type);
+		error_f("Expected SSH2_FXP_EXTENDED_REPLY(%u) packet, got %u",
+		    SSH2_FXP_EXTENDED_REPLY, type);
 		goto violation;
 	}
 

@@ -96,8 +96,8 @@ struct sftp_hpn_dirattr_list;	/* deferred dir attrs */
  * -- Bundle-mode (hpn-bundle@hpnssh.org) tunables ------------------------
  *
  * Target bundle size: default/min/max alias HPN_BUNDLE_SIZE_* from
- * defines.h. Overridden by HPNBundleSize in ssh_config, --bundle-size
- * on hpnsftp, or -o HPNBundleSize=N; clamped to [MIN, MAX]. The
+ * defines.h. Overridden by HPNBundleSize in ssh_config or
+ * -o HPNBundleSize=N; clamped to [MIN, MAX]. The
  * eligibility policy and per-bundle ceilings live in sftp-hpn-bundle.h.
  */
 #define BUNDLE_TARGET_BYTES_DEFAULT  HPN_BUNDLE_SIZE_DEFAULT
@@ -981,12 +981,15 @@ struct sftp_parallel {
 	/* Transfer total to restore. */
 	off_t                       progress_total_bytes;
 	char                        progress_label_saved[128];
-	/* Deferred file-count verb for the parallel download meter. Empty
-	 * unless the client deferred its count (a directory download, where the
-	 * real file count is unknown until the tree walk ends); set by
-	 * sftp_parallel_progress_start_counted, consumed by _set_total to
-	 * rewrite the label to "<verb> N files in parallel". */
+	/* The verb of the meter's label, such as "Fetching". Set by
+	 * sftp_parallel_progress_start_counted and _progress_add. When a walk
+	 * or a joining command adds files, the reporter rewrites the label to
+	 * "<verb> N files in parallel". Empty for a meter started by
+	 * _progress_start alone, whose label stays as given. */
 	char                        progress_verb[16];
+	/* A command with another verb joined the meter, so the rewrite uses
+	 * "Transferring". Main-set, reporter-read. */
+	int                         progress_mixed;
 	/* Post-transfer verify-phase meter (HPN). While active the reporter drives
 	 * aggregate_progress_counter from verify progress rather than the
 	 * transfer-byte snapshot, so the phase shows its own bar instead of a

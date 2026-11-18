@@ -704,7 +704,7 @@ or
 (the default).
 .Pp
 .It Cm ZstdLevel
-HPN: request zstd transport compression
+Request zstd transport compression
 .Pq Cm zstd@hpnssh.org
 at this level
 .Pq 1 No to No 19
@@ -1221,14 +1221,23 @@ of the HPN code produces a net decrease in performance. In these cases it is
 helpful to disable the HPN functionality. By default HPNDisabled is set to
 .Cm no. HPNSSH only.
 .It Cm HPNBundleSize
-Sets the bundle-mode target accumulator size for
+Sets the target size of a bundle, the tar stream in which
 .Xr hpnsftp 1
-when running with
-.Cm -j
-parallel streams and the server advertises the
+and
+.Xr hpnscp 1
+send small files together.
+A file joins a bundle when it is smaller than a quarter of this size.
+Without
+.Fl j ,
+only recursive transfers use bundles.
+With
+.Fl j ,
+any small file may join one.
+Bundling needs a server that advertises the
 .Cm hpn-bundle@hpnssh.org
-SFTP extension.  Each worker collects small files into a tar stream
-up to this many bytes before closing the bundle and starting a new one.
+SFTP extension for uploads, or
+.Cm hpn-bundle-fetch@hpnssh.org
+for downloads, and is not used when resuming.
 Larger values amortize per-bundle open/close cost across more files;
 smaller values keep server-side memory footprint lower.
 The argument is a byte count that accepts the standard
@@ -1248,10 +1257,9 @@ inclusive are clamped and a warning is emitted on standard error.
 The default is
 .Cm 32M
 which testing has shown to perform well across a range of path RTTs.
-Consulted only by
-.Xr hpnsftp 1 ;
 .Xr hpnssh 1
-itself ignores this option. HPNSSH only.
+itself ignores this option.
+HPNSSH only.
 .It Cm HPNMaxAuthConcurrent
 Caps the number of worker SSH children
 .Xr hpnsftp 1
@@ -1314,12 +1322,14 @@ HPNSSH only.
 .It Cm HPNUseBundle
 Controls whether
 .Xr hpnsftp 1
-aggregates small files into bundled tar streams (the
-.Cm hpn-bundle@hpnssh.org
-SFTP extension) when running with
-.Cm -j
-parallel streams. Bundling amortizes per-file open/close round-trip
-costs that dominate small-file throughput on high-RTT paths.
+and
+.Xr hpnscp 1
+send small files together in bundled tar streams.
+Bundling amortizes per-file open/close round-trip costs that dominate
+small-file throughput on high-RTT paths.
+See
+.Cm HPNBundleSize
+for which files and transfers use bundles.
 The argument must be
 .Cm yes
 or
@@ -1330,21 +1340,24 @@ When set to
 .Cm no ,
 or when the remote
 .Xr hpnsftp-server 8
-does not advertise the bundle extension, hpnsftp falls back to the
-per-file pipelined batch upload path. Consulted only by
-.Xr hpnsftp 1 ;
+does not advertise the bundle extensions, each file is transferred on its
+own.
 .Xr hpnssh 1
-itself ignores this option. HPNSSH only.
+itself ignores this option.
+HPNSSH only.
 .It Cm HPNWriterPool
 Controls whether
 .Xr hpnsftp 1
-uses a pool of writer threads when extracting bundled small-file transfers
-(the
-.Cm hpn-bundle@hpnssh.org
-SFTP extension). The pool overlaps the per-file open, write, and close
-operations that a serial extractor performs one at a time; on high-latency
-destinations such as a networked or Lustre filesystem those per-file
-round-trips are the small-file ceiling. The argument must be
+and
+.Xr hpnscp 1
+use a pool of writer threads when extracting bundles
+(see
+.Cm HPNBundleSize ) .
+The pool overlaps the per-file open, write, and close operations that a
+serial extractor performs one at a time; on high-latency destinations
+such as a networked or Lustre filesystem those per-file round-trips are
+the small-file ceiling.
+The argument must be
 .Cm yes
 or
 .Cm no .
@@ -1353,15 +1366,16 @@ The default is
 The setting applies in both directions: on download it controls the local
 extract pool, and on upload it asks the remote
 .Xr hpnsftp-server 8
-whether to use its extract pool. The server-side
+whether to use its extract pool.
+The server-side
 .Cm HPNWriterPool
 in
 .Xr hpnsshd_config 5
 takes precedence: if the operator disables the pool there, it stays off
-regardless of this option. Consulted only by
-.Xr hpnsftp 1 ;
+regardless of this option.
 .Xr hpnssh 1
-itself ignores this option. HPNSSH only.
+itself ignores this option.
+HPNSSH only.
 .It Cm HPNStallAbortTimeout
 Sets how many seconds the
 .Xr hpnsftp 1

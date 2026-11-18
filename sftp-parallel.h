@@ -94,9 +94,13 @@ struct Attrib;		/* sftp-common.h */
  * Override via -M MiB on the hpnsftp command line. Range [64, 10240] MiB
  * is enforced both at parse time and again in the resolver below.
  */
+#define RANGE_SPLIT_MIN_MB_FLOOR       64	/* -M bounds, in MiB */
+#define RANGE_SPLIT_MIN_MB_CEILING     10240
 #define RANGE_SPLIT_MIN_SIZE_DEFAULT   ((uint64_t)2048 * 1024 * 1024)
-#define RANGE_SPLIT_MIN_SIZE_FLOOR     ((uint64_t)64 * 1024 * 1024)
-#define RANGE_SPLIT_MIN_SIZE_CEILING   ((uint64_t)10240 * 1024 * 1024)
+#define RANGE_SPLIT_MIN_SIZE_FLOOR \
+    ((uint64_t)RANGE_SPLIT_MIN_MB_FLOOR * 1024 * 1024)
+#define RANGE_SPLIT_MIN_SIZE_CEILING \
+    ((uint64_t)RANGE_SPLIT_MIN_MB_CEILING * 1024 * 1024)
 
 /*
  * ENV-VAR HPN_PARALLEL_TRACE midstream-freeze probe (2026-06-05): the walker
@@ -293,9 +297,9 @@ struct sftp_parallel_stats {
 	 * units_failed_aggregate because they happen on the main thread
 	 * inside the walkers, not inside a worker. */
 	uint64_t walker_failures_aggregate;
-	int      protocol_violations; /* ID mismatches / bad packet types;
-				       * non-zero means the transfer was aborted
-				       * due to possible MITM or corruption */
+	/* Replies that broke the SFTP protocol, across all workers. A
+	 * worker that sees one is respawned, and the second is fatal. */
+	int      protocol_violations;
 	/* Lifetime worker respawn count for this orchestrator session.
 	 * Incremented atomically at respawn dispatch. Surfaced in the
 	 * end-of-transfer summary as the operator-visible signal for
@@ -348,8 +352,8 @@ void sftp_parallel_set_stall_defaults(struct sftp_parallel_config *pcfg);
 
 /*
  * Submit a work unit. These calls copy the path strings; the caller retains
- * ownership of its own buffers. Returns 0 on success, -1 if the orchestrator
- * is in shutdown / abort state.
+ * ownership of its own buffers. Returns 0 on success, -1 if the source is
+ * not a regular file or the orchestrator is in shutdown / abort state.
  *
  * On upload conn is optional: it queries stripe geometry and pre-creates
  * the remote file when speculative range-splitting applies, and NULL
@@ -381,6 +385,8 @@ int sftp_parallel_submit_download(struct sftp_parallel *fleet,
  */
 int sftp_parallel_preserve_flag(const struct sftp_parallel *fleet);
 int sftp_parallel_follow_link_flag(const struct sftp_parallel *fleet);
+/* Non-zero once the fleet has aborted, from an interrupt or a fleet
+ * failure. After sftp_parallel_wait, callers must not report success. */
 int sftp_parallel_is_aborting(const struct sftp_parallel *fleet);
 /* 1 iff the abort was caused by the user's interrupt (Ctrl-C) rather than a
  * fleet failure; drives interrupt-aware (calm) messaging in flush/walker. */
@@ -474,6 +480,10 @@ void sftp_parallel_set_preserve(struct sftp_parallel *fleet, int on);
  * No-op when fleet is NULL. */
 void sftp_parallel_set_fsync(struct sftp_parallel *, int);
 
+/* Clamp a requested -j worker count to the server's worker cap. Returns
+ * the count to use and logs when it is lower. */
+int sftp_parallel_cap_workers(struct sftp_conn *, int);
+
 /*
  * Register an app-layer round-trip-time estimate, in microseconds, for the
  * remote path. Sample it once on the control connection after
@@ -481,6 +491,10 @@ void sftp_parallel_set_fsync(struct sftp_parallel *, int);
  * "unknown". What the estimate feeds is documented at the definition.
  */
 void sftp_parallel_set_path_rtt(struct sftp_parallel *fleet, uint64_t rtt_us);
+
+/* Measure the path RTT on the control connection and pass it to
+ * sftp_parallel_set_path_rtt. Call once after sftp_parallel_start. */
+void sftp_parallel_sample_path_rtt(struct sftp_parallel *, struct sftp_conn *);
 
 /*
  * Drive the fleet's progress meter for the duration of an aggregate batch
@@ -505,23 +519,24 @@ void sftp_parallel_prewarm_fs_info(struct sftp_parallel *fleet,
 void sftp_parallel_await_capacity(struct sftp_parallel *fleet);
 void sftp_parallel_progress_start_counted(struct sftp_parallel *fleet,
     const char *verb, off_t total_bytes);
+/* Add one command's total and file count to the meter, starting it if
+ * none is running. A command joins a running meter under deferral. */
+void sftp_parallel_progress_add(struct sftp_parallel *, const char *,
+    off_t, int);
 void sftp_parallel_progress_stop(struct sftp_parallel *fleet);
-/* Scan a local path recursively; return total bytes of regular files and
- * optionally the file count via file_count_out (may be NULL). */
-off_t sftp_parallel_scan_upload_total(const char *src,
-    uint64_t *file_count_out);
+/* Scan a local path as the fleet's upload walk reads it. Returns the total
+ * bytes of the regular files the walk sends, and their count through the
+ * last argument when that is non-NULL. */
+off_t sftp_parallel_scan_upload_total(struct sftp_parallel *, const char *,
+    uint64_t *);
 
-/* Store the scan-time total file count (for the progress frames/meter). */
+/* Store the scan-time total file count for the status-relay frames. */
 void sftp_parallel_set_file_total(struct sftp_parallel *fleet, uint64_t total);
 
 /* Walker-authoritative per-file counts (for a final END-frame publish). */
 u_int sftp_parallel_files_submitted(struct sftp_parallel *fleet);
 u_int sftp_parallel_files_total(struct sftp_parallel *fleet);
 int sftp_parallel_files_total_known(struct sftp_parallel *fleet);
-
-/* Non-zero after wait if the run was aborted (interrupt / control-session
- * loss / fatal error) - callers must not report success. */
-int sftp_parallel_was_aborted(struct sftp_parallel *fleet);
 
 /*
  * Tear down: signal workers to exit, join all threads, close worker SSH

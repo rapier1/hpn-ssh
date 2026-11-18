@@ -58,76 +58,17 @@ typedef void EditLine;
 #include "sshbuf.h"
 #include "sftp-common.h"
 #include "sftp-client.h"
-#include "sftp-hpn-transferlog.h"
-#include "hpn-compress.h"		/* HPN: -z zstd level bounds */
-#include "sftp-client-internal.h"	/* the verify and Lustre accessors */
-#include "sftp-hpn-verify.h"		/* sftp_hpn_verify_repair_resolve */
 #include "sftp-usergroup.h"
-#include "sftp-lustre-client.h"	/* maybe_apply_lustre_layout_parent */
-#include "sftp-parallel.h"
-#include "progressmeter.h"	/* pm_mprintf */
+#include "sftp-hpn-transferlog.h"	/* HPN: -X TransferLog */
+#include "hpn-compress.h"	/* HPN: -z zstd level bounds */
+#include "sftp-client-internal.h"	/* HPN: sftp_conn accessors */
+#include "sftp-hpn-verify.h"	/* HPN: sftp_hpn_verify_repair_resolve */
+#include "sftp-lustre-client.h"	/* HPN: maybe_apply_lustre_layout_parent */
+#include "sftp-parallel.h"	/* HPN: -j parallel transfers */
+#include "progressmeter.h"	/* HPN: pm_mprintf */
 
 /* File to read commands from */
 FILE* infile;
-
-/* Parallel-streams orchestrator: NULL = single-stream (default) */
-static struct sftp_parallel *parallel_orch = NULL;
-static int parallel_num_streams = 1;
-/* 1 if the user explicitly passed -j N; 0 otherwise.  When 0, hpnsftp
- * runs as a plain single-stream client (no orchestrator, no autotuning) so
- * default behaviour matches upstream sftp.  -j N opts into the parallel
- * worker pool, which stays fixed at N for the lifetime of the transfer. */
-static int parallel_user_opt_in = 0;
-
-/* User-facing range-split minimum size, in MiB.  0 = unset (orchestrator
- * uses RANGE_SPLIT_MIN_SIZE_DEFAULT).  Set by -M flag.  Bounded to
- * [64, 10240] MiB at parse time. */
-static int range_split_min_mb_user = 0;
-
-/* User-facing per-inode concurrent range-writer cap.  0 = unset (orchestrator
- * uses HPN_RANGE_WRITERS_CAP_DEFAULT).  Set by -w flag; bounded to
- * [HPN_RANGE_WRITERS_CAP_FLOOR, HPN_RANGE_WRITERS_CAP_MAX] at parse time. */
-static int writers_cap_user = 0;
-
-/* Directory for per-worker SSH stderr capture, set by -W flag.  NULL = off
- * (production default - worker stderr is inherited so connection errors
- * reach the user's terminal).  When set, each parallel worker writes its
- * SSH child's stderr to <dir>/hpnssh-worker-<pid>.stderr.  Validated to be
- * an existing writable directory at parse time. */
-static const char *worker_log_dir = NULL;
-
-/*
- * When non-zero, process_put / process_get do NOT call sftp_parallel_wait
- * after submitting their files.  Submissions pile up in the queue and the
- * caller is responsible for calling parallel_flush() at the appropriate time
- * (typically end-of-batch).  Enabled automatically in batch mode so that
- *     put file1
- *     put file2
- *     put file3
- * pipelines all three files instead of serialising on each command's wait.
- *
- * Interactive mode leaves this at 0 by default - users expect their prompt
- * to come back when an upload completes.  A future "job submission mode" in
- * the interactive shell can flip this on per-session via the same hook.
- */
-static int defer_parallel_wait = 0;
-
-/*
- * Sticky session-wide failure flag.  parallel_flush sets this to 1
- * whenever it detects undelivered files (units_failed_aggregate or
- * walker_failures_aggregate > 0).  Consulted by interactive_loop's
- * final return so the process exits non-zero whenever ANY transfer
- * during the session lost data - even if a later command succeeded
- * and reset the local err counter.
- *
- * Why this exists: in interactive (non-batch) mode,
- * parse_dispatch_command intentionally returns 0 for failed individual
- * commands so the session continues to the next prompt.  That
- * swallows the per-command failure signal.  Batch mode propagates it
- * directly (err_abort = 1).  This flag is the bridge so the user
- * always gets a non-zero exit when data was lost, regardless of mode.
- */
-static int session_had_failure = 0;
 
 /* Are we in batchfile mode? */
 int batchmode = 0;
@@ -153,58 +94,8 @@ int global_pflag = 0;
 /* When this option is set, transfers will have fsync() called on each file */
 int global_fflag = 0;
 
-/*
- * Verify transfer: when enabled with -V, every successfully transferred
- * single-stream file is XXH3-verified end-to-end after transfer.  A mismatch does NOT abort -
- * it is logged loudly and recorded; at exit a summary is printed and the
- * process returns SFTP_EX_VERIFY_FAILED (57).
- */
-static int hpn_verify_transfer = 0;	/* session-global -V (program switch) */
-static int verify_flag_user = 0;	/* -V program switch -> hpn_verify_transfer */
-static char **verify_fail_list = NULL;
-static int verify_fail_count = 0;
-
-/* SIGINT received during command processing.  _Atomic (lock-free): set by the
- * signal handler and the main loop, read by parallel worker/reporter threads;
- * the qualifier makes those cross-thread reads race-free (was TSan-flagged). */
-_Atomic sig_atomic_t interrupted = 0;
-
-/*
- * Toggle the post-transfer whole-file verify phase for the next command on
- * both the single-stream connection and (when engaged) the parallel
- * orchestrator.  put/get/-V/getv/putv set it on; the resume verbs set it off
- * (they use the chunked-resume verify path instead).  Forward declaration of
- * parallel_orch is above; the accessors no-op on NULL.
- * Turning it on against a server that cannot verify prints
- * VERIFY_INCOMPAT_MSG and returns -1, so the caller fails only that
- * command and the session stays up. Returns 0 otherwise.
- */
-static int
-verify_set_for_command(struct sftp_conn *conn, int on)
-{
-	if (on && !sftp_conn_verify_transfer_supported(conn)) {
-		error("%s", VERIFY_INCOMPAT_MSG);
-		return -1;
-	}
-	sftp_conn_set_verify_transfer(conn, on);
-	if (parallel_orch != NULL)
-		sftp_parallel_set_verify_transfer(parallel_orch, on);
-	return 0;
-}
-
-/* Check before a resume verb that its -V can be honored. Verified resume
- * hashes the existing partial through hpn-check-file, so without that
- * extension this prints RESUME_INCOMPAT_MSG and returns -1, and the
- * caller fails only that command. Returns 0 otherwise. */
-static int
-resume_verify_check(struct sftp_conn *conn, int verify)
-{
-	if (verify && !sftp_conn_has_hpn_check_file(conn)) {
-		error("%s", RESUME_INCOMPAT_MSG);
-		return -1;
-	}
-	return 0;
-}
+/* SIGINT received during command processing */
+_Atomic sig_atomic_t interrupted = 0;	/* HPN: -j threads read it */
 
 /* I wish qsort() took a separate ctx for the comparison function...*/
 int sort_flag;
@@ -218,7 +109,6 @@ struct complete_ctx {
 
 int sftp_glob(struct sftp_conn *, const char *, int,
     int (*)(const char *, int), glob_t *); /* proto for sftp-glob.c */
-int sftp_glob_get_attrib(const char *, Attrib *);  /* proto for sftp-glob.c */
 
 extern char *__progname;
 
@@ -246,10 +136,8 @@ enum sftp_command {
 	I_CHMOD,
 	I_CHOWN,
 	I_COPY,
-	I_DEFER,
 	I_DF,
 	I_GET,
-	I_VGET,
 	I_HELP,
 	I_LCHDIR,
 	I_LINK,
@@ -260,20 +148,23 @@ enum sftp_command {
 	I_LUMASK,
 	I_MKDIR,
 	I_PUT,
-	I_VPUT,
 	I_PWD,
 	I_QUIT,
 	I_REGET,
-	I_VREGET,
 	I_RENAME,
 	I_REPUT,
-	I_VREPUT,
 	I_RM,
 	I_RMDIR,
 	I_SHELL,
 	I_SYMLINK,
 	I_VERSION,
 	I_PROGRESS,
+	/* HPN: getv, putv, regetv, reputv, defer and wait */
+	I_VGET,
+	I_VPUT,
+	I_VREGET,
+	I_VREPUT,
+	I_DEFER,
 	I_WAIT,
 };
 
@@ -298,12 +189,12 @@ static const struct CMD cmds[] = {
 	{ "chown",	I_CHOWN,	REMOTE,		NOARGS	},
 	{ "copy",	I_COPY,		REMOTE,		LOCAL	},
 	{ "cp",		I_COPY,		REMOTE,		LOCAL	},
-	{ "defer",	I_DEFER,	NOARGS,		NOARGS	},
+	{ "defer",	I_DEFER,	NOARGS,		NOARGS	},	/* HPN */
 	{ "df",		I_DF,		REMOTE,		NOARGS	},
 	{ "dir",	I_LS,		REMOTE,		NOARGS	},
 	{ "exit",	I_QUIT,		NOARGS,		NOARGS	},
 	{ "get",	I_GET,		REMOTE,		LOCAL	},
-	{ "getv",	I_VGET,		REMOTE,		LOCAL	},
+	{ "getv",	I_VGET,		REMOTE,		LOCAL	},	/* HPN */
 	{ "help",	I_HELP,		NOARGS,		NOARGS	},
 	{ "lcd",	I_LCHDIR,	LOCAL,		NOARGS	},
 	{ "lchdir",	I_LCHDIR,	LOCAL,		NOARGS	},
@@ -318,23 +209,150 @@ static const struct CMD cmds[] = {
 	{ "mput",	I_PUT,		LOCAL,		REMOTE	},
 	{ "progress",	I_PROGRESS,	NOARGS,		NOARGS	},
 	{ "put",	I_PUT,		LOCAL,		REMOTE	},
-	{ "putv",	I_VPUT,		LOCAL,		REMOTE	},
+	{ "putv",	I_VPUT,		LOCAL,		REMOTE	},	/* HPN */
 	{ "pwd",	I_PWD,		REMOTE,		NOARGS	},
 	{ "quit",	I_QUIT,		NOARGS,		NOARGS	},
 	{ "reget",	I_REGET,	REMOTE,		LOCAL	},
-	{ "regetv",	I_VREGET,	REMOTE,		LOCAL	},
+	{ "regetv",	I_VREGET,	REMOTE,		LOCAL	},	/* HPN */
 	{ "rename",	I_RENAME,	REMOTE,		REMOTE	},
 	{ "reput",	I_REPUT,	LOCAL,		REMOTE	},
-	{ "reputv",	I_VREPUT,	LOCAL,		REMOTE	},
+	{ "reputv",	I_VREPUT,	LOCAL,		REMOTE	},	/* HPN */
 	{ "rm",		I_RM,		REMOTE,		NOARGS	},
 	{ "rmdir",	I_RMDIR,	REMOTE,		NOARGS	},
 	{ "symlink",	I_SYMLINK,	REMOTE,		REMOTE	},
 	{ "version",	I_VERSION,	NOARGS,		NOARGS	},
-	{ "wait",	I_WAIT,		NOARGS,		NOARGS	},
+	{ "wait",	I_WAIT,		NOARGS,		NOARGS	},	/* HPN */
 	{ "!",		I_SHELL,	NOARGS,		NOARGS	},
 	{ "?",		I_HELP,		NOARGS,		NOARGS	},
 	{ NULL,		-1,		-1,		-1	}
 };
+
+/* HPN-SSH additions.
+ *
+ * The file-scope variables, struct and prototype in this block are
+ * HPN-specific with no upstream counterpart. They are collected here so
+ * the upstream declarations above keep their original order and OpenSSH
+ * merges do not collide with HPN code. */
+
+/* HPN: the -j orchestrator. NULL runs single-stream, the default. */
+static struct sftp_parallel *parallel_orch = NULL;
+
+/* HPN: worker count from -j. The first launch lowers it to the server's
+ * worker cap, or to HPN_NO_POLICY_WORKER_DEFAULT if the server advertises
+ * none. A failed launch resets it to 1. */
+static int parallel_num_streams = 1;
+
+/* HPN: set by -j. Without it there is no fleet and every transfer is
+ * single-stream. -j 1 still runs one worker. */
+static int parallel_user_opt_in = 0;
+
+/* HPN: -M minimum range size in MiB, bounded to [RANGE_SPLIT_MIN_MB_FLOOR,
+ * RANGE_SPLIT_MIN_MB_CEILING] at parse time. 0 means unset, and the fleet
+ * uses RANGE_SPLIT_MIN_SIZE_DEFAULT. */
+static int range_split_min_mb_user = 0;
+
+/* HPN: -w cap on concurrent range writers per file, bounded to
+ * [HPN_RANGE_WRITERS_CAP_FLOOR, HPN_RANGE_WRITERS_CAP_MAX] at parse time.
+ * 0 means unset, and the fleet uses HPN_RANGE_WRITERS_CAP_DEFAULT. */
+static int writers_cap_user = 0;
+
+/* HPN: -W directory for worker ssh stderr, one hpnssh-worker-<pid>.stderr
+ * file per worker. Parsing creates it if missing. NULL, the default, leaves
+ * worker stderr on the terminal. */
+static const char *worker_log_dir = NULL;
+
+/* HPN: when set, put and get return once their files are queued to the
+ * fleet instead of draining it, so successive commands pipeline. Other
+ * commands do not wait for the queue. Batch mode (-b) sets it and the
+ * defer command toggles it. The wait and defer off commands and the end
+ * of the session drain the queue. */
+static int defer_parallel_wait = 0;
+
+/* HPN: set when a -j drain finds files that were not delivered, including
+ * after an interrupt or a fleet abort. A failed command does not always
+ * end the session, so interactive_loop checks this to exit non-zero. */
+static int session_had_failure = 0;
+
+/* HPN: what parallel_flush has already reported for the current fleet:
+ * its stats at the last drain and whether its abort was reported. The
+ * fleet keeps both for its whole life, so each drain reports only what is
+ * new. parallel_orch_launch clears them for each new fleet. */
+static struct sftp_parallel_stats flushed_stats;
+static int flushed_abort = 0;
+
+/* HPN: -V, verify every transfer in the session. put/get -V and
+ * getv/putv turn verify on for one command through
+ * verify_set_for_command. */
+static int hpn_verify_transfer = 0;
+
+/* HPN: files that failed verify on the serial and -j paths, gathered at
+ * exit for the summary. Any entry makes hpnsftp exit
+ * SFTP_EX_VERIFY_FAILED. */
+static char **verify_fail_list = NULL;
+static int verify_fail_count = 0;
+
+/* HPN: the attributes sftp_glob fetched for a matched path, so a -j get
+ * does not stat the file again. Defined in sftp-glob.c. */
+int sftp_glob_get_attrib(const char *, Attrib *);
+
+/* HPN: the -j launch inputs, saved so parallel_orch_ensure_alive can
+ * rebuild the fleet after an abort. main fills them once, after option
+ * parsing and before the first launch. The pointers refer to main's
+ * storage, which lasts the whole session. */
+static struct {
+	char	       *host;
+	char	       *user;
+	int		port;
+	char	       *ssh_program;
+	const char     *identity;
+	const char     *config_file;
+	const char     *sftp_server;	/* -s subsystem name or server path */
+	size_t		buflen;
+	size_t		num_requests;
+	int		no_verify_repair;	/* -X VerifyRepair=no */
+	long long	limit_kbps;
+	int		debug_level;
+} parallel_launch;
+
+/* HPN: the "-o KEY=VALUE" list for each -j worker's ssh, so workers
+ * connect the way the main connection does. Option parsing adds every -o
+ * and each flag that has an -o form. Its list member is NULL-terminated,
+ * or NULL while empty. */
+static arglist parallel_extra_o;
+
+/* HPN: set the post-transfer verify phase for the next command on the
+ * connection and, under -j, on the fleet. Fresh transfers turn it on with
+ * -V or getv/putv. The resume verbs turn it off because they verify
+ * through chunked resume instead. Turning it on against a server that
+ * cannot verify prints VERIFY_INCOMPAT_MSG and returns -1, so only that
+ * command fails. Returns 0 otherwise. */
+static int
+verify_set_for_command(struct sftp_conn *conn, int on)
+{
+	if (on && !sftp_conn_verify_transfer_supported(conn)) {
+		error("%s", VERIFY_INCOMPAT_MSG);
+		return -1;
+	}
+	sftp_conn_set_verify_transfer(conn, on);
+	if (parallel_orch != NULL)
+		sftp_parallel_set_verify_transfer(parallel_orch, on);
+	return 0;
+}
+
+/* HPN: check before a resume verb that its -V can be honored. Verified
+ * resume hashes the existing partial through hpn-check-file, and the
+ * transfer code calls fatal() without it. This prints RESUME_INCOMPAT_MSG
+ * and returns -1 instead, so only that command fails. Returns 0
+ * otherwise. */
+static int
+resume_verify_check(struct sftp_conn *conn, int verify)
+{
+	if (verify && !sftp_conn_has_hpn_check_file(conn)) {
+		error("%s", RESUME_INCOMPAT_MSG);
+		return -1;
+	}
+	return 0;
+}
 
 static void
 killchild(int signo)
@@ -410,7 +428,7 @@ help(void)
 	    "chown [-h] own path                Change owner of file 'path' to 'own'\n"
 	    "copy oldpath newpath               Copy remote file\n"
 	    "cp oldpath newpath                 Copy remote file\n"
-	    "defer [on|off]                     Toggle deferred put/get (parallel mode);\n"
+	    "defer [on|off]                     Turn deferred put/get on or off (-j only);\n"
 	    "                                   no arg prints current state\n"
 	    "df [-hi] [path]                    Display statistics for current directory or\n"
 	    "                                   filesystem containing 'path'\n"
@@ -431,10 +449,10 @@ help(void)
 	    "putv [-afpR] local [remote]        Upload file and verify integrity\n"
 	    "pwd                                Display remote working directory\n"
 	    "quit                               Quit sftp\n"
-	    "reget [-fpR] remote [local]        Resume download file\n"
+	    "reget [-fpRV] remote [local]       Resume download file (-V: hash-verified)\n"
 	    "regetv [-fpR] remote [local]       Resume download with hash verification\n"
 	    "rename oldpath newpath             Rename remote file\n"
-	    "reput [-fpR] local [remote]        Resume upload file\n"
+	    "reput [-fpRV] local [remote]       Resume upload file (-V: hash-verified)\n"
 	    "reputv [-fpR] local [remote]       Resume upload with hash verification\n"
 	    "rm path                            Delete remote file\n"
 	    "rmdir path                         Remove remote directory\n"
@@ -527,8 +545,8 @@ parse_getput_flags(const char *cmd, char **argv, int argc,
 	optind = optreset = 1;
 	opterr = 0;
 
-	*aflag = *fflag = *rflag = *pflag = *vflag = 0;
-	while ((ch = getopt(argc, argv, "afPpRrV")) != -1) {
+	*aflag = *fflag = *rflag = *pflag = *vflag = 0;	/* HPN */
+	while ((ch = getopt(argc, argv, "afPpRrV")) != -1) {	/* HPN */
 		switch (ch) {
 		case 'a':
 			*aflag = 1;
@@ -545,10 +563,8 @@ parse_getput_flags(const char *cmd, char **argv, int argc,
 			*rflag = 1;
 			break;
 		case 'V':
-			/* Integrity verify (capital V; lowercase v is verbose).
-			 * Verify only - resume comes from the verb (reput/reget),
-			 * so put/get -V is a fresh post-transfer verify while
-			 * reput/reget -V is a resume+chunked verify. */
+			/* HPN: verify. get and put verify the whole file after
+			 * the transfer. reget and reput hash-verify the resume. */
 			*vflag = 1;
 			break;
 		default:
@@ -776,32 +792,94 @@ local_is_dir(const char *path)
 	return S_ISDIR(sb.st_mode);
 }
 
-/*
- * Drain all submissions sitting in the parallel orchestrator's queue.
- *
- * Centralises the wait + progress_stop + protocol-violation summary that
- * process_get / process_put used to do at the end of each command.  Called
- * directly by those functions in interactive mode, or once at end-of-batch
- * by the caller (interactive_loop) when defer_parallel_wait is set.
- *
- * Safe to call when parallel_orch is NULL (no-op) or when no submissions are
- * outstanding (sftp_parallel_wait returns immediately).
- */
-/*
- * Drains the parallel orchestrator and returns 0 if every submitted
- * unit completed successfully, -1 if any unit was permanently lost
- * (units_failed_aggregate > 0).  Callers MUST propagate -1 up to the
- * sftp exit code: silent data loss is unacceptable.  When parallel_orch
- * is NULL (parallel mode off) the function is a no-op returning 0.
- *
- * conn is the caller's control connection, lent to sftp_parallel_wait so
- * it can apply the directory attributes the walks deferred.
- */
+/* HPN: scale a byte count for the session summary: GiB from 1 GiB up,
+ * MiB below. Sets *unit and returns the scaled value. */
+static double
+summary_scale(double bytes, const char **unit)
+{
+	if (bytes >= 1024.0 * 1024.0 * 1024.0) {
+		*unit = "GiB";
+		return bytes / (1024.0 * 1024.0 * 1024.0);
+	}
+	*unit = "MiB";
+	return bytes / (1024.0 * 1024.0);
+}
+
+/* HPN: the one-line session summary for the final drain. The figures are
+ * the fleet's totals since it started, so it is printed once at the end,
+ * never per command. It gives the bytes that crossed the wire and, when
+ * nonzero, what resume skipped. It has no rate because the elapsed time
+ * includes idle time between commands. Respawns add a wedge/peer-stall
+ * breakdown and, when frequent, a hint to lower -j. */
+static void
+parallel_report_session(const struct sftp_parallel_stats *pstats)
+{
+	char skipped_str[64] = "", health[64] = "";
+	const char *wired_unit, *skipped_unit, *churn_hint = "";
+	double wired, skipped, secs;
+	uint64_t skipped_bytes = 0;
+	int workers, churn_threshold;
+
+	if (pstats->elapsed_ms == 0 || pstats->bytes_total_aggregate == 0)
+		return;
+	secs = pstats->elapsed_ms / 1000.0;
+	wired = summary_scale((double)pstats->bytes_wired_aggregate,
+	    &wired_unit);
+	/* A file resume found already correct counts at full size in
+	 * bytes_total but sends nothing, so the difference is what resume
+	 * saved. */
+	if (pstats->bytes_total_aggregate > pstats->bytes_wired_aggregate)
+		skipped_bytes = pstats->bytes_total_aggregate -
+		    pstats->bytes_wired_aggregate;
+	if (skipped_bytes > 0) {
+		skipped = summary_scale((double)skipped_bytes, &skipped_unit);
+		snprintf(skipped_str, sizeof(skipped_str),
+		    "; %.2f %s skipped via resume", skipped, skipped_unit);
+	}
+	if (pstats->total_respawns == 0) {
+		logit("Parallel streams: session total %.2f %s "
+		    "transferred in %.1fs%s", wired, wired_unit, secs,
+		    skipped_str);
+		return;
+	}
+	if (pstats->wedge_terminations > 0 &&
+	    pstats->peer_stall_terminations > 0)
+		snprintf(health, sizeof(health), " (%d wedge, %d peer-stall)",
+		    pstats->wedge_terminations,
+		    pstats->peer_stall_terminations);
+	else if (pstats->wedge_terminations > 0)
+		snprintf(health, sizeof(health), " (%d wedge)",
+		    pstats->wedge_terminations);
+	else if (pstats->peer_stall_terminations > 0)
+		snprintf(health, sizeof(health), " (%d peer-stall)",
+		    pstats->peer_stall_terminations);
+	/* Respawns in a quarter or more of the workers suggest -j is past
+	 * the path's knee. */
+	workers = pstats->num_workers > 0 ?
+	    pstats->num_workers : parallel_num_streams;
+	churn_threshold = (workers + 3) / 4;	/* ceil(workers / 4) */
+	if (churn_threshold > 0 && pstats->total_respawns >= churn_threshold)
+		churn_hint = " - consider lowering -j";
+	logit("Parallel streams: session total %.2f %s transferred in "
+	    "%.1fs%s; %d worker respawn%s%s%s", wired, wired_unit, secs,
+	    skipped_str, pstats->total_respawns,
+	    pstats->total_respawns == 1 ? "" : "s", health, churn_hint);
+}
+
+/* HPN: drain the -j fleet and report what is new since the last drain.
+ * Returns 0, or -1 if files failed, were skipped by the walk, or were left
+ * unfinished by an interrupt or abort. Callers must pass -1 on to the exit
+ * status. final marks the end-of-session drain, which also prints the
+ * session summary. conn is lent to sftp_parallel_wait to apply the
+ * directory attributes the walks deferred. Without a fleet it returns 0. */
 static int
 parallel_flush(struct sftp_conn *conn, int final)
 {
 	struct sftp_parallel_stats pstats;
-	int rc = 0;
+	uint64_t units_failed, walker_failures;
+	char **paths = NULL;
+	int i, total, paths_used = 0;
+	int user_int, violations, rc = 0;
 
 	if (parallel_orch == NULL)
 		return 0;
@@ -809,97 +887,20 @@ parallel_flush(struct sftp_conn *conn, int final)
 	sftp_parallel_wait(parallel_orch, conn);
 	sftp_parallel_progress_stop(parallel_orch);
 	sftp_parallel_get_stats(parallel_orch, &pstats);
+	/* Failures already reported by an earlier drain are not reported
+	 * again, nor do they fail this command. */
+	units_failed = pstats.units_failed_aggregate -
+	    flushed_stats.units_failed_aggregate;
+	walker_failures = pstats.walker_failures_aggregate -
+	    flushed_stats.walker_failures_aggregate;
+	violations = pstats.protocol_violations -
+	    flushed_stats.protocol_violations;
+	flushed_stats = pstats;
 
-	/* Session-total summary.  parallel_flush drains after every command,
-	 * but this line is a whole-session rollup - cumulative wire bytes and
-	 * elapsed since the orchestrator started - so it is emitted ONLY on the
-	 * final drain (interactive_loop, after the command loop), never per
-	 * command.  Printing it per command made an interactive user watch the
-	 * running total climb after every get, reading as a per-command figure
-	 * when it is not.  Emitted BEFORE any TRANSFER INCOMPLETE block so the
-	 * signal isn't buried under a long failed-paths list. */
-	if (final && pstats.elapsed_ms > 0 && pstats.bytes_total_aggregate > 0) {
-		double secs   = pstats.elapsed_ms / 1000.0;
-		double wired  = (double)pstats.bytes_wired_aggregate;
-		/*
-		 * Primary number is bytes actually transferred (wired) and
-		 * throughput is computed against it - operators care about
-		 * what moved over the network, not what was visited.  When
-		 * chunked-resume or prefix-resume avoided pushing bytes that
-		 * were already correct on the peer, we tack on a "Y skipped
-		 * via resume" beat so the savings are visible.  No beat is
-		 * emitted for fresh transfers where nothing was skippable.
-		 */
-		uint64_t skipped_b =
-		    pstats.bytes_total_aggregate > pstats.bytes_wired_aggregate
-		    ? pstats.bytes_total_aggregate - pstats.bytes_wired_aggregate
-		    : 0;
-		const char *wired_unit;
-		double wired_val;
-		if (wired >= 1024.0 * 1024.0 * 1024.0) {
-			wired_val  = wired / (1024.0 * 1024.0 * 1024.0);
-			wired_unit = "GiB";
-		} else {
-			wired_val  = wired / (1024.0 * 1024.0);
-			wired_unit = "MiB";
-		}
-		char skipped_str[64];
-		skipped_str[0] = '\0';
-		if (skipped_b > 0) {
-			double skipped_d = (double)skipped_b;
-			const char *skipped_unit;
-			double skipped_val;
-			if (skipped_d >= 1024.0 * 1024.0 * 1024.0) {
-				skipped_val  = skipped_d /
-				    (1024.0 * 1024.0 * 1024.0);
-				skipped_unit = "GiB";
-			} else {
-				skipped_val  = skipped_d / (1024.0 * 1024.0);
-				skipped_unit = "MiB";
-			}
-			snprintf(skipped_str, sizeof(skipped_str),
-			    "; %.2f %s skipped via resume",
-			    skipped_val, skipped_unit);
-		}
-		int j         = pstats.num_workers > 0
-		    ? pstats.num_workers : parallel_num_streams;
-		int respawn_hint_threshold = (j + 3) / 4; /* ceil(j / 4) */
-		const char *churn_hint =
-		    (pstats.total_respawns >= respawn_hint_threshold &&
-		     respawn_hint_threshold > 0)
-		    ? " - consider lowering -j" : "";
-		/* No rate figure: elapsed runs from orchestrator start, so
-		 * in an interactive session it includes idle time between
-		 * commands and the average reads artificially low.  Health
-		 * breakdown (wedge/peer-stall) folds in here; only nonzero
-		 * parts are shown.  The old separate "parallel transfer
-		 * health" line said the respawn count twice. */
-		char brk[64] = "";
-		if (pstats.wedge_terminations > 0 &&
-		    pstats.peer_stall_terminations > 0)
-			snprintf(brk, sizeof(brk), " (%d wedge, %d peer-stall)",
-			    pstats.wedge_terminations,
-			    pstats.peer_stall_terminations);
-		else if (pstats.wedge_terminations > 0)
-			snprintf(brk, sizeof(brk), " (%d wedge)",
-			    pstats.wedge_terminations);
-		else if (pstats.peer_stall_terminations > 0)
-			snprintf(brk, sizeof(brk), " (%d peer-stall)",
-			    pstats.peer_stall_terminations);
-		if (pstats.total_respawns > 0) {
-			logit("Parallel streams: session total %.2f %s "
-			    "transferred in %.1fs%s; %d worker respawn%s%s%s",
-			    wired_val, wired_unit, secs,
-			    skipped_str,
-			    pstats.total_respawns,
-			    pstats.total_respawns == 1 ? "" : "s",
-			    brk, churn_hint);
-		} else {
-			logit("Parallel streams: session total %.2f %s "
-			    "transferred in %.1fs%s",
-			    wired_val, wired_unit, secs, skipped_str);
-		}
-	}
+	/* Printed before any TRANSFER INCOMPLETE lines so it is not buried
+	 * under a long failed-paths list. */
+	if (final)
+		parallel_report_session(&pstats);
 
 	if (pstats.total_respawns > 0 || pstats.wedge_terminations > 0 ||
 	    pstats.peer_stall_terminations > 0) {
@@ -908,91 +909,83 @@ parallel_flush(struct sftp_conn *conn, int final)
 		    pstats.total_respawns, pstats.wedge_terminations,
 		    pstats.peer_stall_terminations);
 	}
-	if (pstats.protocol_violations > 0) {
+	if (violations > 0) {
 		logit("warning: %d worker protocol violation detected "
 		    "(recovered via worker respawn) - investigate if "
 		    "this recurs across transfers",
-		    pstats.protocol_violations);
+		    violations);
 	}
-	/* A USER interrupt is not an error: the casualties below are
-	 * consequences of the Ctrl-C, so they get one calm summary line
-	 * (what is incomplete + how to resume) instead of error theater,
-	 * and the path inventory drops to debug.  Genuine failures keep
-	 * the loud framing. */
-	int user_int = sftp_parallel_user_abort(parallel_orch);
-
+	/* After a Ctrl-C the incomplete files are the user's doing, so they
+	 * get one calm line that says how to resume, and the path list drops
+	 * to debug. Real failures are reported as errors. */
+	user_int = sftp_parallel_user_abort(parallel_orch);
 	if (user_int) {
-		/* Mid-transfer interrupts usually record NO failures - the
-		 * in-flight/queued work is simply abandoned (units_pending) -
-		 * so key the summary on both. */
-		uint64_t n = pstats.units_failed_aggregate +
-		    pstats.walker_failures_aggregate;
-		if (n > 0) {
+		/* An interrupt usually records no failures. It abandons the
+		 * queued and in-flight files, which units_pending counts. */
+		uint64_t incomplete = units_failed + walker_failures;
+
+		if (incomplete > 0) {
 			logit("Transfer interrupted: %llu file(s) incomplete; "
 			    "partials left in place (resume with "
-			    "reputv / regetv).", (unsigned long long)n);
+			    "reputv / regetv).", (unsigned long long)incomplete);
 			rc = -1;
-		} else if (pstats.units_pending > 0) {
+		} else if (!flushed_abort && pstats.units_pending > 0) {
 			logit("Transfer interrupted; partial file(s) left in "
 			    "place (resume with reputv / regetv).");
 			rc = -1;
 		}
 	} else {
-		if (pstats.units_failed_aggregate > 0) {
+		if (units_failed > 0) {
 			error("TRANSFER INCOMPLETE: %llu file(s) could not be "
 			    "delivered after retries",
-			    (unsigned long long)pstats.units_failed_aggregate);
+			    (unsigned long long)units_failed);
 			rc = -1;
 		}
-		if (pstats.walker_failures_aggregate > 0) {
+		if (walker_failures > 0) {
 			error("TRANSFER INCOMPLETE: %llu path(s) "
 			    "were skipped during the directory walk",
-			    (unsigned long long)pstats.walker_failures_aggregate);
+			    (unsigned long long)walker_failures);
 			rc = -1;
 		}
-		/* A fleet abort (stall abort, dead-end respawn, control-
-		 * session loss) abandons queued units without recording
-		 * per-unit failures - the same shape as a user interrupt
-		 * above - so the aggregates alone miss it and the run
-		 * would exit 0.  Refuse to report success for an aborted,
-		 * incomplete transfer. */
-		if (rc == 0 && sftp_parallel_was_aborted(parallel_orch)) {
+		/* A fleet abort (stall timeout, a worker that cannot be
+		 * respawned, or a lost control session) abandons files
+		 * without counting them as failed, so the counts above miss
+		 * it. Report the abort so the run does not exit 0. */
+		if (rc == 0 && !flushed_abort &&
+		    sftp_parallel_is_aborting(parallel_orch)) {
 			error("TRANSFER INCOMPLETE: transfer aborted with "
 			    "%llu unit(s) unfinished",
 			    (unsigned long long)pstats.units_pending);
 			rc = -1;
 		}
 	}
+	/* An aborted fleet stays aborted. Report it once. */
+	if (user_int || sftp_parallel_is_aborting(parallel_orch))
+		flushed_abort = 1;
 
-	/* Drain the failed-paths list and print it.  This is the
-	 * user-facing inventory of what didn't make it - separate from
-	 * the per-aggregate counts above because a path can show up via
-	 * the worker-failure or walker-failure code path.  Always drained
-	 * (it owns the memory); printed at debug after a user interrupt. */
-	{
-		char  **paths     = NULL;
-		int     paths_used = 0;
-		int     total = sftp_parallel_drain_failed_paths(
-		    parallel_orch, &paths, &paths_used);
-		if (total > 0) {
-			if (user_int) {
-				debug("  Incomplete paths (%d total):", total);
-			} else if (paths_used >= total) {
-				error("  Failed paths (%d total):", total);
-			} else {
-				error("  Failed paths (showing first %d; "
-				    "list exceeds current limit of %d files):",
-				    paths_used, paths_used);
-			}
-			for (int i = 0; i < paths_used; i++) {
-				if (user_int)
-					debug("    %s", paths[i]);
-				else
-					error("    %s", paths[i]);
-				free(paths[i]);
-			}
-			free(paths);
+	/* The paths that failed, from the workers or the walk. Drained every
+	 * time because the caller owns the strings. After a Ctrl-C they
+	 * print at debug. */
+	total = sftp_parallel_drain_failed_paths(parallel_orch, &paths,
+	    &paths_used);
+	if (total > 0) {
+		if (user_int) {
+			debug("  Incomplete paths (%d total):", total);
+		} else if (paths_used >= total) {
+			error("  Failed paths (%d total):", total);
+		} else {
+			error("  Failed paths (showing first %d; "
+			    "list exceeds current limit of %d files):",
+			    paths_used, paths_used);
 		}
+		for (i = 0; i < paths_used; i++) {
+			if (user_int)
+				debug("    %s", paths[i]);
+			else
+				error("    %s", paths[i]);
+			free(paths[i]);
+		}
+		free(paths);
 	}
 
 	if (rc != 0)
@@ -1000,10 +993,24 @@ parallel_flush(struct sftp_conn *conn, int final)
 	return rc;
 }
 
-/*
- * Print the verify-failure summary at exit.  Returns the number of files
- * that failed verification (0 = all clean / verify off).
- */
+/* HPN: add paths to the files that failed verify. The list takes
+ * ownership of the strings, and paths itself is freed. */
+static void
+verify_fail_list_add(char **paths, int n)
+{
+	int i;
+
+	if (n > 0) {
+		verify_fail_list = xreallocarray(verify_fail_list,
+		    verify_fail_count + n, sizeof(*verify_fail_list));
+		for (i = 0; i < n; i++)
+			verify_fail_list[verify_fail_count++] = paths[i];
+	}
+	free(paths);
+}
+
+/* HPN: print the files that failed verify, at exit. Returns how many
+ * failed, 0 when all passed or verify was off. */
 static int
 verify_print_summary(void)
 {
@@ -1011,113 +1018,27 @@ verify_print_summary(void)
 
 	if (verify_fail_count == 0)
 		return 0;
-	mprintf("\nVerification FAILED for %d file(s) after transfer:\n",
-	    verify_fail_count);
+	fmprintf(stderr, "\nVerification FAILED for %d file(s) after "
+	    "transfer:\n", verify_fail_count);
 	for (i = 0; i < verify_fail_count; i++)
-		mprintf("    %s\n", verify_fail_list[i]);
+		fmprintf(stderr, "    %s\n", verify_fail_list[i]);
 	return verify_fail_count;
 }
 
-/*
- * Captured launch inputs for the parallel orchestrator, so the fleet can be
- * re-created after an interrupt tears it down (parallel_orch_ensure_alive).
- * Filled once in main() before the first launch; the pointers reference
- * main()'s storage, which lives for the whole session.
- */
-static struct {
-	char        *host;
-	char        *user;
-	int          port;
-	char        *ssh_program;
-	const char  *identity;
-	const char  *config_file;
-	const char  *sftp_server;	/* -s remote subsystem / server path */
-	char       **extra_o;
-	size_t       buflen;
-	size_t       num_requests;
-	int          no_verify_repair;	/* -X VerifyRepair=no */
-	long long    limit_kbps;
-	int          debug_level;
-	int          valid;
-} parallel_launch;
-
-/*
- * Accumulated "-o KEY=VALUE" options to forward to each parallel-streams
- * worker SSH connection.  Populated during getopt (the -o case plus the
- * connection-shaping flags -4/-6/-C/-c/-J, which all have exact -o
- * equivalents); handed to the orchestrator as pcfg.extra_argv so workers
- * are built with the same connection options as the main connection.
- * File scope so parallel_extra_o_add() can append from the option-parsing
- * switch without threading three locals through every call.
- */
-static char **parallel_extra_o = NULL;
-static size_t parallel_extra_o_count = 0;
-static size_t parallel_extra_o_cap = 0;
-
-static void
-parallel_extra_o_add(const char *opt)
-{
-	if (parallel_extra_o_count + 2 > parallel_extra_o_cap) {
-		parallel_extra_o_cap = parallel_extra_o_cap ?
-		    parallel_extra_o_cap * 2 : 8;
-		parallel_extra_o = xreallocarray(parallel_extra_o,
-		    parallel_extra_o_cap, sizeof(*parallel_extra_o));
-	}
-	parallel_extra_o[parallel_extra_o_count++] = xstrdup(opt);
-	parallel_extra_o[parallel_extra_o_count] = NULL;
-}
-
-/*
- * Build and start the parallel orchestrator from the captured launch
- * parameters.  Factored out of main() so the post-interrupt rebuild can call
- * it again; behaviour is identical to the original inline block.  On failure
- * leaves parallel_orch NULL and falls back to single-stream mode.
- */
+/* HPN: build the -j fleet from parallel_launch and start it. main calls
+ * this once the control connection is up, and parallel_orch_ensure_alive
+ * calls it again to rebuild after an abort. On failure parallel_orch stays
+ * NULL and the session runs single-stream. */
 static void
 parallel_orch_launch(struct sftp_conn *conn)
 {
 	struct sftp_parallel_config pcfg;
 	char portbuf[16] = "";
 
-	if (!parallel_launch.valid)
-		return;
-
-	/*
-	 * HPN: clamp the requested worker count to the server's advertised
-	 * per-user cap (hpn-max-workers@hpnssh.org, read at sftp_init):
-	 *   cap < 0  -> not advertised (stock / non-HPN server): apply the
-	 *               conservative no-policy default.
-	 *   cap == 0 -> HPN server with no admin cap: honour the request
-	 *               (already bounded by SFTP_PARALLEL_MAX_WORKERS at parse).
-	 *   cap > 0  -> HPN server policy: clamp to it.
-	 * Done once (re-launch after an interrupt keeps the effective count).
-	 */
-	{
-		static int worker_cap_applied = 0;
-		if (!worker_cap_applied && parallel_num_streams > 1) {
-			int cap = sftp_conn_max_workers_cap(conn);
-			int requested = parallel_num_streams;
-			int eff = requested;
-
-			if (cap < 0)
-				eff = MINIMUM(requested,
-				    HPN_NO_POLICY_WORKER_DEFAULT);
-			else if (cap > 0)
-				eff = MINIMUM(requested, cap);
-			if (eff < requested) {
-				if (cap < 0)
-					logit("Parallel streams limited to %d "
-					    "(server advertises no policy; "
-					    "requested %d)", eff, requested);
-				else
-					logit("Parallel streams limited to %d "
-					    "by server policy (requested %d)",
-					    eff, requested);
-				parallel_num_streams = eff;
-			}
-			worker_cap_applied = 1;
-		}
-	}
+	/* A rebuild finds the count already within the cap, so this changes
+	 * nothing and logs nothing the second time. */
+	parallel_num_streams = sftp_parallel_cap_workers(conn,
+	    parallel_num_streams);
 
 	memset(&pcfg, 0, sizeof(pcfg));
 	pcfg.num_streams      = parallel_num_streams;
@@ -1131,33 +1052,26 @@ parallel_orch_launch(struct sftp_conn *conn)
 	pcfg.identity         = parallel_launch.identity;
 	pcfg.config_file      = parallel_launch.config_file;
 	pcfg.sftp_server      = parallel_launch.sftp_server;
-	pcfg.extra_argv       = parallel_launch.extra_o;
+	pcfg.extra_argv       = parallel_extra_o.list;
 	pcfg.transfer_buflen  = (unsigned int)parallel_launch.buflen;
 	pcfg.num_requests     = (unsigned int)parallel_launch.num_requests;
 	pcfg.no_verify_repair = parallel_launch.no_verify_repair;
 	pcfg.limit_kbps       = parallel_launch.limit_kbps;
 	pcfg.range_split_min_mb = range_split_min_mb_user;
-	pcfg.writers_per_inode_cap = writers_cap_user ?
-	    writers_cap_user : HPN_RANGE_WRITERS_CAP_DEFAULT;
+	pcfg.writers_per_inode_cap = writers_cap_user;
 	pcfg.worker_log_dir     = worker_log_dir;
 	pcfg.verbose_level      = parallel_launch.debug_level;
-	/* Resolve HPNUseBundle and any other ssh_config-derived
-	 * pcfg fields.  Sets pcfg.use_bundle; defaults to 1 (yes)
-	 * if parsing fails or the option isn't set. */
+	/* The HPN ssh_config options, such as HPNUseBundle. Each keeps its
+	 * default when it is unset or the config cannot be parsed. */
 	(void)sftp_parallel_apply_ssh_config(&pcfg, parallel_launch.host,
-	    parallel_launch.config_file, parallel_launch.extra_o);
-	if (verify_flag_user)		/* -V forces verify on regardless of config */
-		pcfg.verify_transfer = 1;
+	    parallel_launch.config_file, parallel_extra_o.list);
+	pcfg.verify_transfer  = hpn_verify_transfer;
 	pcfg.preserve_flag    = global_pflag;
 	pcfg.fsync_flag       = global_fflag;
 	pcfg.print_flag       = quiet ? 0 : 1;
 
-	/*
-	 * Adaptive throughput-outlier stall detection. On by default in
-	 * parallel mode with conservative WAN-bulk settings; the defaults live
-	 * in sftp_parallel_set_stall_defaults so hpnsftp and hpnscp share one
-	 * source of truth.
-	 */
+	/* Throughput-outlier stall detection is on by default. Its settings
+	 * live in sftp_parallel_set_stall_defaults, shared with hpnscp. */
 	sftp_parallel_set_stall_defaults(&pcfg);
 
 	if (!quiet)
@@ -1181,71 +1095,94 @@ parallel_orch_launch(struct sftp_conn *conn)
 		logit("Parallel-streams setup failed; "
 		    "falling back to single-stream mode.");
 		parallel_num_streams = 1;
-	} else {
-		sftp_parallel_set_interrupt_flag(parallel_orch,
-		    &interrupted);
-
-		/*
-		 * Sample app-layer path RTT on the control connection.
-		 * sftp_realpath does one SSH2_FXP_REALPATH round trip,
-		 * which is the cheapest small request available after
-		 * do_init has run.  Median of a few samples filters
-		 * jitter from a single noisy round-trip without paying
-		 * many extra RTTs at startup.  Passed to the orchestrator
-		 * so the reporter can size its outlier-warmup correctly
-		 * (see RAMP_RTTS in sftp-parallel.c).
-		 */
-		{
-			uint64_t samples[3] = {0, 0, 0};
-			int got = 0;
-			for (int i = 0; i < 3; i++) {
-				double t0 = monotime_double();
-				char *r = sftp_realpath(conn, ".");
-				double t1 = monotime_double();
-				if (r == NULL)
-					break;
-				free(r);
-				samples[got++] = (uint64_t)
-				    ((t1 - t0) * 1e6);
-			}
-			if (got > 0) {
-				sort_u64(samples, got);
-				uint64_t rtt_us = samples[got / 2];
-				sftp_parallel_set_path_rtt(
-				    parallel_orch, rtt_us);
-				debug_f("control-path RTT: "
-				    "%llu us (median of %d samples)",
-				    (unsigned long long)rtt_us, got);
-			}
-		}
+		return;
 	}
+	/* A new fleet has reported nothing yet. */
+	memset(&flushed_stats, 0, sizeof(flushed_stats));
+	flushed_abort = 0;
+	sftp_parallel_set_interrupt_flag(parallel_orch, &interrupted);
+	sftp_parallel_sample_path_rtt(parallel_orch, conn);
 }
 
-/*
- * Post-interrupt fleet rebuild.  A SIGINT during a parallel transfer makes
- * the orchestrator abort: abort_flag latches, the work queue shuts down, and
- * every worker connection is closed.  That state is terminal by design
- * ("abort means abort"), but it used to leak into the NEXT command: submit()
- * refuses units while abort_flag is set, so a subsequent put/get failed
- * instantly ("submit range N failed") and the file was reported INCOMPLETE
- * despite never starting.  Tear the dead orchestrator down and launch a
- * fresh fleet instead - a few seconds of reconnects, fresh TCP state,
- * correct by construction.  No-op when the orchestrator is healthy or
- * parallel mode is off.
- */
-static void
+/* HPN: rebuild the -j fleet after an abort. An aborted fleet stays
+ * aborted and refuses new units, so without a rebuild every later get or
+ * put would fail at once. Report the files the old fleet left unfinished,
+ * stop it, and launch a new one. Returns -1 if the old fleet left
+ * unfinished files that no earlier drain reported, else 0. Does nothing
+ * when -j is off or the fleet is healthy. */
+static int
 parallel_orch_ensure_alive(struct sftp_conn *conn)
 {
+	int rc;
+
 	if (parallel_orch == NULL || !sftp_parallel_is_aborting(parallel_orch))
-		return;
-	logit("Parallel workers were shut down by an interrupt; "
+		return 0;
+	/* With deferral on, the commands that queued the abandoned files
+	 * have already returned success. Report those files now, before
+	 * sftp_parallel_stop drops them. */
+	rc = parallel_flush(conn, 0);
+	logit("An earlier parallel transfer aborted; "
 	    "rebuilding the worker fleet.");
 	sftp_parallel_stop(parallel_orch);
 	parallel_orch = NULL;
 	parallel_orch_launch(conn);
-	if (parallel_orch == NULL)
-		logit("Worker fleet rebuild failed; this transfer will run "
-		    "single-stream.");
+	/* The new fleet starts from -V alone. Restore the verify setting
+	 * verify_set_for_command gave this command before the rebuild. A
+	 * failed launch leaves parallel_orch NULL, which the setter ignores. */
+	sftp_parallel_set_verify_transfer(parallel_orch,
+	    sftp_conn_verify_transfer_enabled(conn));
+	return rc;
+}
+
+/* HPN: the attributes of remote glob match path. sftp_glob cached them
+ * when it matched, so this usually costs no round trip. A path past the
+ * cache's cap falls back to a stat, so a single-file get still has a
+ * known size. If that fails too, *a is left cleared. */
+static void
+glob_match_attrib(struct sftp_conn *conn, const char *path, Attrib *a)
+{
+	if (sftp_glob_get_attrib(path, a) != 0 &&
+	    sftp_stat(conn, path, 1, a) != 0)
+		attrib_clear(a);
+}
+
+/* HPN: start a get or put. Rebuild the -j fleet if it aborted, then push
+ * the command's effective -p and -f (per command or program level) to the
+ * fleet, which stamps them into each unit it queues. The single-stream
+ * path takes them as arguments. Returns -1 if the rebuild reported files
+ * the old fleet left unfinished, else 0. The command runs either way. */
+static int
+getput_begin(struct sftp_conn *conn, int pflag, int fflag)
+{
+	int rc;
+
+	rc = parallel_orch_ensure_alive(conn);
+	sftp_parallel_set_preserve(parallel_orch, pflag || global_pflag);
+	sftp_parallel_set_fsync(parallel_orch, fflag || global_fflag);
+	return rc;
+}
+
+/* HPN: finish a get or put. Verify the files the single-stream path
+ * moved, then drain the -j fleet. Returns -1 if the drain reported a
+ * failure, else 0. */
+static int
+getput_end(struct sftp_conn *conn)
+{
+	int vn;
+
+	/* Every file the command moved is in place, so verify them now, as
+	 * the fleet does in its own verify phase. Nothing is parked under
+	 * -j, where the fleet verifies, or with verify off. */
+	if (!quiet && (vn = sftp_conn_verify_pending_count(conn)) > 0)
+		mprintf("Verifying %d file(s)...\n", vn);
+	sftp_conn_verify_run_phase(conn);
+	/* With deferral on (-b or defer on), skip the drain, so successive
+	 * commands pipeline their files instead of each stalling on the
+	 * previous one's slowest chunk. A wait, a defer off or the end of
+	 * the session drains them and reports their failures. */
+	if (defer_parallel_wait)
+		return 0;
+	return parallel_flush(conn, 0);
 }
 
 static int
@@ -1256,15 +1193,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 	glob_t g;
 	int i, r, err = 0;
 
-	/* Rebuild the worker fleet if a prior interrupt tore it down. */
-	parallel_orch_ensure_alive(conn);
-
-	/* HPN: push this command's effective -p and -f (per command or
-	 * program level) to the long-lived orchestrator, which stamps them
-	 * into each unit it queues. The single-stream path below uses the
-	 * arguments. */
-	sftp_parallel_set_preserve(parallel_orch, pflag || global_pflag);
-	sftp_parallel_set_fsync(parallel_orch, fflag || global_fflag);
+	err = getput_begin(conn, pflag, fflag);	/* HPN */
 
 	abs_src = make_absolute_pwd_glob(xstrdup(src), pwd);
 	memset(&g, 0, sizeof(g));
@@ -1291,32 +1220,37 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		goto out;
 	}
 
+	/* HPN: size the -j meter from the attributes sftp_glob cached. A
+	 * path past the cache's cap is counted unsized, not stat'd, because
+	 * the loop below stats it already. */
 	if (parallel_orch != NULL && !quiet && g.gl_matchc > 0) {
-		char label[64];
 		off_t dtotal = 0;
+		int nfiles = 0, sized = 1;
 		Attrib da;
 
-		if (g.gl_matchc == 1 && sftp_globpath_is_dir(g.gl_pathv[0])) {
-			/* Single directory: the real file count is unknown
-			 * until the tree walk ends, so defer it - the label
-			 * is rewritten to "Fetching N files in parallel" once
-			 * the walk drains (see set_total). */
-			sftp_parallel_progress_start_counted(parallel_orch,
-			    "Fetching", 0);
-		} else {
-			/* A single regular-file source: size the meter to it
-			 * for a real percentage and ETA (mirrors scp.c and
-			 * process_put).  Multi-match globs stay rate-only. */
-			if (g.gl_matchc == 1 &&
-			    sftp_stat(conn, g.gl_pathv[0], 1, &da) == 0 &&
-			    (da.flags & SSH2_FILEXFER_ATTR_SIZE))
-				dtotal = (off_t)da.size;
-			snprintf(label, sizeof(label),
-			    "Fetching %d file%s in parallel",
-			    (int)g.gl_matchc, g.gl_matchc == 1 ? "" : "s");
-			sftp_parallel_progress_start(parallel_orch, label,
-			    dtotal);
+		for (i = 0; g.gl_pathv[i]; i++) {
+			/* A -r walk adds its directory's total when it ends.
+			 * Without -r the directory is refused at submit. */
+			if (sftp_globpath_is_dir(g.gl_pathv[i]))
+				continue;
+			if (sftp_glob_get_attrib(g.gl_pathv[i], &da) != 0 ||
+			    !(da.flags & SSH2_FILEXFER_ATTR_SIZE)) {
+				sized = 0;
+				nfiles++;
+				continue;
+			}
+			/* A broken symlink keeps its lstat attributes. It
+			 * and any other non-regular file are refused at
+			 * submit. */
+			if ((da.flags & SSH2_FILEXFER_ATTR_PERMISSIONS) &&
+			    !S_ISREG(da.perm))
+				continue;
+			dtotal += (off_t)da.size;
+			nfiles++;
 		}
+		/* A file of unknown size leaves the meter rate-only. */
+		sftp_parallel_progress_add(parallel_orch, "Fetching",
+		    sized ? dtotal : 0, nfiles);
 	}
 
 	/* HPN: a new command asks again about each destination's parent */
@@ -1348,11 +1282,13 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		free(tmp);
 
 		resume |= global_aflag;
+		/* HPN: a verified resume gets its own line. pm_mprintf clears
+		 * a running meter's line before printing. */
 		if (!quiet && verify)
 			pm_mprintf("Downloading %s to %s (verified resume)\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && resume)
-			mprintf("Resuming %s to %s\n",
+			pm_mprintf("Resuming %s to %s\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && !resume)
 			pm_mprintf("Fetching %s to %s\n",
@@ -1360,7 +1296,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		/* XXX follow link flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
 		    (rflag || global_rflag)) {
-			if (parallel_orch != NULL) {
+			if (parallel_orch != NULL) {	/* HPN */
 				if (sftp_parallel_download_dir(parallel_orch,
 				    conn, g.gl_pathv[i], abs_dst, 1,
 				    resume, verify) == -1)
@@ -1369,35 +1305,21 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			    abs_dst, NULL, pflag || global_pflag, 1, resume,
 			    verify, fflag || global_fflag, 0, 0) == -1)
 				err = -1;
-		} else if (parallel_orch != NULL) {
-			/* HPNLustreStripeCount: stripe the local destination
-			 * directory, so a single-file -j get fans out across
-			 * OSTs too. */
+		} else if (parallel_orch != NULL) {	/* HPN */
+			Attrib ga;
+
+			/* Stripe the local destination directory as
+			 * HPNLustreStripeCount asks, so a single-file -j get
+			 * fans out across OSTs too. */
 			maybe_apply_lustre_layout_parent(parallel_orch, conn,
 			    abs_dst, 1);
-			/*
-			 * Recover size and mode from the glob attrib cache so
-			 * maybe_submit_download can decide whether to range-
-			 * split this file.  sftp_glob already paid an RTT for
-			 * the stat via fudge_stat/fudge_lstat; we just reuse it.
-			 *
-			 * If the lookup misses (rare - typically only the
-			 * GLOB_NOCHECK fallback path), do an explicit stat so
-			 * that the single-file get case (the workload most
-			 * likely to benefit from range splitting) still gets
-			 * a known size.
-			 */
-			Attrib ga;
-			int have = (sftp_glob_get_attrib(g.gl_pathv[i],
-			    &ga) == 0);
-			if (!have &&
-			    sftp_stat(conn, g.gl_pathv[i], 1, &ga) == 0)
-				have = 1;
-			if (!have)
-				attrib_clear(&ga);
-			/* Glob / direct dispatch bypasses the walker; register
-			 * both sides' directories so whole-file verify factors
-			 * the path (download: local=abs_dst, remote=src). */
+			/* The size and mode let the fleet decide whether to
+			 * range-split the file. */
+			glob_match_attrib(conn, g.gl_pathv[i], &ga);
+			/* A file submitted here skips the walker, which
+			 * registers a tree's roots. Register both sides'
+			 * directories, so each parked verify item stores its
+			 * paths relative to them instead of in full. */
 			sftp_parallel_register_verify_dir(parallel_orch, abs_dst);
 			sftp_parallel_register_verify_dir(parallel_orch,
 			    g.gl_pathv[i]);
@@ -1405,18 +1327,21 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			    g.gl_pathv[i], abs_dst, &ga, resume, verify) != 0)
 				err = -1;
 		} else {
-			int dr = sftp_download(conn, g.gl_pathv[i], abs_dst,
-			    NULL, pflag || global_pflag, resume,
-			    fflag || global_fflag, 0, verify);
 			struct stat lsb;
 			off_t sz = -1;
+			int outcome;
 
-			/* Log the local copy's size, -1 when nothing landed. */
+			outcome = sftp_download(conn, g.gl_pathv[i], abs_dst,
+			    NULL, pflag || global_pflag, resume,
+			    fflag || global_fflag, 0, verify);
+			/* HPN: report the outcome, which prints a skip notice
+			 * and writes the TransferLog line. The line carries the
+			 * local copy's size, -1 when nothing landed. */
 			if (transferlog_active() && stat(abs_dst, &lsb) == 0)
 				sz = lsb.st_size;
 			if (sftp_hpn_report_transfer(conn,
-			    TRANSFERLOG_DOWNLOAD, dr, g.gl_pathv[i], abs_dst,
-			    sz) == -1)
+			    TRANSFERLOG_DOWNLOAD, outcome, g.gl_pathv[i],
+			    abs_dst, sz) == -1)
 				err = -1;
 		}
 		/* HPN: a dead connection ends the command, with one line in
@@ -1436,31 +1361,8 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		abs_dst = NULL;
 	}
 
-	/*
-	 * Classic post-transfer verify phase (HPN): all files for this command
-	 * are downloaded, so verify them now - the single-conn analogue of the
-	 * -j orchestrator's verify phase.  No-op in parallel mode (the workers
-	 * verify via the orchestrator) and when verify is off.
-	 */
-	if (!quiet) {
-		int vn = sftp_conn_verify_pending_count(conn);
-		if (vn > 0)
-			mprintf("Verifying %d file(s)...\n", vn);
-	}
-	sftp_conn_verify_run_phase(conn);
-
-	/*
-	 * In deferred-wait mode (batch mode or future "job submission mode"),
-	 * skip the drain - the caller (interactive_loop end-of-batch) will
-	 * flush the queue once after all commands have been submitted, which
-	 * lets multiple get commands pipeline their files instead of stalling
-	 * each get on a slow chunk from the previous one.  Err reporting and
-	 * the protocol-violation summary then happen at flush time.
-	 */
-	if (parallel_orch != NULL && !defer_parallel_wait) {
-		if (parallel_flush(conn, 0) != 0)
-			err = -1;
-	}
+	if (getput_end(conn) != 0)	/* HPN */
+		err = -1;
 
 out:
 	free(abs_src);
@@ -1480,15 +1382,7 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 	int i, dst_is_dir = 1;
 	struct stat sb;
 
-	/* Rebuild the worker fleet if a prior interrupt tore it down. */
-	parallel_orch_ensure_alive(conn);
-
-	/* HPN: push this command's effective -p and -f (per command or
-	 * program level) to the long-lived orchestrator, which stamps them
-	 * into each unit it queues. The single-stream path below uses the
-	 * arguments. */
-	sftp_parallel_set_preserve(parallel_orch, pflag || global_pflag);
-	sftp_parallel_set_fsync(parallel_orch, fflag || global_fflag);
+	err = getput_begin(conn, pflag, fflag);	/* HPN */
 
 	if (dst) {
 		tmp_dst = xstrdup(dst);
@@ -1515,22 +1409,23 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		goto out;
 	}
 
+	/* HPN: size the -j meter from a local scan of what the upload walk
+	 * sends. */
 	if (parallel_orch != NULL && !quiet && g.gl_matchc > 0) {
-		char label[64];
 		off_t total_bytes = 0;
-		uint64_t total_files = 0, fc = 0;
+		uint64_t total_files = 0, fc;
+
 		for (i = 0; g.gl_pathv[i]; i++) {
-			fc = 0;
+			/* Without -r a directory is refused at submit. */
+			if (!(rflag || global_rflag) &&
+			    sftp_globpath_is_dir(g.gl_pathv[i]))
+				continue;
 			total_bytes += sftp_parallel_scan_upload_total(
-			    g.gl_pathv[i], &fc);
+			    parallel_orch, g.gl_pathv[i], &fc);
 			total_files += fc;
 		}
-		snprintf(label, sizeof(label),
-		    "Uploading %llu file%s in parallel",
-		    (unsigned long long)total_files,
-		    total_files == 1 ? "" : "s");
-		sftp_parallel_progress_start(parallel_orch, label, total_bytes);
-		sftp_parallel_set_file_total(parallel_orch, total_files);
+		sftp_parallel_progress_add(parallel_orch, "Uploading",
+		    total_bytes, (int)total_files);
 	}
 
 	/* HPN: a new command asks again about each destination's parent */
@@ -1569,11 +1464,13 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		free(tmp);
 
 		resume |= global_aflag;
+		/* HPN: a verified resume gets its own line. pm_mprintf clears
+		 * a running meter's line before printing. */
 		if (!quiet && verify)
 			pm_mprintf("Uploading %s to %s (verified resume)\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && resume)
-			mprintf("Resuming upload of %s to %s\n",
+			pm_mprintf("Resuming upload of %s to %s\n",
 			    g.gl_pathv[i], abs_dst);
 		else if (!quiet && !resume)
 			pm_mprintf("Uploading %s to %s\n",
@@ -1581,7 +1478,7 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		/* XXX follow_link_flag */
 		if (sftp_globpath_is_dir(g.gl_pathv[i]) &&
 		    (rflag || global_rflag)) {
-			if (parallel_orch != NULL) {
+			if (parallel_orch != NULL) {	/* HPN */
 				if (sftp_parallel_upload_dir(parallel_orch,
 				    conn, g.gl_pathv[i], abs_dst, 1,
 				    resume, verify) == -1)
@@ -1590,17 +1487,18 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			    abs_dst, pflag || global_pflag, 1, resume, verify,
 			    fflag || global_fflag, 0, 0) == -1)
 				err = -1;
-		} else if (parallel_orch != NULL) {
+		} else if (parallel_orch != NULL) {	/* HPN */
 			Attrib sa;
 
-			/* HPNLustreStripeCount: stripe the remote destination
-			 * directory, so a single-file -j put fans out across
-			 * OSTs too. */
+			/* Stripe the remote destination directory as
+			 * HPNLustreStripeCount asks, so a single-file -j put
+			 * fans out across OSTs too. */
 			maybe_apply_lustre_layout_parent(parallel_orch, conn,
 			    abs_dst, 0);
-			/* Glob / direct dispatch bypasses the walker; register
-			 * both sides' directories so whole-file verify factors
-			 * the path (upload: local=src, remote=abs_dst). */
+			/* A file submitted here skips the walker, which
+			 * registers a tree's roots. Register both sides'
+			 * directories, so each parked verify item stores its
+			 * paths relative to them instead of in full. */
 			sftp_parallel_register_verify_dir(parallel_orch,
 			    g.gl_pathv[i]);
 			sftp_parallel_register_verify_dir(parallel_orch, abs_dst);
@@ -1609,13 +1507,16 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 			    g.gl_pathv[i], abs_dst, &sa, resume, verify) != 0)
 				err = -1;
 		} else {
-			int ur = sftp_upload(conn, g.gl_pathv[i], abs_dst,
+			int outcome;
+
+			outcome = sftp_upload(conn, g.gl_pathv[i], abs_dst,
 			    pflag || global_pflag, resume, verify,
 			    fflag || global_fflag, 0);
-
+			/* HPN: report the outcome, which prints a skip notice
+			 * and writes the TransferLog line. */
 			if (sftp_hpn_report_transfer(conn,
-			    TRANSFERLOG_UPLOAD, ur, g.gl_pathv[i], abs_dst,
-			    sb.st_size) == -1)
+			    TRANSFERLOG_UPLOAD, outcome, g.gl_pathv[i],
+			    abs_dst, sb.st_size) == -1)
 				err = -1;
 		}
 		/* HPN: a dead connection ends the command, with one line in
@@ -1631,26 +1532,8 @@ process_put(struct sftp_conn *conn, const char *src, const char *dst,
 		}
 	}
 
-	/*
-	 * Classic post-transfer verify phase (HPN): all files for this command
-	 * are uploaded, so verify them now - the single-conn analogue of the
-	 * -j orchestrator's verify phase.  No-op in parallel mode (the workers
-	 * verify via the orchestrator) and when verify is off.
-	 */
-	if (!quiet) {
-		int vn = sftp_conn_verify_pending_count(conn);
-		if (vn > 0)
-			mprintf("Verifying %d file(s)...\n", vn);
-	}
-	sftp_conn_verify_run_phase(conn);
-
-	/* See process_get - deferred mode skips the per-command drain so
-	 * successive put commands pipeline their files instead of each one
-	 * stalling on a slow tail chunk from the previous file. */
-	if (parallel_orch != NULL && !defer_parallel_wait) {
-		if (parallel_flush(conn, 0) != 0)
-			err = -1;
-	}
+	if (getput_end(conn) != 0)	/* HPN */
+		err = -1;
 
 out:
 	free(abs_dst);
@@ -2241,18 +2124,18 @@ parse_args(const char **cpp, int *ignore_errors, int *disable_echo, int *aflag,
 
 	/* Get arguments and parse flags */
 	*aflag = *fflag = *hflag = *iflag = *lflag = *pflag = 0;
-	*rflag = *sflag = 0;
+	*rflag = *sflag = *vflag = 0;	/* HPN */
 	*path1 = *path2 = NULL;
 	optidx = 1;
 	switch (cmdnum) {
 	case I_GET:
-	case I_VGET:
+	case I_VGET:	/* HPN */
 	case I_REGET:
-	case I_VREGET:
+	case I_VREGET:	/* HPN */
 	case I_REPUT:
-	case I_VREPUT:
+	case I_VREPUT:	/* HPN */
 	case I_PUT:
-	case I_VPUT:
+	case I_VPUT:	/* HPN */
 		if ((optidx = parse_getput_flags(cmd, argv, argc,
 		    aflag, fflag, pflag, rflag, vflag)) == -1)
 			return -1;
@@ -2383,13 +2266,13 @@ parse_args(const char **cpp, int *ignore_errors, int *disable_echo, int *aflag,
 	case I_HELP:
 	case I_VERSION:
 	case I_PROGRESS:
-	case I_WAIT:
+	case I_WAIT:	/* HPN */
 		if ((optidx = parse_no_flags(cmd, argv, argc)) == -1)
 			return -1;
 		break;
-	case I_DEFER:
-		/* "defer" alone reports state; "defer on" / "defer off"
-		 * toggles.  No other args accepted. */
+	case I_DEFER:	/* HPN */
+		/* defer alone reports the state, and defer on or off sets
+		 * it. parse_dispatch_command checks the word. */
 		if ((optidx = parse_no_flags(cmd, argv, argc)) == -1)
 			return -1;
 		if (argc - optidx > 1) {
@@ -2415,7 +2298,8 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 	char *path1, *path2, *tmp;
 	int ignore_errors = 0, disable_echo = 1;
 	int aflag = 0, fflag = 0, hflag = 0, iflag = 0;
-	int lflag = 0, pflag = 0, rflag = 0, sflag = 0, vflag = 0;
+	int lflag = 0, pflag = 0, rflag = 0, sflag = 0;
+	int vflag = 0;	/* HPN */
 	int cmdnum, i;
 	unsigned long n_arg = 0;
 	Attrib a, aa;
@@ -2444,12 +2328,12 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		/* Unrecognized command */
 		err = -1;
 		break;
-	case I_VREGET:
+	case I_VREGET:	/* HPN */
 		vflag = 1;
 		/* FALLTHROUGH */
 	case I_REGET:
-		/* Resume download. -V here is the resume verify, which hashes
-		 * what it resumes, not the post-transfer phase. */
+		/* HPN: resume download. -V here is the resume verify, which
+		 * hashes what it resumes, not the post-transfer phase. */
 		aflag = 1;
 		verify_set_for_command(conn, 0);
 		if (resume_verify_check(conn,
@@ -2460,25 +2344,26 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		err = process_get(conn, path1, path2, *pwd, pflag,
 		    rflag, aflag, fflag, vflag || hpn_verify_transfer);
 		break;
-	case I_VGET:
+	case I_VGET:	/* HPN */
 		vflag = 1;
 		/* FALLTHROUGH */
 	case I_GET:
-		/* Fresh download.  -V (or the session-global -V) runs the
-		 * post-transfer whole-file verify phase for this command; the
-		 * chunked-resume verify arg stays 0 (nothing to resume). */
+		/* HPN: fresh download. -V, given here or for the session,
+		 * runs the whole-file verify phase after the transfer. There
+		 * is nothing to resume, so the resume verify stays off. */
 		if (verify_set_for_command(conn,
 		    vflag || hpn_verify_transfer) == -1) {
 			err = -1;
 			break;
 		}
 		err = process_get(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag, 0 /* not chunked-resume verify */);
+		    rflag, aflag, fflag, 0 /* no resume verify */);
 		break;
-	case I_VREPUT:
+	case I_VREPUT:	/* HPN */
 		vflag = 1;
 		/* FALLTHROUGH */
 	case I_REPUT:
+		/* HPN: resume upload, with -V as in reget. */
 		aflag = 1;
 		verify_set_for_command(conn, 0);
 		if (resume_verify_check(conn,
@@ -2489,17 +2374,18 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		err = process_put(conn, path1, path2, *pwd, pflag,
 		    rflag, aflag, fflag, vflag || hpn_verify_transfer);
 		break;
-	case I_VPUT:
+	case I_VPUT:	/* HPN */
 		vflag = 1;
 		/* FALLTHROUGH */
 	case I_PUT:
+		/* HPN: fresh upload, with -V as in get. */
 		if (verify_set_for_command(conn,
 		    vflag || hpn_verify_transfer) == -1) {
 			err = -1;
 			break;
 		}
 		err = process_put(conn, path1, path2, *pwd, pflag,
-		    rflag, aflag, fflag, 0 /* not chunked-resume verify */);
+		    rflag, aflag, fflag, 0 /* no resume verify */);
 		break;
 	case I_COPY:
 		path1 = sftp_make_absolute(path1, *pwd);
@@ -2705,26 +2591,13 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		else
 			printf("Progress meter disabled\n");
 		break;
-	case I_DEFER:
-		/*
-		 * Toggle the deferred-wait flag.  When ON, `put` and `get`
-		 * return as soon as their submissions hit the queue rather
-		 * than blocking until completion, so successive commands
-		 * pipeline through the worker pool.
-		 *
-		 * Transitioning from ON to OFF drains any pending work
-		 * first (parallel_flush) - `defer off` is a synchronisation
-		 * barrier as well as a state change.  Going ON to ON or OFF
-		 * to OFF is a no-op.  With no argument, the current state
-		 * is printed.
-		 *
-		 * Useful in interactive mode where the user wants to queue
-		 * several uploads back-to-back without waiting for each to
-		 * finish, then synchronise at a chosen point.  In batch mode
-		 * the flag starts ON automatically; this command can disable
-		 * it mid-batch when the next operations depend on prior ones
-		 * having completed.
-		 */
+	case I_DEFER:	/* HPN */
+		/* With deferral on, put and get return once their files are
+		 * queued, so successive commands pipeline through the fleet.
+		 * Turning it off drains the queue first, so defer off is also
+		 * a barrier. Batch mode starts with deferral on, and defer
+		 * off lets later commands depend on earlier ones. Alone,
+		 * defer prints the state. */
 		if (path1 == NULL) {
 			printf("defer is %s\n",
 			    defer_parallel_wait ? "on" : "off");
@@ -2737,10 +2610,8 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 		} else if (strcasecmp(path1, "off") == 0 ||
 		    strcasecmp(path1, "no") == 0 ||
 		    strcmp(path1, "0") == 0) {
-			if (defer_parallel_wait && parallel_orch != NULL) {
-				if (parallel_flush(conn, 0) != 0)
-					err = -1;
-			}
+			if (defer_parallel_wait && parallel_flush(conn, 0) != 0)
+				err = -1;
 			defer_parallel_wait = 0;
 			if (!quiet)
 				printf("defer off\n");
@@ -2750,15 +2621,12 @@ parse_dispatch_command(struct sftp_conn *conn, const char *cmd, char **pwd,
 			err = -1;
 		}
 		break;
-	case I_WAIT:
-		/* Synchronisation barrier: drain any submissions queued by
-		 * deferred put/get commands.  No-op when nothing is in
-		 * flight or when the orchestrator isn't running.  Always
-		 * safe - independent of the defer flag. */
-		if (parallel_orch != NULL) {
-			if (parallel_flush(conn, 0) != 0)
-				err = -1;
-		}
+	case I_WAIT:	/* HPN */
+		/* Drain what deferred commands queued, whether deferral is
+		 * still on or not. Without a fleet there is nothing to
+		 * drain. */
+		if (parallel_flush(conn, 0) != 0)
+			err = -1;
 		if (!quiet)
 			printf("wait: drained\n");
 		break;
@@ -3180,6 +3048,18 @@ complete(EditLine *el, int ch)
 }
 #endif /* USE_LIBEDIT */
 
+/* HPN: end the session on a protocol violation on the control
+ * connection. Its replies no longer match its requests, so no later
+ * command can trust it. Callers check before reporting their own
+ * failure, which would hide the cause. */
+static void
+fatal_on_protocol_violation(struct sftp_conn *conn)
+{
+	if (sftp_conn_is_protocol_violation(conn))
+		fatal("Protocol violation on the control connection, "
+		    "cannot continue");
+}
+
 static int
 interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 {
@@ -3231,11 +3111,7 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 #endif /* USE_LIBEDIT */
 
 	if ((remote_path = sftp_realpath(conn, ".")) == NULL) {
-		/* Distinguish protocol corruption from a generic "no cwd" so
-		 * the user knows whether to investigate the server. */
-		if (sftp_conn_is_protocol_violation(conn))
-			fatal("control connection protocol violation during "
-			    "init - possible MITM or server corruption");
+		fatal_on_protocol_violation(conn);	/* HPN */
 		fatal("Need cwd");
 	}
 	startdir = xstrdup(remote_path);
@@ -3250,26 +3126,30 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 			snprintf(cmd, sizeof cmd, "cd \"%s\"", dir);
 			if (parse_dispatch_command(conn, cmd,
 			    &remote_path, startdir, 1, 0) != 0) {
-				/* Early dispatch (pre-interactive_loop): same
-				 * fail-stop on protocol violation as the main
-				 * loop check at the bottom of interactive_loop. */
-				if (sftp_conn_is_protocol_violation(conn))
-					fatal("control connection protocol "
-					    "violation - possible MITM or "
-					    "server corruption");
+				fatal_on_protocol_violation(conn);	/* HPN */
 				free(dir);
 				free(startdir);
 				free(remote_path);
-				/* conn freed by main (caller) after verify drain */
+				/* HPN: freed by main after its verify drain */
 				return (-1);
 			}
 		} else {
-			err = process_get(conn, dir, file2, remote_path, 0, 0,
-			    global_aflag, 0, hpn_verify_transfer);
+			/* HPN: -V as the get command takes it. Then drain the
+			 * fleet, as after the command loop below. -b turns
+			 * deferral on, so the get may only have queued. */
+			if (verify_set_for_command(conn,
+			    hpn_verify_transfer) == -1)
+				err = -1;
+			else
+				err = process_get(conn, dir, file2,
+				    remote_path, 0, 0, global_aflag, 0,
+				    0 /* no resume verify */);
+			if (parallel_flush(conn, 1) != 0)
+				err = -1;
 			free(dir);
 			free(startdir);
 			free(remote_path);
-			/* conn freed by main (caller) after verify drain */
+			/* HPN: freed by main after its verify drain */
 			return (err);
 		}
 		free(dir);
@@ -3331,31 +3211,22 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 
 		err = parse_dispatch_command(conn, cmd, &remote_path,
 		    startdir, batchmode, !interactive && el == NULL);
-		if (sftp_conn_is_protocol_violation(conn))
-			fatal("control connection protocol violation - "
-			    "possible MITM or server corruption");
+		fatal_on_protocol_violation(conn);	/* HPN */
 		if (err != 0)
 			break;
 	}
 
-	/*
-	 * End-of-batch drain.  In deferred mode (batch mode, or a future
-	 * interactive "job submission mode") process_put / process_get only
-	 * submit to the queue and return; the actual wait happens here.  Safe
-	 * to call unconditionally - parallel_flush() is a no-op when no
-	 * orchestrator exists or no submissions are outstanding.
-	 *
-	 * In non-deferred interactive mode this is also safe: each command
-	 * already drained itself, so the queue is empty and the wait returns
-	 * immediately.
-	 */
+	/* HPN: the end-of-session drain, which also prints the session
+	 * summary. With deferral on, it waits for the files the last commands
+	 * queued. Otherwise each command drained itself. Without a fleet it
+	 * does nothing. */
 	if (parallel_flush(conn, 1) != 0)
 		err = -1;
 
 	ssh_signal(SIGCHLD, SIG_DFL);
 	free(remote_path);
 	free(startdir);
-	/* conn freed by main (caller) after verify drain */
+	/* HPN: freed by main after its verify drain */
 
 #ifdef USE_LIBEDIT
 	if (hl != NULL)
@@ -3364,16 +3235,11 @@ interactive_loop(struct sftp_conn *conn, char *file1, char *file2)
 		el_end(el);
 #endif /* USE_LIBEDIT */
 
-	/*
-	 * err == 1 signifies normal "quit" exit; err == -1 is a failed
-	 * command in batch mode.  Additionally, session_had_failure
-	 * captures any parallel_flush failure that interactive mode
-	 * intentionally swallowed at the parse_dispatch_command layer.
-	 * Either signal forces non-zero exit so the user always knows
-	 * when data was lost.
-	 */
+	/* HPN: a failed command does not always end the loop, so a -j drain
+	 * that lost files must still make the exit non-zero. */
 	if (session_had_failure)
 		return (-1);
+	/* err == 1 signifies normal "quit" exit */
 	return (err >= 0 ? 0 : -1);
 }
 
@@ -3438,11 +3304,37 @@ connect_to_server(char *path, char **args, int *in, int *out)
 	close(c_in);
 	close(c_out);
 
-	/* Announce the control ssh child PID so post-mortem diagnostics can
-	 * tell it apart from worker PIDs (worker PIDs are logged by the
-	 * parallel orchestrator's watchdog as "worker N: ... pid=...").
-	 * Useful when investigating control-connection deaths in -j mode. */
+	/* HPN: log the control connection's ssh pid, so a debug log can
+	 * tell it from the -j workers' ssh pids. */
 	debug("hpnsftp control: ssh child pid=%ld", (long)sshpid);
+}
+
+/* HPN: check the -W directory, creating it and any missing parents if it
+ * does not exist. Anything unusable is fatal, including an argument that
+ * starts with '-', since a mistyped -W is more likely than a directory of
+ * that name. */
+static void
+worker_log_dir_check(const char *dir)
+{
+	struct stat st;
+
+	if (*dir == '\0' || *dir == '-')
+		fatal("-W requires a directory path argument (got \"%s\")",
+		    dir);
+	if (stat(dir, &st) != 0) {
+		if (errno != ENOENT)
+			fatal("-W \"%s\": %s", dir, strerror(errno));
+		if (mkdir_p(dir, 0755) != 0)
+			fatal("-W could not create \"%s\": %s", dir,
+			    strerror(errno));
+		if (stat(dir, &st) != 0)
+			fatal("-W \"%s\" missing after mkdir: %s", dir,
+			    strerror(errno));
+	}
+	if (!S_ISDIR(st.st_mode))
+		fatal("-W \"%s\" is not a directory", dir);
+	if (access(dir, W_OK | X_OK) != 0)
+		fatal("-W \"%s\" not writable: %s", dir, strerror(errno));
 }
 
 static void
@@ -3455,9 +3347,9 @@ usage(void)
 	    "          [-D sftp_server_command] [-F ssh_config] [-i identity_file]\n"
 	    "          [-J destination] [-j parallel_streams] [-l limit]\n"
 	    "          [-M range_split_min_mb] [-o ssh_option] [-P port]\n"
-	    "          [-R num_requests] [-S program] [-w writers_per_file]\n"
-	    "          [-s subsystem | sftp_server] [-X sftp_option] [-z level]\n"
-	    "          [--bundle-size N[KMG]] destination\n",
+	    "          [-R num_requests] [-S program] [-s subsystem | sftp_server]\n"
+	    "          [-W worker_log_dir] [-w writers_per_file] [-X sftp_option]\n"
+	    "          [-z level] destination\n",
 	    __progname);
 	exit(1);
 }
@@ -3478,31 +3370,24 @@ main(int argc, char **argv)
 	struct sftp_conn *conn;
 	size_t copy_buffer_len = 0;
 	size_t num_requests = 0;
-	int no_verify_repair = 0;	/* -X VerifyRepair=no -> 1 */
-	int lustre_stripe_count = -1;	/* HPNLustreStripeCount: -1 = auto */
+	int no_verify_repair = 0;	/* HPN: 1 for -X VerifyRepair=no */
+	int lustre_stripe_count = -1;	/* HPN: HPNLustreStripeCount, -1 auto */
 	long long llv, limit_kbps = 0;
 
-	/* Pass-through state for the parallel worker connections. Captured
-	 * during getopt and forwarded into sftp_parallel_config, so the
-	 * workers honor the connection options the user gave the main
-	 * connection. The forwarded -o list lives at file scope
-	 * (parallel_extra_o, appended to by parallel_extra_o_add()). */
+	/* HPN: the -i and -F values, kept for the -j workers' ssh so they
+	 * connect as the main connection does. The other forwarded options
+	 * go to parallel_extra_o. */
 	const char *parallel_identity = NULL;
 	const char *parallel_config_file = NULL;
-	int zstd_level = 0;			/* -z: zstd@hpnssh.org level */
 
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
 	msetlocale();
 
-	/*
-	 * Ignore SIGPIPE process-wide.  Without this, a write to a closed
-	 * pipe terminates the entire process - fatal in parallel mode
-	 * because a worker thread writing to its (now-dead) ssh child
-	 * delivers SIGPIPE to the whole sftp process, killing the control
-	 * connection and the orchestrator as collateral damage.  After this
-	 * call, those writes return EPIPE which our code already handles.
-	 */
+	/* HPN: ignore SIGPIPE. Under -j a worker thread writing to its dead
+	 * ssh child would otherwise kill the whole process, the control
+	 * connection and the fleet with it. The write returns EPIPE instead,
+	 * which the callers handle. */
 	ssh_signal(SIGPIPE, SIG_IGN);
 
 	__progname = ssh_get_progname(argv[0]);
@@ -3517,113 +3402,40 @@ main(int argc, char **argv)
 	ll = SYSLOG_LEVEL_INFO;
 	infile = stdin;
 
-	/*
-	 * Long-only option pre-scan.  hpnsftp uses the openbsd-compat
-	 * BSDgetopt (defines.h macros `optarg` → `BSDoptarg` when
-	 * HAVE_GETOPT_OPTRESET is undefined), so a getopt_long() call
-	 * from glibc writes its own `optarg` while our code reads
-	 * BSDoptarg - they're different symbols.  Easier than wrestling
-	 * with that mismatch: pre-scan argv before getopt runs, extract
-	 * any `--bundle-size=N[KMG]` or `--bundle-size N[KMG]`, propagate
-	 * to the parallel layer via `-oHPNBundleSize=...`, and compact
-	 * argv so getopt never sees the flag.
-	 */
-	{
-		int i, j;
-		for (i = 1; i < argc; ) {
-			const char *arg = argv[i];
-			const char *val = NULL;
-			int consume = 0;
-			if (arg == NULL) { i++; continue; }
-			if (strncmp(arg, "--bundle-size=", 14) == 0) {
-				val = arg + 14;
-				consume = 1;
-			} else if (strcmp(arg, "--bundle-size") == 0) {
-				if (i + 1 >= argc)
-					fatal("--bundle-size requires an "
-					    "argument");
-				val = argv[i + 1];
-				consume = 2;
-			}
-			if (consume == 0) { i++; continue; }
-			{
-				long long bsv;
-				if (scan_scaled((char *)val, &bsv) == -1)
-					fatal("--bundle-size: bad value "
-					    "\"%s\": %s",
-					    val, strerror(errno));
-				if (bsv < (long long)(1 * 1024 * 1024)) {
-					fprintf(stderr, "--bundle-size %lld "
-					    "is below the minimum (1 MiB); "
-					    "clamping to 1 MiB.\n", bsv);
-					bsv = 1 * 1024 * 1024;
-				} else if (bsv >
-				    (long long)(64 * 1024 * 1024)) {
-					fprintf(stderr, "--bundle-size %lld "
-					    "is above the maximum (64 MiB); "
-					    "clamping to 64 MiB.\n", bsv);
-					bsv = 64 * 1024 * 1024;
-				}
-				{
-					char buf[64];
-					snprintf(buf, sizeof(buf),
-					    "HPNBundleSize=%lld", bsv);
-					addargs(&args, "-o%s", buf);
-					parallel_extra_o_add(buf);
-				}
-			}
-			/* Shift remaining argv left over the consumed slot(s). */
-			for (j = i; j + consume < argc; j++)
-				argv[j] = argv[j + consume];
-			argc -= consume;
-			argv[argc] = NULL;
-			/* don't increment i - re-examine the now-shifted slot */
-		}
-	}
-
 	while ((ch = getopt(argc, argv,
 	    "1246AVafhNpqrvCz:c:D:i:j:l:o:s:S:b:B:F:J:M:P:R:W:w:X:")) != -1) {
 		switch (ch) {
-		/* Passed through to ssh(1).  The connection-shaping flags also
-		 * propagate to parallel-streams workers via their -o
-		 * equivalents (the worker SSH argv is rebuilt from pcfg, not
-		 * from this arglist).  -A (agent forwarding) is deliberately
-		 * not forwarded to data-mover workers. */
+		/* Passed through to ssh(1) */
+		/* HPN: the -j workers get these as -o options too, all but -A.
+		 * Workers only move data, so agent forwarding stays off. */
 		case 'A':
 			addargs(&args, "-%c", ch);
 			break;
 		case '4':
 			addargs(&args, "-%c", ch);
-			parallel_extra_o_add("AddressFamily=inet");
+			addargs(&parallel_extra_o, "AddressFamily=inet");
 			break;
 		case '6':
 			addargs(&args, "-%c", ch);
-			parallel_extra_o_add("AddressFamily=inet6");
+			addargs(&parallel_extra_o, "AddressFamily=inet6");
 			break;
 		case 'C':
 			addargs(&args, "-%c", ch);
-			parallel_extra_o_add("Compression=yes");
+			addargs(&parallel_extra_o, "Compression=yes");
 			break;
-		/* Passed through to ssh(1) with argument; also propagated to
-		 * parallel workers as the -o equivalent. */
-		case 'J': {
-			char *o;
+		/* Passed through to ssh(1) with argument */
+		/* HPN: the -j workers get these too: -J, -c and -o through
+		 * parallel_extra_o, and -F and -i through parallel_launch. */
+		case 'J':
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
-			xasprintf(&o, "ProxyJump=%s", optarg);
-			parallel_extra_o_add(o);
-			free(o);
+			addargs(&parallel_extra_o, "ProxyJump=%s", optarg);
 			break;
-		}
-		case 'c': {
-			char *o;
+		case 'c':
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
-			xasprintf(&o, "Ciphers=%s", optarg);
-			parallel_extra_o_add(o);
-			free(o);
+			addargs(&parallel_extra_o, "Ciphers=%s", optarg);
 			break;
-		}
 		case 'F':
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
@@ -3635,26 +3447,24 @@ main(int argc, char **argv)
 			parallel_identity = optarg;
 			break;
 		case 'z': {
-			/* HPN: zstd@hpnssh.org at this level on the control/
-			 * serial ssh, and forwarded to workers via ZstdLevel. */
-			const char *zerr = NULL;
-			char zo[32];
+			/* HPN: zstd@hpnssh.org at this level, passed as
+			 * ZstdLevel to the main ssh and each -j worker's. */
+			int zstd_level;
 
 			zstd_level = (int)strtonum(optarg, HPN_ZSTD_LEVEL_MIN,
-			    HPN_ZSTD_LEVEL_MAX, &zerr);
-			if (zerr != NULL)
+			    HPN_ZSTD_LEVEL_MAX, &errstr);
+			if (errstr != NULL)
 				fatal("Invalid -z zstd level \"%s\": %s "
-				    "(range %d-%d)", optarg, zerr,
+				    "(range %d-%d)", optarg, errstr,
 				    HPN_ZSTD_LEVEL_MIN, HPN_ZSTD_LEVEL_MAX);
 			addargs(&args, "-oZstdLevel=%d", zstd_level);
-			snprintf(zo, sizeof(zo), "ZstdLevel=%d", zstd_level);
-			parallel_extra_o_add(zo);
+			addargs(&parallel_extra_o, "ZstdLevel=%d", zstd_level);
 			break;
 		}
 		case 'o':
 			addargs(&args, "-%c", ch);
 			addargs(&args, "%s", optarg);
-			parallel_extra_o_add(optarg);
+			addargs(&parallel_extra_o, "%s", optarg);
 			break;
 		case 'q':
 			ll = SYSLOG_LEVEL_ERROR;
@@ -3698,14 +3508,11 @@ main(int argc, char **argv)
 				fatal("%s (%s).", strerror(errno), optarg);
 			showprogress = 0;
 			quiet = batchmode = 1;
-			/*
-			 * Batch mode submits commands sequentially from a file.
-			 * Deferring the per-command parallel_flush lets multiple
-			 * `put`/`get` commands pipeline their files through the
-			 * worker pool instead of each command stalling on the
-			 * slowest chunk of the previous one.  parallel_flush() is
-			 * called once after the command loop exits.
-			 */
+			/* HPN: batch mode defers get and put, so successive
+			 * commands pipeline their files through the -j fleet
+			 * instead of each waiting on the previous one's slowest
+			 * chunk. A wait, a defer off or the end of the batch
+			 * drains them. */
 			defer_parallel_wait = 1;
 			addargs(&args, "-obatchmode yes");
 			break;
@@ -3721,34 +3528,35 @@ main(int argc, char **argv)
 		case 'D':
 			sftp_direct = optarg;
 			break;
-		case 'j':
+		case 'j':	/* HPN */
 			parallel_num_streams = (int)strtonum(optarg, 1,
 			    SFTP_PARALLEL_MAX_WORKERS, &errstr);
 			if (errstr != NULL)
-				fatal("Number of parallel streams must be between 1 and %d: \"%s\": %s",
-				    SFTP_PARALLEL_MAX_WORKERS,optarg, errstr);
+				fatal("Number of parallel streams must be "
+				    "between 1 and %d: \"%s\": %s",
+				    SFTP_PARALLEL_MAX_WORKERS, optarg, errstr);
 			parallel_user_opt_in = 1;
 			break;
 		case 'M':
-			/* Range-split minimum size (in MiB).  Files at or below
-			 * this size are uploaded as whole-file work units; larger
-			 * files are split into byte ranges across workers.  Hard
-			 * bounded to [64, 10240] MiB so neither degenerate value
-			 * can produce pathological behavior (very small => over-
-			 * chunking, very large => no parallelism for huge files). */
-			range_split_min_mb_user = (int)strtonum(optarg, 64,
-			    10240, &errstr);
+			/* HPN: the minimum size, in MiB, of the byte ranges a
+			 * large file is split into for -j. A file splits only
+			 * at twice this size. The bounds keep a tiny value from
+			 * over-chunking and a huge one from never splitting. */
+			range_split_min_mb_user = (int)strtonum(optarg,
+			    RANGE_SPLIT_MIN_MB_FLOOR,
+			    RANGE_SPLIT_MIN_MB_CEILING, &errstr);
 			if (errstr != NULL)
 				fatal("Range-split minimum (-M) must be between "
-				    "64 and 10240 MiB: \"%s\": %s",
-				    optarg, errstr);
+				    "%d and %d MiB: \"%s\": %s",
+				    RANGE_SPLIT_MIN_MB_FLOOR,
+				    RANGE_SPLIT_MIN_MB_CEILING, optarg, errstr);
 			break;
 		case 'w':
-			/* Max concurrent range-writers per inode.  Caps how many
-			 * range-split workers write one file at once; buffered
-			 * multi-writer into a single inode serialises on the
-			 * per-inode lock (4 is the measured throughput knee).
-			 * Effective cap is min(this, -j). */
+			/* HPN: the most -j workers that write ranges of one
+			 * file at once. Buffered writes to one inode serialise
+			 * on its lock, and the default of 4 is the measured
+			 * throughput knee. The cap in effect is the smaller of
+			 * this and -j. */
 			writers_cap_user = (int)strtonum(optarg,
 			    HPN_RANGE_WRITERS_CAP_FLOOR,
 			    HPN_RANGE_WRITERS_CAP_MAX, &errstr);
@@ -3769,14 +3577,10 @@ main(int argc, char **argv)
 			global_rflag = 1;
 			break;
 		case 'V':
-			/*
-			 * Turn verify transfer on for this session. It is
-			 * requested per run by this flag, not by any config
-			 * keyword: transfer-layer verify deserves a first-class
-			 * flag rather than an ssh-wide -o option that plain
-			 * hpnssh would parse and ignore.
-			 */
-			verify_flag_user = 1;
+			/* HPN: verify every transfer in the session. It is a
+			 * flag, not a config keyword, because plain hpnssh
+			 * would parse and ignore an ssh-wide -o option. */
+			hpn_verify_transfer = 1;
 			break;
 		case 'R':
 			num_requests = strtol(optarg, &cp, 10);
@@ -3792,54 +3596,18 @@ main(int argc, char **argv)
 			replacearg(&args, 0, "%s", ssh_program);
 			break;
 		case 'W':
-			/* Per-worker SSH stderr capture directory.  Diagnostic
-			 * aid: when set, each parallel worker writes its SSH
-			 * child's stderr to <dir>/hpnssh-worker-<pid>.stderr,
-			 * giving users a clear per-worker log to send when
-			 * reporting failures.  Off by default - production
-			 * inherits stderr so connection errors / banners /
-			 * warnings reach the user's terminal directly.
-			 *
-			 * Validates: must be a non-empty path that names a
-			 * writable directory.  If the path doesn't exist we
-			 * create it (mkdir-p semantics, mode 0755).  Anything
-			 * else (missing arg, dash-prefixed token, mkdir
-			 * failure, existing path that isn't a directory, no
-			 * write access) is fatal - the user typed something
-			 * they probably didn't mean. */
-			if (optarg == NULL || *optarg == '\0' ||
-			    *optarg == '-')
-				fatal("-W requires a directory path argument "
-				    "(got \"%s\")",
-				    optarg ? optarg : "(none)");
-			{
-				struct stat st;
-				if (stat(optarg, &st) != 0) {
-					if (errno != ENOENT)
-						fatal("-W \"%s\": %s",
-						    optarg, strerror(errno));
-					if (mkdir_p(optarg, 0755) != 0)
-						fatal("-W could not create "
-						    "\"%s\": %s",
-						    optarg, strerror(errno));
-					if (stat(optarg, &st) != 0)
-						fatal("-W \"%s\" missing "
-						    "after mkdir: %s",
-						    optarg, strerror(errno));
-				}
-				if (!S_ISDIR(st.st_mode))
-					fatal("-W \"%s\" is not a directory",
-					    optarg);
-				if (access(optarg, W_OK | X_OK) != 0)
-					fatal("-W \"%s\" not writable: %s",
-					    optarg, strerror(errno));
-			}
+			/* HPN: each -j worker's ssh writes its stderr to
+			 * hpnssh-worker-<pid>.stderr in this directory, a log a
+			 * user can send with a failure report. Without -W it
+			 * reaches the terminal. */
+			worker_log_dir_check(optarg);
 			worker_log_dir = optarg;
 			break;
 		case 'X':
-			if (transferlog_option(optarg))
+			if (transferlog_option(optarg))	/* HPN */
 				break;
 			/* Please keep in sync with scp.c -X */
+			/* HPN: the names match case-insensitively */
 			if (strncasecmp(optarg, "buffer=", 7) == 0) {
 				r = scan_scaled(optarg + 7, &llv);
 				/* don't ask for a buffer larger than the maximum
@@ -3854,7 +3622,7 @@ main(int argc, char **argv)
 				}
 				copy_buffer_len = (size_t)llv;
 			} else if (strncasecmp(optarg, "nrequests=", 10) == 0) {
-				/* the cap on the derived default, see
+				/* HPN: capped as the derived default is, at
 				 * SFTP_HPN_MAX_REQUESTS */
 				llv = strtonum(optarg + 10, 1,
 					       SFTP_HPN_MAX_REQUESTS, &errstr);
@@ -3865,7 +3633,7 @@ main(int argc, char **argv)
 				}
 				num_requests = (size_t)llv;
 			} else if (strncasecmp(optarg, "VerifyRepair=", 13) == 0) {
-				/* Auto-repair toggle (default yes). */
+				/* HPN: verify auto-repair, on by default */
 				const char *v = optarg + 13;
 				if (strcasecmp(v, "no") == 0)
 					no_verify_repair = 1;
@@ -3875,8 +3643,8 @@ main(int argc, char **argv)
 					fatal("Invalid VerifyRepair value "
 					      "\"%s\": use yes or no", v);
 			} else if (strncasecmp(optarg, "Pacing=", 7) == 0) {
-				/* Adaptive upload pacing toggle (default
-				 * no); see sftp_conn_pace_ack. */
+				/* HPN: adaptive upload pacing, off by default.
+				 * See sftp_conn_pace_ack. */
 				const char *v = optarg + 7;
 				if (strcasecmp(v, "no") == 0)
 					sftp_hpn_pace_set_enabled(0);
@@ -3898,6 +3666,8 @@ main(int argc, char **argv)
 	/* Do this last because we want the user to be able to override it */
 	addargs(&args, "-oForwardAgent no");
 
+	/* HPN: with HPN_PM_DEBUG set, the meter runs without a tty too, so its
+	 * values can be captured. */
 	if (!isatty(STDERR_FILENO) && getenv("HPN_PM_DEBUG") == NULL)
 		showprogress = 0;
 
@@ -3906,8 +3676,8 @@ main(int argc, char **argv)
 
 	log_init(argv[0], ll, SYSLOG_FACILITY_USER, 1);
 
-	/* -X TransferLog: open the log before any connection. The open is
-	 * the writability check. */
+	/* HPN: open the -X TransferLog before any connection. The open is the
+	 * writability check. */
 	transferlog_begin();
 
 	if (sftp_direct == NULL) {
@@ -3975,18 +3745,18 @@ main(int argc, char **argv)
 	if (conn == NULL)
 		fatal("Couldn't initialise connection to server");
 
-	/* HPN: resolve the bundling knobs (HPNUseBundle, HPNBundleSize,
-	 * HPNWriterPool) from ssh_config + -o overrides for the serial
-	 * recursive walks.  The parallel path resolves the same options
-	 * into its pcfg at orchestrator launch; this covers no -j runs.
-	 * Skipped for -D direct mode (no host to resolve against): the
-	 * connection keeps the options' documented defaults. */
+	/* HPN: resolve, from ssh_config and any -o, the HPN options the main
+	 * connection carries: the bundle settings (HPNUseBundle,
+	 * HPNBundleSize, HPNWriterPool), HPNLustreStripeCount and
+	 * HPNFailureLog. A -j fleet resolves its own copy when it launches.
+	 * With -D there is no host to resolve against, so the defaults
+	 * stand. */
 	if (sftp_direct == NULL && host != NULL && *host != '\0') {
 		struct sftp_parallel_config bcfg;
 
 		memset(&bcfg, 0, sizeof(bcfg));
 		if (sftp_parallel_apply_ssh_config(&bcfg, host,
-		    parallel_config_file, parallel_extra_o) == 0) {
+		    parallel_config_file, parallel_extra_o.list) == 0) {
 			sftp_conn_set_bundle_config(conn, bcfg.use_bundle,
 			    bcfg.bundle_size, bcfg.writer_pool);
 			lustre_stripe_count = bcfg.lustre_stripe_count;
@@ -4001,21 +3771,11 @@ main(int argc, char **argv)
 			fprintf(stderr, "Attached to %s.\n", sftp_direct);
 	}
 
-	/*
-	 * Start the parallel-streams orchestrator only when the user
-	 * explicitly opted in via -j N.  Without -j, hpnsftp behaves as a
-	 * plain single-stream client (no orchestrator, no autotuning) so
-	 * default behaviour is identical to upstream sftp.  -j N opts into
-	 * the adaptive scaler, treating N as the starting point.
-	 *
-	 * The master and workers honor the same -i / -F / -o options the
-	 * user gave the main connection (captured during getopt above).
-	 */
-	/*
-	 * Capture the orchestrator launch inputs so the fleet can be
-	 * re-created after an interrupt (parallel_orch_ensure_alive),
-	 * then launch via the shared helper.
-	 */
+	/* HPN: save the -j launch inputs, so parallel_orch_ensure_alive can
+	 * rebuild the fleet after an abort, then launch it. The workers
+	 * connect with the -i, -F and -o options the main connection used.
+	 * Without -j, or with -D, there is no fleet and every transfer is
+	 * single-stream. */
 	parallel_launch.host         = host;
 	parallel_launch.user         = user;
 	parallel_launch.port         = port;
@@ -4023,112 +3783,64 @@ main(int argc, char **argv)
 	parallel_launch.identity     = parallel_identity;
 	parallel_launch.config_file  = parallel_config_file;
 	parallel_launch.sftp_server  = sftp_server;
-	parallel_launch.extra_o      = parallel_extra_o;
 	parallel_launch.buflen       = copy_buffer_len;
 	parallel_launch.num_requests = num_requests;
 	parallel_launch.no_verify_repair = no_verify_repair;
 	parallel_launch.limit_kbps   = limit_kbps;
 	parallel_launch.debug_level  = debug_level;
-	parallel_launch.valid        = 1;
 	if (parallel_user_opt_in && sftp_direct == NULL)
 		parallel_orch_launch(conn);
 
-	/*
-	 * Integrity verify is requested by -V only (the session-global program
-	 * switch), not ssh_config.  Per-command put/get -V and getv/putv toggle
-	 * it on top of this via verify_set_for_command().
-	 */
-	hpn_verify_transfer = verify_flag_user;
-	/*
-	 * Propagate verify transfer state onto the connection so the
-	 * resume-decision hash callers can flag the hpn-check-file request
-	 * as STRICT (no sparse-skip sentinel).  When set, the user has
-	 * explicitly asked for maximum verification and shouldn't accept
-	 * the size+allocation trust optimisation.
-	 */
+	/* HPN: the session's -V is the starting verify state. Each get and
+	 * put sets it again for itself through verify_set_for_command. */
 	sftp_conn_set_verify_transfer(conn, hpn_verify_transfer);
 
-	/*
-	 * Resolve and propagate the verify auto-repair (#6) settings onto the
-	 * connection for the single-conn (classic) verify phase, mirroring the
-	 * orchestrator's resolution in sftp_parallel_start.  -X VerifyRepair=no
-	 * (no_verify_repair) disables; the attempt cap is fixed at 3.
-	 */
+	/* HPN: verify auto-repair for the single-stream verify phase,
+	 * resolved as sftp_parallel_start resolves the fleet's. -X
+	 * VerifyRepair=no turns it off, and the attempts are capped at 3. */
 	{
 		int rep_enabled, rep_attempts;
+
 		sftp_hpn_verify_repair_resolve(no_verify_repair,
 		    &rep_enabled, &rep_attempts);
 		sftp_conn_set_verify_repair(conn, rep_enabled, rep_attempts);
 	}
 
-	/*
-	 * Propagate HPNLustreStripeCount (EXPERIMENTAL) onto the connection
-	 * so the parallel upload-walker's dir-layout decision site can see
-	 * it.  Value: -1 = auto (use -j N), 0 = feature off, >0 = explicit.
-	 */
+	/* HPN: HPNLustreStripeCount, EXPERIMENTAL, which the -j layout code
+	 * reads through the connection. -1 is auto (match -j), 0 is off, and
+	 * a positive value is the stripe count. */
 	sftp_conn_set_lustre_stripe_count(conn, lustre_stripe_count);
 
 	err = interactive_loop(conn, file1, file2);
 
-	/*
-	 * Fold classic (single-conn) post-transfer verify mismatches into the
-	 * global list (drain transfers ownership of the strings).  The compare
-	 * now runs inside sftp_upload/sftp_download for every file - single-file
-	 * and recursive - so this is the single classic source feeding the
-	 * shared summary + SFTP_EX_VERIFY_FAILED exit path.
-	 */
+	/* HPN: add the single-stream verify failures to the session's list,
+	 * for the summary and the exit status at the end. */
 	{
 		char  **cvpaths = NULL;
-		int     cvused = 0, i;
+		int     cvused = 0;
 
 		(void)sftp_conn_drain_verify_failures(conn, &cvpaths, &cvused);
-		for (i = 0; i < cvused; i++) {
-			verify_fail_list = xreallocarray(verify_fail_list,
-			    verify_fail_count + 1, sizeof(*verify_fail_list));
-			verify_fail_list[verify_fail_count++] = cvpaths[i];
-		}
-		free(cvpaths);
+		verify_fail_list_add(cvpaths, cvused);
 	}
 
-	/*
-	 * conn ownership lives in main (HPN): upstream's interactive_loop freed
-	 * conn on every exit, but the classic verify drain just above needs it
-	 * after the call returns.  This is conn's last use, so free it here.
-	 */
+	/* HPN: main frees conn, because the verify drain above needs it after
+	 * interactive_loop returns. This is its last use. */
 	free(conn);
 	conn = NULL;
 
-	/*
-	 * Fold any parallel post-transfer verify mismatches into the global
-	 * verify-failure list (drain transfers ownership of the strings), so
-	 * the single end-of-run summary + SFTP_EX_VERIFY_FAILED exit path
-	 * covers both single-stream and parallel transfers.  Must run before
-	 * sftp_parallel_stop frees the orchestrator.
-	 */
+	/* HPN: add the -j verify failures too, before sftp_parallel_stop
+	 * frees the fleet. */
 	if (parallel_orch != NULL) {
 		char  **vpaths = NULL;
-		int     vused = 0, i;
+		int     vused = 0;
 
 		(void)sftp_parallel_drain_verify_failures(parallel_orch,
 		    &vpaths, &vused);
-		for (i = 0; i < vused; i++) {
-			verify_fail_list = xreallocarray(verify_fail_list,
-			    verify_fail_count + 1, sizeof(*verify_fail_list));
-			verify_fail_list[verify_fail_count++] = vpaths[i];
-		}
-		free(vpaths);
-	}
-
-	if (parallel_orch != NULL) {
+		verify_fail_list_add(vpaths, vused);
 		sftp_parallel_stop(parallel_orch);
 		parallel_orch = NULL;
 	}
-	if (parallel_extra_o != NULL) {
-		for (size_t pi = 0; pi < parallel_extra_o_count; pi++)
-			free(parallel_extra_o[pi]);
-		free(parallel_extra_o);
-		parallel_extra_o = NULL;
-	}
+	freeargs(&parallel_extra_o);
 
 #if !defined(USE_PIPES)
 	shutdown(in, SHUT_RDWR);
@@ -4145,14 +3857,10 @@ main(int argc, char **argv)
 			fatal("Couldn't wait for ssh process: %s",
 			    strerror(errno));
 
-	/*
-	 * Verify transfer: if any file failed post-transfer verification,
-	 * print the summary and exit with the distinct SFTP_EX_VERIFY_FAILED
-	 * code so automation can detect silent-corruption even though the
-	 * transfer itself was not aborted.  This takes precedence over the
-	 * generic error code since it flags data integrity specifically.
-	 */
-	transferlog_close();
+	transferlog_close();	/* HPN */
+	/* HPN: a failed verify exits SFTP_EX_VERIFY_FAILED, ahead of the
+	 * generic status, so automation can tell silent corruption from a
+	 * failed transfer. */
 	if (verify_print_summary() > 0)
 		exit(SFTP_EX_VERIFY_FAILED);
 

@@ -56,6 +56,7 @@
 #include "sftp-hpn-workqueue.h"
 #include "sftp-parallel.h"
 #include "sftp-hpn-client.h"	/* deferred dir attrs */
+#include "sftp-hpn-tree.h"	/* HPN_WALK_MAX_DEPTH */
 #include "sftp-parallel-internal.h"
 
 extern int showprogress;
@@ -747,6 +748,33 @@ sftp_parallel_set_interrupt_flag(struct sftp_parallel *fleet,
 		fleet->ext_interrupt_flag = flag;
 }
 
+/* Clamp a requested -j worker count to the server's hpn-max-workers cap,
+ * read at sftp_init. A server that advertises none, such as stock
+ * OpenSSH, gets HPN_NO_POLICY_WORKER_DEFAULT, and a cap of 0 means no
+ * limit. The parser already bounds the request by SFTP_PARALLEL_MAX_WORKERS.
+ * Logs when the count is lowered and returns the count to use. */
+int
+sftp_parallel_cap_workers(struct sftp_conn *conn, int requested)
+{
+	int cap = sftp_conn_max_workers_cap(conn);
+	int workers = requested;
+
+	if (cap < 0)
+		workers = MINIMUM(requested, HPN_NO_POLICY_WORKER_DEFAULT);
+	else if (cap > 0)
+		workers = MINIMUM(requested, cap);
+	if (workers < requested) {
+		if (cap < 0)
+			logit("Parallel streams limited to %d (server "
+			    "advertises no policy; requested %d)", workers,
+			    requested);
+		else
+			logit("Parallel streams limited to %d by server "
+			    "policy (requested %d)", workers, requested);
+	}
+	return workers;
+}
+
 /* Record the path RTT and size the born-dead kill threshold from it.
  * The estimate also lets the watchdog compute a BDP-sized warmup budget,
  * so a freshly respawned worker in slow-start is not reaped
@@ -773,6 +801,39 @@ sftp_parallel_set_path_rtt(struct sftp_parallel *fleet, uint64_t rtt_us)
 			v = BORN_DEAD_SEC_MAX;
 		fleet->born_dead_sec = v;
 	}
+}
+
+/* Sample the path RTT on the control connection and register it with
+ * sftp_parallel_set_path_rtt. Every worker crosses the same path. Each
+ * sample is one SSH2_FXP_REALPATH round trip, the cheapest request after
+ * init, and the median of three filters out one noisy round trip without
+ * many extra RTTs at startup. A failed request ends sampling. With no
+ * samples the fleet keeps its RTT-free defaults. */
+void
+sftp_parallel_sample_path_rtt(struct sftp_parallel *fleet,
+    struct sftp_conn *conn)
+{
+	uint64_t samples[3];
+	double start;
+	char *path;
+	int i, count = 0;
+
+	if (fleet == NULL)
+		return;
+	for (i = 0; i < (int)(sizeof(samples) / sizeof(*samples)); i++) {
+		start = monotime_double();
+		if ((path = sftp_realpath(conn, ".")) == NULL)
+			break;
+		samples[count++] =
+		    (uint64_t)((monotime_double() - start) * 1e6);
+		free(path);
+	}
+	if (count == 0)
+		return;
+	sort_u64(samples, count);
+	sftp_parallel_set_path_rtt(fleet, samples[count / 2]);
+	debug_f("control-path RTT: %llu us (median of %d samples)",
+	    (unsigned long long)samples[count / 2], count);
 }
 
 /* Tear down the fleet and free it. The order is the point: shut the queue
@@ -933,28 +994,37 @@ sftp_parallel_stop(struct sftp_parallel *fleet)
 }
 
 /* Recursive worker for sftp_parallel_scan_upload_total: add src to the
- * running byte and file totals, descending into directories. Regular
- * files only, and the lstat means symlinks are skipped rather than
- * followed. Best effort: a path it cannot stat or a directory it cannot
- * open is left out of the total rather than reported, so on a tree with
- * unreadable directories the meter is sized short and finishes early. */
+ * running byte and file totals, descending into directories. It counts
+ * what the upload walk sends. The root is followed, as the walk follows
+ * it. A symlink below the root is followed only when follow_links is set,
+ * and skipped otherwise. Best effort: a path it cannot stat or a directory
+ * it cannot open is left out of the total rather than reported, so on a
+ * tree with unreadable directories the meter is sized short and finishes
+ * early. */
 static void
-scan_upload_recursive(const char *src, off_t *bytes_out,
-    uint64_t *files_out)
+scan_upload_recursive(const char *src, int depth, int follow_links,
+    off_t *bytes_out, uint64_t *files_out)
 {
 	struct stat sb;
 	DIR *dirp;
 	struct dirent *dp;
 	char *child = NULL;
+	int rc;
 
-	if (lstat(src, &sb) == -1)
+	if (depth == 0 || follow_links)
+		rc = stat(src, &sb);
+	else
+		rc = lstat(src, &sb);
+	if (rc == -1)
 		return;
 	if (S_ISREG(sb.st_mode)) {
 		*bytes_out += sb.st_size;
 		(*files_out)++;
 		return;
 	}
-	if (!S_ISDIR(sb.st_mode))
+	/* The walk refuses a directory at its depth cap. The cap also ends
+	 * a symlink loop. */
+	if (!S_ISDIR(sb.st_mode) || depth >= HPN_WALK_MAX_DEPTH)
 		return;
 	if ((dirp = opendir(src)) == NULL)
 		return;
@@ -965,30 +1035,34 @@ scan_upload_recursive(const char *src, off_t *bytes_out,
 			continue;
 		free(child);
 		xasprintf(&child, "%s/%s", src, dp->d_name);
-		scan_upload_recursive(child, bytes_out, files_out);
+		scan_upload_recursive(child, depth + 1, follow_links,
+		    bytes_out, files_out);
 	}
 	free(child);
 	closedir(dirp);
 }
 
-/* Total bytes of the regular files under a local path, and their count
- * via file_count_out when it is non-NULL. Callers use this to size the
- * progress meter before an upload starts, so it is deliberately best
- * effort: anything unreadable is omitted rather than treated as an
+/* Total bytes of the regular files an upload of a local path sends, and
+ * their count via file_count_out when it is non-NULL. Symlinks are
+ * followed as the fleet's upload walk follows them. Callers use this to
+ * size the progress meter before an upload starts, so it is deliberately
+ * best effort: anything unreadable is omitted rather than treated as an
  * error. */
 off_t
-sftp_parallel_scan_upload_total(const char *src, uint64_t *file_count_out)
+sftp_parallel_scan_upload_total(struct sftp_parallel *fleet, const char *src,
+    uint64_t *file_count_out)
 {
 	off_t bytes = 0;
 	uint64_t files = 0;
 
-	scan_upload_recursive(src, &bytes, &files);
+	scan_upload_recursive(src, 0, sftp_parallel_follow_link_flag(fleet),
+	    &bytes, &files);
 	if (file_count_out != NULL)
 		*file_count_out = files;
 	return bytes;
 }
 
-/* Record the scan-time total file count for the progress frames/meter. */
+/* Record the scan-time total file count for the status-relay frames. */
 void
 sftp_parallel_set_file_total(struct sftp_parallel *fleet, uint64_t total)
 {
@@ -1037,15 +1111,6 @@ sftp_parallel_files_total_known(struct sftp_parallel *fleet)
 	return __atomic_load_n(&fleet->files_total_known, __ATOMIC_RELAXED);
 }
 
-/* Was the run aborted (user interrupt, control-session loss, fatal
- * error)?  Read after sftp_parallel_wait so callers can refuse to
- * report success for a canceled, incomplete transfer. */
-int
-sftp_parallel_was_aborted(struct sftp_parallel *fleet)
-{
-	return fleet != NULL && fleet->abort_flag;
-}
-
 /* Starts the aggregate transfer meter. A total of 0 renders rate-only until
  * sftp_parallel_progress_set_total fills it in.
  *
@@ -1063,6 +1128,7 @@ sftp_parallel_progress_start(struct sftp_parallel *fleet, const char *label,
 	if (label == NULL)
 		label = "transfer";
 	fleet->resume_stretch_on = 0;
+	fleet->progress_mixed = 0;
 	fleet->verify_meter_total = 0;	/* a stale verify total would hijack the stop snapshot */
 	/* Nothing posted yet for this meter. */
 	__atomic_store_n(&fleet->posted_total_add, 0, __ATOMIC_RELAXED);
@@ -1104,12 +1170,12 @@ sftp_parallel_progress_set_total(struct sftp_parallel *fleet, off_t total_bytes,
 	 * rewrites a deferred label from progress_verb. */
 	if (total_bytes > 0)
 		__atomic_fetch_add(&fleet->posted_total_add, total_bytes,
-		    __ATOMIC_RELAXED);
+		    __ATOMIC_RELEASE);
 	/* posted_files_add is u_int to match the frame API, so a size_t count
 	 * narrows here; the truncation point is four billion files. */
 	if (nfiles > 0)
 		__atomic_fetch_add(&fleet->posted_files_add, (u_int)nfiles,
-		    __ATOMIC_RELAXED);
+		    __ATOMIC_RELEASE);
 }
 
 /* Start a parallel download meter whose file count is not yet known (a
@@ -1134,6 +1200,49 @@ sftp_parallel_progress_start_counted(struct sftp_parallel *fleet, const char *ve
 	/* progress_start cleared progress_verb; set it AFTER so the count-fill
 	 * in _set_total rewrites this label. */
 	strlcpy(fleet->progress_verb, verb, sizeof(fleet->progress_verb));
+}
+
+/* Add one command's files to the aggregate meter, starting the meter if
+ * none is running. verb is the command's word ("Fetching", "Uploading").
+ * total_bytes and nfiles are what the command knows before it submits. A
+ * tree walk adds the rest through _set_total when it ends.
+ *
+ * With deferral on, no drain stops the meter between commands, so a later
+ * command joins the running meter. Its total and count add to the
+ * meter's, through the same accumulators a walk posts to. A command with
+ * a different verb relabels the meter "Transferring N files in
+ * parallel". */
+void
+sftp_parallel_progress_add(struct sftp_parallel *fleet, const char *verb,
+    off_t total_bytes, int nfiles)
+{
+	char label[128];
+
+	if (fleet == NULL)
+		return;
+	if (!fleet->progress_meter_started) {
+		if (nfiles > 0)
+			snprintf(label, sizeof(label), "%s %d file%s in parallel",
+			    verb, nfiles, nfiles == 1 ? "" : "s");
+		else
+			snprintf(label, sizeof(label), "%s files in parallel",
+			    verb);
+		sftp_parallel_progress_start(fleet, label, total_bytes);
+		strlcpy(fleet->progress_verb, verb,
+		    sizeof(fleet->progress_verb));
+		/* The total is in the meter already. The count is posted
+		 * below, so the meter's count starts from it. */
+		total_bytes = 0;
+	} else if (strcmp(fleet->progress_verb, verb) != 0)
+		__atomic_store_n(&fleet->progress_mixed, 1, __ATOMIC_RELAXED);
+	/* Release, so the reporter sees progress_verb and progress_mixed
+	 * once it sees the post. */
+	if (total_bytes > 0)
+		__atomic_fetch_add(&fleet->posted_total_add, total_bytes,
+		    __ATOMIC_RELEASE);
+	if (nfiles > 0)
+		__atomic_fetch_add(&fleet->posted_files_add, (u_int)nfiles,
+		    __ATOMIC_RELEASE);
 }
 
 /* Ends the command's progress meter, painting a final 100 percent first.

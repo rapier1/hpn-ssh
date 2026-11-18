@@ -113,7 +113,7 @@ flag to
 .Xr hpnssh 1
 to enable compression.
 .It Fl z Ar level
-HPN: use zstd transport compression
+Use zstd transport compression
 .Pq Cm zstd@hpnssh.org
 at the given
 .Ar level
@@ -206,11 +206,12 @@ with
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
 .It Fl M Ar range_split_min
-Minimum file size, in MiB, at which a single file is split across parallel
-workers by byte range
+Minimum size, in MiB, of the byte ranges a large file is split into across
+parallel workers
 .Pq HPNSSH extension; only meaningful with Fl j .
-The value is clamped to the range 64 to 10240.
-The default is 2048 (2 GiB).
+A file is split only when it is at least twice this size.
+The value must be in the range 64 to 10240.
+The default is 2048 (2 GiB), so files under 4 GiB are not split.
 .It Fl O
 Use the legacy SCP protocol for file transfers instead of the SFTP protocol.
 Forcing the use of the SCP protocol may be necessary for servers that do

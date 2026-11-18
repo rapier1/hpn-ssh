@@ -277,10 +277,11 @@ void sftp_conn_check_policy_tag(struct sftp_conn *, struct sshbuf *);
 void sftp_conn_die(struct sftp_conn *, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
-/* HPN: non-zero if a protocol-level violation was detected (ID mismatch,
- * unexpected packet type). Distinct from sftp_conn_is_dead: indicates possible
- * MITM attack or serious server corruption. The parallel orchestrator aborts
- * the entire transfer on violation rather than retrying the affected worker. */
+/* HPN: non-zero once a reply on this connection broke the SFTP protocol:
+ * a request id other than the one outstanding, a packet type the request
+ * does not permit, or a reply too short to parse. Unlike a dead
+ * connection, the replies no longer match the requests, so callers never
+ * retry on this connection. */
 int sftp_conn_is_protocol_violation(struct sftp_conn *);
 
 /* HPN: server-advertised per-user parallel-worker cap. -1 = not advertised

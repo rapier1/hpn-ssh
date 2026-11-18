@@ -1126,9 +1126,9 @@ parallel_reporter_thread(void *arg)
 		 * stretch's hash-byte total. */
 		if (fleet->progress_meter_started && !fleet->resume_stretch_on) {
 			off_t add_bytes = __atomic_exchange_n(
-			    &fleet->posted_total_add, 0, __ATOMIC_RELAXED);
+			    &fleet->posted_total_add, 0, __ATOMIC_ACQUIRE);
 			u_int add_files = __atomic_exchange_n(
-			    &fleet->posted_files_add, 0, __ATOMIC_RELAXED);
+			    &fleet->posted_files_add, 0, __ATOMIC_ACQUIRE);
 
 			if (add_bytes > 0 || add_files > 0) {
 				hpn_meter_add_total(&fleet->meter, fleet,
@@ -1139,6 +1139,8 @@ parallel_reporter_thread(void *arg)
 
 					snprintf(lbl, sizeof(lbl),
 					    "%s %u %s in parallel",
+					    __atomic_load_n(&fleet->progress_mixed,
+					    __ATOMIC_RELAXED) ? "Transferring" :
 					    fleet->progress_verb, fleet->meter.nfiles,
 					    fleet->meter.nfiles == 1 ? "file" : "files");
 					hpn_meter_relabel(&fleet->meter, fleet, lbl);

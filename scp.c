@@ -199,9 +199,7 @@ static int parallel_num_streams = 1;
 static struct sftp_parallel *parallel_orch = NULL;
 static const char *parallel_identity = NULL;	/* -i */
 static const char *parallel_config_file = NULL;	/* -F */
-static char **parallel_extra_o = NULL;		/* -o KEY=VALUE list, NULL-term */
-static size_t parallel_extra_o_count = 0;
-static size_t parallel_extra_o_cap = 0;
+static arglist parallel_extra_o;		/* -o list for -j workers */
 static int hpn_verify_transfer = 0;		/* Verify transfer resolved */
 static int verify_flag = 0;			/* -V: force verify transfer on */
 static int family_flag = 0;			/* -4/-6: forward to -R source scp */
@@ -217,25 +215,6 @@ static int writers_cap_user = 0;		/* -w: max range-writers per inode */
  * same reason sftp.c gates its progress_start on !quiet rather than showprogress.
  */
 static int parallel_want_progress = 0;
-
-/*
- * Append one -o KEY=VALUE option to the parallel worker-spawn list, kept
- * NULL-terminated so the orchestrator config (cfg->extra_argv) can consume it
- * directly.  optarg points into argv (stable for the process), but xstrdup
- * keeps ownership simple and matches sftp.c.
- */
-static void
-parallel_extra_o_add(const char *opt)
-{
-	if (parallel_extra_o_count + 2 > parallel_extra_o_cap) {
-		parallel_extra_o_cap = parallel_extra_o_cap ?
-		    parallel_extra_o_cap * 2 : 8;
-		parallel_extra_o = xreallocarray(parallel_extra_o,
-		    parallel_extra_o_cap, sizeof(*parallel_extra_o));
-	}
-	parallel_extra_o[parallel_extra_o_count++] = xstrdup(opt);
-	parallel_extra_o[parallel_extra_o_count] = NULL;
-}
 
 static void
 killchild(int signo)
@@ -589,19 +568,19 @@ main(int argc, char **argv)
 		case '4':
 			addargs(&args, "-%c", ch);
 			addargs(&remote_remote_args, "-%c", ch);
-			parallel_extra_o_add("AddressFamily=inet");
+			addargs(&parallel_extra_o, "AddressFamily=inet");
 			family_flag = 4;
 			break;
 		case '6':
 			addargs(&args, "-%c", ch);
 			addargs(&remote_remote_args, "-%c", ch);
-			parallel_extra_o_add("AddressFamily=inet6");
+			addargs(&parallel_extra_o, "AddressFamily=inet6");
 			family_flag = 6;
 			break;
 		case 'C':
 			addargs(&args, "-%c", ch);
 			addargs(&remote_remote_args, "-%c", ch);
-			parallel_extra_o_add("Compression=yes");
+			addargs(&parallel_extra_o, "Compression=yes");
 			compress_flag = 1;
 			break;
 		case 'z': {
@@ -617,12 +596,7 @@ main(int argc, char **argv)
 				    "(range %d-%d)", optarg, zerr,
 				    HPN_ZSTD_LEVEL_MIN, HPN_ZSTD_LEVEL_MAX);
 			addargs(&args, "-oZstdLevel=%d", zstd_level);
-			{
-				char zo[32];
-				snprintf(zo, sizeof(zo), "ZstdLevel=%d",
-				    zstd_level);
-				parallel_extra_o_add(zo);
-			}
+			addargs(&parallel_extra_o, "ZstdLevel=%d", zstd_level);
 			break;
 		}
 		case 'D':
@@ -655,18 +629,13 @@ main(int argc, char **argv)
 			else if (ch == 'F')
 				parallel_config_file = optarg;
 			else if (ch == 'o')
-				parallel_extra_o_add(optarg);
-			else if (ch == 'c') {
-				char *o;
-				xasprintf(&o, "Ciphers=%s", optarg);
-				parallel_extra_o_add(o);
-				free(o);
-			} else if (ch == 'J') {
-				char *o;
-				xasprintf(&o, "ProxyJump=%s", optarg);
-				parallel_extra_o_add(o);
-				free(o);
-			}
+				addargs(&parallel_extra_o, "%s", optarg);
+			else if (ch == 'c')
+				addargs(&parallel_extra_o, "Ciphers=%s",
+				    optarg);
+			else if (ch == 'J')
+				addargs(&parallel_extra_o, "ProxyJump=%s",
+				    optarg);
 			break;
 		case 'O':
 			mode = MODE_SCP;
@@ -742,12 +711,14 @@ main(int argc, char **argv)
 			 * (over-chunking / no parallelism for huge files) can
 			 * occur.  Only meaningful with -j > 1.
 			 */
-			range_split_min_mb_user = (int)strtonum(optarg, 64,
-			    10240, &errstr);
+			range_split_min_mb_user = (int)strtonum(optarg,
+			    RANGE_SPLIT_MIN_MB_FLOOR,
+			    RANGE_SPLIT_MIN_MB_CEILING, &errstr);
 			if (errstr != NULL)
 				fatal("Range-split minimum (-M) must be between "
-				    "64 and 10240 MiB: \"%s\": %s",
-				    optarg, errstr);
+				    "%d and %d MiB: \"%s\": %s",
+				    RANGE_SPLIT_MIN_MB_FLOOR,
+				    RANGE_SPLIT_MIN_MB_CEILING, optarg, errstr);
 			break;
 		case 'w':
 			/* Max concurrent range-writers per inode (mirror
@@ -1360,7 +1331,7 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 
 		memset(&bcfg, 0, sizeof(bcfg));
 		if (sftp_parallel_apply_ssh_config(&bcfg, host,
-		    parallel_config_file, parallel_extra_o) == 0) {
+		    parallel_config_file, parallel_extra_o.list) == 0) {
 			sftp_conn_set_bundle_config(conn, bcfg.use_bundle,
 			    bcfg.bundle_size, bcfg.writer_pool);
 			lustre_stripe_count = bcfg.lustre_stripe_count;
@@ -1374,41 +1345,10 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	if (parallel_num_streams <= 1)
 		return;			/* single-stream: no orchestrator */
 
-	/*
-	 * HPN: clamp the requested worker count to THIS connection's advertised
-	 * per-user cap (hpn-max-workers@hpnssh.org, read at sftp_init).  Computed
-	 * per call into a local; parallel_num_streams stays the immutable -j
-	 * request so each source connection caps against the original request.
-	 * Downloads relaunch this per source argument (each may be a different
-	 * host), and 3rd-party/crossload transfers will too, so the cap must be
-	 * per-connection rather than a sticky once-only global.
-	 *   cap < 0  -> not advertised (stock / non-HPN server): apply the
-	 *               conservative no-policy default.
-	 *   cap == 0 -> HPN server with no admin cap: honour the request.
-	 *   cap > 0  -> HPN server policy: clamp to it.
-	 * (The hard SFTP_PARALLEL_MAX_WORKERS ceiling is enforced at parse.)
-	 */
-	{
-		int cap = sftp_conn_max_workers_cap(conn);
-		int requested = parallel_num_streams;
-
-		eff_streams = requested;
-		if (cap < 0)
-			eff_streams = MINIMUM(requested,
-			    HPN_NO_POLICY_WORKER_DEFAULT);
-		else if (cap > 0)
-			eff_streams = MINIMUM(requested, cap);
-		if (eff_streams < requested) {
-			if (cap < 0)
-				logit("Parallel streams limited to %d "
-				    "(server advertises no policy; "
-				    "requested %d)", eff_streams, requested);
-			else
-				logit("Parallel streams limited to %d "
-				    "by server policy (requested %d)",
-				    eff_streams, requested);
-		}
-	}
+	/* HPN: cap the -j request by this connection's server. Downloads
+	 * relaunch per source argument, and each may be a different host, so
+	 * parallel_num_streams stays the original request. */
+	eff_streams = sftp_parallel_cap_workers(conn, parallel_num_streams);
 	if (eff_streams <= 1)
 		return;			/* clamped down to single-stream */
 
@@ -1423,13 +1363,12 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	pcfg.ssh_binary    = ssh_program;
 	pcfg.identity      = parallel_identity;
 	pcfg.config_file   = parallel_config_file;
-	pcfg.extra_argv    = parallel_extra_o;
+	pcfg.extra_argv    = parallel_extra_o.list;
 	pcfg.transfer_buflen = (u_int)sftp_copy_buflen;
 	pcfg.num_requests  = (u_int)sftp_nrequests;
 	pcfg.no_verify_repair = sftp_no_verify_repair;
 	pcfg.limit_kbps    = (uint64_t)limit_kbps;
-	pcfg.writers_per_inode_cap = writers_cap_user ?
-	    writers_cap_user : HPN_RANGE_WRITERS_CAP_DEFAULT;
+	pcfg.writers_per_inode_cap = writers_cap_user;
 	pcfg.range_split_min_mb = range_split_min_mb_user;
 	pcfg.verbose_level = verbose_mode;
 	pcfg.preserve_flag = pflag;
@@ -1452,7 +1391,7 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	 * applied above, not resolved from client ssh_config.)
 	 */
 	(void)sftp_parallel_apply_ssh_config(&pcfg, host,
-	    parallel_config_file, parallel_extra_o);
+	    parallel_config_file, parallel_extra_o.list);
 	if (verify_flag)		/* -V forces verify on regardless of config */
 		pcfg.verify_transfer = 1;
 	/* HPN: re-latch from the orchestrator's own resolution.  The no -j
@@ -1481,6 +1420,9 @@ scp_parallel_launch(struct sftp_conn *conn, const char *host,
 	 * onto a respawned worker as designed.
 	 */
 	(void)ssh_signal(SIGPIPE, SIG_IGN);
+	/* HPN: the path RTT sizes the born-dead threshold and the watchdog's
+	 * warmup budget. Without it they keep RTT-free defaults. */
+	sftp_parallel_sample_path_rtt(parallel_orch, conn);
 	/*
 	 * No interrupt flag is registered with the orchestrator: scp tears down
 	 * bluntly on SIGINT - killchild SIGTERMs the control connection and
@@ -1507,9 +1449,9 @@ scp_parallel_finish(struct sftp_conn *conn)
 		struct sftp_parallel_stats pstats;
 
 		sftp_parallel_wait(parallel_orch, conn);
-		/* A canceled run (interrupt / control-session loss) must not
-		 * exit 0: the destination is incomplete by design. */
-		if (sftp_parallel_was_aborted(parallel_orch)) {
+		/* An aborted run, from an interrupt or a fleet failure, must
+		 * not exit 0. The destination is incomplete. */
+		if (sftp_parallel_is_aborting(parallel_orch)) {
 			fmprintf(stderr, "scp: transfer aborted\n");
 			++errs;
 		}
@@ -1794,7 +1736,7 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 							fc = 0;
 							total_bytes +=
 							    sftp_parallel_scan_upload_total(
-							    argv[k], &fc);
+							    parallel_orch, argv[k], &fc);
 							total_files += fc;
 						}
 						snprintf(label, sizeof(label),

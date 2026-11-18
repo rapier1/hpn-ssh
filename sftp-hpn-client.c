@@ -680,10 +680,10 @@ sftp_conn_is_dead(struct sftp_conn *conn)
 }
 
 /* A protocol violation is a reply that breaks the SFTP protocol: a
- * request id other than the one outstanding, or a packet type the
- * request does not permit. sftp-client.c flags it wherever it decodes
- * a reply. It points at a MITM or a corrupt server rather than a
- * dropped connection, so callers abort instead of retrying. */
+ * request id other than the one outstanding, a packet type the request
+ * does not permit, or a reply too short to parse. sftp-client.c flags it
+ * wherever it decodes a reply. Unlike a dropped connection, the replies
+ * no longer match the requests, so callers never retry on it. */
 int
 sftp_conn_is_protocol_violation(struct sftp_conn *conn)
 {
