@@ -292,8 +292,10 @@ static char **verify_fail_list = NULL;
 static int verify_fail_count = 0;
 
 /* HPN: the attributes sftp_glob fetched for a matched path, so a -j get
- * does not stat the file again. Defined in sftp-glob.c. */
-int sftp_glob_get_attrib(const char *, Attrib *);
+ * does not stat the file again, and the byte total of the matched files
+ * for the -j meter. Defined in sftp-glob.c. */
+void sftp_glob_match_attrib(struct sftp_conn *, const char *, Attrib *);
+off_t sftp_glob_files_total(const glob_t *, int *);
 
 /* HPN: the -j launch inputs, saved so parallel_orch_ensure_alive can
  * rebuild the fleet after an abort. main fills them once, after option
@@ -792,80 +794,6 @@ local_is_dir(const char *path)
 	return S_ISDIR(sb.st_mode);
 }
 
-/* HPN: scale a byte count for the session summary: GiB from 1 GiB up,
- * MiB below. Sets *unit and returns the scaled value. */
-static double
-summary_scale(double bytes, const char **unit)
-{
-	if (bytes >= 1024.0 * 1024.0 * 1024.0) {
-		*unit = "GiB";
-		return bytes / (1024.0 * 1024.0 * 1024.0);
-	}
-	*unit = "MiB";
-	return bytes / (1024.0 * 1024.0);
-}
-
-/* HPN: the one-line session summary for the final drain. The figures are
- * the fleet's totals since it started, so it is printed once at the end,
- * never per command. It gives the bytes that crossed the wire and, when
- * nonzero, what resume skipped. It has no rate because the elapsed time
- * includes idle time between commands. Respawns add a wedge/peer-stall
- * breakdown and, when frequent, a hint to lower -j. */
-static void
-parallel_report_session(const struct sftp_parallel_stats *pstats)
-{
-	char skipped_str[64] = "", health[64] = "";
-	const char *wired_unit, *skipped_unit, *churn_hint = "";
-	double wired, skipped, secs;
-	uint64_t skipped_bytes = 0;
-	int workers, churn_threshold;
-
-	if (pstats->elapsed_ms == 0 || pstats->bytes_total_aggregate == 0)
-		return;
-	secs = pstats->elapsed_ms / 1000.0;
-	wired = summary_scale((double)pstats->bytes_wired_aggregate,
-	    &wired_unit);
-	/* A file resume found already correct counts at full size in
-	 * bytes_total but sends nothing, so the difference is what resume
-	 * saved. */
-	if (pstats->bytes_total_aggregate > pstats->bytes_wired_aggregate)
-		skipped_bytes = pstats->bytes_total_aggregate -
-		    pstats->bytes_wired_aggregate;
-	if (skipped_bytes > 0) {
-		skipped = summary_scale((double)skipped_bytes, &skipped_unit);
-		snprintf(skipped_str, sizeof(skipped_str),
-		    "; %.2f %s skipped via resume", skipped, skipped_unit);
-	}
-	if (pstats->total_respawns == 0) {
-		logit("Parallel streams: session total %.2f %s "
-		    "transferred in %.1fs%s", wired, wired_unit, secs,
-		    skipped_str);
-		return;
-	}
-	if (pstats->wedge_terminations > 0 &&
-	    pstats->peer_stall_terminations > 0)
-		snprintf(health, sizeof(health), " (%d wedge, %d peer-stall)",
-		    pstats->wedge_terminations,
-		    pstats->peer_stall_terminations);
-	else if (pstats->wedge_terminations > 0)
-		snprintf(health, sizeof(health), " (%d wedge)",
-		    pstats->wedge_terminations);
-	else if (pstats->peer_stall_terminations > 0)
-		snprintf(health, sizeof(health), " (%d peer-stall)",
-		    pstats->peer_stall_terminations);
-	/* Respawns in a quarter or more of the workers suggest -j is past
-	 * the path's knee. */
-	workers = pstats->num_workers > 0 ?
-	    pstats->num_workers : parallel_num_streams;
-	churn_threshold = (workers + 3) / 4;	/* ceil(workers / 4) */
-	if (churn_threshold > 0 && pstats->total_respawns >= churn_threshold)
-		churn_hint = " - consider lowering -j";
-	logit("Parallel streams: session total %.2f %s transferred in "
-	    "%.1fs%s; %d worker respawn%s%s%s", wired, wired_unit, secs,
-	    skipped_str, pstats->total_respawns,
-	    pstats->total_respawns == 1 ? "" : "s", health, churn_hint);
-}
-
 /* HPN: drain the -j fleet and report what is new since the last drain.
  * Returns 0, or -1 if files failed, were skipped by the walk, or were left
  * unfinished by an interrupt or abort. Callers must pass -1 on to the exit
@@ -900,7 +828,7 @@ parallel_flush(struct sftp_conn *conn, int final)
 	/* Printed before any TRANSFER INCOMPLETE lines so it is not buried
 	 * under a long failed-paths list. */
 	if (final)
-		parallel_report_session(&pstats);
+		sftp_parallel_report_session(&pstats);
 
 	if (pstats.total_respawns > 0 || pstats.wedge_terminations > 0 ||
 	    pstats.peer_stall_terminations > 0) {
@@ -1134,18 +1062,6 @@ parallel_orch_ensure_alive(struct sftp_conn *conn)
 	return rc;
 }
 
-/* HPN: the attributes of remote glob match path. sftp_glob cached them
- * when it matched, so this usually costs no round trip. A path past the
- * cache's cap falls back to a stat, so a single-file get still has a
- * known size. If that fails too, *a is left cleared. */
-static void
-glob_match_attrib(struct sftp_conn *conn, const char *path, Attrib *a)
-{
-	if (sftp_glob_get_attrib(path, a) != 0 &&
-	    sftp_stat(conn, path, 1, a) != 0)
-		attrib_clear(a);
-}
-
 /* HPN: start a get or put. Rebuild the -j fleet if it aborted, then push
  * the command's effective -p and -f (per command or program level) to the
  * fleet, which stamps them into each unit it queues. The single-stream
@@ -1220,37 +1136,14 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 		goto out;
 	}
 
-	/* HPN: size the -j meter from the attributes sftp_glob cached. A
-	 * path past the cache's cap is counted unsized, not stat'd, because
-	 * the loop below stats it already. */
+	/* HPN: size the -j meter from the attributes sftp_glob cached */
 	if (parallel_orch != NULL && !quiet && g.gl_matchc > 0) {
-		off_t dtotal = 0;
-		int nfiles = 0, sized = 1;
-		Attrib da;
+		off_t dtotal;
+		int nfiles;
 
-		for (i = 0; g.gl_pathv[i]; i++) {
-			/* A -r walk adds its directory's total when it ends.
-			 * Without -r the directory is refused at submit. */
-			if (sftp_globpath_is_dir(g.gl_pathv[i]))
-				continue;
-			if (sftp_glob_get_attrib(g.gl_pathv[i], &da) != 0 ||
-			    !(da.flags & SSH2_FILEXFER_ATTR_SIZE)) {
-				sized = 0;
-				nfiles++;
-				continue;
-			}
-			/* A broken symlink keeps its lstat attributes. It
-			 * and any other non-regular file are refused at
-			 * submit. */
-			if ((da.flags & SSH2_FILEXFER_ATTR_PERMISSIONS) &&
-			    !S_ISREG(da.perm))
-				continue;
-			dtotal += (off_t)da.size;
-			nfiles++;
-		}
-		/* A file of unknown size leaves the meter rate-only. */
-		sftp_parallel_progress_add(parallel_orch, "Fetching",
-		    sized ? dtotal : 0, nfiles);
+		dtotal = sftp_glob_files_total(&g, &nfiles);
+		sftp_parallel_progress_add(parallel_orch, "Fetching", dtotal,
+		    nfiles);
 	}
 
 	/* HPN: a new command asks again about each destination's parent */
@@ -1315,7 +1208,7 @@ process_get(struct sftp_conn *conn, const char *src, const char *dst,
 			    abs_dst, 1);
 			/* The size and mode let the fleet decide whether to
 			 * range-split the file. */
-			glob_match_attrib(conn, g.gl_pathv[i], &ga);
+			sftp_glob_match_attrib(conn, g.gl_pathv[i], &ga);
 			/* A file submitted here skips the walker, which
 			 * registers a tree's roots. Register both sides'
 			 * directories, so each parked verify item stores its
@@ -3606,6 +3499,9 @@ main(int argc, char **argv)
 		case 'X':
 			if (transferlog_option(optarg))	/* HPN */
 				break;
+			/* HPN: VerifyRepair= and Pacing= */
+			if (sftp_hpn_x_option(optarg, &no_verify_repair))
+				break;
 			/* Please keep in sync with scp.c -X */
 			/* HPN: the names match case-insensitively */
 			if (strncasecmp(optarg, "buffer=", 7) == 0) {
@@ -3632,27 +3528,6 @@ main(int argc, char **argv)
 					      optarg + 10, errstr);
 				}
 				num_requests = (size_t)llv;
-			} else if (strncasecmp(optarg, "VerifyRepair=", 13) == 0) {
-				/* HPN: verify auto-repair, on by default */
-				const char *v = optarg + 13;
-				if (strcasecmp(v, "no") == 0)
-					no_verify_repair = 1;
-				else if (strcasecmp(v, "yes") == 0)
-					no_verify_repair = 0;
-				else
-					fatal("Invalid VerifyRepair value "
-					      "\"%s\": use yes or no", v);
-			} else if (strncasecmp(optarg, "Pacing=", 7) == 0) {
-				/* HPN: adaptive upload pacing, off by default.
-				 * See sftp_conn_pace_ack. */
-				const char *v = optarg + 7;
-				if (strcasecmp(v, "no") == 0)
-					sftp_hpn_pace_set_enabled(0);
-				else if (strcasecmp(v, "yes") == 0)
-					sftp_hpn_pace_set_enabled(1);
-				else
-					fatal("Invalid Pacing value "
-					      "\"%s\": use yes or no", v);
 			} else {
 				fatal("Invalid -X option");
 			}

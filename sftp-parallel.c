@@ -1480,6 +1480,80 @@ sftp_parallel_get_stats(struct sftp_parallel *fleet,
 		out->elapsed_ms = monotime_ms() - fleet->session_start_ms;
 }
 
+/* Scale a byte count for the session summary: GiB from 1 GiB up, MiB
+ * below. Sets *unit and returns the scaled value. */
+static double
+summary_scale(double bytes, const char **unit)
+{
+	if (bytes >= 1024.0 * 1024.0 * 1024.0) {
+		*unit = "GiB";
+		return bytes / (1024.0 * 1024.0 * 1024.0);
+	}
+	*unit = "MiB";
+	return bytes / (1024.0 * 1024.0);
+}
+
+/* Log the one-line session summary from a sftp_parallel_get_stats
+ * snapshot. The figures are the fleet's totals since it started, so
+ * callers print it once, after the last drain. It gives the bytes that
+ * crossed the wire and, when nonzero, what resume skipped. It has no rate
+ * because the elapsed time can include idle time between hpnsftp
+ * commands. Respawns add a wedge/peer-stall breakdown and, when frequent,
+ * a hint to lower -j. */
+void
+sftp_parallel_report_session(const struct sftp_parallel_stats *pstats)
+{
+	char skipped_str[64] = "", health[64] = "";
+	const char *wired_unit, *skipped_unit, *churn_hint = "";
+	double wired, skipped, secs;
+	uint64_t skipped_bytes = 0;
+	int workers, churn_threshold;
+
+	if (pstats->elapsed_ms == 0 || pstats->bytes_total_aggregate == 0)
+		return;
+	secs = pstats->elapsed_ms / 1000.0;
+	wired = summary_scale((double)pstats->bytes_wired_aggregate,
+	    &wired_unit);
+	/* A file resume found already correct counts at full size in
+	 * bytes_total but sends nothing, so the difference is what resume
+	 * saved. */
+	if (pstats->bytes_total_aggregate > pstats->bytes_wired_aggregate)
+		skipped_bytes = pstats->bytes_total_aggregate -
+		    pstats->bytes_wired_aggregate;
+	if (skipped_bytes > 0) {
+		skipped = summary_scale((double)skipped_bytes, &skipped_unit);
+		snprintf(skipped_str, sizeof(skipped_str),
+		    "; %.2f %s skipped via resume", skipped, skipped_unit);
+	}
+	if (pstats->total_respawns == 0) {
+		logit("Parallel streams: session total %.2f %s "
+		    "transferred in %.1fs%s", wired, wired_unit, secs,
+		    skipped_str);
+		return;
+	}
+	if (pstats->wedge_terminations > 0 &&
+	    pstats->peer_stall_terminations > 0)
+		snprintf(health, sizeof(health), " (%d wedge, %d peer-stall)",
+		    pstats->wedge_terminations,
+		    pstats->peer_stall_terminations);
+	else if (pstats->wedge_terminations > 0)
+		snprintf(health, sizeof(health), " (%d wedge)",
+		    pstats->wedge_terminations);
+	else if (pstats->peer_stall_terminations > 0)
+		snprintf(health, sizeof(health), " (%d peer-stall)",
+		    pstats->peer_stall_terminations);
+	/* Respawns in a quarter or more of the workers suggest -j is past
+	 * the path's knee. */
+	workers = pstats->num_workers;
+	churn_threshold = (workers + 3) / 4;	/* ceil(workers / 4) */
+	if (churn_threshold > 0 && pstats->total_respawns >= churn_threshold)
+		churn_hint = " - consider lowering -j";
+	logit("Parallel streams: session total %.2f %s transferred in "
+	    "%.1fs%s; %d worker respawn%s%s%s", wired, wired_unit, secs,
+	    skipped_str, pstats->total_respawns,
+	    pstats->total_respawns == 1 ? "" : "s", health, churn_hint);
+}
+
 /* Drain the failed-path list the walkers and workers appended to:
  * returns the total failure count seen and transfers ownership of the
  * path strings to the caller. The list is reset, so failures recorded

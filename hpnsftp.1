@@ -322,22 +322,21 @@ Lustre uploads and downloads, and disabled with
 At the end of a parallel-streams session a summary line is emitted of
 the form:
 .Bd -literal -offset indent
-Parallel streams: X transferred in Ys (Z MiB/s)
+Parallel streams: session total X transferred in Ys
 .Ed
 .Pp
 where
 .Sy X
-is the number of file bytes that actually crossed the network and
-.Sy Z
-is the corresponding wire throughput in mebibytes per second.
-When verified-resume avoided pushing bytes that already matched on the
-peer (via chunked-resume or prefix-resume) the line gains a
-.Sq ; W skipped via resume
-beat reporting the bytes that did not need to flow.
+is the number of file bytes that crossed the network, in MiB or GiB.
+It gives no rate, since the session time includes the time between
+commands.
+When verified resume found bytes already in place on the peer, the line
+gains
+.Sq ; W skipped via resume .
 If any workers were respawned during the session a worker-respawn count
-is appended, with the same
+is appended, with a
 .Sq consider lowering -j
-hint noted above.
+hint when the count reaches a quarter of the workers.
 .It Fl l Ar limit
 Limits the used bandwidth, specified in Kbit/s.
 .It Fl M Ar range_split_min_mb

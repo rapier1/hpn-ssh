@@ -552,6 +552,10 @@ void sftp_parallel_stop(struct sftp_parallel *fleet);
 void sftp_parallel_get_stats(struct sftp_parallel *fleet,
     struct sftp_parallel_stats *out);
 
+/* Log the one-line session summary from a get_stats snapshot: bytes on
+ * the wire, bytes resume skipped, and worker respawns. */
+void sftp_parallel_report_session(const struct sftp_parallel_stats *);
+
 /*
  * Drain the orchestrator's bounded list of paths that could not be
  * delivered (permanent give-up after MAX_RETRIES, workqueue push-fail,

@@ -38,7 +38,8 @@
 
 int sftp_glob(struct sftp_conn *, const char *, int,
     int (*)(const char *, int), glob_t *);
-int sftp_glob_get_attrib(const char *, Attrib *);
+void sftp_glob_match_attrib(struct sftp_conn *, const char *, Attrib *);
+off_t sftp_glob_files_total(const glob_t *, int *);
 
 struct SFTP_OPENDIR {
 	SFTP_DIRENT **dir;
@@ -106,7 +107,7 @@ attrib_cache_record(const char *path, const Attrib *a)
 
 /* HPN: copy the attributes the last sftp_glob fetched for path into out.
  * Returns 0, or -1 if path is not cached. */
-int
+static int
 sftp_glob_get_attrib(const char *path, Attrib *out)
 {
 	struct glob_attrib_entry *e;
@@ -116,6 +117,54 @@ sftp_glob_get_attrib(const char *path, Attrib *out)
 		return -1;
 	*out = e->attrib;
 	return 0;
+}
+
+/* HPN: the attributes of remote glob match path. sftp_glob cached them
+ * when it matched, so this usually costs no round trip. A path past the
+ * cache's cap falls back to a stat, so a single-file download still has
+ * a known size. If that fails too, *a is left cleared. */
+void
+sftp_glob_match_attrib(struct sftp_conn *conn, const char *path, Attrib *a)
+{
+	if (sftp_glob_get_attrib(path, a) != 0 &&
+	    sftp_stat(conn, path, 1, a) != 0)
+		attrib_clear(a);
+}
+
+/* HPN: the byte total of the regular files in g, the last sftp_glob
+ * result, from the cached attributes, for a -j meter. *nfiles gets their
+ * count. A directory is left out: a -r walk adds its own total when it
+ * ends, and without -r it is refused. A file of unknown size makes the
+ * total 0, so the meter shows a rate only. A path past the cache's cap
+ * is such a file. It is not stat'd here, since its transfer stats it. */
+off_t
+sftp_glob_files_total(const glob_t *g, int *nfiles)
+{
+	off_t total = 0;
+	int i, sized = 1;
+	Attrib a;
+
+	*nfiles = 0;
+	if (g->gl_pathv == NULL)
+		return 0;
+	for (i = 0; g->gl_pathv[i] != NULL; i++) {
+		if (sftp_globpath_is_dir(g->gl_pathv[i]))
+			continue;
+		if (sftp_glob_get_attrib(g->gl_pathv[i], &a) != 0 ||
+		    !(a.flags & SSH2_FILEXFER_ATTR_SIZE)) {
+			sized = 0;
+			(*nfiles)++;
+			continue;
+		}
+		/* A broken symlink keeps its lstat attributes. It and any
+		 * other non-regular file are refused at submit. */
+		if ((a.flags & SSH2_FILEXFER_ATTR_PERMISSIONS) &&
+		    !S_ISREG(a.perm))
+			continue;
+		total += (off_t)a.size;
+		(*nfiles)++;
+	}
+	return sized ? total : 0;
 }
 
 static void *

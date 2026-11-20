@@ -1060,10 +1060,42 @@ sftp_conn_max_workers_cap(struct sftp_conn *conn)
 
 /* -X Pacing= master switch, applied to every connection created after
  * it. Parsed once at startup, before any connection exists. */
-void
+static void
 sftp_hpn_pace_set_enabled(int on)
 {
 	sftp_hpn_pace_default = on;
+}
+
+/* The -X options hpnsftp and hpnscp share: VerifyRepair=yes|no sets
+ * *no_verify_repair, and Pacing=yes|no is the switch above. Returns 1 if
+ * opt was one of them, 0 if not. A value other than yes or no is fatal. */
+int
+sftp_hpn_x_option(const char *opt, int *no_verify_repair)
+{
+	const char *v;
+
+	if (strncasecmp(opt, "VerifyRepair=", 13) == 0) {
+		v = opt + 13;
+		if (strcasecmp(v, "no") == 0)
+			*no_verify_repair = 1;
+		else if (strcasecmp(v, "yes") == 0)
+			*no_verify_repair = 0;
+		else
+			fatal("Invalid VerifyRepair value \"%s\": use yes or no",
+			    v);
+		return 1;
+	}
+	if (strncasecmp(opt, "Pacing=", 7) == 0) {
+		v = opt + 7;
+		if (strcasecmp(v, "no") == 0)
+			sftp_hpn_pace_set_enabled(0);
+		else if (strcasecmp(v, "yes") == 0)
+			sftp_hpn_pace_set_enabled(1);
+		else
+			fatal("Invalid Pacing value \"%s\": use yes or no", v);
+		return 1;
+	}
+	return 0;
 }
 
 /* Mean of the nonzero ring slots in bytes/sec, 0 when there are none.

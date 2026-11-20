@@ -32,6 +32,7 @@
 .Op Fl S Ar program
 .Op Fl w Ar writers_per_file
 .Op Fl X Ar sftp_option
+.Op Fl z Ar level
 .Ar source ... target
 .Sh DESCRIPTION
 .Nm
@@ -189,6 +190,24 @@ keyboard-interactive, or a one-time-password / two-factor challenge
 its own prompt and a one-time password cannot be reused across workers.
 If only interactive authentication is available, run without
 .Fl j .
+.Pp
+Unless
+.Fl q
+is given, a parallel transfer ends with a summary line of the form:
+.Bd -literal -offset indent
+Parallel streams: session total X transferred in Ys
+.Ed
+.Pp
+where
+.Sy X
+is the number of file bytes that crossed the network, in MiB or GiB.
+A download prints one line for each source argument.
+When verified resume found bytes already in place on the peer, the line
+gains
+.Sq ; W skipped via resume .
+If any workers were respawned a worker-respawn count is appended, with a
+.Sq consider lowering -j
+hint when the count reaches a quarter of the workers.
 .Pp
 On Lustre destinations, parallel streams also widen the destination
 directory's stripe to match

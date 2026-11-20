@@ -147,13 +147,15 @@ uint32_t sftp_conn_rdahead_window(struct sftp_conn *, size_t);
  * fresh TCP session. No-op when conn or its HPN state is NULL. */
 void sftp_conn_rdahead_backpressure_signal(struct sftp_conn *);
 
-/* Adaptive upload pacing (see the pace member of struct sftp_hpn_conn).
- * set_enabled is the -X Pacing= master switch, off by default. ack feeds
- * one WRITE status's payload bytes to the rate estimator. bwlimit
- * returns the token bucket the outbound path applies:
- * the tighter of the adaptive ceiling and the user's -l bucket and rate,
- * or NULL for no limit. */
-void sftp_hpn_pace_set_enabled(int);
+/* -X VerifyRepair= and Pacing=, shared by hpnsftp and hpnscp. Returns 1
+ * if the option was one of them. */
+int sftp_hpn_x_option(const char *, int *);
+
+/* Adaptive upload pacing (see the pace member of struct sftp_hpn_conn),
+ * off unless -X Pacing=yes. ack feeds one WRITE status's payload bytes to
+ * the rate estimator. bwlimit returns the token bucket the outbound path
+ * applies: the tighter of the adaptive ceiling and the user's -l bucket
+ * and rate, or NULL for no limit. */
 void sftp_conn_pace_ack(struct sftp_conn *, size_t);
 struct bwlimit *sftp_conn_pace_bwlimit(struct sftp_conn *, struct bwlimit *,
     uint64_t);
